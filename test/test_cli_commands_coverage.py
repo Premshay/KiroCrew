@@ -16,8 +16,12 @@ Follows the style already established by ``test_cli.py`` (``argparse.Namespace``
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import io
 import json
+import os
+import subprocess
+import sys
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -91,6 +95,28 @@ def _cfg_with(
     cfg.default_workspace = default_workspace
     cfg.save = MagicMock()  # type: ignore[method-assign]
     return cfg
+
+
+def _seed_doc_file(tmp_path: Path, cfg: KiroCrewConfig) -> Path:
+    """Materialize *cfg* as a real config.json for the locked-delta writers.
+
+    The CLI CRUD commands no longer mutate the loaded snapshot and ``save()``
+    it -- they write a delta on the document read inside the sidecar flock
+    (#4767 round 7), so tests that check persistence must seed and read the
+    FILE, not the in-memory dataclass.
+    """
+    doc = {
+        "workspaces": {n: dataclasses.asdict(w) for n, w in cfg.workspaces.items()},
+        "agents": {n: dataclasses.asdict(a) for n, a in cfg.agents.items()},
+        "agent": {"default_agent": cfg.default_agent},
+    }
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    return p
+
+
+def _read_doc(p: Path) -> dict:
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 # ── _internal_secret / _format_schedule ──
@@ -462,8 +488,45 @@ class TestAppCli:
     def test_dev_off_restores_caching(self, capsys: pytest.CaptureFixture[str]) -> None:
         with patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value={"ok": True}) as setter:
             cc._handle_app(_ns(app_action="dev", name="demo", off=True))
-        setter.assert_called_once_with("demo", False)
+        setter.assert_called_once_with("demo", False, confirm_out_of_install_root=False)
         assert "dev mode off" in capsys.readouterr().out
+
+    def test_dev_confirmation_refusal_reaches_stderr(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The refusal's own text (which names the CLI flag) is printed as-is."""
+        refusal = {
+            "error": "needs confirmation: run `kirocrew app dev demo --confirm-out-of-install-root`",
+            "code": "dev_mode_out_of_install_confirmation_required",
+        }
+        with (
+            patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value=refusal) as setter,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cc._handle_app(
+                _ns(app_action="dev", name="demo", off=False, confirm_out_of_install_root=False)
+            )
+        assert exc.value.code == 1
+        assert "--confirm-out-of-install-root" in capsys.readouterr().err
+        setter.assert_called_once_with("demo", True, confirm_out_of_install_root=False)
+
+    def test_dev_confirm_flag_is_forwarded(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value={"ok": True}) as setter:
+            cc._handle_app(
+                _ns(app_action="dev", name="demo", off=False, confirm_out_of_install_root=True)
+            )
+        setter.assert_called_once_with("demo", True, confirm_out_of_install_root=True)
+
+    def test_dev_confirm_flag_with_off_warns(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """The flag only applies to enabling — an ignored flag must say so,
+        not exit 0 looking like a confirmed grant."""
+        with patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value={"ok": True}) as setter:
+            cc._handle_app(
+                _ns(app_action="dev", name="demo", off=True, confirm_out_of_install_root=True)
+            )
+        err = capsys.readouterr().err
+        assert "no effect with --off" in err
+        setter.assert_called_once_with("demo", False, confirm_out_of_install_root=True)
 
     def test_dev_error_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
@@ -669,9 +732,15 @@ class TestAgentCli:
         out = capsys.readouterr().out
         assert "default *" in out and "other" in out and "alt" in out
 
-    def test_create_persists_new_agent(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_create_persists_new_agent(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         cfg = _cfg_with(agents={})
-        with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+        ):
             cc._handle_agent(
                 _ns(
                     agent_action="create",
@@ -681,9 +750,9 @@ class TestAgentCli:
                     memory_store="ms",
                 )
             )
-        assert cfg.agents["new"].kiro_agent == "ka"
-        assert cfg.agents["new"].workspace == "ws"
-        cfg.save.assert_called_once()  # type: ignore[attr-defined]
+        doc = _read_doc(cfg_path)
+        assert doc["agents"]["new"]["kiro_agent"] == "ka"
+        assert doc["agents"]["new"]["workspace"] == "ws"
         assert "Created agent: new" in capsys.readouterr().out
 
     def test_create_duplicate_exits_1_without_saving(
@@ -707,11 +776,15 @@ class TestAgentCli:
         cfg.save.assert_not_called()  # type: ignore[attr-defined]
         assert "already exists" in capsys.readouterr().err
 
-    def test_update_applies_only_provided_fields(self) -> None:
+    def test_update_applies_only_provided_fields(self, tmp_path: Path) -> None:
         cfg = _cfg_with(
             agents={"a": KiroCrewAgentConfig(kiro_agent="old", workspace="ws0", memory_store="m0")}
         )
-        with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+        ):
             cc._handle_agent(
                 _ns(
                     agent_action="update",
@@ -721,13 +794,18 @@ class TestAgentCli:
                     memory_store=None,
                 )
             )
-        assert cfg.agents["a"].kiro_agent == "new"
-        assert cfg.agents["a"].workspace == "ws0"
-        assert cfg.agents["a"].memory_store == "m0"
+        agent = _read_doc(cfg_path)["agents"]["a"]
+        assert agent["kiro_agent"] == "new"
+        assert agent["workspace"] == "ws0"
+        assert agent["memory_store"] == "m0"
 
-    def test_update_all_fields(self) -> None:
+    def test_update_all_fields(self, tmp_path: Path) -> None:
         cfg = _cfg_with(agents={"a": KiroCrewAgentConfig()})
-        with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+        ):
             cc._handle_agent(
                 _ns(
                     agent_action="update",
@@ -737,8 +815,12 @@ class TestAgentCli:
                     memory_store="m",
                 )
             )
-        agent = cfg.agents["a"]
-        assert (agent.kiro_agent, agent.workspace, agent.memory_store) == ("k", "w", "m")
+        agent = _read_doc(cfg_path)["agents"]["a"]
+        assert (agent["kiro_agent"], agent["workspace"], agent["memory_store"]) == (
+            "k",
+            "w",
+            "m",
+        )
 
     def test_update_missing_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         cfg = _cfg_with(agents={})
@@ -758,13 +840,19 @@ class TestAgentCli:
         assert exc.value.code == 1
         assert "not found" in capsys.readouterr().err
 
-    def test_delete_removes_non_default(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_delete_removes_non_default(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         cfg = _cfg_with(
             agents={"default": KiroCrewAgentConfig(), "spare": KiroCrewAgentConfig()},
         )
-        with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+        ):
             cc._handle_agent(_ns(agent_action="delete", name="spare"))
-        assert "spare" not in cfg.agents
+        assert "spare" not in _read_doc(cfg_path)["agents"]
         assert "Deleted agent: spare" in capsys.readouterr().out
 
     def test_delete_default_is_refused(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -823,16 +911,18 @@ class TestWorkspaceCopyFrom:
         (src / "memory").mkdir(parents=True)
         (src / "memory" / "notes.md").write_text("hi", encoding="utf-8")
         cfg = self._base()
+        cfg_path = _seed_doc_file(tmp_path, cfg)
         with (
             patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
             patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
             patch("kiro_crew.cli_commands.sel"),
         ):
             cc._handle_workspace(
                 _ns(workspace_action="create", name="copy1", dir=None, copy_from="src")
             )
         assert (tmp_path / "workspace-copy1" / "memory" / "notes.md").read_text() == "hi"
-        assert cfg.workspaces["copy1"].dir == "workspace-copy1"
+        assert _read_doc(cfg_path)["workspaces"]["copy1"]["dir"] == "workspace-copy1"
         assert "Created workspace: copy1" in capsys.readouterr().out
 
     def test_copy_from_skips_sensitive_entries(self, tmp_path: Path) -> None:
@@ -891,15 +981,17 @@ class TestWorkspaceCopyFrom:
     def test_copy_from_missing_source_dir_still_registers(self, tmp_path: Path) -> None:
         """A source workspace with no directory on disk is a config-only copy."""
         cfg = self._base()
+        cfg_path = _seed_doc_file(tmp_path, cfg)
         with (
             patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
             patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
             patch("kiro_crew.cli_commands.sel"),
         ):
             cc._handle_workspace(
                 _ns(workspace_action="create", name="copy3", dir=None, copy_from="src")
             )
-        assert "copy3" in cfg.workspaces
+        assert "copy3" in _read_doc(cfg_path)["workspaces"]
         assert not (tmp_path / "workspace-copy3").exists()
 
 
@@ -1641,6 +1733,34 @@ class TestMemoryCli:
         assert "Semantic: 3 active, 1 deleted" in out
         assert "Embedded: 7/7" in out
         assert "FAISS accelerator: 10 vectors indexed" in out
+
+    def test_stats_reports_read_volume_labelled_as_this_process(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The CLI builds its own store, so the totals must not read as lifetime."""
+        with _MemHarness() as h:
+            h.store.memory_stats.return_value = {
+                "semantic_active": 3,
+                "semantic_deleted": 0,
+                "episodic_active": 7,
+                "episodic_deleted": 0,
+                "faiss_index_size": 0,
+                "events_count": 4,
+                "embedded_count": 7,
+                "faiss_available": False,
+            }
+            h.store.read_counters.return_value = {
+                "statements_executed": 9,
+                "rows_read": 40,
+                "semantic_rows_read": 12,
+                "semantic_full_scans": 2,
+                "episodic_rows_read": 21,
+                "episodic_full_scans": 3,
+            }
+            cc._memory_cmd(_ns(mem_action="stats"))
+        out = capsys.readouterr().out
+        assert "Reads (this process): 40 rows over 9 statements" in out
+        assert "population scans: semantic 2 (12 rows), episodic 3 (21 rows)" in out
 
     def test_stats_without_faiss_reports_fallback_not_zero_vectors(
         self, capsys: pytest.CaptureFixture[str]
@@ -2538,6 +2658,76 @@ class TestRunEval:
         h.runner.run_scenarios.assert_not_awaited()
         assert not (tmp_path / "eval_results").exists()
 
+    #: Imports the helper and writes a report holding the formatter's own glyph.
+    _WRITE_CHILD = """
+import locale, sys
+from pathlib import Path
+from kiro_crew.cli_commands import write_eval_artifacts
+
+print("encoding=" + locale.getencoding())
+report_path, json_path = write_eval_artifacts(
+    Path(sys.argv[1]), "20260101_000000", "## \\u2705 ok", {"overall_passed": 1}
+)
+print("wrote=" + report_path.name + "," + json_path.name)
+"""
+
+    def test_the_artifacts_survive_a_non_utf8_default_codec(self, tmp_path: Path) -> None:
+        """The report is written as UTF-8, not the host's locale codec.
+
+        Run in a CHILD PROCESS on purpose, against this file's usual convention:
+        the default codec ``open()`` picks is fixed when the interpreter starts,
+        so it cannot be substituted in-process — patching ``locale`` does not
+        reach the C-level lookup ``io`` actually performs.
+
+        Without ``encoding="utf-8"`` the write raises ``UnicodeEncodeError`` under
+        cp1252/cp950/cp932, and it raises after the eval has already run, so both
+        artifacts are lost.
+        """
+        env = dict(os.environ)
+        # PEP 540 off, PEP 538 coercion off, C locale: a non-UTF-8 default on
+        # every platform -- the Windows ANSI code page, or ASCII on POSIX.
+        env["PYTHONUTF8"] = "0"
+        env["PYTHONCOERCECLOCALE"] = "0"
+        env["LC_ALL"] = "C"
+        env["LANG"] = "C"
+        env.pop("PYTHONIOENCODING", None)
+        # The child is anchored outside the checkout, so hand it this
+        # interpreter's own import path rather than relying on an installed copy.
+        env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+        env["KIROCREW_HOME"] = str(tmp_path / "home")
+        out_dir = tmp_path / "eval_results"
+        proc = subprocess.run(
+            [sys.executable, "-c", self._WRITE_CHILD, str(out_dir)],
+            env=env,
+            capture_output=True,
+            text=True,
+            # This process's own capture is UTF-8 regardless of the codec the
+            # CHILD was forced onto; only the child's file write is under test.
+            encoding="utf-8",
+            errors="replace",
+            # The child imports the installed package; anchor it outside the
+            # checkout so nothing it writes relatively lands in the repo.
+            cwd=tmp_path,
+        )
+        encoding = next(
+            (
+                line.split("=", 1)[1].strip()
+                for line in proc.stdout.splitlines()
+                if line.startswith("encoding=")
+            ),
+            "",
+        )
+        if not encoding:
+            pytest.fail(f"the child never started:\n{proc.stdout}\n{proc.stderr}")
+        if encoding.lower().replace("-", "") in {"utf8", "utf8mb4"}:
+            pytest.skip(f"this host's default codec stayed UTF-8 ({encoding}); nothing to prove")
+
+        assert proc.returncode == 0, f"the save died under {encoding}:\n{proc.stderr}"
+        report = next(p for p in out_dir.iterdir() if p.suffix == ".md")
+        # Decode strictly: the bytes on disk have to BE UTF-8, whatever the host
+        # codec was. (Line endings are the text layer's, so compare by line.)
+        assert report.read_bytes().decode("utf-8").splitlines() == ["## ✅ ok"]
+
     @pytest.mark.asyncio
     async def test_dimension_summary_marks_pass_and_fail_rates(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -2621,3 +2811,50 @@ class TestRunEval:
             await cc._run_eval(_ns(all_scenarios=False, scenarios=None, judge=True))
         h.judge.judge_turn.assert_not_awaited()
         assert turn.assertion_results[0][1] is False
+
+
+class TestDevConfirmFlagNoAbbreviation:
+    """The dev subparser must reject flag abbreviations (#7169 review).
+
+    The builtin agent deny rule for `--confirm-out-of-install-root` matches
+    the flag's LITERAL text, but argparse's default `allow_abbrev=True` would
+    accept `--confirm` (or `--c`) as the same flag — an agent shell could then
+    supply the operator attestation in a spelling the rule never sees. The
+    `dev` subparser is built with `allow_abbrev=False`, so only the exact
+    flag parses and the substring rule stays sufficient.
+    """
+
+    def test_abbreviated_confirm_flag_is_rejected(self, capsys) -> None:
+        import sys
+        from unittest.mock import patch
+
+        for abbrev in ("--confirm", "--confirm-out-of-install-roo", "--c"):
+            argv = ["kirocrew", "app", "dev", "demo", abbrev]
+            with (
+                patch.object(sys, "argv", argv),
+                patch("kiro_crew.cli_commands._handle_app") as handler,
+            ):
+                from kiro_crew.cli import main
+
+                with pytest.raises(SystemExit) as exc:
+                    main()
+                assert exc.value.code == 2, f"{abbrev} did not exit 2"
+                handler.assert_not_called()
+            err = capsys.readouterr().err
+            assert "unrecognized arguments" in err, f"{abbrev}: {err!r}"
+
+    def test_literal_confirm_flag_still_parses(self) -> None:
+        import sys
+        from unittest.mock import patch
+
+        argv = ["kirocrew", "app", "dev", "demo", "--confirm-out-of-install-root"]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("kiro_crew.cli_commands._handle_app") as handler,
+        ):
+            from kiro_crew.cli import main
+
+            main()
+            ns = handler.call_args[0][0]
+            assert ns.confirm_out_of_install_root is True
+            assert ns.off is False

@@ -41,8 +41,10 @@ if TYPE_CHECKING:
 
 from kiro_crew import name_grant, platform_compat
 from kiro_crew.agent_discovery import cached_project_agent_names, list_agents
+from kiro_crew.agent_sdk.capabilities import capabilities_of
+from kiro_crew.agent_sdk.provider_identity import PROVIDER_CLAUDE_CODE
 from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig
-from kiro_crew.constants import SUBAGENT_COMPLETION_PREFIX
+from kiro_crew.constants import SUBAGENT_COMPLETION_PREFIX, SUBAGENT_TIMEOUT_SECS
 from kiro_crew.context import (
     CONTEXT_GROUP_LESSONS,
     CONTEXT_GROUP_MEMORY,
@@ -63,6 +65,7 @@ from kiro_crew.hooks import (
     TOOL_AUTO_APPROVE,
     TOOL_DENY,
     fire_tool_hooks,
+    identity_grant_covers_child,
     safe_read_file,
 )
 from kiro_crew.llm_helpers import (
@@ -141,8 +144,8 @@ from kiro_crew.subagent_persistence import (
 from kiro_crew.validation import _AGENT_NAME_RE
 
 # Standalone ClaudeCodeProvider removed (KiroACP-only). Name kept as None so the
-# legacy isinstance guards short-circuit; the claude-agent-acp seam lives in
-# providers.acp.is_claude_backend.
+# legacy isinstance guards short-circuit; which seam serves a session is answered
+# by ``SessionCapabilities.provider_seam``.
 ClaudeCodeProvider = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
@@ -171,7 +174,14 @@ _MAX_CONCURRENT = 3
 #: reached by OMITTING ``agent``, not by naming one. Every roster inherits this
 #: as :func:`visible_agent_names`' default ``exclude``, so no other module names
 #: the set and it cannot drift when a reserved name appears.
-UNADVERTISED_AGENTS = frozenset({"kirocrew", "kirocrew-conductor", "kirocrew-pipeline-conductor"})
+UNADVERTISED_AGENTS = frozenset(
+    {
+        "kirocrew",
+        "kirocrew-conductor",
+        "kirocrew-pipeline-conductor",
+        "kirocrew-security-conductor",
+    }
+)
 
 #: Wire code for the unknown-agent refusal ``_validate_agent`` returns. It rides
 #: ``SubagentInfo.error_code`` to ``POST /api/spawn``, which forwards the FIELD as
@@ -444,7 +454,11 @@ def _done_result(text: str) -> str:
     return "…(truncated)\n" + redacted[-_MAX_DONE_RESULT_LEN:]
 
 
-_TIMEOUT_SECS = 1800  # 30 minutes
+# Wall-clock deadline for one subagent run: the fallback when config is
+# unavailable or ``agent.subagent_timeout_secs`` is 0. One owner in
+# ``constants`` because the MCP gateway's hard-wedge ceiling has to sit above
+# it (see ``mcp_gateway/backend.py``).
+_TIMEOUT_SECS = SUBAGENT_TIMEOUT_SECS
 _TURN_LIMIT = 100
 _REAPER_INTERVAL = 60  # seconds between reaper sweeps
 # Idle TTL for continuable conversations (keep=True): a conversation with no
@@ -707,7 +721,7 @@ _SUPPRESS_CEILING = 4
 # so the count can never be reached and the only flush that ever fires is the
 # wave-close one. Every sibling's result is then withheld for the SLOWEST
 # member's entire remaining runtime; a member that HANGS rather than fails
-# withholds them for the full ``_TIMEOUT_SECS`` reap (30 min), which is
+# withholds them for the full ``_TIMEOUT_SECS`` reap, which is
 # indistinguishable from a dead session (issue #2215).
 #
 # This deadline is the latency half of that one-knob-two-jobs split: the count
@@ -1158,11 +1172,11 @@ class SubagentInfo:
     task: str
     started: float = field(default_factory=time.time)
     done: bool = False
-    # True for the record returned by a spawn that hit the stagger/concurrency
-    # gate and was QUEUED instead of started. Such a record is not registered in
-    # ``_agents`` and carries no live state — but its ``id`` IS the id the agent
-    # will run under once ``_drain_queue`` starts it (pre-assigned at accept
-    # time), so callers may print it or hold on to it.
+    # True for work accepted behind the stagger/concurrency gate but never
+    # started. The record returned by ``spawn`` is normally not registered in
+    # ``_agents``; a queued stop registers a synthetic copy temporarily so batch
+    # settlement can observe it, and keeps this discriminator True so running
+    # cancellation and live-resource monitoring do not treat it as executing.
     queued: bool = False
     result: str = ""
     result_path: str = ""
@@ -1312,7 +1326,8 @@ class SubagentInfo:
     # model-pinned review's actual model is auditable (issue #3582).
     resolved_model: str = ""
     # The EFFECTIVE requested model — the per-spawn pin (``model``) OR, when that
-    # is empty, the ``agent.role_models['subagent']`` config pin (AGENTS.md names
+    # is empty, the ``agent.role_models['subagent']`` config pin
+    # (docs/system-specs/common/model-selection.md names
     # the config pin as *the* way to pin a subagent model). This is the side the
     # downgrade comparison must use: a config-pinned run served a different model
     # is exactly the "unverifiable pin" this feature exists to catch, and keying
@@ -1512,6 +1527,37 @@ def _context_groups_field(info: "SubagentInfo") -> str:
 class ToolApprovalCallback(Protocol):
     async def __call__(self, event: LLMEvent, parent_session_key: str = "") -> bool:
         pass
+
+
+class SpawnApprovalUnreachable(Exception):
+    """A spawn-approval prompt has no surface that could ever answer it.
+
+    Raised BY a :class:`SpawnApprovalCallback`, at the point it would otherwise
+    park, and handled by the spawn gate in ``subagent_manager/admission.py``.
+
+    Why an exception rather than a ``False`` return, and why the callback rather
+    than the gate decides:
+
+    * ``False`` already means "a human refused", and the two must not collapse:
+      a refusal is a decision, this is the absence of anyone who could decide.
+      They want different prose, and only this one is a misconfiguration.
+    * The gate cannot compute the answer. Every non-human auto-approve shortcut
+      the callback owns -- ``hooks.auto_approve_sources``, the CLI ``--approval``
+      mode, the YOLO override, slot trust -- is evaluated inside the callback and
+      never reaches the gate's cascade, so a gate-side probe would have to
+      re-derive all four and would reject spawns those rungs mean to allow (the
+      ``auto_approve_sources`` opt-in is issue #2381's own documented
+      workaround). Raising from the callback puts the check where "we are about
+      to park with nobody attached" is the only remaining possibility.
+
+    The message SHOULD name the surface that was missing ("no dashboard client is
+    connected"), because the raiser is the only party that knows what the
+    surfaces are. The gate quotes it and adds the config rungs, which are the
+    gate's own; that split is what keeps the gate's prose from going stale when
+    channel-side delivery lands.
+
+    A callback that never raises it keeps today's behaviour unchanged.
+    """
 
 
 class SpawnApprovalCallback(Protocol):
@@ -2389,14 +2435,18 @@ class SubagentManager:
         latter is what ``_sessions.get_or_create`` actually returns for the
         ``claude_code`` provider, so detecting it here is what makes the
         session-file cleanup target ``~/.claude`` instead of ``~/.kiro``.
+
+        Asks ``SessionCapabilities.provider_seam`` through
+        :func:`~kiro_crew.agent_sdk.capabilities.capabilities_of`, which replaced a
+        lazy ``from kiro_crew.providers.acp import is_claude_backend``. The import
+        was lazy because ``providers.acp`` sits in a providers -> session cycle;
+        the SDK is in no cycle, so this one can live at module scope. The calling
+        convention is unchanged: a shape that is not a provider answers False,
+        which is what the old predicate's ``isinstance`` gate bought.
         """
         if ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider):
             return True
-        # circular import: providers.acp participates in a providers -> session
-        # cycle (see session.py), so keep this off the module top.
-        from kiro_crew.providers.acp import is_claude_backend
-
-        return is_claude_backend(provider)
+        return capabilities_of(provider).provider_seam == PROVIDER_CLAUDE_CODE
 
     @staticmethod
     def _provider_label_of(provider: object) -> str:
@@ -2451,11 +2501,17 @@ class SubagentManager:
                 info._cancel_retry_used = True
         task.cancel()
 
-    def _unqueue(self, agent_id: str) -> bool:
+    def _unqueue(self, agent_id: str) -> dict | None:
         return self._cancellation._unqueue_impl(agent_id)
+
+    def _report_queued_stop(self, params: dict) -> None:
+        return self._cancellation._report_queued_stop_impl(params)
 
     async def cancel(self, agent_id: str) -> bool:
         return await self._cancellation.cancel_impl(agent_id)
+
+    async def cancel_for_parent(self, parent_session_key: str) -> tuple[int, int]:
+        return await self._cancellation.cancel_for_parent_impl(parent_session_key)
 
     async def cancel_all(self) -> None:
         return await self._cancellation.cancel_all_impl()
@@ -2517,6 +2573,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     evict_completed_agents,
     extract_options,
     fire_tool_hooks,
+    identity_grant_covers_child,
     has_dashboard_surface,
     list_orphans,
     maintenance_executor,

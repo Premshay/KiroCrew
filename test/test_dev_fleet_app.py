@@ -7,6 +7,7 @@ import hmac as _hmac  # noqa: F401
 import hmac as _hmac_mod
 import json
 import os
+import shutil
 import sys
 import textwrap
 import threading
@@ -2185,6 +2186,10 @@ def test_escalation_cleanup_removes_empty_builtin_via_pinned_fd(tmp_path, monkey
 def _assert_git_neutralizers(env):
     assert env["GIT_ALLOW_PROTOCOL"] == "https:ssh"
     assert env["GIT_PROTOCOL_FROM_USER"] == "0"
+    # Not a config key and not about code execution: it pins WHICH OBJECT GRAPH
+    # git answers from, so every answer this handler acts on describes the
+    # history the checkout actually holds rather than a grafted substitute.
+    assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
     # Full config-driven-execution neutralizer set, injected as env so it
     # covers EVERY git call (background fetch, rebase, sync pull included).
     pairs = {
@@ -3278,6 +3283,9 @@ def test_git_env_neutralizers_present():
     n = mod._GIT_ENV_NEUTRALIZERS
     assert n["GIT_ALLOW_PROTOCOL"] == "https:ssh"
     assert n["GIT_PROTOCOL_FROM_USER"] == "0"
+    assert n["GIT_NO_REPLACE_OBJECTS"] == "1"
+    # GIT_NO_REPLACE_OBJECTS is an env var in its own right, NOT one of the
+    # config pairs, so the count must not have grown to cover it.
     assert n["GIT_CONFIG_COUNT"] == "4"
     assert n["GIT_CONFIG_KEY_0"] == "core.fsmonitor"
     assert n["GIT_CONFIG_VALUE_0"] == "false"
@@ -3287,6 +3295,100 @@ def test_git_env_neutralizers_present():
     assert n["GIT_CONFIG_VALUE_2"] == ""
     assert n["GIT_CONFIG_KEY_3"] == "core.sshCommand"
     assert n["GIT_CONFIG_VALUE_3"] == "ssh"
+
+
+@pytest.mark.skipif(
+    shutil.which("git") is None,
+    reason="git is required to exercise a real refs/replace graft",
+)
+def test_the_neutralizers_answer_from_the_real_object_graph(tmp_path, monkeypatch):
+    """A ``refs/replace`` graft must not change what Dev Fleet's git reads report.
+
+    Pinned by BEHAVIOUR against a real repository rather than by asserting the
+    variable is present, because the claim is about git's own semantics: a
+    ``refs/replace/<oid>`` ref substitutes one object for another in EVERY read, so
+    ``rev-list --count`` walks the substitute's parents and answers about a history
+    no checked-out commit names. Dev Fleet acts on exactly that number -- it is how
+    "behind by N commits" and the sync's own decisions are formed -- so the real
+    graph is the only one that answers the question asked.
+
+    The unpinned reading is asserted too, so this test fails if git ever stops
+    honouring the graft and the pin becomes a no-op nobody would notice.
+    """
+    import subprocess
+
+    git = shutil.which("git")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # An exported GIT_DIR/GIT_WORK_TREE is PLANTED rather than assumed absent,
+    # because it is what makes the allowlist below observable instead of a claim.
+    # This decoy stands in for the operator's real checkout: drop the filtering
+    # and every ``run()`` retargets here, so the suite mutates a repository
+    # outside tmp_path and the graft assertions answer about a history this test
+    # never built.
+    decoy = tmp_path / "decoy.git"
+    decoy.mkdir()
+    monkeypatch.setenv("GIT_DIR", str(decoy))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "decoy-work"))
+
+    # The base env is the module's OWN allowlist (`_is_safe_env_key`, what
+    # `_build_env` filters through) rather than a merge over `os.environ`,
+    # because git takes its location from the environment and those variables
+    # outrank ``-C <repo>``: an exported ``GIT_DIR``, ``GIT_WORK_TREE`` or
+    # ``GIT_INDEX_FILE`` would send the ``add``/``commit``/``replace`` below at an
+    # unrelated repository, so running the suite would mutate an operator's real
+    # index and refs. ``GIT_REPLACE_REF_BASE`` and ``GIT_NO_REPLACE_OBJECTS``
+    # would also decide the graft assertions before they were made. An allowlist
+    # removes the whole class in one place, including any variable git adds later.
+    #
+    # Global and system config are excluded for the mirror-image reason: a
+    # ``commit.gpgsign`` or ``core.hooksPath`` in the operator's ``~/.gitconfig``
+    # would fail these fixture commits on their machine and nowhere else.
+    # Repository-local config still applies, which is what the identity below is
+    # set through.
+    base_env = {k: v for k, v in os.environ.items() if mod._is_safe_env_key(k)}
+    base_env["GIT_CONFIG_GLOBAL"] = os.devnull
+    base_env["GIT_CONFIG_SYSTEM"] = os.devnull
+
+    def run(*args, env=None):
+        proc = subprocess.run(
+            [git, "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            env={**base_env, **(env or {})},
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout.strip()
+
+    run("init", "-q")
+    run("config", "user.email", "t@example.invalid")
+    run("config", "user.name", "T")
+    oids = []
+    for i in range(3):
+        (repo / "f.txt").write_text(f"{i}\n", encoding="utf-8")
+        run("add", "f.txt")
+        run("commit", "-q", "-m", f"c{i}")
+        oids.append(run("rev-parse", "HEAD"))
+
+    # Three commits, so HEAD's history is three deep.
+    assert run("rev-list", "--count", "HEAD") == "3"
+    # Graft HEAD onto the root, which shortens the history git reports.
+    run("replace", "--graft", oids[2], oids[0])
+
+    # Ungrafted the reading is the truth; grafted it is not. Both are asserted so
+    # neither half of the pin can rot silently.
+    assert run("rev-list", "--count", "HEAD") == "2"
+    assert (
+        run("rev-list", "--count", "HEAD", env={"GIT_NO_REPLACE_OBJECTS": "1"}) == "3"
+    )
+    assert run("rev-list", "--count", "HEAD", env=mod._GIT_ENV_NEUTRALIZERS) == "3"
+
+    # Nothing reached the decoy, so the allowlist rather than luck is what kept
+    # every mutation above inside tmp_path.
+    assert list(decoy.iterdir()) == [], "an inherited GIT_DIR retargeted the fixture"
 
 
 # =============================================================================
@@ -5970,6 +6072,7 @@ async def test_sync_pip_uses_target_repo_venv(monkeypatch, tmp_path):
 
     async def fake_start_run(label, cmd, **kw):
         captured["cmd"] = cmd
+        captured["start_run_kw"] = kw
         return "rid-1"
 
     monkeypatch.setattr(runtime_mod, "_start_run", fake_start_run)
@@ -5979,6 +6082,9 @@ async def test_sync_pip_uses_target_repo_venv(monkeypatch, tmp_path):
     assert pip_argvs, captured.get("argvs")
     assert pip_argvs[0][0] == str(repo / ".venv" / "bin" / "python")
     assert pip_argvs[0][0] != _sys.executable
+    # A dependency sync writes into the measured repo (.venv, node_modules),
+    # so the run must carry the disk-cache invalidation hook (#8787).
+    assert captured["start_run_kw"].get("on_finish") is fleet_state_mod._disk_invalidate
 
 
 @pytest.mark.asyncio
@@ -6363,6 +6469,30 @@ async def test_fleet_pod_health_is_identity_gated_not_a_bare_port_probe():
     # as unhealthy rather than as an open pod.
     assert row["health"] == runtime_mod.rt.HEALTH_FOREIGN
     assert row["health"] < 200
+
+
+@pytest.mark.asyncio
+async def test_fleet_enumerates_active_pods_once_for_all_worktrees():
+    """Fleet polling must not run one full service-manager query per row."""
+    active_names = MagicMock(return_value=set())
+    fake_cfg = SimpleNamespace()
+    worktrees = [
+        {"path": "/repo", "branch": "main", "is_main": True},
+        *[
+            {"path": f"/repo-wt-{idx}", "branch": f"feat/{idx}", "is_main": False}
+            for idx in range(4)
+        ],
+    ]
+    with patch.object(runtime_mod.rt, "active_names", active_names):
+        fleet = await _fleet_with(
+            worktrees,
+            _POD_AVAILABLE=True,
+            _POD_IMPORTED=True,
+            _load_cfg=lambda: fake_cfg,
+        )
+
+    active_names.assert_called_once_with(fake_cfg)
+    assert all(not row["running"] for row in fleet["worktrees"])
 
 
 @pytest.mark.asyncio
@@ -7823,7 +7953,15 @@ async def test_sync_builds_and_stages_under_one_lock_holder(monkeypatch, tmp_pat
     # whole Pull+Build. The repo to build is passed as an argument instead.
     assert argvs[stage_i][0] == sys.executable
     assert str(repo) in argvs[stage_i], "the target repo must be passed explicitly"
-    assert argvs[stage_i][-1].endswith("npm"), "the trusted npm path is passed through"
+    # The build+stage child reads its args positionally: sys.argv[1]=repo,
+    # sys.argv[2]=npm, sys.argv[3]=git. Both binaries are the trusted _trusted_bin
+    # paths (stubbed here to /usr/bin/<name>), passed through explicitly rather
+    # than re-resolved in the child. The git path is a later addition (the
+    # read-only build-source fingerprint, #7132), so npm is now the
+    # second-to-last arg and git the last -- assert each trusted path reaches the
+    # spawn at the position its child consumes, not merely that one is last.
+    assert argvs[stage_i][4].endswith("npm"), "the trusted npm path is passed through (argv[2])"
+    assert argvs[stage_i][5].endswith("git"), "the trusted git path is passed through (argv[3])"
     assert not any(
         a[1:] == ["run", "build", "--prefix", "website"] for a in argvs
     ), "a separate unlocked npm build step would reintroduce the race"
@@ -8344,6 +8482,99 @@ async def test_removal_audit_log_emitted(caplog):
     assert "caller=handler" in msg
     assert "action=removed" in msg
     assert "pr_state=MERGED" in msg
+
+
+@pytest.mark.asyncio
+async def test_removal_invalidates_disk_cache():
+    """Successful removal drops the disk cache's freshness stamp (#8787).
+
+    The chokepoint that every removal path routes through (single-worktree
+    handler, prune workers, auto-prune reaper) must invalidate the /disk TTL
+    cache alongside evicting the fleet row, so the next poll re-aggregates
+    instead of serving pre-removal totals for the rest of the TTL.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            repository_mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(live_mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(live_mod, "_own_checkout_path", return_value=None),
+        patch.object(repository_mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            fleet_state_mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(repository_mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(repository_mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(fleet_state_mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(fleet_state_mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(runtime_mod, "_load_cfg", return_value=None),
+        patch.object(runtime_mod, "_POD_AVAILABLE", False),
+        patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")),
+        patch.object(repository_mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        patch.object(fleet_state_mod, "_disk_invalidate") as invalidate,
+    ):
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    invalidate.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_start_run_invokes_on_finish_at_terminal_state():
+    """_start_run's on_finish fires once when the run finishes (#8787)."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    calls: list[int] = []
+    rid = await mod._start_run("finish-test", ["true"], on_finish=lambda: calls.append(1))
+    for _ in range(50):
+        async with mod._RUNS_LOCK:
+            if mod._RUNS[rid]["status"] != "running":
+                break
+        await asyncio.sleep(0.05)
+    # The callback runs in the worker's finally, after the status stamp.
+    for _ in range(50):
+        if calls:
+            break
+        await asyncio.sleep(0.05)
+    assert calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_pod_provision_registers_disk_invalidation(monkeypatch):
+    """Provisioning builds .venv/dist inside the measured worktree, so the
+    provision run must carry the disk-cache invalidation hook (#8787)."""
+    import kiro_crew.apps.builtins.dev_fleet.worktree_ops as wt_ops
+
+    captured: dict = {}
+
+    async def fake_start_run(label, cmd, **kw):
+        captured.update(kw, label=label)
+        return "rid-1"
+
+    monkeypatch.setattr(wt_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(fleet_state_mod, "_PROVISION_INFLIGHT", {})
+    monkeypatch.setattr(runtime_mod, "_warm_build_path", AsyncMock())
+    monkeypatch.setattr(runtime_mod, "_start_run", fake_start_run)
+    monkeypatch.setattr(runtime_mod, "_find_cli", lambda: ["kirocrew"])
+    monkeypatch.setattr(repository_mod, "_repo", lambda: "/fake/repo")
+    monkeypatch.setattr(wt_ops, "_pod_env", lambda: {})
+    monkeypatch.setattr(
+        wt_ops,
+        "shielded_prepare_off_loop",
+        AsyncMock(return_value=(["kirocrew", "pod", "provision", "feat-x"], {}, None)),
+    )
+
+    result = await wt_ops._pod_provision("feat-x")
+    assert result == {"ok": True, "run_id": "rid-1"}
+    assert captured.get("on_finish") is fleet_state_mod._disk_invalidate
 
 
 @pytest.mark.asyncio
@@ -9722,10 +9953,23 @@ async def test_only_the_preflight_step_may_assert_a_diagnosis(monkeypatch):
     assert passed == ",".join(str(c) for c in reserved), passed
     assert "--preflight-label" in cmd
     assert cmd[cmd.index("--preflight-label") + 1] == mod._PREFLIGHT_LABEL
-    # Every code the gateway will explain must be in the guarded set, or a code
-    # it explains could still arrive forged.
+    # Every code the gateway EXPLAINS must be in the guarded set, or a diagnosis
+    # it explains could arrive forged. The converse does not hold:
+    # EXIT_FRONTEND_SKIP is guarded so an untrusted step cannot forge it, but it
+    # is a SUCCESS verdict, not a diagnosis, so it carries no explanation.
     for code in reserved:
+        if code == npm_preflight.EXIT_FRONTEND_SKIP:
+            assert not npm_preflight.explain_exit(code), "the skip verdict is not a diagnosis"
+            continue
         assert npm_preflight.explain_exit(code), code
+    # The frontend-skip verdict must be guarded (reserved) so a worktree-run step
+    # cannot forge it to suppress the build, and the gateway must tell the runner
+    # its value and which labels it suppresses.
+    assert npm_preflight.EXIT_FRONTEND_SKIP in npm_preflight.RESERVED_EXIT_CODES
+    assert "--exit-frontend-skip" in cmd
+    assert cmd[cmd.index("--exit-frontend-skip") + 1] == str(npm_preflight.EXIT_FRONTEND_SKIP)
+    assert "--frontend-labels" in cmd
+    assert cmd[cmd.index("--frontend-labels") + 1] == "npm ci,npm build + stage"
 
 
 def test_the_trusted_label_matches_the_step_that_carries_it():

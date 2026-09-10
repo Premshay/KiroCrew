@@ -3,10 +3,10 @@
 A *harness* is the agent process Kiro Crew drives over ACP. Kiro Crew has one
 first-class harness — `kiro-cli` (`ACP_BACKEND_KIRO`, spelled `""`) — and a
 growing set of adapted ones: Claude Code (`ACP_BACKEND_CLAUDE`), `KAS`
-(`ACP_BACKEND_KAS`), the dormant `ACP_BACKEND_CODEX` seam, and whatever a
+(`ACP_BACKEND_KAS`), Codex (`ACP_BACKEND_CODEX`), and whatever a
 bring-your-own (BYO) adapter registers next.
 
-Kiro, Claude Code and KAS are selectable on a plain public build; Claude Code in
+Kiro, Claude Code, KAS and Codex are selectable on a plain public build; Claude Code in
 particular is a shipped harness and not a dormant seam: `acp/client.py` owns the
 whole Claude spawn path and the adapter is a public npm package, so an earlier
 revision that left it out of the baseline removed only the switch, never a
@@ -19,15 +19,15 @@ core can spell is an id an operator can choose unless something states the
 exception — pinned by
 `test_agent_backend_editable.py::test_baseline_ships_every_known_backend`, which
 guards against an undocumented NARROWING rather than a widening.
-`ACP_BACKEND_CODEX` is the one exception and it is named in that test: the spawn
-path is complete, but `backend_install.py` has no probe for the adapter, so a
-build offering the switch could not tell an operator what was missing when the
-session failed to start. It becomes selectable through
-`register_selectable_backend`, or through the baseline once that probe lands.
+There is no exception today: `NOT_SHIPPED_SELECTABLE` is empty, which is the
+healthy state. `ACP_BACKEND_CODEX` was the last member and left it once both
+halves landed — `backend_install.py` gained its probe, so the install row names
+the missing component and its command instead of reading `unknown`, and
+`acp_tool_gate` established that its tool calls reach the PreToolUse gate.
 
-Read the invariants below against that tree: three harnesses can serve a real
-session today, so a site that spells "kiro" by exclusion is already wrong on two
-of them.
+Read the invariants below against that tree: four harnesses can serve a real
+session today, so a site that spells "kiro" by exclusion is already wrong on
+three of them.
 
 *Parity* here does not mean equal treatment. It means the opposite, stated
 precisely: **an added harness may only adapt itself to the seams the Kiro
@@ -81,16 +81,16 @@ and Kiro stops being the guaranteed path.
 The whole group is one rule with several faces: **no call site may express
 "this is the Kiro harness" as the absence of another harness.** A negative test
 is correct only while one harness can start, and it fails *open* — the other
-harness is treated as Kiro. Three are selectable today, so `not
+harness is treated as Kiro. Four are selectable today, so `not
 is_claude_backend` is not a rule waiting on a future harness to break it: it
 already reads TRUE for KAS on a plain public build.
 
 | Id | Guarantees | Pinned by | Constrains |
 |---|---|---|---|
 | H5 | Harness identity is a positive comparison against a named constant, or membership in a named set. `not is_claude_backend`, `!= ACP_BACKEND_KAS`, and `== "kas"` (bare literal) are all forbidden; `is_kiro_backend` and `backend in ACP_BACKENDS_<CAP>` are the forms. Enforced on the lines a change ADDS, not whole-tree — see the gate doc for why. | `scripts/check_harness_parity.py` (six rules, self-tested), `test_harness_parity.py::test_added_line_gate_self_test_passes`, `::test_added_line_gate_flags_a_planted_negative_test` | every module reading `AcpClient.backend` / `AcpProvider.is_*_backend` |
-| H6 | A capability is granted by opt-in membership, never by negation. `is_session_sharing_eligible` reads `ACP_BACKENDS_SESSION_SHARING`; steering reads `ACP_BACKENDS_STEER`, with advertised members confirmed from their initialize handshake and their own `AcpClient.steer` wire format. Each tuning channel has its own set: `ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION` (model switch), `ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION` (effort push), and `ACP_BACKENDS_KIRO_SLASH_COMMANDS` (the `_kiro.dev/commands/execute` path and workspace `cli.json` overlays). A harness outside a set must not inherit a request it answers with `-32601`, or an overlay it does not read. `ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD` is the equivalent opt-in skip: only a backend that reconciles its own agent file, at the version reported by its initialize handshake, may keep a running session after MCP configuration changes. | `test_harness_parity.py::test_session_sharing_is_opt_in`, `::test_steer_is_opt_in`, `::test_every_steer_member_has_a_wire_format`, `::test_advertised_steer_backends_are_steer_members`, `::test_model_switch_channel_is_opt_in`, `::test_effort_channel_is_opt_in`, `::test_only_overlay_readers_are_written_to`, `::test_mcp_config_hot_reload_is_opt_in` | `providers/acp.py` (`AcpProvider.is_session_sharing_eligible`, `change_effort`, `clear_effort`, `_apply_effort_overlay`, `_apply_tool_search_overlay`, `stream_command`), `acp/client.py` (`AcpClient.supports_steer`, `AcpClient.steer`), `acp_backends.py`, `mcp_hot_reload.py` (`mcp_hot_reload_supported`) |
+| H6 | A capability is granted by opt-in membership, never by negation. `is_session_sharing_eligible` reads `ACP_BACKENDS_SESSION_SHARING` and `supports_steer` reads `ACP_BACKENDS_STEER` — with advertised members confirmed from their `initialize` handshake and their own `AcpClient.steer` wire format — so a harness that has not demonstrated the capability does not inherit it from a set it was never added to. Every *tuning channel* follows the same rule, one set per channel because a harness can implement one and not another: `ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION` (model switch), `ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION` (effort push), and `ACP_BACKENDS_KIRO_SLASH_COMMANDS` — membership in the last also decides who is sent `_kiro.dev/commands/execute` and who gets the workspace `cli.json` overlay written for them. A harness in none of these must not inherit a channel that answers `-32601`, nor collect an overlay it never reads and the membership-gated clear can never remove. `ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD` follows the same rule for a *skip*: membership is what lets the dashboard's MCP sync leave running sessions alone after a config write, because the harness reconciles the agent file itself (kiro-cli, from the release its reconcile was verified on; `mcp_hot_reload.py` holds every live process to that floor, read from its own `initialize` handshake). A harness that never demonstrated the reconcile would otherwise have its users' freshly installed servers stay unmounted with nothing red to say why. `ACP_BACKENDS_POD_HOME_REMAP` is a further instance and the clearest illustration of why one set per capability matters: it decides whose pod-spawned child has its ambient `HOME` relocated so the harness's `$HOME`-derived OAuth grant store stays pod-scoped (`acp.client._apply_pod_home_remap`). Its membership is identical to `ACP_BACKENDS_INTERNAL_SANDBOX` today, and reusing that set would still be wrong — "carries its own OS sandbox" and "relocating `HOME` moves its credential store" are different properties, so a harness added there for sandbox reasons would silently inherit credential relocation it never opted into. | `test_harness_parity.py::test_session_sharing_is_opt_in`, `::test_steer_is_opt_in`, `::test_every_steer_member_has_a_wire_format`, `::test_advertised_steer_backends_are_steer_members`, `::test_model_switch_channel_is_opt_in`, `::test_effort_channel_is_opt_in`, `::test_only_overlay_readers_are_written_to`, `::test_mcp_config_hot_reload_is_opt_in`, `test_acp_pod_home_remap.py::TestTheCapabilitySetIsItsOwnDecision` | `providers/acp.py` (`AcpProvider.is_session_sharing_eligible`, `change_effort`, `clear_effort`, `_apply_effort_overlay`, `_apply_tool_search_overlay`, `stream_command`), `acp/client.py` (`AcpClient.supports_steer`, `AcpClient.steer`, `_apply_pod_home_remap`), `acp_backends.py`, `mcp_hot_reload.py` (`mcp_hot_reload_supported`) |
 | H7 | `is_kiro_cli` is a positive Kiro test at every call site. It drives internal-sandbox delegation: macOS skips Kiro Crew's seatbelt because Kiro's sandbox cannot nest inside it, and Windows permits the official Kiro backend to run despite having no Kiro Crew OS wrapper. Passed for a harness with no internal sandbox, it hands isolation to a layer that never starts; this is the only Group B row that is also a security invariant. **Windows requires `is_kiro_cli is True` exactly** — `None` and `_spawns_kiro_cli` basename inference can never grant the backend-less-host exception. On macOS a site may grant membership explicitly or pass `None` to defer to the positive basename test. | `test_harness_parity.py::test_is_kiro_cli_is_positive`, `test_sandbox_argv.py::TestKiroInternalSandboxExclusion` | `acp/runtime.py` (`AcpRuntime.spawn`), `acp/client.py` (`AcpClient.ensure_ready`), `sandbox.py` (`wrap_argv`, `_spawns_kiro_cli`) |
-| H8 | New harness identifiers live in `acp_backends.py` — a LEAF module, so every consumer can name the constants rather than copy them — and are added to `ACP_BACKENDS_KNOWN`; every capability set is a subset of it; and `AcpProvider.__init__` rejects anything outside it. `ACP_BACKEND_KIRO` is the empty string, so a value that falls through every identity check spawns `kiro-cli` under a foreign label. `acp/types.py` re-exports the vocabulary and remains the import site for existing callers. | `test_harness_parity.py::test_capability_sets_are_subsets_of_known_backends`, `::test_unknown_backend_rejected_at_construction`, `::test_codex_is_known_but_not_shipped_selectable` | `acp_backends.py` (`ACP_BACKENDS_KNOWN`), `providers/acp.py` (`AcpProvider.__init__`), `scripts/check_harness_parity.py` (`VOCABULARY_PATH`) |
+| H8 | New harness identifiers live in `agent_sdk/backends.py` — a LEAF module behind the agent-SDK boundary, so every consumer can name the constants rather than copy them — and are added to `ACP_BACKENDS_KNOWN`; every capability set is a subset of it; and `AcpProvider.__init__` rejects anything outside it. `ACP_BACKEND_KIRO` is the empty string, so a value that falls through every identity check spawns `kiro-cli` under a foreign label. `acp/types.py` and the `acp_backends` shim both re-export the vocabulary and remain import sites for existing callers. | `test_harness_parity.py::test_capability_sets_are_subsets_of_known_backends`, `::test_unknown_backend_rejected_at_construction`, `::test_codex_is_selectable_and_answerable` | `agent_sdk/backends.py` (`ACP_BACKENDS_KNOWN`), `providers/acp.py` (`AcpProvider.__init__`), `scripts/check_harness_parity.py` (`VOCABULARY_PATH`) |
 
 ## Group C: the Kiro path keeps its own machinery
 
@@ -145,6 +145,6 @@ source of truth for what blocks.
    the id is named in that test's `NOT_SHIPPED_SELECTABLE` allowlist together
    with the reason it cannot be offered yet: the id becomes spellable but
    unreachable, and that state needs a stated reason rather than a default.
-   `ACP_BACKEND_CODEX` is the only member today. The full sequence a new
+   The allowlist is empty today. The full sequence a new
    harness walks, and which stage decides whether it lands dormant or
    selectable, is [harness-onboarding.md](harness-onboarding.md).

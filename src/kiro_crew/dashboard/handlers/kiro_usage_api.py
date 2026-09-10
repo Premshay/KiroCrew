@@ -14,10 +14,10 @@ Whose credits are these?
 ------------------------
 Several credentials can be readable at once (an IDE cache, a kiro-cli store, a
 leftover file from a profile the user has since signed out of), and "unexpired"
-does not mean "the one kiro-cli is actually using": a token for the previous
-profile stays valid at the API until it expires on its own. Picking by fixed
-path order therefore showed the OLD profile's credits after a profile switch,
-and a gateway restart did not help because the order was the same on boot.
+does not mean "the one kiro-cli is actually using": a token for a signed-out
+profile stays valid at the API until it expires on its own. Picking by fixed path
+order therefore reports that profile's credits after a profile switch, and a
+gateway restart does not help because the order is the same on boot.
 
 So the caller passes ``expected_arn`` — the profile ARN ``kiro-cli whoami``
 reports for itself — and a candidate is only used when its own
@@ -710,6 +710,27 @@ def _map_response(data: dict) -> dict | None:
                 break
     if not credit:
         return None
+
+    # Ambiguity probe (observation only — selection above is unchanged). The
+    # plan-pool picker takes the FIRST entry that is exactly resourceType
+    # "CREDIT", so a second CREDIT-typed pool (e.g. a promotional/welcome grant
+    # typed literally "CREDIT" rather than a bonus marker) can win the plan slot
+    # by list order and displace the real plan pool — a latent, unobserved case
+    # with no captured payload. When more than one entry satisfies the plan-pool
+    # test we record the SHAPE so a maintainer can choose a remedy (fail-closed
+    # vs deterministic pick) against real evidence. Log resource types and
+    # counts only, never balances or identifiers (billing-adjacent). Additive:
+    # nothing about which pool wins changes.
+    _credit_typed = [b for b in breakdowns if b.get("resourceType") == "CREDIT"]
+    if len(_credit_typed) > 1:
+        logger.warning(
+            "Kiro usage API: %d CREDIT-typed pools in usageBreakdownList "
+            "(resource types %s); plan pool selected by list order at index %d "
+            "— a second CREDIT-typed pool may be displacing the real plan pool",
+            len(_credit_typed),
+            [str(b.get("resourceType")) for b in breakdowns],
+            breakdowns.index(credit),
+        )
 
     # Prefer the *-WithPrecision fields only when they are valid numbers; a
     # present-but-null/malformed precision value must fall back to the legacy

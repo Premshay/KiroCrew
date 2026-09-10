@@ -28,6 +28,7 @@ from aiohttp import web
 
 import kiro_crew.config.loader as loader
 import kiro_crew.dashboard.handlers.messaging as mod
+from conftest import forget_env_at_teardown
 from kiro_crew.subagent import AGENT_NOT_FOUND_CODE
 
 
@@ -49,7 +50,10 @@ class _Req:
         self.match_info = match_info or {}
         self.query = query or {}
         self.remote = remote
-        self._extra = extra or {}
+        self._extra = {"app": "", **(extra or {})}
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._extra
 
     async def json(self) -> Any:
         if isinstance(self._body, BaseException):
@@ -782,6 +786,69 @@ class TestApiSpawnClear:
         resp = _run(mod.api_spawn_clear, _Req(_state(subagents=mgr)))
         assert _payload(resp) == {"ok": True, "cleared": 1}
         assert list(mgr._agents) == ["run"]
+
+
+class TestApiSpawnStopAll:
+    def test_requires_manager(self) -> None:
+        resp = _run(mod.api_spawn_stop_all, _Req(_state(), {"slot": "chat-1"}))
+        assert resp.status == 503
+        assert _payload(resp)["code"] == "subagents_unavailable"
+
+    @pytest.mark.parametrize("body", [_BAD_JSON, None, {}, {"slot": ""}, {"slot": "../other"}])
+    def test_rejects_invalid_slot_input(self, body: Any) -> None:
+        resp = _run(mod.api_spawn_stop_all, _Req(_state(subagents=_mgr()), body))
+        assert resp.status == 400
+
+    def test_requires_an_existing_slot(self) -> None:
+        state = _state(subagents=_mgr())
+        state.get_slot.return_value = None
+        resp = _run(mod.api_spawn_stop_all, _Req(state, {"slot": "missing"}))
+        assert resp.status == 404
+        assert _payload(resp)["code"] == "slot_not_found"
+
+    def test_resolves_server_owned_session_and_stops_running_and_queue(self) -> None:
+        mgr = _mgr(cancel_for_parent=AsyncMock(return_value=(2, 3)))
+        state = _state(subagents=mgr)
+        state.get_slot.return_value = SimpleNamespace(
+            key="chat-1", linked_session_key="slack:123.456"
+        )
+        resp = _run(mod.api_spawn_stop_all, _Req(state, {"slot": "chat-1"}))
+        assert _payload(resp) == {
+            "ok": True,
+            "stopped": 5,
+            "running": 2,
+            "queued": 3,
+        }
+        mgr.cancel_for_parent.assert_awaited_once_with("slack:123.456")
+
+    @pytest.mark.parametrize("slot_app", ["", "caller-app", "other-app"])
+    def test_app_token_cannot_stop_any_slot(self, slot_app: str) -> None:
+        mgr = _mgr(cancel_for_parent=AsyncMock(return_value=(1, 1)))
+        state = _state(subagents=mgr)
+        state.get_slot.return_value = SimpleNamespace(
+            key="chat-1", linked_session_key="foreign:session", _app=slot_app
+        )
+        req = _Req(state, {"slot": "chat-1"}, extra={"app": "caller-app"})
+
+        resp = _run(mod.api_spawn_stop_all, req)
+
+        assert resp.status == 403
+        assert _payload(resp)["code"] == "app_token_forbidden"
+        state.get_slot.assert_not_called()
+        mgr.cancel_for_parent.assert_not_awaited()
+
+    def test_missing_app_claim_is_denied_before_slot_resolution(self) -> None:
+        mgr = _mgr(cancel_for_parent=AsyncMock(return_value=(1, 1)))
+        state = _state(subagents=mgr)
+        req = _Req(state, {"slot": "chat-1"})
+        req._extra.pop("app")
+
+        resp = _run(mod.api_spawn_stop_all, req)
+
+        assert resp.status == 403
+        assert _payload(resp)["code"] == "app_token_forbidden"
+        state.get_slot.assert_not_called()
+        mgr.cancel_for_parent.assert_not_awaited()
 
 
 # ── notifications ──
@@ -1708,7 +1775,14 @@ class TestConfigGetHandlers:
     def test_slack_config_get_masks_the_tokens(self, monkeypatch, tmp_path: Path) -> None:
         monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
         monkeypatch.delenv("SLACK_APP_TOKEN", raising=False)
-        monkeypatch.delenv("OWNER_ID", raising=False)
+        # load_credentials() propagates .env values into os.environ via
+        # setdefault() so spawned children inherit them (real, deliberate
+        # behavior). A bare monkeypatch.delenv(raising=False) is NOT enough here:
+        # when the variable is absent pytest records no undo, so the OWNER_ID this
+        # load writes survived the test and reached later ones on the worker
+        # (observed in a full run). The helper records the pre-test state --
+        # present or absent -- as the undo, so teardown restores exactly that.
+        forget_env_at_teardown(monkeypatch, "OWNER_ID")
         self._isolate(
             monkeypatch,
             tmp_path,

@@ -67,6 +67,10 @@ from kiro_crew.cloud import ssm as cloud_ssm
 # hardcoded port, no wildcard). See server._extra_frame_ancestors.
 from kiro_crew.config.loader import DASHBOARD_PORT as _LOCAL_DASHBOARD_PORT
 from kiro_crew.deploy.engine import aws_spawn_env
+from kiro_crew.instances.constants import CAPABILITY_REPLY_MAX_BYTES as _CAPABILITY_REPLY_MAX_BYTES
+from kiro_crew.instances.constants import (
+    DEFAULT_CAPABILITY_PROXY_TIMEOUT_SECS as _CAPABILITY_PROXY_TIMEOUT,
+)
 from kiro_crew.instances.constants import (
     DEFAULT_CONNECT_TIMEOUT_SECS as _DEFAULT_CONNECT_TIMEOUT_SECS,
 )
@@ -137,6 +141,25 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 _LOOPBACK = "127.0.0.1"
+
+#: The closed set of peer endpoints :meth:`SshTunnelManager.peer_capability` may
+#: read. Every one is a GET that reports what the peer gateway CAN do — its
+#: version, its agent roster, its model list, its effort levels, its workspaces —
+#: and none of them mutates anything. Keeping the set here (rather than letting
+#: the caller name a path) is what makes the method a carrier instead of a second
+#: proxy: a tainted string cannot reach a peer route that was never listed, and
+#: the ``api/agents`` mutating verbs stay unreachable even though the roster read
+#: lives under the same prefix. Adding a row is a security decision — it grants
+#: the local gateway a new read against every connected peer.
+_PEER_CAPABILITY_PATHS: frozenset[str] = frozenset(
+    {
+        "/api/version",
+        "/api/agents",
+        "/api/models",
+        "/api/effort-levels",
+        "/api/workspaces",
+    }
+)
 # Poll cadence while waiting for the forward to come up.
 _READY_POLL_INTERVAL_SECS = 0.25
 # Bound on retained stderr so a chatty/looping ssh can't grow memory unbounded.
@@ -1380,7 +1403,9 @@ class SshTunnelManager:
             timeout_secs=self._mint_timeout_for(params.method),
         )
 
-    async def connect(self, instance_id: str) -> TunnelStatus:
+    async def connect(
+        self, instance_id: str, *, rebuild: bool = False, only_if_connected: bool = False
+    ) -> TunnelStatus:
         """Open a tunnel + mint a token for *instance_id*; return its status.
 
         Idempotent: connecting an already-connected instance returns its current
@@ -1388,13 +1413,96 @@ class SshTunnelManager:
         validation / mint / spawn error via the returned status (state ERROR).
         Works for either ``connection_method`` — the transport is resolved by
         :meth:`_resolve_transport`.
+
+        ``rebuild=True`` breaks the idempotence on purpose: a CONNECTED tunnel is
+        torn down first (``keep_intent`` — the user is asking for the crew, not
+        turning it off) and a fresh forwarder is spawned on a DIFFERENT local
+        port: the port just freed is excluded from the allocation, so both a
+        stalled stream on the old forwarder and a cause bound to the old port
+        itself are escaped by one Retry. This is the pane's Retry after a load watchdog
+        fired on a document that DID navigate: the transport is up by every
+        probe the manager runs (``/api/health`` answers, the credential
+        validates), yet one stream inside it stalled and the pane's module
+        graph will wait on it forever. Nothing short of a new TCP path clears
+        that, and the plain connect — which sees CONNECTED and returns — would
+        hand the same stalled tunnel back.
+
+        A teardown that fails (the stop raises) is reported as an ERROR status,
+        the same way every other connect failure is: the live tunnel is left
+        exactly as :meth:`_teardown_locked` leaves it (intact — nothing is
+        removed unless the stop succeeded), the reason is retained for
+        :meth:`last_error`, and the caller gets a 502 with a message instead of
+        a propagated exception turned into an unexplained 500.
+
+        ``only_if_connected=True`` is the opposite restriction: answer a
+        CONNECTED tunnel exactly like the plain connect (its status, its cached
+        token) but, when the tunnel is not up, spawn nothing and touch nothing
+        -- return a DISCONNECTED status and leave ``was_connected`` as the user
+        last set it. This is the viewport's auto-warm, whose job is to pre-mount
+        panes for tunnels that are ALREADY up, never to bring one up. The check
+        runs under the manager lock, the same lock :meth:`disconnect` holds
+        while it stops a tunnel, so an auto-warm racing a disconnect either sees
+        the tunnel still CONNECTED (and warms a pane the disconnect's
+        ``removeWarm`` then drops) or sees it gone and stands down; it can never
+        re-open a tunnel the user just closed, which a probe-then-connect from
+        the browser could.
         """
+        if rebuild and only_if_connected:
+            raise ValueError("rebuild and only_if_connected are mutually exclusive")
         async with self._lock:
             inst = await asyncio.to_thread(self._registry.get, instance_id)
             if inst is None:
                 raise KeyError(f"no instance with id {instance_id!r}")
 
             existing = self._tunnels.get(instance_id)
+            # The port a rebuild tears down. Kept out of the allocation below so
+            # the new forwarder lands on a DIFFERENT local port: the field
+            # evidence has every stall on the first allocated port, so a cause
+            # bound to the port itself (a stale listener, a local firewall or
+            # proxy rule) is a live hypothesis alongside the stalled stream. A
+            # first-free allocator would hand the just-freed port straight back
+            # and Retry could loop on it forever with no in-product escape.
+            rebuild_freed_port: int | None = None
+            if only_if_connected and (
+                existing is None or existing.status.state != TunnelState.CONNECTED
+            ):
+                logger.info(
+                    "Connected-only connect for %s declined: tunnel is %s",
+                    instance_id,
+                    existing.status.state.value if existing is not None else "absent",
+                )
+                return TunnelStatus(
+                    instance_id=inst.id,
+                    state=TunnelState.DISCONNECTED,
+                    local_port=inst.local_port,
+                    remote_port=inst.remote_port,
+                )
+            if rebuild and existing is not None:
+                logger.info(
+                    "Rebuilding tunnel for %s on request (was %s on 127.0.0.1:%s)",
+                    instance_id,
+                    existing.status.state.value,
+                    existing.status.local_port,
+                )
+                try:
+                    await self._teardown_locked(instance_id, keep_intent=True)
+                except Exception as e:  # noqa: BLE001 - reported, not swallowed
+                    logger.warning(
+                        "Rebuild of %s could not stop the old tunnel: %s", instance_id, e
+                    )
+                    return self._error_status(
+                        inst,
+                        f"could not stop the existing tunnel to rebuild it: {e}. "
+                        f"Disconnect and connect again, or retry.",
+                    )
+                if existing.status.local_port:
+                    rebuild_freed_port = existing.status.local_port
+                existing = None
+                # The registry row was just rewritten (local_port reset); re-read
+                # so the allocation below skips nothing stale and records fresh.
+                inst = await asyncio.to_thread(self._registry.get, instance_id)
+                if inst is None:
+                    raise KeyError(f"no instance with id {instance_id!r}")
             if existing is not None and existing.status.state == TunnelState.CONNECTED:
                 return existing.status
             if existing is not None:
@@ -1496,6 +1604,8 @@ class SshTunnelManager:
             # stall unrelated requests and heartbeats. This matches how the rest
             # of the module already reaches the registry (``asyncio.to_thread``).
             reserved = await asyncio.to_thread(self._reserved_ports)
+            if rebuild_freed_port is not None:
+                reserved = set(reserved) | {rebuild_freed_port}
             try:
                 local_port = await asyncio.to_thread(self._allocator.allocate, exclude=reserved)
             except RuntimeError as e:
@@ -2424,6 +2534,141 @@ class SshTunnelManager:
             "error": "peer rejected the credential",
             "code": "transfer_unauthorized",
         }
+
+    async def peer_capability(self, instance_id: str, path: str) -> tuple[bool, Any]:
+        """GET one of a connected peer's read-only capability endpoints.
+
+        This is deliberately a NARROW CARRIER, not a general proxy. The generic
+        ``/api/instances/{id}/proxy/*`` route forwards a caller-supplied path and
+        is therefore fenced to the ``api/chat`` / ``api/stream`` prefixes; the
+        five paths a local session needs in order to render a peer-bound header
+        (version, agent roster, model list, effort levels, workspaces) sit
+        outside those prefixes. Widening the prefix list would have granted the
+        whole ``api/agents`` surface — including its mutating ``PUT`` — so the
+        capability read gets its own carrier whose target is chosen from a fixed
+        set here rather than by the caller.
+
+        Returns ``(ok, payload)``. On success *payload* is the peer's decoded
+        JSON, which may be a dict (version, workspaces) or a list (agents,
+        models, effort levels) — both shapes are real and returned as-is. On
+        failure *payload* is ``{"error", "code"}`` so a caller can tell a stale
+        credential from a peer too old to answer.
+        """
+        if path not in _PEER_CAPABILITY_PATHS:
+            # A programming error, not a runtime condition: the path set is
+            # closed and every caller passes a literal from it.
+            raise ValueError(f"not a peer capability path: {path!r}")
+        try:
+            url, cookie_name = self._peer_target(instance_id, path)
+        except _PeerUnavailable as e:
+            return False, {
+                "error": e.message,
+                "code": (
+                    "capability_peer_not_connected"
+                    if e.kind == "not_connected"
+                    else "capability_no_credential"
+                ),
+            }
+        timeout = aiohttp.ClientTimeout(total=_CAPABILITY_PROXY_TIMEOUT)
+        reminted = False
+        for _attempt in range(2):
+            try:
+                headers = self._peer_cookie_header(instance_id, cookie_name)
+            except _PeerUnavailable as e:
+                return False, {"error": e.message, "code": "capability_no_credential"}
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        # Same SSRF reasoning as the search carrier: the tunnel
+                        # endpoint is the only legitimate target, so a peer
+                        # answering 30x must not redirect the hub anywhere.
+                        allow_redirects=False,
+                    ) as resp:
+                        if resp.status in (401, 403):
+                            if not reminted and await self.refresh_token(instance_id):
+                                reminted = True
+                                continue  # retry once with the fresh credential
+                            return False, {
+                                "error": "peer rejected the credential",
+                                "code": "capability_unauthorized",
+                            }
+                        if resp.status in (404, 405):
+                            # The peer predates this endpoint. Reported as its own
+                            # code because it is the actionable case (update the
+                            # peer), not a transport fault to retry.
+                            return False, {
+                                "error": f"peer does not serve {path}",
+                                "code": "capability_peer_too_old",
+                            }
+                        if not 200 <= resp.status < 300:
+                            return False, {
+                                "error": f"peer refused the read (HTTP {resp.status})",
+                                "code": "capability_peer_refused",
+                            }
+                        chunks: list[bytes] = []
+                        received = 0
+                        oversized = False
+                        async for chunk in resp.content.iter_chunked(65536):
+                            received += len(chunk)
+                            if received > _CAPABILITY_REPLY_MAX_BYTES:
+                                oversized = True
+                                break
+                            chunks.append(chunk)
+                        if oversized:
+                            return False, {
+                                "error": "peer capability reply exceeds the size cap",
+                                "code": "capability_malformed_reply",
+                            }
+                        try:
+                            payload = json.loads(b"".join(chunks))
+                        except Exception:
+                            return False, {
+                                "error": "peer returned a malformed capability reply",
+                                "code": "capability_malformed_reply",
+                            }
+                        if not isinstance(payload, (dict, list)):
+                            return False, {
+                                "error": "peer returned a malformed capability reply",
+                                "code": "capability_malformed_reply",
+                            }
+                        return True, payload
+            except Exception as e:
+                logger.info(
+                    "Peer capability read %s from %s failed (%s)",
+                    path,
+                    instance_id,
+                    type(e).__name__,  # never the credential
+                )
+                return False, {
+                    "error": f"could not reach the instance ({type(e).__name__})",
+                    "code": "capability_unreachable",
+                }
+        # Both attempts came back unauthorized.
+        return False, {
+            "error": "peer rejected the credential",
+            "code": "capability_unauthorized",
+        }
+
+    async def peer_version(self, instance_id: str) -> tuple[bool, str]:
+        """The peer gateway's ``kiro_crew.__version__``, or ``(False, code)``.
+
+        Used by the version-equality gate that fences remote execution. A peer
+        without ``/api/version`` answers 404 and comes back as
+        ``capability_peer_too_old`` — which the gate must treat exactly like a
+        mismatch, since an unknown version cannot be proven equal.
+        """
+        ok, payload = await self.peer_capability(instance_id, "/api/version")
+        if not ok:
+            code = (
+                payload.get("code", "capability_unreachable") if isinstance(payload, dict) else ""
+            )
+            return False, str(code)
+        version = payload.get("version") if isinstance(payload, dict) else None
+        if not isinstance(version, str) or not version:
+            return False, "capability_malformed_reply"
+        return True, version
 
     async def search_sessions_remote(
         self, instance_id: str, query: str, limit: int

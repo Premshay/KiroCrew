@@ -14,13 +14,11 @@ import json
 import logging
 import mimetypes
 import os
-import posixpath
 import re
 import shutil
 import stat
 import sys
 import time
-import urllib.parse
 from email.utils import formatdate
 from functools import partial
 from pathlib import Path
@@ -82,7 +80,7 @@ from kiro_crew.apps.manager import (
     uninstall_app,
     update_app,
 )
-from kiro_crew.apps.manifest import Dependencies, PlatformConfig
+from kiro_crew.apps.manifest import Dependencies, PlatformConfig, app_endpoint_allowed
 from kiro_crew.apps.official_category_order import forget_cache as forget_category_order_cache
 from kiro_crew.apps.official_category_order import load_category_order
 from kiro_crew.apps.official_editorial import forget_cache as forget_editorial_cache
@@ -128,9 +126,9 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.executors import subprocess_executor
-from kiro_crew.hooks import _fd_real_path
 from kiro_crew.pinned_fs import (
     PinnedPathRefusal,
+    fd_real_path,
     is_reparse_point,
     open_in_pinned_parent,
     supports_pinned_walk,
@@ -409,25 +407,17 @@ def collect_publish_providers(
             continue
         app_name = str(app.get("name", ""))
         endpoint = str(pp["endpoint"])
-        # Endpoint allowlist: must route within the app's own namespace.
-        # Normalize BEFORE checking to prevent dot-segment traversal
-        # (e.g. "/api/apps/foo/../../shutdown" bypassing prefix check).
-        decoded_endpoint = urllib.parse.unquote(endpoint)
-        normalized_endpoint = posixpath.normpath(decoded_endpoint)
-        allowed_prefix = f"/api/apps/{app_name}/"
-        if (
-            ".." in decoded_endpoint
-            or normalized_endpoint != decoded_endpoint.rstrip("/")
-            # Boundary-safe prefix check: appending "/" prevents a sibling-app
-            # collision ("/api/apps/foobar/x" passing app "foo"'s allowlist).
-            or not (normalized_endpoint + "/").startswith(allowed_prefix)
-        ):
+        # Endpoint allowlist: must route within the app's own namespace. The check lives
+        # in `manifest.app_endpoint_allowed` because more than one contribution type
+        # declares an endpoint, and two copies of one security control drift apart
+        # invisibly -- the traversal and sibling-prefix guards are documented there.
+        if not app_endpoint_allowed(app_name, endpoint):
             logger.warning(
                 "publish provider for app %r declares non-conforming endpoint %r "
                 "(must start with %r, no traversal) — dropping",
                 app_name,
                 endpoint,
-                allowed_prefix,
+                f"/api/apps/{app_name}/",
             )
             continue
         providers.append(
@@ -2557,20 +2547,6 @@ _UI_STREAM_CHUNK = 256 * 1024
 #: microseconds; 8 comfortably covers a dashboard loading assets in parallel.
 _UI_STREAM_SEMAPHORE = asyncio.Semaphore(8)
 
-#: Wall-clock ceiling on the body-writing phase of one UI-file response, and
-#: therefore on how long one client can hold a `_UI_STREAM_SEMAPHORE` permit
-#: while paced by its own read speed. Without it the 8 permits are a
-#: head-of-line queue an UNAUTHENTICATED caller controls: 8 sockets that
-#: connect, receive one chunk and then stop reading pin every permit (and
-#: descriptor) indefinitely, and every app UI on the host stops loading. The
-#: value matches `_BLOB_FETCH_TIMEOUT` / `_PROXY_TIMEOUT` in this file — 30s is
-#: the ceiling this module already treats as "no longer a live client", and it
-#: is ~100x the budget a real transfer needs (`_UI_MAX_BYTES` is 8 MiB, so even
-#: the largest servable file only needs ~280 KB/s to finish, over a loopback
-#: connection to the dashboard). Expiry cancels the write loop; the enclosing
-#: `finally` still closes the descriptor and the permit is released.
-_UI_STREAM_TIMEOUT = 30  # seconds
-
 
 def _open_ui_file(name: str, file_path: str) -> tuple[int, os.stat_result] | str:
     """An OPEN validated descriptor for *file_path* under *name*'s ui/ root
@@ -2708,7 +2684,7 @@ def _open_ui_file(name: str, file_path: str) -> tuple[int, os.stat_result] | str
         # the POSIX hosts the tests run on) and require it to still sit under
         # the resolved root. Fail closed when it cannot be read — on this
         # branch the descriptor is the only trustworthy witness.
-        fd_real = _fd_real_path(fd)
+        fd_real = fd_real_path(fd)
         if fd_real is None:
             os.close(fd)
             return "not_found"
@@ -2833,21 +2809,13 @@ async def handle_app_ui_file(request: web.Request) -> web.StreamResponse:
             # `to_thread` hops on the shared default executor — no second
             # acquisition here: a nested acquire under the same semaphore
             # would deadlock once 8 holders each waited for a 9th permit.
-            # Bounded by wall clock as well as by `remaining`: the permit is
-            # held across this loop, so a client that stops reading would
-            # otherwise hold it (and its fd) forever — 8 such clients wedge the
-            # route for everyone. On expiry the `TimeoutError` propagates, the
-            # `finally` below closes the descriptor, the permit is released, and
-            # aiohttp drops a connection whose announced `content_length` can no
-            # longer be honoured.
-            async with asyncio.timeout(_UI_STREAM_TIMEOUT):
-                while remaining > 0:
-                    chunk = await asyncio.to_thread(os.read, fd, min(_UI_STREAM_CHUNK, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-                    await resp.write(chunk)
-                await resp.write_eof()
+            while remaining > 0:
+                chunk = await asyncio.to_thread(os.read, fd, min(_UI_STREAM_CHUNK, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                await resp.write(chunk)
+            await resp.write_eof()
             return resp
         finally:
             # Off the loop: `os.close` is on the no-blocking-call-on-event-loop
@@ -2868,6 +2836,17 @@ async def handle_app_dev_mode(request: web.Request) -> web.Response:
 
     Metadata-only change (installed.json); the dev-mode watcher picks it up
     within one poll interval, so no gateway restart is needed.
+
+    This route deliberately carries NO way to confirm an out-of-install ui
+    root: app UI bundles run as same-origin modules with the dashboard's own
+    credentials, so any request-body confirmation flag would be data the app
+    controls, not operator attestation — an app could self-grant serving an
+    arbitrary non-sensitive directory over the unauthenticated UI route by
+    POSTing to its own toggle. Enabling dev mode on such a root therefore
+    always answers 400 here (``code:
+    "dev_mode_out_of_install_confirmation_required"``, naming the CLI
+    command); confirmation is supplied only from the gateway host via
+    ``kirocrew app dev <name> --confirm-out-of-install-root``.
     """
     from kiro_crew.apps.dev_mode import set_dev_mode
 

@@ -24,12 +24,13 @@ from aiohttp import web
 # binds via sys.modules and defers attribute access to call time, which also
 # keeps tests' monkeypatching of handlers.redact_* effective (late binding).
 import kiro_crew.dashboard.handlers as _h
-from kiro_crew import session_ledger, work_items
+from kiro_crew import session_directive, session_ledger, work_items
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard.handlers import kiro_usage_api
+from kiro_crew.dashboard.handlers._shared import SESSION_SEARCH_TEXT_FIELDS
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
 from kiro_crew.dashboard.state import DashboardState
@@ -254,13 +255,19 @@ def _record_scrape_outcome(success: bool) -> None:
         )
 
 
-def _cache_without_scrape(api_usage: object, identity: dict[str, object]) -> None:
+def _cache_without_scrape(
+    api_usage: object, identity: dict[str, object], reason: str | None = None
+) -> None:
     """Cache the best available value when the scrape is not going to run.
 
     Degrades rather than erroring: keep a previously-good value (dimmed
     ``stale``) so the pill does not blink out, otherwise surface whatever
     partial fields the API did return alongside ``available: False`` — the
     frontend's existing signal to hide the pill instead of rendering blanks.
+    ``reason`` (when given) rides that unavailable marker so the frontend can
+    explain WHY instead of hiding silently: the opt-in scrape being off is a
+    permanent, user-addressable state, unlike a cold-start failure, and hiding
+    it leaves users with no hint that a knob exists.
 
     Preserving is gated on ``_same_identity``: with the scrape disabled, a
     plan-less API answer recurs every refresh forever, so an unguarded preserve
@@ -284,7 +291,10 @@ def _cache_without_scrape(api_usage: object, identity: dict[str, object]) -> Non
             else {}
         )
         partial.pop("_profile_arn", None)
-        _usage_cache = {**partial, "available": False}
+        unavailable: dict[str, object] = {**partial, "available": False}
+        if reason is not None:
+            unavailable["reason"] = reason
+        _usage_cache = unavailable
     _usage_cache_ts = time.time()
 
 
@@ -424,8 +434,8 @@ def _normalize_text_usage(parsed: dict[str, object]) -> dict[str, object]:
 
     In the raw text, "Credits used:" is the OVERAGE field (0 for org accounts,
     and absent entirely on kiro-cli 2.11.x), while "(X of Y covered in plan)" is
-    the in-plan covered/limit. Total = covered + overage. Post-regression the
-    text carries no overage, so this honestly reports covered==total.
+    the in-plan covered/limit. Total = covered + overage. When the text carries
+    no overage, this honestly reports covered==total.
     """
     covered = parsed.get("credits_covered")
     plan = parsed.get("credits_plan")
@@ -777,8 +787,8 @@ async def _fetch_usage_bg() -> None:
         expected_arn = raw_arn if isinstance(raw_arn, str) and raw_arn else None
         # Primary source: the real GetUsageLimits API. It reads the live bearer
         # token kiro-cli already maintains and returns the true used/limit/overage,
-        # so it survives kiro-cli stdout format changes (the regression that dropped
-        # the overage line).
+        # so it survives kiro-cli stdout format changes, including a text format
+        # that drops the overage line.
         #
         # Both ARN values are safe to pass. An ARN anchors on identity; None
         # anchors on PROVENANCE (kiro-cli's own auth store only) — see
@@ -828,7 +838,7 @@ async def _fetch_usage_bg() -> None:
         # disabled or parked scrape costs nothing at all.
         if not await asyncio.to_thread(_text_scrape_enabled):
             _log_scrape_disabled_once()
-            _cache_without_scrape(api_usage, identity)
+            _cache_without_scrape(api_usage, identity, reason="scrape_disabled")
             return
         if _scrape_in_backoff():
             _cache_without_scrape(api_usage, identity)
@@ -1063,7 +1073,7 @@ async def api_sessions(request: web.Request) -> web.Response:
     # in the history dir — O(all sessions). At 2000 sessions, that's ~200 ms of
     # blocking IO (measured: 208 ms / 2000 files on a dev host). Running that on
     # the event loop freezes chat, heartbeat, and every other coroutine for the
-    # full duration. Offload to a worker thread (#3057).
+    # full duration. Offload to a worker thread.
     all_sessions = await asyncio.to_thread(state.conversation_log.list_sessions)
     if exclude_open:
         open_keys = _open_slot_transcript_keys(state)
@@ -1275,16 +1285,10 @@ async def api_sessions_search(request: web.Request) -> web.Response:
         None, state.conversation_log.search_sessions, q, limit
     )
     for s in sessions:
-        title = s.get("title")
-        if title:
-            title, _ = _h.redact_exfiltration_urls(title)
-            title, _ = _h.redact_credentials(title)
-            s["title"] = title
-        snip = s.get("snippet")
-        if snip:
-            snip, _ = _h.redact_exfiltration_urls(snip)
-            snip, _ = _h.redact_credentials(snip)
-            s["snippet"] = snip
+        for field in SESSION_SEARCH_TEXT_FIELDS:
+            value = s.get(field)
+            if value:
+                s[field] = redact(value)
     return web.json_response({"sessions": sessions})
 
 
@@ -1488,19 +1492,23 @@ async def api_sessions_clear(request: web.Request) -> web.Response:
     # Bind after the None guard so mypy's narrowing carries into the closure.
     log = state.conversation_log
 
-    # list_sessions() globs, stats, and reads the first line of EVERY session file
-    # in the history dir — O(all sessions). Offload to keep the event loop responsive.
-    all_sessions = await asyncio.to_thread(log.list_sessions)
+    # ONE selector, shared with the clearable-count endpoint, so the number a
+    # confirmation displays is the set this loop takes rather than a second
+    # opinion about it. It takes no age cutoff because this path accepts
+    # none: a filtered count would report a subset of what this loop then
+    # permanently unlinks.
+    # It globs and stats every session file, so it stays off the event loop.
+    clearable, skipped = await asyncio.to_thread(_clearable_history_keys, state, log)
 
     count = 0
-    skipped = 0
     failed = 0
     cleanup_tasks = []
-    for s in all_sessions:
-        key = s["key"]
-
-        # Re-check per iteration: a resume publishing a slot during the
-        # list_sessions scan OR during an earlier delete-await now appears here.
+    for key in clearable:
+        # Re-check per iteration: a resume publishing a slot during the selector's
+        # scan OR during an earlier delete-await now appears here. The selector
+        # returns a snapshot; this is the guard that keeps a tab opened mid-loop
+        # from being deleted out from under the user, so it must stay in the loop
+        # rather than move into the selector.
         if key in _open_slot_transcript_keys(state):
             skipped += 1
             continue
@@ -1530,6 +1538,98 @@ async def api_sessions_clear(request: web.Request) -> web.Response:
     return web.json_response(
         {"ok": failed == 0, "cleared": count, "skipped": skipped, "failed": failed}
     )
+
+
+def _clearable_history_keys(
+    state: DashboardState,
+    log: Any,
+) -> tuple[list[str], int]:
+    """The history sessions a bulk clear would remove.
+
+    ONE implementation, shared by ``api_sessions_clear`` and the clearable-count
+    endpoint, so the number a confirmation displays cannot drift from the set the
+    delete takes. Two implementations would let the dialog
+    promise a number the delete does not honour, which is the whole reason a
+    count exists.
+
+    Takes NO age cutoff, deliberately. ``DELETE /api/sessions`` accepts none and
+    removes every clearable session, so a count filtered by age would report a
+    SUBSET of what the delete then permanently unlinks — a confirmation showing a
+    smaller number than the delete honours. There is no cutoff to offer until the
+    delete itself grows one, and then both sides grow it together through this
+    function.
+
+    Returns ``(clearable, skipped)``. A session is skipped when it is reachable as
+    an open tab, when its metadata says ``pinned``, or when that metadata could not
+    be read — the same exclusions ``delete_session(..., skip_pinned=True)``
+    applies, so the two agree. Note that metadata which is present but unparseable
+    is NOT an exclusion: ``get_metadata_status`` reports it as readable-with-no-
+    metadata (``({}, True)``), so such a session reads as unpinned and is cleared.
+    The delete resolves it identically, which is what matters here.
+
+    Reads the filesystem (``list_sessions`` globs and stats every session file),
+    so callers offload it off the event loop.
+    """
+    open_keys = _open_slot_transcript_keys(state)
+
+    clearable: list[str] = []
+    skipped = 0
+    for row in log.list_sessions():
+        key = row.get("key", "")
+        if not key:
+            continue
+        if key in open_keys:
+            skipped += 1
+            continue
+        # Mirror delete_session(skip_pinned=True): pinned and unreadable metadata
+        # both mean "leave it alone". This read is unlocked, so what comes back is
+        # a SNAPSHOT the delete may narrow: it re-checks pinned under its lock and
+        # re-checks open tabs per iteration, so a session pinned or reopened after
+        # this pass is skipped there. The count can therefore over-report a
+        # concurrent change, but nothing here can make the delete take a session
+        # its own locked check refuses.
+        try:
+            meta, readable = log.get_metadata_status(key)
+        except Exception:
+            # Not reachable through get_metadata_status's documented returns; a
+            # genuinely unexpected failure must not read as permission to delete.
+            skipped += 1
+            continue
+        if not readable or not isinstance(meta, dict) or meta.get("pinned"):
+            skipped += 1
+            continue
+        clearable.append(key)
+    return clearable, skipped
+
+
+async def api_sessions_clearable_count(request: web.Request) -> web.Response:
+    """GET /api/sessions/clearable/count — how many sessions a bulk clear removes.
+
+    The confirmation for a bulk delete has to state how many sessions it will
+    remove, and ``DELETE /api/sessions`` offers no way to learn that before
+    committing. This answers the question and nothing else — it
+    is a GET, so no code path here can delete anything.
+
+    A GET rather than a ``dry_run`` flag on the DELETE, deliberately departing
+    from ``POST /api/system/session-storage/cleanup``'s pattern: a flag on the
+    destructive verb means a caller that drops the flag deletes instead of
+    counting, while a GET cannot delete however it is called.
+
+    Takes no parameters. The count is of exactly the set ``DELETE /api/sessions``
+    removes, because that delete accepts no cutoff — see
+    :func:`_clearable_history_keys` for why offering one here would report a
+    subset of what the delete actually takes.
+    """
+    state: DashboardState = request.app["state"]
+    if not state.conversation_log:
+        return web.json_response(
+            {"error": "no conversation log", "code": "count_unavailable"}, status=400
+        )
+
+    clearable, _skipped = await asyncio.to_thread(
+        _clearable_history_keys, state, state.conversation_log
+    )
+    return web.json_response({"sessions": len(clearable)})
 
 
 # ── Approvals ──
@@ -1574,9 +1674,9 @@ async def api_session_directive(request: web.Request) -> web.Response:
     to a session key other than the declared one, which is the check that stops a
     caller parking a directive against somebody else's session.
 
-    Unknown ``kind`` is a 400, not a silent drop: the only legitimate callers are
-    Kiro Crew's own directive tools, so an unrecognized kind means the request did
-    not come from one and the caller should hear about it.
+    A call that derives no directive (unknown tool, validation refusal) is a 400,
+    not a silent drop: the only legitimate callers are Kiro Crew's own directive
+    tools, so a request that does not derive did not come from one.
     """
     # Re-assert the caller's locality BEFORE the header is read. The route is in
     # server.py's strict allowlist, but a ``local_only=False`` deployment
@@ -1622,12 +1722,65 @@ async def api_session_directive(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "malformed JSON body", "code": "invalid_body"}, status=400
         )
-    kind = str(body.get("kind") or "").strip()
-    args = body.get("args")
-    if not isinstance(args, dict):
-        args = {}
+    # The body names the CALL -- the directive tool's name and the raw
+    # ``tools/call`` arguments the MCP stub served -- and nothing else. The
+    # payload is DERIVED here by re-running that tool on those arguments
+    # (``mcp_core.derive_directive``), and the claim key is computed here from the
+    # same pair. A caller who can reach this route therefore controls only what
+    # the named session's own call would have produced: it cannot pair payload X
+    # with the digest of call Y, which a caller-supplied (args, input_digest) body
+    # allowed and which is exactly the substitution the two-channel design exists
+    # to prevent.
+    # Lazy on purpose: mcp_core is the MCP server module and imports every tool
+    # handler; no dashboard module loads it at import time, and this route is
+    # the only one that needs it.
+    from kiro_crew import mcp_core
+
+    tool = str(body.get("tool") or "").strip()
+    raw_args = body.get("raw_args")
+    if not isinstance(raw_args, dict):
+        raw_args = {}
+    if not tool and "kind" in body:
+        # The body shape a Kiro Crew MCP server from BEFORE the call-input
+        # protocol sends: the directive's ``kind``/``args`` rather than the call.
+        # That server is running older code than this gateway -- a pooled MCP
+        # backend that outlived a code change -- and every directive it emits
+        # will land here until it is replaced. Name that, rather than the
+        # generic "not derivable", because the generic wording sent an operator
+        # to the directive tools when the fault was a stale process.
+        logger.warning(
+            "session-directive REFUSED (stale_mcp_backend) for session_key=%r: the "
+            "MCP server sent a pre-call-input body (kind=%r) -- it is running OLDER "
+            "code than this gateway. A pooled backend survived a code change; run "
+            "`kirocrew restart` (which replaces the MCP gateway daemon too) or "
+            "`kirocrew doctor` to see the daemon's code revision. Nothing was parked.",
+            session_key,
+            body.get("kind"),
+        )
+        return web.json_response(
+            {
+                "error": "MCP server runs older code than the gateway; restart it",
+                "code": "stale_mcp_backend",
+            },
+            status=400,
+        )
+    derived = mcp_core.derive_directive(tool, raw_args, session_key)
+    if derived is None:
+        logger.warning(
+            "session-directive REFUSED (not_derivable) for session_key=%r tool=%r: "
+            "re-running the tool on the reported arguments published no directive "
+            "(unknown tool, validation refusal, or handler error). Nothing was parked.",
+            session_key,
+            tool,
+        )
+        return web.json_response(
+            {"error": "directive could not be derived from the call", "code": "not_derivable"},
+            status=400,
+        )
+    kind, args = derived
+    input_digest = session_directive.call_input_digest(tool, raw_args)
     try:
-        record_id = directive_queue.publish(session_key, kind, args)
+        record_id = directive_queue.publish(session_key, kind, args, input_digest)
     except ValueError as exc:
         logger.warning(
             "session-directive REFUSED (invalid_directive) for session_key=%r kind=%r: "

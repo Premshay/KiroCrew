@@ -2,17 +2,19 @@
 """Legacy Goal Conductor item-entry codec for installed-copy compatibility.
 
 The goal-conductor's only compaction-surviving state is the per-work-item entry
-it writes into the session ledger's ``artifacts`` map. Before this script, that
-format existed only as prose plus a worked example in SKILL.md, and the model
-re-derived it every patrol cycle - which produced two real defects during
-review of PR #5652: an acceptance spec that lived only in model context (lost
-on compaction), and an entry written as a nested JSON object, which the ledger
-rejects with ``artifacts_not_string_map`` so nothing persisted at all.
+it writes into the session ledger's ``artifacts`` map. A format the model
+re-derives from prose every patrol cycle costs two defects this codec exists to
+remove: an acceptance spec that lives only in model context, so compaction loses
+it, and an entry written as a nested JSON object, which the ledger rejects with
+``artifacts_not_string_map`` so nothing persists at all.
 
-This script owns the legacy format for already-installed/copy-based skills.
-New Goal Conductor cycles use the product ``work_*`` MCP tools instead. Keep
-this adapter for one compatibility release; it is intentionally not a new-item
-or patrol dependency in the current bundled skill.
+This script owns the format. The conductor calls it; it never hand-rolls the
+encoding.
+
+It also owns the legacy format for already-installed/copy-based skills. New
+Goal Conductor cycles use the product ``work_*`` MCP tools instead, so this
+adapter is a compatibility path rather than a new-item or patrol dependency
+of the current bundled skill.
 
 Usage:
     python3 ledger_entry.py {encode|decode|validate|rotate} < input.json

@@ -39,8 +39,15 @@ import {
   APPROVAL_KIND,
   shouldChimeOnTurnDone,
 } from "./notificationEvent";
+import { shouldNotifyOnChatComplete } from "./chatCompleteNotify";
 import { emitThemeSound } from "./themeSound";
 import { streamingFlushHoldMs } from "../lib/streamHold";
+import {
+  VoicePcmPlayer,
+  createVoiceRequestId,
+  voiceBoundary,
+} from "../lib/voicePlayback";
+import { reportVoiceFailure } from "../lib/voiceFailure";
 import {
   fetchHistory,
   missedChunkMarker,
@@ -86,21 +93,24 @@ import {
   setFollowupCard,
   setFolderSuggestion,
   sseMcpAppRender,
-  setGoalLoops,
-  sseGoalLoop,
+  setAutomations,
+  sseAutomation,
+  removeAutomation,
   sseSideQueue,
   reconcileWorkflowRuns,
 } from "../store/chatSlice";
 import { anchorForSlot, loadLayout, sessionSlots } from "./splitLayoutStore";
 import { TAB_ID } from "../api/tabId";
 import { api } from "../api/client";
+import { AUTONUDGE_LOOPS_QUERY_KEY } from "../components/autoNudgeLoop";
+import { forgetUnobservedMemberThreads } from "../api/membersQuery";
 import { sanitizeLlmOutput } from "../utils/sanitize";
-import { nextSpeakableSpan, MIN_TTS_CHARS } from "./sentenceCutter";
 import { markFirstAudio, markFirstToken } from "../utils/voiceTurnMetrics";
 import {
   applyStatusDelta,
   parseStatusDelta,
 } from "../utils/pullRequestStatusDelta";
+import { slotChangeUrls } from "../utils/pullRequestLinks";
 import type {
   StatusData,
   ChatMessage,
@@ -112,6 +122,11 @@ import type {
   McpSessionReport,
 } from "../types";
 import { i18nT } from "../i18n/t";
+import {
+  dashboardAutomationSlotKey,
+  isFullLegacyAutomationRecord,
+  normalizeAutomationRecord,
+} from "../monitoring/automation";
 
 type LogCallback = ((data: { level: string; msg: string }) => void) | null;
 
@@ -121,6 +136,11 @@ type LogCallback = ((data: { level: string; msg: string }) => void) | null;
  *  channel (that is the live event stream), and the tick makes no request at all
  *  while no row is running. */
 const WORKFLOW_HEAL_MS = 15000;
+const LEGACY_AUTOMATION_SEED_QUERY_KEY = ["automation-seed", "legacy"] as const;
+const STRUCTURED_AUTOMATION_SEED_QUERY_KEY = [
+  "automation-seed",
+  "structured",
+] as const;
 
 type VoiceProgress = {
   slot: string;
@@ -151,6 +171,8 @@ function invalidateRefreshQueries(qc: QueryClient): void {
   qc.invalidateQueries({ queryKey: ["sessions-usage"] });
   qc.invalidateQueries({ queryKey: ["agents-installed"] });
   qc.invalidateQueries({ queryKey: ["mcp-tools"] });
+  // Prefix match on purpose: the Crew Members roster lives under this key
+  // (api/membersQuery.ts) and refreshes with the registry.
   qc.invalidateQueries({ queryKey: ["kirocrew-agents"] });
   qc.invalidateQueries({ queryKey: ["default-agent"] });
   qc.invalidateQueries({ queryKey: ["workspaces"] });
@@ -387,10 +409,19 @@ export function useWebSocket() {
   const lastBundleIdRef = useRef<string | null>(null);
   const lastGitlabHostsGenRef = useRef<number | null>(null);
   const lastFoldersGenRef = useRef<number | null>(null);
+  const lastGovernanceGenRef = useRef<number | null>(null);
   const lastSlotsRawRef = useRef<string | null>(null);
   const lastSlotsArrayRef = useRef<ChatSlot[] | null>(null);
   const voiceQueueRef = useRef<string[]>([]);
   const voicePlayingRef = useRef(false);
+  const pcmPlayerRef = useRef<VoicePcmPlayer | null>(null);
+  const voiceEpochRef = useRef(0);
+  const voiceRequestsRef = useRef(new Map<string, string>());
+  const pendingVoiceRef = useRef<{
+    slot: string;
+    text: string;
+    request_id: string;
+  } | null>(null);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
   const autoSpeakRef = useRef(false);
   const configuredAutoSpeakRef = useRef(false);
@@ -468,8 +499,19 @@ export function useWebSocket() {
     voiceMutedRef.current = true;
     synthAbortRef.current?.abort();
     synthAbortRef.current = null;
+    voiceEpochRef.current++;
+    for (const [requestId, slot] of voiceRequestsRef.current) {
+      void api.voiceCancel?.(slot, requestId).catch(() => {});
+    }
+    voiceRequestsRef.current.clear();
+    pendingVoiceRef.current = null;
+    synthChainRef.current = Promise.resolve();
+    pcmPlayerRef.current?.stop();
     if (activeAudioRef.current) {
+      activeAudioRef.current.onended = null;
+      activeAudioRef.current.onerror = null;
       activeAudioRef.current.pause();
+      URL.revokeObjectURL(activeAudioRef.current.src);
       activeAudioRef.current = null;
     }
     voiceQueueRef.current.forEach((u) => URL.revokeObjectURL(u));
@@ -518,6 +560,19 @@ export function useWebSocket() {
     [dispatch, updateVoiceBusy],
   );
 
+  const getPcmPlayer = useCallback(() => {
+    pcmPlayerRef.current ??= new VoicePcmPlayer(
+      (playing) => dispatch(setVoicePlaying(playing)),
+      (code) => {
+        reportVoiceFailure({ slot: store.getState().chat.activeSlot, code });
+        // A playback failure affects the stream, not just one 200 ms chunk.
+        // Cancel synthesis so later chunks cannot repeatedly raise the same error.
+        stopVoice();
+      },
+    );
+    return pcmPlayerRef.current;
+  }, [dispatch, stopVoice]);
+
   const voiceProgressFor = useCallback(
     (slot: string, message: ChatMessage): VoiceProgress | null => {
       const messageId = voiceMessageId(message);
@@ -530,7 +585,6 @@ export function useWebSocket() {
       ) {
         const next = { slot, messageId, spokenLen: 0 };
         voiceProgressRef.current = next;
-        voiceMutedRef.current = false;
         return next;
       }
       return current;
@@ -540,21 +594,58 @@ export function useWebSocket() {
 
   const enqueueVoiceSynthesis = useCallback(
     (slot: string, text: string) => {
+      // The first sentence starts immediately. While it synthesizes, combine
+      // completed sentences into the next request to amortize local model startup.
+      const pending = pendingVoiceRef.current;
+      if (pending?.slot === slot && pending.text.length + text.length < 4000) {
+        pending.text += "\n" + text;
+        return;
+      }
+      // The abort signal is the LOCAL half of the cancel: stopVoice aborts the
+      // in-flight fetch here while voiceCancel retires the request server-side.
       if (!synthAbortRef.current) synthAbortRef.current = new AbortController();
       const signal = synthAbortRef.current.signal;
+      const epoch = voiceEpochRef.current;
+      const request_id = createVoiceRequestId();
+      const request = { slot, text, request_id };
+      pendingVoiceRef.current = request;
+      voiceRequestsRef.current.set(request_id, slot);
+      // Counted before the chain so the busy indicator covers the queued wait,
+      // not just the moment this request is actually on the wire.
       synthInFlightRef.current += 1;
       updateVoiceBusy();
-      synthChainRef.current = synthChainRef.current
-        .then(() =>
-          signal.aborted
-            ? undefined
-            : api.voiceSynthesize(slot, text, { signal }),
-        )
-        .catch(() => {})
-        .finally(() => {
+      synthChainRef.current = synthChainRef.current.then(async () => {
+        if (pendingVoiceRef.current === request) pendingVoiceRef.current = null;
+        try {
+          if (
+            epoch !== voiceEpochRef.current ||
+            voiceMutedRef.current ||
+            signal.aborted
+          )
+            return;
+          try {
+            await api.voiceSynthesize(slot, request.text, {
+              request_id,
+              signal,
+            });
+          } catch {
+            if (!voiceRequestsRef.current.delete(request_id)) return;
+            if (
+              epoch === voiceEpochRef.current &&
+              slot === store.getState().chat.activeSlot
+            ) {
+              reportVoiceFailure({
+                slot,
+                request_id,
+                code: "voice_synthesis_failed",
+              });
+            }
+          }
+        } finally {
           synthInFlightRef.current = Math.max(0, synthInFlightRef.current - 1);
           updateVoiceBusy();
-        });
+        }
+      });
     },
     [updateVoiceBusy],
   );
@@ -564,11 +655,10 @@ export function useWebSocket() {
       const progress = voiceProgressFor(slot, message);
       if (!progress) return;
       const remaining = message.content.slice(progress.spokenLen).trim();
-      // Mark the whole message consumed even when its tail is below the speech
-      // floor, so a later completion event cannot reconsider or repeat it.
+      // Mark the whole message consumed so a later completion event cannot
+      // reconsider or repeat a tail already queued for speech.
       progress.spokenLen = message.content.length;
-      if (remaining.length >= MIN_TTS_CHARS)
-        enqueueVoiceSynthesis(slot, remaining);
+      if (remaining) enqueueVoiceSynthesis(slot, remaining);
     },
     [enqueueVoiceSynthesis, voiceProgressFor],
   );
@@ -579,10 +669,13 @@ export function useWebSocket() {
     const url = voiceQueueRef.current.shift()!;
     const audio = new Audio(url);
     activeAudioRef.current = audio;
-    audio.onended = () => {
+    const finished = () => {
       URL.revokeObjectURL(url);
+      if (activeAudioRef.current !== audio) return;
       activeAudioRef.current = null;
       voicePlayingRef.current = false;
+      audio.onended = null;
+      audio.onerror = null;
       if (voiceQueueRef.current.length > 0) {
         playNextVoiceChunk();
       } else {
@@ -590,69 +683,230 @@ export function useWebSocket() {
         updateVoiceBusy();
       }
     };
+    audio.onended = finished;
     audio.onerror = () => {
+      if (activeAudioRef.current !== audio) return;
       URL.revokeObjectURL(url);
-      activeAudioRef.current = null;
-      voicePlayingRef.current = false;
-      updateVoiceBusy();
-      playNextVoiceChunk();
+      reportVoiceFailure({
+        slot: store.getState().chat.activeSlot,
+        code: "voice_playback_failed",
+      });
+      // stopVoice clears the queue, the active element and the busy state, so
+      // the fork's skip-to-next path is not also run: a failure the user is
+      // now being told about must not silently continue into the next chunk.
+      stopVoice();
     };
     audio
       .play()
       .then(() => {
         markFirstAudio();
       })
-      .catch(() => {
+      .catch((error) => {
+        if (activeAudioRef.current !== audio) return;
         URL.revokeObjectURL(url);
-        activeAudioRef.current = null;
-        voicePlayingRef.current = false;
-        updateVoiceBusy();
-        playNextVoiceChunk();
+        reportVoiceFailure({
+          slot: store.getState().chat.activeSlot,
+          code:
+            error?.name === "NotAllowedError"
+              ? "voice_playback_blocked"
+              : "voice_playback_failed",
+        });
+        stopVoice();
       });
-  }, [dispatch, updateVoiceBusy]);
+  }, [dispatch, stopVoice, updateVoiceBusy, markFirstAudio]);
 
-  /** Bumped by every `autonudge_state` frame. A seed captures this before its
-   *  fetch and discards the response if a frame landed while it was in flight:
-   *  the seed's full-replace would otherwise resurrect a loop whose `removed`
-   *  frame we had already applied, and because frames fire only on CHANGE
-   *  nothing would ever correct it — leaving a phantom "Loop N/M" that
-   *  suppresses that row's unread dot until the next reconnect. */
-  const goalLoopGenRef = useRef(0);
+  /** Reconnects share one in-flight snapshot and its original watermark;
+   * live frames supersede a snapshot only for their own slot. Per-slot
+   * generations also retain removed-frame tombstones, so stale REST data cannot
+   * resurrect a record without dropping unaffected snapshot rows. */
+  const automationSeedGenRef = useRef(0);
+  const automationLiveGenRef = useRef(new Map<string, number>());
+  const automationSeedInFlightRef = useRef<Promise<void> | null>(null);
+  const automationSeedQueuedRef = useRef(false);
 
-  /** Cold-seed the sidebar's goal-loop map. `autonudge_state` only fires on
-   *  change, so a loop armed before this client connected would show no progress
-   *  until its next cycle fired — which can be minutes. Runs on first connect
-   *  and on every reconnect. Silent on failure and on the feature being
-   *  disabled (the endpoint answers `{enabled:false, loops:[]}`). */
-  const seedGoalLoops = useCallback(() => {
-    const gen = goalLoopGenRef.current;
-    // Fully best-effort, including SYNCHRONOUS failure. This runs early in the
-    // connect handler, ahead of notification sync and the subagent subscribe, so
-    // an exception escaping here would silently strand those — a cosmetic seed
-    // must never be able to do that.
-    try {
-      api
-        .autonudgeList()
-        .then((res) => {
-          // A live frame superseded this snapshot — it is now stale, so drop it
-          // rather than replacing fresher state with older state.
-          if (goalLoopGenRef.current !== gen) return;
+  /** Cold-seed the authoritative automation collection. `autonudge_state` only
+   *  fires on change, so a record armed before this client connected would be
+   *  absent until its next transition. Runs on first connect and reconnect. */
+  const seedAutomations = useCallback(() => {
+    // React Query coalesces equal in-flight fetches. Reuse the matching
+    // orchestration too, or a reconnect would capture a newer watermark for an
+    // older response and could resurrect a live tombstone. A reconnect still
+    // queues one fresh snapshot because the shared request may predate changes
+    // made while the socket was disconnected.
+    if (automationSeedInFlightRef.current) {
+      automationSeedQueuedRef.current = true;
+      return;
+    }
+    const startSeed = () => {
+      automationSeedQueuedRef.current = false;
+      const seedGen = ++automationSeedGenRef.current;
+      const liveAtStart = new Map(automationLiveGenRef.current);
+      const cacheUpdatesAtStart = new Map<string, number>();
+      for (const [queryKey] of queryClient.getQueriesData<
+        ReturnType<typeof normalizeAutomationRecord>
+      >({ queryKey: ["session-automation"] })) {
+        if (queryKey.length === 2 && typeof queryKey[1] === "string") {
+          const slotKey = dashboardAutomationSlotKey(queryKey[1]);
+          cacheUpdatesAtStart.set(
+            slotKey,
+            queryClient.getQueryState(queryKey)?.dataUpdateCount ?? 0,
+          );
+        }
+      }
+      // Fully best-effort, including SYNCHRONOUS failure. This runs early in the
+      // connect handler, ahead of notification sync and the subagent subscribe, so
+      // an exception escaping here would silently strand those — a cosmetic seed
+      // must never be able to do that.
+      let legacy: Promise<{ loops?: unknown[] }>;
+      let structured: Promise<{ monitors?: unknown[] }>;
+      let legacyStarted = true;
+      let structuredStarted = true;
+      try {
+        legacy = queryClient.fetchQuery({
+          queryKey: LEGACY_AUTOMATION_SEED_QUERY_KEY,
+          queryFn: api.autonudgeList,
+          staleTime: 0,
+          retry: false,
+        });
+      } catch {
+        legacyStarted = false;
+        legacy = Promise.resolve({ loops: [] });
+      }
+      try {
+        structured = queryClient.fetchQuery({
+          queryKey: STRUCTURED_AUTOMATION_SEED_QUERY_KEY,
+          queryFn: api.monitorsList,
+          staleTime: 0,
+          retry: false,
+        });
+      } catch {
+        structuredStarted = false;
+        structured = Promise.resolve({ monitors: [] });
+      }
+      let seed: Promise<void>;
+      seed = Promise.allSettled([legacy, structured])
+        .then(([legacyResult, monitorResult]) => {
+          // Do not publish a snapshot known to predate a reconnect. The queued
+          // iteration starts from a new watermark after this request settles.
+          if (automationSeedQueuedRef.current) return;
+          // A later reconnect supersedes this whole seed. Live frames are
+          // reconciled per slot below so unrelated snapshot rows still land.
+          if (automationSeedGenRef.current !== seedGen) return;
+          const legacyComplete =
+            legacyStarted && legacyResult.status === "fulfilled";
+          const structuredComplete =
+            structuredStarted && monitorResult.status === "fulfilled";
+          const legacyRecords =
+            legacyStarted && legacyResult.status === "fulfilled"
+              ? (legacyResult.value.loops ?? [])
+                  .filter(isFullLegacyAutomationRecord)
+                  .map(normalizeAutomationRecord)
+                  .filter((record) => record?.kind === "legacy_goal_loop")
+              : [];
+          const structuredSnapshotRecords =
+            structuredStarted && monitorResult.status === "fulfilled"
+              ? (monitorResult.value.monitors ?? [])
+                  .map(normalizeAutomationRecord)
+                  .filter((record) => record?.kind === "structured_monitor")
+              : [];
+          const stillFresh = (
+            record: NonNullable<ReturnType<typeof normalizeAutomationRecord>>,
+          ) =>
+            (automationLiveGenRef.current.get(record.slotKey) ?? 0) ===
+            (liveAtStart.get(record.slotKey) ?? 0);
+          const protectedSlotSet = new Set(
+            [...automationLiveGenRef.current]
+              .filter(
+                ([slot, generation]) =>
+                  generation !== (liveAtStart.get(slot) ?? 0),
+              )
+              .map(([slot]) => slot),
+          );
+          for (const [queryKey] of queryClient.getQueriesData<
+            ReturnType<typeof normalizeAutomationRecord>
+          >({ queryKey: ["session-automation"] })) {
+            if (queryKey.length !== 2 || typeof queryKey[1] !== "string")
+              continue;
+            const slotKey = dashboardAutomationSlotKey(queryKey[1]);
+            const cachedUpdates =
+              queryClient.getQueryState(queryKey)?.dataUpdateCount;
+            if (cachedUpdates !== cacheUpdatesAtStart.get(slotKey)) {
+              protectedSlotSet.add(slotKey);
+            }
+          }
+          const protectedSlots = [...protectedSlotSet];
+          const records = [
+            ...legacyRecords,
+            ...structuredSnapshotRecords.filter((record) => record.active),
+          ].filter(
+            (record) =>
+              stillFresh(record) && !protectedSlotSet.has(record.slotKey),
+          );
+          const terminalRecords = new Map(
+            structuredSnapshotRecords
+              .filter(
+                (record) =>
+                  !record.active &&
+                  stillFresh(record) &&
+                  !protectedSlotSet.has(record.slotKey),
+              )
+              .map((record) => [record.slotKey, record]),
+          );
+          // Terminal monitors refresh existing per-slot evidence without growing
+          // the global Redux collection or creating unvisited detail queries.
+          const presentSlots = new Set([
+            ...records.map((record) => record.slotKey),
+            ...structuredSnapshotRecords
+              .filter(
+                (record) =>
+                  stillFresh(record) && !protectedSlotSet.has(record.slotKey),
+              )
+              .map((record) => record.slotKey),
+          ]);
+          for (const [queryKey, cached] of queryClient.getQueriesData<
+            ReturnType<typeof normalizeAutomationRecord>
+          >({ queryKey: ["session-automation"] })) {
+            if (queryKey.length !== 2 || typeof queryKey[1] !== "string")
+              continue;
+            const slotKey = dashboardAutomationSlotKey(queryKey[1]);
+            if (protectedSlotSet.has(slotKey)) continue;
+            // A mutation or focused REST refetch may populate this per-slot
+            // cache while the reconnect snapshot is still in flight. Only an
+            // entry known to predate the seed can be absent authoritatively.
+            const cachedUpdates =
+              queryClient.getQueryState(queryKey)?.dataUpdateCount;
+            if (cachedUpdates !== cacheUpdatesAtStart.get(slotKey)) continue;
+            const terminal = terminalRecords.get(slotKey);
+            if (terminal) {
+              queryClient.setQueryData(queryKey, terminal);
+            }
+            if (!cached || presentSlots.has(slotKey)) continue;
+            const complete =
+              cached.kind === "legacy_goal_loop"
+                ? legacyComplete
+                : structuredComplete;
+            if (complete) queryClient.setQueryData(queryKey, null);
+          }
           dispatch(
-            setGoalLoops(
-              (res?.loops || []).map((loop) => ({
-                slot: loop.slot_key,
-                active: loop.active === true,
-                cycle_count: Number(loop.cycle_count) || 0,
-                max_cycles: Number(loop.max_cycles) || 0,
-              })),
-            ),
+            setAutomations({
+              records,
+              legacyComplete,
+              structuredComplete,
+              protectedSlots,
+            }),
           );
         })
-        .catch(() => {});
-    } catch {
-      /* seed is cosmetic — never break the connect path */
-    }
-  }, [dispatch]);
+        .catch(() => {})
+        .finally(() => {
+          if (automationSeedInFlightRef.current === seed) {
+            automationSeedInFlightRef.current = null;
+            if (automationSeedQueuedRef.current) startSeed();
+          }
+        });
+      automationSeedInFlightRef.current = seed;
+    };
+    startSeed();
+  }, [dispatch, queryClient]);
 
   const syncPendingApprovals = useCallback(async () => {
     try {
@@ -891,10 +1145,13 @@ export function useWebSocket() {
       if (streaming) {
         const progress = voiceProgressFor(activeSlot, streaming);
         if (!progress) return;
-        const span = nextSpeakableSpan(streaming.content, progress.spokenLen);
-        if (span) {
-          progress.spokenLen = span.nextSpokenLen;
-          enqueueVoiceSynthesis(activeSlot, span.text);
+        if (voiceMutedRef.current) return;
+        const full = streaming.content;
+        const bound = voiceBoundary(full, progress.spokenLen);
+        if (bound > progress.spokenLen) {
+          const text = full.slice(progress.spokenLen, bound).trim();
+          progress.spokenLen = bound;
+          if (text) enqueueVoiceSynthesis(activeSlot, text);
         }
       }
     }
@@ -1106,6 +1363,8 @@ export function useWebSocket() {
       lastGitlabHostsGenRef.current = null;
       // Same process-local reasoning for the folder-tree generation.
       lastFoldersGenRef.current = null;
+      // …and for the governance-ceiling generation.
+      lastGovernanceGenRef.current = null;
       // Forget the last raw slots frame too, so a reconnect whose first frame
       // repeats the last one before it cannot swallow that first frame.
       lastSlotsRawRef.current = null;
@@ -1192,7 +1451,17 @@ export function useWebSocket() {
         // Invalidate every slot's summary (the key is per-slot and we cannot
         // know which ones moved); react-query only refetches the observed ones.
         queryClient.invalidateQueries({ queryKey: ["session-summary"] });
-        seedGoalLoops();
+        // A dropped socket is the one client-visible sign the gateway may have
+        // restarted — and a restart drops an unmessaged member slot while its
+        // binding survives. The Crew Members page mounts a cached thread key
+        // straight away on a return visit (api/membersQuery.ts), so a key
+        // confirmed BEFORE the drop is no longer known-mountable: forget the
+        // ones nobody is looking at, so the next open waits for the thread
+        // endpoint's answer again; the mounted one is re-confirmed by the page
+        // itself on this same reconnect (and must NOT be cleared here — it
+        // holds the pane, and the draft typed into it).
+        forgetUnobservedMemberThreads(queryClient);
+        seedAutomations();
         dispatch(fetchNotifications()).then(() => syncPendingApprovals());
         syncPendingQuestions();
         // Same one-shot problem, different stream: a run that ENDED while the
@@ -1251,7 +1520,7 @@ export function useWebSocket() {
       }
       wasConnectedRef.current = true;
       dispatch(sseConnected());
-      seedGoalLoops();
+      seedAutomations();
       // FIRST connect only: App's mount effect already dispatched fetchSlots,
       // and this handler fires strictly after it, so repeating it here is a
       // redundant round-trip at the worst possible moment. The reconnect branch
@@ -1432,6 +1701,23 @@ export function useWebSocket() {
               const prevGen = lastGitlabHostsGenRef.current;
               lastGitlabHostsGenRef.current = msg.gitlabHostsGeneration;
               if (prevGen === null || prevGen !== msg.gitlabHostsGeneration) {
+                queryClient.invalidateQueries({
+                  queryKey: ["dashboardConfig"],
+                });
+              }
+            }
+            // Same contract for the governance ceiling: a centrally pushed policy
+            // swaps it mid-session and bumps this generation, and the config
+            // endpoint derives `social_share_enabled` from that ceiling. Without
+            // this the cached answer would keep offering the Share entry for the
+            // rest of its stale window after the fleet withdrew it.
+            if (typeof msg.governanceGeneration === "number") {
+              const prevGovGen = lastGovernanceGenRef.current;
+              lastGovernanceGenRef.current = msg.governanceGeneration;
+              if (
+                prevGovGen === null ||
+                prevGovGen !== msg.governanceGeneration
+              ) {
                 queryClient.invalidateQueries({
                   queryKey: ["dashboardConfig"],
                 });
@@ -1819,13 +2105,14 @@ export function useWebSocket() {
               data.role === "inject" && isReconcileNote(data.cls);
             if (
               !isPassiveNote &&
+              data.slot === store.getState().chat.activeSlot &&
               (data.role === "user" ||
                 data.role === "inject" ||
                 data.role === "subagent")
             ) {
               stopVoice();
+              voiceMutedRef.current = false;
               voiceProgressRef.current = null;
-              synthChainRef.current = Promise.resolve();
             }
             if (
               !isPassiveNote &&
@@ -1901,6 +2188,17 @@ export function useWebSocket() {
             // into the meta so the reconcile in appendSlotMessage can match the
             // optimistic bubble by id instead of by content (#6075).
             const steerSid = (data as { sendId?: unknown }).sendId;
+            // `steerState` says which of written/consumed/requeued this row is in.
+            // The server sends `written` here and patches the row to consumed or
+            // requeued later via `chat_message_update`, so the badge only claims a
+            // successful mid-turn injection once the backend has confirmed one
+            // (#7246). Absent on a pre-#7246 server, which the renderer treats as
+            // the legacy row shape.
+            const steerState = (data as { steerState?: unknown }).steerState;
+            // The server row's own id. Stored so the later `chat_message_update`,
+            // which is keyed on `mid`, resolves this row -- without it that patch
+            // matches nothing and the state never moves until a reload.
+            const steerMid = (data as { mid?: unknown }).mid;
             dispatch(
               appendSlotMessage({
                 slot:
@@ -1915,6 +2213,12 @@ export function useWebSocket() {
                     steer: true,
                     ...(typeof steerSid === "string" && steerSid
                       ? { sendId: steerSid }
+                      : {}),
+                    ...(typeof steerState === "string" && steerState
+                      ? { steerState }
+                      : {}),
+                    ...(typeof steerMid === "string" && steerMid
+                      ? { mid: steerMid }
                       : {}),
                   },
                   ts: (data as { ts?: string }).ts,
@@ -1964,6 +2268,20 @@ export function useWebSocket() {
                 entry = { content: "", lastSeq: undefined, thinking: "" };
                 buf.set(cs, entry);
               }
+              // Idempotency guard: drop a replayed/repeated chunk (seq <= lastSeq).
+              // WS delivery is at-least-once (reconnect replay, retry re-stream), so a
+              // chunk can arrive twice. missedChunkMarker below only flags FORWARD gaps
+              // (curSeq - prevSeq - 1 > 0), so a repeat slips through and its content is
+              // appended a second time with no marker — the silent mid-stream "stutter".
+              // chat_done deletes the buffer entry, so lastSeq resets each turn and a
+              // fresh turn's seq is never suppressed.
+              if (
+                entry.lastSeq !== undefined &&
+                data.seq !== undefined &&
+                data.seq <= entry.lastSeq
+              ) {
+                break;
+              }
               // Cross-chunk gap detection via the shared missedChunkMarker,
               // single-sourced with the reducer so the two copies can't drift.
               if (entry.lastSeq !== undefined && data.seq !== undefined) {
@@ -2006,7 +2324,8 @@ export function useWebSocket() {
                 }),
                 auto: (data as Record<string, unknown>).auto === true,
                 tool_call_id: (data as Record<string, unknown>).tool_call_id as
-                  string | undefined,
+                  | string
+                  | undefined,
                 is_update: (data as Record<string, unknown>).is_update === true,
                 is_shell: (data as Record<string, unknown>).is_shell === true,
               }),
@@ -2031,7 +2350,8 @@ export function useWebSocket() {
               // ("Terminal") for the whole call instead of advancing to the
               // refined command.
               const tcid = (data as Record<string, unknown>).tool_call_id as
-                string | undefined;
+                | string
+                | undefined;
               const isUpdate =
                 (data as Record<string, unknown>).is_update === true;
               const purpose = sanitizeLlmOutput(
@@ -2619,8 +2939,9 @@ export function useWebSocket() {
               if (last) flushVoiceTail(data.slot, last);
             }
             dispatch(sseChatMessage({ ...data, role: "_done" }));
-            // Turn-complete chime: sound-only (no feed entry, no toast).
-            // Plays on every real turn completion — active or background
+            // Turn-complete chime: sound-only (no feed entry, and no toast of
+            // its own — the opt-in one below is a separate branch on its own
+            // gate). Plays on every real turn completion — active or background
             // chat — and never during reconnect catch-up replay.
             // Preset/volume/mute resolve in useNotificationSound via the
             // 'turn' category.
@@ -2631,6 +2952,34 @@ export function useWebSocket() {
               })
             ) {
               dispatchMcNotification(TURN_DONE_KIND);
+            }
+            // Opt-in native toast, default OFF, and gated on the user being
+            // AWAY — deliberately not the chime's gate, which ignores focus so
+            // every turn is audible. Titled with the finishing session so a
+            // user tracking several background threads learns which one is
+            // done; `tag` is per-slot so concurrent completions coalesce per
+            // session instead of overwriting one another.
+            if (
+              shouldNotifyOnChatComplete({
+                slot: data.slot,
+                reconnecting: reconnectingRef.current,
+              })
+            ) {
+              const doneSlot = data.slot as string;
+              const doneTitle =
+                store.getState().dashboard.slots.find((s) => s.key === doneSlot)
+                  ?.title || doneSlot;
+              // Android Chrome throws "Illegal constructor" for page-context
+              // Notification; an uncaught throw here kills the whole message
+              // handler, so the native toast is best-effort (same as approval).
+              try {
+                new Notification(doneTitle, {
+                  body: i18nT("hooks.useWebSocket.response_ready"),
+                  tag: `kirocrew-chat-done:${doneSlot}`,
+                });
+              } catch {
+                /* unsupported platform */
+              }
             }
             if (
               data.slot &&
@@ -2657,19 +3006,50 @@ export function useWebSocket() {
               // Turn boundary: the finished turn is the likeliest moment for
               // this session's PRs to have moved (comments, mergeability, a
               // pushed revision) — changes the lightweight status delta does NOT
-              // carry. Invalidate the detail/status queries so they refetch.
-              // For the ACTIVE slot, refetch now (the panel is on screen). For a
-              // BACKGROUND slot, only MARK stale (refetchType: 'none'): its
-              // detail query is staleTime:Infinity, so without this it would stay
-              // "fresh" forever and render pre-turn data when the user later
-              // switches to it — but refetching an off-screen PR every background
-              // turn would be wasteful, so defer the fetch to its next mount.
+              // carry. Invalidate the detail queries of THIS slot's own pull
+              // requests so they refetch. For the ACTIVE slot, refetch now (the
+              // panel is on screen). For a BACKGROUND slot, only MARK stale
+              // (refetchType: 'none'): its detail query is staleTime:Infinity,
+              // so without this it would stay "fresh" forever and render
+              // pre-turn data when the user later switches to it — but
+              // refetching an off-screen PR every background turn would be
+              // wasteful, so defer the fetch to its next mount.
+              //
+              // Scoped to the slot's own links, never the whole key family: an
+              // unscoped invalidation marked EVERY session's PR stale on EVERY
+              // turn anywhere, so a panel reopened while any chat was running
+              // always refetched (five provider subprocesses per open) even
+              // though nothing about that PR had changed.
+              //
+              // The ACTIVE slot additionally refetches whatever detail query is
+              // MOUNTED — the PR on screen: the slots payload names only the
+              // first few chips, so a session with more PRs than chips could
+              // otherwise have the very PR the user is looking at fall outside
+              // the scoped set. `refetchQueries` with `type: 'active'` is the
+              // primitive for that: it refetches the mounted queries only and
+              // marks nothing else stale. (`invalidateQueries` with
+              // `refetchType: 'active'` would NOT do — refetchType limits only
+              // the refetch, the stale marking still hits every cached PR.) A
+              // background slot's overflow PRs are left to the status-delta
+              // path (lifecycle / CI / merge pair); their comments may lag until
+              // the next event or remount.
               const isActive = data.slot === store.getState().chat.activeSlot;
               const refetchType = isActive ? "active" : "none";
-              queryClient.invalidateQueries({
-                queryKey: ["pull-request-source"],
-                refetchType,
-              });
+              if (isActive) {
+                void queryClient.refetchQueries({
+                  queryKey: ["pull-request-source"],
+                  type: "active",
+                });
+              }
+              for (const url of slotChangeUrls(
+                store.getState().dashboard.slots,
+                data.slot,
+              )) {
+                queryClient.invalidateQueries({
+                  queryKey: ["pull-request-source", url],
+                  refetchType: "none",
+                });
+              }
               queryClient.invalidateQueries({
                 queryKey: ["pull-request-statuses"],
                 refetchType,
@@ -2689,73 +3069,141 @@ export function useWebSocket() {
             }
             break;
           case "autonudge_state": {
-            // Broadcast for ChatPage to refresh its autonudge loop state.
-            window.dispatchEvent(
-              new CustomEvent("autonudge_state", { detail: data }),
-            );
-            // Mirror into the store as well, so the sidebar can show progress on
-            // EVERY looping row instead of only the active slot (ChatPage's
-            // listener filters to `activeSlot`). The service emits one event per
-            // fired cycle, which is what makes the cycle counter tick live.
+            // One transport path feeds the authoritative collection consumed by
+            // both the sidebar and active-slot detail surface.
             const nudge = data as unknown as {
               event?: string;
               slot?: string;
-              loop?: {
-                active?: boolean;
-                cycle_count?: number;
-                max_cycles?: number;
-              };
+              loop?: Record<string, unknown>;
             };
             if (nudge.slot) {
+              const slot = dashboardAutomationSlotKey(nudge.slot);
+              if (nudge.event === "removed") {
+                // A failed refetch must not leave the detail query able to
+                // resurrect a record the live stream authoritatively removed.
+                queryClient.setQueryData(["session-automation", slot], null);
+                // The removal is authoritative for the current frame, but a
+                // refresh still catches a successor created concurrently.
+                queryClient.invalidateQueries({
+                  queryKey: ["session-automation", slot],
+                });
+              }
               // Bump BEFORE dispatching so an in-flight seed is invalidated even
               // if its .then() runs immediately after this frame is handled.
-              goalLoopGenRef.current++;
-              dispatch(
-                sseGoalLoop({
-                  slot: nudge.slot,
-                  // `removed` still carries the loop object (the gateway observer
-                  // only fires when `loop is not None`), and its `active` flag is
-                  // whatever it was at removal — so the event name, not the flag,
-                  // decides a removal.
-                  active:
-                    nudge.event !== "removed" && nudge.loop?.active === true,
-                  cycle_count: Number(nudge.loop?.cycle_count) || 0,
-                  max_cycles: Number(nudge.loop?.max_cycles) || 0,
-                }),
+              automationLiveGenRef.current.set(
+                slot,
+                (automationLiveGenRef.current.get(slot) ?? 0) + 1,
               );
+              if (nudge.event === "removed") {
+                dispatch(removeAutomation(slot));
+                queryClient.invalidateQueries({
+                  queryKey: AUTONUDGE_LOOPS_QUERY_KEY,
+                });
+                break;
+              }
+              const record = normalizeAutomationRecord(nudge);
+              if (record) {
+                // The live projection is already authoritative and normalized;
+                // cache it directly instead of issuing one REST request for
+                // every probe frame.
+                queryClient.setQueryData(["session-automation", slot], record);
+                dispatch(sseAutomation(record));
+              }
             }
+            // Readers of the FULL registry (the Crew Members drawer's patrol
+            // block needs stopped_reason, next_due_ts and banner, none of which
+            // ride this frame) re-read it in place rather than merging a partial
+            // payload — one seed path, not a third copy of the merge.
+            queryClient.invalidateQueries({
+              queryKey: AUTONUDGE_LOOPS_QUERY_KEY,
+            });
             break;
           }
           case "voice_chunk": {
-            if (voiceMutedRef.current) break;
-            if (data.slot !== store.getState().chat.activeSlot) break;
-            // Queue and play audio chunks as they arrive
-            const { audio: b64, audioMime } = data as {
+            if (
+              voiceMutedRef.current ||
+              data.slot !== store.getState().chat.activeSlot
+            )
+              break;
+            const {
+              audio: b64,
+              audioMime,
+              request_id,
+            } = data as {
               audio: string;
               audioMime?: string;
+              request_id?: string;
             };
+            if (
+              !request_id ||
+              voiceRequestsRef.current.get(request_id) !== data.slot
+            )
+              break;
             if (b64) {
               try {
                 const bytes = Uint8Array.from(atob(b64), (c) =>
                   c.charCodeAt(0),
                 );
-                const blob = new Blob([bytes], {
-                  type: audioMime === "audio/wav" ? "audio/wav" : "audio/mpeg",
-                });
-                const url = URL.createObjectURL(blob);
-                voiceQueueRef.current.push(url);
-                dispatch(setVoicePlaying(true));
-                updateVoiceBusy();
-                playNextVoiceChunk();
+                if (
+                  audioMime === "audio/wav" &&
+                  typeof AudioContext !== "undefined"
+                ) {
+                  getPcmPlayer().enqueue(bytes.buffer);
+                  updateVoiceBusy();
+                } else {
+                  const blob = new Blob([bytes], {
+                    type:
+                      audioMime === "audio/wav" ? "audio/wav" : "audio/mpeg",
+                  });
+                  const url = URL.createObjectURL(blob);
+                  voiceQueueRef.current.push(url);
+                  dispatch(setVoicePlaying(true));
+                  updateVoiceBusy();
+                  playNextVoiceChunk();
+                }
               } catch {
-                /* malformed base64 */
+                reportVoiceFailure({
+                  slot: data.slot,
+                  request_id,
+                  code: "voice_playback_failed",
+                });
               }
             }
             break;
           }
           case "voice_complete": {
-            const b64 = (data as { audio: string }).audio;
+            const { audio: b64, request_id } = data as {
+              audio?: string;
+              request_id?: string;
+            };
+            if (
+              voiceMutedRef.current ||
+              data.slot !== store.getState().chat.activeSlot
+            )
+              break;
+            if (!request_id || !voiceRequestsRef.current.delete(request_id))
+              break;
             if (b64) dispatch(setVoiceAudio(b64));
+            break;
+          }
+          case "voice_error": {
+            const { request_id, code } = data as {
+              request_id?: string;
+              code?: string;
+            };
+            if (!request_id || !voiceRequestsRef.current.delete(request_id))
+              break;
+            if (
+              voiceMutedRef.current ||
+              data.slot !== store.getState().chat.activeSlot ||
+              code === "voice_cancelled"
+            )
+              break;
+            reportVoiceFailure({
+              slot: data.slot,
+              request_id,
+              code: code || "voice_synthesis_failed",
+            });
             break;
           }
           case "log":
@@ -2918,6 +3366,19 @@ export function useWebSocket() {
       wsRef.current = null;
 
       if (closingRef.current) return;
+      if (
+        voiceRequestsRef.current.size ||
+        voicePlayingRef.current ||
+        store.getState().chat.voicePlaying
+      ) {
+        reportVoiceFailure({
+          slot: store.getState().chat.activeSlot,
+          code: "voice_playback_failed",
+        });
+        // Audio frames have no reconnect replay. Retrying the connection cannot
+        // recover the missing samples, so release the pending stream explicitly.
+        stopVoice();
+      }
       const delay = reconnectRef.current;
       reconnectRef.current = Math.min(delay * 2, 10000);
       reconnectTimerRef.current = setTimeout(connect, delay);
@@ -2940,10 +3401,11 @@ export function useWebSocket() {
     stopVoice,
     updateVoiceBusy,
     updateAutoSpeak,
+    getPcmPlayer,
     syncPendingApprovals,
     syncPendingQuestions,
     syncWorkflowRuns,
-    seedGoalLoops,
+    seedAutomations,
     recordRetiredId,
   ]);
 
@@ -2985,11 +3447,41 @@ export function useWebSocket() {
   useEffect(() => {
     closingRef.current = false; // reset for StrictMode re-mount
     connect();
-    const onVoiceStop = () => stopVoice();
+    const onVoiceStop = () => {
+      stopVoice();
+      if (autoSpeakRef.current && typeof AudioContext !== "undefined")
+        getPcmPlayer().unlock();
+    };
+    const onVoiceStart = (event: Event) => {
+      const { slot, request_id } = (
+        event as CustomEvent<{ slot: string; request_id: string }>
+      ).detail;
+      voiceRequestsRef.current.set(request_id, slot);
+      if (slot === store.getState().chat.activeSlot) {
+        voiceMutedRef.current = false;
+        if (typeof AudioContext !== "undefined") getPcmPlayer().unlock();
+      }
+    };
+    const onVoiceFailed = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{ slot: string; request_id: string; code: string }>
+      ).detail;
+      if (!voiceRequestsRef.current.delete(detail.request_id)) return;
+      if (
+        !voiceMutedRef.current &&
+        detail.slot === store.getState().chat.activeSlot
+      ) {
+        reportVoiceFailure(detail);
+      }
+    };
     const onVoiceConfigChanged = (e: Event) => {
       const detail = (e as CustomEvent).detail;
       configuredAutoSpeakRef.current = !!detail?.autoSpeak;
       updateAutoSpeak();
+      // Checked AFTER updateAutoSpeak: hands-free can still hold auto-speak on
+      // when the configured setting alone goes off, and stopping then would cut
+      // a hands-free session's speech mid-sentence.
+      if (!autoSpeakRef.current) stopVoice();
     };
     const onHandsFreeSpeechChanged = (e: Event) => {
       const detail = (e as CustomEvent<{ source?: unknown; enabled?: unknown }>)
@@ -3005,6 +3497,8 @@ export function useWebSocket() {
       if (typeof url === "string") playVoiceUrl(url);
     };
     window.addEventListener("voice-stop", onVoiceStop);
+    window.addEventListener("voice-synthesis-start", onVoiceStart);
+    window.addEventListener("voice-synthesis-failed", onVoiceFailed);
     window.addEventListener("voice-config-changed", onVoiceConfigChanged);
     window.addEventListener(
       "handsfree-speech-changed",
@@ -3022,11 +3516,14 @@ export function useWebSocket() {
       ws.send(JSON.stringify({ type: "slot_focused", slot }));
     };
     sendSlotFocusedImpl = sendFocus;
-    let lastFocusSent: string | null = null;
+    let lastFocusSent: string | null = store.getState().chat.activeSlot;
     const unsubFocus = store.subscribe(() => {
       const active = store.getState().chat.activeSlot;
       if (active === lastFocusSent) return; // store.subscribe fires on EVERY action
       lastFocusSent = active;
+      stopVoice();
+      voiceMutedRef.current = false;
+      voiceProgressRef.current = null;
       sendFocus(active);
     });
     const onVisibility = () => {
@@ -3065,7 +3562,12 @@ export function useWebSocket() {
       flushBufferedThinking();
       wsRef.current?.close();
       wsRef.current = null;
+      stopVoice();
+      pcmPlayerRef.current?.close();
+      pcmPlayerRef.current = null;
       window.removeEventListener("voice-stop", onVoiceStop);
+      window.removeEventListener("voice-synthesis-start", onVoiceStart);
+      window.removeEventListener("voice-synthesis-failed", onVoiceFailed);
       window.removeEventListener("voice-config-changed", onVoiceConfigChanged);
       window.removeEventListener(
         "handsfree-speech-changed",
@@ -3081,6 +3583,7 @@ export function useWebSocket() {
     forceReconnect,
     playVoiceUrl,
     stopVoice,
+    getPcmPlayer,
     flushSlotActivity,
     flushSubagentChunks,
     flushBufferedThinking,

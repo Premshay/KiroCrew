@@ -44,9 +44,10 @@ except Exception:  # pragma: no cover
     sel = None  # type: ignore[assignment]
 
 try:
-    from kiro_crew.hooks import _fd_real_path, safe_read_file_bytes_nolink
+    from kiro_crew.hooks import safe_read_file_bytes_nolink
+    from kiro_crew.pinned_fs import fd_real_path
 except Exception:  # pragma: no cover - hooks always present in prod
-    _fd_real_path = None  # type: ignore[assignment]
+    fd_real_path = None  # type: ignore[assignment]
     safe_read_file_bytes_nolink = None  # type: ignore[assignment]
 
 try:
@@ -204,8 +205,8 @@ def _load_settings() -> dict:
     served.
     """
     try:
-        data = json.loads(_settings_path().read_text())
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(_settings_path().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {"base_path": "", "model": ""}
     if not isinstance(data, dict):
         return {"base_path": "", "model": ""}
@@ -259,8 +260,8 @@ def _load_deleted() -> list[str]:
     Shape is treated as untrusted, like every other file this app reads.
     """
     try:
-        data = json.loads(_deleted_path().read_text())
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(_deleted_path().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return []
     if not isinstance(data, list):
         return []
@@ -435,12 +436,12 @@ def _load_index_snapshot() -> tuple[dict, bool]:
     mutation happens to persist the cleaned reservation.
     """
     try:
-        data = json.loads(_index_path().read_text())
+        data = json.loads(_index_path().read_text(encoding="utf-8"))
     except FileNotFoundError:
         clean: dict = {}
         _refresh_slot_keys(clean)
         return clean, True
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}, False
     if not isinstance(data, dict):
         return {}, False
@@ -1060,7 +1061,7 @@ def _open_verified_dir(spec_dir: Path) -> tuple[Path, int] | None:
     mutations use the same descriptor whose identity was authorized here.
     """
     real_dir = _verified_spec_dir(spec_dir)
-    if real_dir is None or not _CAN_PIN_DIR or _fd_real_path is None:
+    if real_dir is None or not _CAN_PIN_DIR or fd_real_path is None:
         return None
     try:
         dir_fd = os.open(
@@ -1070,7 +1071,7 @@ def _open_verified_dir(spec_dir: Path) -> tuple[Path, int] | None:
     except OSError:
         return None
     try:
-        opened_path = _fd_real_path(dir_fd)
+        opened_path = fd_real_path(dir_fd)
         expected = os.path.normcase(str(real_dir))
         if opened_path is None or os.path.normcase(os.path.normpath(opened_path)) != expected:
             os.close(dir_fd)
@@ -1097,7 +1098,7 @@ def _create_open_verified_dir(spec_dir: Path) -> tuple[Path, int, int] | None:
             os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_fd,
         )
-        opened_path = _fd_real_path(dir_fd) if _fd_real_path is not None else None
+        opened_path = fd_real_path(dir_fd) if fd_real_path is not None else None
         expected = os.path.normcase(str(spec_dir))
         if opened_path is None or os.path.normcase(os.path.normpath(opened_path)) != expected:
             os.close(dir_fd)
@@ -2316,7 +2317,7 @@ def _read_recent_projects() -> list[str]:
     BLOCKING -- call via ``asyncio.to_thread``.
     """
     try:
-        data = json.loads((config_dir() / "recent_projects.json").read_text())
+        data = json.loads((config_dir() / "recent_projects.json").read_text(encoding="utf-8"))
     except Exception:
         return []
     if not isinstance(data, list):

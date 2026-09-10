@@ -2930,6 +2930,14 @@ class TestKiroPrerequisiteWorkflow:
         monkeypatch.setattr(platform_compat, "kill_process_tree_async", kill_tree)
         monkeypatch.setattr(platform_compat, "IS_POSIX", True)
         monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+        # The simulated POSIX host must also RESOLVE the ``/usr/bin/env`` wrapper
+        # the spawn path prepends: on a Windows runner the host's ``os.path.isabs``
+        # (ntpath, from Python 3.13) does not consider that path absolute, so the
+        # code falls back to ``trusted_system_bin`` -- which cannot find a POSIX
+        # path on this host and would refuse the spawn before the timeout under
+        # test is ever reached. Resolving the name as itself is what the real
+        # POSIX host does.
+        monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: name)
         # This case is about the timeout escalation, not about sandbox building,
         # and every spawn is sandboxed now — so stub the builder rather than let
         # host sandbox availability decide the outcome.
@@ -5686,7 +5694,7 @@ class TestAgentSpecRepair:
         from kiro_crew import agent as agent_module
 
         self._agents_dir(tmp_path, monkeypatch)
-        # Assembled at runtime so the literal never sits in the file for scrub-lint.
+        # Assembled at runtime so the literal never sits in the file for the scan.
         secret = "ghp_" + "A" * 36
 
         def _rebuild() -> Path:

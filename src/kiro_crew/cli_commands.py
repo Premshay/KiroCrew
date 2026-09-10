@@ -19,6 +19,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -50,16 +51,29 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     WorkspaceConfig,
     build_provider_factory,
+    coerce_dict_section,
     config_local_path,
     config_path,
     read_config_for_update,
     read_local_secret,
     update_config_locked,
 )
-from kiro_crew.cron import CronSchedule, CronService, CronStoreUnreadable, format_schedule
+from kiro_crew.cron import (
+    CronSchedule,
+    CronService,
+    CronStoreUnreadable,
+    format_schedule,
+    lookup_cron_folder_id,
+)
 from kiro_crew.cron_trigger import trigger_cron_job
 from kiro_crew.dashboard import tailnet, tailnet_serve
 from kiro_crew.dashboard.origin import parse_dashboard_url
+from kiro_crew.embeddings import (
+    get_shared_embedder,
+    make_sync_embed_fn,
+    model_file_present,
+    store_embedding_space_is_stale,
+)
 from kiro_crew.eval.judge import LLMJudge
 from kiro_crew.eval.runner import EvalRunner, format_results, score_by_dimension
 from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
@@ -307,6 +321,46 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
             return
 
 
+class _CliConflict(Exception):
+    """An in-lock precondition re-check failed for a CLI config CRUD write.
+
+    The CLI pre-checks its inputs against a config snapshot for fast, friendly
+    errors, but the snapshot can be stale by the time the write runs. The
+    mutate callbacks below re-decide every state-dependent precondition on the
+    document read INSIDE the sidecar flock (#4767) and raise this to refuse.
+    """
+
+
+def _locked_config_write(mutate, *, cleanup_conflict=None, cleanup_failure=None) -> None:
+    """Run one config delta under the sidecar flock; exit(1) on a conflict.
+
+    Replaces the load -> mutate dataclass -> ``cfg.save()`` shape, whose
+    whole-document rename silently discarded any change another process
+    landed between the load and the save (#4767).
+
+    Resolved through the loader MODULE, not this module's by-value imports,
+    so it honors the same ``kiro_crew.config.loader.config_path`` patches the
+    old ``cfg.save()`` path did (save() resolves its path inside loader).
+
+    ``cleanup_conflict`` runs before the exit(1) on a refused precondition;
+    ``cleanup_failure`` runs when the write itself fails -- the workspace
+    create passes its staging-drop / install-rollback handlers here.
+    """
+    from kiro_crew.config import loader as _loader
+
+    try:
+        _loader.update_config_locked(_loader.config_path(), mutate=mutate)
+    except _CliConflict as exc:
+        if cleanup_conflict is not None:
+            cleanup_conflict()
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except BaseException:
+        if cleanup_failure is not None:
+            cleanup_failure()
+        raise
+
+
 def _handle_workspace(args: argparse.Namespace) -> None:
     """Dispatch workspace subcommands: list, create, update, delete."""
 
@@ -331,6 +385,8 @@ def _handle_workspace(args: argparse.Namespace) -> None:
             print(f"Error: workspace '{args.name}' already exists", file=sys.stderr)
             sys.exit(1)
         copy_from = getattr(args, "copy_from", None)
+        staged_path: Path | None = None
+        install_state = {"installed": False}
         if copy_from:
             if copy_from not in cfg.workspaces:
                 print(
@@ -392,13 +448,23 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                             skip.add(entry)
                     return skip
 
-                shutil.copytree(
-                    src_path,
-                    dst_path,
-                    dirs_exist_ok=True,
-                    symlinks=True,
-                    ignore=_ignore_sensitive,
-                )
+                # Copy to a STAGING sibling, not the destination: the copy
+                # runs before the locked registration, so a losing same-name
+                # race must leave the winner's directory untouched (#4767
+                # round 8). The staged tree is installed inside the locked
+                # mutate below, only after the in-lock checks pass.
+                staging = dst_path.parent / f".{dst_path.name}.staging-{uuid.uuid4().hex[:8]}"
+                try:
+                    shutil.copytree(
+                        src_path,
+                        staging,
+                        symlinks=True,
+                        ignore=_ignore_sensitive,
+                    )
+                except BaseException:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    raise
+                staged_path = staging
         else:
             ws_dir = args.dir if args.dir is not None else f"workspace-{args.name}"
 
@@ -430,8 +496,51 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        cfg.workspaces[args.name] = WorkspaceConfig(dir=ws_dir)
-        cfg.save()
+
+        def _mutate_ws_create(doc: dict) -> dict:
+            workspaces = coerce_dict_section(doc, "workspaces")
+            if args.name in workspaces:
+                raise _CliConflict(f"workspace '{args.name}' already exists")
+            used = {str(ws.get("dir", "")) for ws in workspaces.values() if isinstance(ws, dict)}
+            if ws_dir in used:
+                raise _CliConflict(f"directory '{ws_dir}' is already used by another workspace")
+            if staged_path is not None:
+                # Same install invariant as the dashboard handler: the
+                # destination must not exist AT ALL. publish_dir_noreplace,
+                # not check-then-rename: POSIX os.rename silently replaces an
+                # EMPTY destination, so a racer's directory created between
+                # the check and the rename would be destroyed (#4767 round 9).
+                if dst_path.exists():
+                    raise _CliConflict(
+                        f"destination directory '{ws_dir}' already exists; "
+                        "choose another dir or remove it first"
+                    )
+                try:
+                    platform_compat.publish_dir_noreplace(staged_path, dst_path)
+                except (FileExistsError, OSError) as exc:
+                    raise _CliConflict(
+                        f"destination directory '{ws_dir}' already exists; "
+                        "choose another dir or remove it first"
+                    ) from exc
+                install_state["installed"] = True
+            workspaces[args.name] = dataclasses.asdict(WorkspaceConfig(dir=ws_dir))
+            return doc
+
+        def _drop_staging() -> None:
+            if staged_path is not None and not install_state["installed"]:
+                shutil.rmtree(staged_path, ignore_errors=True)
+
+        def _rollback_install() -> None:
+            if install_state["installed"]:
+                shutil.rmtree(dst_path, ignore_errors=True)
+            elif staged_path is not None:
+                shutil.rmtree(staged_path, ignore_errors=True)
+
+        _locked_config_write(
+            _mutate_ws_create,
+            cleanup_conflict=_drop_staging,
+            cleanup_failure=_rollback_install,
+        )
         sel().log_api_access(
             caller="cli",
             operation="workspace.create",
@@ -474,8 +583,26 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            cfg.workspaces[args.name].dir = args.dir
-        cfg.save()
+
+        def _mutate_ws_update(doc: dict) -> dict:
+            workspaces = coerce_dict_section(doc, "workspaces")
+            entry = workspaces.get(args.name)
+            if not isinstance(entry, dict):
+                raise _CliConflict(f"workspace '{args.name}' not found")
+            if args.dir is not None:
+                used = {
+                    str(ws.get("dir", ""))
+                    for n, ws in workspaces.items()
+                    if n != args.name and isinstance(ws, dict)
+                }
+                if args.dir in used:
+                    raise _CliConflict(
+                        f"directory '{args.dir}' is already used by another workspace"
+                    )
+                entry["dir"] = args.dir
+            return doc
+
+        _locked_config_write(_mutate_ws_update)
         sel().log_api_access(
             caller="cli",
             operation="workspace.update",
@@ -524,8 +651,32 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        del cfg.workspaces[args.name]
-        cfg.save()
+
+        def _mutate_ws_delete(doc: dict) -> dict:
+            workspaces = coerce_dict_section(doc, "workspaces")
+            if args.name not in workspaces:
+                raise _CliConflict(f"workspace '{args.name}' not found")
+            # Re-check the TOP-LEVEL default in-lock: a concurrent default
+            # change between this command's snapshot and the lock would
+            # otherwise leave config pointing at a deleted workspace.
+            if doc.get("default_workspace") == args.name:
+                raise _CliConflict(f"cannot delete default workspace '{args.name}'")
+            agents = doc.get("agents")
+            if isinstance(agents, dict):
+                still_referencing = sorted(
+                    a
+                    for a, ac in agents.items()
+                    if isinstance(ac, dict) and ac.get("workspace") == args.name
+                )
+                if still_referencing:
+                    raise _CliConflict(
+                        f"workspace '{args.name}' is referenced by agents: "
+                        + ", ".join(still_referencing)
+                    )
+            del workspaces[args.name]
+            return doc
+
+        _locked_config_write(_mutate_ws_delete)
         sel().log_api_access(
             caller="cli",
             operation="workspace.delete",
@@ -615,30 +766,36 @@ def _register_app_crons_to_scheduler(app_name: str) -> list[str]:
 
 
 def _warn_hooks_need_restart(app_name: str) -> bool:
-    """Say plainly that a running gateway will not pick up this app's backend hooks.
+    """Tell the operator how a CLI enable's backend-hook change reaches a gateway.
 
     Everything else a CLI enable writes is re-read by a running gateway:
     ``enable_app`` writes ``installed.json``, ``register_app`` writes agent and
     skill files, and ``_register_app_crons_to_scheduler`` writes through the
     shared cron store that the gateway's timer tick re-syncs by content digest.
-    Backend hooks are the exception -- they are Python modules imported INTO the
-    gateway process, and only the gateway can replace them (``on_app_enable`` ->
+    Backend hooks are Python modules imported INTO the gateway process, and only
+    the gateway can replace them (``on_app_enable`` ->
     ``RouteRegistry.register_app_routes`` -> ``load_app_module``, reached by the
-    HTTP enable route and by ``on_gateway_startup``). This process has no handle
-    on that one's ``sys.modules``, so a CLI enable cannot load them.
+    HTTP enable route and by ``on_gateway_startup``). This CLI process has no
+    handle on that one's ``sys.modules``, so it cannot load them directly --
+    but it no longer needs to: the gateway runs a hook reconciler
+    (``apps/hook_reconcile.py``) that notices an on-disk hook change this CLI
+    made and reloads it in-process within a poll interval (issue #7880). A
+    stopped gateway loads the new code on its next start.
 
-    Printing only "enabled <app>" reads as though it had. The operator then
-    verifies a hook change against the code the gateway imported earlier and
-    concludes the change did not work -- or that it did, when it never ran
-    (issue #7880).
+    Printing only "enabled <app>" reads as though the change were already live in
+    a running gateway, when in fact it lands a few seconds later; and pre-#7880
+    it never landed at all until a manual restart. This notice states the actual
+    timing so an operator does not verify a hook change against stale code and
+    draw the wrong conclusion.
 
     Deliberately NOT gated on a live-gateway probe. ``_marker_port`` is the only
     verified one available here, and it writes its own multi-gateway warning to
     stderr, which would surface out of context on an app enable. The notice is
-    phrased conditionally instead, so it stays true when no gateway is up.
+    phrased conditionally instead, so it stays true whether or not a gateway is
+    up.
 
-    Only for apps that declare ``backend.hooks``: there is nothing stale to warn
-    about otherwise. Returns whether the notice was printed.
+    Only for apps that declare ``backend.hooks``: there is nothing to say
+    otherwise. Returns whether the notice was printed.
     """
     info = get_app(app_name)
     manifest = info.get("manifest") if isinstance(info, dict) else None
@@ -649,10 +806,9 @@ def _warn_hooks_need_restart(app_name: str) -> bool:
     declared = ", ".join(sorted(str(k) for k in hooks))
     print(
         f"  note: this app declares backend hooks ({declared}).\n"
-        "  A gateway that is already running keeps executing the hook code it\n"
-        "  imported earlier; this command cannot replace it. Run `kirocrew\n"
-        "  restart`, or disable and re-enable the app from the dashboard, for\n"
-        "  hook changes to take effect."
+        "  A gateway that is already running reloads them automatically within a\n"
+        "  few seconds (the gateway reconciles hook changes it did not perform\n"
+        "  itself); if the gateway is stopped, they load on its next start."
     )
     return True
 
@@ -799,7 +955,22 @@ def _handle_app(args: argparse.Namespace) -> None:
         from kiro_crew.apps.dev_mode import set_dev_mode
 
         enabled = not getattr(args, "off", False)
-        dev_result = set_dev_mode(args.name, enabled)
+        confirm_root = getattr(args, "confirm_out_of_install_root", False)
+        if confirm_root and not enabled:
+            # The confirmation only applies to enabling: a disable never
+            # grants. Say so rather than silently ignoring the flag — an
+            # operator who reaches for it on the wrong invocation would
+            # otherwise read the exit-0 as "confirmed".
+            print(
+                "⚠️  --confirm-out-of-install-root has no effect with --off "
+                "(disabling grants nothing)",
+                file=sys.stderr,
+            )
+        dev_result = set_dev_mode(
+            args.name,
+            enabled,
+            confirm_out_of_install_root=confirm_root,
+        )
         if "error" in dev_result:
             print(f"❌ {dev_result['error']}", file=sys.stderr)
             sys.exit(1)
@@ -873,26 +1044,42 @@ def _handle_agent(args: argparse.Namespace) -> None:
         if args.name in cfg.agents:
             print(f"Error: agent '{args.name}' already exists", file=sys.stderr)
             sys.exit(1)
-        cfg.agents[args.name] = KiroCrewAgentConfig(
-            kiro_agent=args.kiro_agent,
-            workspace=args.workspace,
-            memory_store=args.memory_store,
-        )
-        cfg.save()
+
+        def _mutate_agent_create(doc: dict) -> dict:
+            agents = coerce_dict_section(doc, "agents")
+            if args.name in agents:
+                raise _CliConflict(f"agent '{args.name}' already exists")
+            agents[args.name] = dataclasses.asdict(
+                KiroCrewAgentConfig(
+                    kiro_agent=args.kiro_agent,
+                    workspace=args.workspace,
+                    memory_store=args.memory_store,
+                )
+            )
+            return doc
+
+        _locked_config_write(_mutate_agent_create)
         print(f"Created agent: {args.name}")
 
     elif action == "update":
         if args.name not in cfg.agents:
             print(f"Error: agent '{args.name}' not found", file=sys.stderr)
             sys.exit(1)
-        agent = cfg.agents[args.name]
-        if args.kiro_agent is not None:
-            agent.kiro_agent = args.kiro_agent
-        if args.workspace is not None:
-            agent.workspace = args.workspace
-        if args.memory_store is not None:
-            agent.memory_store = args.memory_store
-        cfg.save()
+
+        def _mutate_agent_update(doc: dict) -> dict:
+            agents = coerce_dict_section(doc, "agents")
+            entry = agents.get(args.name)
+            if not isinstance(entry, dict):
+                raise _CliConflict(f"agent '{args.name}' not found")
+            if args.kiro_agent is not None:
+                entry["kiro_agent"] = args.kiro_agent
+            if args.workspace is not None:
+                entry["workspace"] = args.workspace
+            if args.memory_store is not None:
+                entry["memory_store"] = args.memory_store
+            return doc
+
+        _locked_config_write(_mutate_agent_update)
         print(f"Updated agent: {args.name}")
 
     elif action == "delete":
@@ -905,8 +1092,23 @@ def _handle_agent(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        del cfg.agents[args.name]
-        cfg.save()
+
+        def _mutate_agent_delete(doc: dict) -> dict:
+            agents = coerce_dict_section(doc, "agents")
+            if args.name not in agents:
+                raise _CliConflict(f"agent '{args.name}' not found")
+            # Re-check the default in-lock, at the authoritative TOP-LEVEL key
+            # (loader reads `data.get("default_agent")`); the agent-section
+            # key is the migration-era location and is checked as well.
+            agent_section = doc.get("agent")
+            if doc.get("default_agent") == args.name or (
+                isinstance(agent_section, dict) and agent_section.get("default_agent") == args.name
+            ):
+                raise _CliConflict(f"cannot delete default agent '{args.name}'")
+            del agents[args.name]
+            return doc
+
+        _locked_config_write(_mutate_agent_delete)
         print(f"Deleted agent: {args.name}")
 
     elif action == "reset-model":
@@ -1090,6 +1292,19 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
         approval_mode = getattr(args, "approval_mode", "") or ""
         agent = (getattr(args, "agent", "") or "").strip()
         silent = getattr(args, "silent", False)
+        folder_ref = (getattr(args, "folder", "") or "").strip()
+        # Resolve BEFORE add_job so a typo'd folder never leaves an orphaned
+        # job behind. Existing folders only: cron_folders.json is owned by the
+        # dashboard (its state rewrites the file wholesale), so a CLI-side
+        # create could be silently clobbered by the next Schedule-page folder
+        # operation.
+        folder_id = ""
+        if folder_ref:
+            found = lookup_cron_folder_id(folder_ref)
+            if found.error:
+                print(f"Error: {found.error}", file=sys.stderr)
+                sys.exit(1)
+            folder_id = found.folder_id
         if agent and not _AGENT_NAME_RE.match(agent):
             print(
                 "Error: invalid agent name (alphanumeric, hyphens, underscores; 1-64 chars)",
@@ -1101,25 +1316,31 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 f"Error: invalid channel ID format (expected {CHANNEL_ID_RE.pattern.strip('^$')})"
             )
             return
-        if cron_expr:
-            job = svc.add_job(
-                name=args.name,
-                message=args.message,
-                cron_expr=cron_expr,
-                channel=channel,
-                approval_mode=approval_mode,
-            )
-        elif every:
-            job = svc.add_job(
-                name=args.name,
-                message=args.message,
-                every_secs=every,
-                channel=channel,
-                approval_mode=approval_mode,
-            )
-        else:
-            print("Provide --every or --cron")
-            return
+        try:
+            if cron_expr:
+                job = svc.add_job(
+                    name=args.name,
+                    message=args.message,
+                    cron_expr=cron_expr,
+                    channel=channel,
+                    approval_mode=approval_mode,
+                    folder_id=folder_id,
+                )
+            elif every:
+                job = svc.add_job(
+                    name=args.name,
+                    message=args.message,
+                    every_secs=every,
+                    channel=channel,
+                    approval_mode=approval_mode,
+                    folder_id=folder_id,
+                )
+            else:
+                print("Provide --every or --cron")
+                return
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
         # agent_id and silent are CronJob fields but not add_job kwargs;
         # mirror the MCP cron_add post-create mutation pattern so they
         # are persisted with the job.
@@ -1812,6 +2033,28 @@ def _policy_fetch(*, force: bool) -> None:
     raise SystemExit(1)
 
 
+def write_eval_artifacts(
+    results_dir: Path, ts: str, report: str, json_data: dict[str, object]
+) -> tuple[Path, Path]:
+    """Write the run's Markdown report and JSON summary, and return their paths.
+
+    Both are written as UTF-8 rather than the host's locale codec.
+    ``eval.runner.format_results`` puts a ✅ or ❌ on every scenario, session and
+    turn, so the report is never ASCII, and the turn snippets it embeds carry
+    whatever the agent said. Under the default codec on a Windows host — cp1252 in
+    the US and western Europe, cp950, cp932 and friends elsewhere — encoding that
+    raises ``UnicodeEncodeError``, and the raise lands AFTER the whole eval has
+    run, taking the JSON summary with it.
+    """
+
+    results_dir.mkdir(exist_ok=True)
+    report_path = results_dir / f"eval_{ts}.md"
+    report_path.write_text(report + "\n", encoding="utf-8")
+    json_path = results_dir / f"eval_{ts}.json"
+    json_path.write_text(json.dumps(json_data, indent=2) + "\n", encoding="utf-8")
+    return report_path, json_path
+
+
 async def _run_eval(args: argparse.Namespace) -> None:
     """Run multi-session evaluation scenarios."""
 
@@ -1899,13 +2142,7 @@ async def _run_eval(args: argparse.Namespace) -> None:
 
     # Save results
     results_dir = Path.cwd() / "eval_results"
-    results_dir.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
-    report_path = results_dir / f"eval_{ts}.md"
-    report_path.write_text(report + "\n")
-
-    json_path = results_dir / f"eval_{ts}.json"
     json_data = {
         "timestamp": ts,
         "scenarios": [r.summary() for r in results],
@@ -1913,7 +2150,7 @@ async def _run_eval(args: argparse.Namespace) -> None:
         "overall_passed": overall,
         "overall_total": len(results),
     }
-    json_path.write_text(json.dumps(json_data, indent=2) + "\n")
+    report_path, json_path = write_eval_artifacts(results_dir, ts, report, json_data)
 
     print(f"\nResults saved to:\n  {report_path}\n  {json_path}")
 
@@ -1978,6 +2215,58 @@ def _learn(args: argparse.Namespace) -> None:
             # only way into that branch.
             result = vs.write_lesson(rule, category, negative)
             neg = f" ({negative})" if negative else ""
+            # What the save COST. The store's dedup rules tombstone a stored lesson
+            # the submitted rule contains or heavily overlaps, and this command
+            # printed "Saved:" and the dedup NOTE below without ever naming the rule
+            # it removed -- so adding a conditional rule retired the general rule
+            # inside it and the only trace was a row with is_deleted=1. Printed in
+            # full for every outcome that can carry it, because the row is a
+            # tombstone: `learn list` cannot show it and this is the last readable
+            # copy.
+            lost = ""
+            if result.superseded:
+                # Strip terminal controls FIRST, then redact. The order is the whole
+                # correctness of this function, and the intuitive order is the wrong
+                # one: redacting first leaves `AKIA<CSI>IOSFODNN7EXAMPLE` untouched,
+                # because the escape breaks the token so the credential regex does not
+                # match it -- and the control-strip then REASSEMBLES the complete
+                # credential and prints it. Measured: redact-then-strip leaks that
+                # input verbatim; strip-then-redact masks it. Stripping can only ever
+                # JOIN characters, never split a token, so running it first can only
+                # help the regex, never hide a credential from it.
+                #
+                # Both treatments are needed, and both were added in response to a
+                # real finding: an OSC payload stored in a rule would otherwise be
+                # interpreted by the terminal, and a credential in a lesson would
+                # otherwise be printed. This block prints a rule the user did NOT ask
+                # to see, on the one path guaranteed to surface it.
+                #
+                # Redacting at all (rather than control-stripping only) reversed an
+                # earlier decision here. `learn list` prints every stored lesson with
+                # control-stripping alone, and that looked like the convention to
+                # match -- but it is an EXPLICIT request to see the store, while this
+                # block surfaces a lesson the user is about to lose. The right
+                # comparison is the route, which delivers the SAME field and does
+                # redact, so controls-only made one feature's two delivery paths
+                # disagree about whether a superseded rule may carry a secret. A lesson
+                # written by history consolidation also holds model output the user
+                # never typed, so "their own store" is not "their own knowledge".
+                def _safe(text: str) -> str:
+                    text = _TERMINAL_CTRL_RE.sub("", text)
+                    text, _ = redact_exfiltration_urls(text)
+                    text, _ = redact_credentials(text)
+                    return text
+
+                lines = "".join(f"\n    - {_safe(s)}" for s in result.superseded)
+                lost = (
+                    f"\n  REMOVED {len(result.superseded)} stored "
+                    f"lesson{'s' if len(result.superseded) != 1 else ''} this rule "
+                    f"contains or overlaps:{lines}\n"
+                    "  Those are no longer in effect. A verbatim re-add is DECLINED "
+                    "while this rule is stored, so to restore one exactly, "
+                    "`learn remove` this rule first; wording that shares few "
+                    "significant words with it can coexist."
+                )
             # The category is echoed ONLY where the store adopted the submitted one.
             # It is write-once (vector_memory.py builds an enrichment with the STORED
             # category, falling back to the submitted one only when the row has none),
@@ -1986,7 +2275,10 @@ def _learn(args: argparse.Namespace) -> None:
             # the same defect this PR fixes on the reporting side. `learn list` is
             # where stored values belong.
             if result.outcome is LessonWriteOutcome.INSERTED:
-                print(f"Saved: {rule}{neg} [{category}]\n{_LEARN_EMBED_NOTE}\n{_LEARN_DEDUP_NOTE}")
+                print(
+                    f"Saved: {rule}{neg} [{category}]\n{_LEARN_EMBED_NOTE}\n"
+                    f"{_LEARN_DEDUP_NOTE}{lost}"
+                )
             elif result.outcome is LessonWriteOutcome.ENRICHED:
                 # No _LEARN_DEDUP_NOTE here: an enrichment matched its existing row in
                 # pass 1, which SKIPS the generic dedup scan. Instead say what the
@@ -2006,14 +2298,18 @@ def _learn(args: argparse.Namespace) -> None:
                     "changing one means `learn remove` then `learn add`."
                 )
             elif result.outcome is LessonWriteOutcome.DEDUPED:
-                print(f"Not saved: an existing lesson already covers this ({result.reason})")
+                covered = f"Not saved: an existing lesson already covers this ({result.reason})"
+                print(f"{covered}{lost}")
             else:
                 # REFUSED -- and any outcome a later change adds, which is deliberate:
                 # every branch above names ONE outcome, so a new one lands here and
                 # exits non-zero rather than being silently reported as a success. A
                 # non-zero exit so a script driving this command sees the failure.
                 reason = f" ({result.reason})" if result.reason else ""
-                print(f"NOT saved: the memory store refused this lesson{reason}", file=sys.stderr)
+                print(
+                    f"NOT saved: the memory store refused this lesson{reason}{lost}",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
 
         elif action == "list":
@@ -2150,6 +2446,84 @@ def _memory_show(args: argparse.Namespace) -> None:
         print(_TERMINAL_CTRL_RE.sub("", text))
 
 
+# Each says WHICH index answered, because the caller cannot tell a keyword hit
+# from a semantic one by looking at the output. On stderr, not stdout: the hits
+# are still the answer and `--layer vector`'s stdout shape is a documented
+# promise. Same degradations, same wording shape, as the `kirocrew run`
+# store in cli_server.
+_SEARCH_KEYWORD_ONLY_NO_MODEL = (
+    "Embedding model not downloaded yet — keyword-matching this query "
+    "(the gateway downloads it in the background)"
+)
+_SEARCH_KEYWORD_ONLY_STALE_SPACE = (
+    "Embedding model changed — keyword-matching this query "
+    "(the gateway re-embeds in the background)"
+)
+_SEARCH_KEYWORD_ONLY_NOT_READY = (
+    "Embedding model did not load — keyword-matching this query "
+    "(run 'kirocrew doctor' for the reason)"
+)
+_SEARCH_KEYWORD_ONLY_PENDING_ROWS = (
+    "No embedded episodic row matched — keyword-matching this query "
+    "(rows still waiting for the gateway's re-embed sweep are keyword-only)"
+)
+# Loading the GGUF off local disk, matching the wait the knowledge bench allows
+# for the same one-shot CLI block (`cli_bench._KB_REAL_EMBED_TIMEOUT_S`).
+_SEARCH_MODEL_LOAD_TIMEOUT_SECS = 120.0
+
+
+def _memory_search_embedding(store: VectorMemoryStore, query: str) -> list[float] | None:
+    """Query vector for `memory search`, or None when it must degrade to keyword.
+
+    ``search_episodic`` text-searches whenever ``query_embedding`` is None and
+    does NOT auto-embed (only ``get_episodic_context`` does), and nothing repairs
+    an un-embedded QUERY the way the gateway's boot sweep repairs an un-embedded
+    row — so a one-shot read has to produce its own vector or it can never do
+    semantic recall at all. Without one, `--layer all` prints two labelled
+    sections that are both keyword hits over different corpora, while the two are
+    documented as answering different questions ("where did I write this word"
+    versus "what does this mean like").
+
+    Deliberately NO download kick: this is a one-shot CLI and must not start a
+    610MB download it will abandon at exit; the long-lived gateway owns that. A
+    stale vector space degrades this query too — the loaded FAISS index was built
+    by a different model, so scoring a new-model query vector against it compares
+    incomparable vectors, which is worse than keyword.
+
+    Unlike the long-lived stores (gateway, `kirocrew run`), this store embeds
+    exactly once, so ``embed_fn`` is bound only on the path that reaches the
+    embed and no ``embed_fn_factory`` is wired: there is no later write for a
+    lazy rebind to serve, and leaving the factory unset means the degraded
+    branches above cannot be silently undone underneath them.
+    """
+    if not query:
+        return None
+    if not model_file_present():
+        print(_SEARCH_KEYWORD_ONLY_NO_MODEL, file=sys.stderr)
+        return None
+    if store_embedding_space_is_stale(store):
+        print(_SEARCH_KEYWORD_ONLY_STALE_SPACE, file=sys.stderr)
+        return None
+    # BLOCK once, here. The callable from make_sync_embed_fn() never waits on the
+    # model load — it kicks the background load and returns None — so binding it
+    # alone leaves the very invocation the user typed on keyword search. A
+    # one-shot read is exactly the sync context wait_ready() exists for.
+    # wait_ready is the llama.cpp backend's seam and NOT on the EmbeddingBackend
+    # ABC, so probe for it, same as the dashboard and the re-embed sweep.
+    embedder = get_shared_embedder()
+    wait_ready = getattr(embedder, "wait_ready", None)
+    ready = (
+        wait_ready(timeout=_SEARCH_MODEL_LOAD_TIMEOUT_SECS)
+        if callable(wait_ready)
+        else embedder.is_ready()
+    )
+    if not ready:
+        print(_SEARCH_KEYWORD_ONLY_NOT_READY, file=sys.stderr)
+        return None
+    store.embed_fn = make_sync_embed_fn()
+    return store._try_embed(query)
+
+
 def _memory_cmd(args: argparse.Namespace) -> None:
     """Manage the memory system (vector store + markdown layer)."""
     action = getattr(args, "mem_action", None)
@@ -2190,7 +2564,32 @@ def _memory_cmd(args: argparse.Namespace) -> None:
         elif action == "search":
             layer = getattr(args, "layer", "all")
             if layer in ("vector", "all"):
-                results = store.search_episodic(query_text=args.query, limit=10)
+                query_embedding = _memory_search_embedding(store, args.query)
+                results = store.search_episodic(
+                    query_embedding=query_embedding,
+                    query_text=args.query,
+                    limit=10,
+                )
+                if not results and query_embedding is not None:
+                    # Both vector legs score only rows with a non-NULL embedding
+                    # (search_episodic's FAISS branch and _sqlite_vector_search's
+                    # "embedding IS NOT NULL"), and NULL rows are a designed
+                    # state: write_episodic(defer_embedding=True) bulk writers,
+                    # `memory import` / `memory migrate` — THIS store binds no
+                    # embed_fn on those paths — and rows cleared by
+                    # reconcile_embedding_space. All of them wait on the
+                    # gateway's boot-only, paced backfill sweep, so an empty
+                    # semantic result over an un-embedded corpus is not "no such
+                    # memory". Retry the keyword leg the pre-embedding CLI used
+                    # rather than reporting nothing; guarded on query_embedding
+                    # so the degraded paths above never run it twice.
+                    results = store.search_episodic(query_text=args.query, limit=10)
+                    if results:
+                        # Only when keyword actually recovered something the
+                        # vector pass could not see — an empty store must not
+                        # emit a degrade line. Same stderr rule as the three
+                        # degrades above: stdout shape is a promise.
+                        print(_SEARCH_KEYWORD_ONLY_PENDING_ROWS, file=sys.stderr)
                 if not results:
                     print("No episodic memories found.")
                     # Under "all" the markdown layer is still to come: an empty
@@ -2228,6 +2627,21 @@ def _memory_cmd(args: argparse.Namespace) -> None:
             else:
                 print("  FAISS accelerator: not installed — stdlib cosine fallback (exact)")
             print(f"  Audit events: {stats['events_count']}")
+            reads = store.read_counters()
+            # This process only: the store was constructed for this command, so
+            # the totals describe the reads this invocation itself performed, not
+            # the store's lifetime. The gateway's own totals are the `reads`
+            # object on GET /api/memory/observability.
+            print(
+                f"  Reads (this process): {reads['rows_read']} rows over "
+                f"{reads['statements_executed']} statements"
+            )
+            print(
+                f"    population scans: semantic {reads['semantic_full_scans']}"
+                f" ({reads['semantic_rows_read']} rows),"
+                f" episodic {reads['episodic_full_scans']}"
+                f" ({reads['episodic_rows_read']} rows)"
+            )
 
         elif action == "audit":
             findings = scan_memory()

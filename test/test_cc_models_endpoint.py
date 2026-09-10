@@ -38,12 +38,24 @@ def _request_with_providers(providers: dict) -> MagicMock:
     return req
 
 
-class _FakeProvider:
-    def __init__(self, models):
-        self._models = models
+def _FakeProvider(models, *, backend=None):
+    """A provider double carrying a REAL capability record, not an identity flag.
 
-    def available_models(self):
-        return self._models
+    ``_advertised_cc_models`` selects a session by
+    ``SessionCapabilities.resolves_model_from_advertised_list`` AND by
+    ``model_id_namespace``, and ``capabilities_of`` requires a genuine record: a
+    ``MagicMock(spec=...)``'s attributes are all truthy, so an attribute-shaped
+    assertion would let this double claim every capability at once. Setting the
+    real record is what makes the double describe a backend that exists.
+    """
+    from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+    from kiro_crew.agent_sdk.capabilities import capabilities_for
+    from kiro_crew.providers.acp import AcpProvider
+
+    provider = MagicMock(spec=AcpProvider)
+    provider.capabilities = capabilities_for(ACP_BACKEND_CLAUDE if backend is None else backend)
+    provider.available_models.return_value = models
+    return provider
 
 
 class TestAdvertisedCcModels:
@@ -54,7 +66,7 @@ class TestAdvertisedCcModels:
                 {"modelId": "claude-sonnet-4-6", "name": "Sonnet 4.6", "description": "Everyday"},
             ]
         )
-        out = _advertised_cc_models(_request_with_providers({"s": prov}))
+        out = _advertised_cc_models(_request_with_providers({"s": prov}), "claude_code")
         assert out == [
             {
                 "model_name": "claude-sonnet-4-6",
@@ -63,9 +75,8 @@ class TestAdvertisedCcModels:
             }
         ]
 
-    def test_known_provider_id_mapped_to_canonical_key(self):
-        # A backend provider id that IS in the registry maps back to its
-        # canonical key so it dedups against the registry rows.
+    def test_known_provider_id_kept_verbatim(self):
+        # The advertised id is the value set_config_option accepts.
         prov = _FakeProvider(
             [
                 {
@@ -75,14 +86,41 @@ class TestAdvertisedCcModels:
                 },
             ]
         )
-        out = _advertised_cc_models(_request_with_providers({"s": prov}))
-        assert out[0]["model_name"] == "opus-4.8-1m"
+        out = _advertised_cc_models(_request_with_providers({"s": prov}), "claude_code")
+        assert out[0]["model_name"] == "global.anthropic.claude-opus-4-8[1m]"
 
     def test_empty_when_no_active_sessions(self):
-        assert _advertised_cc_models(_request_with_providers({})) == []
+        assert _advertised_cc_models(_request_with_providers({}), "claude_code") == []
 
     def test_skips_provider_without_accessor(self):
-        out = _advertised_cc_models(_request_with_providers({"s": object()}))
+        prov = _FakeProvider([])
+        prov.available_models = None
+        out = _advertised_cc_models(_request_with_providers({"s": prov}), "claude_code")
+        assert out == []
+
+    def test_skips_non_claude_providers(self):
+        prov = _FakeProvider(
+            [{"modelId": "claude-opus-5", "name": "Opus 5", "description": ""}],
+            backend="",
+        )
+        out = _advertised_cc_models(_request_with_providers({"s": prov}), "claude_code")
+        assert out == []
+
+    def test_skips_a_codex_provider_holding_the_same_capability(self):
+        """codex also resolves from its advertised list, and its ids are not claude's.
+
+        Both harnesses hold ``resolves_model_from_advertised_list``, so the
+        capability alone does not say whose list this is. Without the namespace
+        gate a live codex session would answer the claude picker with codex ids,
+        and claude-agent-acp refuses every one of them.
+        """
+        from kiro_crew.acp_backends import ACP_BACKEND_CODEX
+
+        prov = _FakeProvider(
+            [{"modelId": "gpt-5.4-codex", "name": "GPT-5.4 Codex", "description": ""}],
+            backend=ACP_BACKEND_CODEX,
+        )
+        out = _advertised_cc_models(_request_with_providers({"s": prov}), "claude_code")
         assert out == []
 
 
@@ -114,18 +152,19 @@ class TestCcModelsMerge:
         out = _cc_models(_request_with_providers({"s": prov}))
         names = [m["model_name"] for m in out]
         assert names[0] == "auto"
-        assert "sonnet-4.6-1m" in names
+        assert "global.anthropic.claude-sonnet-4-6[1m]" in names
         # The flagship is in the registry but was NOT advertised → filtered out.
         assert "opus-4.8-1m" not in names
         assert "opus-4.8" not in names
 
     def test_registry_display_name_wins_for_survivors(self):
-        """Filtering keeps the registry's cleaner display name, not the adapter's."""
+        """Filtering keeps the registry's cleaner display name, not the adapter's,
+        while the row's wire value stays the advertised id the backend accepts."""
         prov = _FakeProvider(
             [{"modelId": "global.anthropic.claude-sonnet-4-6[1m]", "name": "sonnet-4-6-v1-ugly"}]
         )
         out = _cc_models(_request_with_providers({"s": prov}))
-        row = next(m for m in out if m["model_name"] == "sonnet-4.6-1m")
+        row = next(m for m in out if m["model_name"] == "global.anthropic.claude-sonnet-4-6[1m]")
         assert row["display_name"] == "Sonnet 4.6 (1M context)"
 
     def test_unknown_advertised_models_still_pass_through(self):
@@ -170,8 +209,8 @@ class TestCcModelsMerge:
         assert names[0] == "auto"  # still after nothing, before everything else
 
     def test_no_duplicate_when_adapter_lists_known_model(self):
-        # The adapter advertises provider ids that ARE in the registry; mapped
-        # back to canonical keys they collapse to one row each (registry wins).
+        # The adapter advertises provider ids that ARE in the registry; each
+        # collapses to one row carrying the advertised wire id (registry display).
         prov = _FakeProvider(
             [
                 {
@@ -188,12 +227,12 @@ class TestCcModelsMerge:
         )
         out = _cc_models(_request_with_providers({"s": prov}))
         names = [m["model_name"] for m in out]
-        assert names.count("opus-4.8-1m") == 1
-        assert names.count("sonnet-4.6-1m") == 1
+        assert names.count("global.anthropic.claude-opus-4-8[1m]") == 1
+        assert names.count("global.anthropic.claude-sonnet-4-6[1m]") == 1
 
     def test_registry_row_keeps_friendly_display_name(self):
-        # When the adapter advertises a known id, the registry row (friendly
-        # display name) wins over the backend's terser name.
+        # When the adapter advertises a known id, the registry's friendly display
+        # name wins while the wire value stays the advertised id.
         prov = _FakeProvider(
             [
                 {
@@ -204,7 +243,7 @@ class TestCcModelsMerge:
             ]
         )
         out = _cc_models(_request_with_providers({"s": prov}))
-        opus48 = next(m for m in out if m["model_name"] == "opus-4.8-1m")
+        opus48 = next(m for m in out if m["model_name"] == "global.anthropic.claude-opus-4-8[1m]")
         assert opus48["display_name"] == "Opus 4.8 (1M context)"
 
     def test_configured_default_force_included(self):

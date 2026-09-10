@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { ApiError } from "../api/apiError";
 import {
   Boxes,
   FolderOpen,
@@ -11,9 +12,10 @@ import {
   Star,
   LayoutGrid,
   Rows3,
+  UserPen,
 } from "lucide-react";
 import Clickable from "../components/Clickable";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useAppDispatch } from "../store";
 import { createSlot } from "../store/chatSlice";
 import { api, type WebhookTokenEntry } from "../api/client";
@@ -49,7 +51,17 @@ import SegmentedControl from "../components/SegmentedControl";
 import InfoTip from "../components/InfoTip";
 import { FOCUSABLE } from "../hooks/useDialogFocusTrap";
 import SimpleSelect from "../components/SimpleSelect";
-import CrewAvatar from "../components/CrewAvatar";
+import CrewAvatar, {
+  ghostTraitsFrom,
+  imageAvatarFrom,
+  packAvatarFrom,
+  unclaimedAvatarFrom,
+  type CrewAvatarOverride,
+} from "../components/CrewAvatar";
+import CrewStateAvatar from "../components/CrewStateAvatar";
+import CrewAvatarBuilder from "../components/CrewAvatarBuilder";
+import { expressionsFrom, soundsFrom } from "../lib/crewAvatarState";
+import CrewAvatarButton from "../components/crew/CrewAvatarButton";
 import CrewWakeSection from "../components/CrewWakeSection";
 import CrewWebhookSection from "../components/CrewWebhookSection";
 import CrewEditorRail from "../components/crew/CrewEditorRail";
@@ -104,6 +116,11 @@ interface AgentUpdatePayload {
   reasoning_effort: string;
   /** Default session color (#rrggbb hex) for new sessions. '' = no default. */
   session_color: string;
+  /** The face this save commits. Three spellings the backend tells apart:
+   *  a record pins a face; `null` is an explicit RESET to the name-derived face;
+   *  `{}` says this save has no opinion about the face at all, and on a crew
+   *  wearing a pack the backend answers it by keeping the pack. */
+  avatar: CrewAvatarOverride | Record<string, unknown> | null;
 }
 
 /** The stored spelling for "no per-agent pin, inherit the next tier down". The
@@ -111,7 +128,19 @@ interface AgentUpdatePayload {
 const INHERIT_MODEL = "auto";
 
 /** Which crew the editor dialog is pointed at. `null` = closed. */
-type SheetTarget = { mode: "create" } | { mode: "edit"; name: string } | null;
+/** `origin` records WHERE a create was asked for: the Crew Members roster's
+ *  "+" sends the user here (#9513), and that origin titles the form in the
+ *  roster's own vocabulary and takes the user back there when it closes. */
+type SheetTarget =
+  | { mode: "create"; origin?: "members" }
+  | { mode: "edit"; name: string }
+  | null;
+/** Which word the create form uses for the thing being made. */
+/** Which word a create-form field uses for the thing being made. REQUIRED on
+ *  every field the form composes — no default — so a future field cannot
+ *  silently fall back to "agent" inside the member flow (the exact "renamed
+ *  one field in" defect #9513's review caught). The editor passes 'agent'. */
+type FormSubject = "agent" | "member";
 
 /** Roster layout. `cards` is the roomy grid, `list` the compact table. */
 type CrewView = "cards" | "list";
@@ -146,6 +175,12 @@ function readStoredView(): CrewView {
  */
 type SharedKind = "none" | "memory" | "files" | "both";
 
+/** Text for a failed query: the thrown message, or the value itself when the
+ *  rejection was not an Error. */
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 /* ── Workspace Creation Dialog (a nested Radix layer inside the crew editor) ── */
 
 /** The form itself, mounted only while the dialog is open.
@@ -167,6 +202,9 @@ function WorkspaceForm({
   const [wsDir, setWsDir] = useState("workspace");
   const [dirTouched, setDirTouched] = useState(false);
   const [copyFrom, setCopyFrom] = useState("");
+  // Two states, because they are two different things: `wsHint` is client-side
+  // validation (nothing failed), `wsError` is the outcome of a request that did.
+  const [wsHint, setWsHint] = useState("");
   const [wsError, setWsError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -184,10 +222,11 @@ function WorkspaceForm({
   };
 
   const submit = async () => {
+    setWsHint("");
     setWsError("");
     const n = wsName.trim();
     if (!n) {
-      setWsError(i18nT("pages.kiroCrewAgentsPage.workspace_name_is_required"));
+      setWsHint(i18nT("pages.kiroCrewAgentsPage.workspace_name_is_required"));
       return;
     }
     setSubmitting(true);
@@ -288,7 +327,17 @@ function WorkspaceForm({
               aria-label={i18nT("pages.kiroCrewAgentsPage.copy_from_workspace")}
             />
           </div>
-          {wsError && <div className="text-danger text-[13px]">{wsError}</div>}
+          {/* Client-side validation hint (the name never left the browser) —
+              not an error surface, so it stays plain text rather than ErrorNotice. */}
+          {wsHint && <div className="text-danger text-[13px]">{wsHint}</div>}
+          {/* No hand-off: the workspace name / directory / copy-from fields
+              (wsName, wsDir, copyFrom) are unsaved — a failed create is exactly
+              what did not store them. */}
+          <ErrorNotice
+            message={wsError}
+            variant="inline"
+            testId="workspace-create-error"
+          />
         </div>
       </DialogBody>
       <DialogFooter>
@@ -427,19 +476,26 @@ export function TemplateField({
   options,
   value,
   onChange,
+  subject,
+  editLaterNote,
 }: {
   label: string;
   options: string[];
   value: string;
   onChange: (v: string) => void;
+  subject: FormSubject;
+  /** Create-only reassurance that the pick is not a commitment. The editor never
+   *  sets it: there the fields being edited are themselves the answer. */
+  editLaterNote?: boolean;
 }) {
+  const hint =
+    subject === "member"
+      ? i18nT("pages.kiroCrewAgentsPage.template_hint_member")
+      : i18nT(
+          "pages.kiroCrewAgentsPage.the_agent_definition_it_boots_from_tools_mcp_ser",
+        );
   return (
-    <Field
-      label={label}
-      hint={i18nT(
-        "pages.kiroCrewAgentsPage.the_agent_definition_it_boots_from_tools_mcp_ser",
-      )}
-    >
+    <Field label={label} hint={hint}>
       <SimpleSelect
         options={withCurrent(options, value)}
         value={value}
@@ -449,6 +505,22 @@ export function TemplateField({
         )}
         aria-label={label}
       />
+      {/* Says "this agent" / "this member", not "the template": a definition
+       *  edit customizes THIS one, so copy implying the template itself changes
+       *  would promise a blast radius onto other agents bound to it that does
+       *  not exist. The noun follows `subject`, like every other string in the
+       *  form: the member flow never says "agent". */}
+      {editLaterNote && (
+        <span className="flex items-start gap-1.5 text-[11.5px] leading-relaxed text-accent">
+          <Sparkles
+            className="lucide-inline h-3 w-3 mt-0.5 shrink-0"
+            aria-hidden="true"
+          />
+          {subject === "member"
+            ? i18nT("pages.kiroCrewAgentsPage.template_edit_later_note_member")
+            : i18nT("pages.kiroCrewAgentsPage.template_edit_later_note")}
+        </span>
+      )}
     </Field>
   );
 }
@@ -458,18 +530,24 @@ export function WorkspaceField({
   value,
   onChange,
   onNewWorkspace,
+  subject,
 }: {
   options: string[];
   value: string;
   onChange: (v: string) => void;
   onNewWorkspace: () => void;
+  subject: FormSubject;
 }) {
   return (
     <Field
       label={i18nT("pages.kiroCrewAgentsPage.workspace_2")}
-      hint={i18nT(
-        "pages.kiroCrewAgentsPage.isolated_memory_and_files_for_this_crew",
-      )}
+      hint={
+        subject === "member"
+          ? i18nT("pages.kiroCrewAgentsPage.workspace_hint_member")
+          : i18nT(
+              "pages.kiroCrewAgentsPage.isolated_memory_and_files_for_this_crew",
+            )
+      }
       info={i18nT("pages.kiroCrewAgentsPage.bindings_preview_info")}
     >
       <SimpleSelect
@@ -490,17 +568,23 @@ export function MemoryStoreField({
   options,
   value,
   onChange,
+  subject,
 }: {
   options: string[];
   value: string;
   onChange: (v: string) => void;
+  subject: FormSubject;
 }) {
   return (
     <Field
       label={i18nT("pages.kiroCrewAgentsPage.memory_store")}
-      hint={i18nT(
-        "pages.kiroCrewAgentsPage.which_store_its_lessons_and_history_are_written",
-      )}
+      hint={
+        subject === "member"
+          ? i18nT("pages.kiroCrewAgentsPage.memory_store_hint_member")
+          : i18nT(
+              "pages.kiroCrewAgentsPage.which_store_its_lessons_and_history_are_written",
+            )
+      }
       info={i18nT("pages.kiroCrewAgentsPage.bindings_preview_info")}
     >
       <SimpleSelect
@@ -593,15 +677,25 @@ export function EffortField({
 export function TriggersField({
   value,
   onChange,
+  subject,
 }: {
   value: string;
   onChange: (v: string) => void;
+  subject: FormSubject;
 }) {
+  const hint =
+    subject === "member"
+      ? i18nT("pages.kiroCrewAgentsPage.triggers_hint_member")
+      : i18nT("pages.kiroCrewAgentsPage.triggers_hint");
+  const info =
+    subject === "member"
+      ? i18nT("pages.kiroCrewAgentsPage.triggers_info_member")
+      : i18nT("pages.kiroCrewAgentsPage.triggers_info");
   return (
     <Field
       label={i18nT("pages.kiroCrewAgentsPage.triggers")}
-      hint={i18nT("pages.kiroCrewAgentsPage.triggers_hint")}
-      info={i18nT("pages.kiroCrewAgentsPage.triggers_info")}
+      hint={hint}
+      info={info}
     >
       <Input
         placeholder={i18nT("pages.kiroCrewAgentsPage.triggers_placeholder")}
@@ -618,9 +712,11 @@ export function TriggersField({
 export function SessionColorField({
   value,
   onChange,
+  subject,
 }: {
   value: string;
   onChange: (v: string) => void;
+  subject: FormSubject;
 }) {
   const HEX_RE = /^#[0-9a-f]{6}$/i;
   const [draft, setDraft] = useState(value || "");
@@ -644,7 +740,11 @@ export function SessionColorField({
   return (
     <Field
       label={i18nT("pages.kiroCrewAgentsPage.session_color")}
-      hint={i18nT("pages.kiroCrewAgentsPage.session_color_hint")}
+      hint={
+        subject === "member"
+          ? i18nT("pages.kiroCrewAgentsPage.session_color_hint_member")
+          : i18nT("pages.kiroCrewAgentsPage.session_color_hint")
+      }
     >
       {/* Quick picks first, exact entry below — the order the session
        *  right-click menu uses, so the two surfaces read the same way.
@@ -747,8 +847,10 @@ function BindingFields({
   modelOptions,
   model,
   setModel,
+  subject,
 }: {
   templateLabel: string;
+  subject: FormSubject;
   kiroAgentOptions: string[];
   kiroAgent: string;
   setKiroAgent: (v: string) => void;
@@ -770,17 +872,21 @@ function BindingFields({
         options={kiroAgentOptions}
         value={kiroAgent}
         onChange={setKiroAgent}
+        subject={subject}
+        editLaterNote
       />
       <WorkspaceField
         options={workspaceOptions}
         value={workspace}
         onChange={setWorkspace}
         onNewWorkspace={onNewWorkspace}
+        subject={subject}
       />
       <MemoryStoreField
         options={memoryStoreOptions}
         value={memoryStore}
         onChange={setMemoryStore}
+        subject={subject}
       />
       {modelOptions && setModel && model !== undefined && (
         <ModelField options={modelOptions} value={model} onChange={setModel} />
@@ -823,7 +929,7 @@ function CrewCard({
       }
     >
       <div className="flex items-center gap-3">
-        <CrewAvatar seed={agent.name} size={38} />
+        <CrewAvatar seed={agent.name} avatar={agent.avatar} size={38} />
         {/* Fixed height for the whole header block. Badges are slightly taller
             than plain text, so cards carrying a `default` badge would otherwise
             push their binding grid lower than a card without one, and the row
@@ -956,7 +1062,7 @@ function CrewRow({
     >
       <TableCell>
         <div className="flex items-center gap-2.5 min-w-0">
-          <CrewAvatar seed={agent.name} size={28} />
+          <CrewAvatar seed={agent.name} avatar={agent.avatar} size={28} />
           <div className="min-w-0">
             <div className="flex items-center gap-2 min-w-0">
               <Clickable
@@ -1022,10 +1128,21 @@ export default function KiroCrewAgentsPage({
   const provider = useProvider();
   const dispatch = useAppDispatch();
   const navigate = useNavigate();
-  const { data: agentsData, refetch: refetchAgents } = useQuery({
+  const queryClient = useQueryClient();
+  const { data: agentsData, error: agentsError } = useQuery({
     queryKey: ["kirocrew-agents"],
     queryFn: () => api.kirocrewAgents(),
   });
+  // After a registry write, invalidate the PREFIX rather than refetching this
+  // page's own query: the Crew Members roster is a projection of the same
+  // registry and lives under the same prefix (see api/membersQuery.ts), so a
+  // crew created, renamed or deleted here reaches it without this page
+  // knowing who else reads the registry. This query is active, so the
+  // invalidation refetches it exactly as `refetch()` did.
+  const refetchAgents = useCallback(
+    () => void queryClient.invalidateQueries({ queryKey: ["kirocrew-agents"] }),
+    [queryClient],
+  );
   // Memoised for the empty case: a bare `|| []` hands out a new array on every
   // render, which defeats every `useMemo` downstream that keys on the roster
   // (`sharedTargets`). React Query's structural sharing keeps `agentsData`
@@ -1037,7 +1154,7 @@ export default function KiroCrewAgentsPage({
   );
   const defaultAgent = agentsData?.default_agent || "";
 
-  const { data: installedAgents } = useQuery({
+  const { data: installedAgents, error: installedError } = useQuery({
     queryKey: ["agents-installed"],
     queryFn: () => api.agentsInstalled(),
   });
@@ -1045,7 +1162,11 @@ export default function KiroCrewAgentsPage({
     ? installedAgents.map((x: { name: string }) => x.name).filter(Boolean)
     : ["kirocrew"];
 
-  const { data: workspacesData, refetch: refetchWorkspaces } = useQuery({
+  const {
+    data: workspacesData,
+    refetch: refetchWorkspaces,
+    error: workspacesError,
+  } = useQuery({
     queryKey: ["workspaces"],
     queryFn: () => api.workspaces(),
   });
@@ -1053,17 +1174,25 @@ export default function KiroCrewAgentsPage({
     (w: { name: string }) => w.name,
   ) || ["default"];
 
-  const { data: kirocrewCfg } = useQuery({
+  const { data: kirocrewCfg, error: cfgError } = useQuery({
     queryKey: ["kirocrewConfig"],
     queryFn: () => api.kirocrewConfig(),
   });
   const memoryStoreOptions = kirocrewCfg?.memory_stores
     ? Object.keys(kirocrewCfg.memory_stores)
     : ["default"];
+  // The three option lists above fall back to a built-in default when their
+  // fetch fails, so without this the editor would offer `default` / `kirocrew`
+  // as though those were the only choices. One notice, first failure wins.
+  const editorOptionsError = installedError ?? workspacesError ?? cfgError;
 
   const [filter, setFilter] = useState("");
   const [view, setView] = useState<CrewView>(readStoredView);
   const [error, setError] = useState("");
+  // Client-side validation for the create form ("name is required"). Kept apart
+  // from `error`, which holds the outcome of a request that FAILED: a blank name
+  // never left the browser, so it must not render as a failed operation.
+  const [sheetHint, setSheetHint] = useState("");
   const [sheet, setSheet] = useState<SheetTarget>(null);
   const [name, setName] = useState("");
   // Starts UNSELECTED, not at the built-in 'kirocrew'. Pre-filling the built-in
@@ -1079,6 +1208,35 @@ export default function KiroCrewAgentsPage({
   const [sessionColor, setSessionColor] = useState("");
   const [editModel, setEditModel] = useState(INHERIT_MODEL);
   const [editEffort, setEditEffort] = useState("");
+  /** Draft avatar override. null = the name-derived face (no override). */
+  const [editAvatar, setEditAvatar] = useState<CrewAvatarOverride | null>(null);
+  /**
+   * The stored `avatar` when no reader understood it — a tier a newer client
+   * wrote, or a pack id this build cannot parse.
+   *
+   * Held so Save writes it back VERBATIM. The payload below is `draft ?? {}`, so
+   * without this an unrecognised record is erased by the first unrelated edit —
+   * and that is a property of the enumeration rather than of any one tier, so
+   * teaching the editor a third reader would just leave the fourth to break the
+   * same way. Cleared the moment the builder commits a draft, because that is
+   * the user deciding this crew's avatar.
+   */
+  const [avatarPassthrough, setAvatarPassthrough] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
+  /** The builder committed an explicit RESET — the user pressed "Reset to default"
+   *  and then Apply — as opposed to never having opened it. Both leave
+   *  `editAvatar` null, and the two must not send the same thing: `{}` is the
+   *  spelling a client uses when it has no opinion about the face, and the backend
+   *  answers it on a pack-wearing crew by keeping the pack
+   *  (`_carry_pack_through_faceless_save`), because the editor that shipped before
+   *  this picker could not see a pack and would otherwise have undressed one on
+   *  every unrelated save. `null` is the spelling reserved for a reset that is
+   *  MEANT, and this editor is now the client that can mean it. Without the
+   *  distinction, Reset → Save silently did nothing to a pack crew. */
+  const [avatarReset, setAvatarReset] = useState(false);
+  const [avatarBuilderOpen, setAvatarBuilderOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   /** The armed confirm row, scrolled into view when it appears: the danger zone
    *  is the last section, so on a short window the confirm buttons land under
@@ -1120,7 +1278,7 @@ export default function KiroCrewAgentsPage({
 
   /** The model a new session on this crew would actually run on, resolved by
    *  the backend so the precedence is not re-derived (and drifted) here. */
-  const { data: resolved } = useQuery({
+  const { data: resolved, error: resolvedError } = useQuery({
     queryKey: ["agent-resolved-model", editing],
     queryFn: () => api.agentResolvedModel(editing),
     enabled: !!editing,
@@ -1148,22 +1306,28 @@ export default function KiroCrewAgentsPage({
         : resolved?.model || "";
   const effortCapable = modelSupportsEffort(effortModel);
 
-  const openCreate = useCallback(() => {
+  const openCreateFrom = useCallback((origin?: "members") => {
     sheetEpoch.current += 1;
     setError("");
+    setSheetHint("");
     setConfirmDelete(false);
+    setAvatarPassthrough(null);
     setName("");
     setKiroAgent("");
     setWorkspace("default");
     setMemoryStore("default");
     setTriggers("");
     setSessionColor("");
-    setSheet({ mode: "create" });
+    setSheet(origin ? { mode: "create", origin } : { mode: "create" });
   }, []);
+  /** The page's own "New crew" entries: no origin, the form closes back onto
+   *  this list. Argument-free so a click event is never mistaken for one. */
+  const openCreate = useCallback(() => openCreateFrom(), [openCreateFrom]);
 
   const openEdit = useCallback((a: KiroCrewAgent) => {
     sheetEpoch.current += 1;
     setError("");
+    setSheetHint("");
     setConfirmDelete(false);
     setKiroAgent(a.kiro_agent);
     setWorkspace(a.workspace);
@@ -1172,14 +1336,169 @@ export default function KiroCrewAgentsPage({
     setSessionColor(a.session_color || "");
     setEditModel(a.model || INHERIT_MODEL);
     setEditEffort(a.reasoning_effort || "");
+    // Normalized through the same coercion the renderer applies, so the dirty
+    // check compares like with like (a junk stored value reads as "no
+    // override" everywhere).
+    const storedTraits = ghostTraitsFrom(a.avatar);
+    const storedImage = imageAvatarFrom(a.avatar);
+    const storedPack = packAvatarFrom(a.avatar);
+    // The reaction layer rides on every tier, and on none: a record that pins no
+    // face, no picture and no pack but carries expressions or sounds is still an
+    // override ("the name-derived face, plus these reactions").
+    const storedExpressions = expressionsFrom(a.avatar);
+    const storedSounds = soundsFrom(a.avatar);
+    const reactions = {
+      ...(storedExpressions ? { expressions: storedExpressions } : {}),
+      ...(storedSounds ? { sounds: storedSounds } : {}),
+    };
+    // A record NO reader claimed is owned WHOLE by the passthrough, reactions
+    // included, so it gets no draft at all. Synthesizing `{kind:'ghost',
+    // …reactions}` for it looks harmless and is not: `avatarPayload` prefers a
+    // draft over the passthrough, so the lifted reaction layer would go back as
+    // a GHOST record and the tier it was lifted out of would be dropped — by
+    // exactly the unrelated save the passthrough exists to survive. The builder's
+    // Apply is the only thing allowed to overrule such a record.
+    const storedUnclaimed = unclaimedAvatarFrom(a.avatar);
+    setEditAvatar(
+      storedUnclaimed
+        ? null
+        : storedTraits
+          ? { kind: "ghost", traits: storedTraits, ...reactions }
+          : storedImage
+            ? { kind: "image", v: storedImage.v, ...reactions }
+            : storedPack
+              ? // Loaded so Save writes the pack back verbatim. Without this the
+                // draft was null for a pack crew, and `avatarPayload`'s
+                // `editAvatar ?? {}` reset the record to "no override" — so
+                // changing only the model undressed the crew.
+                { kind: "pack", id: storedPack.id, ...reactions }
+              : Object.keys(reactions).length
+                ? { kind: "ghost", ...reactions }
+                : null,
+    );
+    setAvatarPassthrough(storedUnclaimed);
+    setAvatarReset(false);
+    setAvatarBuilderOpen(false);
     setSheet({ mode: "edit", name: a.name });
   }, []);
 
-  const closeSheet = useCallback(() => {
+  /** THE way the avatar builder opens. Every face and every "Edit avatar"
+   *  button in the editor calls this one function (issue #9103), so no entry
+   *  can drift to a different gate or a different destination. */
+  const openAvatarBuilder = useCallback(() => setAvatarBuilderOpen(true), []);
+
+  /**
+   * Deep link: `?crew=<name>` opens that crew's editor; `&avatar=1` opens the
+   * avatar builder on top of it. This is how the read-only Crew Members page
+   * reaches the builder without becoming a second editor — it navigates here,
+   * the single write path. Latched once the roster has loaded, then stripped
+   * from the URL (same idiom as SkillsTab's `?review=`): reading the param on
+   * every render would re-open the editor after the user closed it.
+   */
+  const [params, setParams] = useSearchParams();
+  const linkedCrew = params.get("crew");
+  const linkedAvatar = params.get("avatar") === "1";
+  useEffect(() => {
+    if (!linkedCrew || !agentsData) return;
+    const target = agents.find((a) => a.name === linkedCrew);
+    if (target) {
+      openEdit(target);
+      if (linkedAvatar) setAvatarBuilderOpen(true);
+    }
+    // An unknown name strips silently: the roster below is the honest answer.
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("crew");
+        next.delete("avatar");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [linkedCrew, linkedAvatar, agentsData, agents, openEdit, setParams]);
+
+  /**
+   * Deep link: `?new=1` opens the editor in create mode straight away. This is
+   * the Crew Members page's "add a member" entry (#9513): adding a member IS
+   * creating a crew, and this page is the single write path — so the roster
+   * sends the user here, but to the form, not to the list the form is behind.
+   * Unlike `?crew=` nothing here waits on the roster: the create form has no
+   * saved record to load. Latched once, then stripped from the URL for the
+   * same reason as `?crew=`: a reload or Back must not re-open a closed form.
+   *
+   * `&from=members` records WHERE the user came from. It rides on the sheet
+   * state (`origin`) so it survives the param being stripped and outlives
+   * exactly as long as the form: it titles the form in the roster's own words
+   * ("Add crew member", not "Create Agent" — the roster never says the two are
+   * one thing), and it decides where the form CLOSES to — the new member's
+   * thread after a create, the roster after a cancel. Without it a cancel
+   * would strand the user on a crew list they never asked to visit.
+   */
+  const linkedNew = params.get("new") === "1";
+  const linkedFromMembers = params.get("from") === "members";
+  useEffect(() => {
+    if (!linkedNew) return;
+    openCreateFrom(linkedFromMembers ? "members" : undefined);
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("new");
+        next.delete("from");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [linkedNew, linkedFromMembers, openCreateFrom, setParams]);
+
+  const fromMembers = sheet?.mode === "create" && sheet.origin === "members";
+  /** Every string in the create form names the thing the way the surface
+   *  that opened it does — the Crew Members roster says "member" — so the
+   *  form never renames it one field in (#9513 UX review). The field label
+   *  "Agent template" is the template KIND and keeps its name. */
+  const formSubject: FormSubject = fromMembers ? "member" : "agent";
+
+  /** Reset the panel's state. Where the user LANDS afterwards is the caller's
+   *  decision: `closeSheet` (dismissal, or a finished write on this page's own
+   *  form) stays here; the Members-origin create answers with the roster. */
+  const dismissSheet = useCallback(() => {
     sheetEpoch.current += 1;
     setSheet(null);
     setError("");
+    setSheetHint("");
     setConfirmDelete(false);
+  }, []);
+  const closeSheet = useCallback(() => {
+    dismissSheet();
+    // Asked for from the Crew Members roster and closed without a create:
+    // back to the roster, not left on the crew list behind the form.
+    if (fromMembers) navigate("/members");
+  }, [dismissSheet, fromMembers, navigate]);
+
+  /**
+   * The pending answer to a discard question that is on screen, as a promise
+   * plus its resolver; `null` when nothing is being asked.
+   *
+   * `sheetEpoch` below cannot express a question that has not been answered
+   * yet — it only moves once the sheet actually closes. A save still STAGING a
+   * picture upload therefore waits on this: committing through a live question
+   * would persist exactly the edits the question asks to throw away, and
+   * Discard would then close the editor over a record the server had already
+   * been told to keep. Backing out resolves it `false`, so holding the PUT
+   * never kills the save the user asked for.
+   */
+  const discardAnswer = useRef<{
+    answered: Promise<boolean>;
+    settle: (discarded: boolean) => void;
+  } | null>(null);
+
+  /** Answer a pending discard question, if one is still open. First caller
+   *  wins and clears the ref, so a confirm and the sheet-change reset arriving
+   *  together cannot settle the same question twice. */
+  const settleDiscardAnswer = useCallback((discarded: boolean) => {
+    const pending = discardAnswer.current;
+    if (!pending) return;
+    discardAnswer.current = null;
+    pending.settle(discarded);
   }, []);
 
   /**
@@ -1228,14 +1547,40 @@ export default function KiroCrewAgentsPage({
       ...data
     }: CreatePayload & { epoch: number }) => api.createKirocrewAgent(data),
     onSuccess: (r: AgentMutationResult, vars) => {
-      settleFor(vars.epoch, r.error);
       refetchAgents();
+      // The Members roster sent the user here to add a member; the member now
+      // exists, so the next step they want is its thread, not the crew list.
+      // Only for the panel the write was fired from (see settleFor). Exact
+      // name, not slug — MembersPage's `?member=` resolves by name.
+      if (fromMembers && !r.error && vars.epoch === sheetEpoch.current) {
+        dismissSheet();
+        navigate(`/members?member=${encodeURIComponent(vars.name)}`);
+        return;
+      }
+      settleFor(vars.epoch, r.error);
     },
-    onError: (e: Error, vars) =>
+    onError: (e: Error, vars) => {
+      // The server's wording is the crew manager's ("Agent 'x' already
+      // exists"); inside the member-titled form the same outcome is said in
+      // the form's own word. 409 is the create route's one "name taken"
+      // answer, so the status is the signal, not the message text.
+      if (fromMembers && e instanceof ApiError && e.status === 409) {
+        settleFor(
+          vars.epoch,
+          i18nT("pages.kiroCrewAgentsPage.member_already_exists", {
+            name: vars.name,
+          }),
+        );
+        return;
+      }
       settleFor(
         vars.epoch,
-        e.message || i18nT("pages.kiroCrewAgentsPage.failed_to_create_agent"),
-      ),
+        e.message ||
+          (fromMembers
+            ? i18nT("pages.kiroCrewAgentsPage.failed_to_create_member")
+            : i18nT("pages.kiroCrewAgentsPage.failed_to_create_agent")),
+      );
+    },
   });
   const updateMut = useMutation({
     mutationFn: ({
@@ -1288,16 +1633,19 @@ export default function KiroCrewAgentsPage({
 
   const create = () => {
     setError("");
+    setSheetHint("");
     const n = name.trim();
     if (!n) {
-      setError(i18nT("pages.kiroCrewAgentsPage.name_is_required"));
+      setSheetHint(i18nT("pages.kiroCrewAgentsPage.name_is_required"));
       return;
     }
     // Refuse an unset template rather than letting the server apply its
     // 'kirocrew' default: that default is what silently turns a new crew into an
     // alias for the DEFAULT agent (#1684).
     if (!kiroAgent) {
-      setError(i18nT("pages.kiroCrewAgentsPage.agent_template_is_required"));
+      setSheetHint(
+        i18nT("pages.kiroCrewAgentsPage.agent_template_is_required"),
+      );
       return;
     }
     createMut.mutate({
@@ -1311,25 +1659,120 @@ export default function KiroCrewAgentsPage({
     });
   };
 
-  const saveEdit = () => {
+  const saveEdit = async () => {
     if (!editing) return;
     setError("");
+    // Snapshot the identity of THIS save before the first await: the epoch
+    // moves when the editor closes or reopens, and a save that awaited an
+    // upload must neither write through to a different opening's crew nor
+    // settle (close) a dialog it no longer owns. The FIELD VALUES are
+    // snapshotted here too — what commits is exactly what was on screen when
+    // Save was pressed, and the pane is fenced (disabled) for the upload's
+    // duration so no edit can land mid-save only to be discarded by the
+    // post-save close.
+    const epoch = sheetEpoch.current;
+    const name = editing;
+    const data = {
+      kiro_agent: kiroAgent,
+      workspace,
+      memory_store: memoryStore,
+      triggers,
+      // INHERIT_MODEL is normalized to '' server-side; send it verbatim so
+      // clearing a pin is a real write rather than a skipped field.
+      model: editModel,
+      // Sent unconditionally for the same reason as `model`: '' is a real
+      // value (clear the pin), so a skipped field would make clearing
+      // impossible.
+      reasoning_effort: editEffort,
+      session_color: sessionColor,
+    };
+    // Three spellings, and the difference between the last two is load-bearing:
+    // a draft the user built; `null` when they explicitly RESET (see
+    // `avatarReset`); `avatarPassthrough` before `{}` so a record this build did
+    // not understand is preserved rather than erased; and `{}` last, for a crew
+    // that really has no override and a save that says nothing about the face.
+    let avatarPayload: CrewAvatarOverride | Record<string, unknown> | null =
+      avatarReset ? null : (editAvatar ?? avatarPassthrough ?? {});
+    if (editAvatar?.kind === "image") {
+      let stagedToken: string | null = null;
+      if (editAvatar.pendingData) {
+        // STAGE the picture; nothing live changes until the PUT below
+        // promotes it under the server's config lock — so a failed or
+        // abandoned Save never costs the previously saved picture.
+        setAvatarUploading(true);
+        try {
+          // Decode the data URI directly — fetch(data:) trips the
+          // dashboard's connect-src CSP, which only allows network origins.
+          const comma = editAvatar.pendingData.indexOf(",");
+          const mime =
+            /data:([^;,]+)/.exec(editAvatar.pendingData)?.[1] ?? "image/png";
+          const bin = atob(editAvatar.pendingData.slice(comma + 1));
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          const up = await api.uploadCrewAvatar(
+            name,
+            new Blob([bytes], { type: mime }),
+          );
+          if (!up.ok || !up.token) {
+            settleFor(
+              epoch,
+              up.error ||
+                i18nT("pages.kiroCrewAgentsPage.failed_to_update_agent"),
+            );
+            return;
+          }
+          stagedToken = up.token;
+        } catch (e) {
+          // A thrown error here is transport-level ("Failed to fetch", a
+          // decode failure) — vocabulary the user never saw. The banner gets
+          // the localized failure; the raw message goes to the console.
+          // eslint-disable-next-line no-console -- the only record of WHY a staged upload failed once the banner shows the localized string
+          console.warn("avatar upload failed", e);
+          settleFor(
+            epoch,
+            i18nT("pages.kiroCrewAgentsPage.failed_to_update_agent"),
+          );
+          return;
+        } finally {
+          setAvatarUploading(false);
+        }
+      }
+      // `promote` + the staging token only when THIS save staged the file —
+      // the token is what stops an overlapping save's staging from being
+      // committed by this one, and a plain {kind:'image'} keeps the current
+      // picture while the server discards any stale staging. The server
+      // stamps the cache-buster `v` at the commit.
+      // Rebuilt rather than spread from the draft (the staging token and
+      // `promote` are wire-only), so the reaction layer must be carried over
+      // by hand — without this, saving a picture silently drops it.
+      const reactions = {
+        ...(editAvatar.expressions
+          ? { expressions: editAvatar.expressions }
+          : {}),
+        ...(editAvatar.sounds ? { sounds: editAvatar.sounds } : {}),
+      };
+      avatarPayload = stagedToken
+        ? { kind: "image", promote: true, token: stagedToken, ...reactions }
+        : { kind: "image", ...reactions };
+    }
+    // A discard question raised WHILE this save was staging owns the outcome,
+    // so wait for the answer instead of racing it: a PUT fired mid-question
+    // persists exactly the edits the question is about, and the epoch check
+    // below cannot see an answer that has not arrived yet. Once answered there
+    // is nothing left to wait for — Discard closed the sheet and moved the
+    // epoch, so that check carries the same decision.
+    const pendingDiscard = discardAnswer.current;
+    if (pendingDiscard && (await pendingDiscard.answered)) return;
+    if (epoch !== sheetEpoch.current) return;
     updateMut.mutate({
-      name: editing,
-      epoch: sheetEpoch.current,
+      name,
+      epoch,
       data: {
-        kiro_agent: kiroAgent,
-        workspace,
-        memory_store: memoryStore,
-        triggers,
-        // INHERIT_MODEL is normalized to '' server-side; send it verbatim so
-        // clearing a pin is a real write rather than a skipped field.
-        model: editModel,
-        // Sent unconditionally for the same reason as `model`: '' is a real
-        // value (clear the pin), so a skipped field would make clearing
-        // impossible.
-        reasoning_effort: editEffort,
-        session_color: sessionColor,
+        ...data,
+        // `null` = reset on purpose, `{}` = this save says nothing about the
+        // face. On a pack crew those two differ, so the distinction has to
+        // survive all the way onto the wire.
+        avatar: avatarPayload,
       },
     });
   };
@@ -1426,8 +1869,25 @@ export default function KiroCrewAgentsPage({
   ];
 
   const creating = sheet?.mode === "create";
+  const [avatarUploading, setAvatarUploading] = useState(false);
   const sheetBusy =
-    createMut.isPending || updateMut.isPending || deleteMut.isPending;
+    createMut.isPending ||
+    updateMut.isPending ||
+    deleteMut.isPending ||
+    avatarUploading;
+
+  /**
+   * The subset of `sheetBusy` that has already COMMITTED something — a write
+   * the server holds and that no answer in the editor can recall.
+   *
+   * `avatarUploading` is deliberately excluded. That leg of saveEdit only
+   * STAGES a picture, and its own epoch check abandons the PUT when the sheet
+   * closes underneath it, so while it stages nothing is committed and every
+   * edit is still genuinely discardable. `requestClose` reads this rather than
+   * `sheetBusy` for that reason: skipping the discard question during staging
+   * would let a dismissal drop the whole save silently.
+   */
+  const committing = updateMut.isPending || deleteMut.isPending;
 
   /** Which rail pane the editor body is showing. Reset whenever the editor is
    *  pointed somewhere else, so a crew never opens on the pane the previous one
@@ -1475,9 +1935,91 @@ export default function KiroCrewAgentsPage({
     setDiscardAsk(null);
   }, [sheet]);
 
+  /** Which panes hold an edit not yet saved. Compared against the SAVED crew,
+   *  so a value the user typed and then typed back is not reported as pending.
+   *  Computed ahead of the guards below because they key on it: what the
+   *  dismissal question protects IS this set. */
+  const dirtyPanes = useMemo(() => {
+    const out = new Set<CrewPaneKey>();
+    if (!editingAgent) return out;
+    if (kiroAgent !== (editingAgent.kiro_agent || "")) out.add("template");
+    if (
+      workspace !== (editingAgent.workspace || "") ||
+      memoryStore !== (editingAgent.memory_store || "")
+    ) {
+      out.add("place");
+    }
+    if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add("model");
+    if (editEffort !== (editingAgent.reasoning_effort || "")) out.add("model");
+    if (triggers !== (editingAgent.triggers || "")) out.add("routing");
+    if (sessionColor !== (editingAgent.session_color || "")) out.add("routing");
+    // Every tier in one comparison: ghost traits normalize through
+    // ghostTraitsFrom (flat record, stable key order), an image override through
+    // imageAvatarFrom and a pack through packAvatarFrom — so a picture pick, a
+    // replace, a removal or a pack swap is dirty exactly like a trait edit.
+    // pendingData is part of the draft's identity on purpose: a newly chosen
+    // picture IS an unsaved change.
+    const savedNorm =
+      ghostTraitsFrom(editingAgent.avatar) ??
+      imageAvatarFrom(editingAgent.avatar) ??
+      packAvatarFrom(editingAgent.avatar);
+    const draftNorm =
+      editAvatar?.kind === "ghost"
+        ? (editAvatar.traits ?? null)
+        : editAvatar?.kind === "image"
+          ? { v: editAvatar.v, pendingData: editAvatar.pendingData }
+          : editAvatar?.kind === "pack"
+            ? { id: editAvatar.id }
+            : null;
+    if (JSON.stringify(draftNorm) !== JSON.stringify(savedNorm))
+      out.add("routing");
+    // Compared separately from the face, and BOTH sides go through the same
+    // coercion — which is what makes the comparison sound rather than merely
+    // convenient. `JSON.stringify` is order-sensitive: the draft's map is in
+    // the order the user touched the states (and, inside one state, the order
+    // they picked eyes vs mouth), while the coercion always emits
+    // working/done/error with eyes before mouth. Comparing the raw draft
+    // against a coerced record would report two identical sets of overrides as
+    // a change, and the rail would show an unsaved dot on a freshly saved crew.
+    //
+    // Both readers are kind-AGNOSTIC, so on a record no reader claimed they
+    // still report its reaction map — while `openEdit` deliberately holds that
+    // record whole in the passthrough and seeds NO draft. Comparing the two
+    // would put an unsaved dot on a crew that was only just opened, so the
+    // saved side reads as "no draft either", which is what it is.
+    const unclaimed = unclaimedAvatarFrom(editingAgent.avatar) !== null;
+    const savedReactions = unclaimed
+      ? [null, null]
+      : [expressionsFrom(editingAgent.avatar), soundsFrom(editingAgent.avatar)];
+    const draftReactions = [
+      expressionsFrom(editAvatar),
+      soundsFrom(editAvatar),
+    ];
+    if (JSON.stringify(draftReactions) !== JSON.stringify(savedReactions))
+      out.add("routing");
+    // An open inline schedule-create form is pending work too: it gets the
+    // rail's unsaved dot and the note, so closing the editor cannot silently
+    // eat a half-typed schedule the way an untracked surface would.
+    if (schedDraft) out.add("schedules");
+    return out;
+  }, [
+    editingAgent,
+    kiroAgent,
+    workspace,
+    memoryStore,
+    editModel,
+    editEffort,
+    triggers,
+    sessionColor,
+    schedDraft,
+    editAvatar,
+  ]);
+
   /** Rail-driven pane changes route through here: leaving the schedules pane
    *  while a schedule draft is open asks before destroying the typed work
-   *  (the form's state is component-local and unmounts with the pane). */
+   *  (the form's state is component-local and unmounts with the pane). The
+   *  other panes' edits live in this component's state and survive a pane
+   *  switch, so only the draft is at stake here. */
   const requestPane = useCallback(
     (key: CrewPaneKey) => {
       if (schedDraft && key !== pane) {
@@ -1489,15 +2031,48 @@ export default function KiroCrewAgentsPage({
     [schedDraft, pane],
   );
 
-  /** Editor dismissal (footer Cancel, Escape, overlay click) routes through
-   *  here: same draft, same guard, same reason as the pane switch above. */
+  /**
+   * Editor dismissal (footer Cancel, Escape, overlay click) routes through
+   * here: it asks before throwing away ANY unsaved pane edit, not just a typed
+   * schedule.
+   *
+   * An open schedule draft is tested FIRST. `dirtyPanes` contains 'schedules'
+   * while the draft is open, so that order is what decides which question the
+   * user gets, and the draft's leg is not interchangeable with the generic one:
+   * it locks its destructive button while the draft's create POST is in flight
+   * (discarding cannot cancel the request) and unlocks it after a grace period,
+   * neither of which the generic question needs. It does have to WIDEN what it
+   * claims when other panes are dirty too — see `discardTakesSheet`.
+   *
+   * A COMMITTING write is dismissed with no question at all: the values on
+   * screen are the ones the user just submitted, so nothing there is unsaved,
+   * and the request is not cancellable — offering to discard would promise a
+   * rollback the backend will not honor and the edits would land anyway.
+   * Dismissing mid-write stays allowed; sheetEpoch/settleFor is what makes the
+   * abandoned write land harmlessly on the UI. The create form is not tracked
+   * by `dirtyPanes` (same `!creating` scoping as the footer's unsaved note), so
+   * it closes immediately too.
+   */
   const requestClose = useCallback(() => {
     if (schedDraft) {
       setDiscardAsk("close");
       return;
     }
-    closeSheet();
-  }, [schedDraft, closeSheet]);
+    if (committing || dirtyPanes.size === 0) {
+      closeSheet();
+      return;
+    }
+    // Published BEFORE the question goes up so a save still staging an upload
+    // sees it and holds its PUT until the answer arrives. Only this leg arms
+    // it: the schedule draft disables Save, so no staging save can be in
+    // flight behind the draft's own question.
+    let settle: (discarded: boolean) => void = () => {};
+    const answered = new Promise<boolean>((resolve) => {
+      settle = resolve;
+    });
+    discardAnswer.current = { answered, settle };
+    setDiscardAsk("close");
+  }, [schedDraft, committing, dirtyPanes, closeSheet]);
 
   /** The header's "Chat with this crew" routes through here: it creates a
    *  chat slot, closes the sheet and navigates -- three steps that would
@@ -1521,6 +2096,9 @@ export default function KiroCrewAgentsPage({
   const confirmDiscard = useCallback(() => {
     const target = discardAsk;
     setDiscardAsk(null);
+    // Tell a save that is waiting on this question that its edits are being
+    // thrown away, so it returns instead of committing them.
+    settleDiscardAnswer(true);
     // The form unmounts with the pane or the sheet; its unmount cleanup is
     // what clears `schedDraft`, so nothing here resets the flag by hand. The
     // chat path only destroys on SUCCESS: a failed slot-create keeps the
@@ -1531,7 +2109,35 @@ export default function KiroCrewAgentsPage({
       collapseProceed.current?.();
       collapseProceed.current = null;
     } else if (target) setPane(target);
-  }, [discardAsk, closeSheet, editing]); // eslint-disable-line react-hooks/exhaustive-deps -- same chatWith identity note as requestChat
+  }, [discardAsk, closeSheet, editing, settleDiscardAnswer]); // eslint-disable-line react-hooks/exhaustive-deps -- same chatWith identity note as requestChat
+
+  /** Every exit from the question that is NOT a confirm answers it "keep": the
+   *  Keep-editing button, an Escape on the confirm, and the sheet-change reset
+   *  all land here. A save holding its PUT is released rather than killed —
+   *  the user asked for that save and then chose to stay. */
+  useEffect(() => {
+    if (discardAsk === null) settleDiscardAnswer(false);
+  }, [discardAsk, settleDiscardAnswer]);
+
+  /**
+   * Whether the pending question destroys the WHOLE editor while panes OTHER
+   * than the schedule draft are dirty — the case where the draft's narrow
+   * question has to name them.
+   *
+   * 'close' and 'chat' both end in closeSheet, so answering "Discard schedule"
+   * over a dialog that mentioned only the typed schedule is how an
+   * untouched-looking Model or Triggers edit disappears without ever being
+   * asked about. A pane switch and a form collapse keep the sheet, so the
+   * narrow question is the true one there and neither escalates.
+   */
+  const discardTakesSheet =
+    (discardAsk === "close" || discardAsk === "chat") &&
+    [...dirtyPanes].some((k) => k !== "schedules");
+
+  /** The question stays the NARROW schedule one only while a draft is the
+   *  single thing at stake: with other panes going too it must name them, and
+   *  with no draft open it was never about a schedule. */
+  const askSchedOnly = schedDraft && !discardTakesSheet;
 
   /** Pane changes driven from INSIDE a pane (an overview diagram node) rather
    *  than from the rail. The clicked node unmounts with its pane, which would
@@ -1597,39 +2203,6 @@ export default function KiroCrewAgentsPage({
     .map((s) => s.trim())
     .filter(Boolean).length;
 
-  /** Which panes hold an edit not yet saved. Compared against the SAVED crew,
-   *  so a value the user typed and then typed back is not reported as pending. */
-  const dirtyPanes = useMemo(() => {
-    const out = new Set<CrewPaneKey>();
-    if (!editingAgent) return out;
-    if (kiroAgent !== (editingAgent.kiro_agent || "")) out.add("template");
-    if (
-      workspace !== (editingAgent.workspace || "") ||
-      memoryStore !== (editingAgent.memory_store || "")
-    ) {
-      out.add("place");
-    }
-    if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add("model");
-    if (editEffort !== (editingAgent.reasoning_effort || "")) out.add("model");
-    if (triggers !== (editingAgent.triggers || "")) out.add("routing");
-    if (sessionColor !== (editingAgent.session_color || "")) out.add("routing");
-    // An open inline schedule-create form is pending work too: it gets the
-    // rail's unsaved dot and the note, so closing the editor cannot silently
-    // eat a half-typed schedule the way an untracked surface would.
-    if (schedDraft) out.add("schedules");
-    return out;
-  }, [
-    editingAgent,
-    kiroAgent,
-    workspace,
-    memoryStore,
-    editModel,
-    editEffort,
-    triggers,
-    sessionColor,
-    schedDraft,
-  ]);
-
   const sections = useCrewEditorSections({
     templateLabel: provider.labels.agentTemplateField,
     activeSchedules: wakeJobs.filter((j) => j.enabled).length,
@@ -1657,6 +2230,25 @@ export default function KiroCrewAgentsPage({
       <div
         className={`${embedded ? "" : "px-4 md:px-6"} pb-8 overflow-y-auto flex-1 min-h-0`}
       >
+        {/* A roster that failed to load must not read as "you have no crews":
+            the empty state below would say exactly that. Hand-off only while the
+            crew sheet is closed — open, its unsaved pane edits (dirtyPanes) would
+            go with the navigation. */}
+        <ErrorNotice
+          className="mb-3.5"
+          title={i18nT("components.agentSelector.roster_load_failed")}
+          message={agentsError ? errorText(agentsError) : null}
+          askAgent={!sheet}
+          testId="crews-roster-load-error"
+        />
+        {/* Same hand-off decision as the roster notice above (dirtyPanes). */}
+        <ErrorNotice
+          className="mb-3.5"
+          title={i18nT("pages.kiroCrewAgentsPage.editor_options_load_failed")}
+          message={editorOptionsError ? errorText(editorOptionsError) : null}
+          askAgent={!sheet}
+          testId="crews-editor-options-load-error"
+        />
         {/* Says out loud what the bindings below cannot: a crew's workspace and
             memory store are shown and editable, but the isolation they imply is
             only partly built — every crew still reads one shared semantic
@@ -1696,9 +2288,19 @@ export default function KiroCrewAgentsPage({
               aria-label={i18nT("pages.kiroCrewAgentsPage.new_sessions_use")}
               style={{ width: 190 }}
             />
-            {/* Hand-off is safe here: the select commits immediately on change,
-                so there is no unsaved draft for the navigation to destroy. */}
-            <ErrorNotice message={error} variant="inline" askAgent />
+            {/* `error` is ONE state shared with the crew sheet: settleFor writes
+                the sheet's create / update / delete failures into it too, and
+                those render in the sheet's own footer without a hand-off because
+                dirtyPanes hold unsaved edits. So this copy shows only while the
+                sheet is closed (closeSheet clears the state on the way out) — the
+                only writer then is the select above, which commits immediately on
+                change, so the hand-off has no draft to destroy. */}
+            <ErrorNotice
+              message={sheet ? null : error}
+              variant="inline"
+              askAgent
+              testId="crews-default-agent-error"
+            />
           </div>
         )}
 
@@ -1867,9 +2469,14 @@ export default function KiroCrewAgentsPage({
              accessible name on its own — it has to say what you are doing to it.
              An explicit aria-label outranks Radix's aria-labelledby, and the
              DialogTitle still has to EXIST or Radix warns. */
+          /* Asked for from the Crew Members roster, the form speaks that
+             page's vocabulary: "Add crew member", the action the user pressed,
+             not "Create Agent" — the app never says the two are one thing. */
           aria-label={
             creating
-              ? i18nT("pages.kiroCrewAgentsPage.create_a_new_crew")
+              ? fromMembers
+                ? i18nT("pages.kiroCrewAgentsPage.add_crew_member")
+                : i18nT("pages.kiroCrewAgentsPage.create_a_new_crew")
               : i18nT("pages.kiroCrewAgentsPage.edit_crew_named", {
                   name: editing,
                 })
@@ -1880,20 +2487,101 @@ export default function KiroCrewAgentsPage({
              and suppressing it would break that. */
         >
           <DialogHeader>
-            {!creating && <CrewAvatar seed={editing} size={28} />}
-            <DialogTitle className="font-mono">
-              {creating
-                ? i18nT("pages.kiroCrewAgentsPage.create_agent")
-                : editing}
-            </DialogTitle>
-            {!creating && editingAgent?.source && (
-              <SourceBadge source={editingAgent.source} />
-            )}
+            {/* The avatar is itself the entry point to the builder: the
+                first-run review's top finding was that a face setting filed
+                under "Triggers" has no scent — but everyone tries clicking
+                the face. CrewAvatarButton makes that visible (hover scrim +
+                pencil, persistent badge on touch); the "Edit avatar" button
+                beside the title is the text route that needs no guessing at
+                all (issue #9103). No first-run hint chip here — the text
+                button IS the hint; the chip is for the Crew Members header,
+                whose text route sits behind the drawer toggle.
+
+                Two visual groups, not one row of controls: the IDENTITY block
+                (face · name · source) on the left, and the ACTION group on the
+                right. The face is the crew's identity that happens to be
+                pressable — it is not a peer of the two labelled actions, and
+                the header's action row stays at two (max-two-buttons-per-row
+                counts per visual group). */}
+            <div
+              className="flex min-w-0 items-center gap-3"
+              data-testid="crew-editor-identity"
+            >
+              {!creating && (
+                <CrewAvatarButton
+                  size={28}
+                  onEdit={openAvatarBuilder}
+                  // Outside the pane's <fieldset> fence, so it carries the same
+                  // busy gate itself: a builder opened mid-save could Apply a newer
+                  // draft that the completing save's close then discards.
+                  disabled={sheetBusy}
+                  data-testid="header-avatar-button"
+                >
+                  {/* Which tier failed decides the message: CrewAvatar draws a pack's slot
+                      URL through the same <img>, so one banner for both told a pack
+                      crew its "saved picture" was broken — a picture it never had,
+                      and advice ("upload it again") it cannot act on. */}
+                  <CrewStateAvatar
+                    seed={editing}
+                    avatar={editAvatar ?? undefined}
+                    size={28}
+                    onImageError={() =>
+                      setError(
+                        i18nT(
+                          packAvatarFrom(editAvatar)
+                            ? "components.avatarBuilder.pack_load_failed"
+                            : "components.avatarBuilder.image_load_failed",
+                        ),
+                      )
+                    }
+                  />
+                </CrewAvatarButton>
+              )}
+              <DialogTitle className="font-mono">
+                {creating
+                  ? fromMembers
+                    ? i18nT("pages.kiroCrewAgentsPage.add_crew_member")
+                    : i18nT("pages.kiroCrewAgentsPage.create_agent")
+                  : editing}
+              </DialogTitle>
+              {!creating && editingAgent?.source && (
+                <SourceBadge source={editingAgent.source} />
+              )}
+            </div>
             {!creating && (
-              <Btn className="ml-auto" onClick={requestChat}>
-                <MessageSquare className="lucide-inline" aria-hidden="true" />
-                {i18nT("pages.kiroCrewAgentsPage.chat_with_this_crew")}
-              </Btn>
+              <div
+                className="ml-auto flex items-center gap-2"
+                data-testid="crew-editor-actions"
+              >
+                <Btn
+                  onClick={openAvatarBuilder}
+                  disabled={sheetBusy}
+                  data-testid="header-edit-avatar"
+                  title={i18nT("components.avatarBuilder.edit_avatar")}
+                  aria-label={i18nT("components.avatarBuilder.edit_avatar")}
+                >
+                  <UserPen className="lucide-inline" aria-hidden="true" />
+                  {/* Both header labels fold to their icon on a phone-width
+                      header so the crew name keeps its room (with two labelled
+                      buttons the Chat label wrapped to four lines and the
+                      title truncated to "on…"); aria-label carries the name. */}
+                  <span className="hidden sm:inline">
+                    {i18nT("components.avatarBuilder.edit_avatar")}
+                  </span>
+                </Btn>
+                <Btn
+                  onClick={requestChat}
+                  title={i18nT("pages.kiroCrewAgentsPage.chat_with_this_crew")}
+                  aria-label={i18nT(
+                    "pages.kiroCrewAgentsPage.chat_with_this_crew",
+                  )}
+                >
+                  <MessageSquare className="lucide-inline" aria-hidden="true" />
+                  <span className="hidden sm:inline">
+                    {i18nT("pages.kiroCrewAgentsPage.chat_with_this_crew")}
+                  </span>
+                </Btn>
+              </div>
             )}
           </DialogHeader>
 
@@ -1907,343 +2595,452 @@ export default function KiroCrewAgentsPage({
                 : "flex flex-col overflow-hidden p-0 sm:flex-row"
             }
           >
-            {creating ? (
-              <div className="flex flex-col gap-6">
-                <section className="flex flex-col gap-3">
-                  <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">
-                    {i18nT("pages.kiroCrewAgentsPage.identity")}
-                  </h3>
-                  <Field label={i18nT("pages.kiroCrewAgentsPage.name")}>
-                    <Input
-                      placeholder={i18nT("pages.kiroCrewAgentsPage.e_g_oncall")}
-                      value={name}
-                      onChange={(e) => setName(e.target.value)}
-                      autoFocus
+            {/* The fence that makes the Save-time snapshot honest: while a
+                save is in flight (staged upload, the committing PUT, create
+                or delete), every control in the pane is disabled (fieldset
+                covers form controls, pointer-events the custom widgets), so
+                no edit can land mid-save only to be silently dropped when
+                the post-save close unmounts the pane.
+                display:contents keeps the flex layout unchanged. */}
+            <fieldset
+              disabled={sheetBusy}
+              aria-busy={sheetBusy}
+              className={`contents ${sheetBusy ? "[&>*]:pointer-events-none [&>*]:opacity-60" : ""}`}
+            >
+              {creating ? (
+                <div className="flex flex-col gap-6">
+                  <section className="flex flex-col gap-3">
+                    <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">
+                      {i18nT("pages.kiroCrewAgentsPage.identity")}
+                    </h3>
+                    <Field label={i18nT("pages.kiroCrewAgentsPage.name")}>
+                      <Input
+                        placeholder={i18nT(
+                          "pages.kiroCrewAgentsPage.e_g_oncall",
+                        )}
+                        value={name}
+                        // A rejected submit's error is about the name that was
+                        // sent; editing the name answers it, so the notice goes
+                        // and the Create button reads as safe to press again.
+                        onChange={(e) => {
+                          setName(e.target.value);
+                          setError("");
+                        }}
+                        autoFocus
+                      />
+                    </Field>
+                  </section>
+                  <section className="flex flex-col gap-3">
+                    <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">
+                      {i18nT("pages.kiroCrewAgentsPage.routing")}
+                    </h3>
+                    <TriggersField
+                      value={triggers}
+                      onChange={setTriggers}
+                      subject={formSubject}
                     />
-                  </Field>
-                </section>
-                <section className="flex flex-col gap-3">
-                  <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">
-                    {i18nT("pages.kiroCrewAgentsPage.routing")}
-                  </h3>
-                  <TriggersField value={triggers} onChange={setTriggers} />
-                  <SessionColorField
-                    value={sessionColor}
-                    onChange={setSessionColor}
+                    <SessionColorField
+                      value={sessionColor}
+                      onChange={setSessionColor}
+                      subject={formSubject}
+                    />
+                  </section>
+                  <section className="flex flex-col gap-3">
+                    <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">
+                      {fromMembers
+                        ? i18nT(
+                            "pages.kiroCrewAgentsPage.runtime_binding_member",
+                          )
+                        : i18nT("pages.kiroCrewAgentsPage.runtime_binding")}
+                    </h3>
+                    <BindingFields
+                      subject={formSubject}
+                      templateLabel={provider.labels.agentTemplateField}
+                      kiroAgentOptions={kiroAgentOptions}
+                      kiroAgent={kiroAgent}
+                      setKiroAgent={setKiroAgent}
+                      workspaceOptions={workspaceOptions}
+                      workspace={workspace}
+                      setWorkspace={setWorkspace}
+                      onNewWorkspace={() => setWsModalOpen(true)}
+                      memoryStoreOptions={memoryStoreOptions}
+                      memoryStore={memoryStore}
+                      setMemoryStore={setMemoryStore}
+                    />
+                  </section>
+                </div>
+              ) : (
+                <>
+                  <CrewEditorRail
+                    sections={sections}
+                    value={pane}
+                    onChange={requestPane}
+                    ariaLabel={i18nT("components.crewEditor.rail_label")}
+                    unsavedLabel={i18nT(
+                      "components.crewEditor.unsaved_changes",
+                    )}
+                    sharedLabel={i18nT("components.crewEditor.tag_shared")}
+                    panelIdPrefix={panelId}
                   />
-                </section>
-                <section className="flex flex-col gap-3">
-                  <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">
-                    {i18nT("pages.kiroCrewAgentsPage.runtime_binding")}
-                  </h3>
-                  <BindingFields
-                    templateLabel={provider.labels.agentTemplateField}
-                    kiroAgentOptions={kiroAgentOptions}
-                    kiroAgent={kiroAgent}
-                    setKiroAgent={setKiroAgent}
-                    workspaceOptions={workspaceOptions}
-                    workspace={workspace}
-                    setWorkspace={setWorkspace}
-                    onNewWorkspace={() => setWsModalOpen(true)}
-                    memoryStoreOptions={memoryStoreOptions}
-                    memoryStore={memoryStore}
-                    setMemoryStore={setMemoryStore}
-                  />
-                </section>
-              </div>
-            ) : (
-              <>
-                <CrewEditorRail
-                  sections={sections}
-                  value={pane}
-                  onChange={requestPane}
-                  ariaLabel={i18nT("components.crewEditor.rail_label")}
-                  unsavedLabel={i18nT("components.crewEditor.unsaved_changes")}
-                  sharedLabel={i18nT("components.crewEditor.tag_shared")}
-                  panelIdPrefix={panelId}
-                />
-                {/* `tabIndex={-1}` so moving focus here after a rail change is
+                  {/* `tabIndex={-1}` so moving focus here after a rail change is
                     possible without adding a Tab stop. The pane scrolls, not the
                     dialog body, which keeps the rail in view at any height. */}
-                <div
-                  id={`${panelId}-${pane}`}
-                  role="tabpanel"
-                  aria-labelledby={`${panelId}-tab-${pane}`}
-                  tabIndex={-1}
-                  className="flex min-w-0 flex-1 flex-col gap-3.5 overflow-y-auto px-5 py-4"
-                >
-                  {pane === "overview" && (
-                    <CrewOverviewPane
-                      hub={<CrewAvatar seed={editing} size={34} />}
-                      templateLabel={provider.labels.agentTemplateField}
-                      template={kiroAgent}
-                      workspace={workspace}
-                      memoryStore={memoryStore}
-                      modelLabel={
-                        editModel === INHERIT_MODEL
-                          ? i18nT("pages.kiroCrewAgentsPage.inherited")
-                          : editModel
-                      }
-                      modelInherited={editModel === INHERIT_MODEL}
-                      resolvedModel={resolved?.model || ""}
-                      activeSchedules={wakeJobs.filter((j) => j.enabled).length}
-                      schedulesUnknown={wakeQuery.isError}
-                      routingWords={routingWords}
-                      sharingCrews={collidingCrews.length}
-                      workspaceShared={sharingWorkspace.length > 0}
-                      memoryShared={sharingMemoryStore.length > 0}
-                      webhookTokens={boundWebhooks}
-                      webhooksUnknown={webhooksQuery.isError}
-                      onNavigate={goToPane}
-                    />
-                  )}
-
-                  {pane === "template" && (
-                    <TemplateField
-                      label={provider.labels.agentTemplateField}
-                      options={kiroAgentOptions}
-                      value={kiroAgent}
-                      onChange={setKiroAgent}
-                    />
-                  )}
-
-                  {pane === "model" && (
-                    <>
-                      {modelPickerAvailable ? (
-                        <ModelField
-                          options={modelOptions}
-                          value={editModel}
-                          onChange={setEditModel}
-                        />
-                      ) : (
-                        <div className="rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                          <span
-                            className={
-                              editModel === INHERIT_MODEL
-                                ? "italic"
-                                : "font-mono text-text"
-                            }
+                  <div
+                    id={`${panelId}-${pane}`}
+                    role="tabpanel"
+                    aria-labelledby={`${panelId}-tab-${pane}`}
+                    tabIndex={-1}
+                    className="flex min-w-0 flex-1 flex-col gap-3.5 overflow-y-auto px-5 py-4"
+                  >
+                    {pane === "overview" && (
+                      <CrewOverviewPane
+                        // The largest face in the editor opens the builder too, so
+                        // the hub does not teach the opposite lesson from the
+                        // header face (same title, same entry point).
+                        hub={
+                          <CrewAvatarButton
+                            size={34}
+                            onEdit={openAvatarBuilder}
+                            data-testid="hub-avatar-button"
                           >
-                            {editModel === INHERIT_MODEL
-                              ? i18nT("pages.kiroCrewAgentsPage.inherited")
-                              : editModel}
-                          </span>
-                          {editModel === INHERIT_MODEL && (
-                            <span>
-                              {" — "}
-                              {i18nT(
-                                "pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses",
-                              )}
+                            <CrewAvatar
+                              seed={editing}
+                              avatar={editAvatar ?? undefined}
+                              size={34}
+                            />
+                          </CrewAvatarButton>
+                        }
+                        templateLabel={provider.labels.agentTemplateField}
+                        template={kiroAgent}
+                        workspace={workspace}
+                        memoryStore={memoryStore}
+                        modelLabel={
+                          editModel === INHERIT_MODEL
+                            ? i18nT("pages.kiroCrewAgentsPage.inherited")
+                            : editModel
+                        }
+                        modelInherited={editModel === INHERIT_MODEL}
+                        resolvedModel={resolved?.model || ""}
+                        activeSchedules={
+                          wakeJobs.filter((j) => j.enabled).length
+                        }
+                        schedulesUnknown={wakeQuery.isError}
+                        routingWords={routingWords}
+                        sharingCrews={collidingCrews.length}
+                        workspaceShared={sharingWorkspace.length > 0}
+                        memoryShared={sharingMemoryStore.length > 0}
+                        webhookTokens={boundWebhooks}
+                        webhooksUnknown={webhooksQuery.isError}
+                        onNavigate={goToPane}
+                      />
+                    )}
+
+                    {pane === "template" && (
+                      <TemplateField
+                        label={provider.labels.agentTemplateField}
+                        options={kiroAgentOptions}
+                        value={kiroAgent}
+                        onChange={setKiroAgent}
+                        subject="agent"
+                      />
+                    )}
+
+                    {pane === "model" && (
+                      <>
+                        {modelPickerAvailable ? (
+                          <ModelField
+                            options={modelOptions}
+                            value={editModel}
+                            onChange={setEditModel}
+                          />
+                        ) : (
+                          <div className="rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                            <span
+                              className={
+                                editModel === INHERIT_MODEL
+                                  ? "italic"
+                                  : "font-mono text-text"
+                              }
+                            >
+                              {editModel === INHERIT_MODEL
+                                ? i18nT("pages.kiroCrewAgentsPage.inherited")
+                                : editModel}
                             </span>
-                          )}
-                        </div>
-                      )}
-                      {/* Offered when the model the crew will actually run on
+                            {editModel === INHERIT_MODEL && (
+                              <span>
+                                {" — "}
+                                {i18nT(
+                                  "pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses",
+                                )}
+                              </span>
+                            )}
+                          </div>
+                        )}
+                        {/* Offered when the model the crew will actually run on
                           accepts effort — OR when a pin is already stored on a
                           model that does not, so the only way to clear a
                           stranded pin is not to first switch the model back. */}
-                      {(effortCapable || !!editEffort) && (
-                        <EffortField
-                          value={editEffort}
-                          onChange={setEditEffort}
-                        />
-                      )}
-                      {!effortCapable && !!editEffort && (
-                        <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                          {/* Two different reasons a stored pin cannot apply, and
+                        {(effortCapable || !!editEffort) && (
+                          <EffortField
+                            value={editEffort}
+                            onChange={setEditEffort}
+                          />
+                        )}
+                        {!effortCapable && !!editEffort && (
+                          <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                            {/* Two different reasons a stored pin cannot apply, and
                               they need different sentences: naming a model only
                               works when there IS one. With nothing resolved,
                               substituting the "Inherited" label would read as
                               "Inherited does not take a reasoning effort", which
                               names no model and states nothing true. */}
-                          {effortModel
-                            ? i18nT(
-                                "pages.kiroCrewAgentsPage.effort_ignored_on_this_model",
-                                { model: effortModel },
-                              )
-                            : i18nT(
-                                "pages.kiroCrewAgentsPage.effort_pin_needs_a_model",
-                              )}
-                        </div>
-                      )}
-                      {resolved && (
-                        <div className="flex flex-col gap-1 rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                          <div>
-                            <span className="text-text">
-                              {i18nT("pages.kiroCrewAgentsPage.resolves_to", {
-                                model:
-                                  resolved.model ||
-                                  i18nT("pages.kiroCrewAgentsPage.inherited"),
-                              })}
-                            </span>
-                            {" — "}
-                            {resolved.pinned
+                            {effortModel
                               ? i18nT(
-                                  "pages.kiroCrewAgentsPage.pinned_on_this_crew",
+                                  "pages.kiroCrewAgentsPage.effort_ignored_on_this_model",
+                                  { model: effortModel },
                                 )
-                              : resolved.model
-                                ? i18nT(
-                                    "pages.kiroCrewAgentsPage.inherited_from_the_agent_template",
-                                  )
-                                : i18nT(
-                                    "pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses",
-                                  )}
+                              : i18nT(
+                                  "pages.kiroCrewAgentsPage.effort_pin_needs_a_model",
+                                )}
                           </div>
-                          {/* The effort half of the same readout. It answers
+                        )}
+                        {/* No hand-off: the crew sheet's unsaved pane edits
+                          (dirtyPanes). Without this a failed resolve just left the
+                          readout below absent, as if the crew had no model. */}
+                        <ErrorNotice
+                          message={
+                            resolvedError ? errorText(resolvedError) : null
+                          }
+                          testId="crew-resolved-model-error"
+                        />
+                        {resolved && (
+                          <div className="flex flex-col gap-1 rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                            <div>
+                              <span className="text-text">
+                                {i18nT("pages.kiroCrewAgentsPage.resolves_to", {
+                                  model:
+                                    resolved.model ||
+                                    i18nT("pages.kiroCrewAgentsPage.inherited"),
+                                })}
+                              </span>
+                              {" — "}
+                              {resolved.pinned
+                                ? i18nT(
+                                    "pages.kiroCrewAgentsPage.pinned_on_this_crew",
+                                  )
+                                : resolved.model
+                                  ? i18nT(
+                                      "pages.kiroCrewAgentsPage.inherited_from_the_agent_template",
+                                    )
+                                  : i18nT(
+                                      "pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses",
+                                    )}
+                            </div>
+                            {/* The effort half of the same readout. It answers
                               "what will this crew think at" in every case,
                               including the one where no level can apply — an
                               absent control with no line about it is what makes
                               the setting look missing rather than unavailable.
                               Suppressed only for the stranded pin, where the
                               warning above already says it and says what to do. */}
-                          {(effortCapable || !editEffort) && (
-                            <div>
-                              {effortCapable ? (
-                                <>
-                                  <span className="text-text">
-                                    {i18nT(
-                                      "pages.kiroCrewAgentsPage.effort_resolves_to",
-                                      {
-                                        effort: resolved.reasoning_effort
-                                          ? effortLabel(
-                                              resolved.reasoning_effort,
-                                            )
-                                          : i18nT("lib.effort.default"),
-                                      },
-                                    )}
-                                  </span>
-                                  {" — "}
-                                  {resolved.effort_pinned
-                                    ? i18nT(
-                                        "pages.kiroCrewAgentsPage.pinned_on_this_crew",
-                                      )
-                                    : resolved.reasoning_effort
+                            {(effortCapable || !editEffort) && (
+                              <div>
+                                {effortCapable ? (
+                                  <>
+                                    <span className="text-text">
+                                      {i18nT(
+                                        "pages.kiroCrewAgentsPage.effort_resolves_to",
+                                        {
+                                          effort: resolved.reasoning_effort
+                                            ? effortLabel(
+                                                resolved.reasoning_effort,
+                                              )
+                                            : i18nT("lib.effort.default"),
+                                        },
+                                      )}
+                                    </span>
+                                    {" — "}
+                                    {resolved.effort_pinned
                                       ? i18nT(
-                                          "pages.kiroCrewAgentsPage.effort_inherited_from_the_global_default",
+                                          "pages.kiroCrewAgentsPage.pinned_on_this_crew",
                                         )
-                                      : i18nT(
-                                          "pages.kiroCrewAgentsPage.no_effort_pin_the_model_decides",
-                                        )}
-                                </>
-                              ) : effortModel ? (
-                                i18nT(
-                                  "pages.kiroCrewAgentsPage.effort_unavailable_on_this_model",
-                                  { model: effortModel },
-                                )
-                              ) : (
-                                i18nT(
-                                  "pages.kiroCrewAgentsPage.effort_needs_a_model",
-                                )
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </>
-                  )}
-
-                  {pane === "place" && (
-                    <>
-                      <WorkspaceField
-                        options={workspaceOptions}
-                        value={workspace}
-                        onChange={setWorkspace}
-                        onNewWorkspace={() => setWsModalOpen(true)}
-                      />
-                      <MemoryStoreField
-                        options={memoryStoreOptions}
-                        value={memoryStore}
-                        onChange={setMemoryStore}
-                      />
-                      {collidingCrews.length > 0 && (
-                        <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                          {i18nT(
-                            "pages.kiroCrewAgentsPage.also_used_by_these_crews",
-                            { crews: collidingCrews.join(", ") },
-                          )}
-                        </div>
-                      )}
-                    </>
-                  )}
-
-                  {pane === "schedules" && (
-                    <CrewWakeSection
-                      crew={editing}
-                      isDefaultCrew={editing === defaultAgent}
-                      onDraftChange={setSchedDraft}
-                      onSavingChange={setSchedSaving}
-                      onRequestCancel={requestCancelDraft}
-                    />
-                  )}
-
-                  {pane === "webhook" && <CrewWebhookSection crew={editing} />}
-
-                  {pane === "routing" && (
-                    <>
-                      <TriggersField value={triggers} onChange={setTriggers} />
-                      <SessionColorField
-                        value={sessionColor}
-                        onChange={setSessionColor}
-                      />
-                    </>
-                  )}
-
-                  {pane === "danger" && (
-                    <div className="flex flex-col gap-3 rounded-md border border-danger-subtle bg-danger-subtle p-3">
-                      <p className="m-0 text-[12px] leading-relaxed text-muted">
-                        {confirmDelete
-                          ? i18nT(
-                              "pages.kiroCrewAgentsPage.delete_crew_named_confirm",
-                              { name: editing },
-                            )
-                          : i18nT(
-                              "pages.kiroCrewAgentsPage.deleting_a_crew_unbinds_it_from_new_sessions_its",
+                                      : resolved.reasoning_effort
+                                        ? i18nT(
+                                            "pages.kiroCrewAgentsPage.effort_inherited_from_the_global_default",
+                                          )
+                                        : i18nT(
+                                            "pages.kiroCrewAgentsPage.no_effort_pin_the_model_decides",
+                                          )}
+                                  </>
+                                ) : effortModel ? (
+                                  i18nT(
+                                    "pages.kiroCrewAgentsPage.effort_unavailable_on_this_model",
+                                    { model: effortModel },
+                                  )
+                                ) : (
+                                  i18nT(
+                                    "pages.kiroCrewAgentsPage.effort_needs_a_model",
+                                  )
+                                )}
+                              </div>
                             )}
-                      </p>
-                      {/* Two-step rather than a one-click destructive button: a
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {pane === "place" && (
+                      <>
+                        <WorkspaceField
+                          options={workspaceOptions}
+                          value={workspace}
+                          onChange={setWorkspace}
+                          onNewWorkspace={() => setWsModalOpen(true)}
+                          subject="agent"
+                        />
+                        <MemoryStoreField
+                          options={memoryStoreOptions}
+                          value={memoryStore}
+                          onChange={setMemoryStore}
+                          subject="agent"
+                        />
+                        {collidingCrews.length > 0 && (
+                          <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                            {i18nT(
+                              "pages.kiroCrewAgentsPage.also_used_by_these_crews",
+                              { crews: collidingCrews.join(", ") },
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {pane === "schedules" && (
+                      <CrewWakeSection
+                        crew={editing}
+                        isDefaultCrew={editing === defaultAgent}
+                        onDraftChange={setSchedDraft}
+                        onSavingChange={setSchedSaving}
+                        onRequestCancel={requestCancelDraft}
+                      />
+                    )}
+
+                    {pane === "webhook" && (
+                      <CrewWebhookSection crew={editing} />
+                    )}
+
+                    {pane === "routing" && (
+                      <>
+                        <TriggersField
+                          value={triggers}
+                          onChange={setTriggers}
+                          subject="agent"
+                        />
+                        <SessionColorField
+                          value={sessionColor}
+                          onChange={setSessionColor}
+                          subject="agent"
+                        />
+                        <Field
+                          label={i18nT("components.avatarBuilder.field_label")}
+                          hint={i18nT("components.avatarBuilder.field_hint")}
+                        >
+                          <div className="flex items-center gap-2.5">
+                            <CrewAvatarButton
+                              size={36}
+                              onEdit={openAvatarBuilder}
+                              data-testid="field-avatar-button"
+                            >
+                              <CrewAvatar
+                                seed={editing || ""}
+                                avatar={editAvatar ?? undefined}
+                                size={36}
+                              />
+                            </CrewAvatarButton>
+                            <Btn
+                              onClick={openAvatarBuilder}
+                              data-testid="open-avatar-builder"
+                            >
+                              <UserPen
+                                className="lucide-inline"
+                                aria-hidden="true"
+                              />
+                              {i18nT("components.avatarBuilder.edit_avatar")}
+                            </Btn>
+                            {editAvatar && (
+                              <span className="text-[11px] text-muted">
+                                {i18nT(
+                                  "components.avatarBuilder.customized_note",
+                                )}
+                              </span>
+                            )}
+                          </div>
+                        </Field>
+                      </>
+                    )}
+
+                    {pane === "danger" && (
+                      <div className="flex flex-col gap-3 rounded-md border border-danger-subtle bg-danger-subtle p-3">
+                        <p className="m-0 text-[12px] leading-relaxed text-muted">
+                          {confirmDelete
+                            ? i18nT(
+                                "pages.kiroCrewAgentsPage.delete_crew_named_confirm",
+                                { name: editing },
+                              )
+                            : i18nT(
+                                "pages.kiroCrewAgentsPage.deleting_a_crew_unbinds_it_from_new_sessions_its",
+                              )}
+                        </p>
+                        {/* Two-step rather than a one-click destructive button: a
                           misclick in an overlay is far likelier than in a table,
                           and a first-run reviewer flagged it as the one action
                           they would regret. A nested confirm DIALOG was the other
                           option; inline keeps this out of a stacked focus trap. */}
-                      <div ref={confirmRef} className="flex items-center gap-2">
-                        <div className="flex-1" />
-                        {confirmDelete ? (
-                          <>
-                            <Btn
-                              onClick={() => setConfirmDelete(false)}
-                              data-testid="cancel-delete-crew"
-                            >
-                              {i18nT("pages.kiroCrewAgentsPage.cancel")}
-                            </Btn>
+                        <div
+                          ref={confirmRef}
+                          className="flex items-center gap-2"
+                        >
+                          <div className="flex-1" />
+                          {confirmDelete ? (
+                            <>
+                              <Btn
+                                onClick={() => setConfirmDelete(false)}
+                                data-testid="cancel-delete-crew"
+                              >
+                                {i18nT("pages.kiroCrewAgentsPage.cancel")}
+                              </Btn>
+                              <Btn
+                                danger
+                                onClick={() =>
+                                  deleteMut.mutate({
+                                    name: editing,
+                                    epoch: sheetEpoch.current,
+                                  })
+                                }
+                                disabled={sheetBusy}
+                                data-testid="confirm-delete-crew"
+                              >
+                                {i18nT(
+                                  "pages.kiroCrewAgentsPage.yes_delete_it",
+                                )}
+                              </Btn>
+                            </>
+                          ) : (
                             <Btn
                               danger
-                              onClick={() =>
-                                deleteMut.mutate({
-                                  name: editing,
-                                  epoch: sheetEpoch.current,
-                                })
-                              }
+                              onClick={() => setConfirmDelete(true)}
                               disabled={sheetBusy}
-                              data-testid="confirm-delete-crew"
                             >
-                              {i18nT("pages.kiroCrewAgentsPage.yes_delete_it")}
+                              {i18nT("pages.kiroCrewAgentsPage.delete_crew")}
                             </Btn>
-                          </>
-                        ) : (
-                          <Btn
-                            danger
-                            onClick={() => setConfirmDelete(true)}
-                            disabled={sheetBusy}
-                          >
-                            {i18nT("pages.kiroCrewAgentsPage.delete_crew")}
-                          </Btn>
-                        )}
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  )}
-                </div>
-              </>
-            )}
+                    )}
+                  </div>
+                </>
+              )}
+            </fieldset>
           </DialogBody>
 
           {/* Save is disabled while nothing is pending. The schedule pause/run
@@ -2251,8 +3048,25 @@ export default function KiroCrewAgentsPage({
               beside them implies those toggles are drafts that Cancel would roll
               back — which it cannot. */}
           <DialogFooter>
-            <ErrorNotice message={error} variant="inline" className="mr-auto" />
-            {!creating && dirtyPanes.size > 0 && !error && (
+            {/* No hand-off: the crew sheet's unsaved pane edits (dirtyPanes) —
+                a failed save is exactly what did not persist them. */}
+            <ErrorNotice
+              message={error}
+              variant="inline"
+              className="mr-auto"
+              testId="crew-sheet-error"
+            />
+            {/* Client-side validation hint — the form never reached the server,
+                so this is plain text, not an error surface. */}
+            {sheetHint && (
+              <span
+                className="mr-auto text-[12px] text-danger"
+                data-testid="crew-sheet-hint"
+              >
+                {sheetHint}
+              </span>
+            )}
+            {!creating && dirtyPanes.size > 0 && !error && !sheetHint && (
               <span
                 className="mr-auto text-[11.5px] text-muted"
                 data-testid="crew-unsaved-note"
@@ -2271,10 +3085,22 @@ export default function KiroCrewAgentsPage({
               {i18nT("pages.kiroCrewAgentsPage.cancel")}
             </Btn>
             {creating ? (
-              <SendBtn onClick={create} disabled={sheetBusy}>
+              // whitespace-nowrap: the footer error shares this row, and the
+              // primary action keeps its one-line label rather than folding
+              // under the notice.
+              <SendBtn
+                onClick={create}
+                disabled={sheetBusy}
+                className="whitespace-nowrap shrink-0"
+              >
+                {/* The primary action names its object in the roster's words when
+                    the roster asked for it — the form's helper copy still says
+                    "agent", and the button is where the two names would jar. */}
                 {createMut.isPending
                   ? i18nT("pages.kiroCrewAgentsPage.creating")
-                  : i18nT("pages.kiroCrewAgentsPage.create")}
+                  : fromMembers
+                    ? i18nT("pages.kiroCrewAgentsPage.create_member")
+                    : i18nT("pages.kiroCrewAgentsPage.create")}
               </SendBtn>
             ) : (
               <SendBtn
@@ -2304,13 +3130,18 @@ export default function KiroCrewAgentsPage({
             onClose={() => setWsModalOpen(false)}
           />
 
-          {/* The schedule-draft discard confirm. Same nesting rule and same
+          {/* The editor's discard confirm. Same nesting rule and same
               always-mounted rule as WorkspaceModal above — conditional
               rendering skips Radix's layer deregistration and leaves the
-              editor believing it is no longer the top layer. The confirm
-              button restates the action; the dismiss restates the
-              alternative, because a bare "Cancel" beside the editor's own
-              footer Cancel is the ambiguity this PR removes elsewhere. */}
+              editor believing it is no longer the top layer. Nested INSIDE the
+              editor's DialogContent is also what keeps Escape addressed to this
+              layer alone, so the editor never treats the confirm's own
+              dismissal as a dismissal of itself. The confirm button restates
+              the action; the dismiss restates the alternative, because a bare
+              "Cancel" beside the editor's own footer Cancel would be ambiguous.
+              The `crew-sched-*` test ids predate the generalization and stay
+              stable: one dialog now asks about a typed schedule, about unsaved
+              pane edits, or about both. */}
           <Dialog
             open={discardAsk !== null}
             onOpenChange={(next) => {
@@ -2320,19 +3151,38 @@ export default function KiroCrewAgentsPage({
             <DialogContent
               maxWidth={440}
               className="z-[110]"
-              aria-label={i18nT(
-                "pages.kiroCrewAgentsPage.discard_new_schedule",
-              )}
+              aria-label={
+                askSchedOnly
+                  ? i18nT("pages.kiroCrewAgentsPage.discard_new_schedule")
+                  : i18nT("pages.kiroCrewAgentsPage.discard_unsaved_changes")
+              }
             >
               <DialogHeader>
                 <DialogTitle>
-                  {i18nT("pages.kiroCrewAgentsPage.discard_new_schedule")}
+                  {askSchedOnly
+                    ? i18nT("pages.kiroCrewAgentsPage.discard_new_schedule")
+                    : i18nT("pages.kiroCrewAgentsPage.discard_unsaved_changes")}
                 </DialogTitle>
               </DialogHeader>
               <DialogBody>
                 <p className="m-0 text-sm text-text">
-                  {i18nT("pages.kiroCrewAgentsPage.discard_new_schedule_body")}
+                  {schedDraft
+                    ? i18nT(
+                        "pages.kiroCrewAgentsPage.discard_new_schedule_body",
+                      )
+                    : i18nT("pages.kiroCrewAgentsPage.discard_unsaved_body")}
                 </p>
+                {/* Full contrast, same as the line above: this is the half of
+                    the consequence the narrow question left out, so it must not
+                    read as a footnote to it. */}
+                {schedDraft && discardTakesSheet && (
+                  <p
+                    className="mb-0 mt-2 text-sm text-text"
+                    data-testid="crew-sched-discard-also-crew"
+                  >
+                    {i18nT("pages.kiroCrewAgentsPage.discard_also_crew_edits")}
+                  </p>
+                )}
                 {/* The reason Discard is locked, as VISIBLE text: the button's
                     `title` never reaches keyboard or touch users, and browsers
                     often suppress titles on disabled controls entirely. */}
@@ -2371,11 +3221,36 @@ export default function KiroCrewAgentsPage({
                   }
                   data-testid="crew-sched-discard-confirm"
                 >
-                  {i18nT("pages.kiroCrewAgentsPage.discard_schedule_confirm")}
+                  {askSchedOnly
+                    ? i18nT("pages.kiroCrewAgentsPage.discard_schedule_confirm")
+                    : i18nT("pages.kiroCrewAgentsPage.discard_confirm")}
                 </Btn>
               </DialogFooter>
             </DialogContent>
           </Dialog>
+          {/* Same stacked-layer contract as WorkspaceModal: mounted inside the
+              editor's DialogContent, `open`-driven. Save only lands in the
+              editor's draft state — the crew record is written by Save changes. */}
+          {!creating && editing && (
+            <CrewAvatarBuilder
+              open={avatarBuilderOpen}
+              name={editing}
+              value={editAvatar}
+              onCancel={() => setAvatarBuilderOpen(false)}
+              onSave={(next) => {
+                setEditAvatar(next);
+                // Any Apply is the user deciding the avatar, so a record they
+                // never saw must not ride along behind their choice.
+                setAvatarPassthrough(null);
+                // A null draft out of the builder is the Reset link having been
+                // pressed — an intent, not an absence. Recorded so Save can send
+                // the reset the backend honours instead of the "no opinion" `{}`
+                // that leaves a pack on.
+                setAvatarReset(next === null);
+                setAvatarBuilderOpen(false);
+              }}
+            />
+          )}
         </DialogContent>
       </Dialog>
     </>

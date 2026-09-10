@@ -39,7 +39,10 @@ Exit codes:
                   a blocking review marker on the current head, no
                   pull_request-event run for the current head, a disposition
                   comment violating the one-lane / one-rationale-per-finding
-                  rule, or anything that cannot be confirmed
+                  rule, an unanswered whole-design CONCERNS verdict for the
+                  current head (local loop only -- --disposition-gate and the
+                  required status are unchanged), or anything that cannot be
+                  confirmed
    2  ENV ERROR - gh missing or not authenticated, or PR not found
 """
 
@@ -82,6 +85,8 @@ REVIEWED_STAMP_RE = _review_contract.REVIEWED_STAMP_RE
 BLOCK_MERGE_RE = _review_contract.BLOCK_MERGE_RE
 DEFAULT_MARKER_AUTHORS = _review_contract.DEFAULT_MARKER_AUTHORS
 DEFAULT_MARKER_BINDINGS = _review_contract.DEFAULT_MARKER_BINDINGS
+VERDICT_LINE_RE = _review_contract.VERDICT_LINE_RE
+WHOLE_DESIGN_LANES = _review_contract.WHOLE_DESIGN_LANES
 _COMMENT_KEY_RE = _review_contract._COMMENT_KEY_RE
 FINDING_RE = _review_contract.FINDING_RE
 DISPOSITION_PREFIX = _review_contract.DISPOSITION_PREFIX
@@ -92,6 +97,10 @@ span_hash = _review_contract.span_hash
 sha_matches = _review_contract.sha_matches
 comment_key = _review_contract.comment_key
 extract_findings = _review_contract.extract_findings
+extract_design_items = _review_contract.extract_design_items
+design_lane_verdicts = _review_contract.design_lane_verdicts
+unanswered_concern_lanes = _review_contract.unanswered_concern_lanes
+unanswered_concerns_reason = _review_contract.unanswered_concerns_reason
 parse_disposition_record = _review_contract.parse_disposition_record
 
 
@@ -993,6 +1002,10 @@ def evaluate_reviewer_markers(comments, head_sha, bindings, only=None):
       stale     -- sorted reviewer names with no fresh stamp for the head
       blocking  -- sorted reviewer names with [BLOCK-MERGE] <current head>
       findings  -- {name: advisory FINDING-line count} for fresh comments
+      pinned    -- whether ``only`` named the fleet. Empty ``stale`` means
+                   "every REQUIRED lane stamped this head" only when pinned;
+                   in discovery mode it means "every lane that POSTED is
+                   fresh", which cannot see a lane that has not spoken yet.
 
     STRUCTURAL INVARIANT -- reviewer identity comes from WORKFLOW-AUTHORED
     bytes, never from model output. ``bindings`` maps each lane's comment
@@ -1011,10 +1024,23 @@ def evaluate_reviewer_markers(comments, head_sha, bindings, only=None):
     posted is not required, its CI gate covers absence).
     """
     if comments is None or not head_sha:
-        return {"ok": False, "stale": [], "blocking": [], "findings": {}, "elided": []}
+        return {
+            "ok": False,
+            "stale": [],
+            "blocking": [],
+            "findings": {},
+            "elided": [],
+            "verdicts": {},
+            "pinned": only is not None,
+        }
     fresh_by_name: dict = {name: False for name in (only or ())}
     findings: dict = {}
     blocking = set()
+    # Whole-design lanes (Design, UX, First Principles) end their body with a
+    # `<Lane>-Verdict: PASS|CONCERNS|BLOCK` line. Only BLOCK gates; CONCERNS is
+    # advisory -- but an unanswered CONCERNS is the review the loop most often
+    # misses, because nothing else prints it. Surface it, never gate on it.
+    verdicts: dict = {}
     # Reviewers whose freshness rests on an ELIDED stamp (see sha_matches). The
     # gate accepts those, but silently swallowing them would hide the emitter
     # defect for good: nobody would learn a lane is mangling the SHA it was
@@ -1041,6 +1067,9 @@ def evaluate_reviewer_markers(comments, head_sha, bindings, only=None):
                     findings[name] = len(FINDING_LINE_RE.findall(body))
                     if not any(head_sha.startswith(sha) for sha in own_stamps):
                         elided.add(name)
+                    vm = VERDICT_LINE_RE.search(body)
+                    if vm:
+                        verdicts[name] = vm.group(1).upper()
         for sha in BLOCK_MERGE_RE.findall(body):
             if sha_matches(sha, head_sha):
                 blocking.add(name or "(unattributed)")
@@ -1051,7 +1080,38 @@ def evaluate_reviewer_markers(comments, head_sha, bindings, only=None):
         "blocking": sorted(blocking),
         "findings": findings,
         "elided": sorted(elided),
+        "verdicts": verdicts,
+        "pinned": only is not None,
     }
+
+
+def reviewer_round_settled(marker_eval):
+    """Whether the AI-review round is decided, regardless of the other checks.
+
+    True only when the fleet was PINNED (``--reviewers`` / the loop's own
+    profile names), the comments were readable, every pinned lane carries a
+    fresh ``[<NAME>-REVIEWED]`` stamp for this head, and at least one posted
+    ``[BLOCK-MERGE]``. That combination is terminal for the head: the diff has
+    to change, so the tests, packaging and lint runs still in flight are
+    running on a commit that is already condemned.
+
+    Deliberately narrow in three ways. It needs a pinned fleet, because in
+    discovery mode an empty ``stale`` only says every lane that has SPOKEN is
+    fresh -- a lane still composing its review is invisible, and acting on the
+    first blocker would throw its verdict away. It needs a blocker, because a
+    settled round with no blocker has nothing to act on and must fall through
+    to the normal running/clean path. And it says nothing about failing
+    non-reviewer checks: a red test while a lane is still pending stays a
+    wait, so one round still fixes one full set of findings.
+    """
+    if not marker_eval:
+        return False
+    return bool(
+        marker_eval.get("pinned")
+        and marker_eval.get("ok")
+        and not marker_eval.get("stale")
+        and marker_eval.get("blocking")
+    )
 
 
 def head_run_exists(repo, head_sha):
@@ -1179,6 +1239,7 @@ def decide(
     head_run="skip",
     rollup_notice="",
     disposition_eval=None,
+    concerns_eval=None,
 ):
     """Resolve PR state to (exit_code, status line). Fail-closed.
 
@@ -1196,7 +1257,13 @@ def decide(
        belongs to the old head. Ranking in-flight checks first reports "running"
        forever while nothing can complete -- a stall only a human notices.
        BEHIND, draft and CHANGES_REQUESTED behave the same way: each survives
-       any amount of waiting and needs the author to act. The disposition
+       any amount of waiting and needs the author to act. A SETTLED reviewer
+       round (``reviewer_round_settled``) joins them: once every pinned lane
+       has stamped this head and one blocks, the edit is required, so the
+       backend/frontend runs still in flight are spending minutes on a commit
+       already condemned -- Phase 3 cancels them instead of waiting them out.
+       Only the AI-review lanes gate this; a non-reviewer check still running
+       does not hold the decision open, and a red one does not force it. The disposition
        evaluation (``disposition_eval``, built from disposition_violations)
        belongs here too, in BOTH its states: a violation is cleared only by
        the author editing or deleting the offending comment, and an
@@ -1224,6 +1291,14 @@ def decide(
        earns: a degraded read names its environment cause, so the reason (and
        ``progress_key.status``, which carries it) distinguishes an environment
        gap from a genuinely check-less PR.
+       ``concerns_eval`` (from unanswered_concern_lanes; None skips the gate)
+       belongs here for the same reason the marker conditions do: mid-round a
+       fresh CONCERNS with no ruling yet is expected, not a defect -- the
+       author has not been shown it. It gates only once the round has settled,
+       which is exactly the state that would otherwise return 0 and arm auto-merge
+       past an unanswered whole-design review. LOCAL ONLY: --disposition-gate
+       never reaches this function, so the repository's required status keeps
+       treating CONCERNS as advisory.
     """
     if state != "OPEN":
         return 20, "STATUS: BLOCKED - PR state is {} (not OPEN; terminal)".format(state or "?")
@@ -1237,6 +1312,20 @@ def decide(
         blocked_now.append("PR is a draft")
     if decision == "CHANGES_REQUESTED":
         blocked_now.append("review decision is CHANGES_REQUESTED")
+    if reviewer_round_settled(marker_eval):
+        # The reviewer round is DONE even though the rollup is not: every
+        # pinned lane stamped this head and at least one blocks. Waiting for
+        # the remaining lanes (backend/frontend tests, packaging) cannot
+        # change that the diff must be edited, and their verdicts do not
+        # survive the edit anyway -- the push re-runs them on the new head.
+        # So this belongs with the other "waiting cannot fix this" conditions
+        # ABOVE the running gate. Requires a PINNED fleet: discovery mode
+        # cannot tell "all lanes reported" from "one lane reported first",
+        # and acting there would drop a verdict that was still coming.
+        blocked_now.append(
+            "reviewer round complete with blocking marker [BLOCK-MERGE] on "
+            "current head from: " + ", ".join(sorted(marker_eval["blocking"]))
+        )
     if disposition_eval is not None:
         # A disposition violation is a condition waiting cannot fix -- only the
         # AUTHOR editing or deleting the comment clears it -- so it belongs
@@ -1315,6 +1404,10 @@ def decide(
                     "stale reviewer stamp(s) - no [<NAME>-REVIEWED] for current head: "
                     + ", ".join(marker_eval["stale"])
                 )
+    for lane in (concerns_eval or {}).get("unanswered") or []:
+        reasons.append(
+            unanswered_concerns_reason(lane, (concerns_eval or {}).get("head_sha") or "")
+        )
     if head_run is False:
         reasons.append(
             "no pull_request-event workflow run for the current head - the "
@@ -1545,7 +1638,7 @@ def main(argv):
     else:
         for name in sorted(marker_eval["findings"]):
             print(
-                "  - {}: fresh{}{}{}".format(
+                "  - {}: fresh{}{}{}{}".format(
                     sanitize(name),
                     "  [BLOCK-MERGE]" if name in marker_eval["blocking"] else "",
                     (
@@ -1557,6 +1650,19 @@ def main(argv):
                         "  [stamp elided the head's middle - emitter transcription "
                         "artifact, verified against this head]"
                         if name in (marker_eval.get("elided") or ())
+                        else ""
+                    ),
+                    (
+                        "  verdict={}{}".format(
+                            marker_eval["verdicts"][name],
+                            (
+                                "  <- whole-design review: answer per item, and read it "
+                                "BEFORE fixing line-level findings"
+                                if marker_eval["verdicts"][name] == "CONCERNS"
+                                else ""
+                            ),
+                        )
+                        if name in (marker_eval.get("verdicts") or {})
                         else ""
                     ),
                 )
@@ -1586,6 +1692,19 @@ def main(argv):
             disposition_records, bot_comments, head_sha, marker_bindings
         )
     disposition_eval = {"ok": disposition_ok, "violations": disposition_violation_list}
+    # A whole-design lane at CONCERNS for this head with no matching
+    # disposition record is the review the loop most often walked past: the
+    # rollup is green, so exit 0 armed auto-merge over it. Requires BOTH reads
+    # to have succeeded -- an unreadable side already gates above, and guessing
+    # "no CONCERNS" from an unread comment list is the wrong direction.
+    concerns_eval = None
+    if marker_eval.get("ok") and disposition_records is not None:
+        concerns_eval = {
+            "unanswered": unanswered_concern_lanes(
+                marker_eval.get("verdicts") or {}, disposition_records, head_sha
+            ),
+            "head_sha": head_sha,
+        }
     print("-- Disposition records (one lane, one rationale per finding) " + "-" * 6)
     if not disposition_ok:
         print("  ERROR: disposition records could not be established (fail-closed)")
@@ -1627,6 +1746,14 @@ def main(argv):
             print("  VIOLATION: " + sanitize(v))
         if not disposition_violation_list:
             print("  (no disposition-rule violations)")
+    for lane in (concerns_eval or {}).get("unanswered") or []:
+        print(
+            "  UNANSWERED: {} reported CONCERNS for this head and no "
+            "target={} disposition record names it - run pr_findings.py for "
+            "the Watch/Subtraction items and their span ids".format(
+                sanitize(lane), sanitize(lane.lower())
+            )
+        )
 
     # Assert a pull_request-event run exists for the current head, but only on
     # a PR that demonstrably uses Actions (a rollup entry with a workflowName);
@@ -1665,6 +1792,7 @@ def main(argv):
         head_run=head_run,
         rollup_notice=rollup_notice,
         disposition_eval=disposition_eval,
+        concerns_eval=concerns_eval,
     )
     print(status)
     if "--json" in argv[1:]:

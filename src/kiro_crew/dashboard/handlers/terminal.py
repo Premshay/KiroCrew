@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import time
@@ -143,6 +144,19 @@ class _TerminalSession:
     scrollback: bytearray = field(default_factory=bytearray)
     last_title: str | None = None  # last title pushed to the client (dedup)
     last_cwd: str | None = None  # last cwd pushed to the client (dedup)
+    # Absolute path of the shell this PTY actually launched, as _resolve_shell
+    # pinned it. Reported to the client in the `ready` frame: the client mints
+    # session ids and opens the socket without ever asking what got spawned, so
+    # a caller that needs to know which shell will interpret the bytes it is
+    # about to write (Run-in-terminal, which honors a code fence's language)
+    # has no other way to find out. Reporting is deliberately one-way -- the
+    # client is never given a say in WHICH shell is spawned.
+    shell: str = ""
+    # name -> absolute path for the shells a code fence can name, as resolved on
+    # this host. Reported alongside `shell` so a caller handing a snippet to a
+    # different shell can name an absolute path instead of a bare name a
+    # project-local PATH entry could hijack.
+    fence_shells: dict[str, str] = field(default_factory=dict)
     # (monotonic_ts, cwd) memo for the path-completion route. The title poller's
     # ``last_cwd`` is up to a second stale, which is long enough for a user to
     # `cd` and immediately request completions against the OLD directory — so
@@ -281,9 +295,9 @@ def _resolve_cwd(cfg: dict, requested: str | None) -> str:
 def _resolve_shell(cfg: dict) -> tuple[str, str | None]:
     """Resolve the shell program the terminal launches.
 
-    Resolution order is unchanged from the historical one — the configured
-    ``dashboard.terminal.shell``, else ``$SHELL`` (POSIX only), else the
-    platform default (``/bin/bash`` / ``powershell.exe``) — but each candidate
+    Resolution order is the configured ``dashboard.terminal.shell``, else
+    ``$SHELL`` (POSIX only), else the platform default (``/bin/bash`` /
+    ``powershell.exe``). Each candidate
     must now resolve to an executable (``shutil.which`` handles both absolute
     paths and bare names on ``PATH``). A configured value that does not resolve
     falls back rather than failing the open: a typo'd setting must never leave
@@ -306,7 +320,7 @@ def _resolve_shell(cfg: dict) -> tuple[str, str | None]:
 
     When no candidate resolves at all, the platform default is returned
     unvalidated so the spawn's own error — not a silent substitution — is what
-    the user sees, matching the historical behavior on such a host.
+    the user sees on such a host.
     """
     configured = str(cfg.get("shell") or "").strip()
     if configured:
@@ -456,6 +470,125 @@ def _is_bash_shell(shell: str) -> bool:
     return name in {"bash", "bash.exe"}
 
 
+# The shells a code fence can name. FIXED here, never derived from anything a
+# client, a fence or an agent supplies: the client selects among the entries
+# this list produced, so no caller-supplied string is ever resolved or run.
+_FENCE_SHELL_NAMES = ("bash", "sh", "zsh", "fish")
+
+
+def _agent_can_rewrite(path: str, uid: int) -> bool:
+    """Whether *path* or any ancestor could be rewritten by uid.
+
+    Current mode bits are not the question: the OWNER of a directory can chmod it
+    writable whenever it likes, so a user-owned ``0555`` directory is mutable in
+    one syscall. Ownership is the durable property, and it has to hold for every
+    ancestor too -- being able to rename a parent is enough to substitute
+    everything under it.
+
+    A world- or group-writable directory counts as rewritable UNLESS it carries
+    the sticky bit, which is what stops a non-owner removing or renaming someone
+    else's entry (``/tmp`` is the ordinary case).
+
+    Two tests are needed and they catch different things. Ownership is the durable
+    property: an owner can chmod at will, so current permission proves nothing
+    about it. Mode bits are the cheap one. Note what this does NOT see: a POSIX
+    ACL grant on an ancestor is invisible to ``st_mode``, and probing it with
+    ``os.access`` here would read the REAL uid rather than this check's subject.
+    Such an ACL can only be placed by root or by the directory's owner, and either
+    of those can equally re-point the shell ``_resolve_shell`` itself resolves, so
+    the exposure it would add over the base is nil. The candidate FILE is probed
+    with ``os.access`` in the caller, where the subject is unambiguous.
+
+    Fails closed: a path that cannot be stat'ed is treated as rewritable.
+    """
+    current = os.path.abspath(path)
+    while True:
+        try:
+            st = os.lstat(current)
+        except OSError:
+            return True
+        if st.st_uid == uid:
+            return True
+        loose = st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        if loose and not st.st_mode & stat.S_ISVTX:
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
+def _resolve_fence_shells(launched: str) -> dict[str, str]:
+    """Fence-nameable shells that sit ALONGSIDE the shell *launched* came from.
+
+    Reported to the client so a snippet handed to a different shell names an
+    absolute path rather than a bare name -- the same reasoning as
+    ``_resolve_shell``'s pinning: the terminal runs with the chat's project
+    directory as its cwd, so a bare name would be resolved there, and a relative
+    ``PATH`` entry would let a project-planted executable win.
+
+    Discovery adds NO new trusted location and consults no ``PATH`` at all. Each
+    name is probed directly inside the directory the session's own shell
+    canonically came from, so the set reported here is exactly as trustworthy as
+    the shell ``_resolve_shell`` already chose. A planted binary therefore cannot
+    become a reported shell unless the attacker already controls that directory,
+    in which case the spawn itself is compromised first and a fence tag adds
+    nothing. Probing the directory rather than resolving and filtering also means
+    an unrelated ``PATH`` entry earlier in the search order (a venv, an asdf shim)
+    cannot shadow a co-located shell out of the map.
+
+    COVERAGE, deliberately narrow: a shell is offered only when it is co-located
+    with the session's own shell AND neither it nor any ancestor of that directory
+    is OWNED by the gateway's user (an owner can chmod at will, so mode bits alone
+    prove nothing). Nothing this process could rewrite is ever offered, which is
+    what closes the swap-after-discovery window: a path is reported now and invoked
+    later, when the user confirms. That leaves the ordinary distro layout
+    (root-owned ``/usr/bin``) and excludes a user-owned prefix -- Homebrew's, a
+    workspace, a project-local ``bin`` -- where the snippet then behaves exactly as
+    it does today. Under a root gateway every path is owned by the caller, so
+    nothing is offered at all; that is the safe direction.
+
+    Blocking note: a bounded handful of stats, run in the same off-loop hop as
+    ``_resolve_shell`` rather than inline.
+    """
+    if not launched:
+        return {}
+    trusted_dir = os.path.dirname(os.path.realpath(launched))
+    if not trusted_dir:
+        return {}
+    if platform_compat.IS_WINDOWS:
+        # POSIX-only by construction: there is no bash/sh/zsh/fish host here to
+        # hand a snippet to, and the ownership test below has no Windows
+        # equivalent -- report nothing rather than approximate it.
+        return {}
+    uid = os.geteuid()
+    if _agent_can_rewrite(trusted_dir, uid):
+        return {}
+    found: dict[str, str] = {}
+    for name in _FENCE_SHELL_NAMES:
+        candidate = os.path.join(trusted_dir, name)
+        if os.path.islink(candidate):
+            continue  # the link target is outside what was vetted above
+        if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+            continue
+        try:
+            st = os.lstat(candidate)
+        except OSError:
+            continue
+        if st.st_uid == uid or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            continue  # rewritable in place
+        if os.access(candidate, os.W_OK):
+            continue  # rewritable in place via an ACL the mode bits do not show
+        found[name] = candidate
+    return found
+
+
+def _resolve_shell_with_fence_shells(cfg: dict) -> tuple[str, str | None, dict[str, str]]:
+    """``_resolve_shell`` plus the fence-shell map, in one off-loop hop."""
+    shell, rejected = _resolve_shell(cfg)
+    return shell, rejected, _resolve_fence_shells(shell)
+
+
 # Names the readiness hook reads. When the hook runs, both are consumed and unset
 # at the first prompt, so nothing the user runs afterwards sees them. A profile
 # that ASSIGNS PROMPT_COMMAND prevents the hook from running at all, and both
@@ -496,14 +629,14 @@ def _bash_ready_env(token: str) -> dict[str, str]:
 
     Bash reads an ``--init-file`` only when it is *not* a login shell, so the
     marker cannot ride an injected rc file without giving up ``-l`` — and giving
-    up ``-l`` is the bug in #5885: ``shopt -q login_shell`` is then false, so
+    up ``-l`` breaks the profile chain: ``shopt -q login_shell`` is then false, so
     every profile stanza guarded on login-ness silently no-ops and the user's
     environment never loads. Sourcing the same files from an rc file cannot
     substitute, because that option is read-only and stays off.
 
     A login shell does honour a ``PROMPT_COMMAND`` inherited from its
     environment, and runs it after the profile chain returns and before the first
-    prompt — the point the injected marker used to occupy.
+    prompt — exactly where the readiness marker has to fire.
 
     The snippet is single-shot and self-removing: it emits only while the token
     variable is still set, unsets that token so neither a later prompt nor a
@@ -533,8 +666,7 @@ def _bash_ready_env(token: str) -> dict[str, str]:
     guard: every carrier a login shell inherits is visible to the profile chain,
     and the carriers that are invisible to it (``BASH_ENV``, non-interactive only;
     ``ENV``, POSIX mode only; ``INPUTRC``, cannot run commands) do not run at the
-    post-profile point a readiness marker needs. Tracked with the alternatives in
-    #7657.
+    post-profile point a readiness marker needs.
     An operator who EXPORTED ``PROMPT_COMMAND`` into the gateway's own
     environment keeps it: the exported value is the readiness hook followed by
     the inherited command, and the withdrawal restores the inherited command
@@ -652,34 +784,19 @@ async def _kill_session(sess: _TerminalSession) -> None:
         except (OSError, RuntimeError):
             pass
         return
-    # Close master_fd first — unblocks reader_task's os.read() in executor.
-    #
-    # os.close() on a PTY master fd can BLOCK in the kernel: when the far-end
-    # shell is wedged (uninterruptible sleep), the tty teardown waits on it.
-    # Run it on the dedicated subprocess pool, never the event loop — a wedged
-    # close then costs at most one pool thread instead of freezing the whole
-    # gateway, and shares no workers with the orphan-reaping maintenance sweep.
-    if sess.master_fd >= 0:
-        fd = sess.master_fd
-        # Clear the handle BEFORE the await: if this coroutine is cancelled while
-        # suspended on the executor (e.g. aiohttp cancels the request handler on
-        # client disconnect), the fd must not be left referenced on the session.
-        sess.master_fd = -1
-        try:
-            await asyncio.get_running_loop().run_in_executor(
-                subprocess_executor(), os.close, fd,
-            )
-        except (OSError, RuntimeError):
-            # OSError: close failed. RuntimeError: the subprocess pool was
-            # already torn down (shutdown races interpreter exit) — submit
-            # raises rather than returning a future; the fd is reaped on exit.
-            pass
-    if sess.reader_task is not None:
-        sess.reader_task.cancel()
-        try:
-            await sess.reader_task
-        except (asyncio.CancelledError, Exception):
-            pass
+    # The child goes FIRST, then the PTY's controller descriptor, and the order
+    # is the fix for a real deadlock. Closing the controller end while the reader
+    # task is blocked in os.read() on it behaves differently per kernel: Linux
+    # hangs up the terminal end and the read returns EIO, which is what let the
+    # close come first; macOS (and the BSDs) make close() wait for that
+    # outstanding read, so with an interactive bash still holding the terminal
+    # end the close never returned, and four PTY tests timed out at 120 s on
+    # every macOS run, each parking a pool thread forever. Ending the session's
+    # process tree first releases the terminal end on both, so the read returns
+    # EOF, the close completes. SIGHUP is what a vanished terminal
+    # delivers and the one signal an interactive shell does not ignore (it
+    # ignores SIGTERM, which alone would cost the 5 s escalation wait); SIGTERM
+    # follows for everything else, SIGKILL after the wait as before.
     if sess.proc is not None and sess.proc.returncode is None:
         # Route through platform_compat.kill_process_tree so the whole terminal
         # handler stays platform-portable (killpg on POSIX, taskkill /T on
@@ -687,18 +804,17 @@ async def _kill_session(sess: _TerminalSession) -> None:
         # ws returns an error on Windows before any session is created — but
         # keeping a single shim call site avoids a raw-os.killpg vs shim
         # inconsistency across the module, and the tests all patch the shim.
-        try:
-            # Async variants offload Windows taskkill to subprocess_executor
-            # so this PTY teardown path never blocks the event loop on
-            # taskkill.exe. POSIX os.killpg stays inline.
-            await platform_compat.kill_process_tree_async(
-                sess.proc.pid, platform_compat.SIGTERM
-            )
-        except (ProcessLookupError, PermissionError):
-            # PermissionError (EPERM): the child made the PTY its controlling
-            # terminal (TIOCSCTTY) and leads a session/group we can't signal.
-            # Fall through to wait()/kill the proc directly.
-            pass
+        for sig in (platform_compat.SIGHUP, platform_compat.SIGTERM):
+            try:
+                # Async variants offload Windows taskkill to subprocess_executor
+                # so this PTY teardown path never blocks the event loop on
+                # taskkill.exe. POSIX os.killpg stays inline.
+                await platform_compat.kill_process_tree_async(sess.proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                # PermissionError (EPERM): the child made the PTY its controlling
+                # terminal (TIOCSCTTY) and leads a session/group we can't signal.
+                # Fall through to wait()/kill the proc directly.
+                pass
         try:
             await asyncio.wait_for(sess.proc.wait(), timeout=5)
         except asyncio.TimeoutError:
@@ -713,6 +829,33 @@ async def _kill_session(sess: _TerminalSession) -> None:
             except ProcessLookupError:
                 pass
             await sess.proc.wait()
+    # os.close() on a PTY controller fd can still BLOCK in the kernel when the far
+    # end is wedged (uninterruptible sleep, or a child this process may not
+    # signal). Run it on the dedicated subprocess pool, never the event loop, so a
+    # wedged close then costs at most one pool thread instead of freezing the
+    # whole gateway, and shares no workers with the orphan-reaping maintenance
+    # sweep.
+    if sess.master_fd >= 0:  # wokeignore:rule=master
+        fd = sess.master_fd  # wokeignore:rule=master
+        # Clear the handle BEFORE the await: if this coroutine is cancelled while
+        # suspended on the executor (e.g. aiohttp cancels the request handler on
+        # client disconnect), the fd must not be left referenced on the session.
+        sess.master_fd = -1  # wokeignore:rule=master
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), os.close, fd,
+            )
+        except (OSError, RuntimeError):
+            # OSError: close failed. RuntimeError: the subprocess pool was
+            # already torn down (shutdown races interpreter exit): submit
+            # raises rather than returning a future; the fd is reaped on exit.
+            pass
+    if sess.reader_task is not None:
+        sess.reader_task.cancel()
+        try:
+            await sess.reader_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.Response:
@@ -783,9 +926,10 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
     # and the session registration, where an added await would suspend the
     # handler with the registry still holding the None placeholder — a window
     # every concurrent reader of the registry would then observe. One hop per
-    # WS open; the reconnect path simply ignores the value.
-    shell, rejected_shell = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(), _resolve_shell, cfg,
+    # WS open, now also carrying the fence-shell map the ready frame reports;
+    # a reconnect keeps the values its original open resolved.
+    shell, rejected_shell, fence_shells = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), _resolve_shell_with_fence_shells, cfg,
     )
 
     # Check if reconnecting to existing session. A None VALUE under an
@@ -859,7 +1003,11 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             try:
                 async with existing.send_lock:
                     if existing.ws is ws and not ws.closed:
-                        await ws.send_str(json.dumps({"type": "ready"}))
+                        await ws.send_str(json.dumps({
+                            "type": "ready",
+                            "shell": existing.shell,
+                            "fence_shells": existing.fence_shells,
+                        }))
             except (ConnectionResetError, RuntimeError, OSError):
                 pass
         _sel().log_api_access(
@@ -901,7 +1049,8 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 await ws.close()
             return ws
         sess = _TerminalSession(
-            session_id=session_id, master_fd=-1, proc=None, winpty=wp, ws=ws,  # wokeignore:rule=master
+            session_id=session_id, master_fd=-1, proc=None, winpty=wp, ws=ws, shell=shell,  # wokeignore:rule=master
+            fence_shells=fence_shells,
         )
         registry[session_id] = sess
         _sel().log_api_access(
@@ -950,13 +1099,13 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             # because the kernel can't find the foreground process group.
             #
             # This is the one async spawn that deliberately keeps preexec_fn
-            # rather than moving to the post-exec shim (see issue #935). The
-            # shim exists to deliver RESOURCE LIMITS, and this spawn carries
-            # none: it is the user's own interactive shell, not agent-executed
-            # code, so it has no rlimits and no OOM bias to apply. Routing it
-            # through the shim therefore bought nothing and cost an interpreter
-            # startup on every terminal open -- measurably doubling the wall time
-            # of the terminal test file, and slowing a user-facing surface.
+            # rather than using the post-exec shim. The shim exists to deliver
+            # RESOURCE LIMITS, and this spawn carries none: it is the user's own
+            # interactive shell, not agent-executed code, so it has no rlimits
+            # and no OOM bias to apply. Routing it through the shim therefore
+            # buys nothing and costs an interpreter startup on every terminal
+            # open -- doubling the wall time of the terminal test file, and
+            # slowing a user-facing surface.
             #
             # Residual risk, stated plainly: this still forks the threaded
             # gateway. It is the smallest such fork in the codebase -- one
@@ -1007,6 +1156,8 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             proc=proc,
             ws=ws,
             ready_marker=ready_marker,
+            shell=shell,
+            fence_shells=fence_shells,
         )
         registry[session_id] = sess
         _sel().log_api_access(
@@ -1018,13 +1169,17 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         )
         if ready_marker is None:
             # The reliable injection above intentionally targets Bash, the
-            # reported shell. Preserve the historical transport-ready behavior
-            # for configured shells whose startup protocol we cannot control.
+            # reported shell. Configured shells whose startup protocol we cannot
+            # control fall back to transport-ready.
             sess.shell_ready = True
             try:
                 async with sess.send_lock:
                     if sess.ws is ws and not ws.closed:
-                        await ws.send_str(json.dumps({"type": "ready"}))
+                        await ws.send_str(json.dumps({
+                            "type": "ready",
+                            "shell": sess.shell,
+                            "fence_shells": sess.fence_shells,
+                        }))
             except (ConnectionResetError, RuntimeError, OSError):
                 pass
 
@@ -1071,7 +1226,11 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                             became_ready = True
                         if became_ready:
                             try:
-                                await live.send_str(json.dumps({"type": "ready"}))
+                                await live.send_str(json.dumps({
+                                    "type": "ready",
+                                    "shell": sess.shell,
+                                    "fence_shells": sess.fence_shells,
+                                }))
                             except (ConnectionResetError, RuntimeError, OSError):
                                 # Preserve shell_ready so a reconnect can receive
                                 # the frame even if this socket disappeared here.
@@ -1605,7 +1764,7 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
     Two mutually exclusive tiers, chosen by the CLIENT because only the client can
     see the screen row:
 
-    * **path** (no ``argv`` in the body) — the historical behaviour. Body
+    * **path** (no ``argv`` in the body) — the default tier. Body
       ``{session_id, token, folders_only?}`` where ``token`` is the DEQUOTED
       literal path the cursor sits in (``"../Kiro"``, ``"src/"``, ``""``); the
       client decodes backslash escapes before asking, so an on-screen ``my\\ dir/``

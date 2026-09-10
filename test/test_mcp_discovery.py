@@ -13,8 +13,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from conftest import host_abs
 from kiro_crew import platform_compat
 from kiro_crew.mcp_discovery import (
+    MCP_REDACTED_HEADER_VALUE,
     SCOPE_CC_GLOBAL,
     SCOPE_KIRO_GLOBAL,
     SCOPE_KIROCREW,
@@ -30,6 +32,7 @@ from kiro_crew.mcp_discovery import (
     _scope_priority,
     discover_servers_to_sync,
     list_servers,
+    probe_metadata,
     probe_server,
     sync_to_agent_config,
 )
@@ -130,9 +133,7 @@ class TestMcpServerInfo:
 
     def test_oauth_hints_omitted_on_stdio_rows(self) -> None:
         """to_dict gates them behind url, so a stdio row never advertises them."""
-        info = McpServerInfo(
-            name="x", command="cmd", scopes=["read"], client_id="public-id"
-        )
+        info = McpServerInfo(name="x", command="cmd", scopes=["read"], client_id="public-id")
         d = info.to_dict()
         assert "scopes" not in d
         assert "clientId" not in d
@@ -328,7 +329,9 @@ class TestListServers:
         monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
         mcp_json = tmp_path / "mcp.json"
         mcp_json.write_text(
-            json.dumps({"mcpServers": {"pending": {"command": "definitely-not-run", "disabled": True}}})
+            json.dumps(
+                {"mcpServers": {"pending": {"command": "definitely-not-run", "disabled": True}}}
+            )
         )
         monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
         probed: list[str] = []
@@ -608,9 +611,9 @@ class TestExtraScopeSeam:
             SCOPE_CC_GLOBAL: {"shared-srv": {"command": "cc"}},
         }
         order = _scope_priority(by_source)
-        assert order.index(SCOPE_KIRO_GLOBAL) < order.index(SCOPE_CC_GLOBAL), (
-            "Kiro global must outrank the seam ccGlobal scope (rebuild parity)"
-        )
+        assert order.index(SCOPE_KIRO_GLOBAL) < order.index(
+            SCOPE_CC_GLOBAL
+        ), "Kiro global must outrank the seam ccGlobal scope (rebuild parity)"
 
         # Functional: same server in Kiro global + seam ccGlobal with different
         # disabledTools → first-scope-wins gives the Kiro-global value.
@@ -641,9 +644,9 @@ class TestExtraScopeSeam:
         )
 
         server = next(s for s in list_servers() if s.name == "shared-srv")
-        assert server.disabled_tools == ["kiro-tool"], (
-            "Kiro-global disabledTools must win over the seam scope (first-scope-wins)"
-        )
+        assert server.disabled_tools == [
+            "kiro-tool"
+        ], "Kiro-global disabledTools must win over the seam scope (first-scope-wins)"
 
 
 class TestDiscoverNew:
@@ -704,11 +707,7 @@ class TestDiscoverNew:
         agent_dir = tmp_path / "agents"
         agent_dir.mkdir()
         headers = {"Authorization": "Bearer sync-secret"}
-        cfg = {
-            "mcpServers": {
-                "remote": {"url": "https://mcp.example.com/v1", "headers": headers}
-            }
-        }
+        cfg = {"mcpServers": {"remote": {"url": "https://mcp.example.com/v1", "headers": headers}}}
         (agent_dir / "defaults.json").write_text(json.dumps(cfg))
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
         mcp_json = tmp_path / "mcp.json"
@@ -797,11 +796,7 @@ class TestDiscoverNew:
         """A Connect that widens or narrows scopes must re-sync, not be ignored."""
         agent_dir = tmp_path / "agents"
         agent_dir.mkdir()
-        cfg = {
-            "mcpServers": {
-                "remote": {"url": "https://mcp.example.com/v1", "scopes": ["read"]}
-            }
-        }
+        cfg = {"mcpServers": {"remote": {"url": "https://mcp.example.com/v1", "scopes": ["read"]}}}
         (agent_dir / "defaults.json").write_text(json.dumps(cfg))
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
         mcp_json = tmp_path / "mcp.json"
@@ -824,15 +819,11 @@ class TestDiscoverNew:
         assert len(result) == 1
         assert result[0].scopes == ["read", "write"]
 
-    def test_discover_flags_existing_remote_client_id_change(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    def test_discover_flags_existing_remote_client_id_change(self, tmp_path, monkeypatch) -> None:
         agent_dir = tmp_path / "agents"
         agent_dir.mkdir()
         cfg = {
-            "mcpServers": {
-                "remote": {"url": "https://mcp.example.com/v1", "clientId": "old-id"}
-            }
+            "mcpServers": {"remote": {"url": "https://mcp.example.com/v1", "clientId": "old-id"}}
         }
         (agent_dir / "defaults.json").write_text(json.dumps(cfg))
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
@@ -962,19 +953,24 @@ class TestDiscoverNew:
         """A genuinely edited env.PATH still triggers a re-sync."""
         from kiro_crew.env import spec_env_path
 
+        # Spelled for the host (conftest.host_abs): a fragment that fails
+        # ``os.path.isabs`` is dropped by the expansion, and from Python 3.13 a bare
+        # ``/opt/old`` is not absolute under ntpath -- then old and new both expand
+        # to the bare augmentation and the edit is invisible.
+        old, new = host_abs("opt", "old"), host_abs("opt", "new")
         agent_dir = tmp_path / "agents"
         agent_dir.mkdir()
-        cfg = {"mcpServers": {"srv": {"command": "a", "env": {"PATH": spec_env_path("/opt/old")}}}}
+        cfg = {"mcpServers": {"srv": {"command": "a", "env": {"PATH": spec_env_path(old)}}}}
         (agent_dir / "defaults.json").write_text(json.dumps(cfg))
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
         mcp_json = tmp_path / "mcp.json"
         mcp_json.write_text(
-            json.dumps({"mcpServers": {"srv": {"command": "a", "env": {"PATH": "/opt/new"}}}})
+            json.dumps({"mcpServers": {"srv": {"command": "a", "env": {"PATH": new}}}})
         )
         monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
         result = discover_servers_to_sync()
         assert len(result) == 1
-        assert result[0].env == {"PATH": "/opt/new"}
+        assert result[0].env == {"PATH": new}
 
     def test_discover_skips_existing_with_identical_env(self, tmp_path, monkeypatch) -> None:
         """Existing servers with identical env are not flagged for sync."""
@@ -1784,7 +1780,9 @@ class TestProbeRemote:
 
         resp = MagicMock()
         resp.status = 403
-        resp.headers = {"WWW-Authenticate": 'Bearer resource_metadata="https://example.com/.well-known"'}
+        resp.headers = {
+            "WWW-Authenticate": 'Bearer resource_metadata="https://example.com/.well-known"'
+        }
         resp.__aenter__ = AsyncMock(return_value=resp)
         resp.__aexit__ = AsyncMock(return_value=False)
 
@@ -1893,7 +1891,9 @@ class TestProbeRemote:
             ),
             pytest.param("Bearer", id="bearer-with-no-evidence"),
             pytest.param('Bearer scope=""', id="empty-scope"),
-            pytest.param('Bearer resource_metadata="http://insecure.example/x"', id="http-metadata"),
+            pytest.param(
+                'Bearer resource_metadata="http://insecure.example/x"', id="http-metadata"
+            ),
             pytest.param(
                 'Bearer resource_metadata="javascript:alert(1)"', id="non-http-scheme-metadata"
             ),
@@ -1930,8 +1930,9 @@ class TestProbeRemote:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session), patch(
-            "kiro_crew.mcp_discovery._runtime_grant_present", AsyncMock(return_value=False)
+        with (
+            patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session),
+            patch("kiro_crew.mcp_discovery._runtime_grant_present", AsyncMock(return_value=False)),
         ):
             result = await _probe_remote(server)
 
@@ -1958,8 +1959,9 @@ class TestProbeRemote:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session), patch(
-            "kiro_crew.mcp_discovery._runtime_grant_present", AsyncMock(return_value=True)
+        with (
+            patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session),
+            patch("kiro_crew.mcp_discovery._runtime_grant_present", AsyncMock(return_value=True)),
         ):
             result = await _probe_remote(server)
 
@@ -1997,8 +1999,9 @@ class TestProbeRemote:
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
         grant_lookup = AsyncMock(return_value=False)
-        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session), patch(
-            "kiro_crew.mcp_discovery._runtime_grant_present", grant_lookup
+        with (
+            patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session),
+            patch("kiro_crew.mcp_discovery._runtime_grant_present", grant_lookup),
         ):
             result = await _probe_remote(server)
 
@@ -2036,7 +2039,7 @@ class TestProbeRemote:
 
     @pytest.mark.asyncio
     async def test_an_unobservable_grant_is_omitted_rather_than_reported_absent(self) -> None:
-        """"Could not observe" must not reach the client as "no grant".
+        """ "Could not observe" must not reach the client as "no grant".
 
         The sign-in wording is gated on an explicit ``false``, so emitting ``false``
         when the lookup merely failed would tell the owner of an already-authorized
@@ -2056,8 +2059,9 @@ class TestProbeRemote:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session), patch(
-            "kiro_crew.mcp_discovery._runtime_grant_present", AsyncMock(return_value=None)
+        with (
+            patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session),
+            patch("kiro_crew.mcp_discovery._runtime_grant_present", AsyncMock(return_value=None)),
         ):
             result = await _probe_remote(server)
 
@@ -2329,9 +2333,7 @@ class TestProbeServerConsentGate:
         fail — it does NOT fail merely from removing the guard, because the
         probe's early error returns skip ``_cache_probe`` anyway.
         """
-        probed = McpServerInfo(
-            name="was-ok", command="true", status="ok", tools=["alpha", "beta"]
-        )
+        probed = McpServerInfo(name="was-ok", command="true", status="ok", tools=["alpha", "beta"])
         _cache_probe(probed)
 
         disabled = McpServerInfo(name="was-ok", command="true", disabled=True)
@@ -2456,9 +2458,7 @@ class TestProbeTempContainment:
         assert owners and all(pid != os.getpid() for pid in owners)
 
     @pytest.mark.asyncio
-    async def test_probe_spawn_failure_reclaims_the_fresh_dir(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    async def test_probe_spawn_failure_reclaims_the_fresh_dir(self, tmp_path, monkeypatch) -> None:
         # A dir whose probe never existed has no dead-owner future: the sweeps
         # never delete provisional/ownerless dirs, so the spawn-failure path
         # is its only reclamation point (mirrors spawn_backend). Exercised on
@@ -2532,6 +2532,108 @@ class TestProbeTempContainment:
         assert captured["TMP"] == str(tmp_path / "chosen")
         root = home / "run" / "mcp-tmp"
         assert not root.exists() or not any(root.iterdir())
+
+    @pytest.mark.asyncio
+    async def test_probe_tmp_allocated_before_wrap_and_carved_out(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """#8653: the probe TMPDIR is allocated BEFORE the sandbox wrap, which
+        receives it as a write carve-out, and the spawn env points at it.
+
+        The managed probe root lives at ``<data home>/run/mcp-tmp``, inside the
+        runtime parent the sandbox seals read-only. A TMPDIR allocated after
+        the wrap is a directory the sandboxed child cannot write -- a
+        Bun-packaged server then fails the probe with "Cannot find the native
+        Koffi module" because it cannot extract its native module. Lock BOTH
+        halves of the fix: the ordering (alloc, then wrap) and the carve-out
+        kwarg naming the allocated dir.
+        """
+        import sys
+        from pathlib import Path
+
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+
+        calls: list[str] = []
+        real_alloc = bt.allocate_probe_tmp
+
+        def alloc_spy():
+            calls.append("alloc")
+            return real_alloc()
+
+        monkeypatch.setattr(bt, "allocate_probe_tmp", alloc_spy)
+
+        captured_wrap: dict = {}
+
+        def _wrap(argv, *a, env=None, **k):
+            calls.append("wrap")
+            captured_wrap.update(k)
+            return list(argv), dict(env if env is not None else os.environ), None
+
+        monkeypatch.setattr("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _wrap)
+
+        server = McpServerInfo(name="order-lock", command=sys.executable, args=["-c", "pass"])
+        with patch(
+            "kiro_crew.mcp_discovery.create_subprocess_limited",
+            new_callable=AsyncMock,
+            side_effect=OSError("stop after env capture"),
+        ) as spawn_mock:
+            await probe_server(server)
+
+        assert calls == ["alloc", "wrap"]
+        carve = captured_wrap.get("extra_writable_dirs")
+        assert carve is not None and len(carve) == 1
+        scratch = Path(carve[0])
+        # The carve-out is the child-facing SCRATCH SUBDIR of the allocation,
+        # never the allocation root: the root holds the ``.owner`` reclamation
+        # record, which must stay OUTSIDE the child's writable window (a
+        # garbled ``.owner`` makes the dir unreclaimable by the daemon sweep).
+        assert scratch.name == bt.PROBE_SCRATCH_SUBDIR
+        allocated = scratch.parent
+        assert allocated.parent == home / "run" / "mcp-tmp"
+        owner = allocated / bt.OWNER_FILENAME
+        assert not str(owner).startswith(str(scratch) + os.sep)
+        # The managed triple lands on the env the child actually receives,
+        # pointing at the SAME dir the wrap carved out.
+        captured_env = spawn_mock.call_args.kwargs["env"]
+        assert captured_env["TMPDIR"] == str(scratch)
+
+    @pytest.mark.asyncio
+    async def test_probe_alloc_failure_wraps_without_carveout(self, tmp_path, monkeypatch) -> None:
+        # Containment is fail-open hygiene: when allocation fails, the probe
+        # must still run -- wrapped, with inherited temp and no carve-out.
+        import sys
+
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+        monkeypatch.setattr(
+            bt,
+            "allocate_probe_tmp",
+            MagicMock(side_effect=OSError("disk full")),
+        )
+
+        captured_wrap: dict = {}
+
+        def _wrap(argv, *a, env=None, **k):
+            captured_wrap.update(k)
+            return list(argv), dict(env if env is not None else os.environ), None
+
+        monkeypatch.setattr("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _wrap)
+
+        server = McpServerInfo(name="alloc-fail", command=sys.executable, args=["-c", "pass"])
+        result = await probe_server(server)
+
+        # The wrap ran (kwargs captured) and received no carve-out.
+        assert "extra_writable_dirs" not in captured_wrap
+        # And the probe was not diverted into an error about containment --
+        # whatever the handshake outcome, allocation failure is not the error.
+        assert "disk full" not in (result.error or "")
 
     @pytest.mark.asyncio
     async def test_probe_drops_reserved_kirocrew_namespace_from_spec_env(
@@ -2640,9 +2742,7 @@ class TestProbeServerProcessCleanup:
     @pytest.mark.asyncio
     async def test_fallback_kill_on_timeout(self) -> None:
         """When graceful shutdown times out, falls back to proc.kill()."""
-        proc = self._make_mock_proc(
-            wait_side_effect=[asyncio.TimeoutError(), 0]
-        )
+        proc = self._make_mock_proc(wait_side_effect=[asyncio.TimeoutError(), 0])
         server = McpServerInfo(name="test", command="echo")
 
         with (
@@ -2704,9 +2804,13 @@ class TestProbeServerProcessCleanup:
         """
         from kiro_crew.env import spec_env_path
 
-        monkeypatch.setenv("PATH", "/usr/bin")
+        # Spelled for the host (conftest.host_abs): the declared entry passes
+        # through the ``os.path.isabs`` filter in env._spec_path_entries, and from
+        # Python 3.13 a bare ``/opt/shims`` is not absolute under ntpath.
+        shims, usr_bin = host_abs("opt", "shims"), host_abs("usr", "bin")
+        monkeypatch.setenv("PATH", usr_bin)
         proc = self._make_mock_proc()
-        server = McpServerInfo(name="test", command="echo", env={"PATH": "/opt/shims"})
+        server = McpServerInfo(name="test", command="echo", env={"PATH": shims})
         captured: dict = {}
 
         def _spawn(*argv, **kw):  # noqa: ANN002, ANN003 - test shim
@@ -2722,10 +2826,10 @@ class TestProbeServerProcessCleanup:
             await probe_server(server)
 
         spawned = captured["env"]["PATH"]
-        assert spawned == spec_env_path("/opt/shims")
+        assert spawned == spec_env_path(shims)
         entries = spawned.split(os.pathsep)
-        assert entries[0] == "/opt/shims"
-        assert "/usr/bin" in entries
+        assert entries[0] == shims
+        assert usr_bin in entries
 
 
 class TestInstallAgentRemote:
@@ -3336,9 +3440,7 @@ class TestProbeServerStderrCapture:
 
         # Resolve the command, then fail at the sandbox chokepoint with the long
         # message — the real path a Windows host takes with no sandbox backend.
-        monkeypatch.setattr(
-            "kiro_crew.mcp_discovery.shutil.which", lambda *a, **k: "/usr/bin/srv"
-        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery.shutil.which", lambda *a, **k: "/usr/bin/srv")
 
         def boom(*_a: object, **_k: object) -> object:
             raise RuntimeError(long_msg)
@@ -3803,18 +3905,14 @@ class TestDisabledIsCrossScope:
         )
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
         kiro_mcp = tmp_path / "kiro-mcp.json"
-        kiro_mcp.write_text(
-            json.dumps({"mcpServers": {"srv": global_spec}}), encoding="utf-8"
-        )
+        kiro_mcp.write_text(json.dumps({"mcpServers": {"srv": global_spec}}), encoding="utf-8")
         monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
         monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (kiro_mcp,))
         monkeypatch.setattr(
             "kiro_crew.mcp_discovery._MCP_SOURCES", ((kiro_mcp, SCOPE_KIRO_GLOBAL),)
         )
 
-    def test_kiro_global_disable_marks_an_agent_introduced_row(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    def test_kiro_global_disable_marks_an_agent_introduced_row(self, tmp_path, monkeypatch) -> None:
         self._env(
             tmp_path,
             monkeypatch,
@@ -3864,9 +3962,7 @@ class TestDisabledIsCrossScope:
         assert out.status == "disabled"
         assert spawned == []
 
-    def test_raw_scoped_key_disable_marks_the_canonical_row(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    def test_raw_scoped_key_disable_marks_the_canonical_row(self, tmp_path, monkeypatch) -> None:
         """Row names are CANONICALIZED (step 3b): ``npm:@playwright/mcp`` is
         reported as ``playwright-mcp``. Scope dicts stay keyed by the raw name,
         so matching before canonicalization misses a raw-keyed disable whenever
@@ -3920,9 +4016,9 @@ class TestWindowsTeardownOffLoop:
         # Every kill_process_tree call in the probe path must be wrapped.
         for line in src.splitlines():
             if "kill_process_tree" in line and not line.strip().startswith("#"):
-                assert "to_thread" in line or "platform_compat.kill_process_tree," in line, (
-                    f"kill_process_tree called on the loop: {line.strip()}"
-                )
+                assert (
+                    "to_thread" in line or "platform_compat.kill_process_tree," in line
+                ), f"kill_process_tree called on the loop: {line.strip()}"
         assert "asyncio.to_thread(" in src
 
 
@@ -3953,8 +4049,9 @@ class TestProbeSandboxUnavailable:
         # A THIRD-PARTY server: managed ones never reach the spawn path at all
         # (their tools are read in-process), so they cannot exercise this branch.
         server = McpServerInfo(name="playwright-mcp", command="node")
-        with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _refuse), patch(
-            "kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/node"
+        with (
+            patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _refuse),
+            patch("kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/node"),
         ):
             result = await probe_server(server)
 
@@ -3981,8 +4078,9 @@ class TestProbeSandboxUnavailable:
             raise RuntimeError("stop at the wrap")
 
         server = McpServerInfo(name="kirocrew-core", command="kirocrew", args=["mcp-core"])
-        with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _wrap), patch(
-            "kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/kirocrew"
+        with (
+            patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _wrap),
+            patch("kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/kirocrew"),
         ):
             await probe_server(server)
 
@@ -4009,8 +4107,9 @@ class TestProbeSandboxUnavailable:
 
         for name, expect_tools in (("kirocrew-core", True), ("kirocrew-cron", True)):
             server = McpServerInfo(name=name, command="kirocrew", args=["mcp-x"])
-            with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _refuse), patch(
-                "kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/kirocrew"
+            with (
+                patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _refuse),
+                patch("kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/kirocrew"),
             ):
                 result = await probe_server(server)
 
@@ -4027,8 +4126,9 @@ class TestProbeSandboxUnavailable:
             raise SandboxUnavailableError("no backend", kind="no_backend", detail="not Linux")
 
         server = McpServerInfo(name="playwright-mcp", command="node")
-        with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _refuse), patch(
-            "kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/node"
+        with (
+            patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _refuse),
+            patch("kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/node"),
         ):
             result = await probe_server(server)
 
@@ -4072,9 +4172,7 @@ class TestFirstPartyManagedArgv:
     def _patch_invocation(self, monkeypatch) -> None:
         import kiro_crew.mcp_discovery as md
 
-        monkeypatch.setattr(
-            md, "_resolved_managed_invocation", {"kirocrew-core": self._INVOCATION}
-        )
+        monkeypatch.setattr(md, "_resolved_managed_invocation", {"kirocrew-core": self._INVOCATION})
         # Default install: the package-derived managed env is empty.
         monkeypatch.setattr("kiro_crew.agent._managed_mcp_env", lambda: {})
 
@@ -4186,8 +4284,9 @@ class TestFirstPartyManagedArgv:
         server = McpServerInfo(
             name="kirocrew-core", command=self._INVOCATION[0], args=list(self._INVOCATION[1])
         )
-        with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _capture), patch(
-            "kiro_crew.mcp_discovery.shutil.which", return_value=self._INVOCATION[0]
+        with (
+            patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _capture),
+            patch("kiro_crew.mcp_discovery.shutil.which", return_value=self._INVOCATION[0]),
         ):
             await probe_server(server)
 
@@ -4205,8 +4304,9 @@ class TestFirstPartyManagedArgv:
             raise RuntimeError("stop at the wrap")
 
         server = McpServerInfo(name="playwright-mcp", command="node")
-        with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _capture), patch(
-            "kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/node"
+        with (
+            patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _capture),
+            patch("kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/node"),
         ):
             await probe_server(server)
 
@@ -4244,3 +4344,248 @@ class TestNoteDeniedEnv:
         s = self._srv(status="error", error="boom", env=None)
         _note_denied_env(s)
         assert s.error == "boom"
+
+
+class TestProbeHeaderReferenceExpansion:
+    """The remote probe resolves ``${VAR}``/``${env:VAR}`` header references.
+
+    A static header whose value carries a runtime reference is a documented
+    form (docs/reference/kiro-cli/mcp/configuration.md) that kiro-cli expands
+    at session runtime. The probe used to send the reference as literal text,
+    so a working configuration rendered as Error / HTTP 401 with advice to
+    delete the header (issue #9206). The probe now resolves references through
+    the gateway rewriter's declared-env expander — same regex, same
+    credential-filtered source view, same "unresolved stays literal" rule.
+    """
+
+    def setup_method(self) -> None:
+        _probe_cache.clear()
+
+    def teardown_method(self) -> None:
+        _probe_cache.clear()
+
+    @staticmethod
+    def _session_returning(*responses: MagicMock) -> MagicMock:
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(side_effect=list(responses))
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        return mock_session
+
+    @staticmethod
+    def _resp(status: int, *, body: dict | None = None) -> MagicMock:
+        resp = MagicMock()
+        resp.status = status
+        resp.content_type = "application/json"
+        resp.headers = {}
+        if body is not None:
+            resp.json = AsyncMock(return_value=body)
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        return resp
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_reference_resolves_and_the_probe_sends_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reference naming an ordinary variable is sent RESOLVED — and a 401
+        against that resolved credential stays a real error, because a
+        credential genuinely was supplied and rejected."""
+        monkeypatch.setenv("KC_PROBE_TEST_TOKEN", "kc-9206-resolved-token")
+        server = McpServerInfo(
+            name="remote",
+            url="https://example.com/mcp",
+            headers={
+                "Authorization": "Bearer ${env:KC_PROBE_TEST_TOKEN}",
+                "X-Api-Key": "${KC_PROBE_TEST_TOKEN}",
+            },
+        )
+
+        mock_session = self._session_returning(self._resp(401))
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session):
+            result = await _probe_remote(server)
+
+        sent = mock_session.post.call_args_list[0].kwargs["headers"]
+        assert sent["Authorization"] == "Bearer kc-9206-resolved-token"
+        assert sent["X-Api-Key"] == "kc-9206-resolved-token"
+        assert result.status == "error"
+        assert "401" in result.error
+
+    @pytest.mark.asyncio
+    async def test_a_credential_filtered_reference_stays_literal_and_is_not_a_rejected_credential(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reference naming a credential-filtered variable is a MISS: the
+        secret value must not ride out in a probe request, and the 401 that
+        follows must not read as "your credential was rejected" — nothing was
+        supplied, so the row reports the sign-in state instead of an error
+        whose remediation advice would break a working configuration."""
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "kc-9206-filtered-secret")
+        server = McpServerInfo(
+            name="remote",
+            url="https://example.com/mcp",
+            headers={"Authorization": "Bearer ${env:AWS_SECRET_ACCESS_KEY}"},
+        )
+
+        mock_session = self._session_returning(self._resp(401))
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session):
+            result = await _probe_remote(server)
+
+        sent = mock_session.post.call_args_list[0].kwargs["headers"]
+        assert "kc-9206-filtered-secret" not in sent["Authorization"]
+        assert "${" in sent["Authorization"]
+        assert result.status == "needs_auth"
+        assert result.error == ""
+
+    @pytest.mark.asyncio
+    async def test_a_missing_variable_reference_stays_literal_and_reports_needs_auth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("KC_PROBE_UNSET_VAR", raising=False)
+        server = McpServerInfo(
+            name="remote",
+            url="https://example.com/mcp",
+            headers={"Authorization": "Bearer ${KC_PROBE_UNSET_VAR}"},
+        )
+
+        mock_session = self._session_returning(self._resp(401))
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session):
+            result = await _probe_remote(server)
+
+        sent = mock_session.post.call_args_list[0].kwargs["headers"]
+        assert sent["Authorization"] == "Bearer ${KC_PROBE_UNSET_VAR}"
+        assert result.status == "needs_auth"
+        assert result.error == ""
+
+    @pytest.mark.asyncio
+    async def test_an_error_echoing_the_resolved_secret_is_scrubbed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """redact_mcp_error's layer-2 scrubber keys on EXACT header values, so
+        it must be handed the values the probe actually sent. Handing it the
+        unexpanded config map would leave the resolved secret matching nothing
+        in the scrub set, in both serialized output (to_dict) and the probe
+        cache (_cache_probe). The synthetic token is chosen to survive the
+        layer-1 generic scanners, so this test isolates the layer-2 threading.
+        """
+        secret = "kc-9206-resolved-token"
+        monkeypatch.setenv("KC_PROBE_TEST_TOKEN", secret)
+        server = McpServerInfo(
+            name="remote",
+            url="https://example.com/mcp",
+            headers={"Authorization": "Bearer ${env:KC_PROBE_TEST_TOKEN}"},
+        )
+
+        init_resp = self._resp(
+            200,
+            body={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"message": f"upstream rejected {secret} as expired"},
+            },
+        )
+        mock_session = self._session_returning(init_resp)
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session):
+            result = await _probe_remote(server)
+
+        assert result.status == "error"
+        serialized = result.to_dict()["error"]
+        assert secret not in serialized
+        assert MCP_REDACTED_HEADER_VALUE in serialized
+        cached = probe_metadata("remote")
+        assert cached is not None
+        assert secret not in cached.error
+        assert MCP_REDACTED_HEADER_VALUE in cached.error
+
+    @pytest.mark.asyncio
+    async def test_a_partially_expanded_header_still_scrubs_the_resolved_fragment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`${TOKEN}${MISSING}` expands to `<resolved>${MISSING}`: the FULL sent
+        value and the Authorization suffix both carry the literal tail, so a
+        server echoing only the resolved token would slip past a scrub set
+        keyed on whole values. Each individually resolved placeholder value
+        must be in the scrub set on its own."""
+        secret = "kc-9206-resolved-token"
+        monkeypatch.setenv("KC_PROBE_TEST_TOKEN", secret)
+        monkeypatch.delenv("KC_PROBE_MISSING", raising=False)
+        server = McpServerInfo(
+            name="remote",
+            url="https://example.com/mcp",
+            headers={"Authorization": "Bearer ${env:KC_PROBE_TEST_TOKEN}${env:KC_PROBE_MISSING}"},
+        )
+
+        init_resp = self._resp(
+            200,
+            body={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"message": f"upstream rejected {secret} as expired"},
+            },
+        )
+        mock_session = self._session_returning(init_resp)
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session):
+            result = await _probe_remote(server)
+
+        assert result.status == "error"
+        serialized = result.to_dict()["error"]
+        assert secret not in serialized
+        assert MCP_REDACTED_HEADER_VALUE in serialized
+        cached = probe_metadata("remote")
+        assert cached is not None
+        assert secret not in cached.error
+
+    @pytest.mark.asyncio
+    async def test_a_tiny_resolved_fragment_does_not_corrupt_ordinary_prose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A resolved placeholder value below the credential minimum length
+        must NOT join the scrub set as a bare substring: no boundary rule
+        separates a one- or two-character value from prose words, and masking
+        it would corrupt unrelated error text."""
+        monkeypatch.setenv("KC_PROBE_TINY", "ab")
+        server = McpServerInfo(
+            name="remote",
+            url="https://example.com/mcp",
+            headers={"X-Key": "x-${env:KC_PROBE_TINY}-y"},
+        )
+
+        init_resp = self._resp(
+            200,
+            body={
+                "jsonrpc": "2.0",
+                "id": 1,
+                # "ab" appears both STANDALONE (a boundary-anchored pattern
+                # would mask it — the case only the minimum-length skip
+                # protects) and embedded in a longer word.
+                "error": {"message": "got ab grade abnormal response"},
+            },
+        )
+        mock_session = self._session_returning(init_resp)
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session):
+            result = await _probe_remote(server)
+
+        assert result.status == "error"
+        serialized = result.to_dict()["error"]
+        assert "got ab grade" in serialized
+        assert "abnormal" in serialized
+
+    def test_needs_authorization_ignores_an_unresolved_reference(self) -> None:
+        """An Authorization value still carrying ``${VAR}`` is not a supplied
+        credential: the premise behind "any auth key present means a credential
+        was rejected" does not hold, so a 401 is an authenticate prompt."""
+        from kiro_crew.mcp_discovery import _needs_authorization
+
+        assert _needs_authorization(401, {}, {"Authorization": "Bearer ${TOKEN}"}) is True
+        assert (
+            _needs_authorization(
+                403,
+                {"WWW-Authenticate": "Bearer"},
+                {"Authorization": "${env:TOKEN}"},
+            )
+            is True
+        )
+        # A resolved (reference-free) credential still suppresses needs_auth.
+        assert _needs_authorization(401, {}, {"Authorization": "Bearer abc"}) is False
+        # Only 401/403-with-challenge become needs_auth even when unresolved.
+        assert _needs_authorization(500, {}, {"Authorization": "Bearer ${TOKEN}"}) is False

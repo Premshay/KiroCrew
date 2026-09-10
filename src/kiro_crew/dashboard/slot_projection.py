@@ -213,14 +213,29 @@ class SlotProjection:
             # = it can, null = not known yet. Carried so the frontend reads the
             # answer instead of inferring it from whether the pin appears in
             # `GET /api/models` -- a list every unrelated filter (deprecation,
-            # curation) narrows, which silently turned those filters into
-            # entitlement signals (#1819). DISPLAY only; never a write source.
+            # curation) narrows, which would silently turn those filters into
+            # entitlement signals. DISPLAY only; never a write source.
             "model_withheld": slot.model_withheld,
+            # The model the live session actually resolved to, so a slot that
+            # inherits (no pin, or a withheld one) can be NAMED rather than
+            # shown as "auto". "" = not known. DISPLAY only, like the verdict
+            # above: never a write source.
+            "served_model": slot.served_model,
             "reasoning_effort": slot.reasoning_effort,
             "mode": slot.mode,
             "surface": slot.mode,
             "workspace": slot.workspace,
             "project": slot.project,
+            # Remote-execution binding. Shipped on every slot (not just remote
+            # ones) so the frontend can branch on a field that is always
+            # present: an absent key and "runs locally" would be the same
+            # reading, and a stale client would then render a peer session as
+            # local. The binding's third field, `remote_slot`, is deliberately
+            # NOT projected: it is the PEER's slot key, meaningful only inside a
+            # request routed back through that instance, and no browser code has
+            # any use for it — these two carry every branch the frontend makes.
+            "executor": slot.executor,
+            "instance_id": slot.instance_id,
             "artifact": slot._artifact,
             "messages": len(slot.messages),
             "running": slot.running,
@@ -272,4 +287,12 @@ class SlotProjection:
             "linked_session_key": slot.linked_session_key,
             "app": slot._app,
             "origin": slot._origin,
+            # Creator attribution: the slot key of the session that asked for
+            # this one via the session-control create verb ("" for a person's
+            # own tab, a fork, a restore). Written at birth and rehydrated, so
+            # it is the one durable link from a crew member's DM thread to the
+            # workers it drives -- the Crew Members drawer filters the live
+            # ``slots`` frames on it. A member caller is ownership-fenced to the
+            # slots it created (``authorize_target``), so created == driven.
+            "created_by": getattr(slot, "_created_by", ""),
         }

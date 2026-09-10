@@ -29,8 +29,8 @@ from kiro_crew.metrics.sessions import (
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
 else:
-    # Importing providers.base from this leaf enters providers -> acp.runtime ->
-    # session_pid -> providers when the module is imported standalone.
+    # ProviderFactory below subscripts LLMProvider at module scope, so a name must
+    # exist at runtime; a real import would cross the agent-SDK boundary gate.
     LLMProvider = Any
 
 
@@ -122,6 +122,7 @@ class AllocationDeps:
     load_watchdog_settings: Callable[[str], object]
     advertised_model_ids: Callable[[Any], list[str]]
     model_is_unusable: Callable[[str, list[str]], bool]
+    resolve_pin_spelling: Callable[[str, list[str]], str]
     to_provider_id: Callable[[str, str], str]
     to_acp_id: Callable[[str], str]
     inc_session_created: Callable[[], None]
@@ -238,7 +239,6 @@ def _collect_parent_runtime_kwargs(
         ("_sandbox_mode", "sandbox_mode"),
         ("_extra_env", "extra_env"),
         ("_mcp_gateway_overlay", "mcp_gateway_overlay"),
-        ("_mcp_gateway_settings_mcp_json", "mcp_gateway_settings_mcp_json"),
         ("_mcp_gateway_socket", "mcp_gateway_socket"),
         ("_mcp_gateway_claude_servers", "mcp_gateway_claude_servers"),
         ("backend", "acp_backend"),
@@ -1306,21 +1306,18 @@ class SessionAllocationService:
             pool_decision = "bypass_member"
         elif cwd_blocks_pool:
             pool_decision = "bypass_cwd"
-        elif extra_factory_kwargs.get("reasoning_effort_override"):
-            pool_decision = "bypass_effort"
         elif extra_env:
             pool_decision = "bypass_env"
         elif await self._crew_pins_effort(agent, extra_factory_kwargs.get("crew_agent")):
-            # Same reason as bypass_effort above, for the effort a CREW pins
-            # rather than one a caller passed: a pooled child was spawned under
-            # whatever effort overlay was current when the pool filled, and the
-            # claim path re-keys the model but never re-pushes effort — so a warm
-            # hit would silently run this crew at the wrong depth. Cold-starting
-            # is what makes the pin real.
+            # A CREW's pinned effort is fixed at spawn time and the warm-pool
+            # claim path never re-pushes it, so a warm hit would silently run
+            # this crew at the wrong depth.  Cold-starting is what makes the
+            # pin real.  (Caller-supplied reasoning_effort_override is handled
+            # post-claim via provider.change_effort instead — see below.)
             #
-            # Last in the chain on purpose: it is the only arm that needs to read
-            # config, so every cheaper reason to skip the pool is settled first
-            # and a bypassing session never pays for the lookup.
+            # Last in the chain on purpose: it is the only arm that needs to
+            # read config, so every cheaper reason to skip the pool is settled
+            # first and a bypassing session never pays for the lookup.
             pool_decision = "bypass_effort"
         else:
             pool_decision = ""
@@ -1386,9 +1383,22 @@ class SessionAllocationService:
                                 )
                             except Exception:  # pragma: no cover - defensive
                                 advertised = []
+                            _send_model = switch_model
                             if advertised and self._deps.model_is_unusable(
                                 switch_model, advertised
                             ):
+                                # A literal miss can be a stale `<namespace>::`
+                                # qualifier on a model the backend fully serves
+                                # (#8521): resolve to the advertised spelling and
+                                # send THAT — the same fold the cold-start spawn
+                                # and the display verdict use, so a warm claim
+                                # runs exactly what a cold start of the same pin
+                                # runs. A pin absent under either spelling still
+                                # takes the withhold below.
+                                _send_model = self._deps.resolve_pin_spelling(
+                                    switch_model, advertised
+                                )
+                            if not _send_model:
                                 self._deps.logger.warning(
                                     "Pool post-claim: model %s is not available to this "
                                     "account; leaving the claimed process on %s",
@@ -1396,11 +1406,42 @@ class SessionAllocationService:
                                     pool_model,
                                 )
                             else:
-                                await cast(Any, provider).client.set_model(switch_model)
+                                await cast(Any, provider).client.set_model(_send_model)
                                 self._deps.logger.info(
                                     "Pool post-claim: switched model to %s",
-                                    switch_model,
+                                    _send_model,
                                 )
+                    _effort_override = extra_factory_kwargs.get("reasoning_effort_override")
+                    if _effort_override:
+                        _eff = str(_effort_override)
+                        try:
+                            if not await provider.change_effort(_eff):
+                                _cur_model = (
+                                    getattr(cast(Any, provider).client, "_model", None) or ""
+                                )
+                                self._deps.logger.warning(
+                                    "reasoning effort '%s' will not be applied (session %s) — "
+                                    "model '%s' does not support effort configuration",
+                                    _eff,
+                                    key or "?",
+                                    _cur_model or "auto",
+                                )
+                            else:
+                                _cur_model = (
+                                    getattr(cast(Any, provider).client, "_model", None) or ""
+                                )
+                                self._deps.logger.info(
+                                    "Pool post-claim: applied reasoning effort %s to model %s",
+                                    _eff,
+                                    _cur_model,
+                                )
+                        except Exception:
+                            self._deps.logger.warning(
+                                "Pool post-claim: failed to apply reasoning effort '%s' (session %s)",
+                                _eff,
+                                key or "?",
+                                exc_info=True,
+                            )
                 self._deps.logger.info(
                     "Claimed warm-pool process for %s (agent=%s)",
                     key,

@@ -86,9 +86,13 @@ _CARRIED_INFORMATIONAL_XATTR_PREFIXES = ("user.",)
 
 #: Whether this platform exposes the xattr syscalls an ACL carry needs at all.
 #:
-#: Windows has none of them, and typeshed guards all three behind
+#: CPython exposes all three on Linux only. Windows has none of them, macOS has
+#: ``openat`` but none of them either (its ACLs live behind ``acl_get_file``,
+#: not the Linux xattr API), and typeshed guards all three behind
 #: ``sys.platform == "linux"``, so every use is a ``hasattr`` probe rather than a
-#: direct call.
+#: direct call. This flag gates only what an ACL carry can READ — a pinned
+#: caller still gets a descriptor from :func:`open_access_control_source`
+#: regardless, because the MODE carry needs one (see that function's contract).
 ACCESS_CONTROL_XATTRS_SUPPORTED = all(
     hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr")
 )
@@ -647,6 +651,21 @@ def _link_trust_anchor(parent: Path) -> tuple[Path, tuple[str, ...]] | None:
         anchor = lexical.parents[best - 1] if best else lexical
         return anchor, names
     return None
+
+
+def refuse_linked_parent(path: Path | str) -> None:
+    """Public form of the planted-link refusal, for out-of-band stagers.
+
+    ``atomic_write(restrict_to_owner=True)`` applies this automatically, and
+    that chokepoint is where the guard normally lives. A secret writer that
+    must stage its temp OUTSIDE the target's parent (md-notebook's masked
+    top-level staging directory) cannot route through ``atomic_write`` itself, so it
+    calls this on the same paths its ``mkdir``/``mkstemp``/``replace`` will
+    walk — BEFORE the mkdirs, which follow a planted link and would build the
+    tree under its target. Raises ``OSError`` on refusal, like the private
+    form.
+    """
+    _refuse_linked_parent(Path(path))
 
 
 def _refuse_linked_parent(path: Path) -> None:

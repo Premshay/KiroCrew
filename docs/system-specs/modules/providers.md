@@ -1,8 +1,16 @@
 ## LLM Provider Abstraction
 
-KiroCrew drives a single LLM backend: `kiro-cli` over ACP. The `LLMProvider`
-interface is retained as a thin seam (consumers depend only on the ABC), but
-there is exactly one concrete provider — `agent.provider` is fixed to `acp`.
+Kiro Crew drives every LLM through one seam: the `LLMProvider` ABC in
+`providers/base.py`. `AcpProvider` (`providers/acp.py`) is the only implementation
+the factory selects; `AcpSessionProvider` (`acp/session_provider.py`) is a second
+concrete subclass, the adapter a shared-runtime session is swapped onto once
+`AcpRuntime` is up.
+`agent.provider` is fixed to `"acp"` (enum `["acp"]`) — the provider is not the
+harness selector. **Which harness that one provider drives is a separate
+decision, taken from `agent_sdk/backends.py`**: `agent.acp_backend` names a backend id
+and `BASELINE_SELECTABLE_BACKENDS` decides which ids an operator may choose.
+Several are selectable on a plain public build, so "one provider" never meant
+"one backend".
 
 ### Architecture
 
@@ -20,45 +28,52 @@ there is exactly one concrete provider — `agent.provider` is fixed to `acp`.
             ┌──────┴──────┐
             │ AcpProvider │
             │ acp.py      │
-            │ kiro-cli    │
-            └─────────────┘
+            └──────┬──────┘
+                   │  backend id from agent_sdk/backends.py
+        ┌──────────┼──────────┬──────────┐
+     kiro-cli   claude-acp   KAS      codex-acp
 ```
 
-**Note:** the removed Bedrock provider and the removed standalone provider were
-**deleted** during de-Amazoning, along with their config fields and the
-multi-provider dispatch factory. `acp/client.py` keeps a dormant
-`ACP_BACKEND_CLAUDE` seam (`AcpProvider` can in principle drive
-`claude-agent-acp`) so an internal companion can re-register a Claude backend,
-but the public provider factory never selects it — `kiro-cli` is the only
-backend.
-See [`../features/claude-code-provider.md`](../features/claude-code-provider.md).
+`agent_sdk/backends.py` is the selection authority: it defines the ids, the membership
+floor (`ACP_BACKENDS_KNOWN`), the selectable baseline, and every capability set a
+backend opts into. Do not re-describe that seam here —
+[harness-parity.md](harness-parity.md) holds the invariants that keep the Kiro
+path from being widened for an adapted harness,
+[harness-onboarding.md](harness-onboarding.md) the sequence a new harness walks,
+and [agent-host-contract.md](agent-host-contract.md) the host obligations every
+adapted backend meets, KAS included, as a worked example. The transport itself (framing, timeouts, binary resolution,
+config isolation) is [acp-client.md](acp-client.md); this file owns the
+*interface*.
+
+**Removed, and not to be re-added:** the Bedrock provider, the standalone
+provider, their config fields, and the multi-provider dispatch factory. A second
+`agent.provider` value would route around every harness-parity invariant, which
+is why the enum stays closed.
+
+The Claude Code harness has its own page: [claude-code-provider.md](claude-code-provider.md).
+
 
 ### LLMProvider ABC (`providers/base.py`)
 
-```python
-class LLMProvider(ABC):
-    async def start() -> None
-    async def shutdown() -> None
-    async def stream(message: str) -> AsyncIterator[LLMEvent]
-    async def approve_tool(request_id) -> None
-    async def reject_tool(request_id) -> None
-    def context_usage_pct() -> float
-    # Optional (have defaults):
-    async def stream_command(command: str) -> AsyncIterator[LLMEvent]
-    async def compact(context: str = "") -> None
-    async def wait_for_compaction(timeout: float = COMPACT_WAIT_TIMEOUT_SECS) -> dict
-    async def cancel(*, wait_ack_timeout: float = 0.0) -> CancelOutcome
-    def is_alive() -> bool
-    def touch_activity() -> None
-    @property def served_model() -> str
-    @property def agent_name() -> str
-    def available_models() -> list[dict[str, str]]
-    async def discover_models() -> list[dict[str, str]]
-    def get_valid_effort_levels() -> list[str]
-    @property def session_provider_label() -> str
-    def set_resume_session_id(session_id: str) -> None
-    @property def session_resumed() -> bool
-```
+`providers/base.py` is the surface, and it is the only honest copy of it — the
+ABC declares roughly forty members, so a hand-maintained list here goes stale
+without anything going red. Read the module.
+
+The members that carry *contract* meaning, rather than plumbing, are the ones a
+harness can get wrong:
+
+| Member | Contract |
+|---|---|
+| `start` / `shutdown` / `stream` | The turn lifecycle every consumer depends on. |
+| `approve_tool` / `reject_tool` | Tool-approval responses; a provider that cannot answer must still refuse, never hang. |
+| `context_usage_pct`, `context_usage_unknown`, `context_window_tokens`, `context_used_tokens` | The context meter. `context_usage_unknown` is what distinguishes "0%" from "not measured". |
+| `session_id`, `cleanup_session`, `cwd` | Session identity and cleanup routing; a wrong `cwd` persists the wrong workspace on resume. |
+| `served_model`, `available_models` | The model actually served, which can differ from the id Crew stored. |
+| `steer` / `supports_steer` / `last_steer_monotonic` | The steer extension. Non-implementers answer `-32601`, so `supports_steer` must be honest. |
+| `has_active_turn`, `has_unfinished_turn`, `wait_turn_done` | Turn-state probes the session layer reads before reusing a process. |
+| `is_session_sharing_eligible` | Whether one process may host multiplexed sessions. |
+| `manual_compact_unsupported_backend`, `mcp_config_hot_reload`, `uses_kiro_identity_store` | Capability answers, each defaulting to the safe value so a Kiro path never needs a `hasattr` probe (harness-parity H14). |
+| `billing_stats`, `child_fidelity_aware` | Accounting and subagent-fidelity reporting. |
 
 `session_provider_label` opts a provider into a non-default session-map namespace; its safe
 default is empty. `set_resume_session_id()` is a safe no-op by default, while a resumable
@@ -100,16 +115,21 @@ must require the raw form.
 
 ### AcpProvider (`providers/acp.py`)
 
-The sole provider. Spawns a long-lived `kiro-cli acp --agent <name>` subprocess
-and speaks JSON-RPC 2.0 over stdio.
+The one concrete provider. It spawns a long-lived harness subprocess — by default
+`kiro-cli acp --agent <name>` — and speaks JSON-RPC 2.0 over stdio.
 
-**Dormant backend seam:** `AcpProvider`/`AcpClient` retain an `acp_backend`
-parameter (`"" ` → kiro-cli; `"claude"` / `ACP_BACKEND_CLAUDE` → `claude-agent-acp`)
-so an internal companion can re-register a Claude backend over the same
-client. **The public provider factory only ever selects kiro-cli** — the claude
-branch is unreachable in this build. Its binary-resolution + config-isolation
-details live in [`acp-client.md`](acp-client.md); do not re-add the registration
-glue or a provider selector (see the repo-root `CLAUDE.md`).
+**The backend seam:** `AcpProvider`/`AcpClient` take an `acp_backend` id
+(`""` → kiro-cli, `"claude"` → `claude-agent-acp`, `"kas"` → KAS,
+`"codex"` → `codex-acp`). Construction rejects an id outside
+`ACP_BACKENDS_KNOWN`, so a value that falls through every identity check cannot
+spawn kiro-cli under a foreign label. Which of those ids an operator can select
+is `BASELINE_SELECTABLE_BACKENDS`, not this file. Binary resolution and
+config isolation per backend live in [`acp-client.md`](acp-client.md); do not add
+a second provider or a provider-level selector (see the repo-root `CLAUDE.md`).
+
+Adding an id to `ACP_BACKENDS_KNOWN` also obliges a frame-replay corpus under
+`test/fixtures/acp_frames/<id>/`; the requirement and what it buys are stated once,
+in [agent-host-contract.md](agent-host-contract.md).
 
 **Companion runtime policy:** a composed `ProviderRegistry` may optionally
 implement `agent_runtime_policy(agent_name)`. The dashboard reads that
@@ -134,16 +154,16 @@ or adapter constraint.
 - `is_alive()` → `AcpClient.is_responsive()` (600s stale threshold)
 - `is_process_alive()` → OS-level process check
 
-**Reasoning effort** (Opus/Sonnet/Fable **and GPT-5.x** — shared vocabulary in `effort.py`: levels `low|medium|high|xhigh|max`, capability via `model_supports_effort`, resolution via `resolve_effort_for_model` with priority slot-override > workspace default > None). Capability is a conservative allowlist of known-capable families (`opus`/`sonnet`/`fable`/`gpt`, minus a hard `haiku` exclusion), verified against kiro-cli 2.12/2.13 over ACP — kiro rejects `/effort` on the other third-party models (deepseek/minimax/glm/qwen/auto) with "Effort configuration is currently not available on <model>". A new model family lands as unsupported until confirmed (safe default: the slider hides). Applied via a workspace `cli.json` overlay at `<work_dir>/.kiro/settings/cli.json` → `chat.modelDefaults.<model>.<key>.effort`, written before every spawn (`_write_cli_overlay`) and recovered on init (`_read_cli_overlay`) for server-restart resilience. The `<key>` sub-object is **family-specific** (`effort_settings_key`): `output_config` for Claude models, `reasoning` for GPT models — kiro silently ignores the wrong key, so a mismatched shape would survive a live push but drop on respawn. `_write_cli_overlay` removes stale effort from the other family key while preserving unrelated settings; `_clear_cli_overlay_effort`/`_read_cli_overlay` sweep both keys. Live change pushes `/effort` with the TuiCommand args form (`send_command(args={"level": …})`). The factory threads `reasoning_effort_override` → `effort_per_model[current_model]`; when a valid requested effort cannot be threaded (the resolved model is empty or not effort-capable) the factory's gate logs one warning naming the level, the session, and the resolved model (or `auto` when unresolved, matching the spawn-side `effort_dropped` verdict) — the single drop authority reporting its own decision, covering every surface (spawn, dashboard slot, cron) that funnels through it, an explicit `reasoning_effort_override` always warns (a caller's own dropped request is the event the gate exists to surface), while a drop sourced only from the config default (`agent.reasoning_effort`) is deduped once per (model, level) for the factory's lifetime so one static configuration fact does not repeat on every construction. A `reasoning_effort_override` also bypasses the warm pool (`bypass_effort`): a pre-warmed provider was built without the override and post-claim fixups never touch effort, so the override must reach a fresh factory call to be delivered at all. The dashboard handler routes through `change_effort`/`clear_effort` and only resets the session when there is no live provider. Non-effort-capable models persist the slot value without a live apply or reset.
+**Reasoning effort** (Opus/Sonnet/Fable **and GPT-5.x** — shared vocabulary in `effort.py`: levels `low|medium|high|xhigh|max`, capability via `model_supports_effort`, resolution via `resolve_effort_for_model` with priority slot-override > workspace default > None). Capability is a conservative allowlist of known-capable families (`opus`/`sonnet`/`fable`/`gpt`, minus a hard `haiku` exclusion), verified against kiro-cli 2.12/2.13 over ACP — kiro rejects `/effort` on the other third-party models (deepseek/minimax/glm/qwen/auto) with "Effort configuration is currently not available on <model>". A new model family lands as unsupported until confirmed (safe default: the slider hides). Applied via a workspace `cli.json` overlay at `<work_dir>/.kiro/settings/cli.json` → `chat.modelDefaults.<model>.<key>.effort`, written before every spawn (`_write_cli_overlay`) and recovered on init (`_read_cli_overlay`) for server-restart resilience. The `<key>` sub-object is **family-specific** (`effort_settings_key`): `output_config` for Claude models, `reasoning` for GPT models — kiro silently ignores the wrong key, so a mismatched shape would survive a live push but drop on respawn. `_write_cli_overlay` removes stale effort from the other family key while preserving unrelated settings; `_clear_cli_overlay_effort`/`_read_cli_overlay` sweep both keys. Live change pushes `/effort` with the TuiCommand args form (`send_command(args={"level": …})`). The factory threads `reasoning_effort_override` → `effort_per_model[current_model]`; when a valid requested effort cannot be threaded on a cold start (the resolved model is empty or not effort-capable) the factory's gate logs one warning naming the level, the session, and the resolved model (or `auto` when unresolved, matching the spawn-side `effort_dropped` verdict) — reporting its own drop decision on surfaces that construct a fresh provider, an explicit `reasoning_effort_override` always warns (a caller's own dropped request is the event the gate exists to surface), while a drop sourced only from the config default (`agent.reasoning_effort`) is deduped once per (model, level) for the factory's lifetime so one static configuration fact does not repeat on every construction. A `reasoning_effort_override` on a warm-pool claim is applied post-claim via `provider.change_effort` (updating `_effort_per_model` and the `cli.json` overlay write) rather than bypassing the pool, recovering pool-hit startup latency; if the claimed model does not support effort, `change_effort` returns False and a corresponding drop warning is logged. The dashboard handler routes through `change_effort`/`clear_effort` and only resets the session when there is no live provider. Non-effort-capable models persist the slot value without a live apply or reset.
 
 **MCP Tool Search** (kiro backend only — see https://kiro.dev/docs/cli/mcp/tool-search/): loads MCP tool specs on demand ("search-and-call") instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. Gated by the `agent.tool_search` config toggle (default **on**; auto-surfaces as a Settings toggle since the schema is generated from the dataclass).
 - Applied via the **same** workspace `cli.json` overlay used for effort (`<work_dir>/.kiro/settings/cli.json`), written deterministically before every spawn and on each restart by `_write_tool_search_overlay` (called from `AcpProvider.__init__` and `start()`). When enabled it writes the flat keys `toolSearch.enabled=true` plus `toolSearch.minPct`/`toolSearch.minTokens`, taken from `agent.tool_search_min_pct` / `agent.tool_search_min_tokens` (defaults `5` / `50000`, mirroring kiro-cli's own thresholds; clamped to 0-100 and >= 0, non-numeric falls back to the default); when disabled it writes `toolSearch.enabled=false` and drops both thresholds.
 - **Why the thresholds are not forced to 0:** deferral costs a round-trip — a deferred tool's spec is absent from the model's tool list, so the first direct call fails with `A tool with the name '<name>' does not exist` and has to be recovered with `tool_search`. That only pays once the specs are genuinely large, which is what the thresholds express (kiro-cli defers when EITHER is exceeded). An earlier build hard-coded both to `0`, imposing the round-trip on every install including ones far below the threshold. Setting both to `0` still restores unconditional deferral for operators who want it. The thresholds are written **explicitly** rather than omitted, so a machine carrying the old forced zeros is actually migrated instead of silently keeping them.
 - Writing both `true` and `false` makes the KiroCrew toggle authoritative over any value in the user's global `~/.kiro/settings/cli.json`. The write is merge-safe with the effort `chat.modelDefaults` keys in the same file.
-- **claude backend** — no-op. Tool Search is a kiro-cli feature; `_apply_tool_search_overlay` returns early for the claude backend and when no toggle value was threaded in (`tool_search is None`).
+- **Non-kiro backends** — no-op. Tool Search is a kiro-cli feature; `_apply_tool_search_overlay` returns early when the backend does not read the overlay and when no toggle value was threaded in (`tool_search is None`).
 
 - **Resume guard:** `session/load` (resume) is only attempted when the prior session transcript exists on disk (`~/.kiro/sessions/cli/<sid>.json`). A stale persisted sid with no transcript falls back to `session/new`, preventing a fresh conversation from replaying old turns (which inflated base context).
-- **Working dir:** `AcpProvider.cwd` overrides the `LLMProvider` ABC default so `session_map` persists the real workspace path. AcpProvider's work_dir lives on the inner client (`_client._work_dir`), so the prior `getattr(provider, "_work_dir", "")` persisted `""` for all ACP sessions — `provider.cwd` fixes resume-cwd-override.
+- **Working dir:** `AcpProvider.cwd` overrides the `LLMProvider` ABC default so `session_map` persists the real workspace path. AcpProvider's work_dir lives on the inner client (`_client._work_dir`), so a consumer reading `_work_dir` off the provider gets `""` for every ACP session; `provider.cwd` is the member to read.
 
 ### Config (`config/loader.py`)
 
@@ -163,8 +183,9 @@ override, then this crew default, then the provider/model default. A companion
 policy can mark the setting runtime-managed or unsupported; such a setting is
 then neither rendered as a selector nor applied by that companion.
 
-- `agent.provider` is fixed to `"acp"` (enum `["acp"]`); there is no provider to choose.
-- `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`.
+- `agent.provider` is fixed to `"acp"` (enum `["acp"]`); the provider is not a choice.
+- `agent.acp_backend` is the harness choice, resolved through `agent_sdk.backends.resolve_selected_backend` (the top-level `acp_backends` module is a re-export shim kept for existing call sites).
+- `create_provider_factory()` returns a `Callable` that builds an `AcpProvider` for the resolved backend.
 
 An agent spec's model is consumed by kiro-cli before Kiro Crew reaches
 `session/new`, so the live-session entitlement guard cannot diagnose a wrong
@@ -184,7 +205,7 @@ are always present; user-configured servers from the agent config are merged in.
 
 ### SessionManager (`session.py`)
 
-- Provider-agnostic via factory (one provider: kiro-cli `AcpProvider`)
+- Provider-agnostic via factory (one provider, `AcpProvider`, over the resolved backend)
 - Calls `repair_agent_configs()` on gateway startup and periodically
 - context_info() reports model/agent
 - Resume: calls `set_resume_session_id()` before `start()`
@@ -201,13 +222,13 @@ If the parent session is alive but returned no policy, deny-by-default applies �
 
 Provider-level recovery mechanisms that fire automatically without user intervention:
 
-**Interactive transient-5xx retry** (a270bd1f; post-token recovery c6fe60a): The interactive dashboard/Slack `chat_runner` stream loop retries a transient backend 5xx (InternalServerError / DispatchFailure / ConnectionReset, JSON-RPC `-32603`) through the shared `llm_helpers` transient classifier + backoff, **without** resetting the still-alive session. Auth/validation errors are excluded (fail-fast); on retry-budget exhaustion a clean error surfaces on a still-resumable session. This extends the unattended `stream_and_collect` retry path (previously deferred for the interactive loop) to interactive callers.
+**Interactive transient-5xx retry:** the interactive dashboard/Slack `chat_runner` stream loop retries a transient backend 5xx (InternalServerError / DispatchFailure / ConnectionReset, JSON-RPC `-32603`) through the shared `llm_helpers` transient classifier + backoff, **without** resetting the still-alive session. Auth/validation errors are excluded (fail-fast); on retry-budget exhaustion a clean error surfaces on a still-resumable session. The unattended `stream_and_collect` path retries on the same classifier, so both callers behave alike.
 
 A transient 5xx that arrives *after* the turn already emitted output (the `_turn_emitted` guard is set once any assistant token streams or a tool call fires) no longer drops the turn. Instead it **RECOVERS ONCE**: the streamed partial is preserved as a finalized assistant message, a brief recovery notice is appended, and a *continue* instruction (not the original prompt) is re-queued onto the SAME live ACP session — which still holds the interrupted turn's context (original prompt, streamed partial, and any completed tool results) — so the model resumes from where it stopped rather than restarting. The recovery is one-shot per genuine user turn: the allowance is consumed only when a recovery is actually enqueued and is refreshed at the start of the next real user turn, never on the synthetic recovery turn, so a repeated post-token 5xx during recovery surfaces a clean error instead of looping. When Stop is active or the turn is nested (`_prompt_depth != 0`) the partial + notice are still shown but nothing is re-queued (the allowance is left unconsumed). This recovery **also applies to turns that already fired a tool call** — an ACCEPTED TRADEOFF (owner decision), rather than failing fast: a mid-stream 5xx is rare, and the continue instruction tells the model to resume and not re-run tools that already completed. A residual double-execution risk remains only for a side-effecting/destructive tool that was still *in flight* when the 5xx hit; the owner accepts that narrow risk in favor of recovering the turn.
 
 **Context-window recovery**: the local fleet router returns the machine code `context_window_exceeded` before forwarding a request that cannot fit the selected model's context. ACP maps that code to `AcpContextWindowExceeded`; the interactive runner then resets the live session **and clears its persisted native session ID**. Clearing the ID is essential: an ordinary reset resumes the same oversized native conversation. The next acquire starts a fresh native session, rebuilds it from KiroCrew's bounded replay, and retries the original request once. A second admission failure does not loop; it surfaces guidance to shorten the request or reduce tool output. Stop-active and nested turns still clear the unusable native resume, but require an explicit retry.
 
-**Compaction-failure notice backoff** (dashboard-chat; `dashboard/chat_utils.py:_broadcast_compaction_result`): Per-turn compaction failures no longer spam the chat. Per slot, `_compaction_fail_streak` counts consecutive failures and the first `_COMPACTION_NOTICE_SHOW_FIRST_N` (=2) are shown verbatim ("❌ Compaction failed: …"); further failures within the `_COMPACTION_FAIL_COOLDOWN_SECS` (60s) `_compaction_fail_cooldown_until` window are suppressed, and when the cooldown elapses a single collapsed "failed Nx in a row … Consider `/compact` manually" message is shown with `/compact` guidance. A `completed` status resets the streak/cooldown. `acp/client.py:_handle_compaction_status` logs the raw failed-compaction notification params at WARNING (kiro-cli carries no dedicated error field on failure). This is a UX/spam guard only — the underlying compaction still runs every turn on kiro-cli's schedule — and is distinct from SessionManager's proactive auto-compact cooldown.
+**Compaction-failure notice backoff** (dashboard-chat; `dashboard/chat_utils._broadcast_compaction_result`): repeated per-turn compaction failures are collapsed rather than repeated. Per slot, `_compaction_fail_streak` counts consecutive failures and the first `_COMPACTION_NOTICE_SHOW_FIRST_N` (=2) are shown verbatim ("❌ Compaction failed: …"); further failures within the `_COMPACTION_FAIL_COOLDOWN_SECS` (60s) `_compaction_fail_cooldown_until` window are suppressed, and when the cooldown elapses a single collapsed "failed Nx in a row … Consider `/compact` manually" message is shown with `/compact` guidance. A `completed` status resets the streak/cooldown. `acp/client.py:_handle_compaction_status` logs the raw failed-compaction notification params at WARNING (kiro-cli carries no dedicated error field on failure). This is a UX/spam guard only — the underlying compaction still runs every turn on kiro-cli's schedule — and is distinct from SessionManager's proactive auto-compact cooldown.
 
 **Compaction resets — then accurately re-reports — the context meter**: a `completed` `_kiro.dev/compaction/status` drops the stale token stats at the provider chokepoints — `AcpClient._handle_compaction_status` (every dispatch loop plus `wait_for_compaction`) and the mirrored sites in `AcpSessionHandle` (prompt dispatch loop and its `wait_for_compaction` queue-drain path) — via `AcpPromptStats.reset_after_compaction()`: `context_used_tokens`/`context_pct` zero out and `context_tokens_from_usage` clears (so fresh metadata can re-derive instead of being gated by the pre-compaction `usage_update`), while `context_window_tokens` is kept (the model did not change, so the served window still holds). kiro-cli then emits a fresh `_kiro.dev/metadata` with the real post-compaction `contextUsagePercentage` about a second after the completed status (live-probe confirmed), so `wait_for_compaction` grace-drains up to `_POST_COMPACTION_METADATA_GRACE_SECS` (5s) for it on `AcpClient`, `AcpSessionHandle`, and `AcpProvider`'s cached mid-turn result path (which delegates to the inner client via the `AcpSessionProvider` pass-through); the drain only ends on a metadata frame actually carrying a `contextUsagePercentage` (a credits-only frame is consumed but does not end it), re-queues non-metadata frames before any poison sentinel, and lets process death (`AcpError`) propagate; `_backfill_context_window` prefers the **kept served window** over the model registry when deriving tokens from that percentage, since the served size can differ from the static entry (e.g. opus served at [1m] vs a 200K registry row). The dashboard's manual `/compact` path then broadcasts the REAL post-compaction numbers when the drain captured them, and only falls back to `context_usage {pct: 0, reset: true}` (the same contract as the threshold auto-compact callback and the in-turn `_broadcast_compaction_result` chokepoint) when no metadata arrived — the meter then self-corrects on the next turn's telemetry. A failed/timed-out compaction leaves the counts untouched and re-sends them as-is. `_context_usage_payload` treats `used == 0` with a known window as "not measured yet" and omits the token fields, so the unconditional end-of-turn broadcast cannot overwrite a reset with a false "0 / W tokens" claim.
 
@@ -226,7 +247,8 @@ enters the same `AcpRuntime.spawn()` cold-start coordinator (default 2 concurren
 spawn+initialize handshakes per gateway loop); admission is backend-neutral, so an
 adapted runtime harness neither bypasses the bound nor changes the Kiro path.
 
-- **kiro (`is_claude_backend` False)** → `_start_kiro_runtime()`. This spawns an
+- **A runtime backend (`is_acp_runtime_backend`, i.e. membership in
+  `ACP_BACKENDS_ACP_RUNTIME`)** → `_start_kiro_runtime()`. This spawns an
   `AcpRuntime` (carrying the provider's sandbox mode, extra env, and MCP-gateway
   overlay/socket), resumes via `runtime.load_session()` when a prior transcript
   exists or otherwise `runtime.create_session()`, applies the configured model,
@@ -234,7 +256,10 @@ adapted runtime harness neither bypasses the bound nor changes the Kiro path.
   same interface as `AcpClient`, so downstream callers are unchanged). Any
   failure after `spawn()` kills the runtime so a half-initialised session never
   leaks an orphaned `kiro-cli`.
-- **Alternate ACP backend (`is_claude_backend` True)** → legacy `AcpClient.ensure_ready()`.
+- **A non-runtime backend (not a member)** → `AcpClient.ensure_ready()`, one
+  process per session with no shared runtime. The branch is expressed as
+  positive membership, not `not is_claude_backend`, so a harness added later
+  does not inherit the kiro-family path (harness-parity H5).
 
 `AcpProvider.is_session_sharing_eligible` is membership in
 `ACP_BACKENDS_SESSION_SHARING` (harness-parity H6), not `not is_claude_backend`:

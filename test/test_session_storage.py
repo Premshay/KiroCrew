@@ -717,21 +717,30 @@ class TestRestoreIsAllOrNothing:
         def _no_writes_here(*args: object, **kwargs: object) -> None:
             raise AssertionError(f"the full-restore path wrote by name: {args!r}")
 
-        monkeypatch.setattr(session_storage, "atomic_write", _no_writes_here)
-        # A cleanup that DECLINES, which is what makes the stale listing reachable: the
-        # batch stays instead of going away with its manifest.
-        monkeypatch.setattr(session_storage, "_remove_emptied_batch", lambda *a, **k: False)
+        # Scoped to just these two patches: `monkeypatch` is the same instance
+        # the `stores` fixture pins KIROCREW_HOME/KIRO_HOME with, and
+        # `monkeypatch.undo()` unwinds its WHOLE stack in LIFO order, including
+        # entries pushed before this test ever ran. An `undo()` here to restore
+        # `atomic_write` also unpins the data home, and the `empty_trash()` call
+        # below then resolves `trash_root()` against the operator's real
+        # `~/.kiro/crew` and writes a real `trash/session-storage.lock`.
+        with pytest.MonkeyPatch.context() as scoped:
+            scoped.setattr(session_storage, "atomic_write", _no_writes_here)
+            # A cleanup that DECLINES, which is what makes the stale listing reachable: the
+            # batch stays instead of going away with its manifest.
+            scoped.setattr(session_storage, "_remove_emptied_batch", lambda *a, **k: False)
 
-        assert session_storage.restore(batch.batch_id) == 1
+            assert session_storage.restore(batch.batch_id) == 1
 
-        assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").read_bytes() == b"c" * 8
-        kept = session_storage.list_trash()
-        assert [b.batch_id for b in kept] == [batch.batch_id], "kept, not removed"
-        # The accepted residual, pinned so that clearing it later is a deliberate change.
-        assert kept[0].sessions == 1, "the listing goes stale rather than being rewritten"
+            assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").read_bytes() == b"c" * 8
+            kept = session_storage.list_trash()
+            assert [b.batch_id for b in kept] == [batch.batch_id], "kept, not removed"
+            # The accepted residual, pinned so that clearing it later is a deliberate change.
+            assert kept[0].sessions == 1, "the listing goes stale rather than being rewritten"
 
         # And the user is not stuck with it: the explicit empty still takes the batch.
-        monkeypatch.undo()
+        # KIROCREW_HOME/KIRO_HOME (set by the `stores` fixture, outside the `with`
+        # above) are still pinned here.
         session_storage.empty_trash()
         assert session_storage.list_trash() == []
 
@@ -1674,19 +1683,27 @@ class TestUntrustedNamesAreLogSafeOutsideListTrash:
         planted = OSError(13, "Permission denied", str(forged / self._FORGED_NAME))
 
         # ``session_storage.os`` is the global module, so this patch is also seen
-        # by ``shutil.rmtree`` during fixture teardown (which passes ``topdown=``
-        # on Windows).  Accept the real signature and divert only the walk of the
-        # forged batch, delegating every other call to the genuine ``os.walk``.
+        # by other walk users during teardown. Accept the real signature and
+        # divert only the walk of the forged batch, delegating every other call
+        # to the genuine function. Both mechanisms are patched because
+        # ``_unlisted_files`` picks fwalk-vs-walk at call time by availability
+        # (fwalk does not exist on Windows).
+        real_fwalk = getattr(os, "fwalk", None)
         real_walk = os.walk
 
-        def _walk(top, *args, onerror=None, **kwargs):  # type: ignore[no-untyped-def]
-            if Path(top) == forged:
-                assert callable(onerror)
-                onerror(planted)
-                return iter(())
-            return real_walk(top, *args, onerror=onerror, **kwargs)
+        def _divert(real):  # type: ignore[no-untyped-def]
+            def inner(top, *args, onerror=None, **kwargs):  # type: ignore[no-untyped-def]
+                if Path(top) == forged:
+                    assert callable(onerror)
+                    onerror(planted)
+                    return iter(())
+                return real(top, *args, onerror=onerror, **kwargs)
 
-        monkeypatch.setattr(session_storage.os, "walk", _walk)
+            return inner
+
+        monkeypatch.setattr(session_storage.os, "walk", _divert(real_walk))
+        if real_fwalk is not None:
+            monkeypatch.setattr(session_storage.os, "fwalk", _divert(real_fwalk))
         monkeypatch.setattr(session_storage, "_manifest_rels", lambda batch: [])
 
         with pytest.raises(SessionStorageError) as raised:
@@ -1974,6 +1991,33 @@ class TestScanCache:
                 assert got == expected, f"disagreement on {a!r} vs {b!r}"
 
 
+def _pin_a_fake_default_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, legacy: bool = False
+) -> None:
+    """Put the process in the DEFAULT-home posture, against a fake host home.
+
+    These tests need ``data_home()`` to BE the default (or the legacy default), so
+    ``reclaim_block_reason`` takes its shared-store branch. Pinning ``_resolved_home``
+    to ``paths._default_home()`` under the operator's real ``HOME`` achieved that by
+    pointing the process at the operator's real ``~/.kiro/crew``: the next
+    ``config_dir()`` then ``mkdir``s it and drops the recovery breadcrumb beside it,
+    and the rootdir floor now fails a test that leaves the real default resolved. So
+    the host home is faked first: every resolver here reads ``Path.home()``
+    (``session_storage`` for both defaults and the pod root, ``paths`` for the data
+    home), so the posture holds exactly as before, one directory over.
+    """
+    host_home = tmp_path / "host-home"
+    host_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: host_home))
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.setattr(
+        paths, "_resolved_home", paths.legacy_home() if legacy else paths._default_home()
+    )
+    monkeypatch.setattr(paths, "_config_dir_memo", None)
+
+
 class TestCotenantCache:
     """The co-tenant lookup follows the scan cache's rules: reads may reuse, mutations never.
 
@@ -2159,8 +2203,7 @@ class TestCotenantCache:
         monkeypatch.delenv("KIRO_HOME", raising=False)
         # Pin the default home rather than clearing the memo; see
         # TestSharedStoreRefusal for why re-resolving on a real machine is unsafe.
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         session_storage.cotenant_sids(cached=True)  # prime
         calls = self._count_pod_scans(monkeypatch)
@@ -2176,8 +2219,7 @@ class TestCotenantCache:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         session_storage.cotenant_sids(cached=True)  # prime
         calls = self._count_pod_scans(monkeypatch)
@@ -2193,8 +2235,7 @@ class TestCotenantCache:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         session_storage.cotenant_sids(cached=True)  # prime
         calls = self._count_pod_scans(monkeypatch)
@@ -2239,8 +2280,7 @@ class TestSharedStoreRefusal:
         # next data_home() RE-RESOLVE, which on a real machine initializes or
         # migrates the operator's actual data home — and leaves that resolution
         # memoized for every later test in the same worker.
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         assert session_storage.reclaim_block_reason() == ""
 
@@ -2256,8 +2296,7 @@ class TestSharedStoreRefusal:
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
-        monkeypatch.setattr(paths, "_resolved_home", paths.legacy_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path, legacy=True)
 
         assert session_storage.reclaim_block_reason() == ""
 
@@ -2307,7 +2346,10 @@ class TestSharedStoreRefusal:
                 onerror(OSError(5, "simulated read failure"))
             return iter(())
 
+        # Both mechanisms: ``_unlisted_files`` picks fwalk-vs-walk at call time
+        # by availability (fwalk does not exist on Windows).
         monkeypatch.setattr(session_storage.os, "walk", failing_walk)
+        monkeypatch.setattr(session_storage.os, "fwalk", failing_walk, raising=False)
 
         assert session_storage.empty_trash([batch.batch_id]) == 0
         # The batch survives, so nothing was destroyed on an unverifiable scan.
@@ -2366,8 +2408,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         assert session_storage.reclaim_block_reason() == ""
         protected, refusals = session_storage.cotenant_sids()
@@ -2394,8 +2435,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         reason = session_storage.reclaim_block_reason()
         assert "wt-legacy-shared" in reason
@@ -2420,8 +2460,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         assert session_storage.reclaim_block_reason() == ""
         assert session_storage.cotenant_sids() == (frozenset(), ())
@@ -2449,8 +2488,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         protected, refusals = session_storage.cotenant_sids()
         assert protected == frozenset({"legacysid01"})
@@ -2580,8 +2618,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         reason = session_storage.reclaim_block_reason()
         assert "make reclaiming unsafe" in reason
@@ -2617,8 +2654,7 @@ class TestSharedStoreRefusal:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "no-pods-here"))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
 
         assert session_storage.reclaim_block_reason() == ""
 
@@ -2902,8 +2938,7 @@ class TestCotenantNamesAreLogSafe:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
         return pod_root
 
     def _make_forged_pod(self, pod_root: Path) -> Path:
@@ -3034,8 +3069,7 @@ class TestCotenantRefusalTextIsForgeSafe:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.delenv("KIRO_HOME", raising=False)
-        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
-        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        _pin_a_fake_default_home(monkeypatch, tmp_path)
         monkeypatch.setattr(
             session_storage, "cotenant_sids", lambda *, cached=False: (frozenset(), self._REFUSALS)
         )
@@ -5954,3 +5988,77 @@ class TestManifestReaders:
         assert listed[0].sessions == batch.sessions == 2
         assert listed[0].bytes == batch.bytes
         assert listed[0].bytes > 0
+
+
+class TestReclaimHoldsTheSessionLockAcrossTheIndexPurge:
+    """The search index's copy of a session's text must not come back after the move.
+
+    The index keeps that copy; the background indexer rebuilds a row from any
+    transcript still in place. A purge that merely PRECEDED the move therefore left a
+    window -- the indexer's write lands after it, and the text is in the index once
+    the files are gone. Both sides take ``ConversationLog._locked``, so the invariant
+    is that the purge runs while the reclaim holds that lock.
+    """
+
+    def test_the_purge_runs_while_the_unit_lock_is_held(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import threading
+
+        from kiro_crew.history import ConversationLog
+
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=2048, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=300, age_days=40)
+
+        exclusive: list[bool] = []
+        real_purge = session_storage._purge_search_index
+
+        def probing_purge(stems: list[str]) -> bool:
+            # Reentrant for the holding thread, so probe from another one.
+            lock_path = str(crew_home / "sessions" / f"{stems[0]}.jsonl")
+            lock = ConversationLog._file_locks.get(lock_path)
+            if lock is None:
+                exclusive.append(False)
+                return real_purge(stems)
+
+            def probe() -> None:
+                got = lock.acquire(blocking=False)
+                exclusive.append(not got)
+                if got:
+                    lock.release()
+
+            thread = threading.Thread(target=probe)
+            thread.start()
+            thread.join(timeout=10)
+            return real_purge(stems)
+
+        monkeypatch.setattr(session_storage, "_purge_search_index", probing_purge)
+
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": "dashboard_chat-1"}),
+            now=_NOW,
+        )
+
+        assert batch.sessions == 1
+        assert exclusive == [True], "the purge ran without the session lock held"
+
+    def test_a_refused_purge_leaves_the_session_in_place(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=2048, age_days=40)
+        _transcript(crew_home, "dashboard_chat-1", size=300, age_days=40)
+        monkeypatch.setattr(session_storage, "_purge_search_index", lambda stems: False)
+
+        with pytest.raises(session_storage.SessionStorageError):
+            session_storage.move_to_trash(
+                ["aaaa1111"],
+                reason="manual",
+                index=_index({"aaaa1111": "dashboard_chat-1"}),
+                now=_NOW,
+            )
+
+        assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()

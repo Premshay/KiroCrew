@@ -19,7 +19,10 @@ import type {
   UpdateCheckResult,
   WorkflowRunSummary,
 } from '../types'
+import type { RemoteCrewCapabilities } from '../hooks/useRemoteCapabilities'
+import type { AutoNudgeListResponse } from '../components/autoNudgeLoop'
 import { ApiError, friendlyErrText } from './apiError'
+import { SESSION_CONTROL_STATUS_PATH_RE } from '../lib/sessionControlStatusPath'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
 import {
   STALE_OWNER_SESSION_CODE,
@@ -28,6 +31,7 @@ import {
 } from './staleOwnerSignal'
 import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
 import { withDeadline } from '../lib/withDeadline'
+import { createVoiceRequestId } from '../lib/voicePlayback'
 
 /** Deadline for `api.skills`. Measured on one host inside twenty minutes: 0.62s
  *  healthy, then 9.76s, 41.41s, 168.71s for a byte-identical payload. 15s clears
@@ -42,7 +46,7 @@ export const SKILLS_TIMEOUT_MS = 15_000
 export const SLASH_COMMANDS_TIMEOUT_MS = 15_000
 import { installApiTransport } from './apiTransport'
 import type { SessionSummary } from '../types/sessionSummary'
-import { queryClient } from './queryClient'
+import { queryClient, resolveDefaultMemoryMode } from './queryClient'
 import { getStoredConsent } from '../utils/themeConsent'
 import { recordError, parseErrorCode, requestPath } from '../utils/errorReport'
 import { i18nT } from '../i18n/t'
@@ -177,6 +181,22 @@ export interface RestartBlockerResult {
   role?: string
   detail?: string
 }
+
+export type MonitorWrite = {
+  slot_key?: string
+  kind?: 'github_pull_request'
+  objective?: 'review_ready'
+  target?: string
+  cadence_secs?: number
+  max_runtime_secs?: number
+  max_agent_turns?: number
+  max_tokens?: number
+  max_provider_errors?: number
+  wake_instructions?: string
+}
+
+export type MonitorResponse = { ok: true; monitor: unknown }
+
 /** The gateway's advisory reading of whether a server's backend can be shared.
  *
  *  `strength` is the evidence tier, weakest first: `unknown`, `no_objection`,
@@ -1187,6 +1207,22 @@ export interface AcpBackendProbe {
    * that is guaranteed to error.
    */
   restart_required: boolean
+  /**
+   * How this harness gets its credential, and what to tell an operator who has
+   * not given it one. OPTIONAL because a gateway that predates this field sends
+   * no `auth` at all, and the panel already treats absent probe information as
+   * "say nothing, gate nothing".
+   *
+   * `sign_in_remedy` is a complete sentence rendered VERBATIM: the server owns
+   * the wording, so it carries no placeholder to interpolate and is not
+   * translated here. `signs_in_separately` is what decides whether the sentence
+   * is shown at all -- a harness authenticating through Crew's own identity
+   * store has no separate sign-in to finish.
+   */
+  auth?: {
+    sign_in_remedy: string
+    signs_in_separately: boolean
+  }
 }
 
 let _sessionExpiredShown = false
@@ -1501,6 +1537,27 @@ const apiFailure = (r: Response, errText: string): ApiError => {
   return new ApiError(r.status, message, errText, authRequired || staleOwnerSession)
 }
 
+/**
+ * The auth-recovery half of `j` for a response that is handed back RAW instead
+ * of parsed (the chat-core transport's wire): the pre-body 403 `X-Auth-Required`
+ * hook, and the body-borne stale-owner code a 401 carries -- read off a CLONE so
+ * the caller's own `json()` still works. Fire-and-forget: the recovery prompts
+ * are idempotent and the receipt read must not wait on them. A 2xx also clears
+ * a stale session-expired banner, exactly as `j` does -- a send that succeeds
+ * after auth was restored elsewhere must not leave the banner up.
+ */
+function sendResponseAuthRecovery(r: Response): Response {
+  checkSessionExpired(r)
+  if (r.ok) removeAuthBanner()
+  if (r.status === 401) {
+    // Best-effort: a wire may hand back a Response-like without `clone`.
+    try {
+      void r.clone().text().then((body) => noteStaleOwnerResponse(r.status, body)).catch(() => {})
+    } catch { /* not a real Response; nothing to read */ }
+  }
+  return r
+}
+
 const j = async (r: Response) => {
   checkSessionExpired(r)
   if (r.ok) removeAuthBanner()
@@ -1565,7 +1622,13 @@ const projectHeader = (projectKey?: string): HeadersInit | undefined =>
 
 const get = (url: string, sessionKey?: string, signal?: AbortSignal) =>
   fetch(url, { headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) }, ...(signal ? { signal } : {}) })
-const post = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
+const post = (
+  url: string,
+  body?: object,
+  sessionKey?: string,
+  extra?: HeadersInit,
+  redirect?: RequestRedirect,
+) =>
   trackArtifactWrite(url, fetch(url, {
     method: 'POST',
     // sessionKey overrides the shared `dashboard:ui` placeholder with the REAL
@@ -1575,6 +1638,11 @@ const post = (url: string, body?: object, sessionKey?: string, extra?: HeadersIn
     // of a specific chat slot must pass it.
     // `extra` carries a per-call precondition header (a view the server must
     // still agree with) without every caller re-implementing the header merge.
+    // `redirect` is for a caller whose URL is not core's to choose: a validated
+    // target that answers 3xx would otherwise be followed automatically, and the
+    // check that approved the FIRST url never sees the second. Defaulted so no
+    // existing caller changes behaviour.
+    ...(redirect ? { redirect } : {}),
     headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra },
     body: body ? JSON.stringify(body) : undefined,
   }))
@@ -1709,6 +1777,23 @@ export interface CloudPreflight {
   session_manager_plugin_command?: string
 }
 
+/** One remote-instance provisioner the gateway offers, from
+ *  `GET /api/cloud/provisioners`.
+ *
+ *  `id` is what `POST /api/cloud/launch` names in `provider_id`; `kind` names the
+ *  FRONTEND form that collects its inputs (see
+ *  `components/remoteProvisionerRenderers.tsx`), so several rows may share one
+ *  kind. `label` and `steps[].label` are server-authored and rendered verbatim,
+ *  not translated. `posix_only` is informational: the server refuses a launch on
+ *  a Windows gateway itself, with 400 `posix_host_required`. */
+export interface RemoteProvisioner {
+  id: string
+  kind: string
+  label: string
+  posix_only: boolean
+  steps: { key: string; label: string }[]
+}
+
 export type LaunchJobStatus =
   | 'pending' | 'running' | 'awaiting_signin' | 'done' | 'failed' | 'cancelled'
 export type LaunchStepState = 'pending' | 'active' | 'done' | 'failed' | 'skipped'
@@ -1731,6 +1816,9 @@ export interface CloudLaunchSignin {
 
 export interface LaunchJob {
   id: string
+  /** Which provisioner ran this job. A job persisted before the provisioner seam
+   *  existed loads as "aws_ec2", so this is always present. */
+  provider_id: string
   profile: string
   region: string
   size_key: string
@@ -1931,6 +2019,17 @@ export interface KasLoginPollResult {
   error?: string
 }
 
+/**
+ * A loopback (PKCE) sign-in the gateway is listening for on a local port. The
+ * dashboard opens `auth_url` in the user's browser; the portal redirects back
+ * to `http://localhost:<port>` on this machine, and the gateway finishes the
+ * exchange itself — the user confirms nothing. Polled with the same login_id.
+ */
+export interface KasLoginLoopbackSession extends KasLoginDeviceSession {
+  auth_url: string
+  port: number
+}
+
 export interface AgentImportCategory {
   id: string
   label: string
@@ -2112,6 +2211,12 @@ export interface MemberRosterRow {
   workspace?: string
   memory_store?: string
   model?: string
+  /** Crew origin, NORMALIZED by the server to exactly 'kirocrew' (created in
+   *  the crew manager), 'builtin', or 'package' (agent-sync-installed; the
+   *  legacy 'aim' spelling and any unknown value collapse to this). */
+  source?: 'kirocrew' | 'builtin' | 'package' | string
+  /** User's favourite mark; toggled via PUT /api/agents/{name}. */
+  starred?: boolean
   [extra: string]: unknown
 }
 
@@ -2124,6 +2229,81 @@ export interface MemberActivityEntry {
   ts: number
   via: 'chat' | 'select_crew' | string
   project?: string
+}
+
+/** WakaTime coding-stats payload (GET /api/wakatime/stats). When the
+ *  integration is off the endpoint returns { configured: false } instead. */
+export type WakaTimeStatsEntry = { name: string; total_seconds: number }
+export type WakaTimeStats = {
+  configured: boolean
+  range?: string
+  stats?: {
+    total_seconds?: number
+    daily_average?: number
+    languages?: WakaTimeStatsEntry[]
+    projects?: WakaTimeStatsEntry[]
+  }
+}
+
+/** One feature-intro clip, as GET /api/feature-videos/next reports it.
+ *  `src`/`poster` are SAME-ORIGIN relative paths under
+ *  `/app-assets/feature-videos/` — the backend names the asset it shipped, so
+ *  the modal never composes a URL and cannot be pointed at a third-party host
+ *  by a config value. */
+export interface FeatureVideo {
+  id: string
+  /** Which dashboard feature the clip introduces — the per-feature key the
+   *  backend dedupes on, so a verdict survives the clip being re-cut under a
+   *  new id. */
+  feature: string
+  title: string
+  description: string
+  src: string
+  poster: string
+  duration_s: number
+  /** Docs FILENAME, as the backend's catalog stores it (`"feature-tips.md"`) --
+   *  not a URL, and unlike `tipsNext` no resolved `doc_link` ships beside it.
+   *  Resolve it with `tipDocHref` from `utils/docsLink`, which validates the
+   *  filename shape and returns the public docs URL. */
+  doc?: string
+}
+
+/** GET /api/feature-videos/next.
+ *
+ *  `video: null` is the steady state, not an error — it is what the endpoint
+ *  returns once every clip has been seen or dismissed, which for most launches
+ *  is always. `enabled` is the operator kill switch, reported separately so a
+ *  disabled install still answers 200 rather than making the client read a
+ *  failure as a policy. */
+export interface FeatureVideoNext {
+  video: FeatureVideo | null
+  enabled: boolean
+}
+
+/**
+ * The saved filename a `Content-Disposition` asks for, or `fallback`.
+ *
+ * Prefers the RFC 5987 `filename*=UTF-8''<percent-encoded>` form, because that is
+ * what the dashboard's own download handlers emit so a non-Latin name survives an
+ * ASCII header. The bare `filename=` form is still read for anything that sends
+ * it. Exported so the precedence can be unit-tested without a DOM.
+ *
+ * A malformed percent sequence falls through to the next candidate rather than
+ * throwing: `decodeURIComponent` raises on bad input, and a broken header must not
+ * take the download with it.
+ */
+export function filenameFromDisposition(disposition: string, fallback: string): string {
+  const star = /filename\*=(?:UTF-8'')?([^;]+)/i.exec(disposition)
+  if (star) {
+    try {
+      const decoded = decodeURIComponent(star[1].trim())
+      if (decoded) return decoded
+    } catch {
+      // fall through to the bare form
+    }
+  }
+  const plain = /filename="?([^";]+)"?/.exec(disposition)
+  return (plain && plain[1].trim()) || fallback
 }
 
 export const api = {
@@ -2158,6 +2338,37 @@ export const api = {
     fetch('/api/telemetry/context-trace?slot=' + encodeURIComponent(slot)).then(j),
   usageTurns: (slot: string) =>
     fetch('/api/usage/turns?slot=' + encodeURIComponent(slot)).then(j),
+  /** WakaTime coding stats for a named range. Returns { configured: false }
+   *  when the integration is off; a 502 body carries { code: 'upstream_unavailable' }. */
+  wakatimeStats: (range: string) =>
+    fetch('/api/wakatime/stats?range=' + encodeURIComponent(range)).then(j) as Promise<WakaTimeStats>,
+  /** Download URL for the billable-hours export. The browser navigates to it so
+   *  the CSV/JSON arrives via the endpoint's own Content-Disposition. */
+  wakatimeExportUrl: (start: string, end: string, format: 'csv' | 'json') =>
+    `/api/wakatime/export?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&format=${format}`,
+  /** Download the export as a file. Fetches rather than navigating, so an
+   *  upstream 502 raises here (surfaced through ErrorNotice) instead of
+   *  replacing the dashboard with the raw error body. The saved filename comes
+   *  from the endpoint's own sanitized Content-Disposition. */
+  wakatimeExportDownload: async (start: string, end: string, format: 'csv' | 'json') => {
+    const r = await get(api.wakatimeExportUrl(start, end, format))
+    if (!r.ok) {
+      const t = await r.text()
+      throw new ApiError(r.status, t || `HTTP ${r.status}`)
+    }
+    const blob = await r.blob()
+    const cd = r.headers.get('Content-Disposition') || ''
+    const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/.exec(cd)
+    const filename = (m && decodeURIComponent(m[1])) || `wakatime-hours-${start}-to-${end}.${format}`
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  },
   /** Intent summary for the chat summary panel.
    *
    *  Read-only: it never triggers generation. Summaries are produced at turn end
@@ -2223,6 +2434,14 @@ export const api = {
     ) as Promise<KasLoginDeviceSession>,
   kasLoginPoll: (login_id: string) =>
     post('/api/kas-login/poll', { login_id }).then(j) as Promise<KasLoginPollResult>,
+  // Loopback begin answers 409 `loopback_unavailable` when this install shape
+  // cannot receive the callback (or every allowlisted port is busy); the gate
+  // treats that as "start the device flow instead", not as a failure.
+  kasLoginBeginLoopback: (provider: string) =>
+    post('/api/kas-login/loopback', { provider }).then(j) as Promise<KasLoginLoopbackSession>,
+  // Idempotent: releases a loopback listener's port early on every start-over path.
+  kasLoginCancel: (login_id: string) =>
+    post('/api/kas-login/cancel', { login_id }).then(j) as Promise<{ ok: boolean }>,
   kasLoginLogout: (identity: string) =>
     post('/api/kas-login/logout', { identity }).then(j) as Promise<KasLoginStatus>,
   onboardingImportScan: () =>
@@ -2313,10 +2532,13 @@ export const api = {
   removeInstance: (id: string) => del('/api/instances/' + encodeURIComponent(id)).then(j),
   instanceStatus: (id: string, diagnose = false) =>
     get('/api/instances/' + encodeURIComponent(id) + '/status' + (diagnose ? '?diagnose=1' : '')).then(j) as Promise<InstanceTunnelStatus>,
-  connectInstance: (id: string) =>
-    post('/api/instances/' + encodeURIComponent(id) + '/connect').then(j) as Promise<
-      InstanceTunnelStatus & { token?: string }
-    >,
+  connectInstance: (id: string, opts?: { rebuild?: boolean; onlyIfConnected?: boolean }) =>
+    post(
+      '/api/instances/' +
+        encodeURIComponent(id) +
+        '/connect' +
+        (opts?.rebuild ? '?rebuild=1' : opts?.onlyIfConnected ? '?only_if_connected=1' : ''),
+    ).then(j) as Promise<InstanceTunnelStatus & { token?: string }>,
   refreshInstanceToken: (id: string) =>
     post('/api/instances/' + encodeURIComponent(id) + '/refresh-token').then(j) as Promise<
       InstanceTunnelStatus & { token?: string }
@@ -2333,6 +2555,41 @@ export const api = {
     }>,
   // Copies a session to another instance. The local session is left untouched:
   // the peer allocates its own key, so this is a copy and never a move.
+  /** Download one session as a single gzipped file.
+   *
+   *  Fetches rather than navigating, so a refusal (an incognito session, an
+   *  empty one) raises here and the menu row can report it, instead of replacing
+   *  the dashboard with a raw JSON error body. The saved filename comes from the
+   *  endpoint's own Content-Disposition, whose slug is built from the REDACTED
+   *  title — the frontend must not reconstruct a name from `slot.title`, which
+   *  is the unredacted copy. */
+  exportSession: async (slot: string) => {
+    const r = await get('/api/chat/slots/' + encodeURIComponent(slot) + '/export')
+    if (!r.ok) {
+      let message = `HTTP ${r.status}`
+      try {
+        const body = await r.json()
+        if (body?.error) message = body.error
+      } catch {
+        // A non-JSON error body is not worth a second failure mode; the status
+        // line above is still a usable message.
+      }
+      throw new ApiError(r.status, message)
+    }
+    const blob = await r.blob()
+    const filename = filenameFromDisposition(
+      r.headers.get('Content-Disposition') || '',
+      `${slot}.kcsession.json.gz`,
+    )
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  },
   sendSessionToInstance: (id: string, slot: string) =>
     post('/api/instances/' + encodeURIComponent(id) + '/send-session', { slot }).then(j) as Promise<{
       ok: boolean
@@ -2356,8 +2613,16 @@ export const api = {
     return get('/api/cloud/preflight' + (s ? '?' + s : '')).then(j) as Promise<CloudPreflight>
   },
   cloudIamPolicy: () => get('/api/cloud/iam-policy').then(j) as Promise<{ policy: string }>,
+  // Which provisioners this gateway offers. Answers on every platform (a Windows
+  // host still lists the POSIX-only built-in, and refuses the launch itself), so
+  // the setup tab can pick a form before it knows whether a launch would be
+  // allowed.
+  cloudProvisioners: () =>
+    get('/api/cloud/provisioners').then(j) as Promise<{ provisioners: RemoteProvisioner[] }>,
   cloudLaunches: () => get('/api/cloud/launch').then(j) as Promise<{ jobs: LaunchJob[] }>,
-  cloudLaunch: (body: { profile: string; region: string; size_key: string }) =>
+  // `provider_id` is optional on the wire: the server defaults it to "aws_ec2"
+  // and answers 400 `unknown_provisioner` for an id it does not offer.
+  cloudLaunch: (body: { provider_id?: string; profile: string; region: string; size_key: string }) =>
     post('/api/cloud/launch', body).then(j) as Promise<LaunchJob>,
   cloudLaunchStatus: (id: string) =>
     get('/api/cloud/launch/' + encodeURIComponent(id)).then(j) as Promise<LaunchJob>,
@@ -2511,6 +2776,45 @@ export const api = {
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) =>
     del('/api/agents/' + encodeURIComponent(name)).then(j),
+  /** Stage a crew's picture on the server (a `.pending` file only — the
+   *  config PUT with `avatar: {kind:'image'}` is what promotes it live,
+   *  keeping the editor's Apply→Save two-step a real commit point). */
+  /**
+   * The crew appearance library — the packs a crew can wear.
+   *
+   * Owner-gated, same-origin cookie auth. There is deliberately no `detail`
+   * wrapper: that route inlines every file in the pack, so drawing a grid of
+   * thumbnails through it would load N whole packs to show N frames. The picker
+   * reads the per-slot route through an `<img>` instead (`packSlotUrl`), and
+   * `detail` lands here with its first real caller.
+   */
+  appearances: {
+    list: () => fetch('/api/appearances').then(j) as Promise<{ packs?: unknown }>,
+    /** Install an exported pack. The JSON envelope, not multipart: the bundle is
+     *  already parsed client-side to reject an obviously wrong pick, so posting
+     *  it back as a file would only re-serialize what we hold. */
+    importBundle: (bundle: unknown) =>
+      post('/api/appearances/import', { bundle }).then(j) as Promise<{
+        ok?: boolean
+        id?: string
+        error?: string
+      }>,
+    /** Delete a custom pack. Rejects 409 while a crew wears it, and the rejection
+     *  body names those crews — `force` is deliberately NOT exposed. */
+    remove: (id: string) =>
+      del('/api/appearances/' + encodeURIComponent(id)).then(j) as Promise<{
+        ok?: boolean
+        id?: string
+      }>,
+  },
+  uploadCrewAvatar: (name: string, file: Blob) => {
+    const form = new FormData()
+    form.append('file', file, 'avatar.png')
+    return fetch('/api/agents/' + encodeURIComponent(name) + '/avatar', {
+      method: 'POST',
+      body: form,
+    }).then(j) as Promise<{ ok?: boolean; staged?: boolean; token?: string; error?: string }>
+  },
   models: () => fetch('/api/models').then(j),
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
@@ -2573,6 +2877,13 @@ export const api = {
   updateCron: (id: string, body: object) =>
     fetch('/api/crons/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j),
   runCron: (id: string) => post('/api/crons/' + id + '/run').then(j),
+  /** Grant/revoke vault secrets, or act on an agent-requested pending grant.
+   * Body: {secret_env: {...}} grants (empty object revokes), or
+   * {approve_pending: true, expected_secret_env, expected_ts} /
+   * {deny_pending: true}. Approval restates the displayed request; the server
+   * refuses with 409 stale_request if it was replaced. Operator-only server-side. */
+  cronSecretsGrant: (id: string, body: { secret_env?: Record<string, string>; approve_pending?: boolean; deny_pending?: boolean; expected_secret_env?: Record<string, string> | null; expected_ts?: number; expected_source_sha256?: string }) =>
+    put('/api/crons/' + id + '/secrets', body).then(j),
   cancelCron: (id: string) => post('/api/crons/' + id + '/cancel').then(j),
   cronToChat: (id: string) => post('/api/crons/' + id + '/to-chat').then(j),
   toggleCron: (id: string, enabled: boolean) => post('/api/crons/' + id + '/enable', { enabled }).then(j),
@@ -2585,6 +2896,9 @@ export const api = {
   },
   cronRunDetail: (jobId: string, runId: string) => fetch('/api/crons/' + jobId + '/history/' + encodeURIComponent(runId), { headers: { ..._sk } }).then(j),
   cronScript: (jobId: string) => fetch('/api/crons/' + jobId + '/script', { headers: { ..._sk } }).then(j),
+  /** Vault secret NAMES (values are never exposed). Same endpoint the Settings
+   * Secrets panel reads. */
+  secretsList: () => fetch('/api/secrets').then(j),
   ackCron: (id: string, summary: string, ts?: string) => post('/api/crons/' + id + '/ack', { summary, ts }).then(j),
   cronHistoryAll: (opts?: { offset?: number; limit?: number; jobId?: string }) => {
     const p = new URLSearchParams()
@@ -2895,6 +3209,10 @@ export const api = {
   // than in the middle of their first dictation. Returns as soon as the transfer
   // is under way; progress is read from `sttStatus`.
   sttPrepare: (model: string) => post('/api/stt/prepare', { model }).then(j),
+  // Fetch the audio decoder (ffmpeg) into the gateway's digest-verified store,
+  // for a source install whose OS ships no ffmpeg package. Same 202-then-poll
+  // shape as `sttPrepare`; progress arrives on `sttStatus().ffmpeg.download`.
+  sttFfmpegDownload: () => post('/api/stt/ffmpeg/download', {}).then(j),
   // Load the model and run one throwaway decode so the first real utterance does
   // not pay for the graph allocation. Fire-and-forget at every call site: a
   // failure only costs the latency it was meant to hide.
@@ -2925,10 +3243,35 @@ export const api = {
   /** Top contributors to an app's source repo (GitHub only). Owner-gated. */
   appContributors: (url: string, refresh = false) => post('/api/source/contributors', { url, refresh }).then(j) as Promise<{ contributors: AppContributor[] }>,
   chatSlots: () => fetch('/api/chat/slots').then(j),
-  /** All goal loops across sessions. Returns `{enabled:false, loops:[]}` when
-   *  the auto-nudge feature flag is off, so callers need no flag check. */
-  autonudgeList: (): Promise<{ enabled: boolean; loops: { slot_key: string; active?: boolean; cycle_count?: number; max_cycles?: number }[] }> =>
+  /** All goal loops across sessions — every record the service holds, ACTIVE
+   *  OR STOPPED (a stopped loop keeps `active: false` + `stopped_reason`, which
+   *  is how a surface can say WHY a patrol went quiet). Returns
+   *  `{enabled:false, loops:[]}` when the auto-nudge feature flag is off, so
+   *  callers need no flag check. */
+  autonudgeList: (): Promise<AutoNudgeListResponse> =>
     fetch('/api/autonudge').then(j),
+  autonudgeForSlot: (slot: string): Promise<{ enabled: boolean; loop: unknown | null }> =>
+    fetch('/api/autonudge/slot/' + encodeURIComponent(slot)).then(j),
+  /** Structured monitor records include terminal outcomes for inspection. */
+  monitorsList: (): Promise<{ enabled: boolean; monitors: unknown[] }> =>
+    fetch('/api/monitors').then(j),
+  monitorForSlot: (slot: string): Promise<{ enabled: boolean; monitor: unknown | null }> =>
+    fetch('/api/monitors/slot/' + encodeURIComponent(slot)).then(j),
+  monitorCreate: (body: Required<MonitorWrite>): Promise<MonitorResponse> =>
+    post('/api/monitors', body).then(j) as Promise<MonitorResponse>,
+  monitorUpdate: (id: string, body: MonitorWrite): Promise<MonitorResponse> =>
+    patch('/api/monitors/' + encodeURIComponent(id), body).then(j) as Promise<MonitorResponse>,
+  monitorStop: (id: string): Promise<MonitorResponse> =>
+    post('/api/monitors/' + encodeURIComponent(id) + '/stop').then(j) as Promise<MonitorResponse>,
+  /** Remove an already-STOPPED monitor's record. `monitorStop` retains its
+   *  outcome for inspection, and a retained stop refuses a re-arm, so this is
+   *  the only way the session's slot is freed to watch a different subject --
+   *  `monitorRestart` revives the same one. Irreversible; the response carries
+   *  `monitor: null`, which is how every read here spells "nothing armed". */
+  monitorClear: (id: string): Promise<MonitorResponse> =>
+    post('/api/monitors/' + encodeURIComponent(id) + '/clear').then(j) as Promise<MonitorResponse>,
+  monitorRestart: (id: string): Promise<MonitorResponse> =>
+    post('/api/monitors/' + encodeURIComponent(id) + '/restart').then(j) as Promise<MonitorResponse>,
   /** Every pull request / issue link a session carries — the unbudgeted read
    *  behind the sidebar's expandable "+N" overflow chip. The slots payload caps
    *  chips per kind, so the links behind that chip are not on the client until
@@ -2941,7 +3284,28 @@ export const api = {
     if (before !== undefined) p.set('before', String(before))
     return fetch('/api/chat/slots/' + encodeURIComponent(slot) + '?' + p, { signal }).then(j)
   },
-  createChatSlot: (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, clean_mode?: boolean, artifact?: string, folder_id?: string) => post('/api/chat/slots', { ...(name ? { name } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(memory_mode ? { memory_mode } : {}), ...(title ? { title } : {}), ...(clean_mode !== undefined ? { clean_mode } : {}), ...(artifact ? { artifact } : {}), ...(folder_id ? { folder_id } : {}) }).then(j),
+  /** Create a chat slot. `instance_id` binds the new session to a connected crew
+   *  for EXECUTION: it lives in this machine's list and history, and its turns run
+   *  over there. The backend opens the peer's slot first, so a peer that is
+   *  disconnected or on a different version fails the create rather than yielding
+   *  a session that cannot send. */
+  createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, clean_mode?: boolean, artifact?: string, folder_id?: string, instance_id?: string) => {
+    const resolvedMemoryMode = memory_mode ?? await resolveDefaultMemoryMode(
+      () => fetch('/api/dashboard/config').then(j),
+    )
+    return post('/api/chat/slots', {
+      ...(name ? { name } : {}),
+      ...(agent ? { agent } : {}),
+      ...(model ? { model } : {}),
+      ...(mode ? { mode } : {}),
+      memory_mode: resolvedMemoryMode,
+      ...(title ? { title } : {}),
+      ...(clean_mode !== undefined ? { clean_mode } : {}),
+      ...(artifact ? { artifact } : {}),
+      ...(folder_id ? { folder_id } : {}),
+      ...(instance_id ? { instance_id } : {}),
+    }).then(j) as Promise<ChatSlot>
+  },
   /** Inject silent background context into a slot — consumed on the next user
    * message. Used by the artifact companion chat to name the bound artifact so
    * the user's first message needs no slug boilerplate. */
@@ -3039,26 +3403,24 @@ export const api = {
     // whenever Browser Mode is enabled in Settings (a durable capability),
     // gated there rather than per turn.
     //
-    // `steer` carries the user's "act on this now" intent into a send that
-    // starts its OWN turn. The slot is idle, so there is no running turn to
-    // inject into; the flag's only effect server-side is to skip the hold that
-    // parks a user message behind still-running sub-agents. Sent through this
-    // endpoint rather than steerChat because a new turn needs `ws=1` to stream.
+    // `steer` carries the user's "act on this now" intent. Mid-turn it injects
+    // into the RUNNING turn instead of queueing (the backend falls back to the
+    // queue if steer is unavailable, so the text is never dropped, and answers
+    // `{ok, steered}`); on an idle slot there is no running turn to inject into
+    // and the flag's only effect server-side is to skip the hold that parks a
+    // user message behind still-running sub-agents. One wire for both: this is
+    // the fetch seam under the chat-core `sendTurn`, which every steer now
+    // rides (there is no separate steer helper).
+    //
+    // The response is handed back RAW (the chat-core transport reads the
+    // receipt itself; a 4xx/5xx must resolve, not throw like `j`), but it still
+    // runs the same auth recovery every `j`-parsed call has -- see
+    // `sendResponseAuthRecovery` -- instead of surfacing an expired or
+    // stale-owner session as a bare "refused" send. The steer helper this
+    // replaced went through `j` and had both; the transport must not lose them.
     const themeConsent = themeConsentSha(colorTheme)
-    return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}), ...(steer ? { steer: true } : {}) }), signal })
+    return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}), ...(steer ? { steer: true } : {}) }), signal }).then(sendResponseAuthRecovery)
   },
-  // Mid-turn steer: inject into the RUNNING turn instead of queueing. Fire-and-forget
-  // JSON response ({ok, steered}); the backend falls back to queue if steer is
-  // unavailable so the text is never dropped.
-  // `ws=1` because a steer that races `chat_done` falls through to the plain send
-  // path, whose JSON receipt is gated on it — without it that arm streams SSE.
-  // `sendId` is the client-minted correlation id stamped on the optimistic steer
-  // bubble (same convention as the plain send path). It rides in `meta`, which
-  // BOTH backend paths persist — the accepted-steer row and the new-turn row a
-  // steer that races chat_done falls onto — so the bubble is reconcilable, and
-  // its accepted-vs-new-turn ambiguity resolvable, by id identity (#6075).
-  steerChat: (message: string, slot?: string, sendId?: string) =>
-    fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, steer: true, ...(sendId ? { meta: { sendId } } : {}) }) }).then(j),
   sessionsHealth: () => fetch('/api/sessions/health').then(j),
   // Knowledge
   knowledgeSearch: (q: string) => get(`/api/knowledge/search-for-context?q=${encodeURIComponent(q)}`).then(j),
@@ -3085,17 +3447,19 @@ export const api = {
   // instance (backend rank-interleaves; remote rows carry instance_id/_name).
   // 403 = instances feature disabled — callers fall back to sessionsSearch.
   instancesSearchSessions: (q: string, limit = 50) => fetch('/api/instances/search-sessions?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
-  /** Create a chat slot ON A CONNECTED PEER, through the instances chat proxy.
-   *  The peer owns the session end to end — its context, memory, skills and
-   *  kiro-cli run the turn, and nothing is written to local history. `api/chat`
-   *  is inside the proxy's path allowlist, so this needs no new backend route;
-   *  the returned `key` is the slot key in the PEER's namespace and is only
-   *  meaningful in a request routed back through the same instance.
-   *  No `agent` is sent: the peer picks its own default, which is the whole
-   *  point of the session running there rather than here. */
-  instancesCreateRemoteSlot: (instanceId: string) =>
-    post('/api/instances/' + encodeURIComponent(instanceId) + '/proxy/api/chat/slots',
-      {}).then(j) as Promise<{ key?: string }>,
+  /** What a connected crew can do: its version, agent roster, model list, effort
+   *  levels and workspaces. The per-instance counterpart to `/api/agents`,
+   *  `/api/models`, `/api/effort-levels` and `/api/workspaces`, which are all
+   *  same-origin reads of THIS machine — a session bound to a peer for execution
+   *  must offer the peer's options, since picking a crew or model that only exists
+   *  here would fail on the first send.
+   *
+   *  `version_match` is the gate the backend enforces on every dispatch, surfaced
+   *  so the UI can explain a refusal before the user types rather than after.
+   *  `unavailable` names the reads that failed, per field, so one unreachable
+   *  roster disables exactly its own control instead of blanking the shelf. */
+  instancesCapabilities: (instanceId: string) =>
+    fetch('/api/instances/' + encodeURIComponent(instanceId) + '/capabilities').then(j) as Promise<RemoteCrewCapabilities>,
   sessionDetail: (key: string) => fetch('/api/sessions/' + encodeURIComponent(key)).then(j),
   deleteSession: (key: string) => del('/api/sessions/' + encodeURIComponent(key)).then(j),
   clearSessions: () => del('/api/sessions').then(j),
@@ -3106,6 +3470,7 @@ export const api = {
   spawn: (task: string) => post('/api/spawn', { task }).then(j),
   spawnStatus: (id: string, opts?: { signal?: AbortSignal }) => fetch('/api/spawn/' + encodeURIComponent(id), opts).then(j),
   spawnDelete: (id: string) => del('/api/spawn/' + encodeURIComponent(id)).then(j),
+  spawnStopAll: (slot: string) => post('/api/spawn/stop-all', { slot }).then(j),
   spawnRetry: (id: string) => post('/api/spawn/' + encodeURIComponent(id) + '/retry', {}).then(j),
   spawnClear: () => del('/api/spawn').then(j),
   approvals: (): Promise<{ id: string; source?: string; tool?: string; tool_input?: string; tool_call_id?: string; slot?: string; ts?: number }[]> => fetch('/api/approvals').then(j),
@@ -3304,6 +3669,24 @@ export const api = {
   themes: () => fetch('/api/themes').then(j),
   // Dashboard config
   dashboardConfig: () => fetch('/api/dashboard/config').then(j),
+  // Feature intro videos (startup). This GET carries METADATA only — the clip
+  // itself is fetched by the <video> element, and only after the modal opens,
+  // so a launch that shows nothing costs one small JSON round trip.
+  //
+  // `sessionKey` MUST carry the active slot's key (`dashboard:<slot>`). Both routes
+  // call the server's `_is_restricted_session`, and that guard treats the shared
+  // `dashboard:ui` default as NOT restricted (`_shared.py:1668`) -- so omitting the
+  // key makes the server's own incognito/temporary check unreachable, and the only
+  // thing left standing between a session that keeps nothing and a PERMANENT verdict
+  // is the dashboard's client-side gate. Same cooperative-honesty contract as
+  // `mobileLoginLink` above.
+  featureVideoNext: (sessionKey?: string) =>
+    get('/api/feature-videos/next', sessionKey).then(j) as Promise<FeatureVideoNext>,
+  /** Permanent per-video verdict, not a snooze: `seen` retires the clip on
+   *  completion or an explicit acknowledgement, `dismissed` retires it on a
+   *  close, and the backend never offers that video again after either. */
+  featureVideoFeedback: (id: string, status: 'seen' | 'dismissed', sessionKey?: string) =>
+    post('/api/feature-videos/feedback', { id, status }, sessionKey).then(j) as Promise<{ ok: true }>,
   updateDashboardConfig: (body: object) => put('/api/dashboard/config', body).then(j),
   createTheme: (body: object) => post('/api/themes', body).then(j),
   installTheme: (source: { type: 'local'; path: string } | { type: 'github'; url: string }) =>
@@ -3328,6 +3711,7 @@ export const api = {
   voiceConfig: () => fetch('/api/voice/config').then(j),
   updateVoiceConfig: (body: object) => put('/api/voice/config', body).then(j),
   voiceVoices: () => fetch('/api/voice/voices').then(j),
+  voiceSystemVoices: () => fetch('/api/voice/system-voices').then(j),
   // Paid-AWS-service consent (Amazon Polly for TTS, Amazon Transcribe for STT).
   // The GET reports what would be billed AND performs the identity probe, so it
   // is the call that surfaces the account before the operator agrees to it.
@@ -3344,15 +3728,33 @@ export const api = {
     }).then(j) as Promise<{ ok?: boolean; error?: string; code?: string; identityDetail?: string }>,
   revokeAwsConsent: (service: string) =>
     del('/api/aws/consent?service=' + encodeURIComponent(service)).then(j) as Promise<{ ok?: boolean; removed?: boolean }>,
-  voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; signal?: AbortSignal }) => {
-    const { signal, ...body } = opts ?? {}
+  // `signal` is carried on the options object rather than as a positional
+  // argument so the correlated-request fields and the abort handle travel
+  // together; it is stripped before the body is serialised. A caller that
+  // aborts has cancelled deliberately, so an abort raises no failure event —
+  // only a real synthesis refusal does.
+  voiceSynthesize: (
+    slot: string,
+    text: string,
+    opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; request_id?: string; signal?: AbortSignal },
+  ) => {
+    const { signal, ...rest } = opts ?? {}
+    const request_id = rest.request_id || createVoiceRequestId()
+    window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot, request_id } }))
     return fetch('/api/voice/synthesize', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ..._sk },
-      body: JSON.stringify({ slot, text, ...body }),
+      body: JSON.stringify({ slot, text, ...rest, request_id }),
       ...(signal ? { signal } : {}),
-    }).then(j)
+    }).then(j).catch(error => {
+      if (signal?.aborted) throw error
+      const code = error instanceof ApiError ? parseErrorCode(error.body) : undefined
+      window.dispatchEvent(new CustomEvent('voice-synthesis-failed', { detail: { slot, request_id, code: code || 'voice_synthesis_failed' } }))
+      throw error
+    })
   },
+  voiceCancel: (slot: string, request_id: string) =>
+    post('/api/voice/cancel', { slot, request_id }).then(j),
 
   // Channels
   channelsList: () => fetch('/api/channels').then(j),
@@ -3369,7 +3771,7 @@ export const api = {
   channelUpdateAgent: (id: string, aid: string, updates: object) => patch('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid), updates).then(j),
   channelDismissAgent: (id: string, aid: string) => del('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid)).then(j),
   channelWakeAgent: (id: string, aid: string) => post('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid) + '/wake', {}).then(j),
-  channelApproveAgent: (id: string, aid: string, action: string) => post('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid) + '/approve', { action }).then(j),
+  channelApproveAgent: (id: string, aid: string, action: string, pattern?: string) => post('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid) + '/approve', pattern ? { action, pattern } : { action }).then(j),
   channelClearContext: (id: string, scope: 'all' | 'agent', agentId?: string) => post('/api/channels/' + encodeURIComponent(id) + '/clear-context', scope === 'agent' ? { scope, agent_id: agentId } : { scope }).then(j),
 
   // --- Apps ---
@@ -3624,6 +4026,16 @@ export const api = {
   updateArtifactSharing: (slug: string, body: { visibility: 'PRIVATE' | 'SHARED' | 'PUBLIC'; shared_with?: string[] }) =>
     patch(`/api/artifacts/${encodeURIComponent(slug)}/sharing`, body).then(j),
   unpublishArtifact: (slug: string) => del(`/api/artifacts/${encodeURIComponent(slug)}/publish`).then(j),
+  /** Re-check a published artifact's destination and clear a notice that no longer holds.
+   *
+   *  A publish notice ("still rolling out", "delivery network disabled") is recorded once,
+   *  at publish time, and the ordinary happy path never revisits it -- so a link that has
+   *  since finished rolling out kept an amber "still rolling out" banner forever. This asks
+   *  the destination again and clears `notice` / `notice_code` only when the condition has
+   *  actually cleared; it is deliberately user-triggered rather than a timer, because the
+   *  answer costs a call to the destination. */
+  reprobeArtifactNotice: (slug: string) =>
+    post(`/api/artifacts/${encodeURIComponent(slug)}/publish/reprobe-notice`, {}).then(j),
   /** Stash model-authored HTML and get back a URL a sandboxed iframe can load.
    *
    *  Artifact and widget frames cannot use a `blob:` URL: some WebKit-based
@@ -3731,6 +4143,50 @@ export const api = {
   // Auto-research
   researchValidate: (body: object) => post("/api/apps/auto-research/validate", body).then(j),
   researchGrillExpand: (body: object) => post("/api/apps/auto-research/grill/expand", body).then(j),
+  /**
+   * GET an app's declared per-session status route.
+   *
+   * Routed through `get()` + `j()` rather than a bare `fetch`, so this call
+   * carries the X-Session-Key gate and runs `checkSessionExpired` like every
+   * other app call. `statusPath` is validated by the caller against the same
+   * allowlist the backend applies at install time.
+   *
+   * `processBacked` selects the prefix, because an app's backend is served at
+   * one of TWO places and picking the wrong one is a silent permanent failure
+   * rather than a visible error: in-gateway hook routes are registered under
+   * `/api/apps/<app>/`, while an app running its own backend PROCESS is
+   * reverse-proxied at `/apps/<app>/api/`. Calling the hook prefix for a
+   * process-backed app answers 502 ("no reachable backend"), which the chip
+   * renders as a permanently stateless control with nothing saying why.
+   */
+  appSessionStatus: (
+    appName: string,
+    statusPath: string,
+    params: Record<string, string>,
+    processBacked = false,
+  ) => {
+    // Defensive: the boundary is enforced here rather than deferred to every
+    // call site. statusPath comes from a third-party app manifest and is
+    // interpolated into the path, so a caller that forgets to sanitize it must
+    // not be able to reach /api/apps/<app>/../other-app/... . This is the
+    // client-side backstop for the same allowlist the backend applies at
+    // install time — callers still validate too, this is not the only check.
+    if (!SESSION_CONTROL_STATUS_PATH_RE.test(statusPath)) {
+      // A machine code, not UI copy: this throw is a programmer-error backstop for
+      // a manifest that got past the caller's own check, so it never renders and
+      // must not become a translated string. The comment above is the explanation;
+      // the code is what a caller can match on.
+      throw new ApiError(400, 'invalidAppStatusPath')
+    }
+    const qs = new URLSearchParams(params).toString()
+    // Both prefixes are built HERE from the app name rather than read from the
+    // manifest, so the only app-authored value interpolated into the URL is the
+    // `statusPath` already validated above.
+    const base = processBacked
+      ? '/apps/' + encodeURIComponent(appName) + '/api/'
+      : '/api/apps/' + encodeURIComponent(appName) + '/'
+    return get(base + statusPath + (qs ? '?' + qs : '')).then(j)
+  },
   researchCampaigns: () => get("/api/apps/auto-research/campaigns").then(j),
   researchCampaign: (id: string) => get("/api/apps/auto-research/campaigns/" + id).then(j),
   researchCreate: (body: object) => post("/api/apps/auto-research/campaigns", body).then(j),
@@ -3745,8 +4201,61 @@ export const api = {
   researchReport: (id: string) => get("/api/apps/auto-research/campaigns/" + id + "/report").then(j),
   researchDelete: (id: string) => del("/api/apps/auto-research/campaigns/" + id).then(j),
 
+  // Activate a file-menu row an installed app contributed. The declarations ride on
+  // `GET /api/apps` (see `fileMenuContributions.ts`) rather than an endpoint of their
+  // own, so only the dispatch lives here: core POSTs the file's path to the row's own
+  // endpoint and never imports app code.
+  //
+  // `sessionKey` is the OWNING SLOT (`dashboard:<slot>`), supplied by the shared
+  // dispatcher. It rides the header rather than the body because the server's
+  // restricted-session gate reads the header, and the body is the app-facing contract
+  // documented in the manifest reference.
+  //
+  // `redirect: 'error'` is what makes the endpoint allowlist mean anything. The URL is
+  // the APP's to choose, and it is validated once, before the request; `fetch` follows a
+  // 3xx by default, and a 307 preserves the method, the body AND this header, so an
+  // approved endpoint answering `307 /api/apps/<victim>/disable` would have the reader's
+  // own session disable another app on a row they merely clicked. Refusing to follow
+  // keeps the checked url the only url.
+  invokeFileMenuItem: async (
+    item: { id: string; endpoint: string },
+    ctx: FileMenuContext,
+    sessionKey?: string,
+  ) => {
+    const r = await post(item.endpoint, { item_id: item.id, ...ctx }, sessionKey, undefined, 'error')
+    checkSessionExpired(r)
+    if (r.ok) { removeAuthBanner(); return r.json() }
+    const errText = await r.text()
+    throw new ApiError(r.status, errText || `HTTP ${r.status}`)
+  },
+
   artifactTeardown: (slug: string) => post(`/api/deploy/teardown/${slug}`, { confirm: true }).then(j),
   publishProviders: () => get('/api/publish-providers').then(j) as Promise<{ providers: AppPublishProvider[] }>,
+  /** Publish through a CORE-registry destination, resolved by its registry name.
+   *  Separate from `publishToProvider` on purpose: that one routes at an app's declared
+   *  endpoint and falls back to `/api/deploy/deploy`, which is per-artifact deploy
+   *  infrastructure -- a different destination, not a different spelling of this one. */
+  publishArtifactToCoreProvider: async (slug: string, providerName: string) => {
+    const r = await post(`/api/artifacts/${encodeURIComponent(slug)}/publish`, {
+      visibility: 'PUBLIC',
+      shared_with: [],
+      provider: providerName,
+    })
+    checkSessionExpired(r)
+    if (r.ok) { removeAuthBanner(); return r.json() }
+    if (r.status === 409) { return r.json() }
+    // Parse before surfacing. The body is JSON, so returning its raw text put
+    // `{"error": "No AWS account is registered yet..."}` verbatim in the error line --
+    // the provider's carefully worded remedy delivered wrapped in syntax.
+    const text = await r.text()
+    try {
+      const parsed = JSON.parse(text)
+      const msg = typeof parsed?.error === 'string' ? parsed.error : text
+      return { error: msg }
+    } catch {
+      return { error: text }
+    }
+  },
   publishToProvider: async (slug: string, providerId: string, provider?: AppPublishProvider, ttlHours?: number) => {
     // Route to the provider's declared endpoint with the payload shape
     // that _do_deploy expects (site_id + artifact_slug). ttl_hours is sent on
@@ -3778,4 +4287,23 @@ export interface AppPublishProvider {
   configured: boolean
   setupRoute: string
   endpoint: string
+}
+
+/** The surfaces a contributed file-menu row can appear on. */
+export type FileMenuSurface = 'file-overflow' | 'tree-context' | 'folder-row'
+
+/**
+ * What core POSTs to a row's endpoint when it is activated.
+ *
+ * The PATH only — deliberately never file CONTENT. A contributed row is declared in a
+ * manifest and needs no permission to exist, so shipping the bytes with the activation
+ * would hand any app that declares one the contents of whatever file the reader clicked,
+ * with no install-time declaration and no consent step. An app that needs the bytes reads
+ * them through a route its own `permissions` cover.
+ */
+export interface FileMenuContext {
+  surface: FileMenuSurface
+  path: string
+  kind?: 'file' | 'dir'
+  root?: string
 }

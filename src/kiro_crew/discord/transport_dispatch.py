@@ -30,7 +30,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.dashboard.state import row_mid
 from kiro_crew.discord.attachments import (
     append_attachment_context,
     process_discord_attachments,
@@ -66,6 +65,7 @@ from kiro_crew.messaging.commands import (
     compact_unsupported_reply,
     stop_running_turn,
 )
+from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
     build_auto_approve,
     build_directive_consumer,
@@ -73,6 +73,7 @@ from kiro_crew.messaging.dispatch import (
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
+from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import (
     ChannelLink,
     bind_origin_mirror,
@@ -82,8 +83,9 @@ from kiro_crew.messaging.link import (
     seed_generation,
 )
 from kiro_crew.messaging.renderer import Renderer, SilentRenderer
+from kiro_crew.messaging.session_resume import persisted_session_agent
 from kiro_crew.messaging.transport import InboundMessage
-from kiro_crew.messaging.upload_gate import live_dashboard_slot, uploads_restricted
+from kiro_crew.messaging.upload_gate import session_is_restricted, uploads_restricted
 from kiro_crew.monitoring.completion import MonitorCompletionHook
 from kiro_crew.monitoring.models import MonitorDispatchResult
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
@@ -128,12 +130,6 @@ class _MonitorGenerationChanged(Exception):
 # Canonical kiro-cli agent fallback so Discord sessions load kirocrew-core
 # (spawn_run etc.) — mirrors the Slack/Telegram paths.
 _DEFAULT_KIROCREW_AGENT = "kirocrew"
-
-#: Values that mean "let the backend pick" rather than naming an agent. The
-#: dashboard writes ``"default"`` into most session metadata, and ``"auto"`` is
-#: its sibling sentinel (see ``dashboard/handlers/agents.py``). Neither is a
-#: kiro-cli mode, so neither may reach ACP ``session/set_mode``.
-_AGENT_SENTINELS = frozenset({"default", "auto"})
 
 # Keep queue collapse within the shared ingestion layer's per-turn file cap.
 _MAX_COLLAPSED_ATTACHMENTS = IngestLimits().max_attachments
@@ -374,9 +370,17 @@ class DiscordDispatcher:
                 await self.client.send_message(channel_id, _RELEASE_FAILURE)
                 return monitor_result
             self._conv.bump_gen(scope_id)
+            new_session_key = self._session_key(user_id, thread_id)
+            saved = await reserve_new_generation(
+                self.sessions,
+                new_session_key,
+                channel_type="Discord",
+            )
             message = "✅ New conversation started."
             if left_resumed is not None:
                 message = "✅ New conversation started — left the resumed session."
+            if not saved:
+                message += "\n⚠️ The new conversation could not be saved for restart."
             await self.client.send_message(channel_id, message)
             return monitor_result
         if cmd == "compact":
@@ -386,7 +390,7 @@ class DiscordDispatcher:
         if cmd == "sessions":
             # DM-ONLY. The owner gate answers WHO may resume, not WHERE the
             # result may be shown: in an allow-listed guild thread the picker
-            # would post dashboard session TITLES and the bind would replay five
+            # would post private session TITLES and the bind would replay five
             # transcript messages, making private history readable by every
             # member of that thread. Resume is inherently a private-surface
             # operation, so refuse outside a DM rather than redacting harder.
@@ -394,7 +398,7 @@ class DiscordDispatcher:
                 await self.client.send_message(
                     channel_id,
                     "🔒 `!sessions` works only in a direct message — it lists and "
-                    "replays private dashboard conversations, so it will not post "
+                    "replays private conversations, so it will not post "
                     "them into a shared thread. DM me instead.",
                 )
                 return monitor_result
@@ -403,6 +407,7 @@ class DiscordDispatcher:
                 user_id,
                 channel_id,
                 query=parse_command_argument(text),
+                native_key=self._session_key(user_id, thread_id),
             )
             return monitor_result
         if cmd == "link":
@@ -569,7 +574,7 @@ class DiscordDispatcher:
             # not just a tone change. get_metadata touches the filesystem, so it
             # goes off-loop. Fall back to the Discord agent only when the
             # conversation recorded none.
-            persisted = await asyncio.to_thread(self._persisted_agent, resumed_key)
+            persisted = await asyncio.to_thread(persisted_session_agent, self.conv_log, resumed_key)
             if persisted:
                 agent = persisted
 
@@ -755,8 +760,12 @@ class DiscordDispatcher:
                     agent=agent,
                     tool_kind=getattr(event, "tool_kind", "") or "",
                     raw_params=getattr(event, "raw_tool_params", None),
+                    diff_path=getattr(event, "diff_path", "") or "",
                     command=getattr(event, "shell_command", None),
                     is_shell=bool(getattr(event, "is_shell", False)),
+                    mcp_server_name=getattr(event, "mcp_server_name", "") or "",
+                    mcp_tool_name=getattr(event, "tool_name", "") or "",
+                    mcp_identity_trusted=bool(getattr(event, "mcp_identity_trusted", False)),
                 )
                 if result.action == TOOL_DENY:
                     return "deny"
@@ -835,16 +844,33 @@ class DiscordDispatcher:
                 # Loop-side: put the turn in the live dashboard window FIRST so
                 # the dashboard's own save serializes it in chronological
                 # position instead of appending it to the foreign tail.
-                mirror_mids = self._mirror_turn_to_live_slot(session_key, text, accumulated)
-                await asyncio.to_thread(
-                    self._persist_turn,
-                    session_key,
-                    text,
-                    accumulated,
-                    is_new_own_session,
-                    agent=agent,
-                    mirror_mids=mirror_mids,
-                )
+                #
+                # Circular import: the dashboard package imports the channel
+                # transports on its boot path, so this edge only exists at call time.
+                from kiro_crew.dashboard.channel_slots import project_channel_turn_live
+
+                # A resumed ``dashboard:`` key carries the dashboard slot's privacy
+                # mode, not a Discord-local one. Decide on the loop before either
+                # writer: project_channel_turn_live marks the slot dirty, so even
+                # skipping the direct append would let a later slot flush persist
+                # the restricted rows.
+                dashboard_restricted = await self._session_restricted(session_key)
+                if not dashboard_restricted:
+                    mirror_mids = project_channel_turn_live(
+                        getattr(self._session_resume, "dashboard_state", None),
+                        session_key,
+                        text,
+                        accumulated,
+                    )
+                    await asyncio.to_thread(
+                        self._persist_turn,
+                        session_key,
+                        text,
+                        accumulated,
+                        is_new_own_session,
+                        agent=agent,
+                        mirror_mids=mirror_mids,
+                    )
             except Exception:
                 logger.warning(
                     "Discord: persist_turn failed session=%s",
@@ -891,6 +917,34 @@ class DiscordDispatcher:
             )
             if monitor_completion is not None:
                 return MonitorDispatchResult.BUSY
+            # Durable inbound spool (issue #2217), for a USER message only — the
+            # monitor branch above returns first. A monitor turn is generated
+            # work whose own loop re-fires after the restart, so spooling it
+            # would replay a check the loop is about to run again anyway.
+            # Discord has no per-message ack and its resume state is in-memory,
+            # so our own disk is the only thing that can carry this across the
+            # restart.
+            #
+            # NOT for a restricted session: an incognito or temporary conversation
+            # is a promise that nothing persists, and the spool is a durable file
+            # holding the message verbatim. The same predicate that gates the
+            # durable-history write gates this one.
+            if not await self._session_restricted(session_key):
+                await spool_refused_turn(
+                    channel_type="discord",
+                    route=InboundRoute(
+                        conversation_id=channel_id,
+                        # ``msg.text``, NOT the local ``text``: by here the latter
+                        # has attachment context appended, whose inlined temp paths
+                        # are gone after a restart. The spool wants what the user
+                        # typed.
+                        text=msg.text,
+                        user_id=user_id,
+                        thread_id=thread_id or "",
+                        message_id=str(getattr(msg, "message_id", "") or ""),
+                        attachments_dropped=len(getattr(msg, "attachments", None) or ()),
+                    ),
+                )
         except Exception:
             logger.exception("Discord transport_dispatch: error handling message")
             if monitor_completion is not None:
@@ -1233,7 +1287,12 @@ class DiscordDispatcher:
         if data.startswith("s:"):
             if itx.guild_id:
                 return
-            await self._session_resume.choose(self.client, itx, data)
+            await self._session_resume.choose(
+                self.client,
+                itx,
+                data,
+                native_key=self._session_key(itx.user_id, thread_id),
+            )
             return
 
         # Tool-approval decision: "a:<request_id>:<nonce>:<1|0>". The nonce is
@@ -1404,33 +1463,6 @@ class DiscordDispatcher:
     def _resolve_agent(self) -> str:
         return self.agent or self.cfg.agent.default_agent or _DEFAULT_KIROCREW_AGENT
 
-    def _persisted_agent(self, session_key: str) -> str:
-        """The agent a session was recorded with, or "" when unknown.
-
-        Blocking (reads the conversation log's metadata) — call via
-        ``asyncio.to_thread``. Returns "" on any failure so the caller falls back
-        to the channel's own agent rather than the turn failing.
-
-        ``"default"``/``"auto"`` are dashboard sentinels meaning "let the backend
-        pick", NOT agent names -- most dashboard sessions record ``"default"``.
-        Forwarding one reaches ACP ``session/set_mode``, which rejects it with
-        ``Mode 'default' not found`` and fails every resumed turn, so they are
-        normalized to "" and the channel's own agent is used instead.
-        """
-        if self.conv_log is None:
-            return ""
-        try:
-            meta = self.conv_log.get_metadata(session_key)
-        except Exception:
-            logger.debug(
-                "discord: could not read persisted agent for %s", session_key, exc_info=True
-            )
-            return ""
-        recorded = str((meta or {}).get("agent") or "").strip()
-        if recorded.lower() in _AGENT_SENTINELS:
-            return ""
-        return recorded
-
     @staticmethod
     def _scope_id(user_id: str, thread_id: str = "") -> str:
         return f"thread:{thread_id}" if thread_id else f"user:{user_id}"
@@ -1596,10 +1628,34 @@ class DiscordDispatcher:
             self._session_resume._push_slots()
         await self.client.send_message(channel_id, reply)
 
-    def _live_dashboard_slot(self, session_key: str) -> Any | None:
-        """The OPEN dashboard slot for *session_key*, or ``None``."""
-        return live_dashboard_slot(
-            getattr(self._session_resume, "dashboard_state", None), session_key
+    async def _session_restricted(self, session_key: str) -> bool:
+        """True when this resumed session must leave no durable transcript.
+
+        Discord can carry a ``dashboard:`` key, whose restriction lives on the
+        dashboard slot rather than in a channel-local tracker. The shared
+        predicate is also the upload ceiling's answer, so a conversation cannot
+        refuse the file and then persist the text.
+
+        With the tab closed, history restricts on an incognito/temporary marker and
+        on an unreadable mode whose transcript EXISTS (an ambiguous stem, or a
+        header no normal session wrote) — that is where an incognito session hides.
+        ``unknown_denies`` is deliberately false here (and true for uploads) only
+        so a truly ABSENT record still records: nothing on disk claims that session
+        is restricted, and denying there would stop recording every conversation
+        whose transcript is not yet written. A legacy header missing the field
+        reads ``persistent``, so it never reaches the unknown case.
+
+        The persisted probe is injected to keep ``messaging`` from importing
+        ``dashboard``. This import stays local because dashboard boot imports the
+        channel transports.
+        """
+        from kiro_crew.dashboard.handlers._shared import _probe_persisted_session
+
+        return await session_is_restricted(
+            getattr(self._session_resume, "dashboard_state", None),
+            session_key,
+            persisted_probe=_probe_persisted_session,
+            unknown_denies=False,
         )
 
     async def _uploads_restricted(self, session_key: str) -> bool:
@@ -1625,52 +1681,6 @@ class DiscordDispatcher:
             persisted_probe=_probe_persisted_session,
         )
 
-    def _mirror_turn_to_live_slot(
-        self, session_key: str, user_text: str, reply_text: str
-    ) -> tuple[str, str] | None:
-        """Land a resumed turn in the live dashboard window. Loop-side only.
-
-        A disk-only append is not enough. The dashboard save writes
-        ``meta + frozen prefix + its own window + foreign tail``, so a line
-        appended to disk BEFORE a later dashboard turn is re-serialized AFTER
-        it, and the transcript reads back out of chronological order. Appending
-        to the live window puts the turn in the region the save re-serializes,
-        so ordering is preserved. Mirrors ``dashboard/cron_inject.py``, which
-        appends to the slot and persists idempotently for the same reason.
-
-        Returns the ``(user_mid, assistant_mid)`` the slot minted when the
-        in-memory window took the turn, else ``None``. The caller hands those to
-        the durable write so both copies of one row share ONE identity -- the
-        dual-writer shape ``cron_inject`` uses (``row_mid(slot.append(...))`` ->
-        ``append_if_absent(..., mid=...)``). Minting a SECOND id there instead
-        would defeat the idempotency check the mirrored write exists for:
-        ``append_if_absent`` only skips a body-equal row carrying the SAME mid,
-        so an unrelated id can never match the copy the slot save already landed
-        and the turn would be persisted twice. An empty string stands for a row
-        the slot did not mint an id for (a reply that was not written).
-        """
-        slot = self._live_dashboard_slot(session_key)
-        if slot is None:
-            return None
-        try:
-            user_mid = row_mid(slot.append("user", user_text, "msg msg-u")) or ""
-            assistant_mid = ""
-            if reply_text:
-                assistant_mid = row_mid(slot.append("assistant", reply_text, "msg msg-a")) or ""
-        except Exception:
-            logger.debug(
-                "discord: could not mirror turn into live slot %s", session_key, exc_info=True
-            )
-            return None
-        state = getattr(self._session_resume, "dashboard_state", None)
-        push = getattr(state, "push_slots_update", None)
-        if callable(push):
-            try:
-                push()
-            except Exception:
-                logger.debug("discord: slots push after resumed turn failed", exc_info=True)
-        return (user_mid, assistant_mid)
-
     def _persist_turn(
         self,
         session_key: str,
@@ -1682,7 +1692,7 @@ class DiscordDispatcher:
     ) -> None:
         """Record the turn to conversation_log (dashboard visibility + restart).
 
-        *mirror_mids* is what ``_mirror_turn_to_live_slot`` returned: the ids the
+        *mirror_mids* is what ``project_channel_turn_live`` returned: the ids the
         live dashboard window minted for this turn's rows, or ``None`` when there
         was no live slot to mirror into. It carries BOTH facts, so there is no
         separate ``mirrored`` flag -- the presence of the tuple IS the flag, and a
@@ -1740,7 +1750,7 @@ class DiscordDispatcher:
         pct = self.sessions.check_context_usage(session_key, provider)
         soft_pct = self.cfg.discord.soft_threshold_pct
         if pct >= soft_pct and compact_unsupported_backend(provider):
-            # Capability gate (#8156): the nudge advises !compact, which this
+            # Capability gate: the nudge advises !compact, which this
             # backend refuses — it compacts on its own as context fills, so
             # there is nothing for the user to act on.
             return

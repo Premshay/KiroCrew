@@ -477,9 +477,7 @@ class TestFindOrphanMcpCandidates:
         assert len(records) == 1
         assert records[0].exc_info is None
 
-    def test_unexpected_probe_error_keeps_traceback(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_unexpected_probe_error_keeps_traceback(self, caplog: pytest.LogCaptureFixture) -> None:
         """A genuinely unexpected probe failure still logs exc_info."""
         from kiro_crew.session_pid import find_orphan_mcp_candidates
 
@@ -664,6 +662,20 @@ class TestFindOrphanMcpCandidates:
 @_POSIX_ONLY
 class TestKillOrphanMcps:
     """Tests for kill_orphan_mcps (kill confirmed orphans)."""
+
+    @pytest.fixture(autouse=True)
+    def _stable_root_identity(self) -> Iterator[None]:
+        """Give synthetic PIDs a start token so the recycle guard passes.
+
+        `kill_orphan_mcps` captures the root's `_pid_start_token` before the
+        subtree scan and re-confirms it before signalling, so a PID whose
+        identity cannot be read is skipped by design. These tests use synthetic
+        PIDs that have no `/proc` entry; a stable token states the thing they
+        already assume -- that the PID was not recycled mid-sweep. See
+        test_orphan_mcp_subtree.TestRootRecycleGuard for the guard's own cover.
+        """
+        with patch("kiro_crew.session_pid._pid_start_token", return_value="tok-stable"):
+            yield
 
     def test_uses_killpg_when_pgid_differs(self) -> None:
         """If orphan is its own group leader, kill via killpg."""
@@ -1285,6 +1297,12 @@ class TestEnvHasKirocrewMarker:
 
 
 class TestMarkedLauncherSweepIntegration:
+    @pytest.fixture(autouse=True)
+    def _stable_root_identity(self) -> Iterator[None]:
+        """See TestKillOrphanMcps._stable_root_identity."""
+        with patch("kiro_crew.session_pid._pid_start_token", return_value="tok-stable"):
+            yield
+
     """find + kill phases honor the marked-launcher positive-ID path."""
 
     def test_find_includes_marked_npx_orphan(self) -> None:
@@ -1398,8 +1416,7 @@ class TestIsSweepableOrphanWork:
         from kiro_crew.session_pid import _is_sweepable_orphan_work
 
         worker = (
-            b"/repo/.venv/bin/python\x00-u\x00-c"
-            b"\x00import sys;exec(eval(sys.stdin.readline()))"
+            b"/repo/.venv/bin/python\x00-u\x00-c" b"\x00import sys;exec(eval(sys.stdin.readline()))"
         )
         with (
             patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
@@ -1528,9 +1545,7 @@ class TestIsSweepableOrphanWork:
         assert _ORPHAN_WORK_MIN_AGE_SECONDS > _ORPHAN_MIN_AGE_SECONDS
         with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True):
             assert (
-                _is_sweepable_orphan_work(
-                    1234, self._PYTEST_CMDLINE, _ORPHAN_MIN_AGE_SECONDS + 1
-                )
+                _is_sweepable_orphan_work(1234, self._PYTEST_CMDLINE, _ORPHAN_MIN_AGE_SECONDS + 1)
                 is False
             )
 
@@ -1547,9 +1562,7 @@ class TestIsSweepableOrphanWork:
 
         with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True):
             assert (
-                _is_sweepable_orphan_work(
-                    1234, b"/usr/local/bin/kiro-cli\x00chat\x00--acp", 700.0
-                )
+                _is_sweepable_orphan_work(1234, b"/usr/local/bin/kiro-cli\x00chat\x00--acp", 700.0)
                 is False
             )
             assert _is_sweepable_orphan_work(1234, b"claude\x00--print", 700.0) is False
@@ -1938,9 +1951,7 @@ class TestPidStartTokenIdentityGuard:
         assert entry in session_pid_file.read_text(encoding="utf-8")
 
     @_POSIX_ONLY
-    def test_session_roots_subreaper_reparent_still_killed(
-        self, session_pid_file: Path
-    ) -> None:
+    def test_session_roots_subreaper_reparent_still_killed(self, session_pid_file: Path) -> None:
         """A recorded start token that MATCHES proves identity on its own.
 
         Orphans do not always reparent to init: a process placed in its own
@@ -1974,9 +1985,10 @@ class TestPidStartTokenIdentityGuard:
         ):
             cleanup_orphaned_session_roots()
 
-        assert (99998, platform_compat.SIGKILL) in kills, (
-            "a token-verified orphan adopted by a subreaper was not reaped"
-        )
+        assert (
+            99998,
+            platform_compat.SIGKILL,
+        ) in kills, "a token-verified orphan adopted by a subreaper was not reaped"
         # And it must not be silently untracked, which is what leaks it forever.
         assert entry not in session_pid_file.read_text(encoding="utf-8")
 
@@ -2981,3 +2993,93 @@ class TestBrowserSessionOwnerAlive:
         with patch.object(sp, "sys") as mock_sys:
             mock_sys.platform = "darwin"
             assert sp._browser_session_owner_alive(900, b"kc-1a2b3c4d") is True
+
+
+class TestAcquiringAPidLockDoesNotTruncateTheLockFile:
+    """A lock file must be opened WRITABLE but never TRUNCATING.
+
+    ``msvcrt.locking`` needs a writable handle, so the fd cannot be opened
+    ``"r"``. But ``"w"`` truncates at open, and on Windows a truncating open of a
+    lock file whose first byte another holder already locked raises a sharing
+    violation instead of waiting — so the contending acquirer crashes with a bare
+    ``OSError`` *before* it reaches ``file_lock``, and the serialisation the lock
+    exists to provide never happens. POSIX ``flock`` tolerates the truncate, which
+    is why the defect is invisible on Linux and reddened only the Windows shards.
+
+    Issue #9248; same defect and same fix as ``work_ledger._open_lock`` (PR #9237)
+    and ``dashboard/handlers/mcp.py``'s ``_McpFileLock``, which was already
+    written this way.
+
+    Truncation is the direct, PLATFORM-INDEPENDENT observable, and that is what
+    these assert: seed the lock file with bytes, take and release the lock, and
+    require the bytes to have survived. Under the old ``open(lock_path, "w")``
+    every one of these fails on every platform, so the guard does not depend on
+    running the suite on Windows to have teeth.
+    """
+
+    SEED = b"lock-file-content-that-must-survive"
+
+    def test_session_pid_file_lock_preserves_the_lock_file(self, session_pid_file: Path) -> None:
+        from kiro_crew.session_pid import _session_pid_file_lock, _session_pid_file_path
+
+        lock_path = _session_pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        with _session_pid_file_lock():
+            pass
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_pid_file_lock_preserves_the_lock_file(self, pid_file: Path) -> None:
+        from kiro_crew.session_pid import _pid_file_lock, _pid_file_path
+
+        lock_path = _pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        with _pid_file_lock():
+            pass
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_the_periodic_sweep_preserves_the_lock_file(self, session_pid_file: Path) -> None:
+        """The sweep is the site most likely to feel this in production.
+
+        It runs on a timer while ``_track_session_pid`` contends for the same
+        lock, which is exactly the interleaving a truncating open turns into a
+        crash rather than a wait.
+        """
+        from kiro_crew.session_pid import _periodic_pid_sweep, _session_pid_file_path
+
+        path = _session_pid_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # The sweep returns early unless the pid file exists, so it must exist
+        # for the lock to be reached at all.
+        path.write_text(f"{os.getpid()}:999999\n", encoding="utf-8")
+        lock_path = path.with_suffix(".lock")
+        lock_path.write_bytes(self.SEED)
+
+        _periodic_pid_sweep(os.getpid(), set())
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_the_lock_is_still_actually_acquired(self, pid_file: Path) -> None:
+        """Guard the guard: a non-truncating open that never locks would pass above.
+
+        ``file_lock`` is asked for the lock through the same helper the production
+        path uses, so this fails if the fd stopped being writable — the failure
+        mode a naive ``"r"`` fix would introduce, and the reason ``"r+"`` rather
+        than ``"r"`` is the answer.
+        """
+        from kiro_crew.session_pid import _pid_file_path
+
+        lock_path = _pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        lock_path.touch(exist_ok=True)
+        with open(lock_path, "r+") as fd:
+            with platform_compat.file_lock(fd.fileno(), exclusive=True):
+                pass
+        assert lock_path.read_bytes() == self.SEED

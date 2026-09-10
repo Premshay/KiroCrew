@@ -160,6 +160,14 @@ _CAP_REASONS = {
 _CAP_REGISTER: dict[str, tuple[str, str]] = {
     # Pre-existing capped sites -- the bounded read's live consumers.
     "chat_pins.py::api_chat_pins_create": ("<default>", _BOUNDED_BY_DEFAULT),
+    # Voice config is a flat set of short scalars (provider name, voice name,
+    # rate, paths) and voice synthesis takes one reply's text, which the panel
+    # already truncates well below the shared default. Neither has a legitimate
+    # body anywhere near 64 KB, so the default cap is the right one and there is
+    # nothing route-specific to own elsewhere.
+    "chat_voice.py::api_voice_config": ("<default>", _BOUNDED_BY_DEFAULT),
+    "chat_voice.py::api_voice_synthesize": ("<default>", _BOUNDED_BY_DEFAULT),
+    "chat_voice.py::api_voice_cancel": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/feedback.py::api_feedback_submit": ("<default>", _BOUNDED_BY_DEFAULT),
     "handlers/messaging.py::api_notification_agent_push": (
         "<default>",
@@ -173,6 +181,12 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
         "TEAMS_MAX_ACTIVITY_BYTES",
         _BOUNDED_EXPLICIT,
     ),
+    # The UI-preference backup stores values up to MAX_VALUE_BYTES (64 KB) and a
+    # document up to MAX_TOTAL_BYTES, so the shared 64 KB default -- exactly one
+    # legal value, with no room for the JSON envelope -- would 413 a patch the
+    # store itself accepts. The cap is owned in kiro_crew/ui_prefs.py beside the
+    # limits it has to cover, so the two cannot drift apart again.
+    "handlers/ui_prefs.py::api_ui_prefs": ("MAX_REQUEST_BYTES", _BOUNDED_EXPLICIT),
     # agents.py tranche.
     "handlers/agents.py::api_agent_config": ("None", _UNBOUNDED_USER_CONTENT),
     "handlers/agents.py::api_default_agent": ("None", _CONTROL_FIELDS_CAP_PENDING),

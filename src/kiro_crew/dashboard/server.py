@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import errno
 import faulthandler
+import functools
 import logging
 import os
 import stat
@@ -20,6 +21,7 @@ from aiohttp import web
 
 from kiro_crew import platform_compat, port_resolution, work_dispatch
 from kiro_crew.apps.backend import start_enabled_app_backends
+from kiro_crew.apps.hook_reconcile import init_hook_reconciler, stop_hook_reconciler
 from kiro_crew.apps.hooks_integration import (
     init_hooks_system,
     on_gateway_shutdown,
@@ -53,6 +55,7 @@ from kiro_crew.dashboard import (
     tailnet,
     tailnet_serve,
 )
+from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.crash_dump_store import (
     claim_dump_notification,
     dump_age_seconds,
@@ -86,6 +89,7 @@ from kiro_crew.dashboard.handlers.artifacts import (
     api_artifact_relocate,
     api_artifact_reopen_comment,
     api_artifact_reply_comment,
+    api_artifact_reprobe_notice,
     api_artifact_resolve_comment,
     api_artifact_session_docs,
     api_artifact_set_folder,
@@ -170,6 +174,7 @@ from kiro_crew.platform import (
 )
 from kiro_crew.power import SleepInhibitor
 from kiro_crew.safety_override import (
+    POLICY_REVOKED_SOURCE,
     apply_config_duration,
     describe_dropped_grant,
     grant_declared_yolo,
@@ -177,9 +182,10 @@ from kiro_crew.safety_override import (
     take_dropped_grant,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.sel import sel
+from kiro_crew.sel import sel, sel_is_warm, warm_sel_singleton
 from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import SkillsLoader, set_pending_consumed_hook, set_pending_staged_hook
+from kiro_crew.stall_attribution import attribute_dump, describe
 from kiro_crew.tunnel.setup import setup_tunnel
 
 if TYPE_CHECKING:
@@ -341,13 +347,14 @@ async def _should_prevent_sleep(state: DashboardState, port: int) -> bool:
 #
 # Module-level and shared by BOTH ``start_dashboard`` and ``start_api_server``
 # so the two entrypoints can never drift: the ``--slack-only`` headless server
-# must gate exactly the same MCP tool routes the dashboard does. A prior drift
-# here — headless mounting no token auth at all — was an auth-bypass regression
-# of the loopback-bypass fix. Keep this as the single source of truth.
+# must gate exactly the same MCP tool routes the dashboard does. Drift here —
+# headless mounting no token auth at all — is an auth bypass. Keep this as the
+# single source of truth.
 _STRICT_INTERNAL_API_PATHS = frozenset(
     {
         "/api/send-message",
         "/api/delete-message",
+        "/api/update-message",
         "/api/browser-event",
         "/api/browser/frame",
         "/api/browser/pump-audit",
@@ -426,6 +433,11 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # MCP-only coordinator work-item operations.  The prefix covers every
         # cycle/item/archive sub-route; no browser route consumes this API.
         "/api/work-items",
+        # MCP-only (the four kirocrew-work tools); no browser caller. Prefix
+        # matching covers "/record", "/brief" and "/report". Without this entry
+        # the tools' internal-secret calls fall through to cookie auth and are
+        # refused before the handler's own session recognition can run.
+        "/api/work-ledger",
         # MCP-only (knowledge_add_document tool); no browser caller — the
         # dashboard ingests via its own cookie-authed knowledge routes. Same
         # wiring class as "/api/notifications/agent" above.
@@ -465,40 +477,53 @@ _PRE_AUDIT_DENY_STATUSES = frozenset({401, 403})
 
 
 async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
-    """Record a middleware refusal in the SEL, off the event loop, best-effort.
+    """Record a middleware refusal in the SEL, best-effort.
 
     Shared by every middleware that denies BEFORE ``sel_audit_middleware`` runs
     (that one is registered inner to them, so a bare raise produces a 403 that
     appears nowhere in the audit log). One helper rather than per-site calls
-    because both properties below are easy to omit at a new deny site and
+    because the property below is easy to omit at a new deny site and
     invisible when omitted:
 
-    * OFF THE LOOP — ``log_api_access`` only enqueues, but the first ``sel()``
-      of a process CONSTRUCTS the log: trust-dir creation, key validation, and
-      on Windows the owner-only DACL on the key file. A fresh
-      dashboard whose first state-changing request is cross-origin would run
-      that synchronously on the event loop and stall every other request.
     * BEST-EFFORT — a trust root too short to sign the chain makes construction
       raise, and an unguarded write would turn the refusal into a 500: losing
       the denial in order to report it.
 
+    No thread hop on the healthy path: the SEL singleton is warmed at startup
+    (:func:`kiro_crew.sel.warm_sel_singleton`, awaited by both start paths
+    before the middleware chain is built), so ``log_api_access`` here only
+    enqueues to the writer thread (after its one-time start on first
+    ``log()``). The warm is best-effort, though: when it FAILS, the
+    next ``sel()`` retries ``_init_locked`` -- trust-dir creation, key load,
+    a tail read of the log -- on the calling thread, and this helper runs on
+    the event loop for every denied request. So the hop is kept for exactly
+    that case, gated on :func:`kiro_crew.sel.sel_is_warm`: two attribute
+    reads on the healthy path, a worker thread on the degraded one, never
+    blocking file I/O on the loop. The ``except`` stays because construction
+    can raise on either path.
+
     Calling this CLAIMS the request (:func:`origin.mark_audit_claimed`) so the
     deny-audit boundary outer to every barrier does not record the same refusal
     a second time. The claim is set unconditionally, before the write: a write
-    that failed here fails identically in the boundary, so a second doomed
-    thread hop buys nothing.
+    that failed here fails identically in the boundary, so retrying in the
+    boundary buys nothing.
     """
     mark_audit_claimed(request)
-    try:
-        await asyncio.to_thread(
-            lambda: sel().log_api_access(
-                caller=caller,
-                operation=f"{request.method} {request.path}",
-                outcome="denied",
-                resources=request.path,
-                error=error,
-            )
+
+    def _write() -> None:
+        sel().log_api_access(
+            caller=caller,
+            operation=f"{request.method} {request.path}",
+            outcome="denied",
+            resources=request.path,
+            error=error,
         )
+
+    try:
+        if sel_is_warm():
+            _write()
+        else:
+            await asyncio.to_thread(_write)
     except Exception:
         logger.warning("Failed to log a middleware denial to SEL", exc_info=True)
 
@@ -709,6 +734,13 @@ _MIXED_INTERNAL_API_PATHS = frozenset(
         "/api/chat",
         "/api/lessons",
         "/api/crons",  # CLI cron trigger; prefix covers all sub-routes (consistent with spawn/taskrunner)
+        # The cron_add/cron_update MCP tools resolve-or-create Schedule-page
+        # folders via X-Internal-Secret. Same trap as "/api/artifact-folders"
+        # below: token_auth prefix-matching is (path == p or
+        # path.startswith(p + "/")), so "/api/cron-folders" is NOT covered by
+        # the "/api/crons" entry above — without this entry those MCP calls
+        # fall through to cookie auth and fail with "Token required".
+        "/api/cron-folders",
         "/api/taskrunner",
         "/api/artifacts",
         # The 5 artifact_folder_* MCP tools authenticate via X-Internal-Secret.
@@ -914,7 +946,7 @@ _PERMISSIONS_POLICY = "clipboard-write=(self), clipboard-read=(self)"
 # header the runtime loads; without it the load hard-fails (crossorigin
 # makes the header MANDATORY, not additive), the runtime never arrives,
 # Tailwind-classed widgets render unstyled, and the widget loading overlay
-# sits on its hang backstop (blank box), see issue #6181. `*` leaks nothing:
+# sits on its hang backstop (blank box). `*` leaks nothing:
 # /vendor/ holds only public, non-secret static JS (already auth-exempt via
 # token_auth._BYPASS_PREFIXES) and the response carries no credentials or
 # user data.
@@ -964,6 +996,7 @@ async def _vendor_preflight_handler(request: web.Request) -> web.Response:
 # /sprites: those use stable, un-hashed filenames.
 _IMMUTABLE_PATH_PREFIXES = ("/assets/",)
 _IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+_NO_STORE_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0"
 
 # Max size of a single incoming HTTP header field, raised from aiohttp's
 # 8190-byte default. Browser cookies are not port-isolated (RFC 6265), so on
@@ -1087,11 +1120,19 @@ def _apply_security_headers(
     # responses for hashed assets: a 304's headers merge into the stored
     # cache entry, so answering it with no-store would degrade the cached
     # immutable bundle.
+    #
+    # This check is NOT sufficient on its own for the static route: aiohttp's
+    # ``FileResponse`` is built with status 200 and only stats the file inside
+    # ``prepare()``, after the middleware chain has returned. A missing chunk
+    # therefore passes through here as a 200 and becomes a 404 later, still
+    # wearing the immutable header. ``_finalize_asset_cache_control`` (an
+    # ``on_response_prepare`` handler, which runs once the status is final)
+    # closes that hole; this early decision stays as the common path.
     status = getattr(resp, "status", None)
     if status in (200, 206, 304) and path.startswith(_IMMUTABLE_PATH_PREFIXES):
         resp.headers.setdefault("Cache-Control", _IMMUTABLE_CACHE_CONTROL)
     else:
-        resp.headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        resp.headers.setdefault("Cache-Control", _NO_STORE_CACHE_CONTROL)
         resp.headers.setdefault("Pragma", "no-cache")
         resp.headers.setdefault("Expires", "0")
 
@@ -1143,6 +1184,41 @@ def _apply_security_headers(
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
+
+async def _finalize_asset_cache_control(request: web.Request, response: web.StreamResponse) -> None:
+    """``on_response_prepare`` hook: never let an error under ``/assets/`` out
+    with ``immutable``.
+
+    ``_apply_security_headers`` runs in middleware, when a ``FileResponse``
+    still reports status 200 — aiohttp defers the ``stat`` to ``prepare()``.
+    A request for a chunk the running ``dist/`` does not have (mid-upgrade, or
+    a stale bundle asking for a chunk the new build renamed) thus reached the
+    wire as ``404`` + ``public, max-age=31536000, immutable``, and Chromium
+    kept that 404 for a year under the request URL. Lucide icon chunks keep
+    their content hash across releases, so one poisoned entry breaks the module
+    graph of every later bundle that imports it: the entry ``<script
+    type=module>`` fails silently and the page never boots — tunnel rebuilds and
+    gateway restarts cannot fix it because the cache key is the local URL. This
+    hook runs after the status is final and overwrites (not ``setdefault``) the
+    header for exactly that case: an immutable-prefixed path whose final status
+    is not one the immutable policy admits.
+    """
+    if response.status in (200, 206, 304):
+        return
+    if not request.path.startswith(_IMMUTABLE_PATH_PREFIXES):
+        return
+    if response.headers.get("Cache-Control") != _IMMUTABLE_CACHE_CONTROL:
+        return
+    response.headers["Cache-Control"] = _NO_STORE_CACHE_CONTROL
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+
+
+def _install_asset_cache_control_finalizer(app: web.Application) -> None:
+    """Register ``_finalize_asset_cache_control`` on ``app``. Idempotent."""
+    if _finalize_asset_cache_control not in app.on_response_prepare:
+        app.on_response_prepare.append(_finalize_asset_cache_control)
 
 
 # URL prefix for app-shipped standalone HTML windows. One namespace keeps app
@@ -1362,6 +1438,26 @@ def _deferred_session_control(handler_name: str) -> Callable:
     return _route
 
 
+def _deferred_work_ledger(handler_name: str) -> Callable:
+    """Bind a work-ledger route without importing the subsystem at boot.
+
+    Same shape and same reason as :func:`_deferred_session_control`: the four
+    handlers belong to ``kirocrew-work``, an opt-in MCP server, so they are an
+    optional subsystem and a module-level import would be an eager one. Route
+    registration itself is allowed at boot; only the import moves to first request,
+    so a session that is neither a conductor nor a worker never pays for loading it.
+    """
+
+    async def _route(request: web.Request) -> web.StreamResponse:
+        from kiro_crew.dashboard.handlers import work_ledger
+
+        handler = getattr(work_ledger, handler_name)
+        return await handler(request)
+
+    _route.__name__ = handler_name
+    return _route
+
+
 def _register_mcp_routes(app: web.Application) -> None:
     """Register API routes used by MCP tools (spawn, lessons, crons, etc.)."""
     app.router.add_post("/api/spawn", handlers.api_spawn)
@@ -1370,6 +1466,7 @@ def _register_mcp_routes(app: web.Application) -> None:
     # MCP Apps (SEP-1865): embedded app iframe -> gateway tool callback.
     app.router.add_post("/api/mcp-apps/call", handlers.api_mcp_apps_call)
     app.router.add_get("/api/spawn", handlers.api_spawn_list)
+    app.router.add_post("/api/spawn/stop-all", handlers.api_spawn_stop_all)
     app.router.add_get("/api/spawn/{agent_id}", handlers.api_spawn_status)
     app.router.add_delete("/api/spawn/{agent_id}", handlers.api_spawn_delete)
     app.router.add_post("/api/spawn/{agent_id}/retry", handlers.api_spawn_retry)
@@ -1420,12 +1517,21 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post(
         "/api/work-items/assigned/{item_id}/handoff", handlers.api_work_item_submit_handoff
     )
+    app.router.add_get("/api/work-ledger", _deferred_work_ledger("api_work_ledger_get"))
+    app.router.add_post("/api/work-ledger/record", _deferred_work_ledger("api_work_ledger_record"))
+    app.router.add_get("/api/work-ledger/brief", _deferred_work_ledger("api_work_brief"))
+    app.router.add_post("/api/work-ledger/report", _deferred_work_ledger("api_work_report"))
     app.router.add_get("/api/crons", handlers.api_crons)
     app.router.add_post("/api/crons", handlers.api_crons_create)
     app.router.add_delete("/api/crons", handlers.api_cron_batch_delete)
     app.router.add_get("/api/crons/history", handlers.api_cron_history_all)
     app.router.add_delete("/api/crons/{job_id}", handlers.api_cron_delete)
     app.router.add_patch("/api/crons/{job_id}", handlers.api_cron_update)
+    # Operator-only vault-secret grants. The "/api/crons" prefix above makes
+    # this reachable with X-Internal-Secret, so the HANDLER refuses proven
+    # internal-secret callers (request["internal_auth"]) — machines request,
+    # humans grant. See the handler docstring.
+    app.router.add_put("/api/crons/{job_id}/secrets", handlers.api_cron_secret_grant)
     app.router.add_post("/api/crons/{job_id}/enable", handlers.api_cron_enable)
     app.router.add_post("/api/crons/{job_id}/run", handlers.api_cron_run)
     app.router.add_post("/api/crons/{job_id}/cancel", handlers.api_cron_cancel)
@@ -1443,6 +1549,7 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/taskrunner/cancel", handlers.api_taskrunner_cancel)
     app.router.add_post("/api/send-message", handlers.api_send_message)
     app.router.add_post("/api/delete-message", handlers.api_delete_message)
+    app.router.add_post("/api/update-message", handlers.api_update_message)
     # send_notification MCP tool (RFC notification bus Phase 5) — registered
     # here (not the dashboard-only block) so headless --slack-only mode
     # serves it too; it is on _STRICT_INTERNAL_API_PATHS like send-message.
@@ -1510,10 +1617,12 @@ def _register_mcp_routes(app: web.Application) -> None:
     # Auto-nudge (feature-flagged — returns 503 when KIROCREW_AUTONUDGE unset)
     from kiro_crew.dashboard.handlers.autonudge import (
         api_autonudge_delete,
+        api_autonudge_fire,
         api_autonudge_get,
         api_autonudge_list,
         api_autonudge_start,
         api_autonudge_update,
+        api_monitor_clear,
         api_monitor_create,
         api_monitor_restart,
         api_monitor_slot_get,
@@ -1529,14 +1638,16 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_get("/api/autonudge/slot/{slot_key}", api_autonudge_get)
     app.router.add_patch("/api/autonudge/{loop_id}", api_autonudge_update)
     app.router.add_delete("/api/autonudge/{loop_id}", api_autonudge_delete)
+    app.router.add_post("/api/autonudge/{loop_id}/fire", api_autonudge_fire)
     app.router.add_get("/api/monitors", api_monitors_list)
     app.router.add_post("/api/monitors", api_monitor_create)
     app.router.add_get("/api/monitors/slot/{slot_key}", api_monitor_slot_get)
     app.router.add_patch("/api/monitors/{monitor_id}", api_monitor_update)
     app.router.add_post("/api/monitors/{monitor_id}/stop", api_monitor_stop)
+    app.router.add_post("/api/monitors/{monitor_id}/clear", api_monitor_clear)
     app.router.add_post("/api/monitors/{monitor_id}/restart", api_monitor_restart)
 
-    # Agent questions. The MCP ask_question tool no longer posts here: it returns
+    # Agent questions. The MCP ask_question tool does not post here: it returns
     # a session directive and the dashboard posts a NON-BLOCKING card (see
     # mcp_tools.control.ask_question). This API stays live because the UI reads
     # /pending to rehydrate cards after a reload and answers or dismisses them
@@ -1625,6 +1736,7 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/artifacts/{slug}/publish", api_artifact_publish)
     app.router.add_delete("/api/artifacts/{slug}/publish", api_artifact_unpublish)
     app.router.add_post("/api/artifacts/{slug}/publish/refresh", api_artifact_refresh_sharing)
+    app.router.add_post("/api/artifacts/{slug}/publish/reprobe-notice", api_artifact_reprobe_notice)
     app.router.add_patch("/api/artifacts/{slug}/sharing", api_artifact_update_sharing)
     app.router.add_patch("/api/artifacts/{slug}/relocate", api_artifact_relocate)
     # Upstream sync (fork/publication lineage) — pull / status / overwrite
@@ -2056,9 +2168,9 @@ def _apply_startup_yolo(state: DashboardState, cfg: Any) -> None:
     """Enable the safety override at startup if the operator declared it.
 
     ``agent.dangerouslySkipPermissions`` is a STANDING operator instruction, so the grant it creates
-    does not expire — it used to lapse after 24h and silently drop the user back
-    to prompt-for-everything, which breaks flows driven from Slack/Discord and
-    from cron where nobody is watching the dashboard to re-enable it.
+    does not expire — a lapse after 24h would silently drop the user back to
+    prompt-for-everything, which breaks flows driven from Slack/Discord and from
+    cron where nobody is watching the dashboard to re-enable it.
 
     State is in-memory, so the grant is re-established and re-audited on every
     startup rather than persisted. An enterprise policy can forbid a
@@ -2159,7 +2271,7 @@ def _armed_unattended_loops() -> "list[Any]":
 _UNATTENDED_EXPIRY_TITLE = "🔒 Auto-approve expired while an unattended run was in progress"
 
 
-def _unattended_expiry_text(loop_count: int) -> str:
+def _unattended_expiry_text(loop_count: int, source: str) -> str:
     """Body shared by the dashboard note and the owner DM, so the two cannot drift.
 
     Names the remedy as well as the cause: ``agent.yolo_duration`` accepts
@@ -2167,16 +2279,32 @@ def _unattended_expiry_text(loop_count: int) -> str:
     problem is that operators do not know that option exists, and the moment it
     would have helped is the moment worth saying so.
 
+    EXCEPT after a policy revocation (``source == POLICY_REVOKED_SOURCE``): both
+    halves of that remedy — re-enabling auto-approve and ``until_shutdown``, a
+    ``yolo_duration`` scope member — are refused by the same fail-closed
+    ``approval_modes`` gate that revoked the grant, so suggesting them directs
+    the one operator who is not present into a wall. The stall
+    description stays; only the remedy is replaced with the actual cause.
+
     The stall is stated conditionally because global auto-approve is not the only
     path to one: a slot carrying its own trust grant is approved by ``slot._trust``
     independently of the grant, so its cycles keep running after this expiry.
     Claiming the run has stopped would send an operator to rescue a healthy one.
     """
-    return (
+    stall = (
         f"{loop_count} monitor loop(s) are still running, but auto-approval has "
         f"ended, so any cycle that relied on it now waits on a per-tool approval "
         f"that nobody is there to give. (A session granted its own trust is "
-        f"unaffected.) Re-enable auto-approve to resume. For runs meant to go "
+        f"unaffected.)"
+    )
+    if source == POLICY_REVOKED_SOURCE:
+        return (
+            f"{stall} Auto-approve was disabled by organization policy, so it "
+            f"cannot be re-enabled while the policy is in effect — contact your "
+            f"administrator if you believe this is unexpected."
+        )
+    return (
+        f"{stall} Re-enable auto-approve to resume. For runs meant to go "
         f"unattended overnight, Settings → agent.yolo_duration has an "
         f"'until_shutdown' option that has no timed expiry."
     )
@@ -2205,7 +2333,7 @@ def _notify_unattended_expiry(state: "DashboardState", source: str) -> None:
         "every further cycle will wait on per-tool approval",
         len(armed),
     )
-    body = _unattended_expiry_text(len(armed))
+    body = _unattended_expiry_text(len(armed), source)
     try:
         state.notify(
             "safety_override",
@@ -2232,12 +2360,179 @@ def _notify_unattended_expiry(state: "DashboardState", source: str) -> None:
     task.add_done_callback(state._background_tasks.discard)
 
 
-def _dispatch_override_expiry_notification(state: DashboardState, notify_coro_factory: Any) -> bool:
+def _override_expiry_dm_text(source: str) -> str:
+    """Owner-DM body for an override expiry, worded by what actually happened.
+
+    A POLICY revocation (``source == POLICY_REVOKED_SOURCE``) is not an expiry
+    the operator can undo: ``_commit_activation``'s fail-closed
+    ``approval_modes`` gate refuses the very ``/kirocrew yolo`` a re-arm
+    suggestion would name, so suggesting it directs the operator into a wall
+    without naming the cause. Presentation only — the gate and its SEL audit are
+    untouched. (The unattended-run notice applies the same source split in
+    ``_unattended_expiry_text``.)
+
+    Every other source keeps the re-armable wording byte-identical: a TTL lapse
+    IS re-armable, and that text is pinned by tests.
+    """
+    if source == POLICY_REVOKED_SOURCE:
+        return (
+            "\U0001f512 Auto-approve was disabled by organization policy, and the "
+            "active safety override has been revoked. Tools now require approval. "
+            "Re-authorization is refused while the policy is in effect — contact "
+            "your administrator if you believe this is unexpected."
+        )
+    return "\U0001f512 Safety override expired. Tools now require approval. Reply `/kirocrew yolo` to re-authorize."
+
+
+async def _notify_slack_override_expired(state: DashboardState, source: str) -> None:
+    """Post the override expiry notice to the owner DM, worded by cause.
+
+    Module-level (not a ``start_dashboard`` closure) so the seam this fix added —
+    ``source`` travelling from the expiry callback into the DM body — is
+    directly testable; a closure would leave that wiring uncovered.
+    """
+    await _dm_owner(state, _override_expiry_dm_text(source))
+
+
+def _clear_override_derived_trust(state: "DashboardState", source: str) -> None:
+    """Drop every INHERITED grant of the expiring override. State only, no loop.
+
+    Module-level (not a ``start_dashboard`` closure), like the Slack notifier, so the
+    seam is directly testable against a real ``DashboardState``.
+
+    Split out of the notifier because the two halves have different
+    deadlines. ``subagent_manager.admission.parent_trusted`` reads a session's
+    ``approval_policy == "auto"`` DIRECTLY -- it consults no flag in
+    ``safety_override`` -- so until this has run a spawn is auto-approved against
+    a ceiling that already denies, and an already-launched subagent is not
+    un-spawned by anything later. That makes this the half a policy revocation has
+    to complete synchronously, on whichever thread installed the ceiling, while
+    the broadcasts and DMs below can be scheduled onto the loop.
+
+    Safe off the event loop: it touches the slot dict and the session store and
+    nothing loop-affine. Idempotent, so the notifier re-running it costs nothing.
+    """
+    # Slots carrying STANDING trust keep their policy: that is a separate,
+    # longer-lived decision than the expiring override, and it is also what must
+    # survive the channel-trust revoke below.
+    standing_trust: set[str] = set()
+    if state.sessions is not None:
+        # Snapshot the slots before iterating. This runs on whatever thread
+        # installed the denying ceiling, and the loop keeps creating and removing
+        # slots -- so iterating the live dict raises "dictionary changed size
+        # during iteration" and ABORTS the teardown partway, leaving the slots it
+        # had not reached yet at ``approval_policy="auto"`` with nothing to come
+        # back for them. A partial revocation is the failure this whole path
+        # exists to prevent, so the iteration cannot be the thing that breaks it.
+        for slot in list(state._slots.values()):
+            if slot._trust or slot._trust_reads:
+                # Excluded from the channel-trust revoke below, via the SAME
+                # derivation the reset uses: a channel-born slot's turns run on
+                # the channel's own session key, so a `dashboard:<slot>` spelling
+                # names a key nothing on that path reads.
+                standing_trust.add(effective_session_key(slot))
+            else:
+                # The SAME derivation the grant used. A channel-born slot's
+                # turns run on the channel's own session key, which is what
+                # `linked_session_key` holds, so clearing `dashboard:<slot>`
+                # here cleared a key nothing on the channel path ever reads:
+                # the TTL could not expire the grant it had handed out, which
+                # is worse than a missing off-switch because the operator was
+                # told it was time-bounded.
+                state.sessions.set_approval_policy(effective_session_key(slot), "")
+    # Slack cleanup — isolated so failures don't block dashboard operations
+    try:
+        # From `messaging`, not `slack.handler`: the grant is channel-neutral.
+        # This revokes the approval_policy half as well as the mapping, which is
+        # what a CHANNEL session needs -- the loop just above resets only the
+        # dashboard's own slots, and a subagent reads the policy rather than the
+        # mapping, so policy left at "auto" outlives the override it belonged to.
+        # ``keep_policy`` is what stops this from undoing the preservation above:
+        # a Trust press can file a ``dashboard:`` key in the shared grant, and
+        # resetting its policy here would revoke standing trust nobody expired.
+        from kiro_crew.messaging.session_trust import clear_trusted_sessions
+
+        clear_trusted_sessions(keep_policy=standing_trust)
+    except Exception:
+        logger.debug("Could not clear trusted sessions", exc_info=True)
+
+
+def _suspend_override_derived_trust(state: "DashboardState") -> Callable[[], None] | None:
+    """Blank the grant's inherited slot policies BEFORE a new ceiling publishes.
+
+    Returns the restore. ``_clear_override_derived_trust`` runs once a deny
+    has been RESOLVED against the new ceiling, but resolving is a governance read
+    and the ceiling is already published while it runs -- and
+    ``admission.parent_trusted`` reads the slot's approval policy directly, not
+    ``is_active()``, so for that whole window a spawn from a slot carrying the
+    override's inherited ``"auto"`` was auto-approved against a ceiling that may
+    deny. This is the pre-publication half that closes it.
+
+    Only the override's OWN inherited trust is suspended: slots with standing
+    ``_trust`` / ``_trust_reads`` are left alone (a Trust press is a separate,
+    longer-lived decision no yolo ceiling touches), and only slots currently at
+    ``"auto"`` are recorded, so the restore puts back exactly what was taken. The
+    shared channel-trust mapping is NOT suspended: ``is_session_trusted`` gates a
+    tool in an already-running turn (recoverable, audited), while this guards
+    spawn admission (unrecoverable) -- the same asymmetry the revoke ordering rests
+    on. Same thread contract as the clear: slot dict + session store only.
+    """
+    if state.sessions is None:
+        return None
+    suspended: list[tuple[str, str]] = []
+    for slot in list(state._slots.values()):
+        if slot._trust or slot._trust_reads:
+            continue
+        key = effective_session_key(slot)
+        try:
+            if state.sessions.get_approval_policy(key) != "auto":
+                continue
+            state.sessions.set_approval_policy(key, "")
+        except Exception:
+            logger.debug("could not suspend inherited trust on %s", key, exc_info=True)
+            continue
+        suspended.append((slot.key, key))
+    if not suspended:
+        return None
+
+    def _restore() -> None:
+        # Restore is CONDITIONAL, per slot, on the slot still being in the state it
+        # was suspended from. The governance read in between is long enough for
+        # the operator to have changed a slot's mode -- picked ``trust_reads`` or
+        # ``trust``, or ``normal`` -- and each of those writes this same policy.
+        # Writing ``"auto"`` over a ``trust_reads`` slot would upgrade read-only
+        # trust to full auto-approve on the read ``parent_trusted`` makes; over a
+        # ``normal`` slot it would undo an explicit revoke. So a slot gets its
+        # ``"auto"`` back only if it still exists, still carries no standing trust
+        # flag, and its policy is still the empty string this suspension left.
+        for slot_key, key in suspended:
+            slot = state._slots.get(slot_key)
+            if slot is None or slot._trust or slot._trust_reads:
+                continue
+            try:
+                if state.sessions.get_approval_policy(key) != "":
+                    continue
+                state.sessions.set_approval_policy(key, "auto")
+            except Exception:
+                logger.debug("could not restore inherited trust on %s", key, exc_info=True)
+
+    return _restore
+
+
+def _dispatch_override_expiry_notification(
+    state: DashboardState, notify_coro_factory: Any, source: str
+) -> bool:
     """Schedule the Slack override-expiry DM unless disabled via config.
 
     Gated by ``agent.notify_override_expiry`` (read live so it can be toggled
     without a restart). Returns True if a notification task was scheduled, False
     if skipped — either disabled via config or no running event loop.
+
+    ``source`` is the expiry trigger (``policy`` for a policy revocation, else
+    the activating source) and is handed to ``notify_coro_factory`` so the DM
+    can word the notice by cause. The config gate deliberately does not vary by
+    source: ``agent.notify_override_expiry`` mutes the recurring expiry notice
+    as a class, whichever way the grant ended.
     """
     if not KiroCrewConfig.load().agent.notify_override_expiry:
         return False
@@ -2246,7 +2541,7 @@ def _dispatch_override_expiry_notification(state: DashboardState, notify_coro_fa
     except RuntimeError:
         logger.debug("No running event loop — Slack expiry notification skipped")
         return False
-    task = loop.create_task(notify_coro_factory())
+    task = loop.create_task(notify_coro_factory(source))
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
     return True
@@ -2259,11 +2554,11 @@ async def _dm_owner(state: DashboardState, text: str) -> None:
     safety-override-expiry path), so the open_dm → post_message →
     swallow-and-log idiom lives in one place.
 
-    **Slack is not the only place an operator lives.** This used to no-op entirely
-    without Slack, which made an expiring unattended grant invisible on a
-    Teams-only, Discord-only or Telegram-only install — silence about a security
-    grant lapsing is the one outcome this notice exists to prevent. So a Slack DM
-    is still preferred (it is the owner's direct address), and every registered
+    **Slack is not the only place an operator lives.** No-opping without Slack
+    would make an expiring unattended grant invisible on a Teams-only,
+    Discord-only or Telegram-only install — silence about a security grant
+    lapsing is the one outcome this notice exists to prevent. So a Slack DM is
+    preferred (it is the owner's direct address), and every registered
     channel transport that advertises a reachable configured target is used as the
     FALLBACK when Slack is absent or could not deliver. Not in addition: an
     operator with Slack should get one notice, not one per channel.
@@ -2364,6 +2659,136 @@ def _dispatch_owner_dm(state: DashboardState, text: str) -> None:
         logger.debug("No running event loop — owner DM skipped")
         return
     task = loop.create_task(_dm_owner(state, text))
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
+def _register_connections_warm_lifecycle(app: web.Application, state: DashboardState) -> None:
+    """Retire warm generations on cleanup; startup scavenging is kicked post-bind.
+
+    The import sits inside the hook deliberately, against ``top-level-imports``, because
+    ``no-new-work-on-gateway-boot-path`` governs this file and wins: importing
+    ``connections.warm`` at module scope would pull its whole dependency graph -- the mint
+    table, the provider registry, tool aliases, MCP discovery -- onto the one ordered thread
+    between process start and the socket accepting requests. Startup scavenging is NOT an
+    ``on_startup`` hook for the same reason: aiohttp runs those inside ``runner.setup()``,
+    BEFORE the listener binds, so even a hook that only created the scavenge task put the
+    synchronous import in front of the bind. Both entrypoints instead call
+    ``_kick_connections_warm_scavenge`` strictly after ``_start_site`` returns.
+
+    The cleanup hook is registered here, before ``runner.setup()`` freezes aiohttp's signal
+    lists; it resolves the import only when a gateway is already stopping.
+    """
+
+    async def _connections_warm_shutdown(_app: web.Application) -> None:
+        try:
+            from kiro_crew.connections.warm import shutdown_warm_mint
+
+            await shutdown_warm_mint()
+        except Exception:  # noqa: BLE001 — one cleanup hook must not suppress later hooks
+            logger.warning("Connections warm shutdown failed", exc_info=True)
+
+    app.on_cleanup.append(_connections_warm_shutdown)
+
+
+def _kick_connections_warm_scavenge(state: DashboardState) -> None:
+    """Start the crash-residue scavenge as a tracked background task, post-bind.
+
+    Called by both gateway entrypoints only after ``_start_site`` has returned, so the
+    listener is already accepting requests. The deferred ``connections.warm`` import
+    happens INSIDE the worker thread: resolving that dependency graph on the event loop
+    would stall in-flight requests just as it would have stalled the bind.
+    """
+
+    def _scavenge_in_thread() -> None:
+        from kiro_crew.connections.warm import scavenge_warm_mint_artifacts
+
+        scavenge_warm_mint_artifacts()
+
+    async def _connections_warm_scavenge() -> None:
+        try:
+            await asyncio.to_thread(_scavenge_in_thread)
+        except Exception:  # noqa: BLE001 — fail closed by retaining unproved residue
+            logger.warning("Connections warm artifact scavenging failed", exc_info=True)
+
+    task = asyncio.create_task(_connections_warm_scavenge())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
+def _kick_session_search_index(state: DashboardState) -> None:
+    """Keep the session search candidate index caught up, post-bind.
+
+    Without this the index never gets built and search silently stays on the
+    scan path — correct, and as slow as it was (measured 6.7 s per keystroke on
+    a 2.96 GB corpus, against ~0.3 s indexed).
+
+    Shape, and why each part is what it is:
+
+    * post-bind and in a worker thread, like the warm scavenge — a first pass
+      over a large corpus reads and parses every session in the search window
+      (~70 s for 500 files here) and must never sit in front of the listener or
+      on the event loop;
+    * budgeted per pass rather than run to completion, so the first pass yields
+      the thread repeatedly instead of holding it for a minute;
+    * paced by a sleep between passes once caught up, because the only work then
+      is picking up sessions that changed since the last pass;
+    * ``optimize`` on a slow multiple of the pass, since FTS5 deletes leave
+      tombstones that every query pays for until segments merge.
+
+    A failure is logged and the loop continues: a missing row costs one scanned
+    file, so the honest response to an index that will not build is to keep
+    serving searches from the files.
+    """
+
+    #: Seconds of indexing work per pass, and the pause between passes once the
+    #: window is fully indexed. The pass budget is small enough that the thread
+    #: is returned promptly; the idle pause is what keeps a caught-up gateway
+    #: from re-stat'ing the window in a tight loop.
+    pass_budget_secs = 5.0
+    idle_pause_secs = 60.0
+    busy_pause_secs = 2.0
+    optimize_every_passes = 60
+
+    def _pass_in_thread() -> dict[str, int]:
+        log = state.conversation_log
+        if log is None:
+            return {"indexed": 0, "dropped": 0, "remaining": 0}
+        return log._catalog_projection.backfill_index(budget_secs=pass_budget_secs)
+
+    def _optimize_in_thread() -> None:
+        log = state.conversation_log
+        if log is not None:
+            log._catalog_projection.search_index.optimize()
+
+    async def _session_index_loop() -> None:
+        if state.conversation_log is None:
+            # No transcript store on this gateway: nothing to index, and the
+            # search path it would serve does not exist either.
+            return
+        passes = 0
+        while True:
+            try:
+                report = await asyncio.to_thread(_pass_in_thread)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — search must survive a bad index
+                logger.warning("Session search index pass failed", exc_info=True)
+                await asyncio.sleep(idle_pause_secs)
+                continue
+            passes += 1
+            if passes % optimize_every_passes == 0:
+                try:
+                    await asyncio.to_thread(_optimize_in_thread)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    logger.warning("Session search index optimize failed", exc_info=True)
+            # More to do means come straight back; caught up means idle until
+            # something changes on disk.
+            await asyncio.sleep(busy_pause_secs if report["remaining"] else idle_pause_secs)
+
+    task = asyncio.create_task(_session_index_loop())
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
 
@@ -3194,7 +3619,7 @@ async def start_dashboard(
     await asyncio.to_thread(state.load_chat_pins)
     # Off-loop: load_tags runs a synchronous save_tags() during load (status
     # back-fill / seed) which fsyncs on the event loop; a large tags.json —
-    # including preserved-but-malformed rows (#5792) — must not stall startup.
+    # including preserved-but-malformed rows — must not stall startup.
     await asyncio.to_thread(state.load_tags)
     app["port"] = port
     app["dashboard_url"] = dashboard_url
@@ -3375,16 +3800,51 @@ async def start_dashboard(
 
         await init_dev_mode_watcher(state.broadcast_ws)
 
+        # App hook reconciler: the CLI (`kirocrew app enable/disable/install/
+        # uninstall`) mutates apps on disk in a DIFFERENT process and never
+        # notifies this gateway, so without reconciliation a CLI reinstall leaves
+        # the old backend.hooks module live, its on_startup task running, and its
+        # .app_secret stale. This poll reloads changed hooks in-process — the same
+        # "CLI writes disk, gateway reconciles" contract already used for crons
+        # and UI files. Started AFTER on_gateway_startup so the boot pass has
+        # already recorded its loaded-hook signatures in the shared registry and
+        # the reconciler's first tick sees no drift. Synchronous + IO-free, so it
+        # adds nothing before the dashboard socket binds.
+        init_hook_reconciler(
+            cron_service=state.crons,
+            broadcast_fn=_app_event_broadcast,
+            spawn_impl=_app_spawn,
+        )
+
     app.on_startup.append(_hooks_startup)
 
     async def _hooks_shutdown(app_: web.Application) -> None:
-        await on_gateway_shutdown()
-        # Cancel the app dev-mode watcher started in _hooks_startup so an
-        # in-process gateway restart does not leak the module-global task (which
-        # holds a stale broadcast_ws targeting dead clients). Await cancellation.
+        # Stop the background pollers BEFORE the gateway hook shutdown sweep.
+        # The reconciler and the dev-mode watcher can each LOAD/START app hooks
+        # on a tick; if either is still live while on_gateway_shutdown() tears
+        # hooks down, a poll landing mid-sweep could re-import a module or spawn
+        # an on_startup task AFTER it was torn down, so that app's code would
+        # survive an in-process gateway restart. Cancelling them first also stops
+        # their module-global tasks from leaking stale gateway service handles /
+        # a stale broadcast_ws across the restart. Await cancellation so neither
+        # can fire one more tick during the sweep.
         from kiro_crew.apps.dev_mode import stop_dev_mode_watcher
 
-        await stop_dev_mode_watcher()
+        # on_gateway_shutdown() is the sweep that actually tears down app
+        # backends; it MUST run even if stopping a poller hangs (its bounded
+        # drain can burn its budget) or raises, otherwise a spawned app backend
+        # survives gateway exit. Stop the pollers first (preserving the
+        # no-tick-during-sweep ordering) but never let a stop failure abort the
+        # sweep: catch and log it, then always run on_gateway_shutdown.
+        try:
+            await stop_dev_mode_watcher()
+            await stop_hook_reconciler()
+        except Exception:
+            logger.exception(
+                "Error stopping background pollers on shutdown; proceeding to the "
+                "gateway hook shutdown sweep so app backends are torn down"
+            )
+        await on_gateway_shutdown()
 
     app.on_cleanup.append(_hooks_shutdown)
 
@@ -3448,6 +3908,11 @@ async def start_dashboard(
         if hasattr(resp, "headers"):
             _apply_security_headers(resp, request.app, request.path, request)
         return resp  # type: ignore[return-value]
+
+    # The static handler's FileResponse decides 200-vs-404 only in prepare(),
+    # after the middleware above has already stamped immutable. This hook sees
+    # the final status and strips immutable from any /assets/ error.
+    _install_asset_cache_control_finalizer(app)
 
     # SPA fallback: serve index.html for client-side React Router paths.
     # Uses the same _is_spa_shell_request predicate as the auth middleware so
@@ -3519,6 +3984,7 @@ async def start_dashboard(
         _ts_cfg.trust_identity,
         tailnet_effective_allowed_logins(_cfg.degraded_sections, _ts_cfg.allowed_logins),
         _ts_cfg.pin_scope,
+        bind_refresh_chains=_ts_cfg.bind_refresh_chains,
         # An unreadable tailnet policy resolves allowed_logins to [] and so
         # trust_identity to False, which is "no login restriction". The values
         # alone cannot tell that from "never configured"; degraded_sections can.
@@ -3572,7 +4038,7 @@ async def start_dashboard(
     # localStorage (theme, zoom, layout, notifications, ...) is never split
     # across hostnames. localStorage keys on scheme://host:port, so reaching the
     # dashboard on "localhost" one time and "kirocrew.localhost" the next (e.g.
-    # `kirocrew token` historically printed localhost while the gateway
+    # `kirocrew token` printing localhost while the gateway
     # auto-opens kirocrew.localhost) lands the browser in a different, empty
     # bucket and all settings appear reset. The canonical host is resolved once
     # at startup (it is stable for the gateway's lifetime). Only top-level
@@ -3590,9 +4056,16 @@ async def start_dashboard(
     # I/O lands on the loop on the first auth op.
     await warm_auth_singletons()
 
+    # Warm the SecurityEventLog singleton off the loop before any handler or
+    # middleware can be its first touch, so a first ``log_api_access`` is a
+    # non-blocking enqueue on every path — call sites need no per-site
+    # ``asyncio.to_thread`` hop. Best-effort inside the helper: a
+    # failed warm never blocks readiness.
+    await warm_sel_singleton()
+
     # Explicit middleware ordering — self-documenting and immune to future insertions
     app.middlewares[:] = [
-        # Outermost: privacy-safe per-route latency (rec #1). Times the FULL
+        # Outermost: privacy-safe per-route latency. Times the FULL
         # in-gateway handling (all middleware + handler). Labels are limited to
         # method / bounded route_template / status_class — never a real path,
         # query, id, or body — so it cannot leak content or explode cardinality.
@@ -3694,6 +4167,7 @@ async def start_dashboard(
     # ``_register_instances_hooks`` for why ordering matters.
     _register_instances_hooks(app, state, port)
     _register_browser_view_cleanup(app)
+    _register_connections_warm_lifecycle(app, state)
 
     # Unix-socket cleanup hook — registered before runner.setup freezes the
     # signal lists; the path itself only becomes known after the site starts
@@ -3734,6 +4208,14 @@ async def start_dashboard(
     except OSError:
         await runner.cleanup()
         raise
+
+    # Listener is bound and credentials are published — now kick the warm
+    # crash-residue scavenge. Deliberately NOT an on_startup hook: those run
+    # inside runner.setup(), before the bind, and the scavenge's deferred
+    # import must never sit in front of the listener
+    # (no-new-work-on-gateway-boot-path).
+    _kick_connections_warm_scavenge(state)
+    _kick_session_search_index(state)
 
     # Event-loop heartbeat: proves the asyncio loop is live (the off-loop /proc
     # sampler can't — it runs in a subprocess). Sleeps 10s, then logs actual
@@ -3868,6 +4350,16 @@ async def start_dashboard(
             # per dump — the dump is re-detected for up to 7 days on every
             # start, so notifying unconditionally would alert every restart.
             if await asyncio.to_thread(claim_dump_notification, _prior_dump):
+                # Say who the loop was working for, from the same evidence the
+                # doctor reads, so the person restarting knows which job to look
+                # at without opening the dump.
+                try:
+                    _attr_lines = describe(
+                        await asyncio.to_thread(attribute_dump, _prior_dump, data_home())
+                    )
+                except Exception:
+                    logger.debug("stall attribution for notification failed", exc_info=True)
+                    _attr_lines = []
                 try:
                     state.notify(
                         "heartbeat",
@@ -3875,8 +4367,9 @@ async def start_dashboard(
                         (
                             f"The previous gateway stopped responding and exited "
                             f"{_age_h:.1f}h ago, then restarted. Work in flight at "
-                            f"that moment was interrupted and not saved. Thread "
-                            f"stacks: {_prior_dump}"
+                            f"that moment was interrupted and not saved. "
+                            + ("".join(f"{ln}. " for ln in _attr_lines))
+                            + f"Thread stacks: {_prior_dump}"
                         ),
                         meta={"url": "/settings", "dump": str(_prior_dump)},
                     )
@@ -3890,7 +4383,7 @@ async def start_dashboard(
     asyncio.create_task(handlers._bg_mcp_probe())
 
     # Refresh config.json's meta stamp when an upgrade left it naming the
-    # previous build (#3102). Post-bind and fire-and-forget (never awaited on
+    # previous build. Post-bind and fire-and-forget (never awaited on
     # the boot path), and the file I/O runs in a thread so the version check —
     # one small fixed-path file, O(1), rewrite only on mismatch — never holds
     # the event loop. Two locks cover both writer generations: the refresh
@@ -3956,65 +4449,40 @@ async def start_dashboard(
     # NOTE: Even with restore_sessions=false, foldered and pinned sessions are restored
     # so the Explorer tree stays populated.  Users can unpin or remove from folder to dismiss.
     cfg = KiroCrewConfig.load()
-    _apply_startup_yolo(state, cfg)
+    # Offloaded: this PR gave arming a fail-closed ``approval_modes`` gate, so
+    # ``grant_declared_yolo`` now resolves governance -- an ``iterdir`` + per-file
+    # ``stat`` walk of the profiles dir. We are inside ``async def start_dashboard``,
+    # so running it inline stalls the gateway's loop, and on slow storage it stalls
+    # the heartbeat with it.
+    await asyncio.to_thread(_apply_startup_yolo, state, cfg)
 
     # Wire safety override expiry notifications
-    async def _notify_slack_override_expired() -> None:
-        """Post override expiry notice to Slack owner DM."""
-        await _dm_owner(
-            state,
-            "\U0001f512 Safety override expired. Tools now require approval. Reply `/kirocrew yolo` to re-authorize.",
-        )
-
     def _on_override_expired(source: str) -> None:
-        """Notify all interfaces when safety override expires."""
+        """Notify all interfaces when safety override expires.
+
+        Runs the inherited-trust teardown first so a TTL lapse -- which reaches this
+        directly, with no separate synchronous call -- still clears everything. A
+        policy revocation has already run it inline by the time this fires, and it is
+        idempotent, so the two paths need no branch between them.
+        """
+        _clear_override_derived_trust(state, source)
         state.broadcast_ws("yolo_expired", {"source": source})
         state.push_slots_update()
-        # Slots carrying STANDING trust keep their policy: that is a separate,
-        # longer-lived decision than the expiring override, and it is also what must
-        # survive the channel-trust revoke below.
-        standing_trust: set[str] = set()
-        if state.sessions is not None:
-            from kiro_crew.dashboard.chat_utils import effective_session_key
-
-            for slot in state._slots.values():
-                if slot._trust or slot._trust_reads:
-                    # Excluded from the channel-trust revoke below, via the SAME
-                    # derivation the reset uses: a channel-born slot's turns run on
-                    # the channel's own session key, so a `dashboard:<slot>` spelling
-                    # names a key nothing on that path reads.
-                    standing_trust.add(effective_session_key(slot))
-                else:
-                    # The SAME derivation the grant used. A channel-born slot's
-                    # turns run on the channel's own session key, which is what
-                    # `linked_session_key` holds, so clearing `dashboard:<slot>`
-                    # here cleared a key nothing on the channel path ever reads:
-                    # the TTL could not expire the grant it had handed out, which
-                    # is worse than a missing off-switch because the operator was
-                    # told it was time-bounded.
-                    state.sessions.set_approval_policy(effective_session_key(slot), "")
-        # Slack cleanup — isolated so failures don't block dashboard operations
-        try:
-            # From `messaging`, not `slack.handler`: the grant is channel-neutral.
-            # This revokes the approval_policy half as well as the mapping, which is
-            # what a CHANNEL session needs -- the loop just above resets only the
-            # dashboard's own slots, and a subagent reads the policy rather than the
-            # mapping, so policy left at "auto" outlives the override it belonged to.
-            # ``keep_policy`` is what stops this from undoing the preservation above:
-            # a Trust press can file a ``dashboard:`` key in the shared grant, and
-            # resetting its policy here would revoke standing trust nobody expired.
-            from kiro_crew.messaging.session_trust import clear_trusted_sessions
-
-            clear_trusted_sessions(keep_policy=standing_trust)
-        except Exception:
-            logger.debug("Could not clear trusted sessions", exc_info=True)
         # Slack notification (prevent GC with background_tasks set)
-        _dispatch_override_expiry_notification(state, _notify_slack_override_expired)
+        _dispatch_override_expiry_notification(
+            state, functools.partial(_notify_slack_override_expired, state), source
+        )
         # An expiry that lands on an unattended run is the one case that cannot
         # self-report: nobody is present to answer the prompts it produces.
         _notify_unattended_expiry(state, source)
 
     safety_override().on_expired = _on_override_expired
+    # The synchronous half, for the one caller that cannot wait for the loop: a
+    # ceiling install that denies ``yolo`` revokes from whatever thread installed it.
+    safety_override().on_policy_revoked = functools.partial(_clear_override_derived_trust, state)
+    # The pre-publication half: suspend inherited slot trust while a new ceiling is
+    # being resolved, and get it back if the ceiling still permits.
+    safety_override().on_policy_suspend = functools.partial(_suspend_override_derived_trust, state)
 
     # A grant that was live when the process went down is GONE -- grants are
     # in-memory by design and this does not change that. What it changes is that
@@ -4062,15 +4530,15 @@ async def start_dashboard(
     #
     # Both restores run inside suspend_slots_push() so the per-slot broadcasts
     # coalesce into one at the end: get_or_create_slot() pushes the whole slot list
-    # on every call, which made bulk restore O(N²) in serialization work for
+    # on every call, which makes bulk restore O(N²) in serialization work for
     # intermediate states no client renders. Reseeding happens inside the block too
     # — it must complete before the single broadcast so clients never see slots
     # under a counter that could still re-mint a colliding index.
-    # Converge any leftover copy transcripts BEFORE the restores read them. A
-    # channel conversation used to get a second transcript under a derived
-    # dashboard key; on an install carrying one, its dashboard-authored turns
-    # exist nowhere else, so they must be merged into the channel transcript
-    # before a slot is built from it. Idempotent, so it is a cheap no-op on
+    # Converge any leftover copy transcripts BEFORE the restores read them. On an
+    # install carrying a second transcript for a channel conversation under a
+    # derived dashboard key, its dashboard-authored turns exist nowhere else, so
+    # they must be merged into the channel transcript before a slot is built
+    # from it. Idempotent, so it is a cheap no-op on
     # every subsequent boot. Off-loop: it takes the per-session cross-process
     # flock, which must never block the event loop.
     try:
@@ -4293,7 +4761,7 @@ async def start_api_server(
     await asyncio.to_thread(state.load_chat_pins)
     # Off-loop: load_tags runs a synchronous save_tags() during load (status
     # back-fill / seed) which fsyncs on the event loop; a large tags.json —
-    # including preserved-but-malformed rows (#5792) — must not stall startup.
+    # including preserved-but-malformed rows — must not stall startup.
     await asyncio.to_thread(state.load_tags)
     app["port"] = port
 
@@ -4312,6 +4780,7 @@ async def start_api_server(
         _ts_cfg.trust_identity,
         tailnet_effective_allowed_logins(_cfg.degraded_sections, _ts_cfg.allowed_logins),
         _ts_cfg.pin_scope,
+        bind_refresh_chains=_ts_cfg.bind_refresh_chains,
         identity_unknown=tailnet_identity_unknown(_cfg.degraded_sections),
         unreadable_files=tuple(degraded_config_files(_cfg.degraded_sections)),
     )
@@ -4406,6 +4875,11 @@ async def start_api_server(
     # (parity with start_dashboard) so no blocking key-file I/O hits the loop.
     await warm_auth_singletons()
 
+    # Warm the SecurityEventLog singleton off the loop (parity with
+    # start_dashboard) so the first audit on this entrypoint is also a
+    # non-blocking enqueue, never an on-loop ``_init_locked``.
+    await warm_sel_singleton()
+
     # Explicit ordering mirrors start_dashboard: latency → deny-audit → host →
     # csrf → token → audit.
     app.middlewares[:] = [
@@ -4470,6 +4944,7 @@ async def start_api_server(
     # is what makes headless --slack-only keep the host awake during a long
     # Slack task, identically to the full dashboard.
     _register_prevent_sleep_shutdown(app, state)
+    _register_connections_warm_lifecycle(app, state)
 
     # Unix-socket cleanup hook — same holder pattern as start_dashboard,
     # registered before runner.setup freezes the signal lists.
@@ -4514,6 +4989,12 @@ async def start_api_server(
     except OSError:
         await runner.cleanup()
         raise
+
+    # Listener is bound — kick the warm crash-residue scavenge (parity with
+    # start_dashboard: never an on_startup hook, which would run the deferred
+    # import before the bind).
+    _kick_connections_warm_scavenge(state)
+    _kick_session_search_index(state)
 
     logger.info("API-only server listening on %s:%d", bind_addr, port)
 

@@ -26,7 +26,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import source_corpus
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_host_service_guard")
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _ROOT_CONFTEST = _REPO_ROOT / "conftest.py"
 _SRC = _REPO_ROOT / "src" / "kiro_crew"
@@ -133,14 +139,19 @@ def _service_tools_referenced_in_src() -> dict[str, tuple[str, ...]]:
     needing to model every call shape -- the codebase spawns through several
     wrappers (``_run_cmd``, ``_systemctl``, ``sandboxed_spawn_argv``), so a scan
     anchored on stdlib call sites alone would miss most of them.
+
+    No single literal narrows this gate (any vocabulary word could appear
+    without any other), so it walks the whole tree via
+    ``source_corpus.parsed_candidates()`` -- one shared read of the source text
+    and one parse per module, instead of this file re-reading and re-parsing
+    ``src/`` on its own. The RESULT (file:line strings) is tiny and safe to
+    keep memoized for the rest of this module; the corpus's own ~160 MB text
+    cache is what ``test/conftest.py``'s module-scoped
+    ``_release_source_corpus_after_module`` drops at teardown.
     """
     found: dict[str, list[str]] = {}
-    for path in sorted(_SRC.rglob("*.py")):
+    for path, _text, tree in source_corpus.parsed_candidates():
         if "_vendor" in path.parts:
-            continue
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):
             continue
         skip = _docstring_nodes(tree)
         for node in ast.walk(tree):

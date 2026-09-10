@@ -6,9 +6,12 @@ import { useNavigate } from 'react-router-dom'
 import { RefreshCw, Ellipsis, ChevronRight, Columns2, Hash, WrapText, FoldVertical, Maximize2, Minimize2, MessageSquare, MessageSquarePlus, Copy, BookOpen, BookmarkPlus, Camera, Check, X, Component, FileText, FileDiff, Folders, TriangleAlert, CaseSensitive, ChevronUp, ChevronDown } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import DetailPanel from './DetailPanel'
+import ErrorNotice from './ErrorNotice'
+import { errMessage } from '../utils/thunkError'
 import Clickable from './Clickable'
 import { CommentPopover, CommentList, formatCommentsMessage, type InlineComment } from './CommentOverlay'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
+import { useFileMenuItems, visibleFileMenuItems, invokeFileMenuItem, FileMenuItemIcon, FileMenuItemLabel } from '../apps/fileMenuContributions'
 import SelectionToolbar, { type SelectionAction } from './SelectionToolbar'
 import MarkdownOutlineRail from './MarkdownToc'
 import { useFileWatch } from '../hooks/useFileWatch'
@@ -77,6 +80,77 @@ export function breadcrumbSegments(filePath: string): BreadcrumbSegment[] {
     const joined = allSegs.slice(0, absIndex + 1).join('/')
     return { seg, path: isAbs ? '/' + joined : joined, isFile: absIndex === allSegs.length - 1 }
   })
+}
+
+/**
+ * The file-viewer header's path display. Only the last three segments are shown
+ * (see breadcrumbSegments), so the full path lives in the hover affordance.
+ *
+ * Three routes to the full path, one per user:
+ * - `title` shows it on POINTER hover.
+ * - `role="group"` + `aria-label={filePath}` name the focused element with the
+ *   full path, so a SCREEN READER announces it on focus.
+ * - a small readout below the breadcrumb, shown only while it has keyboard
+ *   focus, prints the full path for a SIGHTED KEYBOARD-only user, who hears no
+ *   aria-label and to whom a native `title` does not open on focus.
+ *
+ * `tabIndex={0}` is what puts the element in the tab order in the first place.
+ * The label and the readout both ARE the path (runtime data), so no localized
+ * string is added. Right-click still opens the FilePathMenu.
+ *
+ * Exported so the accessibility contract is unit-testable without mounting the
+ * whole panel (which drags in the Pierre editor tree).
+ */
+export function FileHeaderBreadcrumb({ filePath }: { filePath: string }) {
+  const crumbs = breadcrumbSegments(filePath)
+  const [focused, setFocused] = useState(false)
+  return (
+    // Content-sized (NOT flex-1), so the header keeps its original order:
+    // breadcrumb, then the diff-stats badge beside the filename, then the
+    // spacer, then the actions. The focus readout below is anchored to the
+    // header BAR (its relative ancestor), not to this row, so its width is the
+    // panel's, not the compressed breadcrumb's -- see the readout comment.
+    <>
+      <FilePathMenu filePath={filePath}>
+        {/* Focusable so a keyboard user can read the full path: a screen reader
+            from the accessible name, a sighted keyboard user from the readout
+            below. Same focusable-region pattern as CodeBlock / FileRenderers. */}
+        {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
+        <div
+          className="flex items-center min-w-0 outline-none focus-visible:ring-1 focus-visible:ring-accent rounded-sm"
+          title={filePath}
+          role="group"
+          aria-label={filePath}
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+          tabIndex={0}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+        >
+          {crumbs.map((c, i) => (
+            <span key={i} className="flex items-center min-w-0 text-[12px]">
+              {i > 0 && <ChevronRight size={14} className="text-muted opacity-60 shrink-0 mx-0.5" />}
+              <span className={`truncate ${c.isFile ? 'text-text-strong font-medium' : 'text-muted'}`}>{c.seg}</span>
+            </span>
+          ))}
+        </div>
+      </FilePathMenu>
+      {focused && (
+        // The visible half of the keyboard route: the full path on screen for a
+        // sighted keyboard user. aria-hidden because the group's aria-label
+        // already carries it, so a screen reader would otherwise hear it twice.
+        // Anchored left-3 right-3 to the header BAR (its relative ancestor, with
+        // matching px-3), so its right edge is the panel's inner edge: the path
+        // wraps (break-all) inside the panel and the box grows downward, never
+        // past the edge, at any panel width -- and the header's own layout
+        // (diff badge included) is left exactly as it was.
+        <span
+          aria-hidden="true"
+          data-testid="file-header-full-path"
+          className="absolute left-3 right-3 top-full mt-1 z-10 px-2 py-1 rounded-md border border-border bg-bg-elevated text-[11px] font-mono text-text-strong break-all shadow-sm"
+        >{filePath}</span>
+      )}
+    </>
+  )
 }
 
 export function findCoords(content: string, selected: string): { line: number; column: number } | undefined {
@@ -182,6 +256,11 @@ interface Props {
    *  re-read their file once so an earlier preview snapshot cannot linger. */
   isTabActive?: boolean
   onSubmitComments?: (message: string) => void
+  /** Gateway connection flag. Gates the batch comment submit (mirrors
+   *  ChatInput's Send gating) so pending comments can't be composed and
+   *  cleared while the chat send path would silently refuse the message.
+   *  Defaults true for embeddings without a chat send path. */
+  connected?: boolean
   onRefresh?: (filePath: string) => Promise<void>
   reserveWidth?: number
   /** Restored file-tab preference. Undefined allows the initial modified-file
@@ -261,11 +340,15 @@ function CommentHint({ onDismiss }: { onDismiss: () => void }) {
 
 const HINT_KEY = 'kirocrew:comment-hint-dismissed'
 
-async function downloadFile(filePath: string) {
+/** Report a failure to the panel, which renders it through the shared
+ *  ErrorNotice (replacing the blocking `alert()` these paths used to raise). */
+type ReportError = (message: string) => void
+
+async function downloadFile(filePath: string, onError: ReportError) {
   try {
     const res = await fetch(fileDownloadUrl(filePath))
     // eslint-disable-next-line no-console -- surface download failures for diagnostics
-    if (!res.ok) { console.error('downloadFile failed', res.status, res.statusText); alert(i18nT('components.markdownPanel.download_failed')); return }
+    if (!res.ok) { console.error('downloadFile failed', res.status, res.statusText); onError(i18nT('components.markdownPanel.download_failed')); return }
     const blob = await res.blob()
     const a = document.createElement('a')
     const url = URL.createObjectURL(blob)
@@ -276,7 +359,7 @@ async function downloadFile(filePath: string) {
     document.body.removeChild(a)
     setTimeout(() => URL.revokeObjectURL(url), 2_000)
     // eslint-disable-next-line no-console -- surface download failures for diagnostics
-  } catch (err) { console.error('downloadFile failed', err); alert(i18nT('components.markdownPanel.download_failed')) }
+  } catch (err) { console.error('downloadFile failed', err); onError(i18nT('components.markdownPanel.download_failed')) }
 }
 
 /**
@@ -384,10 +467,19 @@ function KnowledgeToggleIconButton({ state }: { state: ReturnType<typeof useFile
  * moved it was a keypress, so arrow-key navigation keeps its indicator while a
  * mouse click paints nothing.
  */
-const menuRowCls = 'flex items-center gap-2 w-full px-3 py-1.5 text-[13px] text-text cursor-pointer border-none bg-transparent text-left whitespace-nowrap hover:bg-bg-hover focus-visible:bg-bg-hover focus:outline-none'
+// `min-w-0 overflow-hidden`: the menu is capped in width (see the container below), and
+// a row's truncating children only shrink when the row itself may shrink past its
+// content. Without it a long app-contributed label sets the row's width and spills past
+// the cap instead of being clipped by it.
+const menuRowCls = 'flex items-center gap-2 w-full min-w-0 overflow-hidden px-3 py-1.5 text-[13px] text-text cursor-pointer border-none bg-transparent text-left whitespace-nowrap hover:bg-bg-hover focus-visible:bg-bg-hover focus:outline-none'
 
-export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, refreshTitle, onFullscreen, fullscreen, onSnapshot, snapshotting, wordWrap, onToggleWordWrap, lineNums, onToggleLineNums, collapseUnchanged, onToggleCollapseUnchanged, diffSplit, onToggleDiffSplit }: {
+export function OverflowMenu({ filePath, content, onError, onRefresh, refreshDisabled, refreshTitle, onFullscreen, fullscreen, onSnapshot, snapshotting, wordWrap, onToggleWordWrap, lineNums, onToggleLineNums, collapseUnchanged, onToggleCollapseUnchanged, diffSplit, onToggleDiffSplit }: {
   filePath: string; content: string
+  /** Where a failed row action (add to knowledge, promote, snapshot, save,
+   *  download, open/reveal, an app-contributed row's dispatch) is reported: the
+   *  panel renders it through the shared ErrorNotice. The menu itself closes on
+   *  select, so it cannot host the notice. */
+  onError: ReportError
   /** View actions folded in from the old header row (side-panel revamp): the
    *  ⋯ menu is the single home for everything that isn't a mode toggle. */
   onRefresh?: () => void; refreshDisabled?: boolean; refreshTitle?: string
@@ -443,8 +535,10 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
   // Platform-aware reveal label from the shared owner (FilePathMenu) so this
   // overflow and FileViewer's overflow name the identical action identically.
   const revealLabel = useRevealLabel()
-  const knowledge = useFileKnowledgeState(filePath)
-  const artifact = useFileArtifactState(filePath, content)
+  const knowledge = useFileKnowledgeState(filePath, onError)
+  const artifact = useFileArtifactState(filePath, content, onError)
+  const contribItems = useFileMenuItems('file-overflow')
+  const contribRows = visibleFileMenuItems(contribItems, { path: filePath, kind: 'file' })
   const delayedClose = () => { closeTimerRef.current = setTimeout(() => setOpen(false), 800) }
   useEffect(() => () => { if (closeTimerRef.current) clearTimeout(closeTimerRef.current) }, [])
   // Reset the per-mutation success flags whenever the menu closes so the
@@ -474,7 +568,7 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
         <Ellipsis size={15} />
       </button>
       {open && (
-        <div ref={listRef} role="menu" tabIndex={-1} onKeyDown={onListKeyDown} className="absolute right-0 top-full mt-1 z-50 rounded-lg bg-bg-elevated border border-border shadow-lg py-1 min-w-[180px] w-max">
+        <div ref={listRef} role="menu" tabIndex={-1} onKeyDown={onListKeyDown} className="absolute right-0 top-full mt-1 z-50 rounded-lg bg-bg-elevated border border-border shadow-lg py-1 min-w-[180px] w-max max-w-[min(420px,calc(100vw-2rem))]">
           {onRefresh && (
             <button role="menuitem" data-option tabIndex={-1} className={`${menuRowCls} disabled:opacity-40`} disabled={refreshDisabled} title={refreshTitle} onClick={() => { onRefresh(); setOpen(false) }}>
               <RefreshCw size={14} className="lucide-inline" /> {i18nT('components.markdownPanel.refresh')}
@@ -559,12 +653,12 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
               drive Finder on the gateway, so it sees the fallbacks only. Same
               gates the shared FilePathMenu applies. */}
           {canOpen && (
-            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'open'); setOpen(false) }}>
+            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'open', { onError }); setOpen(false) }}>
               {i18nT('components.markdownPanel.open_with_default_app')}
             </button>
           )}
           {directLocal && (
-            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'reveal'); setOpen(false) }}>
+            <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void revealOrOpen(filePath, 'reveal', { onError }); setOpen(false) }}>
               {revealLabel}
             </button>
           )}
@@ -574,9 +668,34 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
           <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { copyToClipboard(content); setOpen(false) }}>
             {i18nT('components.markdownPanel.copy_content')}
           </button>
-          <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { downloadFile(filePath); setOpen(false) }}>
+          <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { void downloadFile(filePath, onError); setOpen(false) }}>
             {i18nT('components.markdownPanel.download')}
           </button>
+          {/* App-contributed rows (`contributes.fileMenuItems`, surface
+              'file-overflow'), LAST and in their own group: the core rows above are
+              a fixed vocabulary a reader learns, and splicing third-party rows into
+              the middle of it would move a familiar row whenever an app is
+              installed. Activation POSTs the file's PATH to the app's own endpoint;
+              core imports no app code. Filtered by the declaration's `when`
+              predicate, so the stock build (no declaring app) renders neither the
+              rows nor the separator. `data-option` is what makes each row navigable
+              to `useListboxKeyboard`. */}
+          {contribRows.length > 0 && <div className="h-px bg-border my-1 mx-2" />}
+          {contribRows.map(item => (
+            <button
+              key={`${item.app}:${item.id}`}
+              role="menuitem"
+              data-option
+              tabIndex={-1}
+              className={menuRowCls}
+              onClick={() => {
+                invokeFileMenuItem(item, { surface: 'file-overflow', path: filePath, kind: 'file' }, onError)
+                setOpen(false)
+              }}
+            >
+              <FileMenuItemIcon name={item.icon} /> <FileMenuItemLabel item={item} />
+            </button>
+          ))}
         </div>
       )}
     </div>
@@ -589,13 +708,15 @@ export function OverflowMenu({ filePath, content, onRefresh, refreshDisabled, re
  * inline row-2 buttons and the overflow ⋮ entry share a single fetch via
  * React Query's cache.
  */
-function useFileKnowledgeState(filePath: string) {
+function useFileKnowledgeState(filePath: string, onError: ReportError) {
   const queryClient = useQueryClient()
-  const { data } = useQuery({
+  const { data, error: queryError } = useQuery({
     queryKey: ['knowledge-config', filePath],
     queryFn: async () => {
       const r = await fetch('/api/knowledge/config')
-      if (!r.ok) return null
+      // A failed read used to resolve to `null`, which rendered as "not added"
+      // — a failure dressed as a state. Reject instead so the panel can say so.
+      if (!r.ok) throw new Error(i18nT('components.markdownPanel.knowledge_status_failed'))
       const cfg = await r.json()
       const sr = await fetch(`/api/knowledge/sources?uri=${encodeURIComponent(filePath)}`)
       const sources = sr.ok ? await sr.json() : []
@@ -622,9 +743,9 @@ function useFileKnowledgeState(filePath: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['knowledge-config', filePath] })
     },
-    onError: (err) => alert((err as Error).message),
+    onError: (err) => onError((err as Error).message),
   })
-  return { formats, alreadyAdded, add, adding, added, addResult, reset }
+  return { formats, alreadyAdded, add, adding, added, addResult, reset, queryError }
 }
 
 /**
@@ -632,9 +753,9 @@ function useFileKnowledgeState(filePath: string) {
  * adding/snapshotting mutations. `live_dirty` flows through so
  * the inline Snapshot button can gate visibility/enable correctly.
  */
-function useFileArtifactState(filePath: string, content: string) {
+function useFileArtifactState(filePath: string, content: string, onError: ReportError) {
   const queryClient = useQueryClient()
-  const { data } = useQuery({
+  const { data, error: queryError } = useQuery({
     queryKey: ['artifact-by-source-path', filePath],
     queryFn: async () => {
       const res = await api.artifacts({ source_path: filePath })
@@ -691,7 +812,7 @@ function useFileArtifactState(filePath: string, content: string) {
       queryClient.invalidateQueries({ queryKey: ['artifact-by-source-path', filePath] })
       queryClient.invalidateQueries({ queryKey: ['artifacts'] })
     },
-    onError: (err) => alert((err as Error).message),
+    onError: (err) => onError((err as Error).message),
   })
   const { mutate: snapshot, isPending: snapshotting, isSuccess: snapshotted } = useMutation({
     mutationFn: async () => {
@@ -704,7 +825,7 @@ function useFileArtifactState(filePath: string, content: string) {
       queryClient.invalidateQueries({ queryKey: ['artifact-versions', existing?.slug] })
       queryClient.invalidateQueries({ queryKey: ['artifact-events', existing?.slug] })
     },
-    onError: (err) => alert((err as Error).message),
+    onError: (err) => onError((err as Error).message),
   })
   const { mutate: toggleSave, isPending: toggling } = useMutation({
     mutationFn: async () => {
@@ -739,10 +860,10 @@ function useFileArtifactState(filePath: string, content: string) {
       queryClient.invalidateQueries({ queryKey: ['artifact-by-source-path', filePath] })
       queryClient.invalidateQueries({ queryKey: ['artifacts'] })
     },
-    onError: (err) => alert((err as Error).message),
+    onError: (err) => onError((err as Error).message),
   })
   const saved = !!existing?.pinned
-  return { existing, add, adding, added, resetAdd, snapshot, snapshotting, snapshotted, toggleSave, toggling, saved }
+  return { existing, add, adding, added, resetAdd, snapshot, snapshotting, snapshotted, toggleSave, toggling, saved, queryError }
 }
 
 /** Working-tree diff view (current buffer vs HEAD), Pierre-rendered.
@@ -803,10 +924,11 @@ function DiffViewBlock({ diffMode, fileName, originalContent, content, lineNums,
 }
 
 /** Shared comment overlay — popover + comment list */
-const CommentOverlayBlock = memo(function CommentOverlayBlock({ popover, addComment, setPopover, onSubmitComments, comments, editComment, removeComment, submitAllComments, containerRef, scrollRef }: {
+const CommentOverlayBlock = memo(function CommentOverlayBlock({ popover, addComment, setPopover, onSubmitComments, comments, editComment, removeComment, submitAllComments, containerRef, scrollRef, connected = true }: {
   popover: { x: number; y: number } | null; addComment: (text: string) => void; setPopover: (v: null) => void
-  onSubmitComments?: (message: string) => void; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; containerRef?: React.RefObject<HTMLElement | null>; scrollRef?: React.RefObject<HTMLElement | null>
+  onSubmitComments?: (message: string) => void; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; containerRef?: React.RefObject<HTMLElement | null>; scrollRef?: React.RefObject<HTMLElement | null>; connected?: boolean
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   return (
     <>
       {popover && (
@@ -814,7 +936,7 @@ const CommentOverlayBlock = memo(function CommentOverlayBlock({ popover, addComm
           onCancel={() => { setPopover(null); window.getSelection()?.removeAllRanges() }} />
       )}
       {onSubmitComments && (
-        <CommentList comments={comments} onEdit={editComment} onRemove={removeComment} onSubmitAll={submitAllComments} enableExtraPrompt />
+        <CommentList comments={comments} onEdit={editComment} onRemove={removeComment} onSubmitAll={submitAllComments} enableExtraPrompt connected={connected} />
       )}
     </>
   )
@@ -832,7 +954,7 @@ export interface MarkdownPanelHandle {
   requestNavigate: (nav: (stillClean: () => boolean) => void) => void
 }
 
-export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onSave, onClose, liveWatch, isTabActive = true, onSubmitComments, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle }: Props, ref) {
+export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onSave, onClose, liveWatch, isTabActive = true, onSubmitComments, connected = true, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle }: Props, ref) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ime = useImeGuard()
   const qc = useQueryClient()
@@ -891,6 +1013,15 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     if (savedBaseline != null) setDirty(content !== savedBaseline)
   }, [content, savedBaseline])
   const [saveError, setSaveError] = useState<string | null>(null)
+  // The outcome of the last row action (add to knowledge, promote, snapshot,
+  // save-as-artifact, download, open/reveal) that FAILED. These used to raise a
+  // blocking `alert()` from inside the mutation hooks; they now land here and
+  // render beside the save error through the shared ErrorNotice.
+  const [actionError, setActionError] = useState<string | null>(null)
+  // Scoped to the file it was raised for: a late rejection from the previous
+  // file's action must not render under the file now open.
+  useEffect(() => { setActionError(null) }, [filePath])
+  const reportActionError = useCallback<ReportError>((message) => setActionError(message), [])
   // Editor view preferences — persisted so they survive tab switches/reloads.
   const [lineNums, setLineNums] = usePersistedBool('mc-file-linenums', true)
   const [wordWrap, setWordWrap] = usePersistedBool('mc-file-wordwrap', true)
@@ -970,8 +1101,8 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // Artifact + knowledge state power the header star/knowledge toggles and
   // the ⋯ menu's Snapshot entry (same query cache as the OverflowMenu's own
   // hooks, so states stay coherent).
-  const knowledge = useFileKnowledgeState(filePath)
-  const artifactState = useFileArtifactState(filePath, content)
+  const knowledge = useFileKnowledgeState(filePath, reportActionError)
+  const artifactState = useFileArtifactState(filePath, content, reportActionError)
   const previewRef = useRef<HTMLDivElement>(null)
   const sidePanelScrollRef = useRef<HTMLDivElement>(null)
   const fullscreenPreviewRef = useRef<HTMLDivElement>(null)
@@ -1168,13 +1299,45 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
 
 
   // Detect if file has uncommitted changes and pre-fetch HEAD content
-  const { data: diffData, isFetching: diffChecking } = useQuery({
+  const { data: diffData, isFetching: diffChecking, error: diffQueryError } = useQuery({
     queryKey: ['file-diff', filePath],
     queryFn: () => api.fileDiff(filePath),
     enabled: !!filePath && !isRichType,
     staleTime: 10_000,
   })
   const originalContent = diffData?.original ?? ''
+  // Every failure the panel owns, rendered in ONE place (both layouts mount it
+  // under the header). The three background reads used to fail silently: a
+  // rejected knowledge / artifact / diff query rendered as "not added" / no
+  // artifact / no diff.
+  //
+  // askAgent decision: OFF while the editor buffer is dirty — the hand-off
+  // navigates away and would discard unsaved edits — ON otherwise (nothing to
+  // lose, and a failed gateway read or write is what the agent can diagnose).
+  // The save failure itself is always OFF: by definition the buffer holds the
+  // edits that were NOT persisted.
+  const panelNotices = (saveError || actionError || knowledge.queryError || artifactState.queryError || diffQueryError) ? (
+    <div className="flex flex-col gap-1.5">
+      {/* No hand-off: the editor buffer holds the unsaved edits this save failed to write. */}
+      <ErrorNotice message={saveError} onDismiss={() => setSaveError(null)} testId="markdown-panel-save-error" />
+      <ErrorNotice message={actionError} askAgent={!dirty} onDismiss={() => setActionError(null)} testId="markdown-panel-action-error" />
+      <ErrorNotice
+        message={knowledge.queryError ? (errMessage(knowledge.queryError) || i18nT('components.markdownPanel.knowledge_status_failed')) : null}
+        askAgent={!dirty}
+        testId="markdown-panel-knowledge-error"
+      />
+      <ErrorNotice
+        message={artifactState.queryError ? (errMessage(artifactState.queryError) || i18nT('components.markdownPanel.artifact_status_failed')) : null}
+        askAgent={!dirty}
+        testId="markdown-panel-artifact-error"
+      />
+      <ErrorNotice
+        message={diffQueryError ? (errMessage(diffQueryError) || i18nT('components.markdownPanel.diff_status_failed')) : null}
+        askAgent={!dirty}
+        testId="markdown-panel-diff-error"
+      />
+    </div>
+  ) : null
   // The backend reports WHY there is nothing to diff against. `not_git` means
   // the file is outside any git work tree, so there is no baseline at all —
   // rendering the diff would present the whole file as added against a
@@ -1340,11 +1503,18 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     setComments(prev => prev.map(c => c.id === id ? { ...c, text } : c))
   }, [])
 
+  /**
+   * Compose + hand off the pending comment batch, then clear it. Bails while
+   * the gateway is offline: the downstream send path silently refuses
+   * messages in that state, so clearing here would destroy the user's
+   * comments with no error. The Submit All button is disabled offline too —
+   * this is the behavioral backstop.
+   */
   const submitAllComments = useCallback((extraPrompt?: string) => {
-    if (!onSubmitComments || comments.length === 0) return
+    if (!connected || !onSubmitComments || comments.length === 0) return
     onSubmitComments(formatCommentsMessage(filePath, comments, displayContent, extraPrompt))
     setComments([])
-  }, [onSubmitComments, comments, filePath, displayContent])
+  }, [connected, onSubmitComments, comments, filePath, displayContent])
 
   const dismissHint = useCallback(() => {
     setHintDismissed(true)
@@ -1654,8 +1824,6 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     )}
   </>)
 
-  // Breadcrumb: last two directories + filename (full path in tooltip/copy).
-  const crumbs = breadcrumbSegments(filePath)
   // Diff-mode +N/-N stats over the same original/modified pair the diff view shows.
   const diffStats = useMemo(() => countLines(originalContent, content), [originalContent, content])
   // Snapshot (⋯ menu): capture current content as a new artifact version;
@@ -1685,18 +1853,9 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
            height auto) with the editor options and Save / Cancel so the
            main bar never crowds. */
         <div className="shrink-0 border-b border-border">
-          <div className="flex items-center gap-2 h-[38px] px-3">
+          <div className="relative flex items-center gap-2 h-[38px] px-3">
             <FileText size={14} className="text-muted shrink-0" />
-            <FilePathMenu filePath={filePath}>
-            <span className="flex items-center min-w-0" title={filePath}>
-              {crumbs.map((c, i) => (
-                <span key={i} className="flex items-center min-w-0 text-[12px]">
-                  {i > 0 && <ChevronRight size={14} className="text-muted opacity-60 shrink-0 mx-0.5" />}
-                  <span className={`truncate ${c.isFile ? 'text-text-strong font-medium' : 'text-muted'}`}>{c.seg}</span>
-                </span>
-              ))}
-            </span>
-            </FilePathMenu>
+            <FileHeaderBreadcrumb filePath={filePath} />
             {diffMode && !diffUnavailable && (diffStats.added > 0 || diffStats.removed > 0) && (
               <span className="text-[11px] font-mono font-semibold shrink-0">
                 {diffStats.added > 0 && <span className="text-ok">+{diffStats.added}</span>}
@@ -1730,7 +1889,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
                 aria-pressed={!!railOpen}
               ><Folders size={14} /></button>
             )}
-            <OverflowMenu filePath={filePath} content={content}
+            <OverflowMenu filePath={filePath} content={content} onError={reportActionError}
               onRefresh={handleRefresh} refreshDisabled={refreshing || dirty} refreshTitle={dirty ? i18nT('components.markdownPanel.save_or_discard_changes_first') : i18nT('components.markdownPanel.refresh_file_re_read_from_disk')}
               onFullscreen={() => setFullscreen(f => !f)} fullscreen={fullscreen}
               onSnapshot={artifactState.existing ? handleSnapshot : undefined} snapshotting={artifactState.snapshotting}
@@ -1743,7 +1902,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
         </div>
       }
     >
-      {saveError && <div className="text-[11px] text-danger">{saveError}</div>}
+      {panelNotices}
       {/* Comment hint for markdown files */}
       {isMarkdown && !editing && onSubmitComments && !hintDismissed && (
         <CommentHint onDismiss={dismissHint} />
@@ -1798,7 +1957,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
         )}
       </div>
       {!fullscreen && !editing && <SelectionToolbar containerRef={sidePanelScrollRef} actions={selectionActions} />}
-      {!fullscreen && <CommentOverlayBlock popover={popover} addComment={addComment} setPopover={clearPopover} onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} />}
+      {!fullscreen && <CommentOverlayBlock popover={popover} addComment={addComment} setPopover={clearPopover} onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} />}
     </DetailPanel>
     {fullscreen && createPortal(
       // The onKeyDown here implements a focus trap for the modal dialog; a
@@ -1842,11 +2001,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
               return <KnowledgeToggleIconButton state={knowledge} />
             })()}
             {editorToolbarButtons}
-            <OverflowMenu filePath={filePath} content={content} />
+            <OverflowMenu filePath={filePath} content={content} onError={reportActionError} />
             <button className="p-1.5 rounded-md border border-border text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all" onClick={() => setFullscreen(false)} title={i18nT('components.markdownPanel.exit_full_screen_esc')} aria-label={i18nT('components.markdownPanel.exit_full_screen')}><Minimize2 size={14} /></button>
           </div>
         </div>
-        {saveError && <div className="px-16 text-[11px] text-danger">{saveError}</div>}
+        {panelNotices && <div className="px-16">{panelNotices}</div>}
         {isMarkdown && !editing && onSubmitComments && !hintDismissed && <div className="px-16"><CommentHint onDismiss={dismissHint} /></div>}
         {/* Body */}
         <div data-mc-mdpanel className="relative flex-1 overflow-hidden min-h-0">
@@ -1862,7 +2021,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           {isMarkdown && !editing && <MarkdownOutlineRail containerRef={fullscreenBodyRef} />}
         </div>
         {!editing && <SelectionToolbar containerRef={fullscreenBodyRef} actions={selectionActions} />}
-        <CommentOverlayBlock popover={popover} addComment={addComment} setPopover={clearPopover} onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} scrollRef={fullscreenBodyRef} />
+        <CommentOverlayBlock popover={popover} addComment={addComment} setPopover={clearPopover} onSubmitComments={onSubmitComments} comments={comments} editComment={editComment} removeComment={removeComment} submitAllComments={submitAllComments} connected={connected} scrollRef={fullscreenBodyRef} />
         {/* Footer */}
         <Clickable className="shrink-0 flex items-center px-3 h-6 text-[11px] text-muted font-mono truncate cursor-pointer hover:text-text transition-colors" title={i18nT('components.markdownPanel.click_to_copy_path')} onClick={() => copyToClipboard(filePath)}>{filePath}</Clickable>
       </div>,

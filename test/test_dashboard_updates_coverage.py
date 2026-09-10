@@ -587,7 +587,10 @@ class TestApplyRefusals:
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(plain))
         resp = await updates.api_update_apply(_request({}))
         assert resp.status == 409
-        assert "Not a git checkout" in json.loads(resp.body.decode())["error"]
+        error = json.loads(resp.body.decode())["error"]
+        assert "Not a git checkout" in error
+        assert "kirocrew update" in error
+        assert "cloud launch" not in error
 
     @pytest.mark.asyncio
     async def test_a_pinned_remote_is_refused_before_any_spinner_is_shown(
@@ -776,9 +779,15 @@ class TestLogLevel:
     @pytest.mark.asyncio
     async def test_applies_and_persists_a_valid_level_case_insensitively(self, monkeypatch):
         saved: list[str] = []
-        cfg = MagicMock()
-        cfg.save = lambda: saved.append(cfg.agent.log_level)
-        monkeypatch.setattr(updates.KiroCrewConfig, "load", staticmethod(lambda: cfg))
+
+        def _fake_update_config_locked(*args, **kwargs):
+            # The handler persists via a delta mutate through
+            # update_config_locked (#4767); record what it wrote.
+            doc = kwargs["mutate"]({})
+            saved.append(doc["agent"]["log_level"])
+            return doc
+
+        monkeypatch.setattr(updates, "update_config_locked", _fake_update_config_locked)
 
         resp = await updates.api_log_level(_request({"level": "warning"}))
 
@@ -796,9 +805,9 @@ class TestLogLevel:
         from blocking a debugging session.
         """
         monkeypatch.setattr(
-            updates.KiroCrewConfig,
-            "load",
-            staticmethod(MagicMock(side_effect=OSError("read-only fs"))),
+            updates,
+            "update_config_locked",
+            MagicMock(side_effect=OSError("read-only fs")),
         )
 
         resp = await updates.api_log_level(_request({"level": "DEBUG"}))
@@ -968,9 +977,7 @@ class TestRingLogHandler:
         state._ws_log_subscribers = {MagicMock()}
         handler._state = state
         state.serving_loop = MagicMock()
-        state.serving_loop.call_soon_threadsafe.side_effect = RuntimeError(
-            "event loop is closed"
-        )
+        state.serving_loop.call_soon_threadsafe.side_effect = RuntimeError("event loop is closed")
 
         handler.emit(_record("during shutdown"))
 
@@ -1044,8 +1051,7 @@ class TestLogsStream:
         # The queue handler is only installed AFTER the replay, so an abort here
         # must not leave one attached to the logger.
         assert not any(
-            isinstance(h, updates._QueueLogHandler)
-            for h in logging.getLogger("kiro_crew").handlers
+            isinstance(h, updates._QueueLogHandler) for h in logging.getLogger("kiro_crew").handlers
         )
 
     @pytest.mark.parametrize("raw", ["not-a-number", "", "1e5"])

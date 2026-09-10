@@ -55,7 +55,6 @@ src/kiro_crew/apps/route_registry.py 51.9   # 67/129
 # the `graduated` verdict -- an ::error:: demanding this line be deleted. So the
 # exemption cannot outlive the defect silently.
 src/kiro_crew/builtin_skills/pipeline-conductor/scripts/fleet_probe.py 14.8   # 34/229
-src/kiro_crew/channel.py 70.5   # 258/366
 src/kiro_crew/cli_chat.py 29.5   # 46/156
 src/kiro_crew/cli_cloud.py 61.2   # 178/291
 src/kiro_crew/cli_config.py 70.8   # 114/161
@@ -88,6 +87,5 @@ src/kiro_crew/slack/client.py 67.2   # 246/366
 src/kiro_crew/suggestions.py 18.7   # 31/166
 src/kiro_crew/telegram/client.py 61.8   # 306/495
 src/kiro_crew/telegram/gateway.py 15.5   # 11/71
-src/kiro_crew/tips.py 64.9   # 335/516
 src/kiro_crew/webex/client.py 64.1   # 173/270
 src/kiro_crew/weixin/gateway.py 20.4   # 11/54

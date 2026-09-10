@@ -13,7 +13,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.dev_fleet import npm_preflight, sync_runner
@@ -127,16 +127,29 @@ def _find_cli() -> list[str]:
 # overrides every config file) so EVERY git invocation from this handler —
 # foreground inspection, the unattended background fetch, rebase, sync pull,
 # and any git a build step runs — is neutralized at one chokepoint instead of
-# per-call-site flags. All four keys are attacker-configurable via an
+# per-call-site flags. The config keys are attacker-configurable via an
 # agent-writable ``.git/config`` and would otherwise execute code:
 #   * protocol pin  — ``ext::``/custom remote helpers refused by git itself
 #   * core.fsmonitor / core.hooksPath — repo-registered executables
 #   * credential.helper (reset to empty list) — helper commands
 #   * core.sshCommand (pinned to plain ``ssh``) — arbitrary command on fetch
+#
+# GIT_NO_REPLACE_OBJECTS is the odd one out: not a config key and not about code
+# execution, but about WHICH OBJECT GRAPH git answers from. A
+# ``refs/replace/<oid>`` ref substitutes one object for another in every read, so
+# ``log``, ``rev-list --count``, ``merge-base`` and ``merge --ff-only`` all answer
+# about the SUBSTITUTE graph — a history no checked-out commit names. Every git
+# answer this handler acts on is a statement about the checkout on disk, so the
+# real graph is the only one that answers the question asked. Grafting is a
+# legitimate local operation (``git replace``), so this is a correctness pin
+# first and a tamper pin second, and it is an env var rather than a config pair
+# so no config precedence applies to it at all. ``update_governance`` and
+# ``auto_improvement``'s clone setup already pin it for the same reason.
 # Harmless for non-git commands (pip/npm ignore GIT_*).
 _GIT_ENV_NEUTRALIZERS: dict[str, str] = {
     "GIT_ALLOW_PROTOCOL": "https:ssh",
     "GIT_PROTOCOL_FROM_USER": "0",
+    "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_CONFIG_COUNT": "4",
     "GIT_CONFIG_KEY_0": "core.fsmonitor",
     "GIT_CONFIG_VALUE_0": "false",
@@ -685,11 +698,18 @@ async def _start_run(
     cwd: str | None = None,
     env: dict | None = None,
     cleanup_paths: list[str] | None = None,
+    on_finish: Callable[[], None] | None = None,
 ) -> str:
     """Start a background subprocess with output streaming and watchdog.
 
     ``cleanup_paths``: sandbox launcher/profile temp files from
     ``sandboxed_spawn_argv`` — deleted when the run finishes.
+
+    ``on_finish``: invoked once when the run reaches ANY terminal state
+    (done, timeout, spawn failure, shutdown abort, cancellation) — a killed
+    run may still have mutated disk, so terminal means finished, not
+    succeeded. Must be a cheap synchronous callable; exceptions are logged
+    and never propagate into the worker's own cleanup.
     """
     rid = uuid.uuid4().hex[:12]
     # The run KIND, captured before the output loop can touch it. `label` is
@@ -893,6 +913,11 @@ async def _start_run(
                 _RUNS[rid]["exit_code"] = -1
                 _RUNS[rid]["output"].append("[error] " + str(exc))
         finally:
+            if on_finish is not None:
+                try:
+                    on_finish()
+                except Exception:  # noqa: BLE001
+                    logger.exception("run %s on_finish callback failed", rid)
             for cp in cleanup_paths or []:
                 # A caller may register a temp FILE, or a temp directory it
                 # created for one (the dependency-only sync stages a snapshot

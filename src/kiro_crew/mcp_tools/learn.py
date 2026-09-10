@@ -194,16 +194,77 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
     outcome = d.get("outcome")
     reason = d.get("reason")
     detail = f" ({reason})" if isinstance(reason, str) and reason else ""
+    # What this write DESTROYED, which no wording below could report before. The
+    # store's dedup rules delete a stored lesson when the submitted rule contains it
+    # or overlaps it heavily, and the route reported a plain success -- so teaching a
+    # narrower rule ("when a release is in progress, never force push...") retired
+    # the general one it contains ("never force push...") and the model was told the
+    # save succeeded. Deleting is the designed behaviour; not saying so was not.
+    #
+    # Filtered to strings from a list rather than trusted: this crosses HTTP, and an
+    # older or a hand-rolled gateway can send anything or nothing. Absent reads as
+    # "none reported", which is what every gateway said before this field existed.
+    raw_superseded = d.get("superseded")
+    dropped = (
+        [s for s in raw_superseded if isinstance(s, str) and s.strip()]
+        if isinstance(raw_superseded, list)
+        else []
+    )
+    lost = ""
+    if dropped:
+        # Named in full, not counted and not truncated to a preview: the point of
+        # this sentence is that the user can get the rule back, and a rule the model
+        # cannot read out is a rule nobody can restore -- the row is a tombstone, so
+        # this text is the last copy anything can reach.
+        shown = "".join(f"\n  - {s}" for s in dropped)
+        lost = (
+            f"\n\nWARNING -- saving this REMOVED {len(dropped)} stored "
+            f"lesson{'s' if len(dropped) != 1 else ''} whose wording this rule "
+            f"contains or overlaps:{shown}\n"
+            "Those are no longer in effect and will not appear in learn_list. Tell the "
+            "user which ones were dropped. A verbatim re-add is DECLINED while this "
+            "rule is stored, so restoring one exactly means removing this rule first; "
+            "wording that shares few significant words with it can coexist."
+        )
     if outcome == "refused":
         return (
             f"Lesson was NOT saved{scope_note}: the memory store refused this "
             f"value{detail}. Nothing was stored, so the correction is not in effect. "
             "Re-state it in plainer wording, or tell the user it could not be saved."
+            f"{lost}"
         )
     if outcome == "deduped":
+        # ``rule`` is the SUBMITTED text, not the stored lesson that claimed the
+        # write. The old wording put it directly after "an existing stored lesson
+        # already covers it", which reads as a quote OF that stored lesson -- so a
+        # caller believed it had been shown the winner. It had not, and it could
+        # not name what it lost to, leaving a blind ``learn_remove`` on a guessed
+        # substring as the only recovery. Say which text this is, and name the
+        # replace path for a submission that was meant to CORRECT a stale lesson.
+        if reason == "semantic_similarity":
+            # This reason means the stored near-duplicate OUTRANKS the write
+            # (the user's own lesson, or a higher-confidence imported one).
+            # Do NOT coach the remove-and-re-add path here: an automated
+            # caller following it would delete the row the store just
+            # protected and replace it with lower-authority guidance.
+            return (
+                f"Lesson was NOT saved{detail}: a near-identical lesson with "
+                f"higher authority (set by the user, or imported at higher "
+                f"confidence) already covers it, and that stored lesson stays "
+                f"in effect. The text below is what was DROPPED -- it is NOT the "
+                f"stored lesson: {rule}\n"
+                "Only the user can replace their own lesson; do not remove it on "
+                "their behalf."
+                f"{lost}"
+            )
         return (
-            f"Lesson was NOT saved as a new entry{detail}: an existing stored lesson "
-            f"already covers it, and that lesson stays in effect. Rule: {rule}"
+            f"Lesson was NOT saved{detail}. The text below is what was DROPPED -- it "
+            f"is NOT the stored lesson: {rule}\n"
+            "An existing stored lesson already covers it, and that existing lesson "
+            "stays in effect. If this was meant to correct or replace a stale lesson, "
+            "run learn_list to find the stored wording, learn_remove it, then add this "
+            "again -- otherwise the outdated lesson keeps applying."
+            f"{lost}"
         )
     if outcome == "unchanged":
         # No exact-match claim here, because ``unchanged`` does not mean the stored row
@@ -220,16 +281,23 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
                 f"Lesson was already stored{scope_note}, and it carries a NOT-clause "
                 f"this submission did not include -- the stored clause was kept, not "
                 f"removed. Nothing was written, and the lesson remains in effect: {rule}"
+                f"{lost}"
             )
         return (
             f"Lesson was already stored{scope_note} and nothing was written. A "
             f"re-submit does not rewrite the stored category or NOT-clause, so those "
             f"keep the values they already had -- changing one means removing the "
-            f"lesson and adding it again. It remains in effect: {rule}"
+            f"lesson and adding it again. It remains in effect: {rule}{lost}"
         )
     if outcome == "enriched":
-        return f"Updated the stored lesson{scope_note} with the new clause: {rule}"
-    return f"Saved lesson{scope_note}: {rule}"
+        return f"Updated the stored lesson{scope_note} with the new clause: {rule}{lost}"
+    # ``lost`` is interpolated on EVERY branch, including the two that cannot carry it
+    # (``unchanged`` and ``enriched`` are decided before the dedup scan runs, so they
+    # delete nothing). It renders to the empty string when nothing was superseded, so
+    # the uniform interpolation costs nothing and means no future outcome can drop the
+    # warning by being added to a branch that forgot it -- which is the mistake that
+    # made this field necessary in the first place.
+    return f"Saved lesson{scope_note}: {rule}{lost}"
 
 
 def learn_list(name: str, args: dict[str, Any]) -> str:

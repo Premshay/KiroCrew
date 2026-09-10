@@ -198,8 +198,8 @@ matter most:
   block (the latter re-acquires the lock itself, which is why reentrancy is
   required).
 - **Episodic search** (`_sqlite_vector_search`, the no-FAISS fallback): only the
-  row fetch is locked; the cosine/decay scoring loop then works on materialized
-  rows outside the lock.
+  row fetch — or the scoring-set build that replaces it — is locked; the
+  ranking then works on materialized data outside the lock.
 
 **The lock is never held across an embedding call.** An embed on a loaded model
 is serialized behind the embedder's own lock and costs tens of ms per short
@@ -235,15 +235,34 @@ Context injection: formatted as `key: value` pairs in `[Semantic Memory]` block.
 ### Episodic Memory
 
 SQLite table `episodic_memories` — conversation fragments with optional embeddings:
-- **Write**: text validation (10-2000 chars), **prompt-injection screening** (`_contains_injection`, same pattern set as the semantic-KV path), tag sanitization, importance clamping (0-1), FAISS dedup (cosine > 0.88). The dedup scan **skips tombstoned ("ghost") matches**: tombstone paths (merge, dashboard delete, cap eviction, stale retirement) set `is_deleted=1` but leave the vector in `_faiss_index`/`_faiss_id_map`, so a high-similarity hit may map to a deleted row. `_get_episodic()` filters `is_deleted=0` and returns `None` for those; the write loop `continue`s past a `None` match (mirroring `search_episodic`'s `if not mem or mem["is_deleted"]: continue`) instead of treating it as a conflict — otherwise a new memory matching a deleted one was silently rejected (data loss).
+- **Write**: text validation (10-2000 chars), **prompt-injection screening** (`_contains_injection`, same pattern set as the semantic-KV path), tag sanitization, importance clamping (0-1), FAISS dedup (cosine > `_DEFAULT_DEDUP_THRESHOLD` = 0.88, configurable via `memory.episodic_dedup_threshold` — the production stores (`slack/gateway.py`, `cli_server.py`, the dashboard's standalone fallback in `dashboard/handlers/memory.py`) pass it as `dedup_threshold`; deferred writers skip this check entirely so they have no threshold to honour, and `eval/bench/ingest.py` sweeps its own value). The dedup scan **skips tombstoned ("ghost") matches**: tombstone paths (merge, dashboard delete, cap eviction, stale retirement) set `is_deleted=1` but leave the vector in `_faiss_index`/`_faiss_id_map`, so a high-similarity hit may map to a deleted row. `_get_episodic()` filters `is_deleted=0` and returns `None` for those; the write loop `continue`s past a `None` match (mirroring `search_episodic`'s `if not mem or mem["is_deleted"]: continue`) instead of treating it as a conflict — otherwise a new memory matching a deleted one was silently rejected (data loss).
 - **Injection screening (XPIA defense-in-depth)**: episodic text is derived from conversation transcripts, so a poisoned turn could persist steering instructions that get re-injected into future contexts. `write_episodic()` runs `_contains_injection()` (before the embed call) and, on match, drops the entry and emits an auditable `injection_blocked` event with `memory_type='episodic'`. The stored audit snippet is scrubbed with `redact_exfiltration_urls()` + `redact_credentials()` first, since `/api/memory/events` surfaces it verbatim on the dashboard. This mirrors the semantic-KV screen at `validate_semantic()`. **Residual (accepted risk)**: this is a best-effort regex screen: a determined owner can still steer their own long-term memory with phrasing that evades the patterns; long-term memory poisoning is an accepted residual. The screen raises the bar against accidental/opportunistic XPIA persistence, not against a motivated self-owner.
 - **Search**: FAISS vector similarity with decay scoring: `cosine_sim × (0.7 + 0.3×importance) × exp(-rate×days_old)`, then MMR diversity reranking (Jaccard-based, `_MMR_LAMBDA` = 0.6). The decay rate is `_DEFAULT_DECAY_RATE` = 0.03/day, configurable per tag via `memory.decay_rates` (`_decay_rate_for`): keys are tags (case-insensitive, matching `_matches_tags`), the reserved `default` key replaces the built-in fallback, a multi-tag row uses the SLOWEST matching rate (smallest = maximum retention, so a broad tag can never age out a long-retention one), values are clamped to [0, 10] and non-numeric entries are dropped with a warning at store construction (`_sanitize_decay_rates`). Both vector rungs (FAISS and the stdlib fallback) resolve the rate through the same helper; the keyword rung does no decay scoring at all.
 - **MMR reranking**: Maximal Marginal Relevance balances relevance with diversity. Greedy iterative selection penalizes candidates similar to already-selected results. Prevents redundant episodic fragments from consuming the context budget. Configurable via `mmr=False` parameter to disable. The candidate pool is deliberately NOT truncated toward `limit` (that tail pick is the point of MMR); the only bound is the recall-safe `_MMR_MAX_POOL` = 1000 ceiling for pathological inputs.
 - **Relevance threshold**: `_EPISODIC_RELEVANCE_THRESHOLD` = 0.55 cosine required for context injection (empirically determined from a 100-query benchmark: 50 relevant + 50 irrelevant, F1=0.980), relaxed to `_EPISODIC_LONG_TEXT_THRESHOLD` = 0.42 for entries longer than `_EPISODIC_LONG_TEXT_CHARS` = 300 chars, because long texts dilute cosine scores. The threshold reads the RAW `cosine_sim`, not the decay-adjusted score, so age and importance affect ordering but never admission. Admission runs BEFORE the decay ranking, MMR, and the `limit` cut: `get_episodic_context()` calls `search_episodic(relevance_filter=True)`, which drops sub-threshold candidates first, so a highly relevant but old memory cannot be ordered past `limit` by a cluster of recent-but-irrelevant rows that the gate would then remove — a case that otherwise returned empty context while an exact match sat in the store. `search_episodic()` defaults to `relevance_filter=False` and returns the full ranked set for dashboard/API/CLI use. The keyword fallback is unaffected because those rows carry no `cosine_sim` key at all.
 - **Fallback ladder**: FAISS (needs faiss + numpy) → `_sqlite_vector_search`, stdlib cosine over the stored blobs → FTS5/LIKE keyword search (OR logic on text + tags) when there is no query embedding at all. The middle rung matters: faiss is an optional accelerator, not a declared dependency, so a stock install still gets vector recall from the stored vectors.
+- **Resident scoring set (the middle rung, with numpy)**: scoring reads only the embedding, `tags`, `importance`, `created_at` and the text LENGTH, and none of that changes between two searches with no write in between — so `_EpisodicScoringSet` holds those columns as numpy arrays and the search resolves row BODIES (`text`, `conversation_id`, `last_accessed_at`) for the ranked pool only, through the same `_get_episodic_batch` the FAISS path uses. Decay is a vectorized expression over the cached arrays, not a per-row Python dict build. Filtering still runs across the FULL population before `limit` — `tag_filter` and the relevance gate are masks over the cached arrays, never a top-k window, because a tag matching few rows would otherwise miss the pool entirely and return nothing where it returns hits today. The pool handed to MMR stays `_MMR_MAX_POOL`-bounded rather than `limit`, since the rerank reads each candidate's text.
+- **Scoring-set invalidation**: the validity token is `(in-process generation, PRAGMA data_version)`. `_invalidate_episodic_scoring()` bumps the generation and is called by **every** writer that changes which rows are scored or what they score as — `write_episodic`, `delete_episodic`, `_delete_episodic_row`, `_enforce_episodic_cap`, `_retire_stale_episodic`, `reconcile_embedding_space`, and `backfill_missing_embeddings`. Two of those are traps a naive append-only cache falls into: the backfill rebuilds the FAISS index only `if _HAS_FAISS`, which is False on exactly the install this rung serves, and a body lookup can never repair it (it drops ids that vanished but cannot surface ids that appeared, so recall degrades with no error); and `PRAGMA data_version` is the only in-band signal that a SECOND PROCESS committed to the same file, since the FAISS consistency gate compares two in-process structures. `_touch_last_accessed` is deliberately NOT a writer here — `last_accessed_at` is never scored and is re-read per search with the bodies. A ratchet test (`test_every_episodic_writer_invalidates_the_scoring_set`) fails on a new `episodic_memories` writer that skips the hook. The set is bounded by `_EPISODIC_SCORING_MAX_BYTES` (64 MiB, ~10 MiB for 2,600 rows at dim 1024) and is disabled outright on an sqlite with no `data_version` pragma; either way the rung falls back to reading the population per call.
 - **Cap**: `_DEFAULT_EPISODIC_MAX` = 10,000 active entries. `_enforce_episodic_cap()` tombstones `ORDER BY importance ASC, created_at ASC` (lowest-importance oldest first) on write once the count reaches the cap.
 
 Context injection: `_DEFAULT_EPISODIC_LIMIT` = 8 results in an `[Episodic Memory]` block, each fragment sliced to 1,500 chars, total bounded by `min(_EPISODIC_INJECT_CAP, caps.episodic)` where `_EPISODIC_INJECT_CAP` = 3,000. Injected on the first message of new sessions through the single `memory.get_context()` call in `build_session_context()`, which passes the user's message as the query; episodic is query-gated inside `get_context`, so callers without a message (eval runner) inject none, and follow-up turns never re-inject (ACP native history provides in-thread context).
+
+### Read-volume counters (`_ReadCounters`, `read_counters()`)
+
+Six monotonic per-store-instance integer totals recording how much the store READ. They exist because a whole-population scan is otherwise **unobservable from outside the process**: a SELECT moves neither `PRAGMA data_version` nor the WAL, so a second process cannot tell one materialized row from a thousand, and wall-clock timing is not admissible evidence of a read-volume claim. Counting is unconditional (a method call and a few integer adds per SELECT) — only the EXPOSURE is a surface decision.
+
+| Counter | Counts |
+|---|---|
+| `statements_executed` | SELECTs routed through `_fetch_all_locked` / `_fetch_one_locked`, all tables |
+| `rows_read` | rows those SELECTs materialized, all tables |
+| `semantic_rows_read` | rows materialized by whole-population **semantic retrieval** scans |
+| `semantic_full_scans` | how many such semantic scans ran |
+| `episodic_rows_read` | rows materialized by whole-population **episodic retrieval** scans |
+| `episodic_full_scans` | how many such episodic scans ran |
+
+The four marked scan sites (`_fetch_all_locked(..., scan=...)`, plus one direct `record()` inside `_build_episodic_scoring_set`'s own locked block) are exactly the whole-population reads #8971 names: `get_semantic_context`'s query branch, `get_lessons()` unbounded (what the `_stored_similarity_scorer` callers score over), `_sqlite_vector_search`'s per-call read, and the resident scoring-set build. A bounded read — `get_semantic_context` with no query, `get_lessons(limit=N)`, any keyed lookup — contributes to the all-tables totals only, so a rising `*_full_scans` always means a population was re-read. On the episodic side both rungs land on the same counter, so `episodic_full_scans` rising with WRITES rather than with searches is what the resident set (#8956) looks like from outside; the semantic surface has no such set yet, which is #8971.
+
+Semantics that matter to a caller: per instance and per process (two processes over one file report their own reads independently, never a shared total), never persisted, never reset, and no timing metric is recorded or derived. Every increment happens under `_db_lock`, so `read_counters()` — which takes the same lock — returns an untorn snapshot and no count is lost to a concurrent reader. Two identical `GET /api/memory/observability?q=…` calls with no write in between, compared field by field, are the intended probe.
 
 ### Fading: three independent decay mechanisms
 
@@ -272,7 +291,7 @@ not coordinate, so reason about them separately:
 
 ### In-Process Embedder (`embeddings.py`)
 
-Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kiro_crew/_vendor/llama_cpp`) — no external server, no HTTP hop, no runtime pip install. (The Ollama-era remote-URL path — and with it `_validate_url`/`_resolve_blocked_addr` SSRF hardening from commit `76640a75` — was removed together with the network client: there is no embedding URL to validate anymore.)
+Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kiro_crew/_vendor/llama_cpp`) — no external server, no HTTP hop, no runtime pip install. There is no remote embedding URL, so no URL validation or SSRF hardening is needed on this path; see `../post-launch-removals.md` for why a network embedding client must not come back.
 
 - `LlamaCppEmbedder.embed(text)` / `embed_batch(texts)` → returns 1024-dim vectors or `None` on any failure (graceful degradation)
 - **Non-blocking model load**: the GGUF load runs on a background daemon thread (`_kick_background_load()`, thread name `kc-embed-load`) — `embed()`/`embed_batch()` NEVER block on the load. When the model isn't in memory yet, the call kicks the background load and returns `None` immediately; memory degrades to keyword search until the load lands. The gateway/dashboard event loop is never stalled by embedding work. `wait_ready(timeout)` exists for sync contexts (tests, one-shot CLI flows) that legitimately want to block — never call it from an event-loop thread
@@ -303,7 +322,7 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 - `status` dict (`step`: `idle`/`downloading`/`verifying`/`waiting_retry`/`ready`/`failed`, plus `error` and `attempt`) is readable at any time by the dashboard status endpoint
 
 **Dashboard Enable Flow** (non-blocking, retryable):
-- `POST /api/memory/enable-embeddings` — never blocks on the download: if the model is absent it kicks (or adopts an already-in-flight) background download with `DOWNLOAD_ATTEMPTS_INTERACTIVE` (3) attempts and returns immediately (`{"ok": true, "status": "downloading"}`); the frontend polls `embedding-status` for progress. When the model is present it installs faiss-cpu if missing, wires the embed function, and persists config. The dashboard no longer surfaces a proactive "Start Embedding Engine" button (embeddings auto-start at boot) — this endpoint now backs only the error-state **Retry** affordance
+- `POST /api/memory/enable-embeddings` — never blocks on the download: if the model is absent it kicks (or adopts an already-in-flight) background download with `DOWNLOAD_ATTEMPTS_INTERACTIVE` (3) attempts and returns immediately (`{"ok": true, "status": "downloading"}`); the frontend polls `embedding-status` for progress and keeps the same polling lifecycle across non-terminal `setup_step` transitions. When the model is present it installs faiss-cpu if missing, wires the embed function, and persists config. The dashboard no longer surfaces a proactive "Start Embedding Engine" button (embeddings auto-start at boot) — this endpoint now backs only the error-state **Retry** affordance
 - On failure: status resets to `idle` with error message, frontend shows error + Retry button
 - Prevents concurrent setup attempts (409 if already in progress)
 - `can_retry` flag in status response for frontend retry button
@@ -361,7 +380,7 @@ Model: `Qwen/Qwen3-Embedding-0.6B` Q8_0 GGUF (610MB). Apache-2.0 licensed. Serve
 ### Consolidation Integration
 
 `HistoryConsolidator._consolidate()` now extracts structured data alongside existing fields:
-- `"semantic"` array → `write_semantic()` for each (max 20 per consolidation)
+- `"semantic"` array → `_write_semantic()` for each (max 20 per consolidation), always under `source="consolidation:<key>"` — **never** `user_explicit`, whatever confidence the LLM claims, so the conflict rule above still protects a genuine user-stated row (mirrors the lesson writer's `source="consolidation"`)
 - `"episodic"` array → `write_episodic()` for each (max 10 per consolidation)
 - Dual-write mode: when `config.memory.migrated` is False, also writes markdown files (backward compat)
 
@@ -384,12 +403,14 @@ Model: `Qwen/Qwen3-Embedding-0.6B` Q8_0 GGUF (610MB). Apache-2.0 licensed. Serve
 | POST | `/api/memory/migrate` | Migrate markdown → structured memory |
 | POST | `/api/memory/import` | Import from JSON export |
 | GET | `/api/memory/context-preview?q=` | Preview injected semantic + episodic context |
+| GET | `/api/memory/observability?q=` | `stats` + `rejections` + `context_preview`, plus `reads` — the read-volume counters (see above). `reads` is resolved LAST, so it INCLUDES the reads this request itself performed; that is what lets a caller issue the same `q` twice and compare the two objects |
 
 ### CLI
 
 `kirocrew memory {list,search,show,stats,audit,export,migrate,import}` — manage memory from the command line:
 - `show [preferences|projects|history]` — read the markdown layer through `MemoryStore` (all three targets when none given); `--format md|json` (json entries carry `path`, `updated_at` mtime in UTC ISO-8601, `content`), `--since YYYY-MM-DD` filters history days. Missing/empty files print as empty rather than erroring
-- `search <query>` — searches BOTH memories and labels each section: the vector store's episodic recall, then keyword hits from the markdown layer's FTS5 index (`MemoryStore.search`, over `preferences.md` / `projects.md` / every `history/*.md`). `--layer vector|history|all` (default `all`); `--layer vector` reproduces the previous vector-only output exactly, and `--layer history` skips constructing the vector store entirely, the same way `show` does. The two indexes answer different questions — "where did I write this word" versus "what does this mean like" — so they are reported separately rather than merged into one ranking
+- `search <query>` — searches BOTH memories and labels each section: the vector store's episodic recall, then keyword hits from the markdown layer's FTS5 index (`MemoryStore.search`, over `preferences.md` / `projects.md` / every `history/*.md`). `--layer vector|history|all` (default `all`); `--layer vector` reproduces the previous vector-only output exactly, and `--layer history` skips constructing the vector store entirely, the same way `show` does. The two indexes answer different questions — "where did I write this word" versus "what does this mean like" — so they are reported separately rather than merged into one ranking. `search_episodic` text-searches whenever `query_embedding` is None and does not auto-embed, so the vector section embeds the query in-process, blocking once on the model load (`_SEARCH_MODEL_LOAD_TIMEOUT_SECS`, 120 s) — a one-shot read cannot lean on the gateway's boot re-embed sweep the way a WRITE can. It degrades to keyword matching, naming the reason on **stderr** (stdout shape is unchanged), when the model is not downloaded (a one-shot CLI never kicks the download), when the store's vectors were produced by a different model, or when the model fails to load; and when the semantic pass returns nothing it retries the keyword leg once before reporting "No episodic memories found.", because the vector legs score only rows with a non-NULL embedding and deferred/imported/re-embed-pending rows are keyword-searchable only until the gateway's sweep reaches them
+- `stats` — counts, embedded coverage, FAISS accelerator status, audit event count, and a **`Reads (this process)`** block from `read_counters()` (rows + statements, then the semantic/episodic population-scan tallies). Labelled per-process because the CLI constructs its own store, so the totals describe only what this invocation read; the gateway's totals are the `reads` object on `GET /api/memory/observability`
 - `export` — vector-store collections; `--include-markdown` opts in a `markdown` collection (`preferences`/`projects` entries + per-day `history` list from `MemoryStore.markdown_snapshot()`) without changing the default payload shape
 - `migrate` — one-time markdown → structured migration (preferences.md → semantic, history/*.md → episodic)
 - `import <file>` — restore from JSON export with full validation
@@ -416,7 +437,7 @@ Parses legacy markdown files into structured memory:
 
 **Automatic migration (boot-time, `GatewayOrchestrator._auto_migrate_memory`)**: migration is fully automatic — there is **no dashboard "Migrate" button**. Right after `_start_embeddings()`, the gateway schedules a fire-and-forget background task (retained in `_background_tasks`, cancelled on shutdown) that runs two idempotent phases, all blocking work offloaded to the maintenance executor so boot is never blocked:
 1. **Migrate** (gated on `memory.migrated == False`): detects legacy content via the shared `memory.legacy_memory_present()` helper (also used by `/api/memory/stats`), runs `migrate_from_markdown()`, then flips `memory.migrated=True` for **everyone** — fresh installs with zero legacy entries included, so all users land in vector-only mode. Syncs the live `consolidator._migrated`, and **acknowledges** with a `migration` audit event (`memory_events`, visible in the dashboard Audit tab, `source="auto"`, counts in `new_value`) plus a `logger.info` line. On error: logs and leaves `migrated=False` so the next boot retries.
-2. **Re-embed sweep** (independent of the migrated flag): awaits the background model download if one is still in flight (safe — we are our own task), then `VectorMemory.backfill_missing_embeddings()` embeds any episodic rows written with a NULL vector and rebuilds the FAISS index. Self-healing across boots and across a download that failed then later succeeded.
+2. **Re-embed sweep** (independent of the migrated flag): awaits the background model download if one is still in flight (safe — we are our own task), then `VectorMemoryStore.backfill_missing_embeddings()` embeds any episodic rows written with a NULL vector and rebuilds the FAISS index. Self-healing across boots and across a download that failed then later succeeded.
    - **The sweep probes before it loads.** `wait_ready()` kicks the GGUF load, so asking the model to be ready is not a free question — it costs ~1GB of RSS for the process's lifetime (measured: `VmRSS` +1069 MiB, of which `RssAnon` +455 MiB is private KV/compute buffers and `RssFile` +614 MiB is the mmap'd weights). A steady-state boot has nothing to embed, so the sweep asks two **non-loading** questions first and returns 0 when both say no: `store.has_pending_embeddings()` (three `SELECT 1 … LIMIT 1` reads over the same predicates the three sub-sweeps use) and `store_embedding_space_is_stale(store)` (a signature comparison over `model_id`/`dim`, which are set when the backend is *constructed*). Only when there IS work does it wait on readiness, reconcile, and sweep — so a stale vector space still reconciles and re-embeds, and rows deferred with `defer_embedding=True` are still picked up on a later boot. The non-mutating probe is used deliberately rather than `reconcile_store_embedding_space()`, which is destructive and refuses to clear against an unready backend. A store that does not implement the probe keeps the old always-load behaviour rather than silently losing its sweep.
    - **The model still loads lazily on the first real embedding need.** `_start_embeddings()` binds `embed_fn`/`embed_fn_factory` without loading anything: `make_sync_embed_fn()` returns a closure, and the load is kicked inside `embed_batch()` the first time it finds `_llm is None` (returning `None` so that caller degrades to keyword search).
    - **Two producers of NULL-vector rows**, not just one: rows migrated before the model landed, and rows written by a bulk writer that passed `write_episodic(defer_embedding=True)` — the foreign-agent importer does this so its apply request is not held for minutes by per-chunk inference (see `docs/system-specs/modules/onboarding-import.md`). Import schedules its own sweep, so this boot sweep is the standing retry, not the only path.
@@ -544,21 +565,53 @@ falling back would resurrect lessons the user deleted and ignore the scope gate.
 whose `repo_scope` is present but unusable counts as neither.
 
 **Single write path** — all lesson writes go through `write_lesson()` which provides:
-- Substring dedup: "use dark mode" won't duplicate "always use dark mode"
+- Substring dedup, and it is ASYMMETRIC. A submitted rule contained in a stored one is
+  declined and nothing is mutated (`deduped` / `substring_covered`): "use dark mode"
+  won't duplicate "always use dark mode". A submitted rule that CONTAINS a stored one
+  deletes the stored row instead — "longer wins" — so teaching "when a release is in
+  progress, never force push to a shared branch" retires a stored "never force push to
+  a shared branch". Note the direction of that trade: attaching a condition to a rule
+  makes its text longer and its guidance NARROWER, so the row that survives can be the
+  one that applies in fewer cases.
 - Topic-overlap dedup: "use light mode" replaces "use dark mode" (>50% keyword overlap → newer wins)
 - Allowlist validation, injection scanning, audit logging
+
+Substring-delete and topic-overlap are not independent: verbatim containment at word
+boundaries makes the stored rule's keyword set a subset of the submitted rule's, so
+overlap scores 100% and the topic rule would delete the same row the substring rule
+did. Suppressing either one alone does not keep both lessons — which is why
+`write_lesson` REPORTS its deletions (below) rather than declining to make them, and
+why a caller that must never replace an existing lesson routes to
+`set_semantic_if_absent` instead (see `onboarding_import`, whose comment records that a
+foreign directive could otherwise delete a correction the user taught the agent).
 
 **What a write reports.** `write_lesson()` returns a `LessonWriteResult` naming WHICH
 outcome occurred: `inserted` / `enriched` / `unchanged` / `deduped` / `refused`, plus a
 short reason code (a `SemanticRejectCode` value for a refusal, the dedup rule's name for
 a dedup, `kept_stored_clause` for the one `unchanged` case that is not a byte-identical
-re-submit). The vocabulary is shared with `LessonStore.save_or_enrich()`, which already
-returned the first three words, so both stores describe the same events the same way.
+re-submit), plus `superseded` — the rules this call DELETED. The outcome vocabulary is
+shared with `LessonStore.save_or_enrich()`, which already returned the first three
+words, so both stores describe the same events the same way — but only the vocabulary is
+shared, not the dedup policy: the JSONL store matches on exact rule text plus scope and
+has no rule that supersedes, so it keeps both a general rule and the narrower rule
+containing it.
+
 The distinction matters because two outcomes mean "your lesson did not land"
 (`refused`, `deduped`) while two mean "your lesson is fine, there was nothing to do"
 (`unchanged`, and the kept-clause variant) — a caller reading only a bool cannot tell
 them apart, and the `learn add` CLI guessed wrong, writing a second `lessons.jsonl`
 record on every one of them.
+
+`superseded` exists because every other field describes what happened to the SUBMITTED
+lesson, so a write that tombstoned a stored rule reported a bare `inserted` with
+`reason=None` and the caller was told its lesson was saved with nothing naming the cost.
+The result is the only channel that can carry it: the deleted row is a tombstone, so by
+the time the caller looks it is absent from `get_lessons()`, from `learn_list` and from
+the injected lessons block. It is empty on every path that deleted nothing (including
+`enriched`, which is decided in pass 1 and skips the dedup scan), is forwarded by
+`/api/lessons` as a JSON array, and is rendered in full — not counted, not truncated —
+by the `learn add` CLI and the `learn_add` tool, because that text is the last readable
+copy of the removed rule.
 
 **The result's truth value is the old bool, deliberately.** `bool(result)` is `wrote`,
 byte-for-byte the predicate the previous `-> bool` return answered, so the three callers
@@ -571,7 +624,8 @@ bare assertion would keep passing while asserting nothing — a silent hazard my
 flag, since a bare `if` on any object is legal. `stored` is the separate property for
 "is my lesson in the store" (true for a no-op re-submit, which is NOT a write). Surfaces
 that report to a human or a model — the `learn add` CLI, the `POST /api/lessons` response
-(`ok` / `outcome` / `reason`), the `learn_add` tool result — read `outcome` and `reason`.
+(`ok` / `outcome` / `reason` / `superseded`), the `learn_add` tool result — read `outcome`
+and `reason`, and name the `superseded` rules when there are any.
 The dashboard Memory tab clears its draft and refreshes the list only for `inserted`
 or `enriched`; `unchanged` clears the draft but reports that it was already stored,
 while `deduped` and `refused` preserve the draft and surface the reason so it can be
@@ -608,7 +662,7 @@ lesson beat a contradicting preference in the same prompt.
 |----------|------------|-----------|
 | Lesson contradicts a preference | Lesson wins via the `[Learned corrections]` framing | `context.py` |
 | Two semantic writes to one key | `user_explicit` overrides all; else higher confidence; confidences within 0.1 count as equal so newer wins | `vector_memory._write_semantic()` |
-| Duplicate lessons | Substring dedup, then topic-overlap dedup (≥50% of the smaller keyword set → newer replaces older), then embedding dedup (cosine > 0.85 → longer text wins) | `vector_memory.write_lesson()` |
+| Duplicate lessons | Substring dedup (contained-in-stored declines; contains-a-stored-one DELETES it, "longer wins", regardless of source), then topic-overlap dedup (≥50% of the smaller keyword set → newer replaces older, regardless of source), then embedding dedup (cosine > 0.85 → newer replaces older, unless a stored near-duplicate outranks the write — `user_explicit` over a lower-authority source, or strictly higher stored confidence. That verdict is decided in a non-mutating authority pre-pass before the scan deletes anything, so a write declined on authority deletes nothing and reports empty `superseded`; the pre-pass covers semantic matches only, and the two earlier branches stay source-blind). Every deletion is named in `LessonWriteResult.superseded` | `vector_memory.write_lesson()` |
 | Contradicting episodic fragments | No explicit resolution: time decay plus MMR surfaces the newer/more relevant fragment | `vector_memory.search_episodic()` |
 | A semantic value is superseded | `_retire_stale_episodic()` tombstones episodic rows that quote the old value | `vector_memory._write_semantic()` step 9 |
 
@@ -925,6 +979,35 @@ shows, its token cost, and how to make a session summarize well — so the agent
 help a user enable and interpret it. It does not enable the feature or trigger
 generation, and holds no runtime-written frontmatter, since a builtin skill is
 re-synced by `rmtree` + `copytree` on upgrade.
+
+**`GET /api/skills` coalesces concurrent readers onto one scan, and stores nothing.**
+The catalog assembly is filesystem-heavy (`os.walk` plus per-file frontmatter reads, package
+path globs, per-skill resolve/read, agent annotation), and the defect this addresses is that
+N simultaneous skill-menu opens each paid for their own scan. `_assemble_skills_catalog` in
+`dashboard/handlers/prompts.py` fixes that with single-flight coalescing: the first reader
+assembles, readers queued alongside it take those rows instead of scanning again. Measured
+against a counting assembler, 8-way concurrency goes from 0% to 87.5% redundant-scan
+elimination — eight opens cost one scan.
+
+**There is no stored result and no TTL, and that is what makes the invariant cheap.** The
+leader's rows are offered only while another reader for the same key is still inside
+`_assemble_skills_catalog`; when the last one leaves, they are dropped. So a read that is not
+part of a concurrent burst always scans current on-disk state, the base's recorded default
+("No result cache: the endpoint always reflects current on-disk state, so freshly
+created/installed skills appear immediately") is preserved, and **no mutation path anywhere
+owes the catalog an invalidation**.
+
+**The mechanism is one assembly lock per key** (`LoopBoundLock` values in a registry, the shape
+#4800 established) — fast path, lock, re-check under it, where the re-check is the join. Per key
+rather than global, so readers of different projects still scan in parallel as the base did; the
+registry entry is dropped with the waiter count, and a test pins the parallelism.
+`_assemble_skills_catalog`'s docstring is authoritative for the contract — which readers can be
+served older rows, and the bound — so it stays next to the code it constrains and is spelled once.
+
+**The `?agent=` filter is deliberately NOT part of the key.** It is applied downstream as a
+comprehension over the assembled rows, and an end-to-end test drives two agents through the
+real endpoint in both orders to keep that true rather than merely currently-true — a join that
+ever shared the FILTERED result would fail whichever agent asked second.
 
 **Loading:**
 1. **Always-on**: skills with `always: true` have full content injected every new session
@@ -1515,7 +1598,7 @@ and exfiltration URLs; clean assets are copied byte-for-byte, including leading
 and trailing whitespace. No per-asset preview truncation is used for either the
 security decision or the copied content.
 
-**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
+**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
 
 **LLM tool mechanisms:**
 - MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**
@@ -1700,7 +1783,7 @@ No new command. Users interact via the existing skill management surface:
 ## Hooks (`hooks.py`)
 
 Config-driven from `config.json` → `hooks` section:
-- **auto_approve_tools** / **auto_deny_tools** — tool patterns (exact, `prefix*`, `*suffix`, `*contains*`)
+- **auto_approve_tools** / **auto_deny_tools** — tool patterns (exact, `prefix*`, `*suffix`, `*contains*`). An approve pattern is matched against the display title, except for an MCP-served call whose canonical identity is verified (`mcp_server_name`/`mcp_tool_name` from `_meta.kiro` AND the event's `mcp_identity_trusted` provenance flag, which every permission-path caller threads through — non-emptiness alone is not provenance): there it is matched against that identity as `Running: @server/tool` and `@server/tool` (`mcp_identity_ref`), in place of the title — never the lossy wire form `mcp__server__tool`, under which two identities whose server or tool name contains `__` collide — so a model-authored `description` in the title cannot approve a different tool than the one that executes. An identity that is present but unproven falls back to the title match. Deny patterns keep matching the title, the raw command and the wire `mcp__server__tool` name, and now also the `@server/tool` / `Running: @server/tool` spelling whenever the server name is present (a deny target can only deny), so both lists can be written in one spelling and deny still beats approve on the identity plane. **Migration note:** for an MCP-served call with a verified identity the approve pattern is no longer compared to the title, so an approve pattern written against a title that does not spell the identity (for example one keyed on a tool's `description` text) stops auto-approving and the call shows an approval card; rewrite it as `@server/tool` (or `Running: @server/tool`, kiro-cli's own title for MCP calls). Deny patterns keep matching the title, the raw command, and the canonical `mcp__server__tool` name together.
 - **auto_replies** — pattern → direct reply (skip ACP entirely)
 - **transforms** — pattern → prefix prepended to message
 - **context_rules** — trigger keywords → context injected into message
@@ -1754,10 +1837,12 @@ path, choosing isolation over quoting fidelity.
 
 On Windows both wrappers are pass-throughs whenever they return at all — there is
 no sandbox backend and no cgroup v2 — but `wrap_argv` **fail-closes** rather than
-passing through unless `agent.sandbox_allow_unsandboxed_exec` is set, so a
-Windows script hook needs that opt-in (the same one script crons and Papyrus
-need). Without it the hook's `SandboxUnavailableError` surfaces as the result's
-`error`, naming the setting.
+passing through where that is what the host resolves to. On Windows an
+undeclared key resolves to allow, so a script hook runs unconfined by default
+(as script crons and Papyrus do); where the operator declared
+`agent.sandbox_allow_unsandboxed_exec=false`, or a governance
+`sandbox.min_level` floor is pinned, the hook's `SandboxUnavailableError`
+surfaces as the result's `error`, naming the setting.
 
 ### `safe_read_file(path: str) -> str`
 
@@ -1876,7 +1961,7 @@ Omitting a group **skips its sections** rather than capping them to zero — `Me
 
 A sub-agent that had a group withheld is told so by name (`[CONTEXT SCOPE]`, built by `_build_context_scope_section`), so it reports the gap instead of inventing what it cannot see. That is what makes an aggressive opt-out recoverable: a wrong `false` surfaces as a question rather than a fabrication.
 
-The flags resolve once at spawn and live on `SubagentInfo`. Every path that re-materializes a run from stored fields carries them — the stagger queue entry and `POST /api/spawn/{id}/retry` — so a queued or retried run sees the scope its caller chose. `spawn_continue` does not accept the flags but **inherits** them (`_inherited_context_groups`): a continuation rebuilds session context, because `get_or_create` returns `is_new=True` even when it restores the session via `session/load` (`resumed` is a separate flag and gates only thread history), so an un-inherited continuation would silently regain a withheld group. The live record wins; the run's persisted `context_groups` is the fallback, and a run predating the field records no scope at all — distinguishable from "all withheld" and defaulting to all-on. `GET /api/spawn` reports `context_withheld` only when something was withheld, and `_run_inner` logs the resolved set with the resulting context length.
+The flags resolve once at spawn and live on `SubagentInfo`. Every path that re-materializes a run from stored fields carries them — the stagger queue entry and `POST /api/spawn/{agent_id}/retry` — so a queued or retried run sees the scope its caller chose. `spawn_continue` does not accept the flags but **inherits** them (`_inherited_context_groups`): a continuation rebuilds session context, because `get_or_create` returns `is_new=True` even when it restores the session via `session/load` (`resumed` is a separate flag and gates only thread history), so an un-inherited continuation would silently regain a withheld group. The live record wins; the run's persisted `context_groups` is the fallback, and a run predating the field records no scope at all — distinguishable from "all withheld" and defaulting to all-on. `GET /api/spawn` reports `context_withheld` only when something was withheld, and `_run_inner` logs the resolved set with the resulting context length.
 
 ### Session Resume (`resumed=True`)
 

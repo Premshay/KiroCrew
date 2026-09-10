@@ -2,7 +2,7 @@
 // bypass. A widget action must NEVER auto-submit a user-role turn: it may only
 // pre-fill the composer, requiring an explicit human gesture (Enter) to send.
 // When the user does send pre-filled text, the turn is tagged meta.origin=widget.
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { TranscriptOrigin } from '../hooks/useVoiceInput'
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
@@ -47,6 +47,7 @@ const voice = vi.hoisted(() => {
     partial: '',
     onPartial: null as ((t: string) => void) | null,
     onEndpoint: null as (() => void) | null,
+    onCaptureStop: null as (() => void) | null,
     onText: null as ((t: string, sessionId: string | null, origin: TranscriptOrigin) => void) | null,
     /** Mode the page configured, so a delivered transcript can carry the origin
      *  the real hook would attach to it. */
@@ -63,9 +64,10 @@ voice.start = vi.fn(() => { voice.recording = true })
 voice.stop = vi.fn(() => { voice.recording = false })
 voice.cancel = vi.fn(() => { voice.recording = false })
 vi.mock('../hooks/useVoiceInput', () => ({
-  useVoiceInput: (onText: (t: string, sessionId: string | null, origin: TranscriptOrigin) => void, opts?: { onPartial?: (t: string) => void; onEndpoint?: () => void; streaming?: boolean }) => {
+  useVoiceInput: (onText: (t: string, sessionId: string | null, origin: TranscriptOrigin) => void, opts?: { onPartial?: (t: string) => void; onEndpoint?: () => void; onCaptureStop?: () => void; streaming?: boolean }) => {
     voice.onPartial = opts?.onPartial ?? null
     voice.onEndpoint = opts?.onEndpoint ?? null
+    voice.onCaptureStop = opts?.onCaptureStop ?? null
     voice.onText = onText
     voice.streaming = !!opts?.streaming
     return ({
@@ -173,6 +175,13 @@ describe('ChatPage — sending while dictating', () => {
     voice.recording = false
     vi.mocked(voice.toggle).mockClear()
     vi.mocked(api.sendChat).mockClear()
+  })
+
+  // A test that installs fake timers and then fails mid-region would leave
+  // them installed for every later test in this file (each one then hangs in
+  // `waitFor`), so the restore lives here rather than only at that test's end.
+  afterEach(() => {
+    vi.useRealTimers()
   })
 
   it('drops a partial that lands after the send', async () => {
@@ -331,11 +340,28 @@ describe('ChatPage — sending while dictating', () => {
     // hold-only mode. The discard therefore has to run the streaming rollback
     // (`cancelVoice`) — the hook's raw `cancel` would drop the capture and leave
     // that text stranded in the composer with nothing left to clear it.
+    //
+    // usePushToTalk arms a REAL `holdMs` (500ms) setTimeout on keydown that
+    // flips the phase to 'holding' if it fires before keyup. Dispatching keyup
+    // "immediately" after keydown relies on that timer NOT firing first — true
+    // on an idle host, but under load the event loop can stall past 500ms
+    // before this test's own synchronous code resumes, so the real timer wins
+    // the race, the press commits instead of discarding, and `voice.cancel` is
+    // never called (repro: swap in `await new Promise(r => setTimeout(r, 550))`
+    // between the keydown and keyup below — it fails the same way every time).
+    // Fake timers remove the race entirely: the timer only advances when this
+    // test tells it to, so keyup always lands in the 'arming' phase regardless
+    // of host load. They are installed only AFTER the render has settled:
+    // `renderAndWaitForInput` polls with `waitFor`, which never advances under
+    // fake timers, and the `afterEach` below restores real timers even if an
+    // assertion in the guarded region throws.
     setStt(true)
     savePttConfig({ mode: 'ptt', binding: { code: 'AltRight' }, holdMs: 500 })
     const store = makeStore('chat-main', [{ key: 'chat-main' }])
     await renderAndWaitForInput(store)
     const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+
+    vi.useFakeTimers()
 
     // Press: the driver opens capture immediately.
     await act(async () => {
@@ -350,12 +376,15 @@ describe('ChatPage — sending while dictating', () => {
 
     // Released under the threshold: in hold-only mode a tap means nothing, so the
     // press is discarded — and the composer must not keep the dictated text.
+    // Advance by less than holdMs so the arm timer cannot have fired yet.
+    act(() => { vi.advanceTimersByTime(100) })
     await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keyup', { code: 'AltRight', bubbles: true }))
     })
     expect(voice.cancel).toHaveBeenCalled()
     expect(ta.value).toBe('')
     voice.partial = ''
+    vi.useRealTimers()
   })
 
   it('rolls back a discarded press when the dictation spliced mid-draft', async () => {
@@ -471,6 +500,34 @@ describe('ChatPage — sending while dictating', () => {
     await act(async () => { voice.onPartial?.('remind me to call Ana') })
 
     expect(ta.value).toBe('remind me to call Ana — urgent')
+  })
+
+  it('protects typed text and disables auto-send when cold capture stops itself', async () => {
+    setStt(true)
+    const store = makeStore('chat-main', [{ key: 'chat-main' }])
+    await renderAndWaitForInput(store)
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /voice input/i })) })
+
+    // The readiness buffer stops capture without a second click or key release.
+    await act(async () => {
+      voice.recording = false
+      voice.onCaptureStop?.()
+      voice.onPartial?.('请处理')
+    })
+    await act(async () => { fireEvent.change(ta, { target: { value: '请处理，明天再做' } }) })
+    await act(async () => {
+      voice.onPartial?.('请处理这个任务')
+    })
+    expect(ta.value).toBe('请处理这个任务，明天再做')
+    await act(async () => { voice.onEndpoint?.() })
+    expect(api.sendChat).not.toHaveBeenCalled()
+
+    await act(async () => {
+      voice.onPartial?.('请处理这个任务。谢谢。')
+      deliverText('请处理这个任务。谢谢。')
+    })
+    expect(ta.value).toBe('请处理这个任务。谢谢。，明天再做')
   })
 
   it('leaves the composer alone when the dictated region was edited', async () => {
@@ -711,6 +768,28 @@ describe('ChatPage — sending while dictating', () => {
     // nothing to add and must be suppressed.
     await act(async () => { deliverText('remind me to call Ana') })
     expect(ta.value).toBe('draft remind me to call Ana NOW')
+  })
+
+  it('keeps typing added after a fatal stream frame while socket close is deferred', async () => {
+    setStt(true)
+    const store = makeStore('chat-main', [{ key: 'chat-main' }])
+    await renderAndWaitForInput(store)
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+
+    const mic = screen.getByRole('button', { name: /voice input/i })
+    await act(async () => { fireEvent.click(mic) })
+    await act(async () => { voice.onPartial?.('remind me') })
+    expect(ta.value).toBe('remind me')
+
+    // The hook emits this synchronously with the fatal frame, before the native
+    // decoder's socket close can deliver its fallback final.
+    await act(async () => { voice.onCaptureStop?.() })
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: 'remind me NOW' } })
+    })
+    await act(async () => { deliverText('remind me') })
+
+    expect(ta.value).toBe('remind me NOW')
   })
 
   it('does not auto-send on an endpoint verdict after a cold-stream stop', async () => {

@@ -25,6 +25,7 @@ from kiro_crew import model_registry
 # config.json. Only what it reads changed: the registry, instead of a frozen
 # literal.
 from kiro_crew.acp_backends import resolve_selected_backend
+from kiro_crew.appearance_packs import safe_pack_id as _safe_pack_id
 from kiro_crew.computer_use.types import DEFAULT_ATTACH_SCREENSHOT as _CU_DEFAULT_ATTACH_SCREENSHOT
 from kiro_crew.computer_use.types import DEFAULT_MAX_TREE_DEPTH as _CU_DEFAULT_MAX_TREE_DEPTH
 from kiro_crew.computer_use.types import DEFAULT_MAX_TREE_NODES as _CU_DEFAULT_MAX_TREE_NODES
@@ -34,6 +35,9 @@ from kiro_crew.computer_use.types import (
 from kiro_crew.computer_use.types import DEFAULT_SCREENSHOT_MAX_PX as _CU_DEFAULT_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import DEFAULT_TEXT_LIMIT as _CU_DEFAULT_TEXT_LIMIT
 from kiro_crew.config.resolution import _OBSERVED_DEGRADED_SECTIONS, DEGRADED_TAILSCALE
+from kiro_crew.constants import SUBAGENT_TIMEOUT_MAX as _SUBAGENT_TIMEOUT_MAX
+from kiro_crew.constants import SUBAGENT_TIMEOUT_MIN as _SUBAGENT_TIMEOUT_MIN
+from kiro_crew.constants import SUBAGENT_TIMEOUT_SECS as _SUBAGENT_TIMEOUT_SECS
 from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort
 from kiro_crew.instances.constants import CONNECT_TIMEOUT_CEILING_SECS as _CONNECT_TIMEOUT_CEILING
 from kiro_crew.instances.constants import DEFAULT_MAX_RECOVERY_ATTEMPTS as _DEFAULT_MAX_RECOVERY
@@ -61,6 +65,9 @@ logger = logging.getLogger("kiro_crew.config.loader")
 
 DEFAULT_MODEL = "auto"
 DEFAULT_SESSION_TIMEOUT = 3600  # 60 min
+# Ceiling for a WHOLE orchestrator plan. The per-stage timeout multiplies by
+# stage count, so this is the only bound on total unattended runtime.
+DEFAULT_MAX_PLAN_DURATION = 7200  # 2 h
 # Auto-compaction threshold, as a percentage of the context window. Named
 # because two code paths need it — the dataclass field default (used only when
 # there is no config file) and the dict-load fallback in ``load()`` (used when
@@ -337,8 +344,16 @@ def _safe_dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _resolve_stub_servers(mcp_gateway_data: dict) -> list[str]:
-    """Which MCP servers are given a stub.
+def _resolve_stub_roster(mcp_gateway_data: dict) -> list[str]:
+    """The stub set as CONFIGURED, before the operator's own deviations.
+
+    This is the layer a distribution owns: an edition that wants its known
+    servers stubbed out of the box ships them here, and keeps shipping them as
+    the roster grows. Operator deviations live in ``stub_overrides`` and are
+    applied over this by :func:`_resolve_stub_servers` — which is what lets the
+    two move independently. Read this directly ONLY to answer "what does the
+    roster say"; everything that wants the set actually in effect wants
+    :func:`_resolve_stub_servers`.
 
     ``poolable_servers`` is the deprecated spelling and is consulted ONLY when
     ``stub_servers`` is absent from the file. Key presence, not truthiness, is
@@ -362,6 +377,59 @@ def _resolve_stub_servers(mcp_gateway_data: dict) -> list[str]:
     else:
         source = None
     return [s for s in _safe_list(source) if isinstance(s, str) and s]
+
+
+def _resolve_stub_overrides(mcp_gateway_data: dict) -> dict[str, bool]:
+    """The operator's per-server stub DECISIONS — what they changed, not the result.
+
+    Sparse by construction, and that is the whole point. A flat resulting list
+    can only be REPLACED: an operator who unstubs one server out of a shipped
+    roster would have to restate the survivors, and that restated list then
+    shadows the roster permanently — the next name the distribution adds never
+    reaches them, because their file already answers the question. Recording the
+    DECISION instead leaves every server they did not speak about following the
+    roster.
+
+    Absent means "no opinion", which is why a key whose value equals the roster's
+    answer is pruned on write rather than stored: an override that agrees with
+    its base is indistinguishable from silence in effect, but not in future —
+    stored, it would freeze that server against a later roster change, which is
+    the shadowing this map exists to avoid.
+
+    Non-bool values are dropped rather than coerced. A truthy string here would
+    be an operator's typo, and guessing which way they meant it is worse than
+    leaving that server on the roster's answer.
+    """
+    raw = _safe_dict(mcp_gateway_data.get("stub_overrides"))
+    return {
+        name: value
+        for name, value in raw.items()
+        if isinstance(name, str) and name and isinstance(value, bool)
+    }
+
+
+def _resolve_stub_servers(mcp_gateway_data: dict) -> list[str]:
+    """Which MCP servers are given a stub, roster and operator decisions together.
+
+    The set in EFFECT: :func:`_resolve_stub_roster` supplies the configured base
+    and :func:`_resolve_stub_overrides` the operator's deviations from it, so a
+    distribution can grow the roster without overwriting a choice the operator
+    made, and the operator can turn any single server off without pinning
+    themselves to today's roster.
+
+    Roster order is preserved (the resolver has always handed back what the file
+    held, duplicates included, and ``_freeze_stub_servers`` is what normalizes on
+    write); servers added by an override are appended in sorted order, because
+    they have no position in the file to preserve.
+    """
+    roster = _resolve_stub_roster(mcp_gateway_data)
+    overrides = _resolve_stub_overrides(mcp_gateway_data)
+    if not overrides:
+        return roster
+    resolved = [name for name in roster if overrides.get(name, True)]
+    already = set(resolved)
+    resolved.extend(name for name, on in sorted(overrides.items()) if on and name not in already)
+    return resolved
 
 
 def _safe_float(
@@ -411,6 +479,212 @@ def _safe_color(value: object) -> str:
     if _COLOR_HEX_RE.match(v):
         return v
     return ""
+
+
+#: String-valued ghost trait axes accepted in a per-crew avatar override.
+_AVATAR_GHOST_STR_TRAITS = ("eyes", "brows", "mouth", "accessory", "prop")
+#: Boolean-valued ghost trait axes.
+_AVATAR_GHOST_BOOL_TRAITS = ("blush", "flip")
+#: Cap on a single trait value, so hand-written junk cannot bloat config.json.
+_AVATAR_TRAIT_MAX_LEN = 32
+#: Formats an uploaded crew picture may be stored in. Shared with the avatar
+#: endpoints: the config's ``file`` pin and the files on disk speak this set.
+_AVATAR_IMAGE_EXTS = ("png", "jpg", "webp")
+#: The config's committed-picture pin: ``<16-hex content digest>.<ext>``.
+#: Each install lands at a digest-named path that never collides with the
+#: currently committed file, so nothing overwrites a committed picture before
+#: the config save that commits its replacement.
+_AVATAR_FILE_PIN_RE = _re.compile(r"^[0-9a-f]{16}\.(?:png|jpg|webp)$")
+#: Agent lifecycle states a crew face may react to. A per-state override keys
+#: on one of these exactly; any other key is dropped, so a version-skewed or
+#: typo'd state name cannot smuggle an unbounded key set into config.json.
+_AVATAR_STATES = ("working", "done", "error")
+#: The only trait axes a per-state expression may move. The identity axes
+#: (brows/accessory/prop/tile/blush/flip) are deliberately excluded: a crew
+#: must stay recognisable as itself while its expression changes.
+_AVATAR_EXPRESSION_AXES = ("eyes", "mouth")
+#: Preset cue names a per-state sound may select. `"none"` is a real value
+#: (explicit silence), distinct from an absent state (the default, also
+#: silent) -- so a crew can opt one state out of a fleet-wide cue.
+_AVATAR_SOUNDS = ("none", "chime", "ding", "blip", "pop", "pulse")
+
+
+def _safe_expressions(value: object) -> dict:
+    """Return validated per-state expression overrides, or ``{}``.
+
+    Same forgiveness as the trait coercer: junk is dropped silently rather
+    than refused, because config.json is hand-editable and a malformed
+    expression must never cost the crew its otherwise-valid avatar. A state
+    whose axes all drop out is omitted, so the record never stores an empty
+    per-state dict.
+    """
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for state in _AVATAR_STATES:
+        raw = value.get(state)
+        if not isinstance(raw, dict):
+            continue
+        axes = {}
+        for axis in _AVATAR_EXPRESSION_AXES:
+            v = raw.get(axis)
+            # An empty string is "absent", which is what omitting the axis
+            # already means -- storing it would be a second spelling of the
+            # same state.
+            if isinstance(v, str) and v:
+                axes[axis] = v[:_AVATAR_TRAIT_MAX_LEN]
+        if axes:
+            out[state] = axes
+    return out
+
+
+def _safe_sounds(value: object) -> dict:
+    """Return validated per-state sound cues, or ``{}``.
+
+    Unlike a trait value, a cue name IS pinned to a vocabulary: it selects a
+    shipped preset rather than naming an option the renderer can resolve to
+    absent, so an unknown name has no meaning to carry and is dropped.
+    """
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for state in _AVATAR_STATES:
+        v = value.get(state)
+        if isinstance(v, str) and v in _AVATAR_SOUNDS:
+            out[state] = v
+    return out
+
+
+def _safe_avatar(value: object) -> dict:
+    """Return a validated per-crew avatar override, or ``{}`` on junk.
+
+    Accepted shapes:
+
+    - ``{"kind": "ghost", "traits": {...}}`` — pins the ghost face
+      trait-by-trait instead of deriving it from the crew name. ``traits`` may
+      be absent (or empty) when the override carries only ``expressions`` /
+      ``sounds``: that spelling means "name-derived face, plus these
+      per-state overrides", and the record omits the key entirely rather than
+      storing ``{}``.
+    - ``{"kind": "image"}`` (optional int ``v``, optional ``file``) — the crew
+      wears an uploaded picture, served from ``GET /api/agents/{name}/avatar``.
+      The file itself lives under the data home's agent-fenced
+      ``run/avatars/`` dir; the config
+      field only marks the choice. ``v`` is the upload's cache-busting stamp
+      (file mtime, nanoseconds): the frontend appends it as ``?v=`` so a
+      replaced picture is re-fetched without waiting out the browser cache.
+      ``file`` pins the exact committed file — a ``<digest>.<ext>`` suffix
+      under the crew's stem. Every install lands at a digest-named path, so a
+      replacement never overwrites the committed file before the config save
+      commits it, and serving resolves only the pinned file.
+    - ``{"kind": "pack", "id": "<pack id>"}`` — the crew wears an appearance
+      pack from the crew library (``GET /api/appearances``). ``id`` is
+      validated by :func:`kiro_crew.appearance_packs.safe_pack_id`, the same
+      rule the pack store applies to a directory name, so a value stored here
+      can always be looked up. A junk id collapses the WHOLE override to
+      ``{}``: an unrenderable pack reference is worse than the default face.
+      Whether the pack still EXISTS is deliberately not checked — config load
+      must not touch the disk — so a dangling id renders as the name-derived
+      ghost on the client.
+
+    Empty means "no override" — the frontend keeps rendering the name-seeded
+    face. config.json is hand-editable (and agent-writable), so junk collapses
+    to ``{}`` rather than crashing the load.
+
+    All three kinds may also carry two optional per-state keys, validated and
+    round-tripped through the endpoints and config persistence (a string axis is
+    normalized by the same 32-char truncation a trait gets, so a longer value
+    comes back shortened rather than verbatim):
+
+    - ``expressions: {"<state>": {"eyes"?: str, "mouth"?: str}}`` — the face
+      moves those two axes while the agent is in that state. Only ``eyes`` and
+      ``mouth`` are accepted, so the identity axes stay put and the crew
+      remains recognisable as itself. Legal on ``kind: "image"`` too — stored,
+      and ignored by the picture renderer.
+    - ``sounds: {"<state>": "none"|"chime"|"ding"|"blip"|"pop"|"pulse"}`` — a
+      shipped cue preset per state. ``"none"`` is explicit silence, kept
+      distinct from an absent state so one state can opt out of a cue the
+      others use.
+
+    ``<state>`` is one of ``working``, ``done``, ``error``. Either key is
+    omitted from the record when validation leaves it empty, so a stored
+    avatar never carries ``{}`` for one.
+
+    Trait *values* are deliberately not checked against the frontend's trait
+    vocabulary: the renderer resolves an unknown option to "absent"
+    (``EYES[k] ?? ''``), and keeping the vocabulary in one place (the style
+    module) means a new hat needs no backend release. ``tile`` is the one
+    exception — it is interpolated into SVG markup, so it is pinned to a hex
+    color by the same validator session_color uses.
+    """
+    if not isinstance(value, dict):
+        return {}
+    expressions = _safe_expressions(value.get("expressions"))
+    sounds = _safe_sounds(value.get("sounds"))
+    if value.get("kind") == "image":
+        out: dict[str, object] = {"kind": "image"}
+        v = value.get("v")
+        # bool is an int subclass; a hand-written `"v": true` must not pass.
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            out["v"] = v
+        f = value.get("file")
+        if isinstance(f, str) and _AVATAR_FILE_PIN_RE.fullmatch(f):
+            out["file"] = f
+        if expressions:
+            out["expressions"] = expressions
+        if sounds:
+            out["sounds"] = sounds
+        return out
+    if value.get("kind") == "pack":
+        ident = _safe_pack_id(value.get("id"))
+        if ident is None:
+            # No canonical "pack with no id" spelling exists: a pack avatar IS
+            # its id, so a missing or malformed one leaves nothing to render.
+            return {}
+        pack: dict[str, object] = {"kind": "pack", "id": ident}
+        if expressions:
+            # Accepted for symmetry with the other two kinds and round-tripped
+            # faithfully, but a pack renderer IGNORES it: the art is the pack's
+            # own files, not a trait-composed ghost, so there is no eyes/mouth
+            # axis to move. `sounds` behaves exactly as it does elsewhere.
+            pack["expressions"] = expressions
+        if sounds:
+            pack["sounds"] = sounds
+        return pack
+    if value.get("kind") != "ghost":
+        return {}
+    raw = value.get("traits")
+    traits: dict[str, object] = {}
+    if isinstance(raw, dict):
+        for key in _AVATAR_GHOST_STR_TRAITS:
+            v = raw.get(key, "")
+            traits[key] = v[:_AVATAR_TRAIT_MAX_LEN] if isinstance(v, str) else ""
+        for key in _AVATAR_GHOST_BOOL_TRAITS:
+            # `is True`, not bool(): config.json is hand-editable and
+            # bool("false") is True, so a string-typed value would render the
+            # opposite of what its author wrote. Only a real boolean counts.
+            traits[key] = raw.get(key, False) is True
+        traits["tile"] = _safe_color(raw.get("tile", ""))
+        # An all-empty trait set (every axis absent) is indistinguishable in
+        # intent from "no override" but would render a featureless ghost. The
+        # builder cannot produce it (Apply always carries the seeded
+        # defaults), so it only arrives via hand-written config or direct API
+        # use — drop it to the one canonical "no traits" spelling instead of
+        # storing a third state.
+        if all(not v for v in traits.values()):
+            traits = {}
+    ghost: dict[str, object] = {"kind": "ghost"}
+    if traits:
+        ghost["traits"] = traits
+    if expressions:
+        ghost["expressions"] = expressions
+    if sounds:
+        ghost["sounds"] = sounds
+    # `kind` alone carries no override — a bare ghost is the name-derived face,
+    # which is what an absent field already means.
+    if len(ghost) == 1:
+        return {}
+    return ghost
 
 
 def _meta(label: str, help: str, **kwargs: object) -> dict:
@@ -474,6 +748,29 @@ DEFAULT_CWD_ALLOWED_ROOTS = [
     "~/workplace",
     "~/workplaces",
 ]
+
+
+def coerce_subagent_max_per_parent_by_agent(raw: object) -> dict[str, int]:
+    """Normalize per-agent child-run caps from operator-owned configuration.
+
+    Keys are exact agent names or shell-style patterns and values are positive
+    caps. Invalid entries are discarded so a malformed override cannot weaken
+    the fallback ``subagent_max_per_parent`` limit.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for pattern, limit in raw.items():
+        if (
+            isinstance(pattern, str)
+            and (clean_pattern := pattern.strip())
+            and len(clean_pattern) <= 128
+            and isinstance(limit, int)
+            and not isinstance(limit, bool)
+            and 1 <= limit <= SUBAGENT_AUTO_MAX_CEILING
+        ):
+            out[clean_pattern] = limit
+    return out
 
 
 @dataclass
@@ -652,16 +949,28 @@ class AgentConfig:
         metadata=_meta(
             "Allow Unsandboxed Execution",
             "When true, allow agent subprocesses to execute without any sandbox "
-            "backend (fail-open). When false (default), wrap_argv raises a "
-            "RuntimeError if no sandbox backend is available and mode is not 'off', "
-            "preventing unsandboxed execution entirely (fail-closed). This is "
-            "distinct from sandbox_allow_no_isolation which only controls warning "
-            "severity — this field controls whether execution proceeds at all. "
-            "The default is platform-independent: on a host with no backend (any "
-            "Windows host, a Linux kernel refusing user namespaces) `kirocrew "
-            "setup` OFFERS this opt-in interactively and writes it only on an "
-            "explicit yes, so unconfined execution stays operator-declared and is "
-            "never enabled implicitly by the platform.",
+            "backend (fail-open). When false, wrap_argv raises if no sandbox "
+            "backend is available and mode is not 'off', preventing unsandboxed "
+            "execution entirely (fail-closed). This is distinct from "
+            "sandbox_allow_no_isolation which only controls warning severity — "
+            "this field controls whether execution proceeds at all. "
+            "A LOADED config carries the effective policy: the loader resolves an "
+            "undeclared key through config.loader.unsandboxed_exec_platform_default() "
+            "— allow on Windows, which has no backend that any operator action could "
+            "install, and fail-closed everywhere else, where a missing backend is "
+            "broken or one profile away from working. A declared value always wins in "
+            "both directions, and a governance sandbox.min_level floor outranks the "
+            "declaration. The resolution is folded into the VALUE rather than keyed on "
+            "key presence so a full-document save() — which serializes every field — "
+            "cannot turn 'never decided' into a declared lockdown. This dataclass "
+            "default stays platform-independent so the committed config-schema "
+            "snapshot is identical on every platform; the one caller that writes a "
+            "document from a directly constructed config (the first-run default write "
+            "in cli_server) resolves the platform default explicitly before saving. "
+            "`kirocrew setup` surfaces the decision on a backend-less host, offering "
+            "the opt-in where the default is fail-closed and stating the exposure plus "
+            "offering the opt-out where it is allow, and writes nothing unless the "
+            "operator answers yes.",
         ),
     )
     apps_allow_third_party: bool = field(
@@ -825,6 +1134,25 @@ class AgentConfig:
             "below 3 would disable auto-sizing and run under the default).",
         ),
     )
+    subagent_max_per_parent: int = field(
+        default=0,
+        metadata=_meta(
+            "Max SubAgents Per Parent",
+            "Maximum active child runs for one parent session. 0 leaves the global "
+            "subagent cap as the only limit; set 1 when a routed model lane must "
+            "serve one worker at a time.",
+        ),
+    )
+    subagent_max_per_parent_by_agent: dict[str, int] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Per-agent SubAgent Caps",
+            "Optional exact agent-name or shell-pattern overrides for the maximum "
+            "active child runs from one parent session. Exact names win; otherwise "
+            "the most specific matching pattern wins. Invalid entries are ignored "
+            "and an unmatched agent uses subagent_max_per_parent.",
+        ),
+    )
     max_stop_hook_nudges: int = field(
         default=100,
         metadata=_meta(
@@ -895,16 +1223,18 @@ class AgentConfig:
         ),
     )
     chat_turn_timeout_secs: int = field(
-        default=7200,
+        default=14400,
         metadata=_meta(
             "Chat Turn Timeout (secs)",
             "Wall-clock ceiling for one chat turn. This is a runaway backstop, "
             "so it is clamped to 300s..86400s (24h) and can never be disabled. "
-            "Raise it above the 2h default for long unattended turns (full test "
-            "suites, long builds); the ACP transport's prompt wait follows it. "
-            "Hitting the ceiling is visible: the turn ends with a card naming "
-            "the limit. For work spanning days, prefer monitor/goal loops — "
-            "they end the turn between cycles and survive restarts.",
+            "The 4h default covers the longest single turn the shipped budgets "
+            "produce (a 90-minute test command plus a fix and a re-run, or a "
+            "blocking subagent wave at its 2h wait cap); the ACP transport's "
+            "prompt wait follows it. Hitting the ceiling is visible: the turn ends "
+            "with a card naming the limit. For work spanning many hours or days, "
+            "prefer monitor/goal loops — they end the turn between cycles and "
+            "survive restarts, which a single marathon turn cannot.",
         ),
     )
     session_start_timeout_secs: int = field(
@@ -952,6 +1282,21 @@ class AgentConfig:
             "sessions it created itself.",
         ),
     )
+    member_dispatch: bool = field(
+        default=True,
+        metadata=_meta(
+            "Member Dispatch",
+            "Let a crew member's DM session open and drive worker sessions it "
+            "creates, even when Session Control is off. On by default, because "
+            "dispatching work into workers is the crew-member operating model, "
+            "not an opt-in: this is the zero-configuration contract. Turn this "
+            "off to put member callers back under the Session Control switch, so "
+            "an operator who withdrew session control keeps member DM threads "
+            "chat-only without disabling the member. When on, a member's reach is "
+            "still bounded to sessions it created itself (creator ownership), the "
+            "same fence that binds it when Session Control is on.",
+        ),
+    )
     subagent_cost_gb: float = field(
         default=0.5,
         metadata=_meta(
@@ -991,10 +1336,15 @@ class AgentConfig:
         metadata=_meta("SubAgent Max Turns", "Default tool-call budget per subagent."),
     )
     subagent_timeout_secs: int = field(
-        default=1800,
+        default=_SUBAGENT_TIMEOUT_SECS,
         metadata=_meta(
             "SubAgent Timeout (seconds)",
-            "Wall-clock timeout per subagent execution. 0 uses hardcoded default (1800s).",
+            "Wall-clock timeout per subagent execution. 0 uses the same default. "
+            f"Clamped to {_SUBAGENT_TIMEOUT_MIN}s..{_SUBAGENT_TIMEOUT_MAX}s at load "
+            "(0 is preserved). Raising it past 2 hours only helps the "
+            "fire-and-forget spawn_run path: a BLOCKING spawn_sub_agents call "
+            "collects for at most 2 hours whatever this is set to, so use "
+            "spawn_run for work longer than that.",
         ),
     )
     subagent_stall_idle_secs: int = field(
@@ -1087,6 +1437,9 @@ class AgentConfig:
         # feeds coerced input.
         self.role_models = coerce_role_models(self.role_models)
         self.role_efforts = coerce_role_efforts(self.role_efforts)
+        self.subagent_max_per_parent_by_agent = coerce_subagent_max_per_parent_by_agent(
+            self.subagent_max_per_parent_by_agent
+        )
         # Same defensive coercion for the throttle-fallback model: normalize to
         # ""/"auto"/acp id, so consumers can trust the stored shape.
         self.fallback_model = coerce_fallback_model(self.fallback_model)
@@ -1215,6 +1568,16 @@ class OrchestratorConfig:
         default=1800,
         metadata=_meta(
             "Stage Timeout", "Max seconds per stage before auto-run stops. Default 30 min."
+        ),
+    )
+    max_plan_duration_seconds: int = field(
+        default=DEFAULT_MAX_PLAN_DURATION,
+        metadata=_meta(
+            "Max Plan Duration",
+            "Ceiling for a WHOLE auto-run plan in seconds, checked at each stage "
+            "boundary, with one warning at 75% of the budget. The per-stage "
+            "timeout above multiplies by stage count, so without this a long "
+            "plan can run unattended for hours. 0 disables. Default 2 h.",
         ),
     )
 
@@ -1540,6 +1903,18 @@ class KnowledgeConfig:
             "0 keeps the workers warm indefinitely.",
         ),
     )
+    # The LLM pool reads this directly at each spawn, so the schema must retain
+    # it across unrelated configuration saves.
+    llm_timeout_secs: float = field(
+        default=0.0,
+        metadata=_meta(
+            "LLM Prompt Timeout Floor (secs)",
+            "Overrides the bound-pool prompt timeout floor (built-in 300s). "
+            "The floor is an alarm, not a budget: reaching it means the "
+            "serving lane cannot meet its healthy budget. 0 or unset keeps "
+            "the default.",
+        ),
+    )
     auto_add_documents: bool = field(
         default=False,
         metadata=_meta(
@@ -1552,6 +1927,34 @@ class KnowledgeConfig:
             "aggregate 'Auto-added' source you can remove in one click. Off by "
             "default: the Library should only hold what you asked it to hold. "
             "Renamed from auto_ingest_doc_links, which is still accepted.",
+        ),
+    )
+    auto_register_project_docs: bool = field(
+        default=False,
+        metadata=_meta(
+            "Auto-Register Project Documents",
+            "Register the documents of each project you work in as a Knowledge "
+            "source automatically, so a project's design docs, specs and READMEs "
+            "become searchable without adding the folder by hand. Only documents "
+            "are taken (.md/.pdf/.docx/.org above a small size floor, excluding "
+            "agent instructions, generated files and repository boilerplate) -- "
+            "never source code. There is no confirmation step once enabled: the "
+            "document filter and the per-sweep chunk budget below bound the cost, "
+            "and deleting the source keeps it deleted. Off by default, because "
+            "registering a repository is a decision to spend extraction calls on "
+            "it -- turning this on opts in every project you open.",
+        ),
+    )
+    auto_ingest_chunk_budget: int = field(
+        default=150,
+        metadata=_meta(
+            "Auto-Ingest Chunk Budget",
+            "Chunks an automatically-registered source may ingest per watcher "
+            "sweep. Each chunk costs one LLM extraction call, so this is what "
+            "actually bounds the cost of auto-registration -- file filters bound "
+            "pollution, not spend. Newest documents land first and the rest "
+            "trickle in on later sweeps, so a new project never arrives as a "
+            "burst. 0 removes the bound.",
         ),
     )
     folder_ingest_chunk_budget: int = field(
@@ -1604,6 +2007,40 @@ class KnowledgeConfig:
             "0 removes the bound.",
         ),
     )
+    import_chunk_budget: int = field(
+        default=0,
+        metadata=_meta(
+            "Explicit Import Chunk Budget",
+            "Maximum chunks ingested through the EXPLICIT one-shot import paths "
+            "(a single-file add, an agent-driven add, a direct text ingest, and "
+            "remote sync) within a rolling ~60s window -- the cross-file cost "
+            "ceiling those paths lack, since they are many independent calls "
+            "with no scan boundary the way a watcher sweep has. Each chunk costs "
+            "an LLM extraction call. When the window is exhausted the next import "
+            "is REFUSED with a reason rather than silently truncated, so a "
+            "deliberate import never loses part of a file. A single file stays "
+            "bounded by the 50-chunk per-file cap independently. 0 (the default) "
+            "removes the bound -- opt in by setting it (e.g. 500, matching "
+            "sweep_chunk_budget) so this changes nothing until you choose it. "
+            "LIMITATION if you enable it: reservation is worst-case -- each "
+            "in-flight import books the 50-chunk per-file maximum up front and "
+            "reconciles to the real count only when it finishes, so several "
+            "concurrent imports throttle below the nominal number you set here "
+            "until that accounting is refined. Set it with that headroom in "
+            "mind.",
+        ),
+    )
+    max_sources: int = field(
+        default=50,
+        metadata=_meta(
+            "Max Sources",
+            "Maximum number of Knowledge sources that may be registered. "
+            "Prevents unbounded auto-discovery from registering hundreds of "
+            "sources when many projects are open. Registration attempts past "
+            "the cap are skipped (auto) or rejected (manual). 0 removes the "
+            "bound.",
+        ),
+    )
     embed_rate_limit: int = field(
         default=120,
         metadata=_meta(
@@ -1631,6 +2068,30 @@ class KnowledgeConfig:
             "Number of concurrent LLM workers for document extraction. More "
             "workers = faster ingestion but higher peak cost. Each worker holds "
             "a long-lived session. Requires restart to take effect.",
+        ),
+    )
+    auto_discover_folder: bool = field(
+        default=False,
+        metadata=_meta(
+            "Auto-Discover Documents Folder",
+            "Watch for a documents folder inside the active workspace and "
+            "register it as a Knowledge source automatically, so files dropped "
+            "there become searchable without adding the source by hand. The "
+            "folder is never created for you: its absence means you have not "
+            "opted in, and it is picked up within one watcher sweep of being "
+            "created -- no restart needed. Off by default because ingestion "
+            "spends LLM extraction on every supported file in the folder.",
+        ),
+    )
+    auto_discover_dirname: str = field(
+        default="knowledge-docs",
+        metadata=_meta(
+            "Documents Folder Name",
+            "Name of the folder inside the workspace that auto-discovery looks "
+            "for. A single path segment -- separators and traversal are rejected "
+            "so the source cannot be redirected outside the workspace. Avoid "
+            "'knowledge': that is where the Library's own SQLite store lives and "
+            "it always exists, which would defeat discovery.",
         ),
     )
 
@@ -1879,6 +2340,21 @@ class TailscaleConfig:
             "effect on the next gateway start.",
         ),
     )
+    bind_refresh_chains: bool = field(
+        default=True,
+        metadata=_meta(
+            "Bind Refresh Chains To The Device",
+            "Bind a session's 30-day refresh chain to the tailnet peer that "
+            "opened it, so a stolen refresh cookie cannot be replayed from a "
+            "different allowed device. On by default. Only turn it off if you "
+            "need one session to roam between your DEVICES while pin_scope is "
+            "'node' — with pin_scope 'login' the pin is your identity, not the "
+            "device, so roaming already works. Turning it off means a stolen "
+            "refresh cookie renews from any allowed node. Existing chains keep "
+            "the binding they were opened with; the change applies to sessions "
+            "started after the next gateway start.",
+        ),
+    )
     keep_awake: bool = field(
         default=True,
         metadata=_meta(
@@ -2054,6 +2530,11 @@ def _tailscale_config_from(
         trust_identity=trust_identity,
         allowed_logins=allowed_logins,
         pin_scope=pin_scope,
+        # Defaults TRUE, and a non-boolean resolves to TRUE as well: this is a
+        # narrowing-only field like the two rules above, so an operator typo may
+        # only ever leave the binding ON, never silently reopen the replay path
+        # the binding closes (issue #2417).
+        bind_refresh_chains=_safe_bool(data.get("bind_refresh_chains"), True),
         keep_awake=_safe_bool(data.get("keep_awake"), True),
     )
 
@@ -2273,6 +2754,17 @@ class DashboardConfig:
             "not pushed straight back into the same collapse.",
         ),
     )
+    default_memory_mode: str = field(
+        default="persistent",
+        metadata=_meta(
+            "Default Memory Mode",
+            "Memory mode for new dashboard chat sessions. 'persistent' reads "
+            "and writes memory; 'incognito' reads but does not write; "
+            "'temporary' neither reads nor writes. Explicit per-session choices "
+            "still win.",
+            enum=["persistent", "incognito", "temporary"],
+        ),
+    )
     widget_density: str = field(
         default="more",
         metadata=_meta(
@@ -2453,6 +2945,31 @@ class DashboardConfig:
                         ),
                     },
                 },
+                # Only `enabled` is declared; `completion.commands` (the
+                # subcommand-probe allowlist) stays an undeclared key, so the
+                # object is left open the same way `terminal` itself is.
+                "completion": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "x-meta": {
+                        "label": "Command completion",
+                        "help": "The Terminal tab's inline completion popup.",
+                    },
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": True,
+                            "x-meta": {
+                                "label": "Command completion",
+                                "help": (
+                                    "Show the completion popup while typing in the "
+                                    "Terminal tab. Off = no popup; the shell's own Tab "
+                                    "completion still works."
+                                ),
+                            },
+                        },
+                    },
+                },
             },
         ),
     )
@@ -2582,6 +3099,14 @@ class DashboardConfig:
         metadata=_meta(
             "Tips Enabled",
             "Show feature tip cards while the agent is thinking.",
+        ),
+    )
+    feature_videos_enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Feature Videos Enabled",
+            "Show short feature-intro clips for features this install has not used "
+            "yet. Instance-wide kill switch.",
         ),
     )
     folder_suggestions_enabled: bool = field(
@@ -2719,6 +3244,17 @@ class KiroCrewAgentConfig:
         default="kirocrew",
         metadata=_meta("Source", "Agent origin: kirocrew or builtin."),
     )
+    starred: bool = field(
+        default=False,
+        metadata=_meta(
+            "Starred",
+            "Marks this crew as a favourite on the Crew Members page. Purely a "
+            "roster preference: the page's star filter shows only starred "
+            "crews, so the dozens of package-installed crews the agent sync "
+            "writes here can be collapsed behind the few you actually drive. "
+            "Never read by routing, spawning, or the orchestrator.",
+        ),
+    )
     # Per-agent watchdog window overrides. The global ``watchdog.tool_stall_*``
     # defaults (1h) are build-scale forbearance; an agent that never runs a long
     # build (a pure-LLM reviewer, read-only git) can declare much lower windows
@@ -2764,6 +3300,17 @@ class KiroCrewAgentConfig:
             "bot. Preserved on load and save so an existing config is not "
             "rewritten out from under the operator.",
             deprecated=True,
+        ),
+    )
+    avatar: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Avatar",
+            "Per-crew avatar override. Empty means the face is derived from "
+            "the crew's name. {'kind': 'ghost', 'traits': {...}} pins explicit "
+            "ghost traits chosen in the avatar builder; {'kind': 'image'} "
+            "means an uploaded picture served from the per-crew avatar "
+            "endpoint.",
         ),
     )
 
@@ -3275,19 +3822,24 @@ class TelemetryConfig:
 # GET /api/config/kirocrew response (which serializes a freshly loaded config)
 # reports the clamped value rather than the tampered one.
 SUBAGENT_AUTO_MAX_CEILING = 64  # agent.subagent_auto_max — concurrent subagent ceiling
-SUBAGENT_MAX_TURNS_CEILING = 200  # agent.subagent_max_turns — per-subagent turn budget
+SUBAGENT_MAX_TURNS_CEILING = 1000  # agent.subagent_max_turns — per-subagent turn budget
 POOL_SIZE_MAX = 10  # session.pool_size — pre-warmed process pool
 
 # agent.chat_turn_timeout_secs — wall-clock ceiling for one chat turn. The ACP
 # transport's per-prompt wait follows this value (acp/client.py
 # ``resolve_prompt_timeout``, which adds a margin so the dashboard's visible
-# card fires before the transport cut), so the max is no longer pinned to the
-# transport's 2h default. It is bounded at 24h because the ceiling is a runaway
-# backstop, not a scheduler: a single prompt→response turn longer than a day is
-# pathological, and multi-day unattended operation belongs to the loop
-# mechanisms (monitor/goal loops, crons), which end the turn between cycles and
-# survive restarts — a marathon turn does not. The floor keeps the backstop
-# from being set so low it cuts ordinary work.
+# card fires before the transport cut), so the max is not pinned to the
+# transport's default. The default is 4h: the longest single turn the shipped
+# budgets can legitimately produce is a 90-minute test command plus a fix and a
+# re-run, or a blocking subagent wave at its 2h wait cap plus synthesis, and
+# the watchdog's UNKNOWN-verdict windows must sit well inside the ceiling so its
+# non-lethal recovery is reachable before the turn is cut. It is bounded at 24h
+# because the ceiling is a runaway backstop, not a scheduler: a single
+# prompt→response turn longer than a day is pathological, and multi-day
+# unattended operation belongs to the loop mechanisms (monitor/goal loops,
+# crons), which end the turn between cycles and survive restarts — a marathon
+# turn does not. The floor keeps the backstop from being set so low it cuts
+# ordinary work.
 CHAT_TURN_TIMEOUT_MIN = 300
 CHAT_TURN_TIMEOUT_MAX = 86400
 
@@ -3399,6 +3951,10 @@ FOLDER_INGEST_CHUNK_BUDGET_MAX = 10000
 DEDUP_EVERY_N_SWEEPS_MAX = 288
 SWEEP_CHUNK_BUDGET_MAX = 50000
 EMBED_RATE_LIMIT_MAX = 10000
+# Ceiling on the explicit-import cross-file chunk budget, same rationale as the
+# folder/sweep budgets above: clamp a negative to 0 (0 == unbounded) and cap an
+# absurd hand-edited value so it cannot load verbatim into real work.
+IMPORT_CHUNK_BUDGET_MAX = 50000
 
 
 ACTIVATION_ALWAYS = "always"  # Process every message
@@ -3452,11 +4008,21 @@ class ChannelConfig:
 #: supported OS, with no account, no platform floor, and no separate install.
 STT_PROVIDER_LOCAL = "local"
 
+#: Local Whisper can detect the spoken language; forcing English corrupts
+#: multilingual dictation before the recogniser can choose the right tokens.
+STT_LANGUAGE_AUTO = "auto"
+STT_LANGUAGE_FALLBACK = "en-US"
+
+#: Batch recogniser owned by the operator's service environment. Unlike the
+#: bundled local recogniser, it does not expose a model catalogue or a streaming
+#: protocol to the dashboard.
+STT_PROVIDER_BRIDGE = "bridge"
+
 #: The recognisers a user can select. ``local`` runs whisper.cpp in-process,
-#: ``apple`` uses macOS 26+ on-device recognition, and ``transcribe`` sends audio
-#: to AWS Transcribe (billed, and gated on the AWS consent prompt). All three
-#: produce partial results, so streaming is not a per-provider capability.
-_VALID_STT_PROVIDERS = (STT_PROVIDER_LOCAL, "apple", "transcribe")
+#: ``bridge`` hands audio to an operator-configured batch recogniser, ``apple``
+#: uses macOS 26+ on-device recognition, and ``transcribe`` sends audio to AWS
+#: Transcribe (billed, and gated on the AWS consent prompt).
+_VALID_STT_PROVIDERS = (STT_PROVIDER_LOCAL, STT_PROVIDER_BRIDGE, "apple", "transcribe")
 
 #: Providers a stored config may still name. Each of these needed an out-of-band
 #: install the user had to perform themselves (a whisper CLI on ``PATH``, or an
@@ -3484,6 +4050,16 @@ _VALID_CHANNEL_PREFIXES = ("C", "D", "G")
 _WARNED_STT_PROVIDERS: set[str] = set()
 
 
+def stt_provider_is_coerced(value: object) -> bool:
+    """True when a stored ``stt.provider`` cannot take effect and is replaced.
+
+    The single source of truth for "this stored value is inert", so the surface that
+    offers to remove it (``kirocrew config defaults``) cannot come to disagree with
+    the loader about which providers are dispatchable.
+    """
+    return value not in _VALID_STT_PROVIDERS
+
+
 def _validated_stt_provider(value: object) -> str:
     """Return *value* if it is selectable, else degrade to ``local`` with a reason.
 
@@ -3491,6 +4067,11 @@ def _validated_stt_provider(value: object) -> str:
     an unusable one must leave voice input working the way
     :func:`_normalize_acp_backend` degrades an unusable persisted backend, rather
     than failing the load that read it.
+
+    The notice names the command that removes the dead value. A load never writes,
+    so without that pointer the line repeats on every invocation forever -- and
+    unlike a superseded default there is nothing here to preserve, since the stored
+    value cannot take effect either way.
     """
     if value in _VALID_STT_PROVIDERS:
         return str(value)
@@ -3502,13 +4083,15 @@ def _validated_stt_provider(value: object) -> str:
         logger.warning(
             "STT provider %r is retired; using %r instead. It needed a separate "
             "out-of-band install, which the bundled local engine removes while "
-            "recognising the same speech.",
+            "recognising the same speech. Run 'kirocrew config defaults --adopt' "
+            "to drop the stored value and this notice.",
             value,
             STT_PROVIDER_LOCAL,
         )
     else:
         logger.warning(
-            "Unknown STT provider %r; using %r instead. Selectable providers: %s",
+            "Unknown STT provider %r; using %r instead. Selectable providers: %s. "
+            "Run 'kirocrew config defaults --adopt' to drop the stored value.",
             value,
             STT_PROVIDER_LOCAL,
             ", ".join(_VALID_STT_PROVIDERS),
@@ -3781,6 +4364,9 @@ class ResolvedBindings:
     # agent.model fallback. Defaulted so existing keyword constructions and
     # test doubles built before this field stay valid.
     model: str = ""
+    # The Kiro Crew agent's default effort. It ranks below a per-session pick
+    # and above the provider/model default, mirroring ``model`` above.
+    reasoning_effort: str = ""
     # Whether the REQUESTED agent name was actually honored. False means the
     # resolver fell back to the default agent, so dispatching these bindings runs
     # a different agent than the caller asked for. Callers that store the
@@ -3855,9 +4441,11 @@ class SttConfig:
         ),
     )
     language_code: str = field(
-        default="en-US",
+        default=STT_LANGUAGE_AUTO,
         metadata=_meta(
-            "Language Code", "Language for speech recognition (e.g. en-US, fr-FR, es-ES)."
+            "Language Code",
+            "Language for speech recognition (e.g. zh-CN, en-US). The local provider "
+            "defaults to auto-detect; choosing a language can improve short dictation.",
         ),
     )
     streaming: bool = field(
@@ -3917,7 +4505,11 @@ class SttConfig:
     )
     timeout_secs: int = field(
         default=300,
-        metadata=_meta("Timeout", "Transcription timeout in seconds."),
+        metadata=_meta(
+            "Timeout",
+            "Maximum transcription time in seconds. Local streaming uses the same budget "
+            "for pending audio after recording stops.",
+        ),
     )
     transcribe_region: str = field(
         default="us-east-1",
@@ -3927,6 +4519,23 @@ class SttConfig:
         default="",
         metadata=_meta("Transcribe Profile", "AWS profile for Transcribe API."),
     )
+
+    def __post_init__(self) -> None:
+        language = self.language_code
+        if not isinstance(language, str) or not language.strip():
+            language = STT_LANGUAGE_AUTO
+        else:
+            language = language.strip()
+        if language.lower() == STT_LANGUAGE_AUTO:
+            language = STT_LANGUAGE_AUTO
+        self.language_code = language
+
+    @property
+    def effective_language_code(self) -> str:
+        """Resolve a provider locale without changing the stored preference."""
+        if self.language_code == STT_LANGUAGE_AUTO and self.provider != STT_PROVIDER_LOCAL:
+            return STT_LANGUAGE_FALLBACK
+        return self.language_code
 
 
 @dataclass
@@ -4108,6 +4717,26 @@ class McpGatewayConfig:
             "(mcp_gateway.enabled). Managed from MCP Management.",
         ),
     )
+    shared_readonly_servers: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Shared Read-only Servers",
+            "Subset of Routed Servers allowed to share one backend across agents and "
+            "workspaces. Use only stateless, credential-free, read-only services such "
+            "as a documentation index. Entries with declared environment or "
+            "auto-approved tools stay session-scoped. Empty by default.",
+        ),
+    )
+    claude_session_servers: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Claude Session Servers",
+            "Optional explicit MCP profile for Claude ACP sessions. A non-empty "
+            "list suppresses user-level MCP discovery for those sessions and "
+            "injects only named, enabled servers from the selected KiroCrew "
+            "agent spec. Empty preserves normal Claude Code behaviour.",
+        ),
+    )
     poolable_servers: list[str] = field(
         default_factory=list,
         metadata=_meta(
@@ -4120,6 +4749,50 @@ class McpGatewayConfig:
             "stub set.",
         ),
     )
+    stub_overrides: dict[str, bool] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Stub Overrides",
+            "Per-server deviations from stub_servers: a name mapped to true is "
+            "stubbed even when the roster omits it, false leaves it direct even "
+            "when the roster carries it. Holds what you CHANGED, not the result, "
+            "so a name you never touched keeps following the roster — which is "
+            "what lets an edition that ships its own stub_servers grow that list "
+            "without overwriting your choices, and lets you turn one server off "
+            "without pinning yourself to today's roster. Written by MCP "
+            "Management when a toggle disagrees with the roster, and dropped "
+            "again when you toggle it back to agree. Empty by default.",
+        ),
+    )
+    #: The roster EXACTLY as the file states it, carried so a full-file rewrite
+    #: can put it back.
+    #:
+    #: :attr:`stub_servers` above holds the EFFECTIVE set, because that is what all
+    #: seven of its consumers want (routing, the page's rows, ``stub_count``, the
+    #: doctor). But ``save()`` round-trips this dataclass through ``asdict``, so a
+    #: field whose value differs from the file's is a landmine: emitting the
+    #: effective set would rewrite ``stub_servers`` without the servers the operator
+    #: opted out of, turning a reversible deviation into a permanent deletion from a
+    #: layer that is not ours to edit -- and it would happen on any unrelated
+    #: ``save()``. Carrying the roster lets :meth:`KiroCrewConfig.to_dict` emit the
+    #: file's own value instead.
+    #:
+    #: Excluded from serialization (``repr=False``, popped by ``to_dict``) -- it is
+    #: not a config key and must never be written back as one. The leading
+    #: underscore keeps it out of the config schema/baseline machinery, which skips
+    #: private fields (same convention as ``_degraded_sections``); consumers read
+    #: the :attr:`stub_roster` property.
+    _stub_roster: list[str] = field(
+        default_factory=list,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def stub_roster(self) -> list[str]:
+        """The stub roster as configured, before operator deviations."""
+        return self._stub_roster
+
     pool_identity_env: list[str] = field(
         default_factory=list,
         metadata=_meta(
@@ -4247,11 +4920,12 @@ class InstancesConfig:
             "at once. Least-recently-used instances beyond this are evicted and "
             "reconnected on demand. Bounds memory/socket use (each warm instance is a "
             "full dashboard SPA). 0 (the default) is automatic: the cap follows how "
-            "many crews are currently connected, so a crew you connected is never "
-            "evicted -- eviction cold-boots the pane and reads as a disconnect, so a "
-            "fixed cap below the connected count makes tab switching look like a "
-            "connection flap. Automatic is bounded by an internal ceiling; an explicit "
-            "value is honoured exactly, including one below the connected count.",
+            "many crews are configured, so up to an internal ceiling no crew you added "
+            "is evicted and the cap widens by itself when you add one -- eviction "
+            "cold-boots the pane and reads as a disconnect, so a cap below the number "
+            "of crews in use makes tab switching look like a connection flap. Past that "
+            "ceiling eviction resumes; an explicit value is honoured exactly, including "
+            "one below the number of configured crews.",
         ),
     )
     tunnel_base_port: int = field(
@@ -4455,24 +5129,33 @@ class WatchdogConfig:
         ),
     )
     stale_window_secs: float = field(
-        default=300.0,
+        default=600.0,
         metadata=_meta(
             "Stale probe window (s)",
             "Idle seconds before an UNKNOWN-verdict model-wait turn is safe-probed "
-            "via session/cancel. Probes are non-lethal: a live turn auto-recovers.",
+            "via session/cancel. Probes are non-lethal, but a probe of a LIVE think "
+            "cancels and regenerates it, so the window must clear an ordinary "
+            "silent think. Default 10 min. A think the oracle can attest (an "
+            "established backend socket) gets the longer model-silent window "
+            "instead, so this one governs only thinks with no such evidence: a "
+            "host without procfs, or a backend connection that is momentarily "
+            "down. Its cost is wedge-recovery latency on a runtime that is "
+            "already dead, never lost work.",
         ),
     )
     tool_stall_suspect_secs: float = field(
-        default=3600.0,
+        default=5400.0,
         metadata=_meta(
             "Tool stall suspect (s)",
             "Idle seconds before an UNKNOWN-verdict in-flight tool is cancelled and "
             "the turn routed to tool-stall recovery (continue-nudge, no re-run of "
-            "the original message). WORKING tools (e.g. a matched live build child) "
-            "are never cancelled regardless of duration. Default 1h: generous enough "
-            "for long builds and MCP tools on macOS, where the liveness oracle "
-            "degrades (no /proc) and cannot distinguish a live build from a stall, "
-            "while still landing inside the turn's own ceiling "
+            "the original message). WORKING tools (a matched live build child, an "
+            "MCP subtree with CPU movement) are never cancelled regardless of "
+            "duration, so this window governs only what the liveness oracle cannot "
+            "attest. Default 90 min: it clears every shipped budget a single tool "
+            "call can legitimately spend silent (the task runner's 90-minute test "
+            "command, a full test suite with one retry in one shell call) while "
+            "still landing inside the turn's own ceiling "
             "(agent.chat_turn_timeout_secs) so recovery is reachable. Enforcement is "
             "at handle construction, not config load: a window past the headroom "
             "fraction of the transport's per-prompt timeout is clamped with a "
@@ -4482,25 +5165,27 @@ class WatchdogConfig:
         ),
     )
     tool_stall_hard_cap_secs: float = field(
-        default=3600.0,
+        default=7200.0,
         metadata=_meta(
             "Hard cap (s)",
             "Absolute ceiling for UNKNOWN-verdict forbearance (e.g. the extended "
-            "probably-thinking window). Applies ONLY to UNKNOWN verdicts — never "
-            "to a WORKING session, which is deferred before this cap is consulted "
-            "and is therefore bounded only by the turn's own ceiling. Default 1h, "
-            "clamped against the transport's per-prompt timeout like the suspect "
-            "window.",
+            "probably-thinking window) and for any per-agent "
+            "watchdog_tool_stall_* override. Applies ONLY to UNKNOWN verdicts — "
+            "never to a WORKING session, which is deferred before this cap is "
+            "consulted and is therefore bounded only by the turn's own ceiling. "
+            "Default 2h, clamped against the transport's per-prompt timeout like "
+            "the suspect window.",
         ),
     )
     model_silent_probe_secs: float = field(
-        default=900.0,
+        default=1800.0,
         metadata=_meta(
             "Silent-think probe window (s)",
             "Extended probe window for a model-wait with an established backend "
             "connection but flat counters (non-streamed server-side reasoning, "
             "e.g. long xhigh thinks). Probing a live think cancels and regenerates "
-            "it, so this window is deliberately generous.",
+            "it, so this window is deliberately generous: 30 min clears the long "
+            "end of an extended-effort think.",
         ),
     )
     wellness_sample_secs: float = field(
@@ -6001,3 +6686,27 @@ class TeamsConfig:
         self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
             self.soft_threshold_pct, self.hard_threshold_pct
         )
+
+
+@dataclass
+class WakaTimeConfig:
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Enabled",
+            "Enable the WakaTime integration (send coding-activity heartbeats "
+            "and read back stats). Requires the WAKATIME_API_KEY credential "
+            "stored in the dashboard secrets vault.",
+            tags=["wakatime"],
+        ),
+    )
+    api_base_url: str = field(
+        default="",
+        metadata=_meta(
+            "API Base URL",
+            "Override the WakaTime API base URL for a self-hosted, "
+            "API-compatible backend (Wakapi, Hackatime). Empty uses the public "
+            "WakaTime API at https://wakatime.com/api/v1.",
+            tags=["wakatime"],
+        ),
+    )

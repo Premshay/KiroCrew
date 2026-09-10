@@ -486,6 +486,58 @@ def test_extract_drops_non_http_icon_href() -> None:
     assert meta.icon_candidates == ("https://example.com/favicon.ico",)
 
 
+# --- login-gate titles -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Sign in to Amazon | Slack",
+        "Sign In",
+        "sign-in",
+        "Signin",
+        "Log in",
+        "Login",
+        "Log On",
+        "Sign in - Google Accounts",
+        "Sign in to GitHub · GitHub",
+        "Sign into your account",
+        "Sign in with your Apple ID",
+        "Please log in",
+        "Acme Corp - Sign In",
+        "Slack | Sign in",
+        "Single Sign-On",
+        "Authentication Required",
+    ],
+)
+def test_login_gate_titles_are_detected(title: str) -> None:
+    assert lu.is_login_page_title(title)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "",
+        "Slack is your digital HQ",
+        "How to sign in to AWS",
+        "Assign in bulk",
+        "Logging in production systems",
+        "Log4j vulnerability",
+        "The Sign",
+        "Design tokens - a primer",
+        "Login security best practices",
+        "Sign in with Apple: a guide",
+        "Single sign-on explained",
+        "Sign-in sheets for classrooms",
+    ],
+)
+def test_ordinary_titles_are_not_login_gates(title: str) -> None:
+    """Both ends are anchored: a leading gate phrase must be followed by the
+    title's end, a separator, or a gate continuation — a real title that merely
+    STARTS with "Login"/"Sign in" stays a title."""
+    assert not lu.is_login_page_title(title)
+
+
 # --- icon colour-scheme lanes ----------------------------------------------
 
 
@@ -818,6 +870,37 @@ def test_success_payload_shape(monkeypatch) -> None:
     assert body["domain"] == "example.com"
     assert body["icon"] == "data:image/png;base64,iVBORw=="
     assert isinstance(body["fetched_at"], int) and body["fetched_at"] > 0
+
+
+def test_login_gate_title_falls_back_to_domain_end_to_end(monkeypatch) -> None:
+    """An auth wall's 200 must not label the chip with the gate's own title.
+
+    The text fields are blanked so the client renders the domain; the entry
+    still lands in the POSITIVE cache, because an anonymous re-fetch would be
+    answered by the same gate.
+    """
+    _install(
+        monkeypatch,
+        {
+            "https://ws.slack.com/archives/C123/p456": (
+                200,
+                _HTML_HEADERS,
+                _html(
+                    title="Sign in to Amazon | Slack",
+                    extra='<meta property="og:site_name" content="Slack">',
+                ),
+            ),
+            "https://ws.slack.com/favicon.ico": (404, {}, b""),
+        },
+    )
+    status, body = _run(_call("https://ws.slack.com/archives/C123/p456"))
+    assert status == 200
+    assert body["title"] == ""
+    assert body["description"] == ""
+    assert body["site_name"] == ""
+    assert body["domain"] == "ws.slack.com"
+    entry = lm._CACHE[lu.normalize_cache_key("https://ws.slack.com/archives/C123/p456")]
+    assert entry.payload is not None
 
 
 def test_icon_failure_does_not_fail_the_preview(monkeypatch) -> None:
@@ -1745,3 +1828,29 @@ def test_the_replaced_category_flag_list_would_have_approved_these(address: str)
     )
     assert old_verdict is False, "the old check already caught this; premise is wrong"
     assert lu.address_is_not_public(address) is True
+
+
+@pytest.mark.parametrize("title_source", ["title", "og:title"])
+def test_endpoint_decodes_html_entities_once(monkeypatch, title_source):
+    escaped = "How to spell &amp;lt; and &amp;#65;"
+    title = f"<title>{escaped}</title>" if title_source == "title" else (
+        f'<meta property="og:title" content="{escaped}">'
+    )
+    html = (
+        f"<head>{title}"
+        f'<meta name="description" content="{escaped}">'
+        f'<meta property="og:site_name" content="{escaped}">'
+        '<link rel="icon" href="/icon.png?name=one&amp;amp;two">'
+        "</head>"
+    ).encode()
+    expected_icon = "https://example.com/icon.png?name=one&amp;two"
+    transport = _install(monkeypatch, {
+        "https://example.com/": (200, _HTML_HEADERS, html),
+        expected_icon: (200, {"Content-Type": "image/png"}, b"\x89PNG"),
+    })
+    status, body = _run(_call("https://example.com/"))
+    assert status == 200
+    for field in ("title", "description", "site_name"):
+        assert body[field] == "How to spell &lt; and &#65;"
+    assert body["icon"].startswith("data:image/png;base64,")
+    assert transport.fetch_count == 2

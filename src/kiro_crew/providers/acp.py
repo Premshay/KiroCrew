@@ -11,13 +11,13 @@ from pathlib import Path
 from typing import Any, TypeGuard
 
 from kiro_crew.acp.client import (
-    _NOT_LOGGED_IN_MESSAGE,
     DEFAULT_MODEL,
     AcpAuthRequired,
     AcpClient,
     AcpError,
     advertised_model_ids,
     model_is_unusable,
+    resolve_pin_spelling,
 )
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeError
 from kiro_crew.acp.session_handle import AcpSessionHandle
@@ -29,7 +29,6 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
-    ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SESSION_SHARING,
@@ -42,7 +41,9 @@ from kiro_crew.acp.types import (
     STOP_REASON_END_TURN,
 )
 from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
+from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
+from kiro_crew.agent_sdk.capabilities import SessionCapabilities, capabilities_for
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
@@ -304,7 +305,6 @@ class AcpProvider(LLMProvider):
         tool_search_min_pct: object = None,
         tool_search_min_tokens: object = None,
         mcp_gateway_overlay: str | Path | None = None,
-        mcp_gateway_settings_mcp_json: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         mcp_gateway_claude_servers: list[str] | tuple[str, ...] | None = None,
         permission_mode: str | None = None,
@@ -329,7 +329,6 @@ class AcpProvider(LLMProvider):
             "extra_env": extra_env,
             "acp_backend": acp_backend,
             "mcp_gateway_overlay": mcp_gateway_overlay,
-            "mcp_gateway_settings_mcp_json": mcp_gateway_settings_mcp_json,
             "mcp_gateway_socket": mcp_gateway_socket,
             "mcp_gateway_claude_servers": mcp_gateway_claude_servers,
             # Claude permission mode (Auto-mode/permission-UI parity). None on the
@@ -485,6 +484,25 @@ class AcpProvider(LLMProvider):
         return is_claude_backend_name(self._client.backend)
 
     @property
+    def capabilities(self) -> SessionCapabilities:
+        """What the backend serving this session can DO -- ask this, not who it is.
+
+        The one attribute application code reads to branch on backend behaviour.
+        Every ``is_*_backend`` property beside it names an IDENTITY, and an
+        identity branch hands each new harness whichever arm the old comparison
+        happened to leave behind (harness-parity H6). Those properties stay for
+        the call sites inside this package and for the migration still in front of
+        this one; a consumer outside the boundary reads this instead, and
+        ``test_agent_sdk_capabilities`` pins that the six that already moved do
+        not go back.
+
+        Rebuilt per read rather than cached in ``__init__``: each field is a set
+        membership or a dict lookup over four ids, and an edition can register a
+        backend after this provider was constructed.
+        """
+        return capabilities_for(self._client.backend)
+
+    @property
     def is_codex_backend(self) -> bool:
         """True when this ACP provider talks to codex-acp (vs kiro-cli)."""
         return self._client.backend == ACP_BACKEND_CODEX
@@ -567,13 +585,13 @@ class AcpProvider(LLMProvider):
     def uses_kiro_identity_store(self) -> bool:
         """True when this provider's child signs in from kiro-cli's own store.
 
-        Membership in ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` (harness-parity
+        Membership in ``backends_retired_by_host_logout()`` (harness-parity
         H5/H14). Declaring it here is what lets the session layer ask the
         question through the ABC instead of probing private attributes, so an
         adapted provider is classified by its own declaration rather than by
         whichever internal shape it happens to expose.
         """
-        return self._client.backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        return self._client.backend in host_auth.backends_retired_by_host_logout()
 
     @property
     def mcp_config_hot_reload(self) -> bool:
@@ -809,9 +827,6 @@ class AcpProvider(LLMProvider):
         sandbox_mode = getattr(self._client, "_sandbox_mode", "auto")
         extra_env = getattr(self._client, "_extra_env", None) or {}
         mcp_gateway_overlay = getattr(self._client, "_mcp_gateway_overlay", None)
-        mcp_gateway_settings_mcp_json = getattr(
-            self._client, "_mcp_gateway_settings_mcp_json", None
-        )
         mcp_gateway_socket = getattr(self._client, "_mcp_gateway_socket", None)
         mcp_gateway_claude_servers = getattr(
             self._client, "_mcp_gateway_claude_servers", None
@@ -832,7 +847,6 @@ class AcpProvider(LLMProvider):
             sandbox_mode=sandbox_mode,
             extra_env=extra_env,
             mcp_gateway_overlay=mcp_gateway_overlay,
-            mcp_gateway_settings_mcp_json=mcp_gateway_settings_mcp_json,
             mcp_gateway_socket=mcp_gateway_socket,
             mcp_gateway_claude_servers=mcp_gateway_claude_servers,
             acp_backend=self._client.backend,
@@ -846,7 +860,12 @@ class AcpProvider(LLMProvider):
             # surface an actionable login prompt (parity with AcpClient) rather
             # than a generic runtime-death error.
             if runtime.saw_not_logged_in():
-                raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
+                # ``self._client`` is still the placeholder AcpClient at this
+                # point, and it carries the backend this runtime was spawned for
+                # (it is the value passed as ``acp_backend`` above) — so the
+                # sign-in advice names the harness that actually failed to
+                # authenticate rather than assuming kiro-cli.
+                raise AcpAuthRequired(host_auth.signed_out_message(self._client.backend)) from exc
             raise
         finally:
             # subprocess launch + ACP `initialize` handshake
@@ -934,7 +953,6 @@ class AcpProvider(LLMProvider):
                         sandbox_mode=sandbox_mode,
                         extra_env=extra_env,
                         mcp_gateway_overlay=mcp_gateway_overlay,
-                        mcp_gateway_settings_mcp_json=mcp_gateway_settings_mcp_json,
                         mcp_gateway_socket=mcp_gateway_socket,
                         mcp_gateway_claude_servers=mcp_gateway_claude_servers,
                         acp_backend=self._client.backend,
@@ -944,7 +962,9 @@ class AcpProvider(LLMProvider):
                         await runtime.spawn()
                     except AcpRuntimeError as exc:
                         if runtime.saw_not_logged_in():
-                            raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
+                            raise AcpAuthRequired(
+                                host_auth.signed_out_message(self._client.backend)
+                            ) from exc
                         raise
                 try:
                     handle = await runtime.create_session(
@@ -954,7 +974,9 @@ class AcpProvider(LLMProvider):
                     )
                 except AcpRuntimeError as exc:
                     if runtime.saw_not_logged_in():
-                        raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
+                        raise AcpAuthRequired(
+                            host_auth.signed_out_message(self._client.backend)
+                        ) from exc
                     raise
                 finally:
                     # In a finally, mirroring session_load: a start that BLEW its
@@ -979,7 +1001,15 @@ class AcpProvider(LLMProvider):
                 # Leaving it unset keeps the session on the backend's own
                 # default, so the turn succeeds.
                 _advertised = advertised_model_ids(handle.available_models)
+                _send_model = configured_model
                 if model_is_unusable(configured_model, _advertised):
+                    # A literal miss can be a stale `<namespace>::` qualifier on
+                    # a model the backend fully serves (#8521): resolve to the
+                    # advertised spelling and send THAT — same fold the display
+                    # verdict uses, so chip and wire agree. A pin absent under
+                    # either spelling still takes the withhold.
+                    _send_model = resolve_pin_spelling(configured_model, _advertised)
+                if not _send_model:
                     logger.warning(
                         "Configured model %s is not available to this account; "
                         "leaving the session on the backend default (advertised: %s)",
@@ -989,12 +1019,12 @@ class AcpProvider(LLMProvider):
                 else:
                     _t_model = time.monotonic()
                     try:
-                        await handle.set_model(configured_model)
-                        logger.info("Kiro runtime model set: %s", configured_model)
+                        await handle.set_model(_send_model)
+                        logger.info("Kiro runtime model set: %s", _send_model)
                     except Exception:
                         logger.warning(
                             "Failed to set model %s on kiro runtime session",
-                            configured_model,
+                            _send_model,
                             exc_info=True,
                         )
                     finally:
@@ -1385,10 +1415,12 @@ class AcpProvider(LLMProvider):
             text=e.text,
             tool_call_id=e.tool_call_id,
             title=e.title,
+            wire_title=e.wire_title,
             tool_kind=e.tool_kind,
             tool_purpose=e.tool_purpose,
             context_usage_pct=e.context_usage_pct,
             stop_reason=e.stop_reason,
+            refusal=e.refusal,
             synthetic_completion=e.synthetic_completion,
             request_id=e.request_id,
             options=e.options,
@@ -1615,6 +1647,16 @@ class AcpProvider(LLMProvider):
     def is_process_alive(self) -> bool:
         """True if the underlying OS process has not exited (ignores I/O staleness)."""
         return self._client.is_process_alive()
+
+    @property
+    def process_instance(self) -> str:
+        """Per-spawn identity of the client's current child process (see base).
+
+        A direct read on purpose: a `getattr` hedge would convert a future
+        wiring break into "no banner is ever live", indistinguishable from
+        correct expiry.
+        """
+        return self._client.process_instance
 
     def has_active_turn(self) -> bool:
         """True if a prompt is in flight (and not yet cancelled) on the client."""

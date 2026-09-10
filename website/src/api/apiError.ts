@@ -40,6 +40,16 @@ export class ApiError extends Error {
 }
 
 /**
+ * True for a rejection that means "the resource is absent" (HTTP 404), as
+ * opposed to a request that FAILED. Duck-typed on `status` rather than
+ * `instanceof ApiError` so a page that reads it keeps working under a mocked
+ * `api/client` (the suites reject with `Object.assign(new Error(), { status })`),
+ * and so any future ApiError-shaped rejection from a different transport counts.
+ */
+export const isNotFoundError = (e: unknown): boolean =>
+  typeof e === 'object' && e !== null && (e as { status?: unknown }).status === 404
+
+/**
  * The `error` field of a JSON error envelope, or '' when the body is not JSON
  * or carries no such field. Deliberately narrower than the unwrap below, which
  * also accepts `detail`/`message`: this one is used to tell a Kiro Crew refusal
@@ -55,6 +65,13 @@ const errorFieldOf = (body: string): string => {
 }
 
 /**
+ * A body whose first markup is a document type: both doctype spellings, plus a
+ * bare `<html>` from a proxy that emits none. Deliberately does NOT match every
+ * `<`-leading body, so an XML error envelope still reaches the caller whole.
+ */
+const HTML_DOCUMENT_START = /^<(?:!doctype\s|html[\s>])/i
+
+/**
  * Map raw edge/proxy error bodies to a human-readable message. A dashboard
  * served through Builder Tunnels sits behind API Gateway, whose throttle
  * response is the opaque `{"message":"Rate exceeded","throttlingReasons":null}`
@@ -66,6 +83,10 @@ const errorFieldOf = (body: string): string => {
  * so for those this text is the FIRST thing the operator sees rather than the
  * last resort — which is why it must not be shown unless the edge really is
  * what answered.
+ *
+ * Returns `''` for a body carrying no human message, which is the signal every
+ * caller already turns into `HTTP <status>` — so that wording stays decided in
+ * one place. The raw body remains on `ApiError.body` for diagnostics.
  */
 export const friendlyErrText = (status: number, body: string): string => {
   if (status === 429) {
@@ -96,6 +117,9 @@ export const friendlyErrText = (status: number, body: string): string => {
       if (typeof msg === 'string' && msg.trim()) return msg
     } catch { /* not JSON — fall through to raw body */ }
   }
+  // An error PAGE has no message field to unwrap, so returning it verbatim put
+  // `<!DOCTYPE html><html><head><meta charset="utf…` in the dashboard's topbar.
+  if (HTML_DOCUMENT_START.test(trimmed)) return ''
   return body
 }
 

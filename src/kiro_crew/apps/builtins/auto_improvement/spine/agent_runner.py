@@ -532,6 +532,7 @@ def _governance_denial(ev: object, *, session_key: str, agent: str) -> str:
             app="auto-improvement",
             tool_kind=tool_kind,
             raw_params=getattr(ev, "raw_tool_params", None),
+            diff_path=getattr(ev, "diff_path", "") or "",
             command=command or None,
             # From the EVENT, not derived from the command. `HookManager.on_tool_call` denies
             # when `is_shell and not command` — a shell tool whose command could not be
@@ -540,6 +541,9 @@ def _governance_denial(ev: object, *, session_key: str, agent: str) -> str:
             # command meant is_shell=False, so the request was treated as a non-shell tool and
             # skipped the branch written for it.
             is_shell=bool(getattr(ev, "is_shell", False)) or bool(command),
+            mcp_server_name=getattr(ev, "mcp_server_name", "") or "",
+            mcp_tool_name=getattr(ev, "tool_name", "") or "",
+            mcp_identity_trusted=bool(getattr(ev, "mcp_identity_trusted", False)),
         )
         if getattr(result, "action", "") == TOOL_DENY:
             return (getattr(result, "reason", "") or "denied by governance policy").strip()
@@ -1180,13 +1184,26 @@ class SessionAgentRunner:
     @staticmethod
     def available() -> bool:
         """True iff a Kiro Crew provider factory can be built (a backend is configured).
-        Lets the backend prefer this runner and fall back to the subprocess ``claude -p``
-        runner only when no provider is available."""
+        Lets the backend prefer this runner; there is no subprocess fallback left, so a
+        False here means the backend stays offline."""
         try:
 
             cfg = KiroCrewConfig.load()
             return cfg.create_provider_factory() is not None
         except Exception:  # noqa: BLE001 — any failure → not available, caller falls back
+            # Do NOT discard this. ``create_provider_factory`` has a single method-level
+            # return and cannot yield None, so False is reachable ONLY from this handler —
+            # i.e. only when something raised. The backend's offline reason already tells
+            # the operator that "the gateway config load or the provider-factory
+            # construction raised", and without this line it can never say WHAT raised.
+            # The realistic cause is the acp → client → session → config.loader circular
+            # import the loader documents, which resolves only when ``acp`` is imported
+            # first, and it was previously invisible in every log.
+            logger.warning(
+                "SessionAgentRunner.available(): provider factory could not be built, "
+                "reporting the agent runner as unavailable",
+                exc_info=True,
+            )
             return False
 
     def ensure_agent_registered(self) -> bool:
@@ -1633,7 +1650,7 @@ def _repro_test_dir(worktree: Path) -> str:
     The prompt used to hard-code ``test/``, but a repo using ``tests/`` (plural) then got
     a reproducing test written into a directory that does not exist, so T2 could never
     collect it and EVERY candidate failed ``test_invalid`` regardless of fix quality.
-    Found by running docs/system-specs/modules/auto-improvement-test-plan.md against Zedmor/chess_test, which uses ``tests/``.
+    Found by running docs/system-specs/modules/auto-improvement.md against Zedmor/chess_test, which uses ``tests/``.
 
     The edit fence already permits both (``_ADDABLE_TEST_GLOBS``), so only the
     instruction was wrong. Prefers an EXISTING directory; falls back to ``test``.

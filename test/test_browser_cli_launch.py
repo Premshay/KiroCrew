@@ -202,17 +202,11 @@ def test_the_launch_config_is_write_protected_from_the_agent(
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
     path = str(mod.launch_config_path())
 
-    # 1. the file-edit gate
+    # The file-edit gate. The shell gate matches no paths in command text, and the
+    # sandbox keeps this leaf VISIBLE on purpose (the CLI opens it on every
+    # invocation), so a shell write is the accepted residual: the agent can already
+    # point PLAYWRIGHT_MCP_CONFIG at a file of its own.
     assert security.is_sensitive_write_path(path) is True
-    # 2. the shell gate, across the spellings it does cover
-    for command in (
-        "echo x > ~/.kiro/crew/playwright-cli-config.json",
-        "echo x > $HOME/.kiro/crew/playwright-cli-config.json",
-        "echo x > ~/.kirocrew/playwright-cli-config.json",  # legacy data home
-        "tee ~/.kiro/crew/playwright-cli-config.json",
-        "cp /tmp/evil.json ~/.kiro/crew/playwright-cli-config.json",
-    ):
-        assert security.is_sensitive_bash_command(command) is not None, command
     # Readable through Python: the CLI opens it on every invocation.
     assert security.is_sensitive_path(path) is False
 
@@ -220,15 +214,9 @@ def test_the_launch_config_is_write_protected_from_the_agent(
 def test_launch_config_shell_protection_matches_an_existing_protected_leaf() -> None:
     """The shell gate treats this leaf exactly as it treats a long-standing one.
 
-    Parity is the honest assertion, and the durable one. The leaf is deliberately
-    ANCHORED rather than bare-token: per the scope note on
-    ``_BARE_TOKEN_PROTECTED_LEAVES``, a leaf earns anchor-independent matching only
-    when the filename IS the grant, and here it is not -- the agent can point
-    ``PLAYWRIGHT_MCP_CONFIG`` at a file of its own. So a ``cd``-relative write is
-    the accepted residual, exactly as it is for the on-call schedule.
-
-    Asserting parity is what protects the invariant: it fails if someone protects
-    one leaf and not the other, and it does not pretend a gap is closed.
+    Parity is the honest assertion, and the durable one: the gate matches no paths
+    in command text, so neither leaf is refused there, and this fails the moment
+    someone fences one of the two by text without the other.
     """
     from kiro_crew import security
 
@@ -429,6 +417,117 @@ def test_browser_socket_env_namespaces_configured_bases(
         own_socket_base / "a1b2c3d4" / "s",
         own_daemon_base / "a1b2c3d4" / "d",
     ]
+
+
+def test_browser_socket_env_ignores_an_inherited_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root already under ours arrived by inheritance, not by intent.
+
+    Both spawn sites build the child env from ``{**os.environ, ...}``, so a
+    gateway started from inside an agent process passes its own lifecycle roots
+    down. Namespacing under them nested every session one level deeper inside
+    the parent's root instead of beside it.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr(mod, "config_dir", lambda: home)
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", lambda _path: None)
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    root = home / mod._LIFECYCLE_DIR
+
+    env = {
+        mod.SESSION_ENV: "kc-a1b2c3d4",
+        # what a parent agent process exports
+        mod.SOCKETS_ENV: str(root / "deadbeef" / "s"),
+        mod.DAEMON_DIR_ENV: str(root / "deadbeef" / "d"),
+    }
+    assert mod.browser_socket_env(env) == {
+        mod.SOCKETS_ENV: str(root / "a1b2c3d4" / "s"),
+        mod.DAEMON_DIR_ENV: str(root / "a1b2c3d4" / "d"),
+    }
+
+
+def test_nesting_cannot_deepen_however_long_the_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The end-to-end property: depth stays 1, so the AF_UNIX budget is fixed.
+
+    Feeding each generation's output back in as the next generation's
+    environment is what a gateway-inside-an-agent-inside-a-gateway does.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr(mod, "config_dir", lambda: home)
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", lambda _path: None)
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    root = home / mod._LIFECYCLE_DIR
+
+    env = {mod.SESSION_ENV: "kc-00000000"}
+    for generation in range(6):
+        env = {mod.SESSION_ENV: f"kc-0000000{generation}", **mod.browser_socket_env(env)}
+        socket_root = Path(env[mod.SOCKETS_ENV])
+        assert socket_root.parent.parent == root, f"generation {generation} nested"
+        assert len(socket_root.relative_to(root).parts) == 2
+
+
+def test_a_foreign_configured_root_is_still_honoured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard must not cost an operator their deliberate override."""
+    home = tmp_path / "home"
+    elsewhere = tmp_path / "operator-chosen"
+    monkeypatch.setattr(mod, "config_dir", lambda: home)
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", lambda _path: None)
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+
+    env = {mod.SESSION_ENV: "kc-a1b2c3d4", mod.SOCKETS_ENV: str(elsewhere)}
+    additions = mod.browser_socket_env(env)
+    assert additions[mod.SOCKETS_ENV] == str(elsewhere / "a1b2c3d4" / "s")
+    # the unset sibling still falls to the default root
+    assert additions[mod.DAEMON_DIR_ENV] == str(
+        home / mod._LIFECYCLE_DIR / "a1b2c3d4" / "d"
+    )
+
+
+def test_browser_socket_env_ignores_an_inherited_root_from_another_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trigger flows change ``KIROCREW_HOME``, so identity would miss them.
+
+    ``dev-backend.sh`` exports its own ``KIROCREW_HOME`` and a pod runs an
+    isolated one, so the inherited root sits under the PARENT's home. Testing
+    location against the child's own ``config_dir()`` would read that as a
+    foreign operator base and keep nesting -- and it would also let a pod write
+    its sockets outside its isolated home. Recognition is by shape instead.
+    """
+    parent_home = tmp_path / "parent-home"
+    child_home = tmp_path / "pod-home"
+    monkeypatch.setattr(mod, "config_dir", lambda: child_home)
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", lambda _path: None)
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    parent_root = parent_home / mod._LIFECYCLE_DIR
+
+    env = {
+        mod.SESSION_ENV: "kc-a1b2c3d4",
+        mod.SOCKETS_ENV: str(parent_root / "deadbeef" / "s"),
+        mod.DAEMON_DIR_ENV: str(parent_root / "deadbeef" / "d"),
+    }
+    additions = mod.browser_socket_env(env)
+
+    child_root = child_home / mod._LIFECYCLE_DIR
+    assert additions == {
+        mod.SOCKETS_ENV: str(child_root / "a1b2c3d4" / "s"),
+        mod.DAEMON_DIR_ENV: str(child_root / "a1b2c3d4" / "d"),
+    }
+    # and nothing was written into the parent's home
+    assert parent_home not in Path(additions[mod.SOCKETS_ENV]).parents
 
 
 def test_browser_socket_env_fails_without_partial_additions(

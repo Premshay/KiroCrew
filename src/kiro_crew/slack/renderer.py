@@ -13,8 +13,7 @@ approve/deny buttons. The interactive decision is awaited via
 :class:`SlackApprovalDecider`, whose future is resolved by the Slack
 interaction handler when the user clicks a button.
 
-Two channel-neutral halves do the work this module used to do badly or not at
-all:
+Two channel-neutral halves own work this module deliberately does not:
 
 * **Length splitting** belongs to
   :func:`kiro_crew.messaging.split.split_markdown_safe`, the shared fence-safe
@@ -62,6 +61,7 @@ from kiro_crew.slack.handler import (
     _APPROVAL_TIMEOUT,
     _CURSOR,
     _EDIT_INTERVAL,
+    _STREAM_CONTINUED,
     _THINKING,
     StatusReactionController,
     _append_footer_actions,
@@ -137,8 +137,8 @@ def _display_safe(text: str) -> str:
 
 
 #: Slack channel capabilities live in ``slack/transport.py`` (imported above).
-#: This module used to carry a second literal copy of the declaration; two
-#: literals for one fact is a drift hazard, and they had already diverged once.
+#: This module deliberately carries no second literal copy of the declaration;
+#: two literals for one fact is a drift hazard.
 
 
 def _approval_registry_key(session_key: str, request_id: str | int) -> str:
@@ -434,7 +434,10 @@ class SlackRenderer(Renderer):
         if self._stream_ts:
             await self.slack.stop_stream(self.channel, self._stream_ts)
         new_ts = await self.slack.start_stream(
-            self.channel, self.thread_ts or "", user_id=self._user_id or None
+            self.channel,
+            self.thread_ts or "",
+            initial_text=_STREAM_CONTINUED,
+            user_id=self._user_id or None,
         )
         if new_ts:
             self._stream_ts = new_ts
@@ -675,7 +678,7 @@ class SlackRenderer(Renderer):
         """Final no-stream render: the whole answer, not a truncated prefix.
 
         ``_safe_update`` truncates at Slack's message limit, so an over-limit
-        answer used to lose its tail with only a notice where the native handler
+        answer would lose its tail with only a notice where the native handler
         splits. Consumes the splitter's contract by sealing chunk 0 into the live
         message and posting the rest as thread replies, in order.
         """
@@ -689,19 +692,19 @@ class SlackRenderer(Renderer):
                 logger.debug("slack: posting a continuation chunk failed", exc_info=True)
 
     async def _append_task(self, task_id: str, title: str, status: str, details: str = "") -> bool:
-        """Append a task card, rotating once on failure (native ``_append_task``)."""
+        """Append a task card. Never rotates (native ``_append_task``).
+
+        The card is progress decoration and ``_tool_elapsed_updater`` re-sends it
+        every 30s for as long as a tool runs, so on a long tool phase it is the
+        only caller touching the stream — and rotating on its failure would cost
+        the reader the message they are watching and split the answer in two.
+        ``_append_stream`` still rotates for real text.
+        """
         if not self._stream_ts:
             return False
-        ok = await self.slack.append_task(
+        return await self.slack.append_task(
             self.channel, self._stream_ts, task_id, title, status, details=details
         )
-        if not ok and self._use_slack_stream:
-            if await self._rotate_stream():
-                assert self._stream_ts is not None
-                return await self.slack.append_task(
-                    self.channel, self._stream_ts, task_id, title, status, details=details
-                )
-        return ok
 
     def _tool_elapsed_str(self) -> str:
         """Formatted elapsed time for the active tool, or '' (native helper)."""

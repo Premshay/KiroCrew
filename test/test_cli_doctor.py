@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -80,6 +81,42 @@ class TestFixHint:
         # No Windows arm supplied → keep the Linux text rather than inventing one.
         monkeypatch.setattr(cli_doctor._plat, "system", lambda: "Windows")
         assert cli_doctor._os_fix_hint("brew x", "linux x") == "linux x"
+
+
+class TestFfmpegLinuxHintResolvable:
+    """The Linux missing-ffmpeg hint names only locations the resolver searches (#8897).
+
+    An earlier hint told the user to drop a static build into ``~/.local/bin``,
+    which ``transcribe._find_ffmpeg`` deliberately never searches (its candidate
+    list documents removing that directory), so following the advice literally
+    still ended at "not found". Hold the hint against the resolver's own candidate
+    list rather than freezing its prose.
+    """
+
+    def test_hint_does_not_name_the_deliberately_excluded_dir(self) -> None:
+        assert ".local/bin" not in cli_doctor._FFMPEG_LINUX_HINT
+
+    def test_every_directory_named_is_actually_searched(self) -> None:
+        from kiro_crew import transcribe
+
+        dirs = re.findall(r"/[A-Za-z0-9._/-]+", cli_doctor._FFMPEG_LINUX_HINT)
+        assert dirs, "the hint must name at least one concrete install directory"
+        for directory in dirs:
+            assert (
+                directory in transcribe._FFMPEG_CANDIDATE_DIRS
+            ), f"{directory} is in the doctor hint but _find_ffmpeg never searches it"
+
+    def test_hint_offers_the_managed_store_download(self) -> None:
+        # The store download is the remedy that needs no PATH reasoning and works
+        # on distros with no packaged ffmpeg (the AL2023 case the old hint cited).
+        # Anchored to the decoder table, not the prose alone: if the pinned Linux
+        # artifacts were ever dropped, the hint would promise a download the
+        # gateway refuses (409 decoder_unsupported_platform).
+        from kiro_crew.stt import decoder
+
+        assert "dashboard" in cli_doctor._FFMPEG_LINUX_HINT
+        assert decoder.artifact_for("Linux", "x86_64") is not None
+        assert decoder.artifact_for("Linux", "aarch64") is not None
 
 
 class TestDataHome:
@@ -514,6 +551,60 @@ class TestMemoryPressure:
         assert issues == []
 
 
+class TestDoctorAgentAuth:
+    """One sign-in row per selectable harness, from its declaration."""
+
+    def _run(self, monkeypatch, capsys, backends, signed_in):
+        from kiro_crew import acp_backends
+
+        probes: list[int] = []
+
+        def probe():
+            probes.append(1)
+            return signed_in
+
+        monkeypatch.setattr(acp_backends, "selectable_backend_values", lambda: backends)
+        monkeypatch.setattr(cli_doctor, "_kiro_cli_signed_in", probe)
+        cli_doctor._doctor_agent_auth()
+        return capsys.readouterr().out, len(probes)
+
+    def test_a_separate_sign_in_harness_is_not_probed(self, monkeypatch, capsys) -> None:
+        """Reading another harness's token is what the credential floor forbids, so
+        the row names the store and prints the declared ACTION, unprobed, and says
+        so -- the marker tells the operator this is absence of evidence, not a
+        verdict."""
+        from kiro_crew.agent_sdk import host_auth
+
+        out, probes = self._run(monkeypatch, capsys, ["codex"], signed_in=True)
+        assert probes == 0
+        assert host_auth.entitlement_label("codex") in out
+        assert "not checked here" in out
+        # Wrapped, not reworded: every word of the remedy reaches the row.
+        for word in host_auth.declaration_for("codex").sign_in_remedy.split():
+            assert word in out, word
+        assert host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE not in out
+
+    def test_host_store_harnesses_share_one_probe(self, monkeypatch, capsys) -> None:
+        """kiro and KAS both resolve tokens from the host store, so the row probes it
+        once, and a signed-out answer prints the signed-out STATEMENT -- the one row
+        with evidence behind it."""
+        from kiro_crew.agent_sdk import host_auth
+
+        out, probes = self._run(monkeypatch, capsys, ["", "kas"], signed_in=False)
+        assert probes == 1
+        assert out.count("not signed in") == 2
+        for word in host_auth.signed_out_message("").split():
+            assert word in out, word
+
+    def test_an_unknown_probe_is_not_reported_as_signed_out(self, monkeypatch, capsys) -> None:
+        """A spawn that failed says nothing about the store; reporting it as signed
+        out would send an operator to re-run a login they already completed."""
+        out, probes = self._run(monkeypatch, capsys, [""], signed_in=None)
+        assert probes == 1
+        assert "could not check" in out
+        assert "not signed in" not in out
+
+
 class TestDoctorKas:
     """`kirocrew doctor` KAS backend section — gated on acp_backend == kas.
 
@@ -553,6 +644,8 @@ class TestDoctorKas:
     def test_engine_supported_prints_the_relay_argv(self, monkeypatch, capsys) -> None:
         self._patch_cfg(monkeypatch, "kas")
         monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
+        monkeypatch.setattr("kiro_crew.auth.bridge.vault_holds_identity", lambda: False)
+        monkeypatch.setattr("kiro_crew.auth.bridge.describe_vault_identity", lambda: None)
         monkeypatch.setattr(
             cli_doctor,
             "_kas_relay_help",
@@ -563,7 +656,33 @@ class TestDoctorKas:
         out = capsys.readouterr().out
         # The exact invocation, so a reader can reproduce it by hand.
         assert "acp --agent-engine v3 --auth-method cli" in out
+        assert "auth owner:  kiro-cli credential store" in out
+        assert "crew vault:" not in out
         assert "✅ v3 supported" in out
+        assert issues == []
+
+    def test_crew_sign_in_prints_the_crew_owned_argv(self, monkeypatch, capsys) -> None:
+        """With an identity in Crew's vault the reported argv drops the flag and
+        names Crew as the auth owner -- the same decision the runtime makes."""
+        self._patch_cfg(monkeypatch, "kas")
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
+        monkeypatch.setattr("kiro_crew.auth.bridge.vault_holds_identity", lambda: True)
+        monkeypatch.setattr(
+            "kiro_crew.auth.bridge.describe_vault_identity",
+            lambda: "social/Google, expires in 42m, refresh token present -> usable",
+        )
+        monkeypatch.setattr(
+            cli_doctor,
+            "_kas_relay_help",
+            lambda _binary: "--agent-engine <ENGINE>  v1, v2 (default), or v3",
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        out = capsys.readouterr().out
+        assert "acp --agent-engine v3\n" in out
+        assert "--auth-method" not in out
+        assert "auth owner:  Kiro Crew vault" in out
+        assert "crew vault:  social/Google" in out
         assert issues == []
 
     def test_engine_missing_appends_issue(self, monkeypatch, capsys) -> None:
@@ -651,14 +770,27 @@ class TestDoctorKas:
 
         Pinned as an assertion because the previous implementation DID shell out
         for one, and re-adding that would put Crew back in the credential path.
+
+        The row is asserted against the DECLARED entitlement source rather than
+        against its prose: which store holds the token is the fact, and pinning a
+        sentence instead would fail on a reword while still passing if the block
+        grew a probe.
+
+        Against the source's operator-facing LABEL, and asserting the identifier is
+        absent. Both halves matter: the label proves the row still names the declared
+        source, and the identifier's absence proves a snake_case internal is not being
+        printed into a row a human reads during triage.
         """
+        from kiro_crew.agent_sdk import host_auth
+
         self._patch_cfg(monkeypatch, "kas")
         monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
         monkeypatch.setattr(cli_doctor, "_kas_relay_help", lambda _binary: "v3")
         issues: list[str] = []
         cli_doctor._doctor_kas(issues)
         out = capsys.readouterr().out
-        assert "owned by kiro-cli" in out
+        assert host_auth.entitlement_label("kas") in out
+        assert host_auth.ENTITLEMENT_HOST_IDENTITY_STORE not in out
         assert not hasattr(cli_doctor, "_kas_version_label")
 
 

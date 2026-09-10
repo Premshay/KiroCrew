@@ -17,6 +17,7 @@ Tools:
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
 import platform
@@ -28,6 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,7 +53,7 @@ from kiro_crew.knowledge.embedder import create_embedder_from_config
 from kiro_crew.knowledge.retrieval import HybridRetriever
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.loopback_http import loopback_urlopen
-from kiro_crew.mcp_caller import current_caller
+from kiro_crew.mcp_caller import CallerContext, current_caller, set_current_caller
 from kiro_crew.mcp_shared import (
     call_tool_with_logging,
     internal_caller,
@@ -67,6 +69,7 @@ from kiro_crew.security import (
     redact_exfiltration_urls,
 )
 from kiro_crew.sel import sel
+from kiro_crew.session_directive import DIRECTIVE_TOOLS, refuse_if_markerless
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.validation import (
     MCP_CORE_SCHEMAS,
@@ -847,6 +850,60 @@ def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
     )
 
 
+#: The REFLEXIVE tool surface: every module whose MCP tools embed "my session"
+#: in their semantics (ledger writes, monitor loops, session-scoped control,
+#: attributed channel sends, crew/app state, cron ownership). Each of these
+#: resolves the caller STRICTLY through :func:`require_strict_session_key` —
+#: never the lenient :func:`_resolve_session_key`, whose ``/proc`` ancestor
+#: walk hands a subagent its PARENT slot's identity. This is data, not lore:
+#: ``test/test_identity_topology.py`` scans the source tree and fails when a
+#: module calls the strict resolver directly (bypassing the gate) or calls the
+#: gate without being registered here, so the NEXT reflexive tool cannot skip
+#: the gate silently. Paths are relative to ``src/kiro_crew``.
+REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
+    {
+        "mcp_computer.py",
+        "mcp_cron.py",
+        "mcp_dashboard.py",
+        "mcp_work.py",
+        "mcp_tools/apps.py",
+        "mcp_tools/control.py",
+        "mcp_tools/ledger.py",
+        "mcp_tools/messaging.py",
+        "mcp_tools/workflows.py",
+    }
+)
+
+
+def require_strict_session_key(refusal: str, server: str = "kirocrew-core") -> tuple[str, str]:
+    """The ONE fail-closed identity gate every reflexive tool routes through.
+
+    Returns ``(key, "")`` when the caller is strictly identified, and
+    ``("", error)`` otherwise, where ``error`` is the caller-supplied
+    ``refusal`` text with :func:`strict_identity_diagnosis` appended so the
+    operator learns why THIS install cannot answer "which session is calling".
+
+    Resolution is :func:`_resolve_session_key_strict` — gateway-injected
+    caller context, ``KIROCREW_SESSION_KEY``, or the HMAC-verified host-pid
+    sidecar; never the lenient ``/proc`` ancestor walk, under which a subagent
+    resolves to its PARENT slot and could read or mutate the parent's state.
+
+    The tuple shape is deliberate: each call site keeps its own arm. Most
+    refuse with the ``error`` half; tools that legitimately degrade instead
+    (``autonudge_stop`` short-circuits, ``ask_question`` gates on the
+    dashboard surface, computer-use falls back to an unresolved placeholder)
+    use the resolve half only and ignore ``error``. What no call site may do
+    is resolve identity for a reflexive tool through anything but this gate —
+    the ratchet test over :data:`REFLEXIVE_TOOL_MODULES` enforces exactly
+    that. Callers must send the KEY THIS GATE RETURNED on the wire:
+    re-resolving at the write would check one identity and act as another.
+    """
+    sk = _resolve_session_key_strict()
+    if sk:
+        return sk, ""
+    return "", refusal + strict_identity_diagnosis(server)
+
+
 def _deny_channel_agent_messaging(caller_session: str, tool_name: str) -> str | None:
     """Return an ``Error:`` denial when a channel agent calls a messaging tool.
 
@@ -1011,7 +1068,9 @@ def _vet_browse_governance(caller_session: str) -> str | None:
         return None
 
 
-def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
+def _vet_channel_governance(
+    caller_session: str, transport: str, tool_name: str = "send_message"
+) -> str | None:
     """Return a denial reason if governance forbids messaging *via transport*.
 
     The ``channels`` scope (a ScopedMap) is the per-transport allowlist: which
@@ -1021,8 +1080,14 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
     generally but restrict it to specific transports (e.g. Slack only).  We
     query the ScopedMap ``members`` allowlist for *transport*.  ``posture`` (the
     per-transport identity ceiling, policy-only) is enforced at the transport's
-    own admission path, not here.  Same stdio-silent, fail-closed-CPP discipline
-    as :func:`_vet_messaging_governance`.
+    own admission path, not here.
+
+    ``tool_name`` attributes the SEL audit records (denial / degraded) to the
+    actual calling tool — the gate is shared by ``send_message`` and
+    ``update_message``, and the persisted audit trail must name the real caller.
+
+    Same stdio-silent, fail-closed-CPP discipline as
+    :func:`_vet_messaging_governance`.
     """
     from kiro_crew.platform.context import PlatformCompositionError
 
@@ -1038,9 +1103,7 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
             log_warning=False,
         )
         if not getattr(decision, "permitted", True):
-            _audit_governance_deny(
-                caller_session, f"send_message:{transport}", "channels", decision
-            )
+            _audit_governance_deny(caller_session, f"{tool_name}:{transport}", "channels", decision)
             return f"messaging via transport {transport!r} blocked by governance policy"
         return None
     except PlatformCompositionError:
@@ -1051,7 +1114,7 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
             from kiro_crew.platform.governance_profiles import audit_governance_degraded
 
             audit_governance_degraded(
-                f"send_message:{transport}",
+                f"{tool_name}:{transport}",
                 session_key=caller_session,
                 scope="channels",
                 app=_governance_app(),
@@ -1474,9 +1537,7 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
                 # content, so only a short identifier-shaped value survives —
                 # anything else is dropped rather than echoed onward.
                 raw_code = parsed.get("code")
-                if isinstance(raw_code, str) and _re.fullmatch(
-                    r"[a-z0-9_.-]{1,64}", raw_code
-                ):
+                if isinstance(raw_code, str) and _re.fullmatch(r"[a-z0-9_.-]{1,64}", raw_code):
                     code = raw_code
         except Exception:
             pass
@@ -1800,17 +1861,137 @@ def _classify_slack_identity() -> tuple[str, str | None]:
     return ("non_slack", None)
 
 
+#: The ``tools/call`` name and RAW (pre-validation) arguments of the call in
+#: flight, installed by :func:`_call_tool` and cleared on its exit. Read by
+#: ``mcp_tools.control._emit_directive`` to report the CALL to the gateway, which
+#: derives the directive from it (see :func:`derive_directive`). ContextVars so a
+#: pooled server handling concurrent calls never reports one call under another.
+_CURRENT_CALL_NAME: ContextVar[str] = ContextVar("kirocrew_current_call_name", default="")
+_CURRENT_CALL_RAW_ARGS: ContextVar[dict[str, Any]] = ContextVar(
+    "kirocrew_current_call_raw_args", default={}
+)
+
+
+def current_call_name() -> str:
+    """The ``tools/call`` name of the call in flight, or ``""``."""
+    return _CURRENT_CALL_NAME.get()
+
+
+def current_call_raw_args() -> dict[str, Any]:
+    """The RAW ``tools/call`` arguments of the call in flight (pre-validation)."""
+    return copy.deepcopy(_CURRENT_CALL_RAW_ARGS.get())
+
+
+#: When set, ``mcp_tools.control._emit_directive`` records its validated
+#: ``(kind, args)`` here INSTEAD of POSTing it. This is how the gateway derives a
+#: directive's payload itself: it re-runs the directive tool on the raw call
+#: arguments the MCP stub reported, so the applied payload is a function of the
+#: victim's own call and never of a caller-supplied body. ``None`` = normal mode.
+_DIRECTIVE_CAPTURE: ContextVar[list[tuple[str, dict[str, Any]]] | None] = ContextVar(
+    "kirocrew_directive_capture", default=None
+)
+
+
+def capture_directive(kind: str, args: dict[str, Any]) -> bool:
+    """Record ``(kind, args)`` into the active capture slot; True if captured."""
+    sink = _DIRECTIVE_CAPTURE.get()
+    if sink is None:
+        return False
+    sink.append((kind, dict(args)))
+    return True
+
+
+def derive_directive(
+    tool: str, raw_args: dict[str, Any], session_key: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Re-run directive tool *tool* on *raw_args* AS *session_key* and return the
+    ``(kind, args)`` it would have published, or None if it published nothing
+    (refused, not a directive tool, or raised).
+
+    Runs in the GATEWAY process. *session_key* is the caller's ``X-Session-Key``
+    as the gateway verified it -- kernel-attested on the unix socket, bearer-token
+    ``internal_auth`` on TCP -- and is installed as the call's :class:`CallerContext` for the
+    duration -- source 0 of ``_resolve_session_key_strict`` -- so a handler that
+    refuses without a strict identity (``monitor_watch``, ``monitor_stop``,
+    ``monitor_update``) sees the same session the stub would have and derives
+    rather than short-circuiting. That is the identity gatewayd injects for a
+    pooled backend, arrived at by the same verification. Every write the handler
+    would perform is the POST, and capture mode intercepts exactly that.
+
+    The replay goes through :func:`_call_tool_body`, which in capture mode runs
+    validation and the handler DIRECTLY rather than through
+    ``call_tool_with_logging``: the stub already wrote the invocation's SEL audit
+    row when the model's call ran, and a second "completed" row for the same call
+    -- attributed to the same session, from the gateway process -- would double
+    every directive in the audit trail. Derivation is a read of what the call
+    means, not a second invocation, and leaves no record of its own.
+    """
+    if tool not in DIRECTIVE_TOOLS or not isinstance(raw_args, dict) or not session_key:
+        return None
+    sink: list[tuple[str, dict[str, Any]]] = []
+    token = _DIRECTIVE_CAPTURE.set(sink)
+    prior = current_caller()
+    set_current_caller(CallerContext(session_key=session_key, from_gateway=True))
+    try:
+        # Deep copy for the same reason _call_tool snapshots deeply: the handler
+        # may mutate nested objects, and the caller digests *raw_args* after.
+        _call_tool(tool, copy.deepcopy(raw_args))
+    except Exception:
+        return None
+    finally:
+        set_current_caller(prior)
+        _DIRECTIVE_CAPTURE.reset(token)
+    return sink[0] if len(sink) == 1 else None
+
+
 def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
-    return call_tool_with_logging(
+    # Call-in-flight record for control._emit_directive: the tool name and the
+    # RAW arguments (pre-validation), which is what the gateway is told so it can
+    # re-derive the directive itself. Cleared on exit so a direct handler call in
+    # the same thread later (a test, a nested helper) never reports a stale call.
+    _t_name = _CURRENT_CALL_NAME.set(name)
+    # DEEP copy: validation mutates nested argument objects in place
+    # (suggest_followup pops an empty ``branch`` off each item), and the
+    # gateway must digest what the model SENT -- the same bytes the consumer
+    # digests off the tool_call frame -- not what validation left behind.
+    _t_args = _CURRENT_CALL_RAW_ARGS.set(
+        copy.deepcopy(raw_args) if isinstance(raw_args, dict) else {}
+    )
+    try:
+        return _call_tool_body(name, raw_args)
+    finally:
+        _CURRENT_CALL_NAME.reset(_t_name)
+        _CURRENT_CALL_RAW_ARGS.reset(_t_args)
+
+
+def _call_tool_body(name: str, raw_args: dict[str, Any]) -> str:
+    if _DIRECTIVE_CAPTURE.get() is not None:
+        # Gateway-side derivation (derive_directive): the handler's only write is
+        # the directive it publishes, which capture_directive intercepts, and the
+        # returned text is discarded. No SEL row -- the stub logged the real
+        # invocation -- and no refusal tagging, since nothing reads the result.
+        # A validation error is a refusal here too: the handler never ran, the
+        # sink stays empty, and derive_directive answers None.
+        return _call_tool_inner(name, _validate_args(name, raw_args))
+    # Tag a directive tool's marker-less result as a refusal at the OUTERMOST
+    # return, which is the only point that sees every way such a tool can
+    # decline — argument validation runs inside the wrapper below, ahead of the
+    # handler, so a schema rejection never reaches code that could tag itself
+    # (#8635). Without the tag the consumer reads a decline as a LOST directive
+    # marker and fires a WARNING meant for a transport regression.
+    return refuse_if_markerless(
         name,
-        raw_args,
-        _validate_args,
-        _call_tool_inner,
-        # Real caller identity when resolvable (per-call caller context in
-        # pooled backends, env/PID otherwise) — a hardcoded "mcp_core" lost
-        # attribution for every standard tool audit in shared backends.
-        session_key=_resolve_session_key() or "mcp_core",
-        downstream_service="kirocrew-core",
+        call_tool_with_logging(
+            name,
+            raw_args,
+            _validate_args,
+            _call_tool_inner,
+            # Real caller identity when resolvable (per-call caller context in
+            # pooled backends, env/PID otherwise) — a hardcoded "mcp_core" lost
+            # attribution for every standard tool audit in shared backends.
+            session_key=_resolve_session_key() or "mcp_core",
+            downstream_service="kirocrew-core",
+        ),
     )
 
 

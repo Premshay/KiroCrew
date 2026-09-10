@@ -462,11 +462,35 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
             run["runtime"] = dict(resolution)
 
         dispatch = review_pool.make_sync_dispatch(loop, pool, on_resolution=_record_runtime)
-        # Runtime preflight is read once and shared with the driver so both the
-        # batch lifecycle and every per-change failure describe the same host state.
+        # Bracket the batch: begin_batch() lazily spawns the ONE shared runtime;
+        # end_batch() (in finally) kills it once this run's reviews all drain — so
+        # the subprocess (and its memory) lives exactly as long as the batch. The
+        # holder is reference-counted, so overlapping runs share one runtime and the
+        # last one out tears it down.
+        #
+        # Runtime preflight is read ONCE and shared with the driver so both the
+        # batch lifecycle and every per-change failure describe the same host
+        # state: when the host cannot spawn a reviewer (no kiro-cli, ACP runtime
+        # unimportable) the batch is never opened and the same verdict fails every
+        # change fast with a reason naming the missing runtime.
+        # Offloaded: the executable resolution stats candidates across every PATH
+        # entry, and one stale network mount there would stall the loop.
         runtime_error = await asyncio.to_thread(review_pool.runtime_preflight)
+        # `begin_batch` is the only thing that can answer the sandbox question,
+        # because the delegation decision is made inside the spawn (on Windows
+        # Kiro Crew has no native backend, so a review is confined only when
+        # kiro-cli's own sandbox takes it). A refusal is therefore reported
+        # through the SAME channel as a missing kiro-cli — every change fails
+        # fast with a reason naming the config key — instead of escaping as an
+        # undiscriminated run error. `batch_open` is tracked separately so a
+        # refused spawn never calls end_batch() on a batch that never opened.
+        batch_open = False
         if not runtime_error:
-            await pool.begin_batch()
+            try:
+                await pool.begin_batch()
+                batch_open = True
+            except review_pool.ReviewRuntimeUnavailable as exc:
+                runtime_error = str(exc)
         try:
             summary = await asyncio.to_thread(
                 review_driver.run_review,
@@ -477,12 +501,17 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                 cancelled=lambda: run_id in _CANCELLED,
                 rule_resolutions=run.get("rule_resolutions"),
                 preflight=lambda: runtime_error,
-                # Shared staging paths and result attribution stay deterministic
-                # when this driver serializes changes, even with a warm pool.
+                # One reviewer at a time. Workers share the staging directory and
+                # each has shell and file tools, so two running at once means one
+                # can write another change's record between that change's slot
+                # being cleared and its own worker writing -- attacker-controlled
+                # findings attributed to the victim pull request. Serializing keeps
+                # shared staging paths and result attribution deterministic even
+                # with a warm pool.
                 concurrency=1,
             )
         finally:
-            if not runtime_error:
+            if batch_open:
                 await pool.end_batch()
         run["summary"] = summary
         _collect_delivered(run, summary)
@@ -495,16 +524,34 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
         elif not summary.get("ok"):
             run["status"] = "error"
         elif attempted > 0 and (recorded == 0 or deep == 0):
+            # run_review returns ok=True for any run with >=1 change, so a run
+            # whose every change failed used to report "done" with an empty
+            # report. Nothing was reviewed; say so rather than letting the UI
+            # claim success and then show an empty report.
+            #
+            # `deep == 0` is checked as well as `recorded == 0`: a change can
+            # persist a record and still never be deep-reviewed, which cleared the
+            # record count while leaving the report with no findings in it. Both
+            # are the same "claimed success, delivered nothing" failure.
             run["status"] = "error"
             run["error"] = _first_change_error(summary) or "the reviewer produced no result record"
         else:
+            # "done" even if SOME changes failed — those are surfaced per change.
             run["status"] = "done"
         if not summary.get("ok"):
             run["error"] = summary.get("error", "review failed")
         else:
+            # Durable dedup index: record each reviewed PR's head SHA so a later
+            # repo-review skips it until its head changes. Only repo-review runs
+            # carry head_shas; pasted-link runs skip this (no-op).
             await asyncio.to_thread(_record_reviewed, run)
         if run["status"] == "error":
-            # Keep the machine-readable cause beside the human error sentence.
+            # The cause as a TOKEN, beside the sentence rather than instead of
+            # it. `_first_change_failure` collapses the token into English for
+            # `error`, so without this the payload names the cause nowhere and
+            # the dashboard's translator has to recognize causes by their
+            # wording. Absent (never empty-string) when no record carried one, so
+            # a reader cannot mistake "no token" for a token.
             reason = _first_change_failure(summary)[1]
             if reason:
                 run["reason"] = reason

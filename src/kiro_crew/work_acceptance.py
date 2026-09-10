@@ -90,7 +90,13 @@ def evaluate(item: dict[Any, Any]) -> tuple[str, str]:
         path = accept.get("path")
         if not isinstance(path, str) or not path:
             return ("error", "file spec needs a path")
-        want = bool(accept.get("exists", True))
+        exists = accept.get("exists", True)
+        # Rejected rather than coerced, matching the ``pr`` guard above:
+        # ``bool("false")`` is ``True``, so coercing would report a PASS for
+        # exactly the state the spec asked to rule out.
+        if not isinstance(exists, bool):
+            return ("error", "file spec needs a boolean exists")
+        want = exists
         have = Path(path).exists()
         verdict = "pass" if have == want else "fail"
         return (verdict, f"{path} {'exists' if have else 'does not exist'}")

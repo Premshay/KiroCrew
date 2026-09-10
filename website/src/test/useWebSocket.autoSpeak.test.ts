@@ -76,8 +76,12 @@ const SENTENCE = 'This is the first spoken sentence. '
 /** Any third-arg shape enqueueSynth sends (the abort signal wrapper). */
 const SYNTH_OPTS = expect.objectContaining({ signal: expect.anything() })
 
+/** The request the mounted hook registers for; voice_chunk frames are only
+ *  played when they correlate to a synthesis request this client issued. */
+const VOICE_REQUEST_ID = 'test-voice'
+
 function voiceChunk(slot: string, index: number) {
-  return { type: 'voice_chunk', data: { slot, index, sentence: `s${index}`, audio: btoa(`audio-${index}`) } }
+  return { type: 'voice_chunk', data: { slot, index, sentence: `s${index}`, audio: btoa(`audio-${index}`), request_id: VOICE_REQUEST_ID } }
 }
 
 describe('useWebSocket auto-speak voice pipeline', () => {
@@ -112,7 +116,10 @@ describe('useWebSocket auto-speak voice pipeline', () => {
     }
     const hook = renderHook(() => useWebSocket(), { wrapper })
     const ws = WS_INSTANCES[0]
-    act(() => { ws.simulateOpen() })
+    act(() => {
+      ws.simulateOpen()
+      window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot: 'slot-1', request_id: VOICE_REQUEST_ID } }))
+    })
     // Let the onopen voiceConfig() promise resolve so autoSpeak is cached.
     await act(async () => {})
     return { hook, ws }

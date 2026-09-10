@@ -18,6 +18,7 @@ include setup.py
 
 # --- Top-level package data files (mirror [options.package_data]) ------------
 include src/kiro_crew/py.typed
+include src/kiro_crew/BUILD_VERSION
 include src/kiro_crew/slack-manifest.yaml
 include src/kiro_crew/model_tokens.json
 
@@ -34,7 +35,13 @@ recursive-include src/kiro_crew/apps *.json
 # for apps ported from third-party work; Apache-2.0 attribution must ship.
 recursive-include src/kiro_crew/apps *.md
 recursive-include src/kiro_crew/eval/scenarios *.json
+recursive-include src/kiro_crew/eval/bench/data *.json
 recursive-include src/kiro_crew/docs *.md
+# The generated settings registry beside those docs (see settings-deeplink.md).
+# `[options.package_data]`'s `docs/*.json` covers the WHEEL only; the sdist is
+# built from this file, and `python -m build` builds the wheel FROM the sdist, so
+# a missing line here drops the file from every published artifact.
+recursive-include src/kiro_crew/docs *.json
 recursive-include src/kiro_crew/tests_fixtures *
 
 # --- Pruning: never ship test trees, vendored node deps, or build cruft ------

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -3058,9 +3060,13 @@ class TestCleanupLoop:
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
 
         sweep_threads: list[str] = []
+        sweep_homes: list[object] = []
 
-        def _fake_sweep() -> int:
+        def _fake_sweep(*, data_home=None) -> int:
+            # The deps hand the sweep the data home the manager resolved on ITS
+            # thread (the pool thread must not resolve it itself); record it too.
             sweep_threads.append(threading.current_thread().name)
+            sweep_homes.append(data_home)
             return 3
 
         with (
@@ -3081,13 +3087,24 @@ class TestCleanupLoop:
             with caplog.at_level(logging.INFO, logger="kiro_crew.session"):
                 await mgr._cleanup_loop()
 
-        # Verify: sweep was called (production wiring)
-        mock_sweep.assert_called_once()
-        # Verify the offload: ran on a maintenance-executor worker thread,
-        # not the event loop thread (run_in_executor path).
+        # Verify: sweep was called (production wiring). At least once, not
+        # exactly once: the loop now also dispatches one reclaim pass at START
+        # (a host whose runtime tmpfs is out of inodes cannot spawn at all, so
+        # that pass must not wait out an interval), so a run can legitimately
+        # record the boot pass, the tick pass, or both.
+        assert mock_sweep.call_count >= 1
+        # Verify the offload: EVERY call ran on a maintenance-executor worker
+        # thread, not the event loop thread (run_in_executor path).
         assert sweep_threads, "sweep never executed"
-        assert sweep_threads[0] != threading.main_thread().name
+        assert all(name != threading.main_thread().name for name in sweep_threads)
         assert sweep_threads[0].startswith("mc-maint")
+        # The home reached the pool thread pre-resolved and pinned: a sweep that
+        # resolved config_dir() for itself, after the queuing test's pin was gone,
+        # walked the operator's real ~/.kiro/crew (third side-effect audit).
+        assert sweep_homes and all(
+            h is not None and Path(h).resolve() == Path(os.environ["KIROCREW_HOME"]).resolve()
+            for h in sweep_homes
+        ), sweep_homes
         # Verify: non-zero return produces the info log
         assert "removed 3 stale sandbox artifacts" in caplog.text
         await mgr.close_all()
@@ -4609,8 +4626,8 @@ class TestCleanupLoopResilience:
 
 
 class TestGetBgSessionRecycle:
-    """get_bg_session() recycles a healthy-but-stale _bg runtime only when it
-    has zero active sessions."""
+    """get_bg_session() displaces a healthy-but-stale _bg runtime, killing it
+    when idle and parking it to drain when its handles are still live."""
 
     @pytest.mark.asyncio
     async def test_recycles_stale_idle_runtime(self, cfg):
@@ -4618,7 +4635,7 @@ class TestGetBgSessionRecycle:
 
         stale = AsyncMock()
         stale.is_alive = lambda: True
-        stale.has_active_sessions = lambda: False
+        stale.has_active_or_initializing_sessions = lambda: False
         stale._is_stale = AsyncMock(return_value="age")
         stale.kill = AsyncMock()
         stale.pid = 111
@@ -4640,33 +4657,43 @@ class TestGetBgSessionRecycle:
         await mgr.close_all()
 
     @pytest.mark.asyncio
-    async def test_does_not_recycle_stale_runtime_with_active_sessions(self, cfg):
+    async def test_parks_a_stale_runtime_that_still_has_active_sessions(self, cfg):
+        """A runtime that never goes idle must still be bounded.
+
+        The old policy only recycled during a zero-session window and merely
+        logged otherwise, so under sustained background load the age/RSS caps
+        were never enforced. Now the retiree is detached from the slot — its
+        in-flight work finishes untouched — and new callers get a fresh process.
+        Staleness is probed with ``_is_stale()`` (age OR RSS), not the age-only
+        ``_stale_by_age()``, because RSS is the growth mode that was observed.
+        """
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
 
         stale = AsyncMock()
         stale.is_alive = lambda: True
-        stale.has_active_sessions = lambda: True
-        stale._stale_by_age = lambda: True  # drives the deferral log
-        stale._is_stale = AsyncMock(return_value="age")  # must NOT be consulted
+        stale.has_active_or_initializing_sessions = lambda: True
+        # Inside the age cap; stale by RSS.
+        stale._is_stale = AsyncMock(return_value="rss")
         stale.kill = AsyncMock()
         stale.pid = 222
-        stale._session_queues = {"s": object()}
-        sentinel = object()
-        stale.create_session = AsyncMock(return_value=sentinel)
+        stale.create_session = AsyncMock(return_value=object())
         mgr._bg_runtime = stale
 
-        # A live+reused runtime must not trigger a respawn.
-        with patch(
-            "kiro_crew.acp.runtime.AcpRuntime",
-            side_effect=AssertionError("should not respawn a live runtime"),
-        ):
+        rt2 = AsyncMock()
+        rt2.spawn = AsyncMock()
+        rt2.is_alive = lambda: True
+        sentinel = object()
+        rt2.create_session = AsyncMock(return_value=sentinel)
+
+        with patch("kiro_crew.acp.runtime.AcpRuntime", side_effect=[rt2]):
             result = await mgr.get_bg_session()
 
-        stale.kill.assert_not_awaited()  # active sessions → recycle deferred
-        # The active-session path uses the cheap _stale_by_age(), NOT the
-        # offloaded _is_stale() probe.
-        stale._is_stale.assert_not_awaited()
+        stale._is_stale.assert_awaited_once()
+        stale.kill.assert_not_awaited()  # live handles → parked, not killed
+        stale.create_session.assert_not_awaited()  # and never serves again
+        assert stale in mgr._draining_bg_runtimes
         assert result is sentinel
+        mgr._draining_bg_runtimes = []
         await mgr.close_all()
 
 

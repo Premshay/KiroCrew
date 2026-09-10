@@ -58,6 +58,7 @@ from kiro_crew.messaging.approval import PendingApprovals, SessionApprovalDecide
 from kiro_crew.messaging.attachments import append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
 from kiro_crew.messaging.commands import compact_unsupported_backend, compact_unsupported_reply
+from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
     ChannelTurn,
     build_directive_consumer,
@@ -370,7 +371,15 @@ class WebexDispatcher:
             cmd = parse_command(text)
             if cmd == "new":
                 self._conv.bump_gen(route)
-                await self._reply(inbound, "✅ Started a fresh conversation.")
+                saved = await reserve_new_generation(
+                    self.sessions,
+                    self._session_key(route),
+                    channel_type="Webex",
+                )
+                message = "✅ Started a fresh conversation."
+                if not saved:
+                    message += "\n⚠️ The new conversation could not be saved for restart."
+                await self._reply(inbound, message)
                 return
             if cmd == "compact":
                 self._conv.clear_awaiting(route)
@@ -824,8 +833,9 @@ class WebexDispatcher:
 
         Deliberately not a dashboard-session picker: resuming one of those needs
         the durable resume-expectation store and an inbound path that resolves the
-        mirror binding, which is why ``supports_session_resume`` is Discord-only
-        and the capability ledger pins it that way.
+        mirror binding. Webex implements neither and therefore leaves
+        ``supports_session_resume`` false; Discord and Telegram are the shipped
+        transports that currently declare it.
         """
         if self.conv_log is None:
             await self._reply(inbound, "ℹ️ Conversation history is not available.")

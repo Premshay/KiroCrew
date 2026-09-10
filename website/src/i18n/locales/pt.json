@@ -117,7 +117,8 @@
     "focus_mode": "Modo de foco",
     "focus_mode_title": "Modo de foco · Alt+Shift+M",
     "focus_mode_title_mac": "Modo de foco · ⌥⇧M",
-    "connect_your_phone": "Conectar seu telefone"
+    "connect_your_phone": "Conectar seu telefone",
+    "kiro_credit_usage_scrape_disabled": "Uso de créditos Kiro — a busca ao vivo está desativada (dashboard.usage_text_scrape_enabled)"
   },
   "appSdk": {
     "chatEmbed": {
@@ -130,7 +131,12 @@
       "streaming": "em streaming"
     },
     "chatMessageList": {
-      "open_path": "Abrir {{path}}"
+      "open_path": "Abrir {{path}}",
+      "copied": "Copiado!",
+      "copy": "Copiar",
+      "copy_failed": "Falha ao copiar",
+      "show_less": "Mostrar menos",
+      "show_more": "Mostrar mais"
     }
   },
   "apps": {
@@ -1172,7 +1178,7 @@
         "close": "Fechar (Esc)",
         "custom": "Personalizado",
         "delete": "Excluir",
-        "deleteConfirm": "Excluir o pacote de aparência \"{{name}}\"? Esta ação não pode ser desfeita.",
+        "deleteConfirm": "Excluir o pacote de aparência “{{name}}”? Esta ação não pode ser desfeita.",
         "deleteFailed": "Falha ao excluir",
         "dressUp": "Vestir",
         "edit": "Editar",
@@ -1502,7 +1508,10 @@
         "what_s_working": "O que está funcionando",
         "what_you_ll_get": "O que você vai receber",
         "your_critiques": "Suas críticas",
-        "your_question_click_to_see_the_answer": "Sua pergunta — clique para ver a resposta"
+        "your_question_click_to_see_the_answer": "Sua pergunta — clique para ver a resposta",
+        "couldn_t_tell_what_that_is_give_me_a_figma_link": "Não consegui identificar o que é isso. Envie um link do Figma, um repositório GitHub/GitLab/Bitbucket, um caminho local absoluto ou uma URL que já esteja em execução.",
+        "only_added_the_first_room_the_limit_is_max_screens": "Só as primeiras {{room}} foram adicionadas — o limite é de {{max}} telas.",
+        "that_s_the_limit_of_max_screens": "Esse é o limite de {{max}} telas."
       },
       "findingRow": {
         "based_on": "Com base em",
@@ -1983,7 +1992,6 @@
           "comment_placeholder": "Escreva um comentário…",
           "comment_submit": "Comentar",
           "comment_title": "Adicionar um comentário",
-          "dismiss_error": "Descartar o erro",
           "merge": "Mesclar",
           "merge_hint": "Mesclar este {{subject}} agora — o provedor continua aplicando as revisões e verificações obrigatórias",
           "needs_a_reason": "Escreva primeiro um motivo",
@@ -2582,7 +2590,7 @@
             "which_labels_mark_newcomer_friendly_work_so_issu": "Quais rótulos marcam trabalho adequado para iniciantes, para que o Issue Radar possa destacar issues a encaminhar para quem contribui pela primeira vez.",
             "which_labels_mean_an_issue_still_needs_triage_dr": "Quais rótulos indicam que uma issue ainda precisa de triagem. Alimenta a contagem “Sem triagem” da Visão geral e a fila de itens que precisam de atenção.",
             "without_push_access_to": "Sem acesso de push a",
-            "your_edits_are_kept_here_but_won_t_persist_if_yo": "suas edições são mantidas aqui, mas não serão salvas. Se você acabou de atualizar o Issue Radar, reinicie o backend para que a API de configurações fique disponível."
+            "your_edits_are_kept_here_but_won_t_persist_if_yo": "Suas edições são mantidas aqui, mas não serão salvas. Se você acabou de atualizar o Issue Radar, reinicie o backend para que a API de configurações fique disponível."
           }
         },
         "tagging": {
@@ -2792,7 +2800,7 @@
         "view_rendered": "Renderizado"
       },
       "knowledge": {
-        "connectHelp": "Adiciona este cofre à biblioteca de Conhecimento para que os agentes possam pesquisar suas notas. Você pode alterar isso depois nas Configurações.",
+        "connectHelp": "Adiciona este cofre à biblioteca de Conhecimento para que os agentes possam pesquisar suas notas. Você pode alterar isso depois em {{capabilities}} → {{tab}}.",
         "label": "Sincronizar com o conhecimento do {{productName}}"
       },
       "manifest": {
@@ -3189,8 +3197,8 @@
         "title": "Aprovação de ação",
         "tool": "Ferramenta",
         "trust_all_base": "Confiar em todos os comandos {{base}}",
-        "trust_all_tools": "Confiar em todas as ferramentas",
-        "trust_hint": "“Confiar” também aprova {{tool}} automaticamente de agora em diante.",
+        "trust_all_tools": "Confiar em todas as ferramentas desta sessão",
+        "trust_hint": "“Confiar” aprova automaticamente todas as ferramentas no resto desta sessão.",
         "trust_this_command": "Confiar em “{{cmd}}”",
         "trusted": "Confiável"
       },
@@ -3307,7 +3315,7 @@
         "create_new": "Criar pacote SVG/Lottie",
         "custom": "Personalizado",
         "delete": "Excluir",
-        "delete_confirm": "Excluir o pacote de aparência \"{{name}}\"? Não pode ser desfeito.",
+        "delete_confirm": "Excluir o pacote de aparência “{{name}}”? Não pode ser desfeito.",
         "edit": "Editar",
         "empty": "Nenhum pacote de aparência",
         "export": "Exportar",
@@ -3523,12 +3531,12 @@
         "mcp_available": "Disponíveis para adicionar",
         "mcp_desc": "Estes são os servidores MCP instalados no {{productName}}. {{name}} só pode chamar os que forem adicionados aqui — pressione Adicionar para conceder um, Remover para retirá-lo. Servidores integrados estão sempre disponíveis e não podem ser removidos.",
         "mcp_disabled": "Desativado",
-        "mcp_empty": "Nenhum servidor MCP configurado ainda. Adicione um em Configurações do {{productName}} → MCP e depois reabra este painel.",
-        "mcp_error_disabled": "Este servidor está desativado. Ative-o primeiro em Configurações do {{productName}} → MCP.",
+        "mcp_empty": "Nenhum servidor MCP configurado ainda. Adicione um em {{capabilities}} do {{productName}} → {{tab}} e depois reabra este painel.",
+        "mcp_error_disabled": "Este servidor está desativado. Ative-o primeiro em {{capabilities}} do {{productName}} → {{tab}}.",
         "mcp_error_generic": "Não foi possível carregar as ferramentas — tente novamente.",
         "mcp_error_in_progress": "Já estamos detectando ferramentas — aguarde.",
         "mcp_error_not_found": "Este servidor não está mais configurado.",
-        "mcp_error_probe_failed": "Este servidor não respondeu. Verifique o comando dele em Configurações do {{productName}} → MCP.",
+        "mcp_error_probe_failed": "Este servidor não respondeu. Verifique o comando dele em {{capabilities}} do {{productName}} → {{tab}}.",
         "mcp_from_cache": "(em cache — pode estar desatualizado)",
         "mcp_loading": "Carregando servidores…",
         "mcp_needs_approval": "Precisa de aprovação",
@@ -4198,7 +4206,6 @@
         "create_one_above_or_clone_an_existing_repository": "Crie um acima ou clone um repositório existente.",
         "delete_paper": "Eliminar {{name}}",
         "delete_paper_confirm": "Excluir “{{name}}” e todos os seus arquivos? Esta ação não pode ser desfeita.",
-        "dismiss_error": "Dispensar",
         "downloading_compiler_progress": "A baixar… {{done}} de {{total}}",
         "install_compiler": "Instalar compilador",
         "installing_compiler": "A instalar…",
@@ -4229,9 +4236,9 @@
       "workspace": {
         "co_author": "Coautor",
         "co_author_conflict": "O coautor alterou este arquivo",
-        "co_author_conflict_discard": "Descartar as minhas edições e recarregar",
+        "co_author_conflict_discard": "Descartar as minhas alterações e recarregar",
         "co_author_conflict_discard_button": "Descartar alterações",
-        "co_author_conflict_discard_confirm": "Descartar as tuas edições não guardadas em “{{file}}” e carregar a versão do coautor? Não é possível anular esta ação.",
+        "co_author_conflict_discard_confirm": "Serão descartadas as tuas alterações não salvas em “{{file}}” e será carregada a versão do coautor. Não é possível anular esta ação.",
         "co_author_conflict_discard_title": "Descartar alterações não salvas?",
         "commit_and_push": "Confirmar e enviar",
         "commit_message_prompt": "Descreve esta confirmação. Inclui todas as alterações do artigo.",
@@ -4521,7 +4528,8 @@
           "what_kind_of_work_is_it": "Que tipo de trabalho é?",
           "which_project_is_this_for": "Para qual projeto é?",
           "work_in_a_fresh_worktree": "Trabalhar em um worktree novo",
-          "your_plan_is_saved_as_plain_markdown_inside_your": "Seu plano é salvo como markdown simples dentro do projeto (.kiro/specs), então também funciona com o IDE Kiro e a CLI. Você pode mudar onde as specs ficam guardadas em"
+          "your_plan_is_saved_as_plain_markdown_inside_your": "Seu plano é salvo como markdown simples dentro do projeto (.kiro/specs), então também funciona com o IDE Kiro e a CLI. Você pode mudar onde as specs ficam guardadas em",
+          "this_spec_will_be_called": "Esta especificação se chamará {{name}}"
         },
         "projectPicker": {
           "browse": "Navegar",
@@ -4590,7 +4598,6 @@
           "rename_this_spec_label_the_folder_name_stays": "Renomeie o rótulo desta spec. A pasta e o branch mantêm o mesmo nome.",
           "resize_document_panel": "Redimensionar o painel do documento",
           "restore_this_spec": "Restaurar esta spec",
-          "review_document": "Revisar {{document}}",
           "send_all_to_agent": "Enviar tudo ao agente",
           "sending": "Enviando…",
           "spec_label": "Rótulo da spec",
@@ -4599,10 +4606,18 @@
           "tab_design": "Design",
           "tab_requirements": "Requisitos",
           "tab_tasks": "Tarefas",
-          "tells_the_agent_this_phase_is_approved_and_to_mo": "Informa ao agente que esta fase está aprovada e que ele pode seguir — o mesmo que digitar no chat",
+          "tells_the_agent_this_phase_is_approved_and_to_mo": "Registra a sua aprovação desta versão e depois diz ao agente para seguir adiante",
           "the_agent_is_writing_the_next_document": "Aprovado — o agente está escrevendo o próximo documento",
           "this_document_changed_after_it_was_approved": "Este documento mudou depois de ser aprovado",
-          "working": "trabalhando…"
+          "working": "trabalhando…",
+          "cancel": "Cancelar",
+          "couldn_t_remove_this_spec_try_again": "Não foi possível remover esta especificação — tente novamente.",
+          "delete_spec_named": "Remover a especificação {{name}}",
+          "delete_this_spec": "Remover esta especificação",
+          "remove_spec_body": "“{{name}}” sairá do Spec Builder. Os arquivos markdown permanecem no projeto, e qualquer agente em execução para esta especificação será interrompido.",
+          "remove_this_spec": "Remover esta especificação?",
+          "removing": "Removendo…",
+          "review_document_named": "Revisar {{document}}.md de {{name}}"
         },
         "specRail": {
           "agent_working": "agente trabalhando",
@@ -4617,10 +4632,10 @@
           "spec_builder": "Spec Builder",
           "spec_builder_settings": "Configurações do Spec Builder",
           "specs": "SPECS",
-          "v": "v"
+          "v": "v",
+          "active": "ATIVOS"
         },
         "specStatePanel": {
-          "answer_with": "Como “{{title}}” deve ser respondido?",
           "answered": "respondida",
           "blocking": "BLOQUEIO",
           "context": "CONTEXTO",
@@ -4633,7 +4648,9 @@
           "template": "Modelo",
           "tool_calls": "Chamadas de ferramentas",
           "turns": "Turnos",
-          "worktree": "Worktree"
+          "worktree": "Worktree",
+          "answer_option": "Responder “{{title}}” com {{option}}",
+          "answer_option_recommended": "Responder “{{title}}” com {{option}} (recomendado)"
         },
         "taskList": {
           "done": "Concluída",
@@ -4662,7 +4679,6 @@
         "configuration_1": "Escolha uma pasta de projeto e o modo Feature, Bug ou Quick, crie opcionalmente um novo worktree e revise e aprove cada etapa gerada antes de iniciar a build."
       },
       "specBuilderPage": {
-        "dismiss_error": "Dispensar o erro",
         "spec_builder": "Spec Builder",
         "talk_through_an_idea_review_the_plan_then_let_an": "Converse sobre uma ideia, revise o plano e deixe um agente construí-la."
       }
@@ -4822,7 +4838,6 @@
         "folder_delete_failed": "Não foi possível excluir a pasta.",
         "folder_create_failed": "Não foi possível criar a pasta.",
         "folder_bad_name": "Esse nome de pasta tem caracteres que o drive não consegue armazenar. Letras, dígitos, espaços e . _ - ( ) + @ = são seguros.",
-        "folder_deleted": "{{objects}} item(ns) excluído(s).",
         "cancel": "Cancelar",
         "load_more": "Carregar mais",
         "stat_this_month": "Este mês",
@@ -4858,13 +4873,13 @@
         "drive_title": "Drive",
         "drive_upload": "Enviar",
         "drive_uploading": "Enviando…",
-        "drive_bad_name": "Esse nome de arquivo tem caracteres que o drive não consegue armazenar. Renomeie-o e tente novamente.",
-        "drive_bad_name_named": "Não é possível enviar “{{name}}” — o nome tem caracteres que o drive não consegue armazenar. Renomeie-o e tente novamente.",
+        "drive_bad_name": "Esse nome de arquivo tem caracteres que o drive não consegue armazenar. Letras, dígitos, espaços e . _ - ( ) + @ = são seguros.",
+        "drive_bad_name_named": "Não é possível enviar “{{name}}” — o nome tem caracteres que o drive não consegue armazenar. Letras, dígitos, espaços e . _ - ( ) + @ = são seguros.",
         "drive_upload_failed": "Não foi possível enviar “{{name}}”. Tente novamente.",
         "section_files": "Arquivos",
-        "section_library": "Biblioteca",
+        "section_library": "Biblioteca de artefatos",
         "section_backup": "Backup",
-        "share_title": "Compartilhar este arquivo",
+        "share_title": "Compartilhar “{{name}}”",
         "share_expiry": "O link expira após",
         "share_note": "Nota",
         "share_note_placeholder": "Para que serve este link?",
@@ -4901,8 +4916,8 @@
         "backup_status_failed": "Não foi possível ler o status do backup.",
         "backup_nightly_failed": "Não foi possível alterar a configuração de backup noturno. Ela permanece inalterada.",
         "backup_restore_failed": "Não foi possível restaurar esse backup. Nada foi gravado.",
-        "backup_restored_note": "Nada foi trocado em tempo real. O backup foi baixado para uma pasta de preparação no caminho abaixo.",
-        "access_title": "Acesso",
+        "backup_restored_note": "Seus dados atuais não foram substituídos. O backup foi baixado para uma pasta de preparação no caminho abaixo.",
+        "access_title": "Links de compartilhamento",
         "access_empty": "Nenhum link de compartilhamento ativo.",
         "access_expires_in": "expira {{when}}",
         "access_forget": "Remover da lista",
@@ -4914,9 +4929,7 @@
         "keys_count_one": "{{count}} chave",
         "keys_count_other": "{{count}} chaves",
         "keys_count_many": "{{count}} chaves",
-        "connections": "Conexões",
         "key_healthy": "Íntegra",
-        "key_failed": "Com falha",
         "parent_folders": "Pastas superiores",
         "folder_actions": "Ações da pasta",
         "file_actions": "Ações do arquivo",
@@ -4927,7 +4940,7 @@
         "view_grid": "Exibição em grade",
         "view_list": "Exibição em lista",
         "library_add": "Adicionar dos Artefatos",
-        "library_add_one": "Adicionar à Biblioteca",
+        "library_add_one": "Adicionar à Biblioteca de artefatos",
         "folder_open": "Abrir a pasta {{name}}",
         "library_adding": "A adicionar…",
         "library_add_oneway": "As cópias ocupam armazenamento na nuvem.",
@@ -4952,7 +4965,7 @@
         "library_added": "Adicionado {{when}}",
         "library_open": "Abrir {{name}} em Artefatos",
         "files_empty_title": "Arquivos está vazio",
-        "files_empty_body": "Esta pasta guarda arquivos que você envia do seu computador. É separada de Biblioteca, que guarda as coisas que o Kiro criou para você.",
+        "files_empty_body": "Esta pasta guarda arquivos que você envia do seu computador. É separada de Biblioteca de artefatos, que guarda as coisas que o Kiro criou para você.",
         "library_remove": "Remover",
         "library_remove_confirm": "Remover “{{name}}” da biblioteca na nuvem?",
         "library_remove_confirm_slug": "Isto esvazia a pasta na nuvem <folder>{{folder}}</folder>.",
@@ -4962,10 +4975,44 @@
         "library_remove_failed": "Falha ao remover — a cópia na nuvem está inalterada. Tente novamente.",
         "move_conflict": "A pasta de destino já tem um arquivo com este nome.",
         "move_shared": "Este arquivo tem um link de compartilhamento ativo — movê-lo quebraria o link. Remova o compartilhamento (ou deixe-o expirar) e tente novamente.",
-        "move_failed": "Não foi possível mover o arquivo. Tente novamente."
+        "move_failed": "Não foi possível mover o arquivo. Tente novamente.",
+        "delete_failed_named": "Não foi possível excluir “{{name}}” — o arquivo não foi alterado. Tente novamente.",
+        "folder_deleted_one": "“{{name}}” excluído: {{count}} item.",
+        "folder_deleted_other": "“{{name}}” excluído: {{count}} itens.",
+        "folder_deleted_many": "“{{name}}” excluído: {{count}} itens.",
+        "rename_bad_name": "Esse nome tem caracteres que o drive não consegue armazenar. Altere o nome e tente novamente.",
+        "keys_for_account": "Chaves de {{name}}",
+        "rename": "Renomear",
+        "preview_truncated": "Arquivo grande — mostrando apenas o início.",
+        "preview_redacted": "Valores sensíveis estão mascarados nesta pré-visualização.",
+        "preview_unsupported": "Este tipo de arquivo não pode ser visualizado. Baixe-o para ver.",
+        "preview_failed": "Falha ao carregar a prévia. Baixe o arquivo para vê-lo ou tente novamente.",
+        "search_files": "Pesquisar por nome de arquivo ou caminho…",
+        "search_clear": "Limpar pesquisa",
+        "search_pending": "Pesquisando…",
+        "search_capped": "Muitos resultados — mostrando os primeiros {{count}}.",
+        "search_failed": "A pesquisa falhou. Tente novamente.",
+        "search_goto": "Abrir pasta contêiner",
+        "rename_conflict": "Já existe um arquivo com este nome aqui.",
+        "rename_shared": "Este arquivo tem um link de compartilhamento ativo — renomeá-lo quebraria o link. Remova o compartilhamento (ou deixe-o expirar) e tente novamente.",
+        "rename_failed": "Não foi possível renomear o arquivo. Tente novamente.",
+        "rename_failed_named": "Não foi possível renomear “{{name}}”: {{reason}}",
+        "library_add_empty": "Ainda não há artefatos. O que o Kiro criar para você aparecerá aqui, pronto para copiar para a nuvem.",
+        "move_to": "Mover para a pasta…",
+        "move_title": "Mover “{{name}}” para",
+        "move_root": "Arquivos (nível superior)",
+        "move_up": "Subir para {{name}}",
+        "move_no_folders": "Não há outra pasta aqui para onde movê-lo. Crie uma primeiro.",
+        "move_moving": "Movendo…",
+        "stat_storage": "Armazenamento",
+        "stat_objects": "Objetos",
+        "key_needs_attention": "Precisa de atenção",
+        "backup_state_current": "Com backup",
+        "backup_state_never": "Nunca executado",
+        "costs_refresh_failed": "A última leitura da fatura falhou. Este é o valor em cache."
       },
       "page": {
-        "totals_summary": "{{accounts}} contas · {{keys}} chaves · {{healthy}} íntegras",
+        "totals_summary": "{{accounts}} contas · {{healthy}} de {{keys}} chaves íntegras",
         "refresh": "Atualizar",
         "health_ok": "Íntegro",
         "health_degraded": "Requer atenção",
@@ -4984,7 +5031,7 @@
         "copy": "Copiar",
         "copied": "Copiado",
         "empty_title": "Ainda sem contas",
-        "empty_body": "Por enquanto, os perfis são adicionados em Configurações → Deploy. Assim que um for configurado, a conta dele aparece aqui.",
+        "empty_body": "Registre um dos perfis da AWS desta máquina em Adicionar contas, abaixo, e a conta dele aparece aqui.",
         "error_title": "Não foi possível carregar suas contas.",
         "error_body": "Algo deu errado ao ler a lista de contas. Tente novamente em instantes.",
         "error_forbidden_body": "Esta sessão do painel não é a do proprietário, por isso não pode gerenciar contas da AWS. Entre como proprietário e tente novamente.",
@@ -5001,25 +5048,34 @@
         "keys_summary_other": "{{count}} chaves",
         "add_accounts_title": "Adicionar contas",
         "add_accounts_summary": "Registrar mais perfis da AWS desta máquina",
-        "add_accounts_intro": "Estes perfis locais ainda não estão registrados. Escolha os que você quer adicionar.",
+        "add_accounts_intro": "Estes perfis locais da AWS ainda não estão registrados. Cada um que você adicionar vira uma chave da conta dele.",
         "add_accounts_none": "Todos os perfis locais já estão registrados.",
-        "add_accounts_unsupported": "Esta máquina não consegue listar os perfis locais da AWS automaticamente. Adicione perfis em Configurações -> Deploy.",
+        "add_accounts_unsupported": "No Windows, o AWS Control não consegue acessar os perfis da AWS desta máquina: o acesso à AWS precisa de um shell Linux ou macOS. Execute o gateway do {{productName}} no WSL (Windows Subsystem for Linux) e registre lá os perfis configurados.",
         "add_accounts_count_one": "{{count}} de {{max}} registrado",
         "add_accounts_count_other": "{{count}} de {{max}} registrados",
-        "add_accounts_cap_reached": "Você atingiu o limite de {{max}} perfis. Remova um antes de adicionar mais.",
+        "add_accounts_cap_reached": "Você atingiu o limite de {{max}} chaves. Remova uma antes de adicionar mais.",
         "add_accounts_register": "Registrar selecionados",
         "add_accounts_registering": "Registrando…",
         "add_accounts_error": "Não foi possível registrar esses perfis. Nada foi adicionado. Tente novamente.",
         "add_accounts_load_error": "Não foi possível listar os perfis locais da AWS.",
         "search_placeholder": "Buscar contas",
-        "search_none": "Nenhuma conta corresponde a “{{query}}”.",
         "aggregate_accounts_many": "{{count}} contas",
         "aggregate_keys_many": "{{count}} chaves",
         "aggregate_healthy_many": "{{count}} íntegras",
         "keys_summary_many": "{{count}} chaves",
         "add_accounts_count_many": "{{count}} de {{max}} registrados",
         "paid_services_title": "Serviços pagos",
-        "orphan_consent": "Confirmado para uma conta AWS que não está registrada aqui. Retire a confirmação abaixo, ou registre essa conta novamente para gerenciá-la na página dela."
+        "orphan_consent": "Confirmado para uma conta AWS que não está registrada aqui. Retire a confirmação abaixo, ou registre essa conta novamente para gerenciá-la na página dela.",
+        "add_accounts_search_placeholder": "Buscar perfis",
+        "add_accounts_search_keeps_selected": "Os perfis que você selecionou continuam na lista mesmo que não correspondam.",
+        "account_actions": "Ações da conta",
+        "remove_account": "Remover do AWS Control…",
+        "remove_account_action": "Remover",
+        "remove_account_confirm": "Remover “{{name}}” do AWS Control? Nada muda na AWS nem na sua configuração da AWS CLI.",
+        "remove_account_error": "Não foi possível remover a conta.",
+        "remove_account_hint": "Nada muda na AWS",
+        "forget_key_confirm": "Esquecer a chave “{{name}}” desta linha? Nada muda na AWS nem na sua configuração da AWS CLI.",
+        "forget_key_action": "Esquecer chave"
       },
       "rail": {
         "accounts": "Contas e credenciais",
@@ -5027,6 +5083,99 @@
         "switch_account": "Trocar de conta",
         "usage": "Uso e custos",
         "use_account": "Usar esta conta"
+      },
+      "overview": {
+        "title": "Visão geral",
+        "subtitle": "Um só lugar para as contas, chaves, unidade na nuvem e serviços pagos que seus agentes podem usar.",
+        "stat_accounts": "Contas",
+        "stat_accounts_attention_one": "{{count}} precisa de atenção",
+        "stat_accounts_attention_other": "{{count}} precisam de atenção",
+        "stat_accounts_all_ok": "Tudo em ordem",
+        "stat_keys": "Chaves saudáveis",
+        "stat_keys_sub_one": "{{count}} chave registrada",
+        "stat_keys_sub_other": "{{count}} chaves registradas",
+        "stat_drive": "Espaço usado",
+        "stat_drive_none": "Nenhuma unidade",
+        "stat_spend": "Mês até agora",
+        "stat_spend_consent": "Relatório de custos desligado",
+        "stat_shares_none": "Nada compartilhado",
+        "stat_shares_sub_one": "{{count}} link ativo",
+        "stat_shares_sub_other": "{{count}} links ativos",
+        "stat_backups_nightly": "Noturno",
+        "stat_backups_manual": "Manual",
+        "stat_backups_sub_nightly": "Roda toda noite",
+        "stat_backups_sub_manual": "Sem agendamento",
+        "accounts_title": "Contas",
+        "accounts_note": "Os agentes usam essas chaves sem nunca vê-las. Nada de uma chave aparece em um chat.",
+        "add_account": "Adicionar conta",
+        "drive_title": "Unidade na nuvem",
+        "drive_bar_label": "{{size}} armazenados, entre arquivos, a biblioteca de artifacts e backups",
+        "drive_empty_title": "Nenhuma unidade na nuvem",
+        "drive_empty_body": "Crie um bucket privado e criptografado nesta conta para seus arquivos, a biblioteca de artifacts e os backups.",
+        "drive_setup": "Configurar unidade na nuvem",
+        "stat_accounts_attention_many": "{{count}} precisam de atenção",
+        "stat_keys_sub_many": "{{count}} chaves registradas",
+        "stat_shares_sub_many": "{{count}} links ativos",
+        "drive_bucket_label": "Bucket",
+        "stat_spend_scope": "Fatura da AWS desta conta"
+      }
+    },
+    "projectScaffolder": {
+      "manifest": {
+        "display_name": "Criar pastas a partir de um projeto",
+        "description": "Aponte-o para um diretório de projeto e ele descobre quais subprojetos existem dentro, criando depois uma pasta da barra lateral para cada um. A análise é somente de leitura, por isso você vê a lista completa e marca o que quiser antes de qualquer coisa ser criada. Os subprojetos ficam aninhados sob o diretório superior tal como no disco, e o que você já configurou é mostrado mas nunca criado duas vezes.",
+        "page_label": "Criar pastas",
+        "highlight_1": "Analisa primeiro em modo somente leitura, então nada é criado até você confirmar uma seleção",
+        "highlight_2": "Lista os pacotes de nível superior como linhas, com os achados mais profundos em um único grupo recolhido que você pode selecionar por inteiro ou deixar vazio",
+        "highlight_3": "As correspondências confiáveis vêm marcadas; as mais fracas ficam para você escolher",
+        "highlight_4": "Mostra os sinais por trás de cada correspondência, para você ver por que um diretório foi escolhido",
+        "highlight_5": "As pastas que você já tem aparecem na lista mas são ignoradas, nunca duplicadas",
+        "highlight_6": "Informa exatamente o que foi criado, o que foi ignorado, e o que falhou e por quê",
+        "use_case_1": "Transforma um monorepo ou um diretório de repositórios vizinhos em uma pasta da barra lateral por pacote, para que a orientação por pacote carregue sem montar a árvore à mão.",
+        "configuration_1": "Abra Criar pastas, navegue até um diretório de projeto, revise a prévia e marque os pacotes desejados, depois confirme para criar as pastas."
+      },
+      "projectScaffolderPage": {
+        "absolute_path_to_a_project_directory": "Caminho absoluto para um diretório de projeto",
+        "already_set_up": "Já configurado",
+        "browse": "Escolher diretório",
+        "create_folders": "Criar pastas da barra lateral",
+        "create_folders_from_project": "Criar pastas a partir de um projeto",
+        "create_the_root_folder_only": "Criar apenas a pasta raiz",
+        "creating": "Criando",
+        "directly_under_the_root": "Diretamente sob a raiz",
+        "inside_name": "Dentro de {{name}}",
+        "n_already_existed": "{{n}} já existiam",
+        "n_created": "{{n}} criadas",
+        "n_failed": "{{n}} com falha",
+        "n_possible_sub_folders_inside_packages_above": "{{n}} subpastas possíveis nos pacotes acima",
+        "n_selected": "Pasta raiz + {{n}} selecionadas",
+        "n_selected_root_exists": "{{n}} selecionados",
+        "n_selected_inside": "{{n}} selecionadas dentro",
+        "no_folders_were_created": "Nenhuma pasta foi criada",
+        "no_sub_projects_found": "Nenhum subprojeto encontrado",
+        "nothing_under_this_directory_looked_like_a_proje": "Nada dentro deste diretório parecia um projeto. Você ainda pode criar uma pasta para o próprio diretório.",
+        "preview": "Pré-visualização",
+        "project_directory": "Diretório do projeto",
+        "re_scan": "Analisar de novo",
+        "results": "Resultados",
+        "root_changed_scan_before_creating": "O diretório acima mudou — escaneie-o antes de criar pastas.",
+        "scan": "Analisar",
+        "scan_a_project_directory_then_create_a_sidebar": "Analise um diretório de projeto e crie uma pasta da barra lateral para cada subprojeto que escolher.",
+        "scanning": "Analisando",
+        "select_all": "Selecionar tudo",
+        "select_all_inside": "Selecionar tudo dentro",
+        "select_none": "Limpar seleção",
+        "select_none_inside": "Não selecionar nada dentro",
+        "showing_the_preview_from_the_last_successful_scan": "Mostrando a prévia do último escaneamento bem-sucedido.",
+        "signal_git": "repositório git",
+        "signal_kiro": "pasta Kiro (.kiro)",
+        "signal_manifest": "{{name}} encontrado",
+        "signal_member": "membro do workspace",
+        "signals": "Por que correspondeu",
+        "this_preview_no_longer_matches_the_directory_on": "Esta pré-visualização já não corresponde ao diretório em disco. Analise de novo antes de criar pastas.",
+        "tier_confident": "Confiável",
+        "tier_offered": "Possível correspondência",
+        "warnings": "Avisos"
       }
     }
   },
@@ -5046,7 +5195,7 @@
     "colChecks": "Verificações",
     "colPr": "Pull request",
     "colVerdict": "Estado",
-    "commitConfirm": "Confirmar esta alteração em {{branch}} e enviá-la? Um commit publicado não pode ser retirado.",
+    "commitConfirm": "Confirmar esta alteração em “{{branch}}” e enviá-la? Um commit publicado não pode ser retirado.",
     "commitFailed": "O commit foi recusado.",
     "commitFinding": "Fazer commit no ramo",
     "currentRepo": "Trabalhando em",
@@ -5126,7 +5275,8 @@
       "running": "em execução",
       "schedule": "agendamento",
       "schedules_that_run_this_crew_without_you_asking": "Agendamentos que executam este agente sem você pedir. Diferente de Triggers acima, que só decide quando o orquestrador seleciona este agente.",
-      "what_wakes_this_crew": "O que aciona este agente"
+      "what_wakes_this_crew": "O que aciona este agente",
+      "retry": "Tentar novamente"
     },
     "kiroAccountModal": {
       "account_details_unavailable": "Os detalhes da conta não estão disponíveis",
@@ -5143,7 +5293,8 @@
       "remaining_credit_balance": "Saldo de créditos restante: {{count}}",
       "show_email": "Mostrar e-mail",
       "usage_scope": "Uso mensal de créditos Kiro segundo kiro-cli /usage em chats, agentes, MCP e subagentes.",
-      "used_credits": "Usados: {{used}} / {{total}}"
+      "used_credits": "Usados: {{used}} / {{total}}",
+      "credit_usage_scrape_disabled": "O uso de créditos ao vivo não está disponível: a API gratuita de uso não retornou nenhum plano para esta conta, e o fallback cobrado /usage está desativado por padrão. Defina dashboard.usage_text_scrape_enabled como true em config.json para buscá-lo — cada atualização consome um pequeno número de créditos."
     },
     "agentDropdownList": {
       "active_in_this_session": "Ativo nesta sessão",
@@ -5256,7 +5407,8 @@
       "rejected": "Rejeitado",
       "running": "Executando:",
       "tool_approval_requested": "Aprovação de ferramenta solicitada:",
-      "trusted_auto_approving_future_calls": "Confiável — aprovando automaticamente as chamadas futuras"
+      "trusted_auto_approving_future_calls": "Confiável — aprovando automaticamente as chamadas futuras",
+      "actions_group": "Ações de aprovação"
     },
     "approvalModePicker": {
       "nudge_body": "É aqui que você ajusta como o {{productName}} pede aprovação. Ao escolher \"Confiança\" aqui, ele pode trabalhar neste chat sem perguntar antes — você pode voltar atrás a qualquer momento.",
@@ -5284,7 +5436,8 @@
       "yolo_expiration_until_shutdown": "Continua ativado até o {{productName}} reiniciar — sem expiração por tempo.",
       "yolo_label": "YOLO",
       "yolo_mode_is_an_app_wide_setting": "O modo YOLO é uma configuração de todo o app",
-      "yolo_tooltip": "Em todos os chats, o {{productName}} trabalha sem perguntar primeiro"
+      "yolo_tooltip": "Em todos os chats, o {{productName}} trabalha sem perguntar primeiro",
+      "mode_disabled_by_policy": "Desativado pela política de segurança da sua organização"
     },
     "appstore": {
       "appListRow": {
@@ -5463,7 +5616,16 @@
       "stop_loop": "Parar o loop",
       "watches_next": "próxima",
       "watches_note": "Só acordam o agente diante de um sinal real. Gerencie-os na página Agendamento.",
-      "watches_title": "Monitoramentos sem tokens"
+      "watches_title": "Monitoramentos sem tokens",
+      "retry": "Tentar novamente",
+      "trigger_nudge": "Acionar o empurrão",
+      "watches_load_failed": "Não foi possível carregar as vigilâncias desta sessão.",
+      "clear_stopped_goal": "Excluir objetivo parado",
+      "loop_stopped": "Parado",
+      "stopped_help": "Iniciar ciclo retoma este objetivo. Excluir objetivo parado o remove definitivamente.",
+      "clear_goal_for_good": "Excluir o objetivo definitivamente",
+      "cancel": "Cancelar",
+      "clear_goal_question": "Excluir este objetivo definitivamente?"
     },
     "bottomTerminalPanel": {
       "close_terminal": "Fechar terminal",
@@ -5477,7 +5639,9 @@
       "terminal_is_in_its_own_window": "O terminal está em uma janela própria",
       "move_panel_to_right": "Mover painel para a direita",
       "move_panel_to_bottom": "Mover painel para baixo",
-      "more_actions": "Mais ações"
+      "more_actions": "Mais ações",
+      "close_failed": "Não foi possível encerrar o shell deste terminal no servidor. Ele será limpo automaticamente.",
+      "closing_terminal": "Fechando terminal…"
     },
     "chatInput": {
       "approval_hint_adjust": "Ajustar o modo de aprovação",
@@ -5573,7 +5737,7 @@
       "total": "Total",
       "transcribing": "Transcrevendo…",
       "transcribing_please_wait": "Transcrevendo, aguarde…",
-      "trust_reads": "Confiar em leituras",
+      "trust_reads": "Confiar em comandos somente leitura",
       "turn_interrupted_press_continue": "O último turno foi interrompido — toque em Retomar ou apenas escreva",
       "upload_file": "Enviar arquivo",
       "use_a_skill": "Usar uma habilidade",
@@ -5597,7 +5761,21 @@
       "reset_to_global": "Redefinir para o global ({{pct}}%)",
       "following_global": "Seguindo o global ({{pct}}%)",
       "sketch": "Esboço",
-      "sketch_desc": "Desenhe um esboço; anexa uma imagem e sua fonte editável"
+      "sketch_desc": "Desenhe um esboço; anexa uma imagem e sua fonte editável",
+      "editor_unavailable_standard_input": "O editor aprimorado não pôde ser carregado, então a entrada padrão está ativa. Seu rascunho permanece inalterado.",
+      "collapse_composer": "Recolher a entrada de mensagem",
+      "collapse_composer_desc": "Oculta o campo para dar espaço à resposta; mantém o rascunho",
+      "expand_composer": "Mostrar a entrada de mensagem",
+      "alt_action_hint_queues": "{{chord}} enfileira esta mensagem em vez disso",
+      "alt_action_hint_steers": "{{chord}} direciona com esta mensagem em vez disso",
+      "optimize_failed": "Não foi possível otimizar o prompt. Seu texto original foi restaurado.",
+      "optimize_failed_elsewhere": "Não foi possível otimizar o prompt iniciado em outra sessão. O texto original foi restaurado lá.",
+      "more_actions": "Mais ações",
+      "session_control_needs_attention": "Requer atenção",
+      "session_control_ready": "Pronto",
+      "session_control_chip_label": "{{label}} — {{detail}}",
+      "agent_inherited_default": "Esta sessão segue o agente padrão ({{name}}). Não tem um agente próprio, então muda se o padrão mudar. Clique para fixar um.",
+      "model_inherited_default": "Esta sessão usa o modelo padrão ({{name}}). Não tem um modelo próprio, então muda se o padrão mudar. Clique para fixar um."
     },
     "chatPane": {
       "agent_list": "Lista de agentes",
@@ -5611,7 +5789,11 @@
       "split_down": "Dividir abaixo",
       "split_right": "Dividir à direita",
       "split_right_d": "Dividir à direita (⌘D)",
-      "type_to_filter": "Digite para filtrar…"
+      "type_to_filter": "Digite para filtrar…",
+      "history_load_failed": "Não foi possível carregar as mensagens desta sessão.",
+      "retry": "Tentar novamente",
+      "stop_failed": "Não foi possível interromper este turno ({{error}}). Pressione Parar novamente.",
+      "stop_failed_network": "Não foi possível contatar o servidor para interromper este turno. Pressione Parar novamente."
     },
     "cliPanel": {
       "copied": "Copiado",
@@ -5779,7 +5961,9 @@
       "scroll_to_the_highlighted_text": "Rolar até o texto destacado",
       "shared_comment": "Comentário compartilhado",
       "show": "Mostrar",
-      "unknown": "Desconhecido"
+      "unknown": "Desconhecido",
+      "comment_change_failed": "Não foi possível salvar essa alteração no comentário.",
+      "comments_load_failed": "Não foi possível carregar os comentários."
     },
     "computerUseLiveView": {
       "close": "Fechar",
@@ -5867,7 +6051,8 @@
       "close_tab": "Fechar aba",
       "new_tab": "Nova aba",
       "new_tab_shift_click_for_new_chat": "Nova aba (Shift+clique para novo chat)",
-      "sessions": "Sessões"
+      "sessions": "Sessões",
+      "new_chat_failed": "Não foi possível criar um novo chat."
     },
     "errorBoundary": {
       "reload_page": "Recarregar página",
@@ -5896,7 +6081,8 @@
       "summary": "Resumo",
       "timeout": "Tempo esgotado",
       "timestamp": "Data/hora",
-      "trigger": "Acionador"
+      "trigger": "Acionador",
+      "jobs_load_failed": "Não foi possível verificar quais jobs ainda existem, então os jobs excluídos não estão marcados neste histórico."
     },
     "feedbackPill": {
       "insider": "Insider",
@@ -5930,7 +6116,8 @@
       "switch_to_split_view": "Alternar para visualização dividida",
       "switch_to_unified_view": "Alternar para visualização unificada",
       "this_document_is_tracked_as_a_session_artifact_n": "Este documento é rastreado como artefato da sessão, não como alteração de arquivo-fonte",
-      "toggle_diff": "Mostrar ou ocultar o diff de {{path}}"
+      "toggle_diff": "Mostrar ou ocultar o diff de {{path}}",
+      "large_file_simplified_view": "Arquivo grande — visualização simplificada"
     },
     "filePickerMenu": {
       "folder": "Pasta",
@@ -5943,7 +6130,8 @@
       "searching_ctrl_enter_held": "Pesquisando… — Ctrl+Enter ainda não envia; pressione Esc e depois Ctrl+Enter envia a mensagem",
       "searching_enter_held": "Pesquisando… — Enter ainda não envia; pressione Esc e depois Enter envia a mensagem",
       "type_2_chars_to_search_files_ctrl_enter_held": "Digite 2+ caracteres para pesquisar arquivos e pastas… — Ctrl+Enter ainda não envia; pressione Esc e depois Ctrl+Enter envia a mensagem",
-      "type_2_chars_to_search_files_enter_held": "Digite 2+ caracteres para pesquisar arquivos e pastas… — Enter ainda não envia; pressione Esc e depois Enter envia a mensagem"
+      "type_2_chars_to_search_files_enter_held": "Digite 2+ caracteres para pesquisar arquivos e pastas… — Enter ainda não envia; pressione Esc e depois Enter envia a mensagem",
+      "search_failed": "Não foi possível pesquisar arquivos. Tente novamente."
     },
     "fileRenderers": {
       "download": "Baixar",
@@ -6097,7 +6285,8 @@
       "pin_crew": "Fixar {{name}} no cabeçalho",
       "unpin_crew": "Desafixar {{name}}",
       "pinned_no_room": "fixado, sem espaço no cabeçalho",
-      "keep_tab_order_fixed": "Manter a ordem das abas"
+      "keep_tab_order_fixed": "Manter a ordem das abas",
+      "instances_load_failed": "Não foi possível carregar as equipes remotas."
     },
     "instancesViewport": {
       "connecting": "Conectando…",
@@ -6107,7 +6296,7 @@
       "pane_failed_to_load": "Falha ao carregar o painel",
       "retry": "Tentar novamente",
       "the_tunnel_looks_connected_but_the_remote_dashbo": "O túnel parece conectado, mas o painel remoto nunca carregou. Ele pode estar\n                  reiniciando — tente novamente ou troque de aba acima.",
-      "this_tab_stays_until_you_disconnect_the_instance": "Esta aba permanece até você desconectar a instância em Configurações → Instâncias remotas."
+      "this_tab_stays_until_you_disconnect_the_instance": "Esta aba permanece até você desconectar a instância em <0>Configurações → Instâncias remotas</0>."
     },
     "issuePanel": {
       "add_to_chat": "Adicionar ao chat",
@@ -6207,7 +6396,11 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "O prompt ou a tarefa enviado ao agente quando este job dispara",
       "timezone": "Fuso horário",
       "weekly_schedule": "Agendamento semanal",
-      "which_agent_handles_this_job_leave_default_for_t": "Qual agente cuida deste job. Deixe como padrão para o agente principal."
+      "which_agent_handles_this_job_leave_default_for_t": "Qual agente cuida deste job. Deixe como padrão para o agente principal.",
+      "minimal_context": "Contexto mínimo",
+      "minimal_context_description": "Ignora a memória, as lições, as diretrizes, as habilidades e o histórico de sessões anteriores em cada execução, para que um job rotineiro pare de pagar por um contexto que nunca lê. Deixe desativado se o job precisar do seu contexto salvo ou usar uma habilidade.",
+      "mode_advice_minimal_context": "Este job precisa do agente, mas parece não precisar do seu contexto salvo. O contexto mínimo mantém o agente e descarta o resto.",
+      "mode_advice_script": "Este job parece uma verificação mecânica que não exige nenhum raciocínio. A forma mais barata é um job de script, que não consome nenhum turno do agente; peça no chat para criar um. O contexto mínimo é a segunda melhor opção aqui."
     },
     "jobLogsView": {
       "cancel": "Cancelar",
@@ -6262,7 +6455,17 @@
       "sso_helper": "Cole a URL do portal de acesso da AWS que sua empresa forneceu.",
       "sso_region_label": "Região da AWS (opcional)",
       "sso_continue": "Continuar",
-      "sso_cancel": "Cancelar"
+      "sso_cancel": "Cancelar",
+      "loopback_aside_headline": "Conclua no seu navegador",
+      "loopback_aside_body": "Abrimos o login do Kiro em uma nova aba. Aprove lá e esta página continua sozinha.",
+      "loopback_aside_footnote": "Nada para digitar: o login volta direto para este computador.",
+      "loopback_waiting_title": "Aguardando seu navegador",
+      "loopback_waiting_body": "Conclua o login na aba que acabou de abrir. Se nenhuma aba apareceu, abra de novo abaixo.",
+      "loopback_open_again": "Abrir a página de login novamente",
+      "loopback_use_code": "Usar um código em vez disso",
+      "loopback_slow_hint": "Está demorando? Se a página de login não conseguir alcançar este computador, mude para um código: funciona de qualquer dispositivo.",
+      "loopback_fell_back": "O login não conseguiu voltar direto para este computador, então aqui está um código.",
+      "cancel_unsettled": "Não foi possível cancelar o login. Ele ainda está ativo: pressione a mesma opção novamente para tentar de novo."
     },
     "kiroPrerequisiteGate": {
       "agent_specs_missing": "Especificações de agente ausentes",
@@ -6348,7 +6551,8 @@
       "waiting": "Aguardando",
       "we_could_not_check_kiro_cli": "Não foi possível verificar o Kiro CLI.",
       "your_crew_is_almost_ready": "Sua crew está quase pronta.",
-      "your_kiro_cli_is_out_of_date": "Seu Kiro CLI está desatualizado"
+      "your_kiro_cli_is_out_of_date": "Seu Kiro CLI está desatualizado",
+      "attempt_failed_remedy": "Corrija a causa indicada acima (geralmente um problema de permissões ou de instalação) e pressione “{{action}}” para tentar novamente. Se continuar falhando, reinstale o Kiro CLI."
     },
     "linkPreview": {
       "copied": "Copiado",
@@ -6362,14 +6566,16 @@
       "disconnect_from": "Desconectar de {{label}}",
       "held_elsewhere": "{{label}} está em uso por outra sessão.",
       "unavailable": "Este destino está indisponível.",
-      "unknown_error": "erro desconhecido"
+      "unknown_error": "erro desconhecido",
+      "targets_load_failed": "Não foi possível carregar os canais aos quais esta sessão pode se conectar."
     },
     "logEntry": {
       "cancelled": "Cancelado",
       "error": "Erro",
       "loading_trace": "Carregando rastreamento…",
       "ok": "OK",
-      "timeout": "Tempo esgotado"
+      "timeout": "Tempo esgotado",
+      "trace_load_failed": "Não foi possível carregar o rastreamento desta execução."
     },
     "markdownPanel": {
       "add_to_artifact_library": "Adicionar à biblioteca de artefatos",
@@ -6447,7 +6653,11 @@
       "unsaved_changes": "Alterações não salvas",
       "word_wrap": "Quebra de linha",
       "view_preview": "Ver prévia",
-      "view_source": "Ver código-fonte"
+      "view_source": "Ver código-fonte",
+      "open_in_editor": "Abrir no editor",
+      "knowledge_status_failed": "Não foi possível verificar a biblioteca de conhecimento.",
+      "artifact_status_failed": "Não foi possível verificar se este arquivo é um artefato.",
+      "diff_status_failed": "Não foi possível verificar as alterações git deste arquivo."
     },
     "markdownRenderer": {
       "click_to_browse_shift_click_to_open_in_file_explorer": "Clique para navegar / Shift+clique para mostrar no Explorador de Arquivos",
@@ -6470,7 +6680,12 @@
       "zoom_in": "Ampliar (+)",
       "zoom_out": "Reduzir (-)",
       "click_to_browse_shift_click_to_copy_path": "Clique para navegar / Shift+clique para copiar o caminho",
-      "click_to_open_shift_click_to_copy_path": "Clique para abrir / Shift+clique para copiar o caminho"
+      "click_to_open_shift_click_to_copy_path": "Clique para abrir / Shift+clique para copiar o caminho",
+      "copy_diagram_source": "Copiar o código-fonte do diagrama",
+      "diagram_source": "Código-fonte do diagrama",
+      "copy_failed": "Falha ao copiar",
+      "mermaid_render_failed": "Não foi possível renderizar este diagrama. Exibindo o código-fonte.",
+      "image_position": "{{index}} de {{total}}"
     },
     "markdownToc": {
       "contents": "Conteúdo",
@@ -6508,7 +6723,9 @@
       "set_these_in_the_server_config_before_enabling_i": "Defina-as na configuração do servidor antes de ativá-lo.",
       "source": "Origem",
       "v": "v",
-      "waiting_for_the_install_plan_to_load": "Aguardando o carregamento do plano de instalação"
+      "waiting_for_the_install_plan_to_load": "Aguardando o carregamento do plano de instalação",
+      "detail_load_failed": "Não foi possível carregar os detalhes deste servidor.",
+      "search_failed": "Não foi possível pesquisar no registro. Tente novamente."
     },
     "mcpCustomServerModal": {
       "add_custom_server": "Adicionar servidor personalizado",
@@ -6698,7 +6915,9 @@
       "paste_lines_other": "[ Colado #{{seq}} · {{count}} linhas ]",
       "preview_more_lines_many": "… mais {{count}} linhas",
       "preview_more_lines_one": "… mais {{count}} linha",
-      "preview_more_lines_other": "… mais {{count}} linhas"
+      "preview_more_lines_other": "… mais {{count}} linhas",
+      "hide_paste_preview": "Ocultar prévia do conteúdo colado",
+      "show_paste_preview": "Mostrar prévia do conteúdo colado"
     },
     "privacyChapter": {
       "continue": "Continuar",
@@ -6731,7 +6950,8 @@
       "exposure_window_ttl_one": "Este link ficará público por {{count}} hora e depois será excluído automaticamente.",
       "exposure_window_ttl_other": "Este link ficará público por {{count}} horas e depois será excluído automaticamente.",
       "publishing": "Publicando…",
-      "title": "Isto criará um site acessível publicamente"
+      "title": "Isto criará um site acessível publicamente",
+      "exposure_window_persistent_withdrawable": "Este link permanece público até que a cópia publicada seja removida. Excluir o artefato solicita essa remoção."
     },
     "publishHub": {
       "back": "Voltar",
@@ -6760,7 +6980,11 @@
       "ttl_time_to_live": "TTL (tempo de vida)",
       "unexpected_response": "Resposta inesperada",
       "via": "via",
-      "public_exposure_warning": "Qualquer pessoa com o link publicado pode ver este conteúdo. Ele é servido na internet pública sem autenticação."
+      "public_exposure_warning": "Qualquer pessoa com o link publicado pode ver este conteúdo. Ele é servido na internet pública sem autenticação.",
+      "published_still_rolling_out": "Ainda em distribuição — acessível em alguns minutos.",
+      "published_distribution_disabled": "A rede de entrega deste link está desativada, portanto o link não será resolvido. Reative a distribuição no console da AWS.",
+      "published_notice_generic": "Talvez este link ainda não funcione.",
+      "open_artifact_deploy": "Registrar um perfil da AWS"
     },
     "pullRequestPanel": {
       "a_reviewer": "um revisor",
@@ -6837,7 +7061,8 @@
       "this_authorizes_the_merge_as_soon_as_requirement": "Isso autoriza o merge assim que os requisitos forem atendidos, com squash se este repositório permitir (caso contrário, um merge commit e depois rebase).",
       "this_authorizes_the_merge_when_the_pipeline_succ": "Isso autoriza o merge quando o pipeline for bem-sucedido.",
       "untitled_commit": "Commit sem título",
-      "updated": "Atualizado"
+      "updated": "Atualizado",
+      "could_not_refresh_showing_cached": "Não foi possível atualizar — mostrando a última versão carregada"
     },
     "questionCard": {
       "collapse_all": "Recolher tudo",
@@ -6863,7 +7088,13 @@
       "send_now": "Enviar agora",
       "sub_agent_result_many": "{{count}} resultados de subagente",
       "sub_agent_result_one": "{{count}} resultado de subagente",
-      "sub_agent_result_other": "{{count}} resultados de subagente"
+      "sub_agent_result_other": "{{count}} resultados de subagente",
+      "hidden_attachments_many": "+{{count}} anexos",
+      "hidden_attachments_one": "+{{count}} anexo",
+      "hidden_attachments_other": "+{{count}} anexos",
+      "hidden_lines_many": "+{{count}} linhas",
+      "hidden_lines_one": "+{{count}} linha",
+      "hidden_lines_other": "+{{count}} linhas"
     },
     "readingWidthToggle": {
       "label_full": "T",
@@ -7024,9 +7255,11 @@
       "will_be_removed_on_save": "Será removido ao salvar."
     },
     "selectionToolbar": {
-      "ask": "Perguntar no Chat lateral",
+      "ask": "Perguntar sobre isto",
       "copy": "Copiar",
-      "quote": "Citar"
+      "quote": "Citar",
+      "ask_hint": "Abre o Chat lateral com a seleção citada: nada é enviado até você enviar, e o chat principal fica intacto",
+      "quote_hint": "Cita a seleção no compositor desta conversa: sua resposta vai para o chat principal"
     },
     "sendToInstanceSubmenu": {
       "failed": "Falhou",
@@ -7129,7 +7362,9 @@
       "use_ctrl_not_option_for_chat_1_9": "Use ⌃ Ctrl (não ⌥ Option) para os chats 1–9",
       "use_ctrl_not_option_for_chat_1_to_9": "Use Ctrl (não Option) para os chats 1 a 9",
       "panel_toggles": "Alternar painéis",
-      "unset": "Não definido"
+      "unset": "Não definido",
+      "browser_reserved_hint": "Em uma aba do navegador, o navegador captura estes atalhos antes que a página os receba — as alternativas funcionam em qualquer lugar; o aplicativo desktop aceita ambos.",
+      "desktop_app_only": "Somente aplicativo desktop"
     },
     "sidePanelLayout": {
       "update_available": "atualização disponível"
@@ -7209,7 +7444,7 @@
       "decline_consequence": "Se você recusar, nada é carregado e sua mensagem fica como você digitou.",
       "grant_failed": "Não foi possível registrar a confiança nesta pasta.",
       "title": "Confiar nas habilidades deste projeto?",
-      "withdraw_hint": "Você pode revogar isso depois na página de configurações Skills.",
+      "withdraw_hint": "Você pode revogar isso depois em {{capabilities}} → {{tab}}.",
       "working": "Confiando…"
     },
     "projectSkillsTrustList": {
@@ -7408,7 +7643,7 @@
     "trustDropdown": {
       "trust": "Confiar",
       "trust_all_base": "Confiar em todos os comandos <mono>{{base}}</mono>",
-      "trust_all_tools": "Confiar em todas as ferramentas",
+      "trust_all_tools": "Confiar em todas as ferramentas desta sessão",
       "trust_all_tools_channel": "Confiar em todas as ferramentas deste canal — persiste após reiniciar",
       "trust_this_command": "Confiar em “<mono>{{cmd}}</mono>”"
     },
@@ -7459,11 +7694,11 @@
       "install_restart_timing": "A instalação pode levar vários minutos. O app será fechado e abrirá novamente automaticamente quando a atualização terminar.",
       "windows_installer_handoff": "Uma janela de instalação do Windows mostrará o progresso.",
       "installing_update": "Instalando a atualização…",
-      "installing_update_body": "O {{productName}} está parando o gateway local e instalando a atualização. Isso pode levar um minuto — não feche o aplicativo; ele será reiniciado sozinho.",
+      "installing_update_body": "O {{productName}} está parando o gateway local e instalando a atualização. Isso pode levar vários minutos. O app abrirá novamente automaticamente.",
       "is_downloaded_and_ready_to_install": "foi baixado e está pronto para instalar.",
       "kirocrew": "{{productName}}",
       "later": "Depois",
-      "restart_update": "Reiniciar e atualizar",
+      "restart_update": "Instalar atualização e reiniciar app",
       "restarting": "Reiniciando...",
       "update_ready": "Atualização pronta",
       "the_app_will_stop_the_local_gateway_install_the": "O app vai parar o gateway local, instalar a atualização e reiniciar."
@@ -7614,7 +7849,11 @@
       "temporary": "Temporário",
       "temporary_desc": "Começo do zero — sem leituras ou gravações de memória",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "Tente: “Crie um plano para analisar o pacote de código do {{productName}} e informar a contagem de arquivos por componente principal”",
-      "what_can_i_do_for_you": "O que posso fazer por você?"
+      "what_can_i_do_for_you": "O que posso fazer por você?",
+      "choose_memory_mode": "Escolher modo de memória",
+      "incognito_active_switch_to_persistent": "Anônimo — mudar para o modo persistente",
+      "switch_to_persistent_mode": "Mudar para o modo persistente",
+      "temporary_active_switch_to_persistent": "Temporário — mudar para o modo persistente"
     },
     "widgetFrame": {
       "cannot_star_widget_has_no_slug_or_message_contex": "Não é possível marcar: o widget não tem slug nem contexto de mensagem",
@@ -7697,7 +7936,9 @@
       "no_project": "Nenhuma pasta de projeto definida para esta sessão.",
       "refresh": "Atualizar",
       "title": "Git",
-      "uncommitted": "{{count}} sem commit"
+      "uncommitted": "{{count}} sem commit",
+      "status_failed": "Não foi possível ler o estado do repositório.",
+      "log_failed": "Não foi possível ler o histórico de commits."
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",
@@ -7743,7 +7984,12 @@
       "status_failed": "Não foi possível ler o status da confirmação.",
       "confirm_failed": "A confirmação não foi registrada.",
       "withdraw_failed": "A confirmação não foi retirada.",
-      "retry": "Tentar novamente"
+      "retry": "Tentar novamente",
+      "badge_confirmed": "Confirmado",
+      "badge_not_enabled": "Não ativado",
+      "confirmed_on": "confirmado {{date}}",
+      "billing_notice_short": "Cobrado. Nada é enviado até você confirmar.",
+      "withdraw_effect": "Ao retirar, os agentes deixam de usar este serviço até você confirmar de novo."
     },
     "confirmDialog": {
       "cancel": "Cancelar"
@@ -7885,6 +8131,266 @@
       "confirm_discard": "Descartar desenho",
       "already_attached": "Anexado — edite a tela para esboçar novamente",
       "load_failed": "Não foi possível carregar o bloco de esboços — verifique sua conexão e reabra"
+    },
+    "voicePlaybackNotice": {
+      "failed": "Não foi possível usar “{{speak}}”. Verifique as definições de texto para fala e tente novamente.",
+      "blocked": "O navegador bloqueou a reprodução automática. Abra “{{moreActions}}” abaixo da resposta concluída e selecione “{{speak}}”.",
+      "settings": "Definições de “{{speak}}” (texto para fala)"
+    },
+    "avatarBuilder": {
+      "apply": "Aplicar",
+      "apply_hint": "Aplica-se aqui — pressione “Salvar alterações” para manter.",
+      "axis_accessory": "Acessório",
+      "axis_blush": "Rubor",
+      "axis_brows": "Sobrancelhas",
+      "axis_eyes": "Olhos",
+      "axis_mouth": "Boca",
+      "axis_prop": "Objeto",
+      "axis_tile": "Fundo",
+      "cancel": "Cancelar",
+      "customized_note": "Usando um rosto personalizado",
+      "edit_avatar": "Editar avatar",
+      "expr_hint": "Escolha um rosto e um som diferentes para cada momento.",
+      "expr_pack_note": "Esta tripulação usa um pacote — um conjunto de rostos prontos — então aqui só o som se aplica.",
+      "expr_picture_note": "Uma imagem não tem rosto para mudar, então só os sons se aplicam.",
+      "expr_reset_state": "Redefinir",
+      "expr_sound": "Som",
+      "field_hint": "O rosto deste membro em todos os lugares.",
+      "field_label": "Avatar",
+      "hint_customize": "Editar este avatar",
+      "image_load_failed": "Não foi possível carregar a imagem salva — exibindo o rosto padrão.",
+      "lib_badge_builtin": "Integrado",
+      "lib_badge_custom": "Personalizado",
+      "lib_by_author": "Autor: {{author}}",
+      "lib_delete": "Excluir",
+      "lib_delete_confirm": "Excluir pacote",
+      "lib_delete_failed": "Não foi possível excluir esse pacote.",
+      "lib_delete_keep": "Manter",
+      "lib_delete_note": "Removido para todas as tripulações. Importe o pacote novamente para recuperá-lo.",
+      "lib_empty": "Nenhum pacote de aparência ainda. Um pacote chega como um arquivo .json que alguém compartilha com você — importe um para começar.",
+      "lib_error": "Não foi possível carregar a biblioteca de aparências.",
+      "lib_format_lottie": "Lottie",
+      "lib_format_sprite": "Sprite",
+      "lib_format_svg": "SVG",
+      "lib_hint": "Um pacote é um conjunto de rostos pronto para uma crew, desenhado por outra pessoa. Por enquanto, só pacotes SVG podem ser o rosto de uma crew.",
+      "lib_import": "Importar pacote (.json)…",
+      "lib_import_too_large": "Esse arquivo de pacote é grande demais. O limite é 24 MB.",
+      "lib_import_unreadable": "Esse arquivo não é um pacote.",
+      "lib_import_unwearable": "Esse pacote está instalado, mas uma crew só pode vestir um pacote SVG.",
+      "lib_in_use": "{{name}} não foi excluído — ainda está sendo usado por: {{crews}}",
+      "lib_in_use_unknown": "{{name}} não foi excluído — uma tripulação ainda está usando.",
+      "lib_loading": "Carregando pacotes…",
+      "lib_retry": "Tentar novamente",
+      "lib_selected": "Selecionado",
+      "lib_unsupported": "Ainda sem suporte para crews",
+      "mirror": "Inverter direção",
+      "mode_expressions": "Expressões",
+      "mode_face": "Rosto fantasma",
+      "mode_library": "Biblioteca",
+      "mode_picture": "Imagem",
+      "opt_angry": "Zangadas",
+      "opt_antenna": "Antena",
+      "opt_bandana": "Bandana",
+      "opt_beanie": "Gorro",
+      "opt_blush": "Rubor",
+      "opt_bolt": "Raio",
+      "opt_bow": "Laço",
+      "opt_canon": "Clássico",
+      "opt_cap": "Boné",
+      "opt_cat": "Gato",
+      "opt_closed": "Fechados",
+      "opt_cross": "Afiados",
+      "opt_crown": "Coroa",
+      "opt_cyclops": "Ciclope",
+      "opt_flat": "Retas",
+      "opt_flower": "Flor",
+      "opt_glass": "Lupa",
+      "opt_glasses": "Óculos",
+      "opt_grin": "Sorriso largo",
+      "opt_halo": "Auréola",
+      "opt_hardhat": "Capacete",
+      "opt_heart": "Corações",
+      "opt_mug": "Caneca",
+      "opt_none": "Nenhum",
+      "opt_oh": "Oh",
+      "opt_open": "Aberta",
+      "opt_party": "Chapéu de festa",
+      "opt_phones": "Fones",
+      "opt_raised": "Levantadas",
+      "opt_same_as_idle": "Como sempre",
+      "opt_sleepy": "Sonolento",
+      "opt_smile": "Sorriso",
+      "opt_smirk": "Sorriso de canto",
+      "opt_sparkle": "Brilho",
+      "opt_squint": "Semicerrados",
+      "opt_star": "Estrela",
+      "opt_swirl": "Espiral",
+      "opt_term": "Terminal",
+      "opt_tongue": "Língua",
+      "opt_visor": "Visor",
+      "opt_wide": "Arregalados",
+      "opt_wink": "Piscadela",
+      "opt_wobble": "Ondulada",
+      "opt_wrench": "Chave inglesa",
+      "pack_load_failed": "Não foi possível carregar a arte do pacote — exibindo o rosto padrão.",
+      "randomize": "Aleatório",
+      "reset_default": "Redefinir para o rosto padrão",
+      "sound_blip": "Blip",
+      "sound_chime": "Sino",
+      "sound_ding": "Ding",
+      "sound_pop": "Pop",
+      "sound_preview": "Tocar este som",
+      "sound_pulse": "Pulso",
+      "sound_silent": "Sem som",
+      "state_done": "Concluído",
+      "state_error": "Falhou",
+      "state_working": "Trabalhando",
+      "tile_amber": "Âmbar",
+      "tile_bronze": "Bronze",
+      "tile_coral": "Coral",
+      "tile_cyan": "Ciano",
+      "tile_green": "Verde",
+      "tile_indigo": "Índigo",
+      "tile_magenta": "Magenta",
+      "tile_olive": "Oliva",
+      "tile_plum": "Ameixa",
+      "tile_purple": "Roxo Kiro",
+      "tile_red": "Vermelho",
+      "tile_rose": "Rosa",
+      "tile_sky": "Azul-céu",
+      "tile_steel": "Azul-aço",
+      "tile_teal": "Verde-azulado",
+      "title": "Personalizar avatar",
+      "title_named": "Personalizar avatar — {{name}}",
+      "upload_bad_image": "Não foi possível ler o arquivo como imagem.",
+      "upload_choose": "Escolher uma imagem…",
+      "upload_hint": "Arraste uma imagem para cá, ou",
+      "upload_note": "PNG, JPEG ou WEBP. Recortada em quadrado e reduzida para 512 px antes de salvar.",
+      "upload_too_large": "O arquivo é grande demais (máx. 20 MB)."
+    },
+    "crashNotice": {
+      "diagnostics_were_saved_locally": "Novos registros de falha salvos neste computador: {{n}}. Anexe-os ao relatar o problema.",
+      "dismiss": "Dispensar",
+      "reveal_failed": "Não foi possível abrir a pasta — procure crashes.log no diretório de logs do aplicativo.",
+      "show_diagnostics": "Mostrar diagnósticos",
+      "the_app_closed_unexpectedly": "O aplicativo foi encerrado inesperadamente"
+    },
+    "exportSessionItem": {
+      "export_to_file": "Exportar para um arquivo",
+      "exported": "Exportado",
+      "failed": "Falhou",
+      "not_saved_to_disk": "sessão não salva em disco",
+      "unknown_error": "A exportação falhou"
+    },
+    "startupVideoModal": {
+      "close": "Fechar",
+      "feature_intro": "Introdução ao recurso",
+      "got_it": "Entendi",
+      "media_failed": "Não foi possível carregar o vídeo do recurso",
+      "share": "Compartilhar",
+      "share_description": "Transforme este vídeo do recurso em um card que você pode publicar em qualquer lugar.",
+      "share_include_title": "Incluir o título do vídeo"
+    },
+    "pendingQuestionCard": {
+      "answer_failed": "Não foi possível enviar sua resposta. O agente ainda está aguardando, então tente novamente.",
+      "dismiss_failed": "Não foi possível descartar esta pergunta. Tente novamente."
+    },
+    "pinSurfaceButton": {
+      "pin_limit_reached": "Máximo de {{n}} itens fixados na barra lateral: remova um primeiro"
+    },
+    "sessionControlHost": {
+      "controls_unavailable": "Controles de sessão indisponíveis",
+      "failed": "Falha em {{label}}",
+      "chat_unaffected": "Seu chat não é afetado — apenas este controle parou de funcionar.",
+      "retry": "Tentar novamente",
+      "retry_loading": "Tentar carregar {{label}} novamente",
+      "could_not_load": "Não foi possível carregar {{label}}",
+      "loading": "Carregando {{label}}…",
+      "dialog_label": "{{label}} — {{appName}}"
+    },
+    "markdownCard": {
+      "formatted": "Formatado",
+      "raw": "Bruto",
+      "render_the_markdown_headings_lists_tables_links": "Renderizar o markdown - títulos, listas, tabelas, links",
+      "show_the_exact_markdown_source": "Mostrar o código markdown exato"
+    },
+    "fileMenuContributions": {
+      "app_actions": "Ações do aplicativo",
+      "contributed_by": "Aplicativo: {{app}}"
+    },
+    "featurePreviewIntro": {
+      "learn_more": "Ver como fica",
+      "learn_more_about": "Ver como fica {{feature}}",
+      "gif_badge": "GIF",
+      "previous": "Captura anterior",
+      "next": "Próxima captura",
+      "captures": "Capturas",
+      "capture_n_of_m": "Captura {{n}} de {{m}}",
+      "where_to_find": "Onde você vai ver",
+      "turn_on": "Ligar esta prévia",
+      "screenshot_badge": "Captura de tela",
+      "is_on": "Esta prévia está ligada — desligar só a esconde, nada do que você criou se perde"
+    },
+    "sessionAutomationPopover": {
+      "snapshot_failed": "Não foi possível carregar o estado do monitor desta sessão. Tente carregar novamente antes de iniciar um monitor.",
+      "retry_snapshot": "Tentar carregar novamente",
+      "agent_turns": "Turnos do agente: {{count}}",
+      "awaiting_first_probe": "Aguardando a primeira consulta",
+      "cancel": "Cancelar",
+      "close": "Fechar",
+      "confirm_stop": "Confirmar parada",
+      "description": "Consulte com baixo custo e acione o agente somente quando houver trabalho de revisão que possa ser feito.",
+      "enter_pull_request_url": "Insira a URL de uma solicitação de pull.",
+      "latest_classification": "Classificação mais recente",
+      "latest_decision": "Decisão mais recente",
+      "limit_range": "Insira um número inteiro entre {{min}} e {{max}}.",
+      "maximum_agent_turns": "Máximo de turnos do agente",
+      "maximum_provider_errors": "Máximo de erros do provedor",
+      "maximum_runtime": "Tempo máximo de execução em segundos",
+      "maximum_tokens": "Máximo de tokens",
+      "monitor_status": "Status do monitor: {{status}}",
+      "next_probe": "Próxima consulta",
+      "none_yet": "Nenhum ainda",
+      "not_scheduled": "Não agendado",
+      "objective": "Objetivo",
+      "probe_cadence": "Intervalo de consulta em segundos",
+      "probes": "Consultas: {{count}}",
+      "provider_errors": "Erros do provedor: {{count}}",
+      "pull_request_url": "URL da solicitação de pull",
+      "pull_request_url_placeholder": "por ex. https://github.com/org/repo/pull/123…",
+      "request_failed": "A solicitação do monitor falhou. Tente novamente.",
+      "session_mode_unavailable": "Os monitores não estão disponíveis em sessões de equipe ou de membro porque essas sessões encaminham o trabalho pela equipe.",
+      "restart_monitor": "Reiniciar monitor",
+      "review_ready": "Pronta para revisão",
+      "save_changes": "Salvar alterações",
+      "set_up_bounded_monitor": "Configurar um monitor limitado",
+      "sidebar_status": "Monitor · {{status}}",
+      "start_monitor": "Iniciar monitor",
+      "statuses": {
+        "action_running": "agente em execução",
+        "active": "ativo",
+        "arm_pending": "preparando",
+        "backing_off": "aguardando nova tentativa",
+        "blocked": "bloqueado",
+        "budget_stopped": "parado por limite",
+        "success": "concluído",
+        "user_stopped": "parado"
+      },
+      "stop_monitor": "Parar monitor",
+      "terminal_reason": "Motivo do encerramento",
+      "title": "Monitor limitado de solicitação de pull",
+      "tokens": "Tokens: {{count}}",
+      "unknown": "Desconhecido",
+      "back_to_bounded_monitor": "Voltar ao monitor limitado",
+      "legacy_notice": "Este ciclo antigo invoca o agente a cada ciclo e pode ser executado sem limite.",
+      "use_legacy_costly": "Usar o ciclo de objetivo antigo (caro)",
+      "wake_instructions": "Instruções para o agente quando ele for ativado",
+      "wake_instructions_too_long": "Insira no máximo {{max}} caracteres.",
+      "wakes": "Acionamentos: {{count}}",
+      "clear_monitor": "Excluir monitor parado",
+      "confirm_clear": "Excluir o monitor definitivamente",
+      "terminal_exits": "Reiniciar volta a vigiar a mesma pull request. Excluir monitor parado o remove definitivamente e libera esta sessão para vigiar outra coisa.",
+      "clear_monitor_question": "Excluir este monitor definitivamente?"
     }
   },
   "hooks": {
@@ -7939,7 +8445,8 @@
       "toggle_left_sidebar": "Alternar barra lateral esquerda",
       "toggle_session_panel": "Alternar painel de sessões",
       "toggle_side_panel": "Alternar painel lateral",
-      "toggle_terminal": "Alternar terminal"
+      "toggle_terminal": "Alternar terminal",
+      "focus_pending_approval": "Focar a aprovação pendente"
     },
     "usePanelTabs": {
       "artifacts": "Artefatos",
@@ -8012,7 +8519,8 @@
       "a_task_needs_your_decision": "Uma tarefa precisa da sua decisão",
       "approval_required": "Aprovação necessária",
       "tool_approval": "Aprovação de ferramenta: {{name}}",
-      "unknown": "Desconhecido"
+      "unknown": "Desconhecido",
+      "response_ready": "Resposta pronta"
     }
   },
   "lib": {
@@ -8025,7 +8533,12 @@
       "xhigh": "Muito alto"
     },
     "sttProviders": {
-      "downloading_speech_model": "Baixando o modelo de voz: {{pct}} ({{done}} de {{total}})"
+      "downloading_speech_model": "Baixando o modelo de voz: {{pct}} ({{done}} de {{total}})",
+      "downloading_decoder": "Baixando o decodificador de áudio: {{pct}} ({{done}} de {{total}})",
+      "stream_error_decode_failed": "O reconhecimento de fala não conseguiu concluir esta transcrição. Dite novamente.",
+      "stream_error_max_duration": "O ditado atingiu o limite de duração. Inicie uma nova gravação para continuar.",
+      "stream_error_model_missing": "O modelo de voz ainda não está pronto. Baixe-o nas configurações de voz para texto e tente novamente.",
+      "stream_error_session_failed": "A sessão de ditado falhou. Tente gravar novamente."
     }
   },
   "nav": {
@@ -8122,7 +8635,10 @@
       "what_a_crew_starts_from_its_model_skills_tools_mc": "Com o que um agente começa: o modelo, as skills, as ferramentas, os servidores MCP e os limites de segurança",
       "when_nothing_names_a_template_use": "Quando nada indica um modelo, usar",
       "where_it_comes_from": "De onde ele vem",
-      "yes_delete_it": "Sim, excluir"
+      "yes_delete_it": "Sim, excluir",
+      "retry": "Tentar novamente",
+      "delete_unavailable_references_failed": "Não foi possível carregar a lista da equipe nem a configuração do modelo de fallback, então excluir este modelo fica indisponível até que carreguem.",
+      "failed_to_load_agents": "Falha ao carregar os agentes"
     },
     "aidlc": {
       "dagView": {
@@ -8192,7 +8708,6 @@
       "details": "Detalhes",
       "disable": "Desativar",
       "disabled": "Desativado",
-      "dismiss_error": "Descartar erro",
       "doesnt_exist": "\"{{name}}\" não existe",
       "enable": "Ativar",
       "enabled": "Ativado",
@@ -8202,7 +8717,6 @@
       "features": "Funcionalidades",
       "use_cases": "Casos de uso",
       "configuration": "Configuração",
-      "fix_with_ai": "Corrigir com IA",
       "github_stars": "Estrelas do GitHub",
       "github_stars_2": "Estrelas do GitHub: {{value}}",
       "install": "Instalar",
@@ -8251,10 +8765,14 @@
       "v_2": "· v",
       "websocket_events": "Eventos WebSocket",
       "all_contributors": "Todos os contribuidores",
-      "contributors": "Contribuidores"
+      "contributors": "Contribuidores",
+      "retry": "Tentar novamente"
     },
     "appPage": {
-      "loading_app": "Carregando app…"
+      "loading_app": "Carregando app…",
+      "retry": "Tentar novamente",
+      "back_to_apps": "Voltar para Apps",
+      "failed_to_load_app": "Falha ao carregar o app"
     },
     "appsPage": {
       "action_failed": "Falha ao {{action}} {{name}}",
@@ -8331,7 +8849,12 @@
       "installed_app_find_in_library_and_enable": "{{name}} instalado. Ative-o na Biblioteca.",
       "synced_from_its_source_directory": "{{name}} sincronizado a partir do diretório de origem.",
       "updated_from_the_registry": "{{name}} atualizado a partir do registro.",
-      "refresh_store": "Atualizar a loja"
+      "refresh_store": "Atualizar a loja",
+      "no_enabled_apps": "Nenhum app ativado",
+      "show_disabled_one": "Mostrar {{count}} app desativado",
+      "show_disabled_many": "Mostrar {{count}} apps desativados",
+      "show_disabled_other": "Mostrar {{count}} apps desativados",
+      "show_enabled_only": "Mostrar apenas ativados"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/mês",
@@ -8382,7 +8905,7 @@
       "deployments_count": "Implantações ({{count}})",
       "deployments_tip": "Todos os recursos implantados — sites estáticos publicados a partir de artefatos e implantações de aplicações web completas. Recolher = remoção reversível; Destruir = remoção permanente da infraestrutura.",
       "destroy": "Destruir",
-      "destroy_confirm": "DESTRUIR '{{name}}'? Exclui permanentemente o bucket {{bucket}} e a distribuição {{distribution}}. Não pode ser desfeito.",
+      "destroy_confirm": "DESTRUIR “{{name}}”? Exclui permanentemente o bucket {{bucket}} e a distribuição {{distribution}}. Não pode ser desfeito.",
       "destroying": "Destruindo '{{name}}' (desativar o CloudFront pode levar de 5 a 15 min).",
       "details": "Detalhes",
       "dismiss": "Descartar",
@@ -8438,7 +8961,7 @@
       "ready_to_deploy_count": "Pronto para implantar ({{count}})",
       "ready_to_deploy_tip": "Artefatos de aplicação web que ainda não foram implantados. Implantar abre uma sessão de chat com a habilidade carregada que adapta o app e o publica.",
       "recall": "Retirar",
-      "recall_confirm": "Recolher '{{name}}'? Esvazia o bucket {{bucket}} (URL → 404, reversível). Os caches de borda podem responder por um curto período; conteúdo já baixado não pode ser recolhido.",
+      "recall_confirm": "Recolher “{{name}}”? Esvazia o bucket {{bucket}} (URL → 404, reversível). Os caches de borda podem responder por um curto período; conteúdo já baixado não pode ser recolhido.",
       "recalled": "'{{name}}' recolhido.",
       "refresh": "Atualizar",
       "region": "Região",
@@ -8447,7 +8970,7 @@
       "remove": "Remover",
       "remove_failed": "falha ao remover",
       "remove_from_registry": "Remover {{name}} do registro",
-      "remove_profile_confirm": "Remover '{{name}}' do registro? Seu ~/.aws/config NÃO é alterado.",
+      "remove_profile_confirm": "Remover “{{name}}” do registro? Seu ~/.aws/config NÃO é alterado.",
       "removed_from_registry_your_aws_config_is_untouche": "Removido do registro (o seu ~/.aws/config permanece intacto).",
       "resolves_v2_before_any_v1": "do gateway resolve a v2 antes de qualquer v1.",
       "role_optional": "Função (opcional)",
@@ -8493,7 +9016,9 @@
       "destroy_title": "Destruir o site?",
       "destroy_button": "Destruir o site",
       "remove_profile_title": "Remover o perfil?",
-      "remove_profile_button": "Remover o perfil"
+      "remove_profile_button": "Remover o perfil",
+      "retry": "Tentar novamente",
+      "profile_errors_title": "Alguns perfis não puderam ser listados"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· uma versão mais recente está disponível na cópia remota",
@@ -8610,7 +9135,19 @@
       "version": "Versão",
       "via_dashboard": "pelo painel",
       "view_remote": "Ver remoto",
-      "your_current_edits_are_saved_as_a_version_first": "Suas edições atuais são salvas como uma versão primeiro, então nada é perdido."
+      "your_current_edits_are_saved_as_a_version_first": "Suas edições atuais são salvas como uma versão primeiro, então nada é perdido.",
+      "publication_still_rolling_out": "Ainda em distribuição — este link ficará acessível em alguns minutos.",
+      "publication_distribution_disabled": "A rede de entrega deste link está desativada, portanto o link não será resolvido. Reative a distribuição no console da AWS.",
+      "publication_notice_generic": "Talvez este link ainda não funcione.",
+      "check_again": "Verificar novamente",
+      "rechecking": "Verificando…",
+      "recheck_publication_notice": "Verificar novamente o estado desta publicação",
+      "back_to_live": "Voltar para a versão atual",
+      "versions_failed_to_load": "Falha ao carregar as versões",
+      "comments_failed_to_load": "Falha ao carregar os comentários",
+      "comment_action_failed": "Falha na ação do comentário",
+      "activity_failed_to_load": "Falha ao carregar a atividade",
+      "sync_status_unavailable": "Status de sincronização indisponível"
     },
     "artifactPopoutFrame": {
       "artifact": "Artefato",
@@ -8648,7 +9185,6 @@
       "delete": "Excluir…",
       "deploying": "Implantando…",
       "drop_here_to_unfile": "— solte aqui para retirar da pasta",
-      "error": "Erro",
       "expired": "Expirado",
       "filter_artifacts": "Filtrar artefatos do {{provider}}…",
       "filter_by_kind": "Filtrar por tipo",
@@ -8694,7 +9230,7 @@
       "promote_slug_taken_open_older": "Abrir o anterior “{{taken}}”",
       "published": "Publicado ({{visibility}})",
       "published_sync_issue": "Publicado (problema de sincronização)",
-      "remove_artifact_confirm": "Remover o artefato \"{{slug}}\" da sua biblioteca?\n\nIsso exclui o registro do artefato e seu histórico de versões. Se este artefato veio de um arquivo no disco ou de um widget do chat, o original NÃO é alterado — você pode adicioná-lo novamente depois.",
+      "remove_artifact_confirm": "Remover o artefato “{{slug}}” da sua biblioteca?\n\nIsso exclui o registro do artefato e seu histórico de versões. Se este artefato veio de um arquivo no disco ou de um widget do chat, o original NÃO é alterado — você pode adicioná-lo novamente depois.",
       "remove_from_artifacts_library": "Remover da biblioteca de artefatos",
       "remove_from_library": "Remover da biblioteca",
       "remove_star_from_artifact": "Remover o artefato dos favoritos",
@@ -8723,7 +9259,11 @@
       "widgets_files_and_snippets_live_tracked_with_ver": "Widgets, arquivos e snippets — rastreados em tempo real com histórico de versões",
       "your_artifacts": "Seus artefatos",
       "local_preview": "Local preview",
-      "more_actions": "Mais ações"
+      "more_actions": "Mais ações",
+      "published_rolling_out": "Publicado — ainda em distribuição",
+      "published_distribution_disabled": "Publicado — rede de entrega desativada",
+      "published_notice_generic": "Publicado — talvez o link ainda não funcione",
+      "retry": "Tentar novamente"
     },
     "capabilitiesPage": {
       "agent_capabilities": "Recursos do agente",
@@ -8792,7 +9332,6 @@
       "new_channel": "Novo canal",
       "new_channel_2": "Novo canal",
       "no_channels_yet": "Nenhum canal ainda",
-      "ok": "OK",
       "preset_custom_empty": "Personalizado (vazio)",
       "preset_incident_response": "Resposta a incidentes",
       "reply": "Responder",
@@ -8817,7 +9356,15 @@
       "this_will_reset_conversation_history_for_all_age": "Isto redefinirá o histórico de conversa de todos os agentes. As configurações são preservadas.",
       "thread": "Tópico",
       "topic": "Assunto",
-      "unknown_error": "erro desconhecido"
+      "unknown_error": "erro desconhecido",
+      "failed_to_load_channels": "Falha ao carregar os canais",
+      "failed_to_load_presets": "Falha ao carregar as predefinições de equipe",
+      "failed_to_load_channel": "Falha ao carregar o canal",
+      "failed_to_send_message": "Falha ao enviar a mensagem",
+      "failed_to_dismiss_agent": "Falha ao dispensar o agente",
+      "failed_to_update_agent": "Falha ao atualizar o agente",
+      "failed_to_close_channel": "Falha ao fechar o canal",
+      "failed_to_clear_context": "Falha ao limpar o contexto"
     },
     "chat": {
       "activityViewer": {
@@ -8842,7 +9389,6 @@
         "complete": "Concluído",
         "dismiss_done_count": "Descartar concluídos ({{count}})",
         "error": "Erro",
-        "failed_click_to_retry": "Falhou — clique para tentar novamente",
         "input": "Entrada",
         "issues": "Issues",
         "last_tool": "Última ferramenta:",
@@ -8887,7 +9433,16 @@
         "waiting_to_start_queued_behind_the_concurrency_l": "aguardando para iniciar — na fila devido ao limite de simultaneidade",
         "workflows": "Workflows",
         "workspace_empty": "Este espaço de trabalho ainda não tem arquivos",
-        "workspace_truncated": "Espaço de trabalho grande — mostrando os primeiros 10.000 arquivos"
+        "workspace_truncated": "Espaço de trabalho grande — mostrando os primeiros 10.000 arquivos",
+        "output_load_failed": "Não foi possível carregar a saída",
+        "retry": "Tentar novamente",
+        "cancel_failed": "Não foi possível cancelar o subagente",
+        "dismiss_failed": "Alguns subagentes concluídos não foram removidos no servidor e podem reaparecer",
+        "retry_failed_error": "Não foi possível repetir {{count}} dos subagentes com falha",
+        "artifacts_load_failed": "Não foi possível carregar os artefatos desta sessão",
+        "library_load_failed": "Não foi possível carregar a biblioteca de artefatos",
+        "artifact_save_failed": "Não foi possível salvar o artefato",
+        "workflow_runs_load_failed": "Não foi possível carregar as execuções de fluxo de trabalho"
       },
       "assistantMessage": {
         "applied_to_tasks": "Aplicado às tarefas",
@@ -8904,7 +9459,7 @@
         "regenerate_response": "Gerar resposta novamente",
         "rendered": "renderizado",
         "rendered_view": "Visualização renderizada",
-        "speak": "Falar",
+        "speak": "Ler em voz alta",
         "speak_message": "Ler a mensagem em voz alta",
         "steered": "Direcionado",
         "switch_to_raw_markdown_view": "Alternar para a visualização em Markdown bruto",
@@ -8923,7 +9478,9 @@
         "needs_earlier_history_count_one": "Selecione para carregar o histórico anterior: resta {{count}} mensagem anterior",
         "needs_earlier_history_count_many": "Selecione para carregar o histórico anterior: restam {{count}} mensagens anteriores",
         "needs_earlier_history_count_other": "Selecione para carregar o histórico anterior: restam {{count}} mensagens anteriores",
-        "share_message": "Compartilhar como imagem"
+        "share_message": "Compartilhar como imagem",
+        "copy_text": "Copiar texto",
+        "copy_failed": "Falha ao copiar"
       },
       "chatFooter": {
         "compacting": "Compactando…",
@@ -8968,7 +9525,14 @@
       },
       "errorCard": {
         "continue": "Continuar",
-        "continue_hint": "Retomar de onde parou. O trabalho já gravado no disco permanece intacto."
+        "continue_hint": "Retomar de onde parou. O trabalho já gravado no disco permanece intacto.",
+        "default_model": "Alterar o modelo padrão",
+        "default_model_hint": "Abra Configurações → Chat → Modelo padrão. Novas sessões começam com este valor.",
+        "pick_model": "Escolher um modelo para esta sessão",
+        "pick_model_hint": "Abra o seletor de modelos, escolha um dos modelos que a sua conta pode usar e envie sua mensagem de novo.",
+        "both_hint": "Faça os dois: “{{pick}}” corrige esta sessão, “{{default}}” impede que novas sessões comecem com o mesmo modelo se ele for o padrão. Depois envie sua mensagem de novo.",
+        "elsewhere_hint": "O seletor de modelos e Configurações → Chat ficam na janela principal do chat. Abra-a para escolher um modelo e alterar o padrão.",
+        "elsewhere_settings_hint": "Configurações → Chat fica na janela principal do chat. Abra-a para alterar o modelo padrão."
       },
       "folderPanel": {
         "clear_search": "Limpar pesquisa",
@@ -8995,14 +9559,18 @@
         "no_knowledge_found_for_query": "Nenhum conhecimento encontrado para “{{query}}”",
         "searching_knowledge_for_query": "Buscando conhecimento para “{{query}}”…",
         "selected": "selecionados ·",
-        "tokens": "tokens"
+        "tokens": "tokens",
+        "retry": "Tentar novamente",
+        "search_failed_for_query": "A busca de conhecimento falhou para “{{query}}”"
       },
       "mcpInfoButton": {
         "agent_loads_only_its_own_mcp_servers": "O agente \"{{name}}\" carrega apenas os próprios servidores MCP.",
         "disabled": "desativado",
         "mcp_servers_count": "Servidores MCP ({{count}}/{{total}})",
         "none_loaded": "Nenhum carregado",
-        "session_mcp_servers": "Servidores MCP da sessão"
+        "session_mcp_servers": "Servidores MCP da sessão",
+        "load_failed": "Não foi possível carregar os servidores MCP",
+        "mode_load_failed": "Não foi possível ler o modo Tool Search; mostrando o padrão"
       },
       "mcpOAuthBanner": {
         "authenticated": "autenticado.",
@@ -9080,7 +9648,8 @@
         "change_your_color_palette_in_display_settings": "Altere sua paleta de cores nas configurações de Exibição",
         "no_color": "Sem cor",
         "session_color": "Cor da sessão",
-        "session_colors": "Cores da sessão"
+        "session_colors": "Cores da sessão",
+        "save_failed": "Não foi possível salvar a cor da sessão"
       },
       "sessionFlyout": {
         "new": "Novo",
@@ -9105,7 +9674,9 @@
         "turn_many": "{{count}} turnos",
         "turn_one": "{{count}} turno",
         "turn_other": "{{count}} turnos",
-        "send": "Enviar"
+        "send": "Enviar",
+        "off_record_marker": "Chat lateral · não é salvo na conversa",
+        "context_only_tools_unavailable": "Somente contexto · Ferramentas e MCPs não estão disponíveis aqui. Use o chat principal para realizar ações."
       },
       "sidePanel": {
         "close_panel": "Fechar painel",
@@ -9150,7 +9721,9 @@
         "switch_to_split_view": "Alternar para a visualização dividida",
         "switch_to_unified_view": "Alternar para a visualização unificada",
         "this_app_render_is_no_longer_available": "Esta renderização do app não está mais disponível. Execute a ferramenta novamente para vê-la.",
-        "turn_diff": "Diff do turno"
+        "turn_diff": "Diff do turno",
+        "menu_terminal": "Terminal",
+        "menu_terminal_desc": "Shell no host do gateway, restrito a esta conversa"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "Falha ao parar, sessão redefinida",
@@ -9197,7 +9770,10 @@
         "tool_one": "{{count}} ferramenta",
         "tool_other": "{{count}} ferramentas",
         "waiting_for_your_approval_to_start": "Aguardando sua aprovação para iniciar",
-        "waiting_to_start_queued_behind_the_concurrency_l": "Aguardando para iniciar — na fila devido ao limite de simultaneidade"
+        "waiting_to_start_queued_behind_the_concurrency_l": "Aguardando para iniciar — na fila devido ao limite de simultaneidade",
+        "stop_failed": "Não foi possível parar o subagente {{name}}",
+        "stop_all_failed": "Não foi possível parar os subagentes",
+        "retry_failed_error": "Não foi possível repetir alguns subagentes com falha"
       },
       "subagentRunCard": {
         "agent_finished_many": "{{count}} agentes concluídos",
@@ -9250,7 +9826,8 @@
         "wait_ending": "Encerrando…",
         "wait_remaining": "restam {{time}}",
         "wait_status": "Aguardando",
-        "blocked_by_security_policy": "Bloqueado pela política de segurança"
+        "blocked_by_security_policy": "Bloqueado pela política de segurança",
+        "end_wait_failed": "Não foi possível encerrar a espera"
       },
       "toolDetails": {
         "auto": "Auto",
@@ -9280,7 +9857,12 @@
         "send_enter": "Enviar (Enter)",
         "steered_into_the_running_turn": "Direcionado para o turno em andamento",
         "pin_message": "Fixar mensagem",
-        "unpin_message": "Desafixar mensagem"
+        "unpin_message": "Desafixar mensagem",
+        "copied": "Copiado",
+        "copy_failed": "Falha ao copiar",
+        "steering": "Direcionando…",
+        "redirecting_the_running_turn_not_yet_confirmed": "Redirecionando o turno em andamento — ainda não confirmado.",
+        "turn_ended_before_this_applied_runs_as_its_own_message": "O turno terminou antes de isto ser aplicado — é executado como uma mensagem separada."
       },
       "workflowCompletionCard": {
         "hide_result": "Ocultar resultado",
@@ -9323,11 +9905,13 @@
         "copied": "Copiado",
         "copy_link": "Copiar link da mensagem",
         "unpin": "Desafixar",
-        "jump_to_message": "Ir para a mensagem"
+        "jump_to_message": "Ir para a mensagem",
+        "copy_failed": "Falha ao copiar"
       },
       "earlierMessagesBar": {
         "load_earlier_messages": "Carregar mensagens anteriores",
-        "error_retry": "Não foi possível carregar as mensagens anteriores — tentar novamente"
+        "load_failed": "Não foi possível carregar as mensagens anteriores",
+        "retry": "Tentar novamente"
       },
       "sessionSummary": {
         "empty_body": "O resumo é escrito quando um turno termina. Envie uma mensagem para obter um desta sessão.",
@@ -9379,7 +9963,8 @@
         "filter_placeholder": "Filtrar arquivos…",
         "refresh": "Atualizar",
         "resize": "Redimensionar o navegador de arquivos",
-        "tree_mode": "Modo de lista de arquivos"
+        "tree_mode": "Modo de lista de arquivos",
+        "git_status_failed": "Não foi possível ler o status do git"
       },
       "filesHome": {
         "no_project_dir": "Nenhum diretório de projeto definido para este chat",
@@ -9415,7 +10000,18 @@
         "kind_internal_url": "uma URL interna",
         "card_wordmark": "{{productName}}",
         "sensitive_in_card": "Antes de compartilhar — o cartão contém: {{kinds}}",
-        "sensitive_in_caption": "Antes de compartilhar — o texto da publicação contém: {{kinds}}"
+        "sensitive_in_caption": "Antes de compartilhar — o texto da publicação contém: {{kinds}}",
+        "withdrawn_by_policy": "O compartilhamento foi desativado por política. Copie seu texto agora se quiser mantê-lo — ele não é salvo ao fechar esta caixa de diálogo.",
+        "copy_text_only": "Copiar texto",
+        "copied_text": "Copiado",
+        "copy_text_failed": "Falha ao copiar",
+        "copy_text_unavailable": "A área de transferência está bloqueada aqui. O texto da sua publicação está selecionado — pressione Ctrl+C / ⌘C. O texto do cartão que você editou, copie do próprio cartão.",
+        "export_failed": "Não foi possível gerar o cartão de compartilhamento"
+      },
+      "compactionCard": {
+        "no_summary": "Concluído — sem resumo para mostrar",
+        "summary_hint": "Resumo recolhido — expanda para ler",
+        "title": "Contexto compactado"
       }
     },
     "chatPage": {
@@ -9433,8 +10029,6 @@
       "could_not_switch_variant": "Não foi possível trocar de versão",
       "could_not_start_a_new_session": "Não foi possível iniciar uma nova sessão",
       "could_not_start_session_message_restored": "Não foi possível iniciar uma nova sessão: {{error}}. Sua mensagem foi restaurada — envie novamente para tentar de novo.",
-      "dismiss_error": "Descartar erro",
-      "dismiss_upload_error": "Descartar erro de upload",
       "enter_split_view": "Entrar na visualização dividida",
       "error_reading_file": "_Erro ao ler o arquivo_",
       "esc_to_dismiss": "Esc para descartar",
@@ -9514,7 +10108,25 @@
       "what_can_i_do_for_you": "O que posso fazer por você?",
       "worktree_creation_returned_no_path": "A criação da worktree não retornou nenhum caminho",
       "loading_earlier_messages": "Carregando mensagens anteriores…",
-      "send_failed_with_error": "Falha ao enviar: {{error}}"
+      "send_failed_with_error": "Falha ao enviar: {{error}}",
+      "turn_minimap": "Navegar pelos turnos da conversa",
+      "turn_minimap_active": "Turno {{current}} de {{count}}: {{prompt}}",
+      "turn_minimap_active_windowed": "Turno {{current}} de {{count}} carregados: {{prompt}}",
+      "turn_minimap_earlier": "Os turnos anteriores ainda não foram carregados. Carregar mensagens mais antigas",
+      "turn_minimap_landmark": "Turnos da conversa",
+      "side_chat_pane_gone": "Não foi possível abrir um Chat lateral para esse painel: a sessão dele não está mais disponível: {{error}}",
+      "attached_file_inert": "Arquivo anexado (não pode ser aberto aqui): {{path}}",
+      "send_failed_connection": "Não foi possível enviar — verifique sua conexão e tente novamente.",
+      "send_failed_with_error_restored": "Não foi possível enviar esta mensagem: {{error}}. Seu texto voltou para a caixa de composição.",
+      "delivery_unconfirmed": "Entrega não confirmada — seu texto voltou para a caixa de composição; verifique a conversa antes de enviar novamente.",
+      "could_not_read_file_reason": "Não foi possível ler {{path}} ({{reason}})",
+      "screenshot_failed_reason": "Falha na captura de tela: {{reason}}",
+      "http_status": "HTTP {{status}}",
+      "could_not_rename_session": "Não foi possível renomear a sessão",
+      "could_not_generate_title": "Não foi possível gerar um título",
+      "could_not_open_side_chat": "Não foi possível abrir o chat lateral",
+      "side_command_not_run": "O comando /side não foi executado. Sua mensagem continua no editor.",
+      "could_not_send_to_side_chat": "Não foi possível enviar para o chat lateral"
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "(1 ignorada — atualmente selecionada)",
@@ -9569,7 +10181,7 @@
       "default_agent": "Agente padrão: {{name}}",
       "delete_column": "Excluir coluna",
       "delete_folder": "Excluir pasta",
-      "delete_folder_confirm": "Excluir \"{{name}}\"? As sessões serão desagrupadas.",
+      "delete_folder_confirm": "Excluir “{{name}}”? As sessões serão desagrupadas.",
       "delete_history_session": "Excluir sessão do histórico",
       "delete_this_column": "Excluir esta coluna?",
       "double_click_to_rename": "Clique duas vezes para renomear",
@@ -9681,7 +10293,6 @@
       "sessions": "Sessões",
       "show": "Mostrar",
       "show_all_folders": "Mostrar todas as pastas",
-      "show_collapsed_folders": "Mostrar pastas recolhidas:",
       "show_folder": "Mostrar pasta",
       "show_hidden_folder_many": "Mostrar {{count}} pastas ocultas",
       "show_hidden_folder_one": "Mostrar {{count}} pasta oculta",
@@ -9756,7 +10367,16 @@
       "workflow_running_other": "{{count}} fluxos de trabalho em execução",
       "flat_view_hide_folders_in_board_columns": "Visão plana — ocultar pastas nas colunas do quadro",
       "show_folders_in_board_columns": "Mostrar pastas nas colunas do quadro",
-      "switch_to_flat_view_hide_folders_in_board_columns": "Mudar para visão plana (ocultar pastas nas colunas do quadro)"
+      "switch_to_flat_view_hide_folders_in_board_columns": "Mudar para visão plana (ocultar pastas nas colunas do quadro)",
+      "closed": "Fechado",
+      "folder_create_failed": "Não foi possível criar o chat.",
+      "folder_project_dir_missing": "O diretório do projeto da pasta não existe mais: {{path}}. Atualize-o nas configurações da pasta.",
+      "runs_on_crew": "Executa em {{name}} — um Crew conectado, não nesta máquina",
+      "show_all_older_sessions": "Mostrar todas as sessões antigas",
+      "folders_load_failed": "Não foi possível carregar as pastas",
+      "columns_load_failed": "Não foi possível carregar as colunas do quadro",
+      "folder_update_failed": "Falha ao atualizar a pasta",
+      "board_update_failed": "Falha ao atualizar o quadro"
     },
     "connectionsPage": {
       "action_failed": "Falha na ação: {{error}}",
@@ -9828,7 +10448,11 @@
       "value_prop_stripe": "Consultar clientes, pagamentos e faturas do Stripe.",
       "value_prop_vercel": "Inspecionar seus projetos e deployments da Vercel.",
       "waiting_for_approval": "Aguardando aprovação",
-      "waiting_for_approval_address": "Aguardando o endereço de aprovação… Ele aparecerá aqui na próxima conexão do agente — envie qualquer mensagem no chat para iniciar a autorização agora."
+      "waiting_for_approval_address": "Aguardando o endereço de aprovação… Ele aparecerá aqui na próxima conexão do agente — envie qualquer mensagem no chat para iniciar a autorização agora.",
+      "connection_unreachable": "Não foi possível contactar {{provider}} para verificar esta conexão.",
+      "approval_opened_in_default_browser": "Aprovação aberta no seu navegador padrão…",
+      "test_blocked_by_sibling": "Apenas um teste de conexão é executado por vez — {{provider}} está sendo testado",
+      "test_in_flight": "Já há um teste de conexão em execução para {{provider}}. Tente novamente quando terminar."
     },
     "contextBreakdown": {
       "axis_bar": "comprimento da barra ∝ √caracteres · segmentos = composição desse turno",
@@ -9907,7 +10531,6 @@
       "disk": "Disco:",
       "disk_worktrees": "Disco (worktrees)",
       "dismiss": "Descartar",
-      "dismiss_provision_status": "Descartar status de provisionamento",
       "dismiss_sync_status": "Descartar status de sincronização",
       "each_row_below_is_a_git_worktree_discovered_from": "Cada linha abaixo é uma worktree git descoberta a partir do checkout principal. Use",
       "empty_worktree_cannot_be_undone": "Worktree vazia. Não pode ser desfeito.",
@@ -10104,7 +10727,8 @@
       "pod_home_disk": "Disco de homes de pods: {{value}}",
       "orphan_pods_label": "Homes de pods órfãos: {{value}}",
       "total_disk_used_by_running_pod_homes": "Disco total usado pelos homes de pods em execução",
-      "pod_homes_left_on_disk_with_no_live_pod": "Homes de pods deixados no disco sem um pod ativo"
+      "pod_homes_left_on_disk_with_no_live_pod": "Homes de pods deixados no disco sem um pod ativo",
+      "disk_usage_unavailable": "Uso de disco indisponível"
     },
     "developer": {
       "agentBackendTab": {
@@ -10128,12 +10752,25 @@
       },
       "featurePreviewsTab": {
         "chat_on_a_crew": "Conversar em um Crew",
-        "chat_on_a_crew_desc": "Adiciona “New chat on crew” ao menu de criação, que inicia uma sessão executada em um Crew conectado. Inacabado: ela abre no painel do próprio Crew, e sessões executadas em um Crew ainda não aparecem aqui.",
-        "crew": "Crew",
+        "chat_on_a_crew_desc": "Adiciona “New chat on crew” ao menu de criação, que inicia uma sessão em uma instância remota, ou seja, outra máquina que você conectou em Configurações > Instâncias remotas. Inacabado: a sessão abre no painel da própria instância e ainda não aparece na lista de sessões deste painel; para voltar a ela depois, mude para o painel dessa instância.",
+        "crew": "Membros da equipe e Crew Mode",
         "inbound_webhook_tokens_registered_contexts_and_r": "Tokens de webhooks de entrada, contextos registrados e histórico de execuções. A API funciona; a página não está concluída.",
         "open_webhooks": "Abrir Webhooks",
         "the_crew_members_page_and_crew_mode_chats_both_a": "A página Membros da equipe e os chats do Crew Mode. Ambos ainda estão em construção, por isso só aparecem quando esta opção é ativada.",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "intro": {
+          "webhooks_summary": "Outro sistema (CI, um bot de revisão, uma pipeline de deploy) pode iniciar seu agente por você enviando uma mensagem com um token de acesso que você cria na página Webhooks.",
+          "webhooks_where": "Quando isto estiver ligado, o link “Abrir Webhooks” aparece neste cartão em Configurações; é dali que a nova página Webhooks abre. Ela fica fora da barra lateral até estar pronta. Desligar só esconde a página de novo; os tokens que você criou são mantidos.",
+          "webhooks_media_page": "A página Webhooks: lista de tokens à esquerda e, à direita, a configuração “Deixe um sistema externo acordar seu agente”.",
+          "crew_summary": "Crew Members é uma página que lista cada agente que você tem e o que cada um está conduzindo agora; um chat em Crew Mode executa vários trabalhos ao mesmo tempo, cada tema na própria sessão, e responde quando terminam. Não tem relação com a prévia “Conversar em um Crew” abaixo, que é sobre outra máquina.",
+          "crew_where": "“Crew Members” aparece na barra lateral abaixo de Sessões e “Novo chat em Crew Mode” no menu do botão Novo, ambos assim que isto estiver ligado.",
+          "crew_media_members": "A página Crew Members com um membro selecionado e o painel de atividade aberto.",
+          "crew_media_menu": "O menu do botão Novo com “Novo chat em Crew Mode” adicionado. O selo Experimental é a marcação do menu para esta mesma prévia."
+        }
+      },
+      "debugToolsTab": {
+        "overlays_the_chat_with_live_scroll_and_anchor_dia": "Sobrepõe ao chat um diagnóstico ao vivo de rolagem e âncoras",
+        "scroll_inspector": "Inspetor de rolagem"
       }
     },
     "developerPage": {
@@ -10178,8 +10815,13 @@
         "telemetry": {
           "description": "Latência de inicialização da sessão (p50/p90) e métricas de aceleração de MCP e habilidades",
           "label": "Telemetria"
+        },
+        "debugTools": {
+          "label": "Ferramentas de depuração",
+          "description": "Sobreposições que mostram no dispositivo o que o aplicativo faz consigo mesmo."
         }
-      }
+      },
+      "feature_previews_moved": "As prévias de recursos foram movidas para Configurações > Desenvolvedor"
     },
     "discoverPage": {
       "subtitle": "Explore e instale apps agênticos",
@@ -10204,7 +10846,6 @@
       "actions": "Ações",
       "bundled": "integrado",
       "cancel": "Cancelar",
-      "check_your_connection_or_configuration_and_try_a": "Verifique sua conexão ou configuração e tente novamente.",
       "click_again_to_confirm": "Clique novamente para confirmar",
       "command": "Comando",
       "config": "configuração",
@@ -10260,7 +10901,10 @@
       "user": "usuário",
       "matcher_placeholder_regex": "Matcher (regex, e.g. \\b(auth|login)\\b)",
       "matcher_placeholder_contains": "Matcher (contains, e.g. deploy|release)",
-      "skills_inert_warning": "These skills can't fire on this configuration: {{skills}}. To save, switch to UserPromptSubmit or AgentSpawn without a command — or remove the skills."
+      "skills_inert_warning": "These skills can't fire on this configuration: {{skills}}. To save, switch to UserPromptSubmit or AgentSpawn without a command — or remove the skills.",
+      "retry": "Tentar novamente",
+      "show_last_error": "Mostrar o último erro de {{name}}",
+      "test_failed_for": "Falha no teste de {{name}}"
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "Um identificador único para este workspace. Agentes referenciam workspaces pelo nome.",
@@ -10357,7 +11001,25 @@
       "session_color": "Cor da sessão",
       "session_color_hint": "As sessões iniciadas por este agente usam esta cor, a menos que a sessão tenha uma cor própria. Editá-la recolore essas sessões. Deixe vazio para nenhuma cor de agente.",
       "session_color_hex": "Valor hexadecimal da cor da sessão",
-      "session_color_clear": "Limpar"
+      "session_color_clear": "Limpar",
+      "add_crew_member": "Adicionar membro da equipe",
+      "create_member": "Criar membro",
+      "failed_to_create_member": "Falha ao criar membro",
+      "member_already_exists": "Já existe um membro chamado '{{name}}'. Escolha outro nome.",
+      "memory_store_hint_member": "A qual armazenamento de memória este membro está vinculado. O vínculo é registrado, mas ainda não dá ao membro uma memória própria.",
+      "runtime_binding_member": "O que este membro usa",
+      "session_color_hint_member": "As sessões que este membro inicia usam esta cor, a menos que a sessão tenha a sua própria. Deixe em branco para nenhuma cor de membro.",
+      "template_hint_member": "A configuração inicial que este membro usa — suas ferramentas, conexões e instruções.",
+      "triggers_hint_member": "Quando passar trabalho a este membro — orientação em texto livre que o {{productName}} lê para decidir. Deixe em branco para excluir este membro da seleção automática.",
+      "triggers_info_member": "Quando sua mensagem corresponde claramente a esses acionadores, o {{productName}} seleciona este membro e executa a tarefa com o workspace, a memória e o modelo do membro. Membros sem acionadores nunca são selecionados automaticamente.",
+      "workspace_hint_member": "A pasta que este membro lê e grava. Ao trocá-la, novos chats começam do zero na nova pasta; a antiga é mantida.",
+      "discard_unsaved_changes": "Descartar alterações não salvas?",
+      "discard_unsaved_body": "Este grupo tem edições que nunca foram salvas. Fechar agora vai descartá-las.",
+      "discard_confirm": "Descartar alterações",
+      "discard_also_crew_edits": "As outras edições não salvas deste grupo serão descartadas junto com ele.",
+      "editor_options_load_failed": "Não foi possível carregar as opções de espaço de trabalho, modelo e armazenamento de memória do editor de crew.",
+      "template_edit_later_note": "Escolha o ponto de partida mais próximo: você pode trocar o modelo deste agente a qualquer momento depois de criá-lo.",
+      "template_edit_later_note_member": "Escolha o ponto de partida mais próximo — você pode trocar o modelo deste membro a qualquer momento depois de criar."
     },
     "knowledge": {
       "detailView": {
@@ -10649,7 +11311,8 @@
       "tail_off": "Tail: desligado",
       "tail_on": "Tail: ligado",
       "wrap_off": "Quebra de linha: desligada",
-      "wrap_on": "Quebra de linha: ligada"
+      "wrap_on": "Quebra de linha: ligada",
+      "level_change_failed": "Falha ao alterar o nível de log"
     },
     "mcpGatewayCard": {
       "active_sessions": "Sessões ativas",
@@ -10707,7 +11370,8 @@
         "strength_measured": "medido, sem divergência",
         "strength_no_objection": "nenhuma objeção encontrada",
         "strength_refuted": "não é seguro compartilhar",
-        "strength_unknown": "não medido"
+        "strength_unknown": "não medido",
+        "measure_progress_failed": "Não foi possível ler o progresso da medição."
       },
       "cancel": "Cancelar",
       "col_server": "Servidor",
@@ -10765,7 +11429,8 @@
       "views_aria": "Visualizações de gerenciamento do MCP",
       "state_direct_env": "direto (env)",
       "state_direct_env_reason": "Sem stub, mas sua seleção continua salva.",
-      "state_direct_env_legend": "direto (env) — o servidor declara uma chave de ambiente que um backend compartilhado retiraria, portanto o {{productName}} não cria stub algum: a sessão o inicia por conta própria, sem backend compartilhado e sem interface própria do servidor."
+      "state_direct_env_legend": "direto (env) — o servidor declara uma chave de ambiente que um backend compartilhado retiraria, portanto o {{productName}} não cria stub algum: a sessão o inicia por conta própria, sem backend compartilhado e sem interface própria do servidor.",
+      "status_failed": "Não foi possível carregar o status de compartilhamento. As chaves abaixo mostram os padrões, não o que está salvo."
     },
     "migrationPage": {
       "app_migration": "Migração de app",
@@ -10831,11 +11496,9 @@
         "workflow_description": "Descrição"
       },
       "agentCfgTab": {
-        "after_saving_use": "Após salvar, use",
         "agent_config_file": "Configuração do agente ({{file}})",
         "agent_config_json": "JSON de configuração do agente",
         "agent_config_tip": "A definição do agente {{process}} — prompt, ferramentas, servidores MCP e configurações do modelo. Esta é a configuração da camada de execução, separada dos vínculos operacionais do {{productName}}.",
-        "apply_restart_sessions_at_the_top_to_apply_chang": "Aplicar e reiniciar sessões no topo para aplicar as alterações.",
         "invalid_json": "JSON inválido",
         "loading": "Carregando…",
         "save": "Salvar",
@@ -10965,7 +11628,8 @@
         "using_legacy_mode_agent_default_agent_as_agent_t": "Usando o modo legado — agent.default_agent como modelo de agente",
         "warm_pool": "Pool aquecido",
         "workspace": "Workspace",
-        "workspaces": "Workspaces"
+        "workspaces": "Workspaces",
+        "tool_call_budget_per_subagent_1_1000_default_100": "Orçamento de chamadas de ferramenta por subagente (1–1000). Padrão: 100."
       },
       "mcpTab": {
         "actions": "Ações",
@@ -11170,7 +11834,8 @@
         "select_a_prompt": "Selecione um prompt para ver seu conteúdo",
         "send_to": "Enviar para…",
         "use_in_chat": "Usar no chat",
-        "user_prompts_count": "Prompts do usuário ({{count}})"
+        "user_prompts_count": "Prompts do usuário ({{count}})",
+        "retry_read": "Tentar novamente"
       },
       "skillsTab": {
         "add_skill": "Adicionar habilidade",
@@ -11210,9 +11875,9 @@
         "create": "Criar",
         "create_new_skill": "Criar nova habilidade",
         "delete": "Excluir",
-        "delete_confirm": "Excluir \"{{name}}\"?",
+        "delete_confirm": "Excluir “{{name}}”?",
         "dismiss": "Descartar",
-        "dismiss_confirm": "Descartar \"{{name}}\"?",
+        "dismiss_confirm": "Descartar “{{name}}”?",
         "dismiss_all": "Descartar tudo",
         "dismiss_all_confirm": "Descartar todas as {{count}} habilidades pendentes?",
         "edit": "Editar",
@@ -11265,7 +11930,7 @@
         "content": "Conteúdo",
         "create": "Criar",
         "delete": "Excluir",
-        "delete_confirm": "Excluir \"{{path}}\"?",
+        "delete_confirm": "Excluir “{{path}}”?",
         "edit": "Editar",
         "edit_2": "Editar {{path}}",
         "file_name": "Nome do arquivo",
@@ -11354,7 +12019,8 @@
         "total_sessions_30d": "Total de sessões (30d)",
         "total_tokens": "Total de tokens",
         "total_turns": "Total de turnos",
-        "usage_tracking_is_not_available_for": "O acompanhamento de uso não está disponível para {{provider}}."
+        "usage_tracking_is_not_available_for": "O acompanhamento de uso não está disponível para {{provider}}.",
+        "refused_transcripts_warning": "O {{productName}} não conseguiu carregar {{count}} das suas conversas, portanto estes números estão incompletos. Isso pode acontecer quando o seu perfil do Windows está armazenado em uma unidade de rede."
       },
       "vectorMemoryCard": {
         "active": "ativo",
@@ -11413,6 +12079,30 @@
         "vector_memory": "Memória vetorial",
         "vector_memory_is_initializing_the_embedding_mode": "A memória vetorial está inicializando. O modelo de embeddings (~610MB) é baixado automaticamente em segundo plano e a memória legada é migrada por conta própria — nenhuma ação é necessária.",
         "verifying_model_integrity": "Verificando a integridade do modelo…"
+      },
+      "wakatimeTab": {
+        "active_projects": "Projetos em que você trabalhou",
+        "coding_time": "Tempo de programação",
+        "connect_body": "O WakaTime é uma ferramenta gratuita que registra o tempo que você passa programando no seu editor.",
+        "connect_hint": "Primeiro defina wakatime.enabled como true em $KIROCREW_HOME/config.json (padrão: ~/.kiro/crew/config.json) e depois, em Configurações → Segredos, defina a chave de API do WakaTime em Usadas automaticamente pelo {{productName}}. Obtenha uma chave em wakatime.com/settings/account.",
+        "connect_title": "Conectar o WakaTime",
+        "daily_average": "Média por dia",
+        "export_csv": "Exportar horas (CSV)",
+        "export_failed_title": "Falha na exportação",
+        "export_json": "Exportar horas (JSON)",
+        "languages": "Linguagens",
+        "no_activity_body": "Nenhum tempo de programação registrado para as datas escolhidas. Tente um período maior.",
+        "no_activity_title": "Sem atividade para estas datas",
+        "projects": "Projetos",
+        "range_label": "Intervalo de datas",
+        "range_last30": "Últimos 30 dias",
+        "range_last6mo": "Últimos 6 meses",
+        "range_last7": "Últimos 7 dias",
+        "range_today": "Hoje",
+        "subtitle": "Sua atividade de programação, medida pelo WakaTime a partir do seu editor de código.",
+        "this_range": "Total para estas datas",
+        "unreachable_body": "Não foi possível acessar o serviço ou sua chave de API. Seus dados não foram perdidos, tente novamente em breve.",
+        "unreachable_title": "O WakaTime está inacessível"
       }
     },
     "overviewPage": {
@@ -11442,7 +12132,10 @@
       "usage": "Uso",
       "usage_tracking_is_not_available_for": "O acompanhamento de uso não está disponível para",
       "v": "· v",
-      "view_details": "Ver detalhes"
+      "view_details": "Ver detalhes",
+      "wakatime": "WakaTime",
+      "wakatime_last_7_days": "Últimos 7 dias",
+      "wakatime_not_connected": "Não conectado"
     },
     "performanceTab": {
       "builder_mcp_procs": "Builder MCP",
@@ -11502,7 +12195,8 @@
       "phased": "Em fases",
       "task_is_waiting_for_your_decision": "Tarefa {{index}} \"{{title}}\" está aguardando sua decisão",
       "tasks": "Tarefas",
-      "the_dag_view_will_appear_once_the_plan_is_ready": "A visualização DAG aparecerá quando o plano estiver pronto"
+      "the_dag_view_will_appear_once_the_plan_is_ready": "A visualização DAG aparecerá quando o plano estiver pronto",
+      "failed_to_update_task": "Falha ao atualizar a tarefa"
     },
     "projectsPage": {
       "agent": "Agente:",
@@ -11559,7 +12253,8 @@
       "workspace": "Workspace:",
       "workspace_folder": "Pasta do workspace",
       "yaml_files_should_be_uploaded_via_the_from_yaml": "Os arquivos YAML devem ser enviados pela aba \"De YAML\".",
-      "yaml_workflows_bypass_the_llm_decomposer": "Os fluxos de trabalho YAML ignoram o decompositor do LLM —"
+      "yaml_workflows_bypass_the_llm_decomposer": "Os fluxos de trabalho YAML ignoram o decompositor do LLM —",
+      "action_failed": "Ação falhou"
     },
     "remoteArtifactDetailPage": {
       "back": "Voltar",
@@ -11667,7 +12362,7 @@
         "batch_move_failed_one": "Não foi possível mover {{count}} de {{total}} tarefa",
         "batch_move_failed_other": "Não foi possível mover {{count}} de {{total}} tarefas",
         "collapse_folder": "Recolher pasta",
-        "confirm_delete_folder": "Excluir \"{{name}}\"? As tarefas ficarão desagrupadas.",
+        "confirm_delete_folder": "Excluir “{{name}}”? As tarefas ficarão desagrupadas.",
         "create": "Criar",
         "delete_folder": "Excluir pasta",
         "delete_folder_named": "Excluir \"{{name}}\"",
@@ -11764,7 +12459,27 @@
       "script_source_failed": "Não foi possível carregar o código-fonte do script.",
       "script_source_truncated": "Truncado — o script excede o limite de pré-visualização.",
       "no_owning_session": "Sem sessão proprietária",
-      "owning_session": "Sessão proprietária"
+      "owning_session": "Sessão proprietária",
+      "template_updated_notice": "O modelo {{name}} mudou desde que você salvou este trabalho. Sua mensagem salva permanece inalterada.",
+      "template_updated_dismiss": "Dispensar",
+      "template_updated_dismiss_hint": "Dispensar (reaparece se o modelo mudar novamente)",
+      "secrets_active_help": "Injetados no ambiente desta tarefa na execução. Apenas nomes — os valores ficam no cofre.",
+      "secrets_approve": "Aprovar",
+      "secrets_deny": "Negar",
+      "secrets_direction_caption": "variável de ambiente ← segredo do vault",
+      "secrets_none": "Nenhum segredo concedido.",
+      "secrets_none_hint": "Peça ao agente para solicitar segredos para este job.",
+      "secrets_pending_badge": "Solicitação de segredos aguardando aprovação",
+      "secrets_pending_help": "Ao aprovar, estes valores do cofre são injetados no ambiente da tarefa na execução. A aprovação fica vinculada ao código atual da tarefa: se o script ou o comando mudar depois, a injeção para até você aprovar novamente.",
+      "secrets_pending_source": "Script coberto por esta aprovação",
+      "secrets_pending_source_failed": "Não foi possível carregar o código do script, então esta solicitação não pode ser aprovada.",
+      "secrets_pending_source_loading": "Carregando o script que esta solicitação executaria. A aprovação é liberada assim que ele for exibido.",
+      "secrets_pending_source_truncated": "Este script excede o tamanho revisável, então esta solicitação não pode ser aprovada.",
+      "secrets_pending_source_unreviewable": "Partes deste script não podem ser exibidas como foram escritas (texto semelhante a credencial mascarado ou bytes não decodificáveis), então o que você vê não é exatamente o que seria executado. Esta solicitação não pode ser aprovada.",
+      "secrets_pending_title": "O agente solicitou segredos",
+      "secrets_section": "Segredos do cofre",
+      "secrets_revoke_all": "Revogar todos os segredos",
+      "secrets_revoke_all_confirm": "Revogar tudo?"
     },
     "servicesTab": {
       "channels": "Canais",
@@ -11955,18 +12670,18 @@
     },
     "settings": {
       "mobileLoginCard": {
-        "sign_in_on_mobile": "Entrar no dispositivo móvel",
-        "create_a_one_time_link_for_mobile_or_another_browser": "Crie um link de entrada de curta duração para um dispositivo móvel ou outro navegador. Ele expira em 5 minutos.",
+        "sign_in_on_mobile": "Entrar no celular",
+        "create_a_one_time_link_for_mobile_or_another_browser": "Crie um link de login de curta duração para celular ou outro navegador. Ele expira em 5 minutos.",
         "creating_link": "Criando link…",
-        "create_mobile_sign_in_link": "Criar link de entrada para dispositivo móvel",
+        "create_mobile_sign_in_link": "Criar link de login para celular",
         "create_new_mobile_sign_in_link": "Criar novo link",
-        "mobile_sign_in_link": "Link de entrada para dispositivo móvel",
-        "copy_sign_in_link": "Copiar link de entrada",
+        "mobile_sign_in_link": "Link de login para celular",
+        "copy_sign_in_link": "Copiar link de login",
         "link_copied": "Link copiado",
         "link_expires_in_minutes": "Este link expira em {{minutes}} minutos.",
-        "send_the_copied_link_to_your_mobile_device_then_open_it": "Envie o link copiado para seu dispositivo móvel e abra-o lá.",
+        "send_the_copied_link_to_your_mobile_device_then_open_it": "Envie o link copiado ao seu celular e abra-o lá.",
         "dashboard_url_required_to_create_a_mobile_sign_in_link": "A URL do painel não está configurada. Defina dashboard.url para criar um link de login para celular.",
-        "could_not_create_a_sign_in_link_try_again": "Não foi possível criar um link de entrada. Tente novamente.",
+        "could_not_create_a_sign_in_link_try_again": "Não foi possível criar um link de login. Tente novamente.",
         "copy_failed_select_the_link_and_copy_it_manually": "Falha ao copiar. Selecione o link e copie-o manualmente."
       },
       "aboutPanel": {
@@ -12020,7 +12735,7 @@
         "insider": "Insider",
         "install_failed": "Não foi possível instalar a atualização",
         "install_update_restart_app": "Instalar atualização e reiniciar app",
-        "installing_quiet_note": "Instalando — o {{productName}} ficará em silêncio por um ou dois minutos e depois reiniciará sozinho.",
+        "installing_quiet_note": "Instalando — isso pode levar vários minutos. O {{productName}} abrirá novamente automaticamente quando a atualização terminar.",
         "is_available": "está disponível.",
         "loading_changelog": "Carregando changelog…",
         "manual_install_fallback": "Se a atualização não funcionar, você pode {{link}} e reinstalar sobre esta cópia. Suas configurações, conversas e arquivos são preservados.",
@@ -12092,7 +12807,12 @@
         "channel_publishes_older_version": "O canal {{channel}} publica atualmente a v{{version}}, mais antiga que a build que você está executando, então não há atualização a oferecer. <link>Baixe a v{{version}}</link> para passar para esse canal.",
         "switch_to_version": "Mudar para a v{{version}}",
         "in_app_channel_move_intro": "A versão do canal escolhido é instalada ao lado da atual e a troca é atômica. Aplicar exige um comando de aprovação no host do gateway.",
-        "restart_update": "Reiniciar e atualizar"
+        "restart_update": "Reiniciar e atualizar",
+        "arm_status_poll_failing": "Não foi possível atualizar o status de aprovação a partir do gateway. A contagem regressiva continua localmente.",
+        "auto_download_save_failed": "Não foi possível salvar a configuração de download automático.",
+        "auto_update_setting_unavailable": "Não foi possível carregar a configuração de atualização automática. A chave mostra o padrão até que ela carregue.",
+        "copy_failed_select_the_command_and_copy_it_manually": "Falha ao copiar. Selecione o comando e copie-o manualmente.",
+        "update_info_unavailable": "Não foi possível ler a versão e o canal de atualização desta build a partir do app."
       },
       "botChannelPanel": {
         "allowed_user_ids": "IDs de usuário permitidos",
@@ -12174,7 +12894,13 @@
         "node_how": "Instale-o e reabra esta página. <dl>Baixar Node.js</dl>",
         "node_no_admin": "Em uma máquina onde você não pode instalar o Node — sem direitos de administrador ou com um registro que exige login — execute o comando abaixo na máquina onde o {{productName}} está em execução. O script instala o Node e a CLI no seu diretório pessoal e explica como resolver se a sua rede bloquear o download.",
         "copy_command": "Copiar comando",
-        "copied": "Copiado"
+        "copied": "Copiado",
+        "builtin_save_failed": "Não foi possível salvar a configuração do navegador integrado.",
+        "builtin_status_unavailable": "Não foi possível carregar a configuração do navegador integrado.",
+        "copy_failed": "Falha ao copiar. Selecione o comando e copie-o manualmente.",
+        "engine_download_failed": "Não foi possível iniciar o download do navegador.",
+        "install_request_failed": "Não foi possível iniciar a instalação.",
+        "token_save_failed": "Não foi possível salvar o token da extensão."
       },
       "channelDisabledPanel": {
         "checking_your_organization_s_channel_policy": "Verificando a política de canais da sua organização…",
@@ -12203,7 +12929,7 @@
       },
       "chatPanel": {
         "about_you": "Sobre você",
-        "answer_only_details_on_request": "Somente a resposta — detalhes a pedido ou se crítico",
+        "answer_only_details_on_request": "Somente a resposta — palavras simples, detalhes a pedido",
         "auto_add_documents": "Adicionar documentos automaticamente",
         "auto_add_saved_artifacts": "Adicionar artefatos salvos automaticamente",
         "auto_compact_threshold": "Limite de compactação automática",
@@ -12373,7 +13099,11 @@
         "widget_density": "Densidade de widgets",
         "your_role": "Sua função",
         "session_card_source_links": "Chips de PR e issues nos cartões de sessão",
-        "session_card_source_links_desc": "Mostra no cartão de cada sessão, na barra lateral, um chip para cada pull request, merge request e issue mencionada nessa sessão. Ao desativar, também param as chamadas periódicas ao provedor que mantêm esses chips atualizados."
+        "session_card_source_links_desc": "Mostra no cartão de cada sessão, na barra lateral, um chip para cada pull request, merge request e issue mencionada nessa sessão. Ao desativar, também param as chamadas periódicas ao provedor que mantêm esses chips atualizados.",
+        "busy_alt_action_desc": "Direcionar age no texto imediatamente; Enfileirar o executa após o trabalho atual terminar. {{chord}} envia uma única mensagem com a outra ação. Sessões em que você escolheu um modo no botão de enviar mantêm a escolha.",
+        "busy_alt_action_desc_no_chord": "Direcionar age no texto imediatamente; Enfileirar o executa após o trabalho atual terminar. O atalho para alternar uma vez só está disponível quando Enter envia; use o menu do botão de enviar. Sessões em que você escolheu um modo no botão de enviar mantêm a escolha.",
+        "what_enter_does_while_the_agent_is_working": "O que Enter faz enquanto o agente trabalha",
+        "failed_to_load_tips_preference": "Não foi possível carregar a preferência de dicas."
       },
       "computerUsePanel": {
         "accessibility": "Acessibilidade",
@@ -12418,7 +13148,9 @@
         "open_developer_page": "Abrir a página Desenvolvedor",
         "run_a_local_gateway": "Executar um gateway local",
         "show_developer_page_in_sidebar_with_logs_system": "Mostrar a página Desenvolvedor na barra lateral, com Logs, Métricas do sistema e Detalhes internos da memória",
-        "start_a_gateway_on_this_machine_turn_it_off_to_u": "Inicia um gateway nesta máquina. Desative para usar o {{productName}} apenas como cliente, conectando-se ao gateway que você configurou em vez de executar um aqui. Entra em vigor na próxima vez que você abrir o aplicativo."
+        "start_a_gateway_on_this_machine_turn_it_off_to_u": "Inicia um gateway nesta máquina. Desative para usar o {{productName}} apenas como cliente, conectando-se ao gateway que você configurou em vez de executar um aqui. Entra em vigor na próxima vez que você abrir o aplicativo.",
+        "feature_previews": "Prévias de recursos",
+        "feature_previews_desc": "Recursos e páginas não lançados. As páginas ficam ocultas da barra lateral e da Pesquisar em tudo até você ativá-las aqui; os próprios interruptores, porém, aparecem na busca das configurações. Valem só para este dispositivo e estão inacabados de propósito."
       },
       "discordPanel": {
         "allowed_server_channel_ids": "IDs de canais de servidor permitidos",
@@ -12509,7 +13241,12 @@
         "view": "Visualização",
         "zoom_font": "Zoom e fonte",
         "zoom_level": "Nível de zoom",
-        "font_family_option_opendyslexic": "OpenDyslexic"
+        "font_family_option_opendyslexic": "OpenDyslexic",
+        "terminal_completion": "Conclusão de comandos",
+        "terminal_completion_desc": "Mostrar o menu de conclusão ao digitar no Terminal. Enter executa a linha que você digitou; para aceitar uma sugestão, pressione ↑/↓ e depois Enter, ou Tab. Desativado oculta o menu; a conclusão por Tab do seu shell continua funcionando.",
+        "terminal_completion_save_failed": "Não foi possível salvar a configuração de conclusão de comandos",
+        "config_load_failed": "Não foi possível carregar as configurações de exibição salvas. As configurações de shell, sessões recentes e conclusão de comandos ficam indisponíveis até que elas carreguem.",
+        "recent_tint_save_failed": "Não foi possível salvar a quantidade de sessões recentes destacadas."
       },
       "importPanel": {
         "agent_data": "Dados do agente",
@@ -12583,7 +13320,6 @@
         "disconnect_failed": "Falha ao desconectar {{id}}: {{error}}",
         "dismiss": "Descartar",
         "dismiss_diagnosis": "Descartar diagnóstico",
-        "dismiss_error": "Descartar erro",
         "distinct": "distinta",
         "ec2_instance_id_i_or_ssm_managed_instance_id_mi": "Id da instância EC2 (i-…) ou id de instância gerenciada do SSM (mi-…).",
         "enable_it_to_let_this_gateway_open_ssh_tunnels_t": "Ative para permitir que este gateway abra túneis (SSH ou AWS SSM) para suas instâncias remotas e\n          alterne entre elas pela barra de abas superior.",
@@ -12680,7 +13416,11 @@
         "test_sound": "Testar som",
         "use_default": "Usar o padrão",
         "volume": "Volume",
-        "preset_pulse": "Pulso"
+        "preset_pulse": "Pulso",
+        "desktop_alerts": "Alertas da área de trabalho",
+        "notify_when_a_background_chat_finishes": "Avisar quando uma conversa em segundo plano terminar",
+        "notify_when_a_background_chat_finishes_description": "Mostra uma notificação do sistema com o nome da conversa que terminou, mas apenas enquanto esta janela estiver minimizada ou atrás de outro aplicativo.",
+        "failed_to_save_channel_setting": "Não foi possível salvar a configuração do canal. O valor anterior foi restaurado."
       },
       "privacyPanel": {
         "recordMetricsLabel": "Registrar métricas",
@@ -12691,7 +13431,8 @@
         "recordMetricsDescriptionExporting": "Coletar métricas de desempenho e enviá-las ao coletor configurado em config.json.",
         "recordMetricsEgressOff": "telemetry.otlp_endpoint está definido, então registrar também enviaria métricas para fora desta máquina. Ative o registro em config.json se for isso que você quer.",
         "recordMetricsEgressOn": "As métricas estão sendo enviadas para fora desta máquina, ao coletor em telemetry.otlp_endpoint.",
-        "recordMetricsSaveRefusedEgress": "O registro não foi ativado: telemetry.otlp_endpoint está definido, então ativá-lo aqui começaria a enviar métricas para fora desta máquina. Ative-o em config.json."
+        "recordMetricsSaveRefusedEgress": "O registro não foi ativado: telemetry.otlp_endpoint está definido, então ativá-lo aqui começaria a enviar métricas para fora desta máquina. Ative-o em config.json.",
+        "recordMetricsStatusUnavailable": "Não foi possível carregar a configuração de gravação de métricas. O interruptor fica bloqueado até carregar."
       },
       "postureDisclosure": {
         "filter": "Filtrar {{label}}",
@@ -12699,7 +13440,8 @@
         "more": "mais",
         "no_matches_for_query": "Nenhum resultado para “{{query}}”.",
         "show": "Mostrar",
-        "unavailable": "indisponível"
+        "unavailable": "indisponível",
+        "live_count_unavailable": "A contagem ao vivo deste controle está indisponível no momento."
       },
       "releases": {
         "badge_unreleased": "Não lançada",
@@ -12945,14 +13687,21 @@
           "revoke_disables": "O {{name}} não é mais confiável e foi desligado.",
           "change_failed": "A alteração não entrou em vigor: {{detail}}",
           "unknown_error": "erro desconhecido",
-          "revoke_confirm_title": "Remover a confiança do {{name}}?",
-          "revoke_confirm_body": "O {{name}} vai ser desligado e vai parar de funcionar. Ele continua instalado, e você pode confiar nele de novo depois.",
+          "revoke_confirm_title": "Remover a confiança do “{{name}}”?",
+          "revoke_confirm_body": "O “{{name}}” vai ser desligado e vai parar de funcionar. Ele continua instalado, e você pode confiar nele de novo depois.",
           "revoke_confirm_ok": "Remover a confiança e desligar",
           "allow_all_confirm_body": "Confiar em todos os apps de terceiros permite que qualquer app que você instalar execute o próprio código dentro do {{productName}}, com o mesmo acesso que o {{productName}} tem — seus arquivos, suas credenciais salvas e a internet. Confiar em um app por vez é mais seguro.",
           "allow_all_confirm_ack": "Entendo que todo app de terceiros que eu instalar vai poder executar o próprio código com o acesso do {{productName}}.",
           "ineffective_label": "Salvo, mas sem efeito",
           "ineffective_description": "Esses nomes foram salvos como confiáveis, mas o {{productName}} não os aceita, então os apps continuam bloqueados. Remova-os para limpar a lista."
-        }
+        },
+        "gov_scope_social_share": "Compartilhar como imagem",
+        "yolo_duration_load_failed": "Não foi possível carregar a duração salva. A opção destacada é o padrão, não o que está salvo.",
+        "tailnet_copy_failed": "Falha ao copiar. Selecione o endereço e copie manualmente.",
+        "distribution_error_misconfigured_detail": "A declaração de política central neste host não pôde ser interpretada, então nenhum limite está sendo obtido.",
+        "distribution_refresh_rejected_detail": "A última atualização da política foi rejeitada pela origem.",
+        "distribution_refresh_unreachable_detail": "A última atualização da política não conseguiu alcançar a origem.",
+        "denied_commands_load_failed": "Não foi possível carregar as regras de comandos negados. As listas abaixo estão vazias porque a leitura falhou, não porque não há regras."
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Vincular a alternância de abas de chat a Ctrl+dígito em vez de Option+dígito",
@@ -12964,7 +13713,7 @@
         "preset_mod_k": "⌘K / Ctrl+K",
         "record_prompt": "Pressione as teclas…",
         "search": "Pesquisar",
-        "turn_keyboard_shortcuts_on_or_off_globally": "Ativar ou desativar os atalhos de teclado globalmente — {{mod}} + K (esta referência) sempre funciona",
+        "turn_keyboard_shortcuts_on_or_off_globally": "Ativar ou desativar os atalhos de teclado globalmente — {{chord}} (esta referência) sempre funciona",
         "use_ctrl_not_option_for_chat_1_9": "Usar ⌃ Ctrl (não ⌥ Option) para chats 1–9",
         "clear_shortcut": "Limpar",
         "panel_toggles": "Alternar painéis",
@@ -12976,7 +13725,8 @@
         "failed_to_save_skills_setting": "Falha ao salvar a configuração de habilidades",
         "keep_every_auto_generated_candidate_in_the_pendi": "Manter todo candidato gerado automaticamente na fila de pendentes até você aprová-lo. Desativar isso permite que skills apenas de texto sejam publicadas automaticamente; skills que incluem scripts sempre exigem aprovação.",
         "require_approval_before_generated_skills_go_live": "Exigir aprovação antes de as skills geradas entrarem em vigor",
-        "skills": "Skills"
+        "skills": "Skills",
+        "config_load_failed": "Não foi possível carregar as configurações de habilidades. Os interruptores mostram os padrões, não o que está salvo."
       },
       "slackPanel": {
         "add": "Adicionar",
@@ -13029,7 +13779,9 @@
         "u0123abc456": "U0123ABC456",
         "verified_with_slack_and_saved_restart_the_gatewa": "Verificado com o Slack e salvo. Reinicie o gateway para conectar.",
         "where_to_find_the_app_token": "Onde encontrar o token de app",
-        "where_to_find_the_bot_token": "Onde encontrar o token de bot"
+        "where_to_find_the_bot_token": "Onde encontrar o token de bot",
+        "manifest_unavailable": "Não foi possível carregar o manifesto do app do Slack. Crie o app manualmente a partir do guia de configuração.",
+        "copy_manifest_failed": "Não foi possível copiar o manifesto para a área de transferência."
       },
       "sttSettings": {
         "allow_microphone_access_to_show_device_names": "Permita o acesso ao microfone para exibir os nomes dos dispositivos",
@@ -13062,7 +13814,7 @@
         "system_default": "Padrão do sistema",
         "ffmpeg_is_missing_voice_recordings_from_the_brow": "O ffmpeg está ausente — as gravações de voz do navegador não podem ser transcritas até que ele seja instalado.",
         "the_bundled_audio_decoder_is_missing_or_damaged": "O decodificador de áudio incluído está ausente ou danificado. Reinstale o app {{productName}} para desktop; não instale o FFmpeg separadamente.",
-        "then_restart_the_gateway_so_it_can_import_the_ne": "Depois reinicie o gateway (Configurações → Sobre → Reiniciar gateway) para que ele possa importar os novos pacotes.",
+        "then_restart_the_gateway_so_it_can_import_the_ne": "Depois reinicie o gateway para que ele possa importar os novos pacotes.",
         "the_desktop_app_can_t_add_transcribe_support_ins": "O aplicativo desktop não pode adicionar suporte ao Transcribe — o Python integrado não consegue instalar pacotes adicionais. Instale o {{productName}} com pip e execute o gateway a partir desse ambiente.",
         "this_gateway_s_python_can_t_install_extra_packag": "O Python deste gateway não consegue instalar pacotes adicionais, então o Transcribe não pode ser ativado aqui. Execute o gateway em um ambiente Python onde o pip possa instalar boto3 + amazon-transcribe.",
         "transcribe_voice_into_the_message_box_when_you_c": "Transcrever a voz na caixa de mensagem quando você clicar no microfone",
@@ -13122,7 +13874,16 @@
         "unavailable_import_failed": "O reconhecedor de voz está instalado, mas não pôde ser carregado nesta máquina.",
         "unavailable_model_missing": "O modelo de voz ainda não está nesta máquina. Baixe-o abaixo.",
         "unavailable_apple_unsupported": "O Apple Speech precisa do macOS 26 ou mais recente. Escolha o provedor local em vez dele.",
-        "unavailable_apple_needs_toolchain": "O Apple Speech precisa das ferramentas de linha de comando do Xcode. Instale-as e recarregue esta página."
+        "unavailable_apple_needs_toolchain": "O Apple Speech precisa das ferramentas de linha de comando do Xcode. Instale-as e recarregue esta página.",
+        "language_auto": "Detectar o idioma automaticamente",
+        "decoder_fetch_prompt": "O {{productName}} pode baixar uma cópia verificada por resumo para esta máquina, então nada precisa ser instalado à mão.",
+        "download_decoder": "Baixar decodificador",
+        "decoder_download_failed_reason": "O download do decodificador falhou: {{error}}",
+        "let_the_agent_fix_it": "Deixar o {{productName}} resolver",
+        "decoder_failure_unknown": "não informado",
+        "decoder_agent_prompt": "Não foi possível instalar o decodificador de áudio (ffmpeg) de que o {{productName}} precisa para transcrever gravações de voz. Faça-o funcionar neste host.\n\nO que falhou: {{code}} — {{detail}}\nHost: {{os}} {{arch}}\n\nO {{productName}} só executa um ffmpeg cujos bytes correspondam a um resumo SHA-256 fixado, e procura exatamente nestes lugares: /usr/local/bin, /opt/homebrew/bin, os diretórios de programas do próprio sistema operacional e seu próprio repositório de decodificadores verificado por resumo em <data home>/models/ffmpeg/. O caminho nunca é a âncora de confiança, então ~/.local/bin NÃO é confiável de propósito e uma cópia deixada ali é ignorada.\n\nDescubra o que este host realmente precisa — um gerenciador de pacotes, uma compilação a partir do código-fonte ou outra tentativa de baixar o decodificador — e decida por conta própria se privilégios elevados se justificam antes de usá-los. Ao terminar, verifique novamente GET /api/stt/status e confirme que a página de configurações de Voz não relata mais um decodificador ausente.",
+        "config_load_failed": "Não foi possível carregar as configurações de fala para texto.",
+        "status_unavailable": "Não foi possível verificar o status de fala para texto. O selo acima mostra a configuração salva, não uma verificação ao vivo."
       },
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "acima. Diferente do Slack, o Bot Framework não tem\n              modo somente de saída.",
@@ -13243,13 +14004,12 @@
         "faster": "Mais rápido",
         "fastest": "O mais rápido",
         "normal": "Normal",
-        "path_to_the_piper_executable_leave_blank_to_auto": "Caminho para o executável do piper. Deixe em branco para detectar automaticamente no PATH ou em ~/piper-venv/bin/piper",
-        "path_to_the_piper_voice_model_onnx_required_down": "Caminho para o modelo de voz do Piper (.onnx). Obrigatório — baixe em github.com/rhasspy/piper",
+        "path_to_the_piper_executable_leave_blank_to_auto": "Caminho para o executável do piper. Deixe em branco para detectar automaticamente no PATH ou em uma instalação ~/piper-venv",
+        "path_to_the_piper_voice_model_onnx_required_down": "Caminho para o modelo de voz do Piper (.onnx). Obrigatório — baixe em huggingface.co/rhasspy/piper-voices",
         "piper_binary": "Binário do Piper",
         "piper_en_us_lessac_medium_onnx": "~/piper/en_US-lessac-medium.onnx",
         "piper_local_offline": "Piper (local, offline)",
         "piper_model": "Modelo do Piper",
-        "piper_runs_locally_and_offline_polly_uses_aws_cr": "O Piper roda localmente e offline; o Amazon Polly usa credenciais AWS + rede",
         "piper_speech_speed_length_scale": "Velocidade da fala do Piper (length scale)",
         "polly_engine_type": "Tipo de motor do Amazon Polly",
         "provider": "Provedor",
@@ -13258,14 +14018,23 @@
         "slower": "Mais lento",
         "slowest": "O mais lento",
         "speak_every_assistant_reply_automatically": "Falar automaticamente todas as respostas do assistente",
-        "speech_rate": "Velocidade da fala",
         "speech_to_text": "Fala para texto",
         "speed": "Velocidade",
         "text_to_speech": "Texto para fala",
         "us_east_1": "us-east-1",
         "voice": "Voz",
         "pocket_tts_local": "Pocket TTS (local)",
-        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS é executado localmente e transmite Ogg Opus para reprodução sob demanda."
+        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS é executado localmente e transmite Ogg Opus para reprodução sob demanda.",
+        "could_not_read_the_hosts_voice_list_only_the_operat": "Não foi possível ler a lista de vozes do host. Apenas o padrão do sistema operacional está disponível.",
+        "os_default_voice": "Padrão do sistema operacional",
+        "speech_rate_for_spoken_replies_built_in": "Velocidade da fala das respostas faladas (motor integrado)",
+        "speech_rate_for_spoken_replies_polly": "Velocidade da fala das respostas faladas (Amazon Polly)",
+        "system_built_in": "Sistema (integrado)",
+        "the_built_in_engine_needs_no_setup_piper_is_offlin": "O motor integrado não precisa de configuração; o Piper roda offline com melhor qualidade; o Amazon Polly usa credenciais AWS + rede",
+        "this_host_has_no_built_in_speech_engine_install_es": "Este host não tem nenhum motor de voz integrado. Instale o espeak-ng (por exemplo: sudo apt install espeak-ng), ou escolha outro provedor.",
+        "voice_catalogue_unavailable": "Não foi possível carregar a lista de vozes do Polly. O seletor mostra uma lista de reserva integrada.",
+        "voice_from_the_hosts_built_in_speech_engine": "Voz do motor de fala integrado do host",
+        "recheck": "Verificar novamente"
       },
       "weComPanel": {
         "allow_all_bypass_note": "“Permitir todos” está ativado: a lista de userids acima é ignorada. Ela é mantida para quando você voltar atrás.",
@@ -13379,7 +14148,8 @@
         "wechat": "WeChat",
         "wechat_login_qr_code": "QR code de login do WeChat",
         "who_can_message_the_bot": "Quem pode enviar mensagem ao bot",
-        "wxid": "wxid_…"
+        "wxid": "wxid_…",
+        "scan_status_poll_failing": "Não foi possível verificar se o código foi escaneado. Continuando a tentar."
       },
       "whatsAppPanel": {
         "status_unavailable": "Status indisponível",
@@ -13443,7 +14213,9 @@
         "rules_example_placeholder": "Responder perguntas sobre impressão 3D",
         "seconds_between_unprompted_replies": "Segundos entre respostas não solicitadas",
         "remove_name_from_the_group_list": "Remover {{name}} da lista de grupos",
-        "unofficial_protocol_ban_risk": "Protocolo não oficial: o WhatsApp pode banir o número vinculado. Não vincule um número que você não possa perder."
+        "unofficial_protocol_ban_risk": "Protocolo não oficial: o WhatsApp pode banir o número vinculado. Não vincule um número que você não possa perder.",
+        "scan_status_poll_failing": "Não foi possível verificar se o código foi escaneado. Continuando a tentar.",
+        "groups_unavailable": "Não foi possível carregar os grupos dos quais esta conta participa."
       },
       "remoteCrewPanel": {
         "your_crews": "Suas instâncias",
@@ -13468,7 +14240,7 @@
         "delete": "Delete…",
         "deleting": "Excluindo…",
         "delete_crew": "Delete {{name}}",
-        "confirm_delete_of": "Confirm deleting {{name}}",
+        "confirm_delete_of": "Confirm deleting “{{name}}”",
         "delete_warning": "Delete terminates the EC2 instance and ends its charges. This cannot be undone.",
         "before_you_start": "Before you start — your AWS setup",
         "checking": "Checking…",
@@ -13537,7 +14309,14 @@
         "stopping": "Parando…",
         "starting": "Iniciando…",
         "changed_outside_this_form": "Esta instância mudou fora deste formulário ({{fields}}). Verifique a linha acima — se não for a instância que você começou a editar, cancele.",
-        "use_my_edits_anyway": "Aplicar minhas alterações à instância como ela está agora"
+        "use_my_edits_anyway": "Aplicar minhas alterações à instância como ela está agora",
+        "provisioner_choose": "Onde a nova instância deve ser executada?",
+        "copy_failed": "Falha ao copiar. Selecione o texto e copie manualmente.",
+        "launch_status_unavailable": "Não foi possível atualizar o progresso da configuração. O cartão abaixo mostra o último estado recebido.",
+        "copy_policy_failed": "Não foi possível copiar o JSON da política para a área de transferência. Tente novamente ou permita o acesso à área de transferência para este site.",
+        "provisioner_stale_choice": "O tipo de instância que você usou antes não é mais oferecido por este gateway; {{label}} foi selecionado no lugar.",
+        "provisioner_none_drawable": "Este gateway não oferece nenhuma forma de criar uma instância que este painel consiga exibir. Atualize o painel ou pergunte ao administrador qual provisionador usar.",
+        "provisioners_unavailable": "Não foi possível ler quais formas de criar uma instância este gateway oferece. O iniciador AWS integrado é exibido."
       },
       "webhooksPanel": {
         "inbound_webhooks": "Webhooks de entrada",
@@ -13866,7 +14645,7 @@
       "configuration": "Configuração",
       "details": "Detalhes",
       "edit_in_crew_manager": "Editar no gerenciador de equipes",
-      "empty_roster": "Ainda não há membros. Crie uma equipe no gerenciador para vê-la aqui.",
+      "empty_roster": "Ainda não há membros.",
       "inherited": "Herdado",
       "member_count_many": "{{count}} membros",
       "member_count_one": "{{count}} membro",
@@ -13879,7 +14658,7 @@
       "roster_load_failed": "Não foi possível carregar a lista de membros.",
       "search_members": "Pesquisar membros…",
       "add_member": "Adicionar membro",
-      "slug_collision": "Este membro compartilha seu identificador com {{name}}, cuja conversa já o possui. Renomeie uma das equipes para que cada uma tenha sua própria conversa.",
+      "slug_collision": "Este membro compartilha seu nome curto com {{name}}, cuja conversa já o usa. Renomeie um dos dois membros para que cada um tenha sua própria conversa.",
       "thread_open_failed": "Não foi possível abrir a conversa deste membro.",
       "title": "Membros da equipe",
       "unread_message": "Mensagem não lida",
@@ -13889,7 +14668,7 @@
       "stat_week": "Últimos 7 dias",
       "recent_activity": "Atividade recente",
       "activity_chat": "Conversa",
-      "activity_routed": "Roteado para este membro",
+      "activity_routed": "Escolhido automaticamente pelo orquestrador para uma tarefa",
       "activity_empty": "Nenhuma atividade registrada ainda.",
       "wake_sources": "Fontes de ativação",
       "open_schedule": "Abrir agenda",
@@ -13897,7 +14676,79 @@
       "wake_error": "Não foi possível carregar as fontes de ativação deste membro.",
       "wake_paused": "pausado",
       "wake_webhook": "webhook",
-      "activity_error": "Não foi possível carregar a atividade deste membro."
+      "activity_error": "Não foi possível carregar a atividade deste membro.",
+      "crew_summary": "Resumo do membro",
+      "edit_member": "Editar membro",
+      "member_gone": "Exibindo {{shown}} — “{{name}}” não está mais na lista.",
+      "member_gone_roster": "“{{name}}” não está mais na lista.",
+      "memory_dedicated_note": "As preferências e as notas de projeto vêm do armazenamento {{store}} em vez do padrão compartilhado. A memória de conversa e as lições ainda não estão separadas: o que você diz a este membro todos continuam sabendo.",
+      "thread_repair_failed": "Não foi possível reconectar esta conversa. Reabra o membro para tentar novamente.",
+      "activity_chat_count_many": "{{count}} conversas",
+      "activity_chat_count_one": "{{count}} conversa",
+      "activity_chat_count_other": "{{count}} conversas",
+      "activity_routed_count_many": "{{count}} escolhas automáticas",
+      "activity_routed_count_one": "{{count}} escolha automática",
+      "activity_routed_count_other": "{{count}} escolhas automáticas",
+      "activity_more_days_many": "Mostrar mais {{count}} dias",
+      "activity_more_days_one": "Mostrar mais {{count}} dia",
+      "activity_more_days_other": "Mostrar mais {{count}} dias",
+      "activity_capped": "Apenas os eventos mais recentes são carregados; o dia mais antigo exibido pode estar incompleto.",
+      "activity_projects_more_many": "{{name}} e mais {{count}}",
+      "activity_projects_more_one": "{{name}} e mais {{count}}",
+      "activity_projects_more_other": "{{name}} e mais {{count}}",
+      "driving_sessions": "Sessões que conduz",
+      "driving_none": "Não está conduzindo nenhuma sessão no momento.",
+      "driving_idle": "Inativo",
+      "driving_show_all": "Mostrar todas ({{count}})",
+      "driving_show_less": "Mostrar menos",
+      "patrol_title": "Patrulha automática",
+      "patrol_active": "Patrulhando",
+      "patrol_interval": "Intervalo",
+      "patrol_cycles": "Ativações",
+      "patrol_cycles_unlimited": "{{n}} · sem limite",
+      "patrol_cycles_of": "{{n}} de {{max}}",
+      "patrol_last_wake": "Última ativação",
+      "patrol_next_wake": "Próxima ativação",
+      "patrol_instruction": "Instrução",
+      "patrol_stopped": "Patrulha parada.",
+      "patrol_stopped_manual": "Pausada manualmente.",
+      "patrol_stopped_cycle_cap": "Atingiu o limite de ativações.",
+      "patrol_stopped_runtime_budget": "Atingiu o orçamento de tempo.",
+      "patrol_stopped_approval_stalled": "Parou aguardando uma aprovação de ferramenta nesta conversa.",
+      "patrol_last_wake_ago": "Última ativação {{when}}",
+      "patrol_none": "Nenhuma patrulha agendada.",
+      "patrol_error": "Não foi possível carregar o status de patrulha deste membro.",
+      "patrol_error_roster": "Não foi possível carregar o status de patrulha da lista.",
+      "patrol_badge": "Em patrulha · {{cycle}}",
+      "patrol_next_in": "Daqui a {{time}}",
+      "wake_patrol_every": "A cada {{every}}",
+      "filter_starred": "Favoritos",
+      "filter_starred_description": "Mostrar apenas membros favoritos",
+      "filter_source_mine": "Meus",
+      "filter_source_builtin": "Integrados",
+      "filter_source_package": "De pacotes",
+      "filters_hide_all": "Os filtros ativos ocultam todos os membros.",
+      "filters_clear": "Limpar filtros",
+      "star": "Favoritar {{name}}",
+      "unstar": "Desfavoritar {{name}}",
+      "star_failed_title": "Favorito não salvo",
+      "star_failed": "Não foi possível atualizar o favorito deste membro.",
+      "filter_source_mine_description": "Crews que você criou no gerenciador de crews",
+      "filter_source_builtin_description": "Crews incluídos no {{productName}}",
+      "filter_source_package_description": "Crews instalados por pacotes de capacidades",
+      "member_count_filtered": "{{shown}} de {{count}} membros"
+    },
+    "sessionsPage": {
+      "page_title": "Todas as sessões",
+      "search_placeholder": "Pesquisar sessões…",
+      "new_session": "Nova sessão",
+      "filter_all": "Todas",
+      "filter_unread": "Não lidas",
+      "group_today": "Hoje",
+      "group_yesterday": "Ontem",
+      "group_earlier": "Anteriores",
+      "empty_title": "Nenhuma sessão",
+      "empty_subtitle": "Crie uma para começar."
     }
   },
   "privacyDisclosure": {
@@ -13967,7 +14818,7 @@
         "label": "Uso do computador"
       },
       "developer": {
-        "description": "Modo desenvolvedor, logs, métricas do sistema e diagnósticos",
+        "description": "Modo desenvolvedor, prévias de recursos, logs, métricas do sistema e diagnósticos",
         "label": "Desenvolvedor"
       },
       "display": {
@@ -14026,7 +14877,7 @@
       "add_secret": "Adicionar segredo",
       "name_label": "Nome",
       "value_label": "Valor",
-      "delete_confirm": "Excluir este segredo?",
+      "delete_confirm": "Excluir “{{name}}” permanentemente? O valor atual não pode ser recuperado.",
       "delete": "Excluir",
       "cancel": "Cancelar",
       "save": "Salvar",
@@ -14036,7 +14887,45 @@
       "secret_name_aria": "Nome do segredo",
       "secret_value_aria": "Valor do segredo",
       "save_error": "Não foi possível salvar o segredo: {{error}}",
-      "delete_error": "Não foi possível excluir o segredo: {{error}}"
+      "delete_error": "Não foi possível excluir o segredo: {{error}}",
+      "managed_title": "Usadas automaticamente pelo {{productName}}",
+      "managed_description": "Credenciais que o {{productName}} reconhece e usa automaticamente. Adicione ou altere os valores aqui.",
+      "jira_api_token_label": "Token de API do Jira",
+      "jira_api_token_description": "Autentica consultas de chamados do Jira para a instância configurada.",
+      "jira_global_unused_multi_host": "Não é usado pelo Jira quando vários hosts estão configurados. Defina acima a credencial de cada host ou exclua esta entrada.",
+      "jira_global_unused_host_token": "Não é usado porque a credencial do Jira específica do host tem precedência. Exclua esta entrada se não precisar mais do fallback.",
+      "jira_host_token_label": "Token de API do host Jira",
+      "jira_host_token_description": "Autentica consultas de chamados do Jira para um host configurado.",
+      "wakatime_api_key_label": "Chave de API do WakaTime",
+      "wakatime_api_key_description": "Autentica a sincronização da atividade de programação quando o WakaTime está ativado.",
+      "other_stored_title": "Outros segredos armazenados",
+      "other_stored_description": "Referencie segredos armazenados pelo nome exato como secret://NAME em uma configuração de servidor MCP ou credencial .env.",
+      "managed_config_error": "Algumas credenciais automáticas estão ocultas porque não foi possível ler $KIROCREW_HOME/config.json (padrão: ~/.kiro/crew/config.json).",
+      "managed_name_hint": "Salvar aqui atualiza {{name}} na seção de credenciais automáticas. — {{productName}}",
+      "stored_title": "Segredos armazenados",
+      "managed_unconfigured_hint": "Para usar WakaTime ou Jira automaticamente, ative o WakaTime ou adicione um host do Jira em $KIROCREW_HOME/config.json (padrão: ~/.kiro/crew/config.json).",
+      "managed_setup_guide": "Abrir o guia de configuração de segredos",
+      "delete_managed_confirm": "Excluir “{{name}}” permanentemente? O valor atual não pode ser recuperado.",
+      "delete_managed_name": "Excluir {{name}}",
+      "save_managed_name": "Salvar {{name}}",
+      "managed_value_placeholder": "Cole o valor do segredo",
+      "wakatime_setup_link": "Abrir configurações da chave de API do WakaTime",
+      "saved": "Salvo",
+      "name_placeholder": "MY_API_KEY",
+      "value_placeholder": "sk-...",
+      "load_error": "Não foi possível carregar os segredos: {{error}}",
+      "wakatime_unused_hint": "Não é usado enquanto o WakaTime está desativado. Ative o WakaTime ou exclua esta entrada."
+    },
+    "chat": {
+      "defaultMemoryMode": {
+        "description": "Persistente usa o que já sabe e salva nova memória. Anônimo usa o que sabe, mas não salva nova memória. Temporário começa em branco e não salva nada. Todos os chats continuam aparecendo no histórico. Você pode mudar o modo de qualquer chat.",
+        "label": "Modo de memória padrão",
+        "persistent": "Persistente"
+      },
+      "plainDiff": {
+        "description": "Exibe os diffs como texto unified diff sem realce de sintaxe. Usa menos memória em diffs grandes.",
+        "label": "Diffs em texto simples"
+      }
     }
   },
   "store": {
@@ -14058,7 +14947,8 @@
     },
     "offline": {
       "disabled_gateway_offline": "{{label}} indisponível — gateway offline",
-      "gateway_offline_reconnect": "Gateway offline — reconecte para {{action}}"
+      "gateway_offline_reconnect": "Gateway offline — reconecte para {{action}}",
+      "submit_comments": "enviar comentários"
     },
     "popoutController": {
       "your_browser_blocked_the_pop_out_window_allow_po": "Seu navegador bloqueou a janela destacada. Permita pop-ups para este site e tente novamente."

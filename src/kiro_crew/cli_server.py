@@ -400,6 +400,7 @@ def _stop(cli_port: int | None = None) -> None:
             resources=f"port={port} via=service",
         )
         print("✅ Stopped kirocrew service. To remove it: kirocrew service uninstall")
+        _stop_mcp_gateway_daemon()
         return
 
     # Cross-platform port -> listening PID lookup (lsof on POSIX, netstat -ano
@@ -516,6 +517,7 @@ def _stop(cli_port: int | None = None) -> None:
         )
         _verb = "Terminated" if platform_compat.IS_WINDOWS else "Sent SIGTERM to"
         print(f"✅ {_verb} gateway (pid {', '.join(str(p) for p in sorted(sent))}).")
+        _stop_mcp_gateway_daemon()
     if denied:
         sel().log_api_access(
             caller="cli",
@@ -538,6 +540,37 @@ def _stop(cli_port: int | None = None) -> None:
         )
         print(f"No Kiro Crew gateway currently running on port {port} (process already exited).")
         sys.exit(1)
+
+
+def _stop_mcp_gateway_daemon() -> None:
+    """Take the MCP gateway daemon down with the gateway it served.
+
+    The daemon is a separate session leader, so the gateway's own SIGTERM never
+    reaches it; it exits on its own once its owner is gone (``--owner-pid``), but
+    that probe runs on an interval, and a ``kirocrew restart`` spawns the next
+    gateway inside that window -- which then finds a healthy daemon on the socket
+    and adopts it. A daemon adopted across a code change is how pooled MCP
+    backends kept speaking a wire shape the new gateway did not read. Stopping
+    it here, synchronously, means the replacement always spawns its own.
+
+    Best-effort: a stop that finds no daemon, or one this user may not signal,
+    is reported and never fails the command that called it.
+    """
+    try:
+        from kiro_crew.mcp_gateway.daemon_control import stop_daemon
+
+        outcome = stop_daemon()
+    except Exception:  # pragma: no cover - defensive; the stop already succeeded
+        logging.getLogger(__name__).debug("mcp gateway daemon stop failed", exc_info=True)
+        return
+    if outcome == "stopped":
+        print("✅ Stopped the MCP gateway daemon and its pooled MCP servers.")
+    elif outcome == "draining":
+        print("⏳ MCP gateway daemon is draining its pooled MCP servers; it exits on its own.")
+    elif outcome == "denied":
+        print("⚠️  No permission to stop the MCP gateway daemon; it exits once it sees its gateway is gone.")
+    elif outcome == "unverified":
+        print("⚠️  Something other than gatewayd answers the MCP gateway socket; left it alone.")
 
 
 def _pid_exited(pid: int) -> bool:
@@ -1655,6 +1688,9 @@ def _update_approve() -> None:
     from kiro_crew.platform.update_stepup import read_pending
 
     print("👻 Approving the pending in-app update…\n")
+    # Default read: never writes. This runs in the CLI process, outside the
+    # gateway's nonce mutex — expiry cleanup here could race a gateway
+    # re-arm and delete a fresh request. Cleanup is the gateway's job.
     pending = read_pending()
     if pending is None:
         print("❌ No armed update request (it may have expired).")
@@ -1822,7 +1858,13 @@ async def _gateway(
 
     if not config_path().exists():
         cfg = KiroCrewConfig()
-        cfg.save()
+        # _gateway is a coroutine, so this runs on the event loop: save() takes
+        # the sidecar advisory flock (#4767) and a contended wait (another
+        # process writing config at boot) must block a worker thread, not the
+        # loop. run_config_write does not fit here — the dashboard's asyncio
+        # config lock guards loop-side handler writers, none of which exist
+        # before run_gateway starts serving.
+        await asyncio.to_thread(cfg.save)
         print(f"👻 Created default config: {config_path()}")
 
     cfg = KiroCrewConfig.load()
@@ -1867,6 +1909,7 @@ async def _run_task(args: argparse.Namespace) -> None:
         episodic_limit=cfg.memory.episodic_max_results,
         embedding_dim=cfg.memory.embedding_dim,
         decay_rates=cfg.memory.decay_rates or None,
+        dedup_threshold=cfg.memory.episodic_dedup_threshold,
     )
     # CALLER CONTRACT (vector_memory.py): async callers offload init() — it is
     # blocking file IO end to end (sqlite connect, migrations, lockdown pass)

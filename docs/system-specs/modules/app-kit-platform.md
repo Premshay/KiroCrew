@@ -291,6 +291,22 @@ wins and reverts a correction the registration path had made. Fixing that revers
 the editor-snapshot-wins contract kept in #5899, and unlike resurrection it
 self-heals on the next gateway start, so it is left to a separate ruling.
 
+What the ruling is weighing, since "less severe than resurrection" understates it:
+the reverted value is the exact artefact `_register_mcp_servers` refuses to write
+and scrubs on sight — a `backend.port:"auto"` app's illustrative manifest port,
+i.e. a reachable-LOOKING dead URL whose cost that path states as breaking *every*
+kiro session, not just this app's. Two facts set the window. The PUT's own tail
+calls `_reset_all_sessions`, which drains every active session **and** the warm
+pool, so the next cold start reads the reverted row rather than the revert lying
+dormant. And the only writer that puts the live port back is
+`reconcile_enabled_app_resources`, whose single call site is the gateway boot path
+(`dashboard/server.py`) — the mid-turn rung `_recover_app_agent_binding` is gated
+on an UNRESOLVED agent binding, which a reverted port does not produce. So the
+self-heal is a restart, and nothing shorter. Both axes above plus this open cell
+are enumerated in one table by
+`test_the_app_namespace_region_decides_every_axis_it_claims_to`, so a change to
+any of them has to come through it.
+
 Writer: `apps/bridges.py::_apply_agent_mcp_policy`, `_mcp_json_path`,
 `_scrub_legacy_shared_mcp`;
 `dashboard/handlers/agents.py::_merge_unowned_servers` and
@@ -891,7 +907,7 @@ resolution), `dashboard/state.py` (`_send_ws_all`, `_ws_client_allowed`,
 (`_granted_list`, `RESERVED_APP_PATH_SEGMENTS`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
 for developer-facing diagnostics, drift-guarded by
 `website/src/test/appSdkEventScope.test.ts`). Runtime-facing summary for app
-authors: [../../../src/kiro_crew/docs/app-platform-trust-model.md](../../../src/kiro_crew/docs/app-platform-trust-model.md).
+authors: [../../architecture/app-platform-trust-model.md](../../architecture/app-platform-trust-model.md).
 
 ## 14. The published catalog is the store's inventory
 
@@ -1635,3 +1651,33 @@ Writers: `apps/backend.py` (`_health_check_loop`, `_watch_backend_health`,
 `_demote`, `_promote`, `_supervise_backend_health`, `_start_health_supervisor`,
 `_start_adopted_health_watch`, `AppProcess.is_running`), `apps/routes.py`
 (`handle_list_apps`).
+
+## 18. An app UI is a dynamically imported ESM module, not an iframe
+
+A gateway-managed app's dashboard UI is a real ESM module loaded into the
+dashboard's own React tree, so it shares one React instance and the host theme
+instead of living behind an iframe boundary. `AppHost` reads `ui.entry` from the
+manifest and dynamic-`import()`s `/apps/<app>/ui/<entry>`, served from the app's
+static UI directory. An app whose manifest declares no `ui.entry` renders the
+no-UI placeholder: the entry is optional, never defaulted.
+
+Cache-busting applies to the entry module alone. Busting the whole graph would
+re-fetch every chunk the entry statically imports, so a reload is driven by the
+`mc:app-reload` event instead: a module specifier already resolved in the page
+cannot be re-evaluated, so the host reloads the window when the named app
+announces new bytes.
+
+Shared host capability reaches an app through `@kirocrew/app-sdk`, which the host
+provides rather than publishing to npm — the SDK lives in the dashboard bundle, so
+an app externalizes it at build time instead of vendoring a second copy and a
+second React. Apps receive host events as `CustomEvent`s on `window`
+(`mc:app:<event>`) and raise host notifications through `mc:notify`.
+
+This is a different mechanism from the MCP App (SEP-1865) `srcdoc` iframes, which
+load their own ESM runtime from a CDN through an import map and are confined by
+the response CSP. §13 covers their token scoping;
+`src/kiro_crew/docs/mcp-apps.md` covers the iframe contract itself.
+
+Writers: `website/src/components/AppHost.tsx`, `apps/manifest.py` (the manifest
+`entry` field), `apps/routes.py` (static UI serving),
+`dashboard/server.py` (the CSP allowances the CDN import map needs).

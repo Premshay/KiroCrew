@@ -7,7 +7,7 @@
  * release loses the work and the review history; shipping it visible releases
  * an unpolished page. A preview flag keeps the code on `main`, keeps the route
  * routable, and simply does not advertise the surface anywhere in the UI until
- * the operator turns it on from Developer > Feature Previews.
+ * the operator turns it on from Settings > Developer > Feature Previews.
  *
  * Deliberately localStorage, not backend config: this is a per-device "show me
  * the unfinished thing" switch with no server behavior attached (the surface's
@@ -17,8 +17,13 @@
  *
  * Retiring a flag is the goal, not an afterthought: when the surface is
  * polished, delete its `previewFlag` from the registry entry and its card from
- * Developer > Feature Previews. The stale localStorage key then reads as an
- * ordinary unused key and no longer gates anything.
+ * Settings > Developer > Feature Previews. The stale localStorage key then reads as an
+ * ordinary unused key and no longer gates anything. The card's "See what it
+ * looks like" intro goes with it: its builder in `FeaturePreviewsSection.tsx`,
+ * its captures under `public/app-assets/feature-previews/`, its
+ * `pages.developer.featurePreviewsTab.intro.*` keys in every catalog, and its
+ * `shoot` step in `scripts/capture-feature-previews.mjs` — the media is the
+ * heaviest thing a flag ships, so it must not outlive the flag.
  */
 import { safeGetItem, safeSetItem } from './safeStorage'
 
@@ -82,8 +87,8 @@ export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
  * by switching to that crew's pane, and the local session list does not show
  * live remote sessions — so the session is hard to return to afterwards.
  *
- * Its toggle lives in Developer > Feature Previews, alongside every other
- * unreleased surface, and NOT on Settings > Remote crews where it started: a
+ * Its toggle lives in Settings > Developer > Feature Previews, alongside every other
+ * unreleased surface, and NOT on Settings > Remote Instances where it started: a
  * held feature is found by looking at the one page that lists held features, so
  * scattering an opt-in onto the page it happens to act on hides it from the only
  * reader who wants it. It keeps its own card there rather than sharing

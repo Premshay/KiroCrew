@@ -14,9 +14,11 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1079,16 +1081,156 @@ async def test_disk_in_progress_returns_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_disk_done_snapshot_resets_to_idle(monkeypatch):
+async def test_disk_fresh_result_served_without_rescan(monkeypatch):
+    """A completed result inside the TTL is a cache, not a one-read handoff."""
     monkeypatch.setattr(fleet_state, "_DISK", {"status": "done", "total_mb": 42, "per": {"a": 42}})
-    snap = await fleet_state._disk()
-    assert snap["total_mb"] == 42
-    assert fleet_state._DISK["status"] == "idle"
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", time.monotonic())
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    monkeypatch.setattr(
+        repository, "_discover_worktrees", AsyncMock(side_effect=AssertionError("must not scan"))
+    )
+    for _ in range(2):
+        snap = await fleet_state._disk()
+        assert snap == {"status": "done", "total_mb": 42, "per": {"a": 42}}
+    assert fleet_state._DISK["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_disk_six_sequential_polls_run_one_aggregation(monkeypatch):
+    """Regression for #8787: an open dashboard polling /disk must not re-scan.
+
+    Six sequential endpoint reads on main ran three full aggregations because
+    the done branch reset the state machine to idle on every snapshot. With
+    the TTL cache the same six reads run exactly one.
+    """
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "idle", "total_mb": None, "per": {}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", 0.0)
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    discoveries = 0
+    du_calls: list = []
+
+    async def fake_discover():
+        nonlocal discoveries
+        discoveries += 1
+        return [{"path": "/repo/wt-a"}]
+
+    async def fake_run(cmd, **kw):
+        du_calls.append(cmd)
+        return (0, "12\t/repo/wt-a", "")
+
+    monkeypatch.setattr(repository, "_discover_worktrees", fake_discover)
+    monkeypatch.setattr(runtime, "_trusted_bin", lambda name: "/usr/bin/du")
+    monkeypatch.setattr(runtime, "_run_cmd", fake_run)
+
+    assert (await fleet_state._disk())["status"] == "computing"
+    for _ in range(50):
+        if fleet_state._DISK["status"] == "done":
+            break
+        await asyncio.sleep(0.01)
+    for _ in range(5):
+        snap = await fleet_state._disk()
+        assert snap == {"status": "done", "total_mb": 12, "per": {"wt-a": 12}}
+        await asyncio.sleep(0)  # give any wrongly-spawned refresh a chance to run
+    assert discoveries == 1
+    assert len(du_calls) == 1
+    assert fleet_state._DISK["status"] == "done"  # never reset back to idle
+
+
+@pytest.mark.asyncio
+async def test_disk_stale_cache_coalesces_one_refresh(monkeypatch):
+    """Concurrent polls past the TTL start exactly one background refresh."""
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "done", "total_mb": 42, "per": {"a": 42}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(
+        fleet_state, "_DISK_COMPUTED_AT", time.monotonic() - fleet_state._DISK_TTL - 1
+    )
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    started = 0
+    release = asyncio.Event()
+
+    async def fake_discover():
+        nonlocal started
+        started += 1
+        await release.wait()
+        return [{"path": "/repo/wt-a"}]
+
+    monkeypatch.setattr(repository, "_discover_worktrees", fake_discover)
+    monkeypatch.setattr(runtime, "_trusted_bin", lambda name: "/usr/bin/du")
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "7\t/repo/wt-a", "")))
+
+    snaps = await asyncio.gather(*(fleet_state._disk() for _ in range(6)))
+    # Every concurrent poll keeps observing the stale numbers, never a reset.
+    assert all(s == {"status": "done", "total_mb": 42, "per": {"a": 42}} for s in snaps)
+    await asyncio.sleep(0)  # let the refresh task reach the discovery await
+    assert started == 1
+    release.set()
+    for _ in range(50):
+        if fleet_state._DISK["total_mb"] == 7:
+            break
+        await asyncio.sleep(0.01)
+    assert fleet_state._DISK == {"status": "done", "total_mb": 7, "per": {"wt-a": 7}}
+    assert started == 1
+
+
+@pytest.mark.asyncio
+async def test_disk_invalidate_forces_refresh_on_next_read(monkeypatch):
+    """A worktree mutation drops the freshness stamp; the next read re-scans."""
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "done", "total_mb": 42, "per": {"a": 42}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", time.monotonic())
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    monkeypatch.setattr(
+        repository, "_discover_worktrees", AsyncMock(return_value=[{"path": "/repo/wt-b"}])
+    )
+    monkeypatch.setattr(runtime, "_trusted_bin", lambda name: "/usr/bin/du")
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "9\t/repo/wt-b", "")))
+
+    fleet_state._disk_invalidate()
+    # The stale numbers keep serving while the refresh runs behind them.
+    assert await fleet_state._disk() == {"status": "done", "total_mb": 42, "per": {"a": 42}}
+    for _ in range(50):
+        if fleet_state._DISK["total_mb"] == 9:
+            break
+        await asyncio.sleep(0.01)
+    assert fleet_state._DISK == {"status": "done", "total_mb": 9, "per": {"wt-b": 9}}
+
+
+@pytest.mark.asyncio
+async def test_disk_mid_flight_invalidation_leaves_result_stale(monkeypatch):
+    """An aggregation overlapped by a mutation must not be stamped fresh."""
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "idle", "total_mb": None, "per": {}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", 0.0)
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    release = asyncio.Event()
+
+    async def fake_discover():
+        await release.wait()
+        return [{"path": "/repo/wt-a"}]
+
+    monkeypatch.setattr(repository, "_discover_worktrees", fake_discover)
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "5\t/repo/wt-a", "")))
+
+    await fleet_state._disk()  # starts the aggregation
+    fleet_state._disk_invalidate()  # a mutation lands mid-flight
+    release.set()
+    for _ in range(50):
+        if fleet_state._DISK["status"] == "done":
+            break
+        await asyncio.sleep(0.01)
+    # The measurement is kept for display but left stale: the next read starts
+    # a fresh aggregation instead of serving pre-mutation numbers for a TTL.
+    assert fleet_state._DISK_COMPUTED_AT == 0.0
 
 
 @pytest.mark.asyncio
 async def test_disk_idle_starts_background_aggregation(monkeypatch):
     monkeypatch.setattr(fleet_state, "_DISK", {"status": "idle", "total_mb": None, "per": {}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", 0.0)
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
     monkeypatch.setattr(
         repository,
         "_discover_worktrees",
@@ -1098,6 +1240,7 @@ async def test_disk_idle_starts_background_aggregation(monkeypatch):
     async def fake_run(cmd, **kw):
         return (0, "12\t" + cmd[-1], "") if cmd[-1].endswith("wt-a") else (1, "", "err")
 
+    monkeypatch.setattr(runtime, "_trusted_bin", lambda name: "/usr/bin/du")
     monkeypatch.setattr(runtime, "_run_cmd", fake_run)
 
     assert await fleet_state._disk() == {"status": "computing", "total_mb": None, "per": {}}
@@ -1112,6 +1255,9 @@ async def test_disk_idle_starts_background_aggregation(monkeypatch):
 @pytest.mark.asyncio
 async def test_disk_aggregation_failure_reports_unknown(monkeypatch):
     monkeypatch.setattr(fleet_state, "_DISK", {"status": "idle", "total_mb": None, "per": {}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", 0.0)
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
     monkeypatch.setattr(
         repository, "_discover_worktrees", AsyncMock(side_effect=RuntimeError("git"))
     )
@@ -1122,6 +1268,31 @@ async def test_disk_aggregation_failure_reports_unknown(monkeypatch):
             break
         await asyncio.sleep(0.01)
     assert fleet_state._DISK == {"status": "done", "total_mb": None, "per": {}}
+
+
+@pytest.mark.asyncio
+async def test_disk_transient_failure_preserves_numbers_and_retries(monkeypatch):
+    """A failed refresh keeps the previous result and is never cached fresh."""
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "done", "total_mb": 42, "per": {"a": 42}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(
+        fleet_state, "_DISK_COMPUTED_AT", time.monotonic() - fleet_state._DISK_TTL - 1
+    )
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    monkeypatch.setattr(
+        repository, "_discover_worktrees", AsyncMock(side_effect=RuntimeError("git timeout"))
+    )
+
+    # Stale read starts the refresh, which fails behind the scenes.
+    assert await fleet_state._disk() == {"status": "done", "total_mb": 42, "per": {"a": 42}}
+    for _ in range(50):
+        if not fleet_state._DISK_COMPUTING:
+            break
+        await asyncio.sleep(0.01)
+    # Good numbers survive the failure, and the stamp stays 0.0 so the next
+    # read retries instead of serving the failure for a full TTL.
+    assert fleet_state._DISK == {"status": "done", "total_mb": 42, "per": {"a": 42}}
+    assert fleet_state._DISK_COMPUTED_AT == 0.0
 
 
 # --------------------------------------------------------------------------
@@ -2550,6 +2721,7 @@ async def test_worktree_detail_includes_pod_state_and_design_docs(monkeypatch, t
         return ""
 
     monkeypatch.setattr(repository, "_git", fake_git)
+    monkeypatch.setattr(runtime, "_trusted_bin", lambda name: "/usr/bin/du")
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "31\t.", "")))
     monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
     monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
@@ -2595,6 +2767,7 @@ async def test_worktree_detail_survives_pod_probe_failure(monkeypatch, tmp_path)
     monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=0))
     monkeypatch.setattr(fleet_state, "_context_cached", AsyncMock(return_value={}))
     monkeypatch.setattr(repository, "_git", AsyncMock(return_value=""))
+    monkeypatch.setattr(runtime, "_trusted_bin", lambda name: "/usr/bin/du")
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(1, "", "du failed")))
     monkeypatch.setattr(runtime, "_load_cfg", lambda: None)
 
@@ -2602,6 +2775,60 @@ async def test_worktree_detail_survives_pod_probe_failure(monkeypatch, tmp_path)
     assert detail["pod_running"] is False
     assert detail["disk_mb"] is None
     assert detail["commits"] == []
+
+
+def test_dir_size_bytes_does_not_follow_a_directory_link():
+    """A directory symlink/junction inside the tree must not be walked into.
+
+    ``entry.is_dir(follow_symlinks=False)`` reports True for a Windows
+    junction (a reparse point, not a symlink), so a naive walk would push it
+    and recurse through the link's target -- unbounded on a cycle (a link
+    pointing back at an ancestor) and potentially an outbound SMB connection
+    if the target is a network share.
+
+    A real junction cannot be created on this (POSIX) test host, and a plain
+    symlink does not exercise the guard: ``is_dir(follow_symlinks=False)``
+    reports False for a symlink on every platform, so only a junction's
+    ``is_dir(False) == True`` reaches the branch the guard protects. So this
+    drives that SAME branch by monkeypatching ``os.DirEntry.is_dir`` to answer
+    the way a junction's DirEntry does (True even with follow_symlinks=False)
+    for one specific path, and asserts ``is_link_or_junction`` -- not
+    ``is_dir`` -- is what the walk consults before recursing into it.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.fleet_state as fleet_state_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        root = base / "walked-root"
+        root.mkdir()
+        (root / "real.bin").write_bytes(b"x" * 1000)
+        outside = base / "outside-target"
+        outside.mkdir()
+        (outside / "elsewhere.bin").write_bytes(b"y" * 5000)
+        junction_path = root / "junction-to-outside"
+        # No real reparse point on POSIX; a symlink stands in as the on-disk
+        # object so scandir yields a real DirEntry, but its is_dir() answer is
+        # forced below to the junction shape the fix must handle.
+        junction_path.symlink_to(outside, target_is_directory=True)
+        real_is_dir = os.DirEntry.is_dir
+        real_is_link_or_junction = fleet_state_mod.is_link_or_junction
+
+        def fake_is_dir(self, *, follow_symlinks=True):
+            if self.path == str(junction_path):
+                return True
+            return real_is_dir(self, follow_symlinks=follow_symlinks)
+
+        def fake_is_link_or_junction(path):
+            if str(path) == str(junction_path):
+                return True
+            return real_is_link_or_junction(path)
+
+        with mock.patch.object(os.DirEntry, "is_dir", fake_is_dir), mock.patch.object(
+            fleet_state_mod, "is_link_or_junction", fake_is_link_or_junction
+        ):
+            size = fleet_state_mod._dir_size_bytes(str(root))
+
+    assert size == 1000, "the walk must count only real.bin, never through the junction"
 
 
 def test_main_boots_platform_before_serving(monkeypatch):

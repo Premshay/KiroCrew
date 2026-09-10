@@ -29,6 +29,7 @@ import {
   SAMPLE_SCREENS,
 } from "./constants";
 import Clickable from "../../components/Clickable";
+import ErrorNotice from "../../components/ErrorNotice";
 import { Spinner } from "./Motion";
 import { S } from "./styles";
 import { designCritiqueApi, fileUrl } from "./api";
@@ -130,6 +131,15 @@ function DesignCritiquePageContent() {
     screens: Screen[];
     report: Report;
   } | null>(null);
+  // A BACKGROUND run that failed. The foreground run reports through `err`, but
+  // a run the user had already navigated away from used to announce its failure
+  // only as a toast — once that faded, the critique had simply vanished from the
+  // history with nothing on screen saying why. Kept per run (keyed by slotKey)
+  // until each is read and dismissed, so a second failure cannot overwrite the
+  // first back into toast-only.
+  const [backgroundFailures, setBackgroundFailures] = useState<
+    Array<{ slotKey: string; message: string }>
+  >([]);
   const [dragId, setDragId] = useState<string | null>(null);
   const [sel, setSel] = useState<Sel | null>(null);
   const [asks, setAsks] = useState<Ask[]>([]);
@@ -143,7 +153,22 @@ function DesignCritiquePageContent() {
     entryId?: number | null;
   } | null>(null);
   const [critiques, setCritiques] = useState<HistoryEntry[]>(loadHistory);
-  const [err, setErr] = useState("");
+  // Two composer messages, kept apart on purpose: `err` is a failure (a caught
+  // exception, a run that did not finish) and renders through ErrorNotice;
+  // `hint` is a client-side check or a not-failed status ("still working") and
+  // must not be dressed as an error. The two are mutually exclusive on screen:
+  // setting either clears the other, so a run that times out ("still working")
+  // and then fails never shows both verdicts above one composer.
+  const [err, setErrRaw] = useState("");
+  const [hint, setHintRaw] = useState("");
+  const setErr = (m: string) => {
+    setErrRaw(m);
+    if (m) setHintRaw("");
+  };
+  const setHint = (m: string) => {
+    setHintRaw(m);
+    if (m) setErrRaw("");
+  };
   const [dragging, setDragging] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [zoom, setZoom] = useState(false);
@@ -763,7 +788,7 @@ function DesignCritiquePageContent() {
     const watching = isWatching(slotKey);
     if (flag && flag.timeout) {
       if (watching) {
-        setErr(
+        setHint(
           i18nT(
             "apps.designCritique.designCritiquePage.still_working_on_this_one_it_s_kept_running_come",
           ),
@@ -778,16 +803,21 @@ function DesignCritiquePageContent() {
     }).catch(() => undefined);
     endRun(slotKey);
     setCritiques(dropPendingCritique(slotKey));
+    const message =
+      e instanceof Error
+        ? e.message
+        : i18nT("apps.designCritique.designCritiquePage.something_went_wrong");
     if (watching) {
-      setErr(
-        e instanceof Error
-          ? e.message
-          : i18nT(
-              "apps.designCritique.designCritiquePage.something_went_wrong",
-            ),
-      );
+      setErr(message);
       setPhase("error");
     }
+    // The toast is transient feedback; the failed state itself is rendered
+    // in-page (the rail notice) so it is not lost when the toast fades.
+    else
+      setBackgroundFailures((prev) => [
+        ...prev.filter((f) => f.slotKey !== slotKey),
+        { slotKey, message },
+      ]);
     notify("Critique failed: " + (e instanceof Error ? e.message : String(e)), {
       type: "error",
     });
@@ -835,7 +865,7 @@ function DesignCritiquePageContent() {
       /^image\//.test(f.type || ""),
     );
     if (!files.length) {
-      setErr(
+      setHint(
         i18nT(
           "apps.designCritique.designCritiquePage.those_weren_t_image_files",
         ),
@@ -844,7 +874,7 @@ function DesignCritiquePageContent() {
       return;
     }
     if (files.length > 20) {
-      setErr(
+      setHint(
         i18nT(
           "apps.designCritique.designCritiquePage.that_s_more_than_20_screens_send_fewer",
         ),
@@ -854,6 +884,7 @@ function DesignCritiquePageContent() {
     }
     const seq = ++runSeqRef.current;
     setErr("");
+    setHint("");
     setBlocked(null);
     setShowAuth(false);
     setMenuOpen(false);
@@ -963,8 +994,10 @@ function DesignCritiquePageContent() {
     const det = detectKind(raw);
     if (!det) return;
     if (det.kind === "unknown") {
-      setErr(
-        "I couldn’t tell what that is. Give me a Figma link, a GitHub/GitLab/Bitbucket repo, an absolute local path, or a URL that’s already serving.",
+      setHint(
+        i18nT(
+          "apps.designCritique.designCritiquePage.couldn_t_tell_what_that_is_give_me_a_figma_link",
+        ),
       );
       setPhase("error");
       return;
@@ -972,6 +1005,7 @@ function DesignCritiquePageContent() {
     const seq = ++runSeqRef.current;
     const jobKey = "ref-" + Date.now();
     setErr("");
+    setHint("");
     setBlocked(null);
     setShowAuth(false);
     setMenuOpen(false);
@@ -1290,7 +1324,7 @@ function DesignCritiquePageContent() {
         const flag = e as Flagged;
         if (flag && flag.cancelled) return;
         if (flag && flag.timeout) {
-          setErr(
+          setHint(
             i18nT(
               "apps.designCritique.designCritiquePage.still_working_on_this_one_it_s_kept_running_come_2",
             ),
@@ -1356,7 +1390,7 @@ function DesignCritiquePageContent() {
       /^image\//.test(f.type || ""),
     );
     if (!imgs.length) {
-      setErr(
+      setHint(
         i18nT(
           "apps.designCritique.designCritiquePage.those_weren_t_image_files",
         ),
@@ -1364,19 +1398,24 @@ function DesignCritiquePageContent() {
       return;
     }
     setErr("");
+    setHint("");
     setStaged((prev) => {
       const room = MAX_SCREENS - prev.length;
       if (room <= 0) {
-        setErr("That’s the limit of " + MAX_SCREENS + " screens.");
+        setHint(
+          i18nT(
+            "apps.designCritique.designCritiquePage.that_s_the_limit_of_max_screens",
+            { max: MAX_SCREENS },
+          ),
+        );
         return prev;
       }
       if (imgs.length > room)
-        setErr(
-          "Only added the first " +
-            room +
-            " — the limit is " +
-            MAX_SCREENS +
-            " screens.",
+        setHint(
+          i18nT(
+            "apps.designCritique.designCritiquePage.only_added_the_first_room_the_limit_is_max_screens",
+            { room, max: MAX_SCREENS },
+          ),
         );
       return prev.concat(
         imgs.slice(0, room).map((f) => ({
@@ -1634,6 +1673,7 @@ function DesignCritiquePageContent() {
     setScope(null);
     setPicked([]);
     setErr("");
+    setHint("");
     setRefText("");
     setTimeout(() => {
       if (inputRef.current) inputRef.current.click();
@@ -1645,6 +1685,7 @@ function DesignCritiquePageContent() {
     setScope(null);
     setPicked([]);
     setErr("");
+    setHint("");
     setRefText("http://localhost:");
   };
 
@@ -1679,6 +1720,7 @@ function DesignCritiquePageContent() {
     setPhase("new");
     setCurrent(null);
     setErr("");
+    setHint("");
     setWriting(false);
     setPendingKind(null);
     startedAtRef.current = 0;
@@ -1745,6 +1787,7 @@ function DesignCritiquePageContent() {
     setCurrent(null);
     setMenuOpen(false);
     setErr("");
+    setHint("");
     setBlocked(null);
     setRefText("");
     startedAtRef.current = 0;
@@ -1764,6 +1807,7 @@ function DesignCritiquePageContent() {
     setCurrent({ report: null, screens: e.screens || [] });
     setJustFinished(null);
     setErr("");
+    setHint("");
     setBlocked(null);
     const job = loadJobs().find((j) => j.slotKey === e.slotKey);
     startClock(job && job.ts ? job.ts : e.ts);
@@ -2461,12 +2505,31 @@ function DesignCritiquePageContent() {
     );
   }
 
+  // Failed background runs, on their own row under the rail head — not inside
+  // its button row, where the notice's hand-off would join New / History /
+  // Running as a third action. The failed run is gone from history and its
+  // screens are on disk, so the hand-off has nothing on this rail to lose.
+  const railFailures = backgroundFailures.length ? (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '12px' }}>
+      {backgroundFailures.map(f => (
+        <ErrorNotice
+          key={f.slotKey}
+          message={f.message}
+          title={i18nT('apps.designCritique.designCritiquePage.that_critique_didn_t_finish')}
+          askAgent
+          onDismiss={() => setBackgroundFailures(prev => prev.filter(x => x.slotKey !== f.slotKey))}
+        />
+      ))}
+    </div>
+  ) : null
+
   const rail = (
     <div
       style={{ ...S.rail, ...(narrow ? S.railNarrow : {}) }}
       onMouseUp={phase === "report" ? captureSelection : undefined}
     >
       {railHead}
+      {railFailures}
       {railBody}
     </div>
   );
@@ -2615,6 +2678,7 @@ function DesignCritiquePageContent() {
         selectedAgent={activeAgent}
         setSelectedAgent={setSelectedAgent}
         err={err}
+        hint={hint}
         inputRef={inputRef}
         contexts={projectContexts}
         brief={reviewBrief}

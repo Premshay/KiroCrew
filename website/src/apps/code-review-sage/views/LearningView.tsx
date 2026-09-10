@@ -14,6 +14,7 @@ import type { ConsolidationPreview, LearnedPattern } from '../lib/types'
 import { Btn } from '../../../components/ui'
 import { fmtNumber } from '../../../i18n/format'
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 
 function ImpactTag({ impact }: { impact: string }) {
   const high = impact === 'high'
@@ -483,9 +484,12 @@ export default function LearningView() {
             </p>
           )}
           {(previewFailure || requestError || applyError) && (
-            <p className="mt-2 text-[12.5px] text-danger">
-              {previewFailure || requestError || applyError}
-            </p>
+            <ErrorNotice
+              message={previewFailure || requestError || applyError}
+              variant="inline"
+              askAgent
+              className="mt-2"
+            />
           )}
           {previewsQuery.error && (
             <p className="mt-2 text-[12.5px] text-danger">
@@ -526,9 +530,12 @@ export default function LearningView() {
           </div>
         )}
         {learningsQuery.error && (
-          <div className="mt-6 text-[13px] text-danger">
-            {i18nT('apps.codeReviewSage.views.learningView.learnings_unavailable')}
-          </div>
+          <ErrorNotice
+            title={i18nT('apps.codeReviewSage.views.learningView.learnings_unavailable')}
+            message={(learningsQuery.error as Error).message}
+            askAgent
+            className="mt-6"
+          />
         )}
 
         {!learningsQuery.isLoading && !learningsQuery.error && (

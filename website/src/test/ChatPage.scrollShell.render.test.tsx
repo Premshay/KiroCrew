@@ -144,9 +144,20 @@ describe('ChatPage invocation: slot membership and prop threading', () => {
       'onScroll={onScrollPin}',
       'virt={virt}',
       'loadingOlder={loadingOlder}',
-      'scrollerStyle={{ paddingBottom: 16 }}',
+      // A PREFIX, not the whole literal: the style object also carries the
+      // restore-gate visibility flip, so pinning the closing braces would pin the
+      // gate's presence into a test about prop THREADING. This still fails on a
+      // duplicated prop and still requires the padding the shell contract needs.
+      //
+      // Whitespace-tolerant because the object literal is formatted across lines
+      // in this file; a fixed-spacing pin counts ZERO occurrences and the
+      // exactly-once assertion then fails on the formatting rather than on a
+      // duplicated or missing prop.
+      /scrollerStyle=\{\{\s*paddingBottom: 16/g,
     ]) {
-      expect(inv.split(pin).length - 1, pin).toBe(1)
+      const count =
+        typeof pin === 'string' ? inv.split(pin).length - 1 : [...inv.matchAll(pin)].length
+      expect(count, String(pin)).toBe(1)
     }
   })
 

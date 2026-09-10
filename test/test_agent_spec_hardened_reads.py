@@ -27,6 +27,7 @@ the ``oversized`` and symlink cases are differential against the old path
 from __future__ import annotations
 
 import ast
+import functools
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -49,6 +50,12 @@ from kiro_crew.dashboard.handlers.mcp import (
     _launch_specs_for,
     api_mcp_active,
 )
+
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_agent_spec_hardened_reads")
 
 # The two refusal shapes cheap enough to plant per surface. "oversized" is the
 # differential case (the old read_text path had no cap, so it PARSED these);
@@ -955,6 +962,7 @@ _EXPECTED_WARM_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
 }
 
 
+@functools.lru_cache(maxsize=None)
 def _labelled_call_sites(target: str) -> dict[str, list[tuple[str | None, str | None]]]:
     """Return every *target* call site and its label pair.
 
@@ -968,6 +976,10 @@ def _labelled_call_sites(target: str) -> dict[str, list[tuple[str | None, str | 
     well, and its labels are read from the handing-off call, which is where the
     forwarded kwargs are written. This applies to every entry in
     ``_RATCHET_INVENTORY``, not to any one callee.
+
+    Cached per *target*: the source tree cannot change mid-run, both tests in
+    ``TestCallSiteLabelRatchet`` ask the same three targets, and the scan itself
+    (rglob + ast.parse of the whole ``src/`` tree) is the expensive part.
     """
     src = Path(__file__).resolve().parent.parent / "src"
     sites: dict[str, list[tuple[str | None, str | None]]] = {}

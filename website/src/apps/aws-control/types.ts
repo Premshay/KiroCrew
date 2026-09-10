@@ -83,6 +83,11 @@ export interface AvailableProfile {
  * read as "can't tell", not "none" — the UI says so instead of implying the
  * operator has no accounts. `registeredCount`/`max` bound the registry so the
  * picker can show a count hint and stop offering more once the cap is reached.
+ *
+ * A scan that FAILS on a supported platform answers 503 `profiles_unavailable`
+ * rather than a 200 carrying an empty list, so this payload is only ever the
+ * real listing: `profiles: []` with `supported: true` does mean none are left to
+ * register. The failed scan surfaces through the query's error state instead.
  */
 export interface AvailableProfilesResponse {
   profiles: AvailableProfile[]
@@ -94,11 +99,25 @@ export interface AvailableProfilesResponse {
 /**
  * Payload of `POST /profiles/register`. A batch registers the prefix that fits
  * under the cap, so `added + skipped` counts the whole request, not just the
- * winners. Error codes: `invalid_names` (400), `unknown_profile` (400).
+ * winners. Error codes: `invalid_names` (400), `unknown_profile` (400),
+ * `profiles_unavailable` (503, the local profile scan could not run, so no name
+ * could be checked and nothing was registered), `unsupported_platform` (501, the
+ * same but on a platform that cannot scan at all, so retrying never clears it).
  */
 export interface RegisterProfilesResult {
   added: number
   skipped: number
+}
+
+/**
+ * Outcome of dropping profiles from the registry. Registry-only: nothing in
+ * AWS or in the operator's AWS CLI configuration changes. `consentWithdrawn`
+ * names the paid services whose grant named a removed profile.
+ */
+export interface UnregisterProfilesResult {
+  removed: number
+  skipped: number
+  consentWithdrawn: string[]
 }
 
 /**
@@ -182,6 +201,36 @@ export interface DriveListing {
 export interface DriveDownload {
   url: string
   expiresSecs: number
+  /** The object's stored Content-Type from the same HEAD that gates the
+   *  presign, or null when S3 recorded none. The preview uses it to tell a
+   *  real PDF from a `.pdf`-named object served as octet-stream. */
+  contentType?: string | null
+}
+
+/** Payload of `GET /drive/{account}/preview` — the head bytes of a text file,
+ *  decoded utf-8. `truncated` says the file continues past the preview window;
+ *  `redacted` says the egress redactor masked at least one value, so what is
+ *  shown is not byte-for-byte what the file holds. */
+export interface DrivePreview {
+  content: string
+  truncated: boolean
+  redacted: boolean
+}
+
+/** One filename-search hit. `key` is section-relative (full path, not basename). */
+export interface DriveSearchHit {
+  key: string
+  size: number
+  modified: string
+}
+
+/** Payload of `GET /drive/{account}/search`. `capped` says the walk stopped at
+ *  `limit` hits — more matches may exist beyond it. The server owns the cap
+ *  and echoes it so the notice can name the real number. */
+export interface DriveSearch {
+  results: DriveSearchHit[]
+  capped: boolean
+  limit: number
 }
 
 /** Result of `POST /drive/{account}/upload`. */

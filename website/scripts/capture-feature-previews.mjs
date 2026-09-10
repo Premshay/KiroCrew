@@ -1,115 +1,153 @@
 /**
- * Screenshot harness for the Developer > Feature Previews page.
+ * Regenerate the Feature Previews "See what it looks like" media set —
+ * `public/app-assets/feature-previews/` — from a RUNNING pod, so the pictures
+ * the dialog shows stay pictures of the real surfaces rather than frozen bytes.
  *
- * Runs the REAL built SPA (website/dist) behind the shared in-process static
- * server and answers every /api/** call from fixtures via Playwright route
- * interception — gateway-free, no kiro-cli, no dashboard auth.
+ * Why this exists: `FeaturePreviewIntroDialog.tsx` promises "what you see is
+ * what will appear". A preview surface is, by definition, the part of the app
+ * that changes fastest, so the captures drift. This script is the honest way to
+ * re-shoot them; a hand-made mockup is not (see the component comment).
  *
- * Two shots, because the card only tells half its story with the switch off: the
- * ingress into the hidden page is progressively disclosed, so it exists in the
- * `on` frame and must be absent from the `off` one.
+ * Every capture is REAL: each preview flag is turned on in the pod's
+ * localStorage, the theme is set through the pod's own `PUT /api/config/theme`,
+ * and the page is driven with Playwright. Stills are PNG; the one interaction
+ * (the create menu opening) is recorded with Playwright's `recordVideo` and
+ * turned into a palette-quantised GIF with the ffmpeg that `imageio-ffmpeg`
+ * ships in the repo's venv (12 fps, 800 px wide, ~6 s loop).
  *
- * Run against a main build with the `before` prefix and the tab is absent; the
- * script then shoots Developer > Config, which is where the toggles live on a
- * main build, so the pair reads as a move rather than two unrelated pages.
+ * Usage (from website/, with the pod up and this branch's dist provisioned):
  *
- * Usage: node scripts/capture-feature-previews.mjs [outDir] [prefix]
+ *   kirocrew pod up <worktree> --seed rich --json | tail -1 > /tmp/pod.json
+ *   POD_INFO=/tmp/pod.json node scripts/capture-feature-previews.mjs [outDir]
+ *
+ * `outDir` defaults to `public/app-assets/feature-previews`. Budgets the PR
+ * agreed to: PNG <= 200 KB, GIF <= 1.5 MB — the script fails loudly past them.
+ * Adding a preview: add a `shoot*` step below AND a builder in
+ * `pages/settings/FeaturePreviewsSection.tsx`; a preview with no honest capture
+ * gets no builder and so no button.
  */
 import { chromium } from 'playwright'
-import { mkdirSync } from 'node:fs'
-import { serveDist } from './lib/serve-dist.mjs'
-import { logPageProblems, stubDashboardApi, json } from './lib/stub-dashboard-api.mjs'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 
-const OUT = process.argv[2] || '../.github/screenshots/feature-previews'
-const PREFIX = process.argv[3] || 'after'
+const info = JSON.parse(fs.readFileSync(process.env.POD_INFO, 'utf8').trim().split('\n').pop())
+const base = info.base_url
+const token = info.token
+const out = path.resolve(process.argv[2] || 'public/app-assets/feature-previews')
+fs.mkdirSync(out, { recursive: true })
 
-mkdirSync(OUT, { recursive: true })
+const PNG_MAX = 200 * 1024
+const GIF_MAX = 1.5 * 1024 * 1024
+const VIEW = { width: 1200, height: 760 }
+const GIF_VIEW = { width: 1000, height: 640 }
 
-/**
- * The Config tab's two viewers, which the `before` run has to render.
- *
- * Named here rather than in the shared stub because the shared stub's catch-all
- * answers anything path-matching `config` with `{}`, and `KiroCrewCfgTab` calls
- * `Object.entries(cfg.agents)` — undefined under that default, which throws
- * inside the app-shell error boundary and leaves the whole page blank. Only a
- * harness that actually opens Config needs these, so the fixture lives with it.
- *
- * Returns `true` after fulfilling, never the `json()` promise: the shared stub
- * tests `await extra(...)` to decide whether the route is already handled, and
- * that promise resolves to `undefined`, so the catch-all would fulfil a second
- * time and Playwright throws `Route is already handled!`.
- */
-const CONFIG_API = async (path, route) => {
-  if (path === '/api/config/kirocrew') {
-    await json(route, {
-      agents: { kirocrew: { kiro_agent: 'kirocrew', workspace: 'default', memory_store: 'default' } },
-      default_agent: 'kirocrew',
-      workspaces: { default: { path: '~/.kiro/crew/workspace' } },
-      default_workspace: 'default',
-      memory_stores: { default: { path: '~/.kiro/crew/workspace/memory' } },
-      default_memory_store: 'default',
-      agent: {
-        default_agent: 'kirocrew', provider: 'acp', model: 'auto',
-        approval_mode: 'interactive', sandbox: 'auto', max_channels: 8,
-        max_channel_agents: 4, enforce_denied_commands: 'always',
-      },
-      session: { timeout_secs: 1800, pool_size: 2, pool_agent: 'kirocrew', pool_ttl_secs: 600 },
-      memory: { embedding_provider: 'local' },
-      auto_update: true,
+/** The venv's imageio-ffmpeg binary: a full build (palettegen/paletteuse),
+ *  unlike Playwright's bundled ffmpeg, which only decodes screencasts. */
+function ffmpegExe() {
+  const py = path.resolve('../.venv/bin/python')
+  return execFileSync(py, ['-c', 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())'], { encoding: 'utf8' }).trim()
+}
+
+async function settle(page) {
+  await page.waitForURL(u => !String(u).includes('token='), { timeout: 20_000 }).catch(() => {})
+  await page.waitForTimeout(1200)
+}
+
+/** Fresh context: sign in with the pod token, set the theme server-side (the
+ *  boot fetch overrides localStorage otherwise), turn the given flags on. */
+async function session(browser, theme, flags, viewport = VIEW, extra = {}) {
+  const ctx = await browser.newContext({ viewport, ...extra })
+  const page = await ctx.newPage()
+  await page.goto(`${base}/?token=${token}`, { waitUntil: 'load' })
+  await settle(page)
+  const status = await page.evaluate(async (mode) => {
+    const r = await fetch('/api/config/theme', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }),
     })
-    return true
-  }
-  if (path === '/api/agent/config') {
-    await json(route, { name: 'kirocrew', mcpServers: {} })
-    return true
-  }
-  return false
+    return r.status
+  }, theme)
+  if (status !== 200) throw new Error(`theme PUT ${status}`)
+  await page.evaluate(({ theme, flags }) => {
+    localStorage.setItem('mc-theme', theme)
+    for (const f of flags) localStorage.setItem(f, '1')
+  }, { theme, flags })
+  return { ctx, page }
 }
 
-async function main() {
-  const { srv, base } = await serveDist()
-  const browser = await chromium.launch()
-  const context = await browser.newContext({
-    viewport: { width: 1400, height: 900 },
-    deviceScaleFactor: 2, // 12-13px type renders soft at 1x on GitHub
-  })
-  const page = await context.newPage()
-  logPageProblems(page)
-
-  await stubDashboardApi(page, { extra: CONFIG_API })
-  // AFTER the shared stub, whose own init script clears storage: Developer Mode
-  // is what puts the Developer row in the sidebar at all.
-  await page.addInitScript(() => localStorage.setItem('mc-dev-mode', '1'))
-
-  const shot = []
-  const save = async (name) => {
-    await page.screenshot({ path: `${OUT}/${PREFIX}-${name}.png` })
-    shot.push(`${PREFIX}-${name}.png`)
-  }
-
-  await page.goto(base + '/developer?tab=feature-previews', { waitUntil: 'domcontentloaded' })
-  const rail = page.getByRole('button', { name: /feature previews/i })
-  const onBranch = await rail.count() > 0
-
-  if (!onBranch) {
-    // A main build: the toggles are a card at the top of Config.
-    await page.goto(base + '/developer?tab=config', { waitUntil: 'domcontentloaded' })
-  }
-  const toggle = page.getByRole('switch', { name: /webhooks/i })
-  await toggle.waitFor({ state: 'visible', timeout: 15000 })
-  await page.waitForTimeout(500) // let the card's rise animation finish
-
-  await save('off')
-
-  await toggle.click()
-  await page.getByRole('button', { name: /open webhooks/i })
-    .waitFor({ state: 'visible', timeout: 5000 })
-  await page.waitForTimeout(300)
-  await save('on')
-
-  await browser.close()
-  srv.close()
-  console.log(`wrote ${shot.length} shot(s) to ${OUT}: ${shot.join(', ')}`)
+function check(file, max) {
+  const size = fs.statSync(file).size
+  if (size > max) throw new Error(`${path.basename(file)} is ${size} bytes, over the ${max} budget`)
+  console.log(`${path.basename(file)}  ${size} B`)
 }
 
-main().catch(err => { console.error(err); process.exit(1) })
+async function shoot(page, file) {
+  await page.screenshot({ path: file })
+  check(file, PNG_MAX)
+}
+
+const browser = await chromium.launch()
+
+for (const theme of ['light', 'dark']) {
+  // Webhooks: the page is the flag's only door.
+  {
+    const { ctx, page } = await session(browser, theme, ['mc-preview-webhooks'])
+    await page.goto(`${base}/webhooks`, { waitUntil: 'load' })
+    await settle(page)
+    await shoot(page, path.join(out, `webhooks-page-${theme}.png`))
+    await ctx.close()
+  }
+  // Crew, door 1: the Members page.
+  {
+    const { ctx, page } = await session(browser, theme, ['mc-preview-crew'])
+    await page.goto(`${base}/members`, { waitUntil: 'load' })
+    await settle(page)
+    await shoot(page, path.join(out, `crew-members-${theme}.png`))
+    await ctx.close()
+  }
+  // Crew, door 2: the create menu opening — an interaction, so a GIF.
+  {
+    const vdir = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-gif-'))
+    const seed = await session(browser, theme, ['mc-preview-crew'], GIF_VIEW)
+    const state = await seed.ctx.storageState()
+    await seed.ctx.close()
+    const ctx = await browser.newContext({
+      viewport: GIF_VIEW, storageState: state, recordVideo: { dir: vdir, size: GIF_VIEW },
+    })
+    await ctx.addInitScript((mode) => {
+      localStorage.setItem('mc-theme', mode)
+      localStorage.setItem('mc-preview-crew', '1')
+    }, theme)
+    const page = await ctx.newPage()
+    await page.goto(`${base}/`, { waitUntil: 'load' })
+    await settle(page)
+    await page.getByRole('button', { name: 'Older Sessions' }).first().waitFor()
+    await page.waitForTimeout(2200)
+    const more = page.getByRole('button', { name: 'More create options' })
+    await more.hover(); await page.waitForTimeout(500)
+    await more.click()
+    await page.getByTestId('new-crew-chat').waitFor()
+    await page.waitForTimeout(700)
+    await page.getByTestId('new-crew-chat').hover()
+    await page.waitForTimeout(1800)
+    await page.keyboard.press('Escape')
+    await page.waitForTimeout(600)
+    const video = page.video()
+    await ctx.close()
+    const webm = await video.path()
+    const gif = path.join(out, `crew-menu-${theme}.gif`)
+    const ffmpeg = ffmpegExe()
+    // Skip the first 3 s (page settling), then two-pass palette GIF — the same
+    // recipe as the browser-recording skill: sharp text, bounded size.
+    const filters = 'fps=12,scale=min(800\\,iw):-2:flags=lanczos'
+    const palette = path.join(vdir, 'palette.png')
+    execFileSync(ffmpeg, ['-y', '-loglevel', 'error', '-ss', '3', '-i', webm, '-vf', `${filters},palettegen=max_colors=128`, palette])
+    execFileSync(ffmpeg, ['-y', '-loglevel', 'error', '-ss', '3', '-i', webm, '-i', palette, '-lavfi', `${filters} [x]; [x][1:v] paletteuse=dither=none`, gif])
+    fs.rmSync(vdir, { recursive: true, force: true })
+    check(gif, GIF_MAX)
+  }
+}
+
+await browser.close()
+console.log(`media set written to ${out}`)

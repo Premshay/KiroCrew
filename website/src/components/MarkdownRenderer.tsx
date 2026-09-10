@@ -1,9 +1,9 @@
 import React, { createContext, useContext, memo, useEffect, useMemo, useRef, useId, useCallback, useState } from 'react'
 import Clickable from './Clickable'
-import { HOVER_NONE_ACTION_BTN_CLS } from '../utils/touchActions'
+import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { X, Download, Plus, Minus, Search, Folder, Maximize2, Check, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare } from 'lucide-react'
-import { copyToClipboard } from '../utils/clipboard'
+import { X, Download, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare } from 'lucide-react'
+import { copyCode, copyToClipboard } from '../utils/clipboard'
 import { canonicalChatHref, sessionKeyFrom, sessionKeyFromChatHref } from '../utils/sessionKeys'
 import ReactMarkdown from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
@@ -34,6 +34,7 @@ function spliceChildren(parent: HastParent, index: number, nodes: Array<HastElem
 }
 import '../utils/hljs'
 import { useBlockAssembler, maskInlineCode } from '../hooks/useBlockAssembler'
+import SegmentedControl from './SegmentedControl'
 import { usePathKind, type PathKind } from '../hooks/usePathKind'
 import { useGatewayPlatform, type GatewayPlatform } from '../hooks/useGatewayPlatform'
 import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM } from '../hooks/usePinchZoom'
@@ -50,9 +51,10 @@ import JiraLogo from './icons/JiraLogo'
 import GithubLogo from './icons/GithubLogo'
 import GitlabLogo from './icons/GitlabLogo'
 import DiffBlock from './DiffBlock'
+import ErrorNotice from './ErrorNotice'
 import FoldableDiffBlock from './FoldableDiffBlock'
 import EditableCodeBlock from './EditableCodeBlock'
-import FilePathMenu, { revealOrOpen } from './FilePathMenu'
+import FilePathMenu, { revealOrOpen, useRevealFailure } from './FilePathMenu'
 import { SmoothResize } from './SmoothResize'
 import type { ContentBlock } from '../types'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
@@ -211,9 +213,36 @@ const REL_PREFIX_RE = /^\.{1,2}[/\\]/
  * rules would otherwise readmit it: the extension rule matches
  * `\\host\share\x.txt`, and the leading-`/` rule matches `//host/share/x`.
  * See `UNC_PREFIX_RE` for why that shape must never reach the probe.
+ *
+ * A directory written with a trailing separator (`/home/user/notes/`,
+ * `C:\Users\me\`) is classified by retrying on the slash-stripped form when the
+ * literal string fails: `PATH_SHAPE_RE` requires the string to END in a name
+ * character, so a trailing `/` otherwise fails the shape and the directory chip
+ * renders dead -- the directory-chip half of issue #9409. This widens NOTHING.
+ * The retry runs the SAME rules on the string minus one trailing separator, so a
+ * trailing slash rescues only a string whose slash-less form is already a
+ * candidate: `owner/repo/`, `text/plain/` and `2026/08/02/` stay rejected because
+ * `owner/repo` etc. are. The literal form is tried first so a bare drive root
+ * (`C:\`, whose slash-stripped `C:` is not a valid shape) keeps classifying, and
+ * the UNC refusal runs on the ORIGINAL string so `//host/share/` cannot slip
+ * through the strip.
  */
 export function isPathCandidate(s: string): boolean {
   if (UNC_PREFIX_RE.test(s)) return false
+  if (classifyPathShape(s)) return true
+  // Retry once on the slash-stripped form so a trailing separator does not
+  // disqualify an otherwise-valid directory. Guarded to len > 1 so `/` and `\`
+  // are not reduced to the empty string.
+  if (s.length > 1 && (s.endsWith('/') || s.endsWith('\\'))) {
+    return classifyPathShape(s.slice(0, -1))
+  }
+  return false
+}
+
+/** Shape + positive-signal test for a UNC-screened candidate. See
+ *  `isPathCandidate`, which owns the UNC refusal and the trailing-separator
+ *  retry. */
+function classifyPathShape(s: string): boolean {
   if (!PATH_SHAPE_RE.test(s) && !WIN_DRIVE_PATH_SHAPE_RE.test(s)) return false
   if (s.startsWith('/') || s.startsWith('~') || REL_PREFIX_RE.test(s)) return true
   // Rootedness is the positive signal, exactly as a leading `/` is on POSIX, so
@@ -515,6 +544,15 @@ const LIST_STYLE_TYPE: Record<string, string> = {
   I: 'upper-roman',
 }
 
+/** Chrome shared by the diagram action row's buttons. The padding is kept an
+ *  UNVARIATED base utility on purpose: `HOVER_NONE_ACTIONS_ROW_CLS` grows the
+ *  touch target with `[&_button]:p-3`, which wins by Tailwind's
+ *  variant-after-base ordering rather than by specificity, so a padding that
+ *  itself carried a variant could sort after the override and silently keep the
+ *  target below the touch floor. Positioning and the reveal live on the row. */
+const MERMAID_ACTION_BTN_CLS =
+  'p-1.5 rounded-md bg-bg-elevated/90 border border-border text-muted hover:text-text cursor-pointer'
+
 const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ref = useRef<HTMLDivElement>(null)
@@ -525,10 +563,57 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
   // for (and targets) the diagram currently on screen.
   const [svg, setSvg] = useState('')
   const [enlarged, setEnlarged] = useState(false)
+  // Which of the two views is on screen. The diagram host below stays MOUNTED
+  // either way and is hidden with the `hidden` ATTRIBUTE rather than unmounted:
+  // the render effect is guarded on `renderedRef.current === code`, so a
+  // remounted host would be a fresh empty node the effect then declines to fill,
+  // and toggling back would show a blank frame. Hiding keeps the already-rendered
+  // SVG in the same node, so the switch back is instant and cannot strand an
+  // empty host. The attribute rather than a `hidden` utility class because it
+  // also takes the diagram out of the accessibility tree, which a class cannot.
+  const [showSource, setShowSource] = useState(false)
+  // Outcome of the last copy press. `failed` is a refused clipboard write --
+  // `copyCode` RESOLVES false when the textarea fallback reports failure and
+  // REJECTS if that fallback throws, so both arms are handled; confirming
+  // unconditionally would announce "Copied" for a write that never landed.
+  //
+  // The two outcomes are NOT symmetric, and that asymmetry is the design:
+  //   - `ok` is a transient confirmation. It clears itself, because a
+  //     confirmation the user has already read is noise.
+  //   - `failed` is an ERROR and persists until it is dismissed or until a later
+  //     press succeeds. A failure that erased itself after a second and a half
+  //     could not be read, let alone acted on -- and it is the outcome the user
+  //     most needs, since the text they asked for is NOT on their clipboard.
+  //
+  // It surfaces through `ErrorNotice` rather than through the button's own icon
+  // and label: the value originates in an operation that failed, which is what
+  // `errors-use-error-notice` covers -- the rule decides by where the value
+  // comes from, not by how it is rendered, so a refusal reported only as a red
+  // glyph is the same finding in a smaller font. The notice is the SINGLE error
+  // surface for it; the button deliberately keeps its neutral icon while it
+  // shows, rather than restating the failure a second time beside it.
+  type CopyOutcome = 'idle' | 'ok' | 'failed'
+  const [copyState, setCopyState] = useState<CopyOutcome>('idle')
+  const copySource = () => {
+    copyCode(code).then(
+      ok => {
+        setCopyState(ok ? 'ok' : 'failed')
+        // Only the confirmation is on a timer. See above.
+        if (ok) setTimeout(() => setCopyState('idle'), 1500)
+      },
+      () => setCopyState('failed'),
+    )
+  }
+  const copyLabel = copyState === 'ok' ? i18nT('components.markdownRenderer.copied')
+    : i18nT('components.markdownRenderer.copy_diagram_source')
+  // A render that threw: the raw source stays visible below (it is the only
+  // evidence of what failed), and this drives the notice above it.
+  const [failed, setFailed] = useState(false)
 
   useEffect(() => {
     if (!ref.current || renderedRef.current === code) return
     renderedRef.current = code
+    setFailed(false)
     loadMermaid().then(mermaid => {
       // Re-initialized per render so a theme switch between two diagrams is
       // picked up; initialize() is cheap and idempotent.
@@ -543,38 +628,142 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
       setSvg(svg)
     }).catch(() => {
       if (!ref.current) return
-      const pre = document.createElement('pre')
-      pre.className = 'text-danger text-[13px]'
-      pre.textContent = code
+      // The host is EMPTIED rather than filled with a hand-built <pre>. The
+      // source is rendered declaratively below for both states that show it
+      // (`failed || showSource`), so there is exactly one element -- and one set
+      // of styles -- meaning "this diagram's source as text". Building a second
+      // one here left two spellings of the same thing, kept in sync by hand,
+      // which diverges the first time either is retouched.
       ref.current.textContent = ''
-      ref.current.appendChild(pre)
       setSvg('')
       setEnlarged(false)
+      // Reset so the failed state has ONE shape. Not to prevent stranding: the
+      // source below now lives OUTSIDE the hidden host, so neither value of
+      // `showSource` can strand the reader. It is that a later successful render
+      // should show the diagram it just produced rather than silently staying on
+      // text, and while no diagram exists neither does the toggle that would
+      // bring the reader back.
+      setShowSource(false)
+      setFailed(true)
     })
   }, [code, id])
 
   return (
     <div className="relative group my-3">
+      {/* No hand-off: this renderer is embedded in hosts that hold unsaved
+          drafts and cannot tell which — the file panel's editor buffer and the
+          composer's markdown preview among them — so the navigation could
+          discard what the user typed. */}
+      {failed && (
+        <ErrorNotice
+          variant="inline"
+          className="mb-2"
+          message={i18nT('components.markdownRenderer.mermaid_render_failed')}
+          testId="mermaid-render-error"
+        />
+      )}
       {/* Pointer convenience: clicking the rendered diagram opens the viewer.
           Keyboard and AT users reach the same viewer through the real button
           below — the same pairing the image lightbox uses (clickable <img>,
           focusable controls elsewhere). */}
       {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/click-events-have-key-events */}
       <figure
+        hidden={showSource || failed}
         className={`m-0 ${svg ? 'cursor-zoom-in' : ''}`}
         onClick={svg ? () => setEnlarged(true) : undefined}
       >
         <div ref={ref} className="flex justify-center overflow-x-auto min-h-[60px]" />
       </figure>
-      {svg && (
-        <button
-          aria-label={i18nT('components.diagramLightbox.enlarge_diagram')}
-          title={i18nT('components.diagramLightbox.enlarge_diagram')}
-          className={`absolute top-1.5 right-1.5 p-1.5 rounded-md bg-bg-elevated/90 border border-border text-muted hover:text-text opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 transition-opacity cursor-pointer ${HOVER_NONE_ACTION_BTN_CLS}`}
-          onClick={() => setEnlarged(true)}
-        >
-          <Maximize2 className="lucide-inline" aria-hidden="true" />
-        </button>
+      {(showSource || failed) && (
+        // THE one place this component paints a diagram's source as text, for
+        // both states that show it: the toggle, and a render that threw (where
+        // the source is the only evidence of what failed, sitting under the
+        // notice that reports it). One element rather than two hand-synced ones,
+        // so toggling to the source after a failure cannot restyle it and the
+        // two cannot drift. Styles are explicit rather than leaning on
+        // `.msg-content pre`: this renderer is also mounted in hosts that are
+        // not a message body.
+        <pre data-testid="mermaid-source" className="text-[13px] font-mono overflow-x-auto text-muted">{code}</pre>
+      )}
+      {/* One action row rather than three absolutely-positioned buttons:
+          `touchActions` documents that the ROW shape is what carries the touch
+          overrides for a cluster (it grows the descendants and wraps), while the
+          single-button shape this replaces can only override the element it sits
+          on. The row stays visible while the source view is on, so the control
+          that left the default state is still reachable without hovering.
+
+          AT MOST TWO BUTTONS IN EVERY REACHABLE STATE, by construction rather
+          than by counting: the diagram view is toggle + enlarge, the source view
+          is toggle + copy (enlarge would open a viewer for the view just left),
+          and a failed render is copy alone, there being no rendered diagram to
+          toggle to. Copy rides with the SOURCE for a second reason: on the
+          rendered diagram the object of "copy" is ambiguous -- the picture or the
+          text behind it -- and beside the source text it is not. */}
+      <div className={`absolute top-1.5 right-1.5 flex items-center gap-1 transition-opacity ${showSource ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'} ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
+        {svg && (
+          <button
+            data-testid="mermaid-source-toggle"
+            aria-pressed={showSource}
+            aria-label={i18nT('components.markdownRenderer.diagram_source')}
+            title={i18nT('components.markdownRenderer.diagram_source')}
+            className={MERMAID_ACTION_BTN_CLS}
+            onClick={() => setShowSource(v => !v)}
+          >
+            {/* `FileCode`, not `Code`: the message footer's own raw-markdown
+                toggle sits a row below and already uses `Code`, and a first-time
+                reader could not tell the two glyphs apart. */}
+            <FileCode className="lucide-inline" aria-hidden="true" />
+          </button>
+        )}
+        {/* Copies the SOURCE, never the rendered image, and only where the source
+            is on screen: the source view, and a failed render, where it is what a
+            reader most wants to take away. Copying the image is not offered at
+            all -- this surface leaves mermaid's `htmlLabels` at its default, so
+            labels live in `<foreignObject>`, which browsers refuse to paint in an
+            image context; see `DiagramLightbox`'s note on the same constraint. */}
+        {(showSource || failed) && (
+          <button
+            data-testid="mermaid-copy-source"
+            aria-label={copyLabel}
+            title={copyLabel}
+            className={MERMAID_ACTION_BTN_CLS}
+            onClick={copySource}
+          >
+            {copyState === 'ok' ? <Check className="lucide-inline text-ok" aria-hidden="true" />
+              : <Copy className="lucide-inline" aria-hidden="true" />}
+          </button>
+        )}
+        {svg && !showSource && (
+          <button
+            data-testid="mermaid-enlarge"
+            aria-label={i18nT('components.diagramLightbox.enlarge_diagram')}
+            title={i18nT('components.diagramLightbox.enlarge_diagram')}
+            className={MERMAID_ACTION_BTN_CLS}
+            onClick={() => setEnlarged(true)}
+          >
+            <Maximize2 className="lucide-inline" aria-hidden="true" />
+          </button>
+        )}
+      </div>
+      {/* A SEPARATED REGION below the action row, deliberately NOT a third
+          control inside it. `max-two-buttons-per-row` counts action controls
+          that are siblings in one horizontal group and exempts "controls in a
+          genuinely different row or a separated region", so this notice -- and
+          the dismiss affordance it brings with it -- cannot push the row past
+          two. The row's cap therefore still holds in this state as well: toggle
+          + copy, with the failure reported beneath them rather than among them.
+
+          No hand-off, for exactly the reason given at the render notice above --
+          this renderer is embedded in hosts holding unsaved drafts it cannot
+          identify, so navigating away could discard what the user typed. */}
+      {copyState === 'failed' && (
+        <ErrorNotice
+          variant="inline"
+          className="mt-2"
+          message={i18nT('components.markdownRenderer.copy_failed')}
+          onDismiss={() => setCopyState('idle')}
+          testId="mermaid-copy-error"
+        />
       )}
       {enlarged && svg && <DiagramLightbox svg={svg} onClose={() => setEnlarged(false)} />}
     </div>
@@ -697,6 +886,9 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       && !artifactSlugFromHref(localHref)
       && !!(actions.onFileOpen || actions.onFolderOpen),
   )
+  // askAgent on: a transcript link holds no draft (the host composer's draft is
+  // persisted per slot), and a blocked or failed reveal is gateway-side.
+  const reveal = useRevealFailure(localHref ?? undefined)
   const onPathClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
     const plainPrimaryClick = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey
     if (pathResolution.probePending && plainPrimaryClick) {
@@ -712,6 +904,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       pathResolution.kind,
       e.shiftKey,
       actions,
+      reveal.onError,
       pathResolution.line,
       pathResolution.endLine,
     )
@@ -774,6 +967,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   // A confirmed session link is in-app navigation, so it keeps in-place semantics.
   if (sessionLink) ext = true
   return (
+    <>
     <a
       {...sp(node)}
       href={sessionHref ?? href}
@@ -787,6 +981,10 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
     >
       <InsideLinkCtx.Provider value={true}>{children}</InsideLinkCtx.Provider>
     </a>
+    {reveal.error && (
+      <ErrorNotice variant="inline" className="ml-1.5 align-baseline" message={reveal.error} askAgent onDismiss={reveal.clear} testId="md-link-reveal-error" />
+    )}
+    </>
   )
 }
 
@@ -858,6 +1056,14 @@ function resolveSessionChip(raw: string, actions: SessionActions): { key: string
 
 type PathResolution = {
   candidate: boolean
+  /** Path SHAPE alone, independent of whether probing is enabled.
+   *
+   * `candidate` also requires the probe to be on, so it flips the moment a
+   * message stops streaming — and anything keyed to it would appear then,
+   * re-wrapping a paragraph whose text has just become final. The glyph reserve
+   * is keyed to this instead, so it is already in place before the probe's
+   * answer (or the probe itself) can arrive. */
+  shaped: boolean
   kind: PathKind | undefined
   path: string
   splitPath: string
@@ -873,7 +1079,8 @@ type PathResolution = {
  */
 function usePathResolution(raw: string, probeEnabled: boolean): PathResolution {
   const { path: splitPath, line, endLine } = splitLineRef(raw)
-  const candidate = probeEnabled && isPathCandidate(splitPath)
+  const shaped = isPathCandidate(splitPath)
+  const candidate = probeEnabled && shaped
   const literalCandidate = candidate && line != null
   const splitKind = usePathKind(candidate ? splitPath : null)
   const literalKind = usePathKind(literalCandidate ? raw : null)
@@ -881,6 +1088,7 @@ function usePathResolution(raw: string, probeEnabled: boolean): PathResolution {
 
   return {
     candidate,
+    shaped,
     kind: literalWins ? literalKind : splitKind,
     path: literalWins ? raw : splitPath,
     splitPath,
@@ -902,21 +1110,31 @@ function usePathResolution(raw: string, probeEnabled: boolean): PathResolution {
  * `revealPath` selects a file in Finder/Explorer, which has no notion of a line,
  * and a directory does not have one either.
  */
-function activatePath(path: string, kind: PathKind, reveal: boolean, actions: PathActions, line?: number, endLine?: number): void {
+function activatePath(
+  path: string,
+  kind: PathKind,
+  reveal: boolean,
+  actions: PathActions,
+  onRevealError: (message: string) => void,
+  line?: number,
+  endLine?: number,
+): void {
   // Route through the shared helper, not bare `api.revealPath`: the helper owns
   // the clipboard write and the failure message. `api.revealPath` is side-effect-
   // free, so a bare call on a remote/headless session would answer {ok, copy} and
   // nobody would write the clipboard — the chip's "Shift+click to copy path"
-  // promise would silently do nothing.
-  if (reveal) { void revealOrOpen(path); return }
+  // promise would silently do nothing. A failed reveal is reported to the chip
+  // that was clicked (see useRevealFailure), never to a blocking dialog.
+  const opts = { onError: onRevealError }
+  if (reveal) { void revealOrOpen(path, 'reveal', opts); return }
   if (kind === 'dir') {
     // No folder handler wired: fall back to the OS file manager rather than
     // silently doing nothing.
     if (actions.onFolderOpen) actions.onFolderOpen(path)
-    else void revealOrOpen(path)
+    else void revealOrOpen(path, 'reveal', opts)
     return
   }
-  if (!actions.onFileOpen) { void revealOrOpen(path); return }
+  if (!actions.onFileOpen) { void revealOrOpen(path, 'reveal', opts); return }
   // Called with ONE argument when there is no line, not with an explicit
   // `undefined`: the handler is also the app's general-purpose file opener, and
   // an omitted argument keeps a chip click indistinguishable from every other
@@ -926,6 +1144,41 @@ function activatePath(path: string, kind: PathKind, reveal: boolean, actions: Pa
 }
 
 const CHIP_BASE = 'bg-bg-elevated px-1.5 py-0.5 rounded text-accent text-sm font-mono'
+
+/** Geometry of a path chip's leading glyph, shared by the confirmed chip and by
+ *  the reserve that stands in for it while the path is unconfirmed.
+ *
+ *  Both sites MUST read these two values, because equal width in every state is
+ *  the whole mechanism: the glyph is an inline atom, so 16px (12px box + 4px
+ *  margin) appearing mid-paragraph can push a line over and change the row's
+ *  height. Measured in a browser at phone widths, that re-wrap costs 24px — one
+ *  line — and it lands under a reader who is scrolling history, because a path
+ *  is probed the first time its row mounts. Same rule the image reserve follows
+ *  (`reservedImageStyle`): reserve the box before the async answer arrives, so
+ *  the answer restyles instead of reflowing. */
+const CHIP_GLYPH_SIZE = 12
+const CHIP_GLYPH_GEOMETRY = 'inline align-middle mr-1'
+
+/**
+ * Invisible stand-in for the chip glyph, for a path-shaped span that is not (or
+ * not yet) a confirmed path.
+ *
+ * It renders the same icon element at the same size and margin, so it occupies
+ * the confirmed chip's width exactly rather than an approximation of it — the
+ * geometry cannot drift because a different icon or a different margin would
+ * have to be written at both sites. `opacity-0` rather than a blank span keeps
+ * the line box identical too: an empty inline-block contributes a different
+ * baseline than an svg does.
+ *
+ * Blank, deliberately NOT a dimmed glyph: `InlineCode`'s glyph is what tells a
+ * reader at rest which paths the backend actually confirmed, and a placeholder
+ * glyph would erase that distinction to buy nothing — the reserve only needs the
+ * space, not a mark.
+ */
+function ChipGlyphReserve({ path }: { path: string }) {
+  const Glyph = fileIcon(path)
+  return <Glyph size={CHIP_GLYPH_SIZE} aria-hidden="true" className={`${CHIP_GLYPH_GEOMETRY} opacity-0`} />
+}
 
 /**
  * The chip's hover instruction, naming the application shift+click will actually
@@ -1095,6 +1348,9 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
   const { directLocal } = useBranding()
   const raw = codeStr.trim()
   const pathResolution = usePathResolution(raw, probeEnabled)
+  // Failure state for the chip's reveal (Shift+click / no handler wired); rendered
+  // beside the chip. Declared before the early returns below (rules of hooks).
+  const reveal = useRevealFailure(raw)
 
   // `data-path*` / `data-session-key` describe a chip THIS component rendered, so
   // only it may set them. rehypeSanitize allowlists every `data-*` attribute
@@ -1110,10 +1366,18 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
 
   if (pathResolution.probePending
     || (pathResolution.kind !== 'file' && pathResolution.kind !== 'dir')) {
+    // Keyed to `shaped`, not to `candidate` or `probePending`, so the reserve is
+    // present in EVERY state this span can be in — streaming, probe in flight,
+    // and probe answered "not a path". A reserve that appeared only while a probe
+    // was pending would simply move the re-wrap to the moment it went away.
+    // A session chip needs none: `isPathCandidate` demands a separator, a drive
+    // or an extension, and a session key carries none of the three, so the two
+    // chips cannot claim the same span.
+    const reserve = pathResolution.shaped ? <ChipGlyphReserve path={pathResolution.splitPath} /> : null
     // Inside an anchor the link owns the click, so stay the inert span this was
     // before #4433 rather than cancelling the navigation to copy. Nothing is
     // lost: the browser's own "Copy link address" still reaches the URL.
-    if (insideLink) return <code className={CHIP_BASE} {...safeProps}>{children}</code>
+    if (insideLink) return <code className={CHIP_BASE} {...safeProps}>{reserve}{children}</code>
     const session = resolveSessionChip(raw, sessionActions)
     if (session) {
       return (
@@ -1125,7 +1389,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
         >{children}</SessionChip>
       )
     }
-    return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{children}</CopyableCode>
+    return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{reserve}{children}</CopyableCode>
   }
   const isDir = pathResolution.kind === 'dir'
   const { path, splitPath, kind, line: targetLine, endLine: targetEndLine } = pathResolution
@@ -1150,7 +1414,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     e.stopPropagation()
     // Ctrl/Cmd+Click copies the path text rather than opening/revealing.
     if (e.ctrlKey || e.metaKey) { copyToClipboard(raw); return }
-    activatePath(path, kind, e.shiftKey, actions, targetLine, targetEndLine)
+    activatePath(path, kind, e.shiftKey, actions, reveal.onError, targetLine, targetEndLine)
   }
   // Right-click opens the shared file-path menu (Open in default app / reveal /
   // copy path), additive to the existing click/shift-click activation. The menu
@@ -1159,6 +1423,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
   // app" — the reveal endpoint 400s an `open` on a directory, which would land
   // the user on an error for a click they cannot fix.
   return (
+    <>
     <FilePathMenu filePath={path} kind={kind}>
       <code
         className={`${CHIP_BASE} cursor-pointer hover:underline`}
@@ -1184,7 +1449,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
         // the location is already in the text the user is hovering.
         title={`${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
       >
-        <Glyph size={12} aria-hidden="true" className="inline align-middle mr-1 opacity-70" />
+        <Glyph size={CHIP_GLYPH_SIZE} aria-hidden="true" className={`${CHIP_GLYPH_GEOMETRY} opacity-70`} />
         {targetLine != null && raw.length > splitPath.length
           // Keep the location suffix atomic. A range is the case that actually
           // misleads: broken across lines, `…2026.md:10-` / `16` reads as a citation
@@ -1194,6 +1459,12 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
           : children}
       </code>
     </FilePathMenu>
+    {/* askAgent on: a transcript chip holds no draft; the host composer's
+        draft is persisted per slot. */}
+    {reveal.error && (
+      <ErrorNotice variant="inline" className="ml-1.5 align-baseline" message={reveal.error} askAgent onDismiss={reveal.clear} testId="md-chip-reveal-error" />
+    )}
+    </>
   )
 }
 
@@ -2201,16 +2472,16 @@ const SOFT_BREAK_RE = /[\t ]*(?:\r?\n|\r)/g
  * (mdast `break` → <br>). This is an inlined equivalent of the `remark-breaks`
  * package, kept local to avoid adding a runtime dependency.
  *
- * Opt-in via MarkdownRenderer's `softBreaks` prop and used ONLY for user
- * messages: the chat input lets people press Shift+Enter for a newline, so
- * those breaks must survive rendering. Assistant/LLM markdown keeps standard
- * CommonMark soft-break-collapse.
+ * Opt-in via MarkdownRenderer's `softBreaks` prop, for surfaces where a lone
+ * source newline is meaningful: user messages (Shift+Enter in the composer)
+ * and injected notes. Assistant/LLM markdown keeps standard CommonMark
+ * soft-break-collapse.
  *
  * Operates on `text` nodes only, so fenced code, inline code, math, and raw
  * HTML (whose content lives in `.value`, not `.children`) are untouched, and
  * blank-line block separators — already parsed as distinct blocks — are not
  * affected, so lists and paragraphs keep their normal block spacing. That is
- * what lets user messages drop container-level `white-space: pre-wrap`, which
+ * what lets those surfaces drop container-level `white-space: pre-wrap`, which
  * had made react-markdown's inter-block newline text nodes render as literal
  * blank lines and inflated list/paragraph gaps.
  */
@@ -3490,10 +3761,70 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
   return <LinkUnfurlCtx.Provider value={unfurlCtx}>{body}</LinkUnfurlCtx.Provider>
 })
 
+/** Languages whose fenced content IS markdown, so a rendered view is
+ *  meaningful. Kept in sync with `NESTABLE_LANGS` in useBlockAssembler for the
+ *  markup/doc subset a reader would want rendered — mdx is included because its
+ *  markdown structure still renders, its JSX just passes through as text. */
+const MARKDOWN_LANGS = new Set(['markdown', 'md', 'mdx'])
+function isMarkdownLang(lang?: string): boolean {
+  return lang != null && MARKDOWN_LANGS.has(lang.toLowerCase())
+}
+
+/** A markdown content card in the chat transcript: a ```markdown fence with a
+ *  Formatted | Raw view toggle in the upper right, matching the segmented
+ *  control tool detail cards carry (see pages/chat/ToolDetails.tsx). Formatted
+ *  renders through the same pipeline as agent prose; Raw is the verbatim source
+ *  with the edit affordance, which keeps editing Raw-only. Opens Formatted; the
+ *  control overrides per card. Only mounted for a COMPLETE fence — see the
+ *  caller in BlockRenderer. */
+const MarkdownContentCard = memo(function MarkdownContentCard(
+  { content, lang }: { content: string; lang?: string },
+) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const [view, setView] = useState<'formatted' | 'raw'>('formatted')
+
+  return (
+    <div className="my-2">
+      <div className="flex items-center justify-end mb-1">
+        <SegmentedControl<'formatted' | 'raw'>
+          segments={[
+            {
+              key: 'formatted',
+              label: i18nT('components.markdownCard.formatted'),
+              tooltip: i18nT('components.markdownCard.render_the_markdown_headings_lists_tables_links'),
+            },
+            {
+              key: 'raw',
+              label: i18nT('components.markdownCard.raw'),
+              tooltip: i18nT('components.markdownCard.show_the_exact_markdown_source'),
+            },
+          ]}
+          value={view}
+          onChange={setView}
+          layoutId="md-card-view"
+          collapse={false}
+        />
+      </div>
+      {/* Both views stay MOUNTED; the inactive one is hidden with `hidden`
+          rather than unmounted. EditableCodeBlock's Raw scratch editor holds
+          unsaved local edits in its own state, so unmounting it on a toggle to
+          Formatted would silently discard them. Keeping it mounted preserves
+          that state across any number of view switches. */}
+      <div className={view === 'formatted' ? undefined : 'hidden'}>
+        <MarkdownBlock content={content} />
+      </div>
+      <div className={view === 'raw' ? undefined : 'hidden'}>
+        <EditableCodeBlock code={content} lang={lang} complete={true} />
+      </div>
+    </div>
+  )
+})
+
 import WidgetFrame from './WidgetFrame'
 import WidgetPlaceholder from './WidgetPlaceholder'
 
 import { i18nT } from '../i18n/t'
+import { fmtNumber } from '../i18n/format'
 /** Try to extract a file path from chat text immediately preceding a diff
  * block. Tools sometimes emit "Created /path/to/file:" or "Modified ..."
  * before a bare diff with no +++/--- headers; this hint lets DiffBlock's
@@ -3523,7 +3854,7 @@ function extractPathHintFromText(text: string | undefined): string | undefined {
   return undefined
 }
 
-function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, widgetIndex, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; widgetIndex?: number; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean }) {
+function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, widgetIndex, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; widgetIndex?: number; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean }) {
   switch (block.type) {
     case 'diff': {
       const pathHint = prevBlock?.type === 'markdown'
@@ -3567,6 +3898,17 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
         <div className="my-2 p-3 bg-bg-elevated border border-border rounded-md text-muted text-[12px] italic animate-pulse">{i18nT('components.markdownRenderer.generating_diagram')}</div>
       )
     case 'code': {
+      // A ```markdown / ```md / ```mdx fence is the "markdown content card":
+      // today it renders verbatim source with an edit affordance. In the chat
+      // transcript (`mdCardToggle`) give it a Formatted | Raw segmented control
+      // like tool detail cards carry, so long docs can be read rendered. Raw is
+      // the pre-toggle EditableCodeBlock, so the edit affordance stays Raw-only.
+      // Only fenced content whose CLOSE has arrived is offered a rendered view:
+      // a half-streamed markdown source would flip structure as delimiters land.
+      if (mdCardToggle && block.complete && isMarkdownLang(block.language)) {
+        const mdNode = <MarkdownContentCard content={block.content} lang={block.language} />
+        return smooth ? <SmoothResize enabled={!block.complete}>{mdNode}</SmoothResize> : mdNode
+      }
       const node = <EditableCodeBlock code={block.content} lang={block.language} complete={block.complete} />
       // Height-grow only — streaming code renders as one plain <pre> text node
       // so per-line content animation isn't applied here.
@@ -3584,7 +3926,7 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
   }
 }
 
-export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean }) {
+export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
 
@@ -3736,6 +4078,7 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             smooth={smooth}
             softBreaks={softBreaks}
             collapseDiffs={collapseDiffs}
+            mdCardToggle={mdCardToggle}
           />
         ))}
       </ImageVersionCtx.Provider>
@@ -3772,6 +4115,19 @@ const LIGHTBOX_ZOOM_STEP = 0.5
 const LIGHTBOX_DISMISS_SLOP = 8
 const LIGHTBOX_DISMISS_DISTANCE = 96
 const LIGHTBOX_DISMISS_TRAVEL = 260
+
+/** Release threshold that commits a horizontal page, deliberately SHORTER than
+ *  the dismiss distance. Paging is reversible — the opposite swipe comes back —
+ *  while a dismiss destroys the viewing context, so it can commit on less travel.
+ *  Distance is the only criterion, for the reason the dismiss path already gives:
+ *  the flick a user actually makes travels past it anyway, and a velocity path
+ *  would cost per-move rate tracking plus a second threshold. */
+const LIGHTBOX_PAGE_DISTANCE = 64
+
+/** How far a drag with nowhere to go still follows the finger: the ends of the
+ *  set, and the upward direction of the dismiss drag. Both are gestures that must
+ *  not commit but must not feel dead either — a silent no-op reads as broken. */
+const LIGHTBOX_RUBBER_BAND_DIVISOR = 4
 
 /** True when a keyboard event originates from an editable element, so global
  *  printable-key shortcuts (like the lightbox 'd' download) don't hijack typing. */
@@ -3848,6 +4204,11 @@ export function dispatchLightbox(target: HTMLImageElement): void {
  *  payload and the legacy { src, alt } single-image shape. */
 export function Lightbox() {
   const [state, setState] = useState<LightboxDetail | null>(null)
+  // A fresh mirror of `state`, so handlers subscribed once per open — the global
+  // keydown listener's download shortcut, and the paging gesture's read of the
+  // set's size and position — see the current value rather than a stale closure.
+  const stateRef = useRef<LightboxDetail | null>(null)
+  stateRef.current = state
   const imgRef = useRef<HTMLImageElement>(null)
   /** The overlay root. Separate from `imgRef` because the transform target is the
    *  image while the surface a user perceives as "the viewer" is the whole
@@ -3914,31 +4275,43 @@ export function Lightbox() {
     d.active = false
     if (d.dragging) { d.dragging = false; setDragging(false) }
   }, [])
-  // ── swipe-down-to-dismiss ────────────────────────────────────────────────
-  // A touch drag anywhere over the overlay pulls the image with the finger and
-  // dismisses on release. Gated to fit zoom (above it the same gesture already
+  // ── one-finger overlay drag: dismiss down, page sideways ─────────────────
+  // A touch drag anywhere over the overlay locks an AXIS once it crosses the
+  // slop, then either pulls the image down to dismiss or sideways to page
+  // through the set. Both are gated to fit zoom (above it the same drag already
   // means "pan", handled on the <img>) and to non-mouse pointers, so the desktop
   // click-backdrop-to-close behaviour is untouched.
-  const [swipeY, setSwipeY] = useState(0)
-  const [swiping, setSwiping] = useState(false)
-  // `engaged` flips once SLOP is crossed with vertical intent; until then the
-  // gesture is still a candidate tap. `suppressClick` makes the click that
-  // follows a real drag a no-op, so a spring-back does not also close via the
-  // backdrop handler.
   //
-  // `pointerId` is what keeps a PINCH from reading as a dismiss. Every finger
+  // The horizontal half exists because the set was otherwise reachable only from
+  // ArrowLeft/ArrowRight: on a phone every image after the first was unreachable.
+  // Owning that axis is safe here for a reason worth stating — the app-wide nav
+  // drawer claims horizontal drags everywhere else, and yields only to an element
+  // whose computed `touch-action` is `none`. The overlay's `touch-none` (already
+  // there to take page zoom) is what makes this gesture ours rather than a fight.
+  const [swipeY, setSwipeY] = useState(0)
+  const [swipeX, setSwipeX] = useState(0)
+  const [swiping, setSwiping] = useState(false)
+  // `engaged` flips once SLOP is crossed, fixing `axis` for the rest of the
+  // gesture; until then it is still a candidate tap. Locking the axis is what
+  // keeps a diagonal drag from both dimming the backdrop and paging.
+  // `suppressClick` makes the click that follows a real drag a no-op, so a
+  // spring-back does not also close via the backdrop handler.
+  //
+  // `pointerId` is what keeps a PINCH from reading as a drag. Every finger
   // raises its own pointerdown/move/up, so without an id the second finger
   // rewrites the gesture's origin and a two-finger zoom attempt walks the image
   // down and closes the viewer the user was zooming into.
-  const swipeRef = useRef({ pointerId: -1, startX: 0, startY: 0, active: false, engaged: false })
+  const swipeRef = useRef({ pointerId: -1, startX: 0, startY: 0, active: false, engaged: false, axis: '' as '' | 'x' | 'y' })
   // Abandon the in-flight gesture and return the image to rest. Used by the
   // multi-touch bail-out and by pointercancel.
   const abortSwipe = useCallback(() => {
     const s = swipeRef.current
     s.active = false
     if (s.engaged) { s.engaged = false; setSwiping(false); suppressClickRef.current = true }
+    s.axis = ''
     s.pointerId = -1
     setSwipeY(0)
+    setSwipeX(0)
   }, [])
   // Publish it for the hook's `onPinchStart`, which is constructed above this.
   abortSwipeRef.current = abortSwipe
@@ -4007,7 +4380,7 @@ export function Lightbox() {
     // instead of consulting the still-fit ref and re-arming swipe-to-dismiss.
     if (onDoubleTap(e)) return
     if (zoomRef.current > LIGHTBOX_ZOOM_MIN) return // the <img> pan owns this gesture
-    swipeRef.current = { pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, active: true, engaged: false }
+    swipeRef.current = { pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, active: true, engaged: false, axis: '' }
   }, [trackPointerDown, onDoubleTap, zoomRef])
   const onOverlayPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     // A live pinch consumes the move (scale + focal-anchored pan).
@@ -4016,18 +4389,30 @@ export function Lightbox() {
     if (!s.active || e.pointerId !== s.pointerId) return
     const dx = e.clientX - s.startX
     const dy = e.clientY - s.startY
+    const cur = stateRef.current
+    const total = cur ? cur.images.length : 0
     if (!s.engaged) {
       if (Math.hypot(dx, dy) < LIGHTBOX_DISMISS_SLOP) return
-      // Horizontal intent is not a dismiss — drop the gesture rather than
-      // yanking the image sideways.
-      if (Math.abs(dx) > Math.abs(dy)) { s.active = false; return }
+      const axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y'
+      // Paging needs somewhere to go. A single image has no neighbours, so the
+      // horizontal gesture is dropped outright rather than rubber-banding an
+      // image whose set cannot move — which is what it did before paging existed.
+      if (axis === 'x' && total < 2) { s.active = false; return }
+      s.axis = axis
       s.engaged = true
       setSwiping(true)
       lastTapRef.current = { t: 0, x: 0, y: 0 }
     }
+    if (s.axis === 'x') {
+      // Mid-set the image tracks the finger 1:1; at either end it is rubber-banded,
+      // which is what says "no more images this way" instead of looking broken.
+      const blocked = (dx > 0 && cur?.index === 0) || (dx < 0 && cur?.index === total - 1)
+      setSwipeX(blocked ? dx / LIGHTBOX_RUBBER_BAND_DIVISOR : dx)
+      return
+    }
     // Downward travel tracks the finger 1:1; upward is rubber-banded, since
     // pulling up is not a dismiss but should not feel dead either.
-    setSwipeY(dy >= 0 ? dy : dy / 4)
+    setSwipeY(dy >= 0 ? dy : dy / LIGHTBOX_RUBBER_BAND_DIVISOR)
   }, [trackPointerMove])
   const endSwipe = useCallback((e: React.PointerEvent<HTMLDivElement>, cancelled: boolean) => {
     // The hook drops the contact and ends the pinch on the FIRST lift (rather than
@@ -4041,8 +4426,22 @@ export function Lightbox() {
     s.pointerId = -1
     if (!s.engaged) return
     s.engaged = false
+    const axis = s.axis
+    s.axis = ''
     setSwiping(false)
     suppressClickRef.current = true
+    if (axis === 'x') {
+      // Clamped the same way the arrow keys are, so a drag that reached the
+      // threshold at either end springs back instead of paging off the set.
+      const dx = e.clientX - s.startX
+      if (dx <= -LIGHTBOX_PAGE_DISTANCE) {
+        setState(cur => (cur && cur.index < cur.images.length - 1 ? { ...cur, index: cur.index + 1 } : cur))
+      } else if (dx >= LIGHTBOX_PAGE_DISTANCE) {
+        setState(cur => (cur && cur.index > 0 ? { ...cur, index: cur.index - 1 } : cur))
+      }
+      setSwipeX(0)
+      return
+    }
     if (e.clientY - s.startY > LIGHTBOX_DISMISS_DISTANCE) setState(null)
     else setSwipeY(0)
   }, [abortSwipe, trackPointerUp])
@@ -4052,10 +4451,6 @@ export function Lightbox() {
     if (suppressClickRef.current) { suppressClickRef.current = false; return }
     setState(null)
   }, [])
-  // Keep a fresh ref so the global keydown handler (subscribed once per open)
-  // can read the current image for the download shortcut without a stale closure.
-  const stateRef = useRef<LightboxDetail | null>(null)
-  stateRef.current = state
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as Partial<LightboxDetail> & Partial<LightboxImage> | undefined
@@ -4078,10 +4473,12 @@ export function Lightbox() {
   // right after a spring-back must not start half-dragged.
   useEffect(() => {
     setSwipeY(0)
+    setSwipeX(0)
     setSwiping(false)
     lastTapRef.current = { t: 0, x: 0, y: 0 }
     swipeRef.current.active = false
     swipeRef.current.engaged = false
+    swipeRef.current.axis = ''
     swipeRef.current.pointerId = -1
     // Contacts do not survive the viewer: closing mid-pinch (or an image change
     // driven from the keyboard while fingers are down) must not leave a stale
@@ -4139,6 +4536,15 @@ export function Lightbox() {
   // 0 → untouched, 1 → full dismiss feedback. Downward pull only; the
   // rubber-banded upward direction keeps the backdrop at full strength.
   const swipeProgress = Math.min(1, Math.max(0, swipeY) / LIGHTBOX_DISMISS_TRAVEL)
+  // The axis is locked for the whole gesture, so only one of the two offsets is
+  // ever live. Paging carries no shrink and no backdrop fade: it is not a
+  // dismiss, and dimming on the way to another image of the same set would read
+  // as the viewer leaving.
+  const swipeTransform = swipeX !== 0
+    ? `translateX(${swipeX.toFixed(1)}px)`
+    : swipeY !== 0
+      ? `translateY(${swipeY.toFixed(1)}px) scale(${(1 - swipeProgress * 0.15).toFixed(3)})`
+      : undefined
   return (
     <Clickable
       ref={overlayRef}
@@ -4160,7 +4566,7 @@ export function Lightbox() {
           <img> so it composes with (rather than fights) the pan/zoom transform. */}
       <div
         className={`flex items-center justify-center w-full h-full ${swiping ? '' : 'transition-transform duration-200'}`}
-        style={swipeY !== 0 ? { transform: `translateY(${swipeY.toFixed(1)}px) scale(${(1 - swipeProgress * 0.15).toFixed(3)})` } : undefined}
+        style={swipeTransform ? { transform: swipeTransform } : undefined}
       >
         {/* The image is a drag surface for panning when zoomed; zoom itself
             lives in the toolbar + keyboard. A plain click only stops the
@@ -4249,6 +4655,24 @@ export function Lightbox() {
           <X className="lucide-inline" aria-hidden="true" />
         </button>
       </div>
+      {/* Position in the set. Without it the swipe is invisible — nothing on
+          screen says a set exists, which is how every image after the first came
+          to be unreachable on touch while the keyboard could still reach them.
+          `aria-live` carries the same fact to a screen reader as the image
+          changes, which nothing did before. Rendered LAST so the overlay's first
+          child stays the wrapper the drag transform is written to. Matches the
+          toolbar's own treatment because the scrim is dark in every theme. */}
+      {state.images.length > 1 && (
+        <div
+          className="fixed bottom-safe-offset-4 left-1/2 -translate-x-1/2 rounded-full bg-black/60 backdrop-blur-md ring-1 ring-white/15 shadow-lg px-3 py-1 text-sm text-white/90 tabular-nums"
+          aria-live="polite"
+        >
+          {i18nT('components.markdownRenderer.image_position', {
+            index: fmtNumber(state.index + 1),
+            total: fmtNumber(state.images.length),
+          })}
+        </div>
+      )}
     </Clickable>
   )
 }

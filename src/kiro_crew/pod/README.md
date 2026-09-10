@@ -5,7 +5,9 @@ its own port, its own `KIROCREW_HOME` (own DB / sessions / memory), no Slack
 tunnel, `--no-crons` (unless you pass `--crons`), resource-capped, and reclaimed
 by `pod down`. Test a branch's
 backend `/api/*` **and** the SPA bundle it serves, all **without touching your
-live gateway or your shared `~/.kiro/crew` data**.
+live gateway or your shared `~/.kiro/crew` data**. `--no-embeddings` additionally
+boots it without the embedding model, for load tests that must not pay per-chunk
+embed compute.
 
 Think **`kubectl` for local worktree test rigs.** This is the *test line*
 (multi-active, burn-on-evict); it is orthogonal to the *live line* (a single
@@ -28,8 +30,10 @@ kirocrew pod up   <wt> [--json]   # bring up an isolated pod → {base_url, toke
 kirocrew pod up   <wt> --provision# provision (if needed) then bring it up
 kirocrew pod up   <wt> --approval reads  # boot its gateway in an approval mode
 kirocrew pod up   <wt> --crons          # boot its gateway with the cron scheduler on
+kirocrew pod up   <wt> --no-embeddings  # boot without the embedding model (keyword-search fallback)
 kirocrew pod up   <wt> --seed minimal  # pre-populate its HOME from a named scenario
 kirocrew pod scenarios [--json]        # list named scenarios and their descriptions
+kirocrew pod api  <wt> GET sessions    # authenticated request → fixed-key JSON
 kirocrew pod ls                   # what's running (≈ kubectl get pods) + orphaned HOMEs (with age)
 kirocrew pod prune [--all] [--dry-run]  # bulk-reclaim orphaned HOMEs (default: older than 3d; --all for every age)
 kirocrew pod status <wt>          # up/down + health
@@ -72,10 +76,13 @@ kirocrew pod up my-wt --seed ~/.kiro/crew
 ```
 
 `pod scenarios` reads the packaged fixture registry and lists names in sorted
-order with the first description line from each `fixture.yaml`. The default is a
-human-readable table; `--json` emits a stable array of `{name, description}`
-objects. Description extraction uses the fixture manifest's narrow scalar format
-and does not require PyYAML at runtime.
+order. The default human-readable table shortens each description to the last
+complete sentence that fits, falling back to a cut between words with an
+ellipsis. `--json`
+emits a stable array of `{name, description}` objects containing the complete
+description scalar. Literal (`|`) blocks preserve newlines and folded (`>`) blocks
+normalize to one paragraph. Extraction uses the fixture manifest's narrow scalar
+format and does not require PyYAML at runtime.
 
 A bare name selects a fixture shipped under `kiro_crew/tests_fixtures/<name>/`
 and populates the whole isolated home. Anything with a path separator or a
@@ -100,6 +107,102 @@ already matches. Use plain `pod up` to restart that home unchanged. Service
 restarts keep the sessions and logs already present. After health succeeds,
 `pod up` reads the fixture marker back and fails if the requested scenario did
 not land.
+
+## Boot without the embedding model
+
+```bash
+kirocrew pod up my-wt --no-embeddings
+```
+
+Records `EMBEDDINGS='0'` in the pod's env file, which makes `boot` export
+`KIROCREW_SKIP_MODEL_DOWNLOAD=1` into **the pod's env only**. The pod never
+downloads the ~610MB GGUF and never computes a vector; memory and knowledge
+search answer through the keyword fallback, which is a supported mode rather than
+a broken one, so the instance stays usable. Your own home is untouched and keeps
+whatever model it already has.
+
+This exists for **load-testing ingestion**. Knowledge ingest embeds per chunk, so
+a bundle large enough to exercise a cross-file cost ceiling spends nearly all of
+its wall clock inside embedding compute — enough that driving one has hit a
+30-minute worker wall. Without the model, chunk count grows while embed compute
+does not, so the same bundle is drivable in minutes and any remaining slowness is
+attributable to something else.
+
+The setting travels with the pod, so `pod exec` against an embedding-light pod
+also sees it and cannot quietly start the download the pod was booted to do
+without. It is read once at boot: recording it against a running pod applies on
+the next one, and `pod up` says so. It lives as `EMBEDDINGS='0'` in the per-pod
+env file — the same hand-editable file that pins `CHECKOUT=` and `PORT=` — so a
+pod you keep around for other work can be flipped persistently by editing that
+line and bringing the pod up again.
+
+The boot journal names the mode from the env the pod actually runs with, so a
+`KIROCREW_SKIP_MODEL_DOWNLOAD=1` the pod merely inherits is announced too (as
+"inherited from the boot environment"), and the `pod.up` audit row keys
+`embeddings=off` on the merged env file plus that inherited switch rather than on
+the flag alone. Any `KIROCREW_EMBED_MODEL_PATH` / `KIROCREW_EMBED_MODEL_URL` in
+the inherited environment is dropped from the pod env alongside the switch: the
+switch only gates the download, and a custom model path would otherwise load and
+embed anyway while the journal says the pod does not.
+
+The switch behind the flag, `KIROCREW_SKIP_MODEL_DOWNLOAD`, is deliberately
+subsystem-wide: an embedding-light pod also skips its speech-to-text (whisper)
+model download, so do not test or measure voice input in one.
+
+`--no-embeddings` is the only supported spelling. Pointing
+`KIROCREW_EMBED_MODEL_URL` at an unreachable mirror looks equivalent and is not:
+it spends the downloader's whole attempt budget on requests chosen to fail, and a
+value that is not `https://` is ignored in favour of the real CDN — so a typo
+downloads the model you were avoiding.
+
+## Call the pod API without handling its token
+
+```bash
+kirocrew pod api my-wt GET sessions
+kirocrew pod api my-wt GET '/api/sessions?limit=20'
+kirocrew pod api my-wt POST config --data '{"key":"agent.model"}' --allow-write
+```
+
+`pod api` makes one request and prints one JSON document with fixed keys:
+`{name, method, path, status, ok, body}`. JSON response bodies are decoded into
+`body`; other bodies remain text. A non-2xx response prints the same shape and
+exits 1. Response reads are capped at 32 MiB and an oversized or truncated body
+fails without buffering indefinitely.
+
+GET and HEAD are allowed by default. POST, PUT, PATCH, and DELETE require
+`--allow-write`; v1 deliberately has no route-by-route side-effect catalog, so a
+safe-method route that mutates state is a server contract defect to fix at that
+route. Caller-supplied `token` query parameters are refused without displaying
+their value. The command mints its own dashboard token and sends it using the
+same `?token=` query contract as the dashboard middleware, never an
+`Authorization` header.
+
+The authenticated request travels over the pod's **private dashboard unix
+socket** — `<pod home>/dashboard-<port>.sock`, the same file name the gateway
+binds, resolved against the pod's isolated home rather than the host's — and
+**never over TCP, with no fallback**. The port is only the `Host` the gateway
+sees. A pod's port is ordinary loopback: any local user can bind it the moment
+the pod releases it, so a pod that exits between the mint and the send would
+otherwise hand a token that is valid as an `mc_token_<port>` cookie to whatever
+answered next, replayable against the restarted pod. The socket cannot be
+answered by another user, because it sits in a home created owner-only and is
+itself `chmod 0600`.
+
+A missing socket therefore **refuses through the envelope** (`status: 0`,
+`ok: false`, remediation in `body`) instead of retrying on `127.0.0.1:<port>`,
+and it refuses *before* minting, so an undeliverable request never pays for a
+credential. The refusal is expected while a pod is starting, after it crashed
+without a `down`, and on a checkout whose gateway predates the socket; a
+`pod down` plus `pod up` clears all three. Requiring the socket costs no
+capability: `pod api` is Linux-only like every systemd-touching pod verb, and on
+Linux the gateway binds the socket unconditionally.
+
+Before minting, the control plane reads the gateway PID sidecar from the pod's
+isolated home and requires it to equal the service manager's current MainPID.
+That agreement is the primary ownership attestation and works on minimal hosts
+without `lsof` or `netstat`. Listener attribution is additional corroboration
+when available; it is never sufficient by itself. Tokens are scrubbed from
+response text and transport failures never include the authenticated URL.
 
 ## A pod IS the worktree's gateway (control plane vs payload)
 
@@ -183,10 +286,27 @@ names started concurrently can still race inside the window between the service
 manager accepting the start and the gateway binding. When that happens whoever binds
 first wins and the loser's gateway exits "address already in use", its unit
 crash-looping behind `Restart=on-failure`. So reachability on a port is never
-evidence that THIS pod is up: `health` and the credential mint both require the
-process a `127.0.0.1` connect reaches to be the pod's own `MainPID` (`port_owner`),
-and `pod status` / `pod ls` print `foreign (port held by another instance)` when it
-is not. `pod up` names the conflict and points at `PORT=` rather than blaming the
+evidence that THIS pod is up: `health` and the credential mint both go through
+`port_owner`, and `pod status` / `pod ls` print `foreign (port held by another
+instance)` when the port belongs to somebody else.
+
+What `port_owner` proves is that the pod's gateway PID sidecar — written into the
+isolated home only *after* the bind succeeds — agrees with the service manager's
+current `MainPID`. Beside that sidecar the gateway writes its start-time identity in
+its own `gateway-<port>.start` file (the pid file itself stays a bare pid, so every
+shipped reader keeps parsing it), so a record left behind by a crash cannot attest
+once that pid has been recycled onto an unrelated process; a record that cannot prove
+its own freshness is refused, and the mint withholds the secret. A record carrying NO
+start identity is refused the same way, but it is a different fault with a different
+fix: a pod's gateway is its worktree's own venv binary, so a checkout that predates
+the sidecar writes no identity and a restart adds none — the mint says so and points
+at re-provisioning the worktree rather than at a restart. Listener attribution
+(`lsof`) is corroboration on top: a *different* pid holding the `127.0.0.1`
+listener is positive proof of a foreign responder and overrides the record, but an
+absent, failed, or unattributable lookup is not evidence of anything and leaves the
+record's verdict standing. That last case is the norm, not an edge: a minimal Linux
+host may ship no `lsof` at all, and an unprivileged caller — which is how `pod api`
+runs — cannot see a socket held by a gateway the user's service manager started. `pod up` names the conflict and points at `PORT=` rather than blaming the
 worktree build, and pinning a colliding pod's own `PORT=` remains the manual way out.
 
 ## Configuration (`PodConfig`, all `KIROCREW_POD_*`-overridable)

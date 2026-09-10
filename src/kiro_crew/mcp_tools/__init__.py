@@ -21,6 +21,7 @@ DOMAIN_MODULES: tuple[str, ...] = (
     "ledger",
     "work_items",
     "skills",
+    "logs",
     "control",
     "messaging",
     "artifacts",

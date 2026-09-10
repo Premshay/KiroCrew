@@ -711,9 +711,14 @@ class TestDecidableFindingsExitTheTieBreaker:
     def test_ux_tie_breaker_carries_a_closed_exception_list(self, name):
         wf = _flat(_read(name))
         assert "Tie-breaker: when torn between BLOCK and CONCERNS" in wf
-        assert "The tie-breaker does NOT apply to the two below" in wf
+        # Four decidable exits: the two notice rules, plus (PR #6783) a primary
+        # control the blind reader could not use and a hard element swap. Each
+        # is read off the blind-read report or the diff, not judged.
+        assert "The tie-breaker does NOT apply to the four below" in wf
         assert "hedges about state the code already holds" in wf
         assert "assert what happened" in wf
+        assert "A primary control (lens 12) the blind reader misread" in wf
+        assert "A hard swap (lens 13)" in wf
 
     @pytest.mark.parametrize("name", UX_LANES + DESIGN_LANES)
     def test_every_mandated_block_carries_a_falsification_step(self, name):
@@ -730,13 +735,17 @@ class TestDecidableFindingsExitTheTieBreaker:
     def test_first_principles_tie_breaker_exempts_the_rider_combination(self):
         contract = _flat(_read_prompt(FP_CONTRACT))
         assert "Tie-breaker: when torn between BLOCK and CONCERNS" in contract
-        assert "The tie-breaker does NOT apply to one combination" in contract
+        # Two combinations are settled by reading, not by degree: (a) an
+        # unverified premise on a core availability path, (b) the rider.
+        assert "Two combinations are settled by reading the diff" in contract
+        assert "UNVERIFIED PREMISE ON A CORE AVAILABILITY PATH" in contract
         assert "an item is riding along" in contract
-        assert "When all four hold at once" in contract
+        assert "When all four hold the defect is already" in contract
 
     def test_first_principles_lower_the_concern_names_the_exception(self):
         # `When unsure, LOWER the concern` sits far from the tie-breaker and
         # would otherwise re-impose the ratchet the exception just lifted.
         contract = _flat(_read_prompt(FP_CONTRACT))
         assert "When unsure, LOWER the concern" in contract
-        assert "The single exception is the combination" in contract
+        assert "The two exceptions are named at the" in contract
+        assert "there is no third" in contract

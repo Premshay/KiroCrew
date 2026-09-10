@@ -282,9 +282,21 @@ Probes run from `POST /api/mcp/probe`:
   excluded from the shared per-name probe cache, because a synthetic-identity
   handshake is a diagnostic and not the canonical observation the dashboard
   renders.
+- Remote header VALUES may carry `${VAR}`/`${env:VAR}` references — the
+  documented config form kiro-cli resolves at session runtime. The probe
+  resolves them through the gateway rewriter's declared-env expander
+  (`mcp_gateway.rewriter._expand_env_placeholders`): same regex, same
+  credential-filtered source view, and an unresolved reference stays literal —
+  so the probe presents the credential a session presents instead of sending
+  the reference as text and reporting the server's correct rejection as a
+  failing row. Probe-error redaction keys on the resolved values the probe
+  actually sent.
 - A remote server that answers the handshake with `401` — or with `403` carrying a
-  `WWW-Authenticate` challenge — and whose config has no static `Authorization`
-  header gets status `needs_auth` and an empty `error`, not `error`. The probe
+  `WWW-Authenticate` challenge — and whose sent headers carry no static
+  `Authorization` credential gets status `needs_auth` and an empty `error`, not
+  `error`. An `Authorization` value still carrying an unresolved `${VAR}`
+  reference (a missing or credential-filtered variable) supplied nothing, so it
+  does not count as a static credential here. The probe
   holds no OAuth token, because kiro-cli owns token custody
   ([design-notes/mcp-oauth-ownership.md](design-notes/mcp-oauth-ownership.md)), so
   the status code alone carries no verdict on the server: an unauthorized server
@@ -390,7 +402,9 @@ Probes run from `POST /api/mcp/probe`:
   debugging a server that was fine. `server.error` therefore leads with the
   machine-readable `mcp_probe_sandbox_unavailable:` prefix (mirroring the `code`
   field on dashboard JSON error bodies), states that the server itself may be fine,
-  and names the `agent.sandbox_allow_unsandboxed_exec` remedy. Because the cause is
+  and names the `agent.sandbox_allow_unsandboxed_exec` remedy (on Windows this
+  refusal means the key is declared `false` or a governance floor is pinned, since
+  the platform default permits the spawn). Because the cause is
   the HOST, it recurs identically for every server on every discovery cycle, so the
   remedy paragraph warns once per server name
   (`_warn_probe_sandbox_unavailable_once`) and demotes repeats to DEBUG.
@@ -653,6 +667,27 @@ CLI commands and their MCP twins:
 | `kirocrew learn remove` | `learn_remove` | `kirocrew-core` |
 | `kirocrew run TASK.md` | `task_run` | `kirocrew-core` |
 | `kirocrew computer apps` | `computer_list_apps` | `kirocrew-computer` |
+| `kirocrew knowledge dedup` | `knowledge_dedup` | `kirocrew-core` |
+| `kirocrew knowledge stats` | `knowledge_list_sources` | `kirocrew-core` |
+
+The last row is the one place a twin does not share its command's name, and it is
+a placement decision rather than an oversight. A tool in `kirocrew-core` costs
+context in every request of every session for as long as the session lives, so a
+fifth knowledge tool would be advertised forever to answer a question
+`knowledge_list_sources` was already 90% of: it opens the same store, over the
+same active-items rule, to serve the same "what is in this library" purpose. The
+aggregate is a strict superset of what its own query already computed, so it
+lands as a leading totals line on that tool instead, and the CLI verb and the
+tool render ONE `aggregate_stats()` call.
+
+The rule the MCP-first section states is that the model must get a structured
+tool rather than a bash-shaped CLI command — the model has one. Two conditions
+have to hold for that reading to be honest, and both are checked in
+`test_knowledge_stats.py`: the tool must actually surface the numbers (its
+descriptor advertises them, so deferral still selects it), and the capability
+must not be one an agent should be granted SEPARATELY, which would make it a
+`kirocrew-dashboard`-shaped opt-in server instead. It is not: anyone who may list
+sources already reads this data from that store, so the counts add no reach.
 
 `kirocrew-core` tools with no CLI twin, grouped by concern (authoritative list:
 `kiro_crew.mcp_tools.build_tool_list()`, which is what `mcp_core._list_tools`
@@ -661,9 +696,14 @@ answers `tools/list` from):
 - **Subagents:** `spawn_status`, `spawn_continue`, `spawn_steer`,
   `spawn_release`, `spawn_sub_agents`, `wait`
 - **Messaging and notification:** `send_message`, `send_notification`,
-  `delete_message`, `file_send`, `read_slack_profile`. `send_message` is the
-  agent's only proactive egress, and it names its destination rather than
-  inferring one: `session="slack"` / `channel` / `user` / `thread_ts` are the
+  `delete_message`, `update_message`, `file_send`, `read_slack_profile`.
+  `send_message` is the agent's only proactive egress to a NEW destination —
+  `update_message` rewrites a Slack message the bot itself already posted, on the
+  same gate ladder (strict identity, channel-agent containment,
+  `capabilities.messaging` and the `channels` scope for `"slack"`), because an
+  edit publishes new text to an audience rather than retracting what it has.
+  `send_message` names its destination rather than inferring one:
+  `session="slack"` / `channel` / `user` / `thread_ts` are the
   Slack fields, and `channel_type` is the non-Slack one — the transport of the
   conversation the calling session already belongs to. Exactly one of the two
   families may appear per call. The routing ladder and the fail-closed contract
@@ -674,8 +714,8 @@ answers `tools/list` from):
     over.** The `channels` scope is a per-transport allowlist, so vetting
     `"slack"` for a Telegram send evaluates a Telegram denial against Slack's
     rule — and refuses a permitted Telegram send whenever Slack is denied.
-  - **`channel_type` is the one `send_message` argument that requires
-    `_resolve_session_key_strict()`.** It posts into one specific conversation,
+  - **`channel_type` is the one `send_message` argument that requires strict
+    identity (via `require_strict_session_key`).** It posts into one specific conversation,
     which is the "targets a specific session" case below; the lenient walk
     climbs process ancestors, so a sub-agent would resolve to its parent and
     deliver into the parent's chat window. An unresolvable identity refuses the
@@ -702,12 +742,29 @@ answers `tools/list` from):
   `artifact_folder_rename`, `artifact_folder_move`, `artifact_folder_delete`,
   `artifact_get_comments`, `artifact_post_comment`, `artifact_reply_comment`,
   `artifact_delete_comment`, `artifact_mark_review`, `deploy_artifact`
-- **Knowledge and skills:** `local_knowledge_search`, `knowledge_dedup`,
-  `knowledge_list_sources`, `skill_discover`, `skill_search`, `skill_fetch`,
-  `browse_outline`, `browse_search`
+- **Knowledge and skills:** `local_knowledge_search`, `knowledge_add_document`,
+  `skill_discover`, `skill_search`, `skill_fetch`,
+  `browse_outline`, `browse_search`. (`knowledge_dedup` and
+  `knowledge_list_sources` have CLI twins — see the table above.)
 - **Workflows and hooks:** `workflow_author`, `workflow_list`,
   `workflow_cancel`, `workflow_rerun_subtree`, `register_hook`
-- **Diagnostics:** `resource_status`, `issue_radar_record_investigation`
+- **Diagnostics:** `resource_status`, `issue_radar_record_investigation`,
+  `kiro_cli_logs` — a redacted tail of kiro-cli's own mcp/lsp protocol logs, so
+  the agent can self-diagnose a rejected turn. Reads log files only: never the
+  fenced identity/token stores, and never the conversation-bearing sources
+  (`kiro-chat.log`, session transcripts), each of which is one shared host file
+  per gateway that would disclose another session's conversation. That scope
+  holds only while mcp.log / lsp.log record protocol traffic rather than full
+  frame bodies, since they share the chat log's single-fixed-path,
+  all-sessions-interleaved shape and an MCP `tools/call` frame carries
+  conversation-derived arguments. Measured on kiro-cli 2.21.1: mcp.log is empty
+  across a session of continuous MCP tool calls, every lsp.log record is a
+  single-line `<timestamp> ERROR <module>: <message>` with no JSON-RPC envelope
+  and a longest line of 313 bytes, and sentinel strings passed as tool-call
+  arguments appear in neither file. Because that measures one version of a
+  component this repo does not pin, a source whose text carries serialized frames
+  is REFUSED whole and visibly, so a kiro-cli that starts logging payloads
+  surfaces as a refusal instead of a silent widening
 - **App bridges (credentialed):** `ops_mission_control_api` — the MCP server
   process holds the gateway's internal secret and forwards only a frozen
   (method, path) allowlist of Ops Mission Control routes; the agent never
@@ -955,8 +1012,11 @@ Two failure modes follow.
 backend: the warm pool spawns with an empty key, and a sub-agent inherits its
 parent's tree. `mcp_core.py` offers two resolvers:
 
-- `_resolve_session_key_strict()` for **anything that mutates or targets a
-  specific session** (post to a slot, change its state, deliver a callback). It
+- `_resolve_session_key_strict` for **anything that mutates or targets a
+  specific session** (post to a slot, change its state, deliver a callback) —
+  reached ONLY through `require_strict_session_key()`, the shared fail-closed
+  gate every reflexive tool module routes through (`REFLEXIVE_TOOL_MODULES`
+  enumerates them; a ratchet test rejects direct calls outside `mcp_core`). It
   accepts only the gateway-injected caller context (`mcp_caller.current_caller()`,
   which gatewayd stamps on every forwarded frame after stripping any
   client-forged `kirocrew.caller` block), the injected `KIROCREW_SESSION_KEY`, or
@@ -1030,12 +1090,73 @@ legitimately rewrite. `encode()` refuses above `MAX_DIRECTIVE_CHARS` (3800), und
 the ACP tool-result truncation bound, so an oversized payload fails loudly
 instead of losing its trailing marker.
 
+A tail-anchored marker must survive delivery, and a rejection must not be able to
+carry one. `validate_tool_args` reports an unknown field by echoing the argument
+NAME, which the model chooses, so that name is the injection point for both
+problems. A name carrying the sentinel plus a JSON payload plus a newline made the
+REJECTION string decode as a genuine directive under the real tool's authenticated
+identity — applying the arguments validation had just refused — so every place
+`mcp_shared` builds an `"Error: …"` result passes the interpolated text through
+`session_directive.neutralize_markers`. That defanging is applied only where the
+caller KNOWS the string is not a directive: doing it centrally over every tool
+result would defang the real marker too. Separately, a 9,000-character name
+produced a result whose refusal tag the transport cut removed, and the decline read
+as a lost marker again — `tag_refusal` elides the middle of an over-long text
+against `MAX_TOOL_RESULT_CHARS`, the single constant `acp/_dispatch.py` slices on.
+That bound alone is necessary but not sufficient, because the cut runs AFTER
+redaction and redaction GROWS text (a credential becomes a longer placeholder,
+measured 7,999 chars in and 8,755 out), so `preserve_tail_marker` re-attaches a
+marker the cut removed — the same re-injection the MCP App render marker already
+gets at that seam, for the same reason: a control token that decides how a frame is
+interpreted must not be a casualty of a length cut applied to the frame's prose.
+
+**A directive tool's result either carries the marker, or it is a tagged
+refusal — nothing in between.** The consumer cannot otherwise tell a decline from
+a marker destroyed in transport: both decode to "no directive", but only the
+second is a bug, and the diagnostic for the second is a WARNING
+(`session-directive decode FAILED … effect dropped`) whose whole purpose is to
+catch a rawOutput-envelope escaping regression. So every marker-less return is
+stamped with `_REFUSAL_SENTINEL` and reported at INFO as
+`session-directive REFUSED`: `encode()` stamps its own oversized-payload refusal,
+and `mcp_core._call_tool` stamps the rest via `refuse_if_markerless()`. That
+second producer sits at the OUTERMOST return because argument validation runs in
+the dispatch wrapper *ahead of* the handler, so a schema rejection never reaches
+code inside the tool that could tag itself. Tagging is diagnostic only and keys on
+the tool name alone: the token carries no payload and grants no effect, so it can
+change how a line is logged and never what is applied. Two consequences for a tool
+author — a directive tool must RETURN its declines rather than raise them (an
+exception escapes this return path and reads as a lost marker), and a caller that
+sees `decode FAILED` is looking at a transport bug or at a handler that crashed --
+the line names both, because a crash also drops the effect and asserting only the
+transport cause sends an operator hunting a regression that is not there.
+That first rule is enforced rather than left to convention: a parametrized test
+drives every name in `DIRECTIVE_TOOLS` with a hostile call and asserts the result
+is a marker or a tagged refusal, and its companion asserts the table covers the
+frozenset, so a new directive tool fails until it is added. The one raising
+dependency these handlers share, `parse_github_pull_request_target`, is reached
+through a single guarded seam (`_parsed_pull_request_target`) for the same reason
+-- guarding its two call sites independently is how the second one came to ship
+unguarded.
+
+`FieldSpec.clamp_to_max` is the other half of that: an over-long argument used to
+be able to defeat the request it was only describing. `autonudge_stop` and
+`monitor_stop` both take a `reason` that selects no behaviour — the applier just
+interpolates it into the outcome text and the persisted stop record — so their
+`reason` is TRUNCATED to the cap instead of rejecting the stop, and the truncated
+value carries a `[... truncated, dropped N chars]` note so the cut is visible
+wherever the value travels. `N` counts what THAT cut dropped, including the note's
+own cost — deliberately not the caller's original length, which the clamp cannot
+know because the field is sanitized before the cap is checked, so one number
+cannot honestly stand for both removals. Opt-in per field, and never for a field
+the handler acts on: a truncated control input is a wrong control input, and
+rejecting is the only safe answer there.
+
 Structured monitoring deliberately splits mutation from inspection.
 `monitor_watch`, `monitor_update`, and `monitor_stop` are directives: the
 consumer applies them to its authoritative session, so their payloads contain
 neither a session key nor a loop id. `monitor_inspect` needs a result in the same
 turn and therefore calls the session-bound read route only after
-`_resolve_session_key_strict()` succeeds, passing that exact key to `_get`.
+`require_strict_session_key()` resolves, passing that exact key to `_get`.
 It projects that response into bounded agent-oriented state (check counts and
 accepted wake count, plus only a small failed/pending/unknown name sample),
 omitting wake instructions and browser/persistence internals. Inspection reports

@@ -390,6 +390,379 @@ class TestValidateFilePath:
         f = _write(tmp_path / "ok.txt", "x")
         assert _same(validate_file_path(str(f)) or "", str(f))
 
+    def _windows(self, monkeypatch, realpath=os.path.realpath):
+        """Simulate the Windows gates without patching the global os.name
+        (which would make pathlib dispatch WindowsPath on a POSIX host).
+        NOTE: candidate strings stay host-native under this simulation; the
+        Windows CI shard exercises real backslash shapes via tmp_path. The
+        namespace carries every os attribute the validate_file_path call
+        graph can reach (unc_probe_allowed folds with normcase/normpath and
+        joins with sep) so a stub miss cannot masquerade as a product bug."""
+        import types
+
+        from kiro_crew import hooks as hooks_mod
+
+        monkeypatch.setattr(
+            hooks_mod,
+            "os",
+            types.SimpleNamespace(
+                name="nt",
+                sep=os.sep,
+                # unc_probe_allowed and main's _unc_agents_root memo key read
+                # the environment through this namespace; carry the real
+                # mapping so a stub miss cannot masquerade as a product bug.
+                environ=os.environ,
+                path=types.SimpleNamespace(
+                    expanduser=os.path.expanduser,
+                    abspath=os.path.abspath,
+                    realpath=realpath,
+                    normcase=os.path.normcase,
+                    normpath=os.path.normpath,
+                    isabs=os.path.isabs,
+                    join=os.path.join,
+                    dirname=os.path.dirname,
+                ),
+            ),
+        )
+
+    def test_linked_ancestor_is_refused_before_realpath(self, tmp_path, monkeypatch):
+        """realpath resolves the whole ancestor chain, so it IS the outbound
+        SMB probe when an ancestor junction targets a UNC share (#5962).
+        Wiring realpath to explode proves the walk returned first."""
+        from kiro_crew import platform_compat
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran before the ancestor walk")
+
+        self._windows(monkeypatch, realpath=_boom)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: str(tmp_path))
+        assert validate_file_path(str(tmp_path / "doc.txt")) is None
+
+    def test_bypassing_the_ancestor_guard_restores_validation(self, tmp_path, monkeypatch):
+        """Mutation check: with the walk reporting no link, the same path
+        validates again -- the refusal above is attributable to the guard."""
+        from kiro_crew import platform_compat
+
+        f = _write(tmp_path / "ok.txt", "x")
+        self._windows(monkeypatch)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        assert _same(validate_file_path(str(f)) or "", str(f))
+
+    def test_a_leaf_link_aimed_at_unc_is_refused_before_realpath(self, tmp_path, monkeypatch):
+        """A leaf FILE symlink is part of this function's contract (it
+        resolves and re-checks), so the leaf is not blanket-refused -- but a
+        leaf link aimed straight at an untrusted UNC share must be refused
+        before the realpath that would probe it. readlink is a local
+        metadata read, wired here to prove no traversal happened."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran before the leaf target screen")
+
+        self._windows(monkeypatch, realpath=_boom)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda _p: True)
+        monkeypatch.setattr(
+            hooks_mod.os, "readlink", lambda _p: r"\\evil-host\share\doc.txt", raising=False
+        )
+        assert validate_file_path(str(tmp_path / "doc.txt")) is None
+
+    def test_a_benign_leaf_link_still_resolves_on_windows(self, tmp_path, monkeypatch):
+        """The documented contract resolves benign leaf symlinks (CI pins it
+        end-to-end with a real link in test_hooks.py test_allows_benign_symlink);
+        the Windows leaf screen must not blanket-refuse them -- only an
+        untrusted-UNC target refuses. Under this simulation no real link
+        exists, so the pin is that validation SUCCEEDS (reaches realpath)
+        rather than returning None."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        alias = tmp_path / "alias.txt"
+        self._windows(monkeypatch)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda p: str(p) == str(alias))
+        # A drive-absolute target: the shape a real Windows link carries.
+        monkeypatch.setattr(
+            hooks_mod.os, "readlink", lambda _p: r"C:\Users\me\real.txt", raising=False
+        )
+        assert validate_file_path(str(alias)) is not None
+
+    def test_a_multi_hop_chain_landing_on_unc_is_refused(self, tmp_path, monkeypatch):
+        r"""A leaf link -> LOCAL link -> UNC chain must be refused hop by hop:
+        screening only the first target would launder the probe through the
+        intermediate local link."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        alias = tmp_path / "alias.txt"
+        mid_t = r"C:\Users\me\mid.txt"
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran before the chain walk refused")
+
+        self._windows(monkeypatch, realpath=_boom)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(
+            platform_compat,
+            "is_link_or_junction",
+            lambda p: str(p) in (str(alias), mid_t),
+        )
+        targets = {str(alias): mid_t, mid_t: r"\\evil-host\share\doc.txt"}
+        monkeypatch.setattr(hooks_mod.os, "readlink", lambda p: targets[str(p)], raising=False)
+        assert validate_file_path(str(alias)) is None
+
+    def test_an_overlong_leaf_chain_is_refused_not_probed(self, tmp_path, monkeypatch):
+        """A chain longer than the walk's bound refuses rather than probes --
+        the same fail-closed posture as the kernels' own ELOOP ceiling."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        alias = tmp_path / "alias.txt"
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran on an over-long chain")
+
+        self._windows(monkeypatch, realpath=_boom)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda _p: True)
+        monkeypatch.setattr(hooks_mod.os, "readlink", lambda _p: r"C:\loop\self.lnk", raising=False)
+        assert validate_file_path(str(alias)) is None
+
+    @pytest.mark.parametrize(
+        "exotic",
+        [r"\pivot\file.txt", r"D:pivot\file.txt"],
+        ids=["root-relative", "drive-relative"],
+    )
+    def test_root_and_drive_relative_targets_are_refused(self, tmp_path, monkeypatch, exotic):
+        r"""Root-relative (\pivot -> the CURRENT drive's root) and
+        drive-relative (D:pivot -> D:'s per-drive CWD) targets resolve
+        against ambient state the walk cannot see, so the screened string
+        and the resolved string could diverge by drive. Refused fail-closed
+        before realpath."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        alias = tmp_path / "alias.txt"
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran on an ambient-state target")
+
+        self._windows(monkeypatch, realpath=_boom)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda p: str(p) == str(alias))
+        monkeypatch.setattr(hooks_mod.os, "readlink", lambda _p: exotic, raising=False)
+        assert validate_file_path(str(alias)) is None
+
+    def test_an_adversarially_deep_path_is_refused_before_the_walk(self, monkeypatch):
+        """The screen is one lstat per component, so the walk's cost is
+        bounded BEFORE it starts: a path with thousands of components would
+        stall the event loop inside the guard itself."""
+        from kiro_crew import platform_compat
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("ancestor walk started on an over-deep path")
+
+        self._windows(monkeypatch)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", _boom)
+        deep = "/" + "/".join("a" * 1 for _ in range(300)) + "/doc.txt"
+        assert validate_file_path(deep) is None
+
+    def test_an_unreadable_leaf_link_fails_closed(self, tmp_path, monkeypatch):
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        def _raise(_p):
+            raise OSError("unreadable reparse point")
+
+        self._windows(monkeypatch)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda _p: True)
+        monkeypatch.setattr(hooks_mod.os, "readlink", _raise, raising=False)
+        assert validate_file_path(str(tmp_path / "doc.txt")) is None
+
+    def test_a_longform_unc_leaf_target_is_still_refused(self, tmp_path, monkeypatch):
+        r"""The \\?\UNC\host\share long-path spelling folds into the screened
+        UNC shape rather than slipping past as a non-UNC-looking string."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        self._windows(monkeypatch)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda _p: True)
+        monkeypatch.setattr(
+            hooks_mod.os,
+            "readlink",
+            lambda _p: "\\\\?\\UNC\\evil-host\\share\\doc.txt",
+            raising=False,
+        )
+        assert validate_file_path(str(tmp_path / "doc.txt")) is None
+
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            "\\\\?\\unc\\evil-host\\share\\doc.txt",
+            "\\\\?\\Unc\\evil-host\\share\\doc.txt",
+            "\\\\?\\uNC\\evil-host\\share\\doc.txt",
+        ],
+        ids=["lowercase", "titlecase", "mixed"],
+    )
+    def test_a_mixed_case_longform_unc_target_is_still_refused(
+        self, tmp_path, monkeypatch, spelling
+    ):
+        r"""The OS resolves \\?\unc\... case-insensitively, so the fold must
+        match the UNC component case-insensitively too: a case-sensitive
+        match would drop a lowercase spelling into the plain \\?\ branch,
+        strip four characters, and launder the share into a relative-looking
+        string that realpath would then probe over SMB."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran on a mixed-case UNC target")
+
+        self._windows(monkeypatch, realpath=_boom)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda _p: True)
+        monkeypatch.setattr(hooks_mod.os, "readlink", lambda _p: spelling, raising=False)
+        assert validate_file_path(str(tmp_path / "doc.txt")) is None
+
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            "\\\\?\\GLOBALROOT\\Device\\Mup\\evil-host\\share\\doc.txt",
+            "\\\\?\\Volume{deadbeef-0000-0000-0000-000000000000}\\doc.txt",
+        ],
+        ids=["globalroot-mup", "volume-guid"],
+    )
+    def test_a_non_drive_extended_namespace_target_is_refused(
+        self, tmp_path, monkeypatch, spelling
+    ):
+        r"""A bare \\?\ prefix is only folded when the remainder is a
+        drive-absolute local path. Any other extended namespace (GLOBALROOT
+        device-namespace spelling of a UNC share, a Volume GUID) must be
+        refused outright: stripping the prefix would leave a string with no
+        leading separator and no drive, which the shape allowlist would then
+        anchor as PLAIN RELATIVE while realpath follows the real link."""
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("realpath ran on an extended-namespace target")
+
+        self._windows(monkeypatch, realpath=_boom)
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(platform_compat, "is_link_or_junction", lambda _p: True)
+        monkeypatch.setattr(hooks_mod.os, "readlink", lambda _p: spelling, raising=False)
+        assert validate_file_path(str(tmp_path / "doc.txt")) is None
+
+    @pytest.mark.skipif(os.name == "nt", reason="pins POSIX resolve-through-symlink semantics")
+    def test_posix_dotdot_still_resolves_through_the_symlink(self, tmp_path):
+        """A `..` crossing a symlinked component must keep resolving THROUGH
+        the link (realpath order), not be collapsed lexically first -- the
+        Windows-only abspath anchoring must never leak into the POSIX path."""
+        real = tmp_path / "srv"
+        (real / "sub").mkdir(parents=True)
+        x = _write(real / "x.txt", "payload")
+        pub = tmp_path / "pub"
+        pub.mkdir()
+        link = pub / "link"
+        link.symlink_to(real / "sub", target_is_directory=True)
+
+        got = validate_file_path(str(link / ".." / "x.txt"))
+
+        # realpath: link -> srv/sub, then `..` -> srv, then x.txt. A lexical
+        # collapse would instead yield pub/x.txt, which does not exist.
+        assert got is not None
+        assert _same(got, str(x))
+
+    def test_the_ancestor_walk_is_not_consulted_on_posix(self, tmp_path, monkeypatch):
+        """On POSIX the real guard is is_sensitive_path on the RESOLVED path;
+        an unconditional walk would refuse a symlinked /home."""
+        if os.name == "nt":
+            pytest.skip("gate is active on Windows by design")
+        from kiro_crew import platform_compat
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("ancestor walk ran on POSIX")
+
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", _boom)
+        f = _write(tmp_path / "ok.txt", "x")
+        assert _same(validate_file_path(str(f)) or "", str(f))
+
+    def test_unc_shaped_anchored_form_is_refused_before_the_walk(self, monkeypatch):
+        """A `~` expanding to a roaming-profile UNC home surfaces a UNC shape
+        the raw text did not have. The ANCHORED form (the exact string walked
+        and resolved) must be screened before the ancestor walk -- the walk is
+        an lstat per component, so on an untrusted UNC path the walk itself
+        would be the outbound SMB probe. abspath never strips UNC-ness, so
+        this single screen covers the expanded form too."""
+        import types
+
+        from kiro_crew import hooks as hooks_mod
+        from kiro_crew import platform_compat
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("ancestor walk ran on a UNC-shaped expansion")
+
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", _boom)
+        monkeypatch.setattr(
+            hooks_mod,
+            "os",
+            types.SimpleNamespace(
+                name="nt",
+                sep=os.sep,
+                environ=os.environ,
+                path=types.SimpleNamespace(
+                    expanduser=lambda _raw: "//evil-host/share/doc.txt",
+                    abspath=os.path.abspath,
+                    realpath=os.path.realpath,
+                    # unc_probe_allowed's lexical folding runs on this
+                    # namespace too once the expanded form is UNC-shaped.
+                    normcase=os.path.normcase,
+                    normpath=os.path.normpath,
+                ),
+            ),
+        )
+        assert validate_file_path("~/doc.txt") is None
+
+    def test_unc_home_sessions_transcript_is_refused(self, monkeypatch):
+        """#6733: a kiro-cli session transcript under a Windows roaming-profile
+        (UNC) home is refused by the UNC trusted-root gate, because the sessions
+        dir is not one of unc_probe_allowed's admitted roots. This is the exact
+        refusal the usage page counts as ``refused_transcripts`` instead of
+        rendering a confident zero. Exercised as DATA -- a ``\\\\server\\share``
+        string through validate_file_path -- so it runs on a POSIX host; the
+        Windows CI shard confirms the native backslash form.
+
+        The fix for #6733 does NOT relax this refusal: admitting the sessions
+        dir to the gate is a separate trust decision (open issue #8079). This
+        test therefore pins that the transcript STAYS refused.
+        """
+        from kiro_crew import platform_compat
+
+        # No linked ancestor: isolate the pure UNC-shape screen.
+        monkeypatch.setattr(platform_compat, "first_linked_ancestor", lambda _p: None)
+        self._windows(monkeypatch)
+        unc_transcript = "//roaming-server/profiles/alice/.kiro/sessions/cli/s1.jsonl"
+        assert validate_file_path(unc_transcript) is None
+
+    def test_unc_path_under_data_home_still_validates(self, monkeypatch, tmp_path):
+        """Control for the test above: a UNC path UNDER an admitted root (the
+        data home) is NOT refused by the UNC gate -- so the refusal there is
+        attributable to the sessions dir being outside the trusted roots, not
+        to a blanket UNC ban. Uses a UNC-shaped data_home so unc_probe_allowed
+        has a UNC root to match against."""
+        import kiro_crew.hooks as hooks_mod
+
+        unc_home = "//roaming-server/profiles/alice/.kiro/crew"
+        monkeypatch.setattr(hooks_mod._config_paths, "data_home", lambda: Path(unc_home))
+        self._windows(monkeypatch)
+        candidate = unc_home + "/ledger/state.json"
+        # The UNC gate admits it (unc_probe_allowed returns True); the value may
+        # still be canonicalized downstream, but it is NOT refused by the gate.
+        assert hooks_mod.unc_probe_allowed(candidate) is True
+
 
 class TestSafeReadFile:
     def test_reads_text(self, tmp_path):
@@ -427,18 +800,24 @@ class TestSafeReadFile:
         """
         import errno as _errno
 
+        from kiro_crew import platform_compat as _pc
+
         f = tmp_path / "map.json"
         f.write_text("{}", encoding="utf-8")
         resolved = os.path.realpath(str(f))
 
-        real_open = os.open
+        real_no_reparse = _pc.open_file_no_reparse
 
-        def _eloop(path, flags, *args, **kwargs):
+        # Patch the open the code actually performs, not one platform's
+        # implementation of it: the Windows arm of open_file_no_reparse reaches
+        # CreateFileW, so a patch on os.open would simulate the race on POSIX only
+        # and the assertion would pass for the wrong reason on the Windows shard.
+        def _eloop(path, *args, **kwargs):
             if str(path) == resolved:
                 raise OSError(_errno.ELOOP, "symlink swapped in")
-            return real_open(path, flags, *args, **kwargs)
+            return real_no_reparse(path, *args, **kwargs)
 
-        monkeypatch.setattr(os, "open", _eloop)
+        monkeypatch.setattr(_pc, "open_file_no_reparse", _eloop)
         with pytest.raises(PermissionError, match="refusing to follow symlink") as excinfo:
             safe_read_file(str(f))
         message = str(excinfo.value)
@@ -488,18 +867,22 @@ class TestSafeReadFileBytesWithIdentity:
     def test_symlink_swap_at_final_component_is_refused(self, tmp_path, monkeypatch):
         # validate_file_path resolves symlinks, so the refusal is reached by
         # making the post-validation open report ELOOP -- the TOCTOU shape the
-        # O_NOFOLLOW guard exists for.
+        # final-component guard exists for. Patching open_file_no_reparse rather
+        # than os.open keeps the simulation faithful on Windows, whose arm of that
+        # helper reaches CreateFileW instead.
         f = _write(tmp_path / "a.txt", "payload")
         import errno as _errno
 
-        real_open = os.open
+        from kiro_crew import platform_compat as _pc
 
-        def _eloop(path, flags, *args, **kwargs):
+        real_no_reparse = _pc.open_file_no_reparse
+
+        def _eloop(path, *args, **kwargs):
             if _same(str(path), str(f)):
                 raise OSError(_errno.ELOOP, "symlink swapped in")
-            return real_open(path, flags, *args, **kwargs)
+            return real_no_reparse(path, *args, **kwargs)
 
-        monkeypatch.setattr(os, "open", _eloop)
+        monkeypatch.setattr(_pc, "open_file_no_reparse", _eloop)
         with pytest.raises(PermissionError, match="refusing to follow symlink"):
             safe_read_file_bytes_with_identity(str(f), {_identity(f)})
 
@@ -762,6 +1145,27 @@ class TestSafeCopyFileNolink:
         assert Path(copied).parent == dest
         assert Path(copied).suffix == ".png"
 
+    def test_binary_payload_is_copied_byte_for_byte(self, tmp_path):
+        """A media file must survive the copy exactly, 0x1A and CRLF included.
+
+        This function exists to hand a large binary to a subprocess BY PATH, so
+        byte fidelity is its whole contract. Two Windows-specific hazards can break
+        it while every text-content test still passes: a CRT descriptor in text mode
+        translates CRLF, and it reports end-of-file at the first 0x1A. The copy loop
+        reads with a raw ``os.read``, which honours that mode, so the descriptor has
+        to be opened in binary — a payload of ASCII would not detect either fault.
+        """
+        payload = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) + b"\r\ntail\x1amore\x00\xff"
+        src = tmp_path / "clip.mp4"
+        src.write_bytes(payload)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        copied = safe_copy_file_nolink(str(src), str(dest))
+
+        assert copied is not None
+        assert Path(copied).read_bytes() == payload
+
     def test_copy_is_private(self, tmp_path):
         if _IS_WINDOWS:
             pytest.skip("POSIX mode bits are not meaningful on Windows")
@@ -879,14 +1283,19 @@ class TestSafeReadFileInternal:
             "_emit_internal_read_audit",
             lambda read_id, outcome: outcomes.append(outcome) or True,
         )
-        real_open = os.open
+        from kiro_crew import platform_compat as _pc
 
-        def _eacces(path, flags, *args, **kwargs):
+        real_no_reparse = _pc.open_file_no_reparse
+
+        # Patch the seam the read performs. os.open is only the POSIX arm of
+        # open_file_no_reparse, so a patch there would leave the Windows shard
+        # opening the real file and classifying it by contents.
+        def _eacces(path, *args, **kwargs):
             if str(path).endswith(os.path.basename(rel)):
                 raise PermissionError("denied")
-            return real_open(path, flags, *args, **kwargs)
+            return real_no_reparse(path, *args, **kwargs)
 
-        monkeypatch.setattr(os, "open", _eacces)
+        monkeypatch.setattr(_pc, "open_file_no_reparse", _eacces)
         assert safe_read_file_internal("unreadable") is None
         assert outcomes == ["unreadable"]
 
@@ -1577,15 +1986,19 @@ class TestSafeReadFileSymlinkRace:
     def test_eloop_after_canonicalization_is_refused(self, tmp_path, monkeypatch):
         import errno as _errno
 
-        f = _write(tmp_path / "a.txt", "x")
-        real_open = os.open
+        from kiro_crew import platform_compat as _pc
 
-        def _eloop(path, flags, *args, **kwargs):
+        f = _write(tmp_path / "a.txt", "x")
+        real_no_reparse = _pc.open_file_no_reparse
+
+        # The seam is open_file_no_reparse, which is what carries the
+        # final-component refusal on both platforms; os.open is only its POSIX arm.
+        def _eloop(path, *args, **kwargs):
             if isinstance(path, str) and _same(path, str(f)):
                 raise OSError(_errno.ELOOP, "swapped for a symlink")
-            return real_open(path, flags, *args, **kwargs)
+            return real_no_reparse(path, *args, **kwargs)
 
-        monkeypatch.setattr(os, "open", _eloop)
+        monkeypatch.setattr(_pc, "open_file_no_reparse", _eloop)
         with pytest.raises(PermissionError, match="refusing to follow symlink"):
             safe_read_file(str(f))
 

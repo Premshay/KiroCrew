@@ -34,6 +34,9 @@ vi.mock('../api/client', () => ({
     cronHistoryAll: vi.fn().mockResolvedValue({ runs: [] }),
     kirocrewAgents: vi.fn().mockResolvedValue({ agents: [], default_agent: '' }),
     syncKirocrewAgents: vi.fn().mockResolvedValue({}),
+    // The page now SAYS when the default-agent read fails; an unmocked
+    // `api.defaultAgent` would surface that notice in every case here.
+    defaultAgent: vi.fn().mockResolvedValue({ default_agent: '' }),
   },
 }))
 
@@ -444,7 +447,11 @@ describe('SchedulePage write-capable preset indicator', () => {
     await screen.findByRole('dialog')
     fireEvent.click(screen.getByRole('button', { name: `Use the ${writesPreset.title} template` }))
 
-    expect(await screen.findByRole('note')).toHaveTextContent(/not enforced policy/i)
+    // Addressed by test id rather than by role: the create dialog can carry a
+    // SECOND advisory note (the cheaper-execution-mode hint), and a bare
+    // `role="note"` query cannot tell the two apart. The contract here is about
+    // the writes notice specifically.
+    expect(await screen.findByTestId('schedule-writes-notice')).toHaveTextContent(/not enforced policy/i)
   })
 
   it('re-selecting the SAME preset resets the form (pins the selection-nonce remount)', async () => {
@@ -545,7 +552,7 @@ describe('SchedulePage write-capable preset indicator', () => {
     fireEvent.click(screen.getByRole('button', { name: `Use the ${readOnlyPreset.title} template` }))
 
     await waitFor(() => expect(screen.getByDisplayValue(readOnlyPreset.prefill.name)).toBeInTheDocument())
-    expect(screen.queryByRole('note')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('schedule-writes-notice')).not.toBeInTheDocument()
   })
 })
 

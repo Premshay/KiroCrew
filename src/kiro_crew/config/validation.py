@@ -283,8 +283,17 @@ class ConfigCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # (fingerprint, deep-copyable validated data dict)
-        self._entry: tuple[tuple, dict] | None = None
+        # (fingerprint, deep-copyable validated data dict, opaque sidecar)
+        self._entry: tuple[tuple, dict, dict] | None = None
+        # Monotonic invalidation token. A loader captures this before disk I/O;
+        # clear() advances it so that reader cannot publish a pre-write snapshot
+        # afterward even when a coarse filesystem reports the same fingerprint.
+        self._generation = 0
+
+    def generation(self) -> int:
+        """Return the current invalidation token for a prospective disk read."""
+        with self._lock:
+            return self._generation
 
     def get(self, fingerprint: tuple) -> dict | None:
         """Return a deep copy of the cached dict if *fingerprint* matches, else None.
@@ -299,24 +308,56 @@ class ConfigCache:
                 return copy.deepcopy(self._entry[1])
         return None
 
-    def store(self, data: dict, fingerprint: tuple) -> None:
-        """Cache a deep copy of *data* under *fingerprint*.
+    def get_with_sidecar(self, fingerprint: tuple) -> tuple[dict, dict] | None:
+        """Return deep copies of ``(data, sidecar)`` from ONE lock hold, else None.
 
-        *fingerprint* MUST be the one captured BEFORE the files were read (by
-        ``load()``), not a fresh stat. If a write lands between the read and this
-        store, *fingerprint* describes the pre-write file, so it won't match the
-        post-write on-disk stat — the next ``load()`` misses and re-reads rather
-        than serving the stale content we just read. Re-statting here instead
-        would cache old content under the new file's fingerprint (a read->store
-        TOCTOU) and serve it as a false hit until the file changed again.
+        The sidecar carries facts about the SAME read that the merged dict cannot
+        express — today, the pre-overlay base values the loader needs to round-trip
+        unknown keys correctly. The two halves describe one read and must be
+        served together: a ``save()`` on another thread calls ``clear()``, and
+        fetching them in two steps let the dict land before the clear and the
+        sidecar after it — a merged document with an EMPTY base shadow, which the
+        loader would then capture from as if no overlay existed, deleting shadowed
+        base keys on the next save. There is deliberately no separate sidecar
+        accessor: the lock makes the pair all-or-nothing.
         """
         with self._lock:
-            self._entry = (fingerprint, copy.deepcopy(data))
+            if self._entry is not None and self._entry[0] == fingerprint:
+                return copy.deepcopy(self._entry[1]), copy.deepcopy(self._entry[2])
+        return None
+
+    def store(
+        self,
+        data: dict,
+        fingerprint: tuple,
+        sidecar: dict | None = None,
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
+        """Cache *data* when no invalidation occurred since its disk read began.
+
+        *fingerprint* MUST be the one captured BEFORE the files were read (by
+        ``load()``), not a fresh stat. Normally a write changes that fingerprint,
+        so the next ``load()`` misses. A same-size replacement on a coarse-time
+        filesystem can remain indistinguishable, however; *expected_generation*
+        closes that gap. ``clear()`` advances the token, and a reader holding an
+        older token is refused rather than restoring stale data after the clear.
+
+        Returns whether the value was stored. Callers that do not perform disk
+        I/O may omit *expected_generation* and retain the original unconditional
+        cache-insertion behavior.
+        """
+        with self._lock:
+            if expected_generation is not None and expected_generation != self._generation:
+                return False
+            self._entry = (fingerprint, copy.deepcopy(data), copy.deepcopy(sidecar or {}))
+            return True
 
     def clear(self) -> None:
-        """Drop the cached validated config (called after save()/write-back)."""
+        """Drop the cached config and invalidate every in-flight disk read."""
         with self._lock:
             self._entry = None
+            self._generation += 1
 
 
 # Process-global cache instance.

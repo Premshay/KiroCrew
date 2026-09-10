@@ -16,6 +16,7 @@ from kiro_crew.discord.client import DISCORD_CHUNK_LIMIT, DiscordInteraction
 from kiro_crew.discord.commands import parse_command, parse_command_argument
 from kiro_crew.discord.renderer import session_provenance_tag
 from kiro_crew.discord.transport_dispatch import DiscordDispatcher
+from kiro_crew.history import transcript_stem
 from kiro_crew.messaging import resume_expectation
 from kiro_crew.messaging import session_resume as session_resume_core
 from kiro_crew.messaging.link import UNBIND_REASON_UNSPECIFIED, ChannelLink
@@ -122,6 +123,7 @@ class _Sessions:
         self.begin_turns = 0
         self.flushed: list[dict] = []
         self.flush_error: Exception | None = None
+        self.reserve_error: Exception | None = None
         self.origin_links: dict[str, ChannelLink] = {}
         self.inbound_keys: set[str] = set()
         self.mirror_opt_outs: set[str] = set()
@@ -130,6 +132,8 @@ class _Sessions:
         self.unbind_reasons: list[str] = []
         self.last_key = ""
         self.targeted: list[tuple[str, str]] = []
+        self.channel_keys: set[str] = set()
+        self.reserved_generations: set[str] = set()
         self.provider = _Provider()
 
     def set_mirror_link(
@@ -209,8 +213,28 @@ class _Sessions:
             self.mirror_links.pop(key, None)
         return cleared
 
+    def reserve_generation(self, session_key: str) -> None:
+        if self.reserve_error is not None:
+            raise self.reserve_error
+        self.reserved_generations.add(session_key)
+        self.channel_keys.add(session_key)
+
     def max_generation(self, bucket: str) -> int:
-        return -1
+        prefix = f"{bucket}:gen"
+        return max(
+            (
+                int(key[len(prefix) :])
+                for key in self.reserved_generations
+                if key.startswith(prefix) and key[len(prefix) :].isdigit()
+            ),
+            default=-1,
+        )
+
+    def channel_key_for_stem(self, stem: str) -> str:
+        for key in self.channel_keys | set(self.mirror_links):
+            if transcript_stem(key) == stem:
+                return key
+        return ""
 
     def is_busy(self, key: str) -> bool:
         return False
@@ -225,6 +249,7 @@ class _Sessions:
     async def get_or_create(self, key: str, **kwargs: Any) -> tuple[Any, bool, bool]:
         self.last_key = key
         self.last_agent = kwargs.get("agent")
+        self.channel_keys.add(key)
         return self.provider, getattr(self, "is_new_result", False), True
 
     def begin_turn(self, key: str) -> None:
@@ -329,6 +354,23 @@ class _ConversationLog:
     ) -> None:
         self.messages.setdefault(key, []).append({"role": role, "content": content})
 
+    def update_metadata(self, key: str, fields: dict) -> None:
+        self.metadata.setdefault(key, {}).update(fields)
+        self.messages.setdefault(key, [])
+        stem = transcript_stem(key)
+        for row in self.rows:
+            if row.get("key") == stem:
+                row.update(fields)
+                break
+        else:
+            self.rows.insert(0, {"key": stem, **fields})
+
+    def update_metadata_if(self, key: str, fields: dict, guard: Any) -> bool:
+        if not guard(self.metadata.get(key, {})):
+            return False
+        self.update_metadata(key, fields)
+        return True
+
     def set_title(self, key: str, title: str) -> None:
         self.titles_set = getattr(self, "titles_set", [])
         self.titles_set.append((key, title))
@@ -370,8 +412,10 @@ def _config() -> Any:
 def _dispatcher(
     allowed: set[str],
     log: _ConversationLog | None,
+    *,
+    sessions: _Sessions | None = None,
 ) -> tuple[DiscordDispatcher, _Client, _Sessions]:
-    sessions = _Sessions()
+    sessions = sessions or _Sessions()
     dispatcher = DiscordDispatcher(
         sessions=sessions,  # type: ignore[arg-type]
         ctx_builder=_Context(),  # type: ignore[arg-type]
@@ -550,7 +594,7 @@ async def test_sessions_keyword_filters_beyond_recent_limit() -> None:
 
     text, _ = client.sent[-1]
     assert _picker_labels(client) == ["1. Codex compaction investigation"]
-    assert "Dashboard session search" in text
+    assert "Session search" in text
     assert "for `codex`" in text
 
 
@@ -572,7 +616,7 @@ async def test_sessions_no_match_is_explicit() -> None:
 
     text, components = client.sent[-1]
     assert components is None
-    assert "No dashboard sessions matched `missing topic`" in text
+    assert "No sessions matched `missing topic`" in text
     assert "Try fewer words" in text
     assert "`!sessions`" in text
     assert len(dispatcher._session_pickers) == 0
@@ -586,7 +630,7 @@ async def test_empty_sessions_query_keeps_recent_order_and_discloses_cap() -> No
     await dispatcher.handle_message(_message("!sessions   "))
 
     assert _picker_labels(client) == [f"{index + 1}. Recent session {index}" for index in range(10)]
-    assert "Showing 10 of 12 most recent dashboard sessions" in client.sent[-1][0]
+    assert "Showing 10 of 12 most recent sessions" in client.sent[-1][0]
 
 
 @pytest.mark.asyncio
@@ -613,8 +657,10 @@ async def test_sessions_requires_exactly_one_allowed_user() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sessions_lists_only_persistent_dashboard_sessions_and_redacts() -> None:
+async def test_sessions_lists_dashboard_and_same_dm_generations_only_and_redacts() -> None:
     secret = "ghp_" + "a" * 36
+    prior_key = "discord:kirocrew:direct:u1:gen4"
+    other_user_key = "discord:kirocrew:direct:u2:gen4"
     log = _ConversationLog(
         [
             {
@@ -628,24 +674,114 @@ async def test_sessions_lists_only_persistent_dashboard_sessions_and_redacts() -
                 "memory_mode": "persistent",
             },
             {
+                "key": transcript_stem(prior_key),
+                "title": "Earlier Discord generation",
+                "memory_mode": "persistent",
+            },
+            {
+                "key": transcript_stem(other_user_key),
+                "title": "Another user's Discord session",
+                "memory_mode": "persistent",
+            },
+            {
                 "key": "dashboard_private",
                 "title": "Incognito",
                 "memory_mode": "temporary",
             },
         ],
-        {"dashboard:chat-1": []},
+        {
+            "dashboard:chat-1": [],
+            "discord:kirocrew:direct:u1": [],
+            prior_key: [],
+            other_user_key: [],
+        },
     )
-    dispatcher, client, _ = _dispatcher({"u1"}, log)
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    sessions.channel_keys.update({dispatcher.current_session_key("u1"), prior_key, other_user_key})
 
     await dispatcher.handle_message(_message("!sessions"))
 
     text, components = client.sent[-1]
     buttons = [button for row in components for button in row["components"]]
-    assert "Recent dashboard sessions" in text
-    assert len(buttons) == 1
+    assert "Recent sessions" in text
+    labels = [button["label"] for button in buttons]
+    assert labels[0].startswith("1. Deploy with [REDACTED")
+    assert labels[1:] == [
+        "2. Current Discord session",
+        "3. Earlier Discord generation",
+    ]
     assert buttons[0]["custom_id"].startswith("s:")
     assert secret not in buttons[0]["label"]
     assert "REDACTED" in buttons[0]["label"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_new_does_not_materialize_empty_history_rows() -> None:
+    log = _log()
+    dispatcher, _, sessions = _dispatcher({"u1"}, log)
+
+    await dispatcher.handle_message(_message("!new"))
+    first_key = dispatcher.current_session_key("u1")
+    await dispatcher.handle_message(_message("!new"))
+    second_key = dispatcher.current_session_key("u1")
+
+    assert first_key != second_key
+    assert not log.has_log(first_key)
+    assert not log.has_log(second_key)
+    assert {first_key, second_key} <= sessions.reserved_generations
+
+
+@pytest.mark.asyncio
+async def test_new_generation_survives_restart_before_its_first_turn() -> None:
+    log = _log()
+    dispatcher, _, sessions = _dispatcher({"u1"}, log)
+
+    await dispatcher.handle_message(_message("!new"))
+    new_key = dispatcher.current_session_key("u1")
+
+    restarted, _, _ = _dispatcher({"u1"}, log, sessions=sessions)
+    assert restarted.current_session_key("u1") == new_key
+
+
+@pytest.mark.asyncio
+async def test_new_reports_generation_floor_failure_without_rolling_back() -> None:
+    log = _log()
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    old_key = dispatcher.current_session_key("u1")
+    sessions.reserve_error = OSError("disk unavailable")
+
+    await dispatcher.handle_message(_message("!new"))
+
+    assert dispatcher.current_session_key("u1") != old_key
+    assert "could not be saved for restart" in client.sent[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_native_generation_pick_replaces_only_same_dm_origin_mirrors() -> None:
+    prior_key = "discord:kirocrew:direct:u1:gen4"
+    log = _ConversationLog(
+        [
+            {
+                "key": transcript_stem(prior_key),
+                "title": "Earlier Discord generation",
+                "memory_mode": "persistent",
+            }
+        ],
+        {prior_key: []},
+    )
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    current_key = dispatcher.current_session_key("u1")
+    sessions.channel_keys.update({current_key, prior_key})
+    link = ChannelLink(channel_type="discord", channel_id="c1")
+    sessions.set_mirror_link(current_key, link)
+    sessions.set_mirror_link(prior_key, link)
+
+    await dispatcher.handle_message(_message("!sessions"))
+    custom_id, message_id = _picker_button(client)
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+
+    assert sessions.find_mirror_sessions(link, inbound_only=True) == [prior_key]
+    assert current_key not in sessions.mirror_links
 
 
 @pytest.mark.asyncio
@@ -682,24 +818,36 @@ async def test_binding_claimed_during_header_edit_is_not_overwritten() -> None:
 
 @pytest.mark.asyncio
 async def test_resumed_turn_lands_in_live_dashboard_window() -> None:
-    """A resumed turn must enter the OPEN slot's window, not just disk.
-
-    The dashboard save writes meta + frozen prefix + its own window + foreign
-    tail. A disk-only append made before a later dashboard turn is therefore
-    re-serialized AFTER it and the transcript reads back out of order. Landing
-    the turn in the live window keeps it inside the region the save
-    re-serializes. Mirrors dashboard/cron_inject.py.
-    """
+    """A resumed turn is projected user-first without a new user-row broadcast."""
     log = _log()
     log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": "prior"}]
     dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    durable: list[tuple[str, str, str]] = []
+
+    def _append_if_absent(
+        key: str,
+        role: str,
+        content: str,
+        *,
+        agent: str | None = None,
+        mid: str | None = None,
+    ) -> None:
+        durable.append((role, content, mid or ""))
+
+    log.append_if_absent = _append_if_absent  # type: ignore[attr-defined]
 
     class _Slot:
         def __init__(self) -> None:
-            self.messages: list[tuple[str, str]] = []
+            self.messages: list[dict[str, Any]] = []
+            self.broadcasts: list[tuple[str, bool]] = []
+            self.is_restricted = False
 
-        def append(self, role: str, content: str, cls: str = "", **kw: Any) -> None:
-            self.messages.append((role, content))
+        def append(self, role: str, content: str, cls: str = "", **kw: Any) -> dict[str, Any]:
+            mid = f"m-{len(self.messages) + 1:016x}"
+            row = {"role": role, "content": content, "meta": {"mid": mid}}
+            self.messages.append(row)
+            self.broadcasts.append((role, bool(kw.get("broadcast_user"))))
+            return row
 
     class _State:
         def __init__(self) -> None:
@@ -718,13 +866,93 @@ async def test_resumed_turn_lands_in_live_dashboard_window() -> None:
     await dispatcher.handle_message(_message("!sessions"))
     custom_id, message_id = _picker_button(client)
     await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    pushes_before_turn = state.pushes
     await dispatcher.handle_message(_message("continue here"))
 
     assert sessions.last_key == "dashboard:chat-1"
-    roles = [r for r, _ in state.slot.messages]
-    assert roles == ["user", "assistant"], state.slot.messages
-    assert state.slot.messages[0][1] == "continue here"
-    assert state.pushes >= 1
+    assert [(row["role"], row["content"]) for row in state.slot.messages] == [
+        ("user", "continue here"),
+        ("assistant", "Answer: continue here"),
+    ]
+    assert state.slot.broadcasts == [("user", False), ("assistant", False)]
+    assert durable == [
+        ("user", "continue here", "m-0000000000000001"),
+        ("assistant", "Answer: continue here", "m-0000000000000002"),
+    ]
+    assert state.pushes == pushes_before_turn + 1
+
+
+@pytest.mark.asyncio
+async def test_restricted_resumed_turn_is_neither_projected_nor_persisted() -> None:
+    """Discord had the same two-writer leak as Telegram.
+
+    A resumed ``dashboard:`` key gets its privacy mode from the dashboard slot.
+    Without the caller-side gate Discord projected the turn into that slot (making
+    it dirty for a later flush) and also appended it directly to durable history.
+    Neither path may see content for an incognito or temporary session.
+    """
+    log = _log()
+    log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": "prior"}]
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    durable_before = list(log.messages["dashboard:chat-1"])
+    persist_calls: list[str] = []
+    real_persist = dispatcher._persist_turn
+
+    def _persist(*args: Any, **kwargs: Any) -> None:
+        persist_calls.append(str(args[0]))
+        real_persist(*args, **kwargs)
+
+    dispatcher._persist_turn = _persist  # type: ignore[method-assign]
+
+    class _RestrictedSlot:
+        is_restricted = True
+
+        def __init__(self) -> None:
+            self.messages: list[dict[str, Any]] = []
+
+        def append(self, role: str, content: str, cls: str = "", **kw: Any) -> dict[str, Any]:
+            row = {"role": role, "content": content, "meta": {"mid": f"m-{len(self.messages)}"}}
+            self.messages.append(row)
+            return row
+
+    class _State:
+        def __init__(self) -> None:
+            self.slot = _RestrictedSlot()
+
+        def get_slot(self, name: str) -> Any:
+            return self.slot if name == "chat-1" else None
+
+        def push_slots_update(self) -> None:
+            raise AssertionError("a restricted turn must not dirty or push its slot")
+
+    state = _State()
+    dispatcher._session_resume.dashboard_state = state
+
+    await dispatcher.handle_message(_message("!sessions"))
+    custom_id, message_id = _picker_button(client)
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    await dispatcher.handle_message(_message("private continuation"))
+
+    assert sessions.last_key == "dashboard:chat-1"
+    assert state.slot.messages == []
+    assert persist_calls == []
+    assert log.messages["dashboard:chat-1"] == durable_before
+
+
+@pytest.mark.asyncio
+async def test_discord_restricted_decision_allows_unknown_but_denies_live_slot() -> None:
+    """Cold ordinary resumes keep history; an affirmative live restriction wins."""
+    dispatcher, _, _ = _dispatcher({"u1"}, _log())
+
+    dispatcher._session_resume.dashboard_state = SimpleNamespace(
+        sessions=None, get_slot=lambda _name: SimpleNamespace(is_restricted=True)
+    )
+    assert await dispatcher._session_restricted("dashboard:chat-1") is True
+
+    dispatcher._session_resume.dashboard_state = SimpleNamespace(
+        sessions=None, get_slot=lambda _name: None
+    )
+    assert await dispatcher._session_restricted("dashboard:missing") is False
 
 
 @pytest.mark.asyncio
@@ -740,7 +968,11 @@ async def test_mirrored_turn_persists_idempotently() -> None:
 
     class _State:
         def get_slot(self, name: str) -> Any:
-            return type("S", (), {"append": lambda *a, **k: None})()
+            return type(
+                "S",
+                (),
+                {"append": lambda *a, **k: None, "is_restricted": False},
+            )()
 
         def push_slots_update(self) -> None:
             return None

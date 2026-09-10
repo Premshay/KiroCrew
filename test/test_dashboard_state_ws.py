@@ -961,6 +961,11 @@ class TestOwnerSourceStatusTransport:
             owner_messages[0]["gitlabHostsGeneration"]
             == dash_messages[0]["gitlabHostsGeneration"]
         )
+        assert isinstance(owner_messages[0]["governanceGeneration"], int)
+        assert (
+            owner_messages[0]["governanceGeneration"]
+            == dash_messages[0]["governanceGeneration"]
+        )
 
     def test_owner_sockets_still_receive_non_slot_broadcasts(
         self, state: DashboardState, monkeypatch
@@ -1069,6 +1074,10 @@ class TestOwnerSourceStatusTransport:
         # connect-time frame carries the folder tree — the frame that fixes the
         # first-paint flicker (#4127).
         state._folders = [{"id": "f1", "name": "Work", "order": 0}]
+        # The snapshot is really dumped now (offender-note seam), so every
+        # frame field must be JSON-serializable — a bare MagicMock return
+        # value no longer slips through a fake send_json unserialized.
+        state.folders_generation.return_value = 7
 
         class Request(dict):
             def __init__(self) -> None:
@@ -1100,6 +1109,11 @@ class TestOwnerSourceStatusTransport:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self
@@ -1220,6 +1234,11 @@ class TestOwnerSourceStatusTransport:
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
 
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
+
             def __aiter__(self):
                 return self
 
@@ -1333,6 +1352,11 @@ class TestPeriodicCheckStatusRefresh:
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
 
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
+
             def __aiter__(self):
                 return self
 
@@ -1413,6 +1437,11 @@ class TestPeriodicCheckStatusRefresh:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self
@@ -1524,6 +1553,11 @@ class TestPeriodicCheckStatusRefresh:
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
 
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
+
             def __aiter__(self):
                 return self
 
@@ -1583,6 +1617,11 @@ class TestPeriodicCheckStatusRefresh:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self
@@ -1651,6 +1690,11 @@ class TestPeriodicCheckStatusRefresh:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self
@@ -1731,6 +1775,11 @@ class TestPeriodicCheckStatusRefresh:
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
 
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
+
             def __aiter__(self):
                 return self
 
@@ -1806,6 +1855,11 @@ class TestPeriodicCheckStatusRefresh:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self

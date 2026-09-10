@@ -737,7 +737,6 @@ class TestStartKiroRuntimeResume:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         # _model is a real string (not a MagicMock) so the DEFAULT_MODEL guard
         # in _start_kiro_runtime compares correctly.
@@ -781,8 +780,12 @@ class TestStartKiroRuntimeResume:
         runtime.create_session.assert_not_awaited()
         args = runtime.load_session.await_args.args
         loaded_path, loaded_sid = args[0], args[1]
-        # First positional is the full transcript path, never the bare sid.
-        assert loaded_path.endswith("/.kiro/sessions/cli/abc-123.json")
+        # First positional is the full transcript path under kiro-cli's session
+        # store -- wherever the resolver says that is (the test floor pins it) --
+        # never the bare sid.
+        from kiro_crew.config.paths import kiro_sessions_dir
+
+        assert loaded_path == str(kiro_sessions_dir() / "abc-123.json")
         assert loaded_path != "abc-123"
         # Second positional is the original sid, adopted as the resumed sessionId.
         assert loaded_sid == "abc-123"
@@ -890,7 +893,6 @@ class TestKiroStartupMetric:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         provider._client._resume_session_id = ""
         provider._client._model = model
@@ -976,7 +978,6 @@ class TestFixBDeadRuntimeRespawn:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         provider._client._model = "auto"
         return provider
@@ -1133,7 +1134,6 @@ class TestStartKiroRuntimeModelEntitlement:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         provider._client._model = model
         provider._client._resume_session_id = ""  # straight to create_session

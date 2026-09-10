@@ -818,7 +818,7 @@ class TaskRunner:
             run.status = "planned"
             await self._apersist_runs()
 
-        self._grant_run_trust(run, bool(auto_approve))
+        await self._grant_run_trust(run, bool(auto_approve))
         await self._apersist_runs()
 
         self._agent = agent
@@ -933,7 +933,7 @@ class TaskRunner:
         run.task_id = task_id
         run.name = name or auto_name(spec_content, str(spec_path))
         run.work_dir = str(task_dir)
-        self._grant_run_trust(run, bool(auto_approve))
+        await self._grant_run_trust(run, bool(auto_approve))
         self._runs[task_id] = run
         watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
         history_key = f"taskrunner:run:{spec_path.stem}"
@@ -1439,18 +1439,31 @@ class TaskRunner:
         # down (one kiro-cli process for the whole run).
         await self._release_run_runtime(run)
 
-    def _grant_run_trust(self, run: Project, enabled: bool) -> None:
+    async def _grant_run_trust(self, run: Project, enabled: bool) -> None:
         """Single owner of per-run trust — sets the persisted UI intent flag AND
         the authoritative SafetyOverride scoped grant together, so the two
         representations can never diverge at a call site. Enable activates an
         audited, TTL-bounded scoped grant; disable revokes it.
+
+        Async, and both halves are offloaded: each writes a SEL event, and arming
+        additionally consults the ``approval_modes`` policy. Both callers are async
+        methods, so running either inline put that filesystem work on the gateway's
+        event loop.
+
+        The flag is set FROM the activation result, never ahead of it. Arming can
+        now be refused -- an ``approval_modes`` deny of ``yolo`` disables scoped
+        grants too -- and assigning the flag first meant a refused arm still
+        persisted and reported ``auto_approve: True`` with no authoritative grant
+        behind it. That is the exact divergence this function exists to prevent,
+        so the refusal has to reach the flag.
         """
-        run.auto_approve = bool(enabled)
         scope = _auto_approve_scope(run.task_id)
-        if run.auto_approve:
-            safety_override().activate_scoped(scope, source="dashboard")
+        if enabled:
+            result = await asyncio.to_thread(safety_override().activate_scoped, scope, "dashboard")
+            run.auto_approve = bool(result.active)
         else:
-            safety_override().deactivate_scope(scope)
+            await asyncio.to_thread(safety_override().deactivate_scope, scope)
+            run.auto_approve = False
 
     async def _release_run_runtime(self, run: Project) -> None:
         """Kill the run's shared AcpRuntime once (idempotent) at run teardown.
@@ -1541,10 +1554,25 @@ class TaskRunner:
         run = self._resolve_task(task_id)
         if not run:
             raise ValueError(f"Run {task_id} not found")
+        # _resolve_task accepts a run NAME as well as the canonical id, but
+        # self._tasks is keyed by the canonical id. Canonicalize before any
+        # lookup, or a name-addressed retry misses the prior background-task
+        # handle, bypasses the finishing guard below, and races the prior
+        # run's finalizer (which is about to remove the worktree).
+        task_id = run.task_id
         if run.status == "running":
             raise ValueError("Cannot retry a running task")
         if run.status in ("cancelling", "pausing"):
             raise ValueError("Cannot retry while cancel is in progress")
+        # The status flips terminal BEFORE the prior run's finally-block
+        # finishes -- git finalize (which removes the worktree) runs after
+        # the terminal status is persisted. A retry accepted in that window
+        # validates a workspace the prior finalizer is about to delete, and
+        # then executes against a missing directory. The background task
+        # handle is the honest signal: refuse while it is still running.
+        prior = self._tasks.get(task_id)
+        if prior is not None and not prior.done():
+            raise ValueError("Cannot retry while the previous run is still finishing")
         for task in run.tasks:
             if task.index >= from_task:
                 task.status = TaskStatus.PENDING
@@ -1563,11 +1591,29 @@ class TaskRunner:
             watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
             try:
                 await self._workflow_rebind(run)
-                if run.branch_name and not Path(run.work_dir).exists():
-                    try:
-                        await git_coord.init_workspace(run)
-                    except Exception:
-                        logger.debug("Git re-init on retry failed", exc_info=True)
+                if run.branch_name and not await git_coord.workspace_is_valid(run):
+                    # Directory-exists alone is not enough: `git worktree
+                    # remove` deregisters and deletes in separate steps, so
+                    # an interrupted finalize() (or the worktree being
+                    # removed out from under the run some other way) can
+                    # leave the directory present but not registered as a
+                    # git worktree -- resuming against it would silently
+                    # dispatch every remaining step against a non-git
+                    # directory while still reporting them completed.
+                    if not await git_coord.reinit_workspace_for_retry(run):
+                        run.status = "failed"
+                        run.error = (
+                            "Task Runner workspace worktree was lost and "
+                            "could not be restored before retry"
+                        )
+                        run.finished_at = time.time()
+                        await self._apersist_runs()
+                        await self._notify(
+                            "❌ Retry failed",
+                            "Workspace could not be restored",
+                            run=run,
+                        )
+                        return
                 await self._notify("\U0001f504 Retrying", f"From task {from_task}", run=run)
                 watchdog_task = asyncio.create_task(self._watchdog_loop(run))
                 await self._execute_tasks(run, history_key)

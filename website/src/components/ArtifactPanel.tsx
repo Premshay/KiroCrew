@@ -17,6 +17,7 @@ import DetailPanel from "./DetailPanel";
 import Clickable from "./Clickable";
 import SelectionToolbar, { type SelectionAction } from "./SelectionToolbar";
 import { SendBtn } from "./ui";
+import ErrorNotice from "./ErrorNotice";
 import {
   ArtifactBodyNative,
   ArtifactBodyIframe,
@@ -25,8 +26,11 @@ import {
 import { useFileArtifactComments } from "./FileArtifactComments";
 import { formatArtifactCommentsMessage } from "./CommentOverlay";
 import { copyToClipboard } from "../utils/clipboard";
+import { safeSetItem } from "../utils/safeStorage";
+import { offlineProps } from "../utils/offline";
 import { api } from "../api/client";
 import { useDocumentImeLatch } from "../hooks/useImeGuard";
+import { useArtifactLiveReload } from "../hooks/useArtifactLiveReload";
 import type { Artifact } from "../types";
 
 import { i18nT } from "../i18n/t";
@@ -46,8 +50,18 @@ interface Props {
   active?: boolean;
   /** Mirror of the local-file submit path: sends a formatted USER message to
    *  the chat session the panel was opened from (panel.slot). When omitted the
-   *  submit-to-chat affordance is hidden (read-only embedding). */
-  onSubmitComments?: (message: string) => void;
+   *  submit-to-chat affordance is hidden (read-only embedding). The return is
+   *  an optional delivery verdict: an explicit `false` (or a promise of one)
+   *  means the message was NOT delivered, so the batch must stay pending; any
+   *  other return counts as delivered. */
+  onSubmitComments?: (
+    message: string,
+  ) => void | boolean | Promise<void | boolean>;
+  /** Gateway connection flag. Gates the submit-to-chat affordance (mirrors
+   *  ChatInput's Send gating) so a batch submit can't fire while the chat
+   *  send path would silently refuse it. Defaults true for embeddings
+   *  without a chat send path. */
+  connected?: boolean;
   /** Render as a SidePanel tab body (fills parent, no resize handle/border). */
   embedded?: boolean;
   /** Document tabs stay mounted while hidden. Refresh current artifact content
@@ -57,6 +71,17 @@ interface Props {
 }
 
 const BODY_HEIGHT_STYLE: React.CSSProperties = { height: "100%", minHeight: 0 };
+
+/** Sent-to-chat comment ids for one artifact — see "submitted-to-chat
+ *  tracking" in the component. A corrupt/absent entry reads as "nothing
+ *  sent yet", which only ever over-counts the pending batch. */
+const readSentIds = (key: string): Set<string> => {
+  try {
+    return new Set<string>(JSON.parse(localStorage.getItem(key) || "[]"));
+  } catch {
+    return new Set<string>();
+  }
+};
 // Non-fullscreen sidebar stacks below content (not beside it) and is
 // height-capped so content stays the primary region in the narrow panel.
 const STACKED_SIDEBAR_CLASS =
@@ -74,6 +99,7 @@ function SubmitBar({
   submitting,
   onSubmit,
   bleed = false,
+  connected = true,
 }: {
   count: number;
   submitting: boolean;
@@ -81,6 +107,8 @@ function SubmitBar({
   /** Bleed to the panel edges (non-fullscreen, inside the negative-margin
    *  content wrapper). Fullscreen uses its own padding, so omit it there. */
   bleed?: boolean;
+  /** Gateway connection flag — disables Submit while offline. */
+  connected?: boolean;
 }) {
   const [extraPrompt, setExtraPrompt] = useState("");
   const [showExtraPrompt, setShowExtraPrompt] = useState(false);
@@ -116,7 +144,15 @@ function SubmitBar({
             {i18nT("components.artifactPanel.add_instruction")}
           </button>
         </div>
-        <SendBtn onClick={submit} disabled={submitting}>
+        <SendBtn
+          onClick={submit}
+          disabled={submitting || !connected}
+          {...offlineProps(
+            connected,
+            i18nT("utils.offline.submit_comments"),
+            i18nT("components.artifactPanel.submit"),
+          )}
+        >
           {i18nT("components.artifactPanel.submit")}{" "}
           <Send className="lucide-inline" />
         </SendBtn>
@@ -157,6 +193,7 @@ export default memo(function ArtifactPanel({
   onClose,
   active: visible = true,
   onSubmitComments,
+  connected = true,
   embedded,
   isTabActive = true,
 }: Props) {
@@ -184,6 +221,10 @@ export default memo(function ArtifactPanel({
   });
   const artifact = detailQuery.data;
   const { refetch: refetchArtifact } = detailQuery;
+  // File-backed artifacts: an agent rewriting the backing file never passes
+  // through a handler, so the artifact_update WS event does not fire for it.
+  // Watch the live pointer and refetch through the shared cache instead.
+  useArtifactLiveReload(slug, artifact?.source_path);
   const effectiveKind = artifact?.kind ?? kind;
   const effectiveContent = artifact?.content ?? content;
   const name = artifact?.name ?? slug;
@@ -259,11 +300,32 @@ export default memo(function ArtifactPanel({
     [handleCommentAction, handleCopyAction],
   );
 
-  // Human-only: agent comments are filtered out here AND defensively inside
-  // formatArtifactCommentsMessage (which applies the hardened esc()).
-  const humanComments = useMemo(
-    () => fa.comments.filter((c) => !c.is_agent),
-    [fa.comments],
+  // ── submitted-to-chat tracking ──
+  // Durable artifact comments survive a chat submission (unlike the local-file
+  // pending list, which the submit clears), so without per-id tracking every
+  // Submit would re-send the whole comment history and the "N comments to send"
+  // count would never reset — the bar reads as stuck on the previous batch and
+  // newly added comments are indistinguishable inside the stale total. Sent ids
+  // are persisted per artifact (mirroring the `mc-cmt-read:` key in
+  // useFileArtifactComments) so a slot switch / remount doesn't resurrect an
+  // already-sent batch.
+  // ponytail: append-only like the read-tracking key — ids of since-deleted
+  // comments linger harmlessly (pruning against a possibly-stale comment list
+  // could resurrect sent ids); cross-window sync is on remount only; an edit
+  // to an already-sent comment does not re-queue it.
+  const sentKey = `mc-cmt-sent:${slug}`;
+  const [sentIds, setSentIds] = useState<Set<string>>(() =>
+    readSentIds(sentKey),
+  );
+  // Re-read when the panel is reused for a different artifact.
+  useEffect(() => {
+    setSentIds(readSentIds(sentKey));
+  }, [sentKey]);
+  // Pending = human-authored AND not yet submitted. Agent comments are filtered
+  // out here AND defensively inside formatArtifactCommentsMessage (hardened esc()).
+  const pendingComments = useMemo(
+    () => fa.comments.filter((c) => !c.is_agent && !sentIds.has(c.id)),
+    [fa.comments, sentIds],
   );
   const [submitting, setSubmitting] = useState(false);
   // Tracks the "submitting" reset timer so it can be cancelled on unmount —
@@ -273,19 +335,51 @@ export default memo(function ArtifactPanel({
   const submitResetTimer = useRef<ReturnType<typeof setTimeout>>();
   const submitToChat = useCallback(
     (extraPrompt?: string) => {
-      if (!onSubmitComments || humanComments.length === 0) return;
+      // Bail while offline: the chat send path silently refuses messages in
+      // that state, so firing the fake "submitting" spinner would just mislead.
+      // The Submit button is disabled offline too — this is the backstop.
+      if (!connected || !onSubmitComments || pendingComments.length === 0)
+        return;
       setSubmitting(true);
+      const batch = pendingComments;
+      // The send itself fires synchronously; only the MARKING waits for the
+      // host's delivery verdict. An explicit `false` (or a throw/rejection)
+      // means the chat send was refused, so the batch stays pending and Submit
+      // re-offers it — sent ids are append-only, so marking an undelivered
+      // batch would silently drop it with no re-surface path. A void-returning
+      // host counts as delivered (embeddings without a verdict keep the
+      // clear-on-submit behavior).
+      let verdict: void | boolean | Promise<void | boolean>;
       try {
-        onSubmitComments(
-          formatArtifactCommentsMessage(slug, name, humanComments, extraPrompt),
+        verdict = onSubmitComments(
+          formatArtifactCommentsMessage(slug, name, batch, extraPrompt),
         );
-      } finally {
-        // Brief guard against double-fire.
-        clearTimeout(submitResetTimer.current);
-        submitResetTimer.current = setTimeout(() => setSubmitting(false), 400);
+      } catch {
+        verdict = false;
       }
+      Promise.resolve(verdict)
+        .then((delivered) => {
+          if (delivered === false) return;
+          setSentIds((prev) => {
+            const next = new Set(prev);
+            for (const c of batch) next.add(c.id);
+            safeSetItem(sentKey, JSON.stringify([...next]));
+            return next;
+          });
+        })
+        .catch(() => {
+          /* undelivered — keep the batch pending */
+        })
+        .finally(() => {
+          // Brief guard against double-fire, released after the verdict settles.
+          clearTimeout(submitResetTimer.current);
+          submitResetTimer.current = setTimeout(
+            () => setSubmitting(false),
+            400,
+          );
+        });
     },
-    [onSubmitComments, humanComments, slug, name],
+    [connected, onSubmitComments, pendingComments, slug, name, sentKey],
   );
   useEffect(() => () => clearTimeout(submitResetTimer.current), []);
 
@@ -325,7 +419,7 @@ export default memo(function ArtifactPanel({
 
   // Submit-to-chat is the side-panel analog of the detail page's companion
   // chat. Only rendered when the host actually supplies a submit channel.
-  const showSubmitBar = !!onSubmitComments && humanComments.length > 0;
+  const showSubmitBar = !!onSubmitComments && pendingComments.length > 0;
 
   // `flush` drops the native body's card chrome so a markdown artifact in the
   // side panel looks like a markdown FILE in the side panel — same edge-to-edge
@@ -350,10 +444,15 @@ export default memo(function ArtifactPanel({
           </span>
         </div>
       ) : loadFailed ? (
-        <div className="h-full flex items-center justify-center px-6 text-center text-[13px] text-danger">
-          {i18nT(
-            "components.artifactPanel.couldn_t_load_this_artifact_it_may_have_been_del",
-          )}
+        <div className="h-full flex items-center justify-center px-6">
+          {/* Read failure before anything loaded — nothing in the panel to lose, so the hand-off is on. */}
+          <ErrorNotice
+            askAgent
+            testId="artifact-panel-load-error"
+            message={i18nT(
+              "components.artifactPanel.couldn_t_load_this_artifact_it_may_have_been_del",
+            )}
+          />
         </div>
       ) : effectiveKind === "image" && artifact ? (
         <ArtifactBodyImage
@@ -481,9 +580,10 @@ export default memo(function ArtifactPanel({
           )}
           {showSubmitBar && (
             <SubmitBar
-              count={humanComments.length}
+              count={pendingComments.length}
               submitting={submitting}
               onSubmit={submitToChat}
+              connected={connected}
               bleed
             />
           )}
@@ -597,9 +697,10 @@ export default memo(function ArtifactPanel({
             {showSubmitBar && (
               <div className="shrink-0 px-16 pb-3">
                 <SubmitBar
-                  count={humanComments.length}
+                  count={pendingComments.length}
                   submitting={submitting}
                   onSubmit={submitToChat}
+                  connected={connected}
                 />
               </div>
             )}

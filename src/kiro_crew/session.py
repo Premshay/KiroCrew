@@ -111,6 +111,7 @@ from kiro_crew.acp_backends import selectable_backends
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
+from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     AUTOCOMPACT_PCT_MAX,
@@ -122,6 +123,7 @@ from kiro_crew.config.loader import (
     normalize_agent_model,
     published_autocompact_pct,
 )
+from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.mcp_gateway.abort import schedule_abort
@@ -350,7 +352,7 @@ def _provider_uses_kiro_identity_store(provider: Any) -> bool:
     Reads the capability the object DECLARES (harness-parity H14) rather than
     probing private attributes: ``LLMProvider`` declares it with a safe default of
     False, ``AcpProvider`` / ``AcpSessionProvider`` grant it by membership in
-    ``ACP_BACKENDS_KIRO_IDENTITY_STORE``, and ``AcpRuntime`` declares the same
+    ``backends_retired_by_host_logout()``, and ``AcpRuntime`` declares the same
     property under the same name because the sweep reaches shared runtimes too.
 
     Fails CLOSED on anything that does not declare it -- a test double or a future
@@ -658,7 +660,7 @@ def _opt_out_key(key: str) -> str:
 
 # Background session recycle thresholds (more aggressive than chat compaction)
 _BG_RECYCLE_PCT = 70.0  # recycle at 70% — well before overflow
-_BG_BLIND_RECYCLE_PROMPTS = 40  # recycle after 40 prompts if no metadata
+_BG_BLIND_RECYCLE_PROMPTS = 40  # unconditional backstop: recycle after 40 prompts
 
 # TTL (seconds) for the per-agent model resolution cache. Bounds how long a
 # stale resolution — especially the "auto" miss for an agent whose JSON is
@@ -1023,6 +1025,7 @@ class SessionManager:
             load_watchdog_settings=lambda crew: _load_allocation_watchdog_settings(crew),
             advertised_model_ids=lambda models: advertised_model_ids(models),
             model_is_unusable=lambda model, advertised: model_is_unusable(model, advertised),
+            resolve_pin_spelling=lambda model, advertised: resolve_pin_spelling(model, advertised),
             to_provider_id=lambda model, provider: model_registry.to_provider_id(model, provider),
             to_acp_id=lambda model: model_registry.to_acp_id(model),
             inc_session_created=lambda: Stats().inc_session_created(),
@@ -1110,6 +1113,14 @@ class SessionManager:
         return state
 
     def _cleanup_deps(self) -> CleanupDeps:
+        # Resolved HERE, on the thread that builds the deps, and carried into the
+        # sandbox sweep. That sweep runs on the maintenance pool, and a path a pool
+        # thread resolves for itself is resolved whenever the thread gets scheduled:
+        # under the test suite that is routinely after the test that queued it has
+        # dropped its KIROCREW_HOME pin, so the sweep walked the operator's real
+        # ~/.kiro/crew. The data home does not move during a gateway's life, so
+        # resolving it once at construction loses nothing.
+        data_home = config_dir()
         return CleanupDeps(
             logger=logger,
             get_shutdown_signal=lambda: shutdown_event,
@@ -1117,7 +1128,9 @@ class SessionManager:
             get_subprocess_executor=lambda: subprocess_executor(),
             cleanup_orphaned_mcp_servers=lambda: _cleanup_orphaned_mcp_servers(),
             cleanup_orphaned_session_roots=lambda: cleanup_orphaned_session_roots(),
-            cleanup_stale_sandbox_profiles=lambda: cleanup_stale_sandbox_profiles(),
+            cleanup_stale_sandbox_profiles=lambda: cleanup_stale_sandbox_profiles(
+                data_home=data_home
+            ),
             prune_pycache=lambda: prune_pycache(),
             collect_active_pids=lambda sessions: _collect_active_pids(
                 cast(dict[Any, Any], sessions)
@@ -1878,8 +1891,9 @@ class SessionManager:
           session's subagents (alive for the parent's whole lifetime).
         - ``self._bg_runtime`` — the background runtime backing ``get_bg_session``
           (kirocrew-lite title-gen / memory consolidation), plus any
-          ``_draining_bg_runtimes`` displaced by a backend switch while their
-          handles finish — killing one mid-drain is exactly what parking avoids.
+          ``_draining_bg_runtimes`` displaced by a backend switch or by
+          staleness while their handles finish — killing one mid-drain is
+          exactly what parking avoids.
 
         All are shielded from the sweep by unioning their live PIDs into the
         active set here (mirrors ``_pool_pids``/``_in_flight_pids``). Only alive
@@ -2563,6 +2577,10 @@ class SessionManager:
 
     def find_key_by_sid(self, sid: str) -> str | None:
         return self._session_map.find_key_by_sid(sid)
+
+    def reserve_generation(self, session_key: str) -> None:
+        """Persist a generation floor before its first provider turn."""
+        self._session_map.reserve_generation(session_key)
 
     def max_generation(self, bucket: str) -> int:
         """Highest persisted DM generation for a session bucket (see SessionMap)."""

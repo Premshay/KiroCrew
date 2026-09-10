@@ -13,6 +13,7 @@ import NamespaceScopePanel from '../components/NamespaceScopePanel'
 
 import SimpleSelect from '../../../components/SimpleSelect'
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 function Field({ label, hint, children }: {
   label: string
   hint: string
@@ -71,9 +72,7 @@ export default function SettingsView() {
           </div>
         )}
         {settingsQuery.error && (
-          <div className="mt-6 text-[13px] text-danger">
-            {(settingsQuery.error as Error).message}
-          </div>
+          <ErrorNotice message={(settingsQuery.error as Error).message} askAgent className="mt-6" />
         )}
 
         {data && s && (
@@ -154,10 +153,11 @@ export default function SettingsView() {
           />
         )}
 
+        {/* Every control except the scope panel commits on change
+            (saveMut.mutate in onChange); the scope panel holds its edits until
+            its own Save, so that is the only draft a hand-off would cost. */}
         {saveMut.error && (
-          <div className="mt-3 text-[12.5px] text-danger">
-            {(saveMut.error as Error).message}
-          </div>
+          <ErrorNotice message={(saveMut.error as Error).message} askAgent className="mt-3" />
         )}
       </div>
     </div>

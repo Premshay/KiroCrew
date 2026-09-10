@@ -18,6 +18,11 @@ from pathlib import Path
 
 import pytest
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_ci_surface_tests")
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "ci-surface-tests.py"
 
@@ -337,6 +342,7 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
         "test_sandbox_argv.py",
         "test_sandbox_cc_mode.py",
         "test_sandbox_hardlink_scan.py",
+        "test_sandbox_md_notebook_carveout.py",
         "test_sandbox_nested_tier.py",
         "test_pid_lifecycle.py",
         "test_pid_sweep_helpers.py",

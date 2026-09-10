@@ -3,7 +3,9 @@
 Pins the four seams the member-dispatch mount rides on:
 
 - ``members.member_dispatch_session_server`` — the session-level ``mcpServers``
-  element, carrying strict identity via ``KIROCREW_SESSION_KEY`` in its env.
+  element, carrying strict identity via ``KIROCREW_SESSION_KEY`` in its env
+  plus the gateway's bound port and its ``KIROCREW_HOME`` override, both of
+  which the from-scratch env would otherwise drop.
 - ``kas_agents.to_client_custom_agent(member_dispatch=True)`` — the KAS wire
   projection widening: the server joins ``tools`` and the conductor's
   approval-free dashboard verbs join the ``allowedTools`` input BEFORE the
@@ -68,6 +70,70 @@ class TestMemberDispatchSessionServer:
         entry = member_dispatch_session_server(MEMBER_KEY)
         assert entry is not None
         assert {"name": "KIROCREW_SESSION_KEY", "value": MEMBER_KEY} in entry["env"]
+
+    def test_env_carries_the_exported_bound_port(self, monkeypatch):
+        """A chat session's MCP child inherits the gateway's environment; this
+        entry is built from scratch, so the port has to be handed over
+        explicitly or the child dials the default one."""
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "7779")
+        entry = member_dispatch_session_server(MEMBER_KEY)
+        assert entry is not None
+        assert {"name": "KIROCREW_BOUND_PORT", "value": "7779"} in entry["env"]
+
+    def test_env_falls_back_to_the_serving_resolver(self, monkeypatch):
+        """No export (a gateway started outside the normal path) still yields a
+        port: the serving resolver's remaining order — configured, marker,
+        default — decides it, and the member child inherits that answer instead
+        of re-deriving it without lsof."""
+        from kiro_crew import port_resolution
+
+        monkeypatch.delenv("KIROCREW_BOUND_PORT", raising=False)
+        monkeypatch.setattr(port_resolution, "resolve_serving_port", lambda: 6123)
+        entry = member_dispatch_session_server(MEMBER_KEY)
+        assert entry is not None
+        assert {"name": "KIROCREW_BOUND_PORT", "value": "6123"} in entry["env"]
+
+    def test_port_does_not_displace_the_identity_pair(self, monkeypatch):
+        """Both env pairs, and no KIROCREW_PORT: that name means "the port an
+        operator asked for" and is persisted, so exporting it here would let a
+        transient binding outlive this process."""
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "7779")
+        entry = member_dispatch_session_server(MEMBER_KEY)
+        assert entry is not None
+        names = [pair["name"] for pair in entry["env"]]
+        assert "KIROCREW_SESSION_KEY" in names
+        assert "KIROCREW_BOUND_PORT" in names
+        assert "KIROCREW_PORT" not in names
+
+    def test_env_carries_the_gateway_home_override(self, monkeypatch):
+        """On an install with ``KIROCREW_HOME`` set (a pod, a second profile) the
+        server must resolve THIS gateway from that home. Without the override it
+        would present the member's identity to the default home's gateway, where
+        the member slot does not exist, and every verb would be refused as
+        ``caller_unidentified``. Same helper the managed Crew servers use, so the
+        two cannot drift."""
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "_managed_mcp_env", lambda: {"KIROCREW_HOME": "/pods/x"})
+        entry = member_dispatch_session_server(MEMBER_KEY)
+        assert entry is not None
+        assert {"name": "KIROCREW_HOME", "value": "/pods/x"} in entry["env"]
+        assert {"name": "KIROCREW_SESSION_KEY", "value": MEMBER_KEY} in entry["env"]
+
+    def test_default_install_carries_no_home_override(self, monkeypatch):
+        """No ``KIROCREW_HOME`` override on a default install: the env is exactly
+        the identity pair plus the bound port — byte-identical to before the
+        override was threaded through."""
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "_managed_mcp_env", lambda: {})
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "7779")
+        entry = member_dispatch_session_server(MEMBER_KEY)
+        assert entry is not None
+        assert entry["env"] == [
+            {"name": "KIROCREW_SESSION_KEY", "value": MEMBER_KEY},
+            {"name": "KIROCREW_BOUND_PORT", "value": "7779"},
+        ]
 
     def test_unresolvable_command_degrades_to_none(self, monkeypatch):
         import kiro_crew.agent as agent_mod
@@ -290,15 +356,10 @@ class TestMemberServerJoinsSubtraction:
 class TestSelectProviderBackend:
     """The per-session half of the one backend-selection gate (H3/H13)."""
 
-    def test_explicit_pick_wins(self):
-        from kiro_crew.members import select_provider_backend
-
-        assert select_provider_backend("kas", MEMBER_KEY, "claude", "") == "kas"
-
     def test_member_route(self):
         from kiro_crew.members import select_provider_backend
 
-        assert select_provider_backend(None, MEMBER_KEY, "kas", "") == "kas"
+        assert select_provider_backend(MEMBER_KEY, "kas", "") == "kas"
 
     def test_non_member_gets_the_configured_default_unresolved(self):
         """The default arm passes the configured value through UNCHANGED —
@@ -306,12 +367,12 @@ class TestSelectProviderBackend:
         would be the second check H3 forbids."""
         from kiro_crew.members import select_provider_backend
 
-        assert select_provider_backend(None, "dashboard_abc", "kas", "") == ""
+        assert select_provider_backend("dashboard_abc", "kas", "") == ""
 
     def test_denied_member_backend_degrades_to_kiro(self):
         from kiro_crew.members import select_provider_backend
 
-        assert select_provider_backend(None, MEMBER_KEY, "no-such-backend", "") == ""
+        assert select_provider_backend(MEMBER_KEY, "no-such-backend", "") == ""
 
 
 class TestSessionHistoryWriteProtected:

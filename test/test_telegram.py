@@ -321,6 +321,7 @@ class FakeSessions:
         self.queued: list = []
         self._gp = FakeProvider()
         self.mirror_links: dict[str, Any] = {}
+        self.inbound_keys: set[str] = set()
         self.mirror_opt_outs: set[str] = set()
         self.batch_depth = 0
         self.batched_writes: list[bool] = []
@@ -383,13 +384,32 @@ class FakeSessions:
         return -1
 
     def set_mirror_link(
-        self, key: str, link: Any, *, reason: str = UNBIND_REASON_UNSPECIFIED
+        self,
+        key: str,
+        link: Any,
+        *,
+        accepts_inbound: bool = False,
+        reason: str = UNBIND_REASON_UNSPECIFIED,
     ) -> None:
         self.batched_writes.append(self.batch_depth > 0)
         self.mirror_links[key] = link
+        if accepts_inbound:
+            self.inbound_keys.add(key)
+        else:
+            self.inbound_keys.discard(key)
 
     def get_mirror_link(self, key: str) -> Any:
         return self.mirror_links.get(key)
+
+    def find_mirror_sessions(self, link: Any, *, inbound_only: bool = False) -> list[str]:
+        return [
+            key
+            for key, candidate in self.mirror_links.items()
+            if candidate == link and (not inbound_only or key in self.inbound_keys)
+        ]
+
+    async def aflush(self) -> None:
+        return None
 
     @contextmanager
     def batched_save(self) -> Any:
@@ -411,6 +431,7 @@ class FakeSessions:
 
     def clear_mirror_link(self, key: str, *, reason: str = UNBIND_REASON_UNSPECIFIED) -> bool:
         self.batched_writes.append(self.batch_depth > 0)
+        self.inbound_keys.discard(key)
         return self.mirror_links.pop(key, None) is not None
 
     def clear_mirror_links_at(
@@ -418,6 +439,7 @@ class FakeSessions:
     ) -> list[str]:
         cleared = [key for key, candidate in self.mirror_links.items() if candidate == link]
         for key in cleared:
+            self.inbound_keys.discard(key)
             self.mirror_links.pop(key, None)
         return cleared
 
@@ -2718,6 +2740,61 @@ class TestDispatcher:
         assert sess.failures == []
         # Refused is not leaked -- the session-keyed semaphore still comes back.
         assert sess.released == ["telegram:kirocrew:direct:7"]
+
+    def test_a_shutdown_refusal_is_spooled_for_a_persistent_session(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The durable inbound spool receives the refused message."""
+        from kiro_crew.messaging import inbound_spool as S
+
+        monkeypatch.setattr(S, "data_home", lambda: tmp_path)
+        d, _cli, sess = _dispatcher({7})
+        sess.closing = True
+
+        async def _go() -> None:
+            await d.handle_message(
+                InboundMessage(
+                    channel_type="telegram", user_id="7", conversation_id="7", text="keep me"
+                )
+            )
+
+        asyncio.run(_go())
+
+        spool = tmp_path / "inbound-spool" / "refused.jsonl"
+        assert spool.exists() and "keep me" in spool.read_text(encoding="utf-8")
+
+    def test_a_shutdown_refusal_is_not_spooled_for_a_restricted_session(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """``/incognito`` is a promise that nothing persists, and the spool is a file.
+
+        RED-BEFORE: without the restricted-session gate at the refusal point the
+        private message is written verbatim to ``refused.jsonl``. The same
+        predicate that gates the durable-history write gates this one.
+        """
+        from kiro_crew.messaging import inbound_spool as S
+
+        monkeypatch.setattr(S, "data_home", lambda: tmp_path)
+        d, _cli, sess = _dispatcher({7})
+        sess.closing = True
+
+        async def _restricted(_key: str) -> bool:
+            return True
+
+        monkeypatch.setattr(d, "_session_restricted", _restricted)
+
+        async def _go() -> None:
+            await d.handle_message(
+                InboundMessage(
+                    channel_type="telegram", user_id="7", conversation_id="7", text="my secret"
+                )
+            )
+
+        asyncio.run(_go())
+
+        spool = tmp_path / "inbound-spool" / "refused.jsonl"
+        assert not spool.exists(), "an incognito message was persisted to the spool"
+        assert sess.released == ["telegram:kirocrew:direct:7"], "the refusal must still release"
 
     def test_agent_resolves_to_kirocrew_when_unset(self) -> None:
         # agent=None + empty default_agent must fall back to "kirocrew" so the

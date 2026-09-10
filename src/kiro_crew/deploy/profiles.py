@@ -123,7 +123,12 @@ def locked_registry() -> Generator[dict[str, Any], None, None]:
     # required=True: a lost profile write is silent data loss, so refuse to
     # proceed without cross-process exclusion. flock_compat is a Windows no-op,
     # so this uses platform_compat's real msvcrt lock.
-    with open(lock_path, "w") as fd:
+    # touch + "r+": writable (msvcrt.locking needs it) but NON-TRUNCATING — a
+    # truncating "w" open of a lock file whose first byte another holder already
+    # locked raises a sharing violation on Windows instead of waiting. Full
+    # rationale: work_ledger._open_lock.
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with file_lock(fd.fileno(), exclusive=True, required=True):
             reg = load_registry()
             yield reg
@@ -217,7 +222,10 @@ def load_registry() -> dict[str, Any]:
 def save_registry(reg: dict[str, Any]) -> dict[str, Any]:
     _data_dir().mkdir(parents=True, exist_ok=True)
     lock_path = _registry_path().with_suffix(".lock")
-    with open(lock_path, "w") as fd:
+    # touch + "r+": writable but non-truncating; see locked_registry above and
+    # work_ledger._open_lock for the Windows sharing-violation rationale.
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with file_lock(fd.fileno(), exclusive=True, required=True):
             tmp_fd = tempfile.NamedTemporaryFile(
                 mode="w", dir=str(_data_dir()), suffix=".json.tmp",
@@ -265,22 +273,34 @@ def resolve_profile(requested: str = "") -> tuple[str, str] | None:
 
 # --- discovery (read-only, names only) --------------------------------------
 
-def discover_aws_profiles() -> list[str]:
+def discover_aws_profiles() -> list[str] | None:
     """Profile names known to the AWS CLI (``aws configure list-profiles``).
 
     Names only — the CLI enumerates sections itself; we never read the files.
 
-    On native Windows the sandboxed subprocess backend is unavailable (deploy
-    features are POSIX-only, fail-loud policy) — degrade to an empty list
-    instead of surfacing a sandbox error through the profiles endpoint.
+    ``None`` means could not ask, and it is deliberately not ``[]``. "Asked, and
+    there are none" is a fact about the machine, "could not ask" is a fact about
+    this process, and a caller handed the same empty list for both reports the
+    second as the first. That is not a corner case: ``configure list-profiles``
+    arrived in AWS CLI v2 and exits non-zero on v1, so an ordinary host with
+    profiles configured takes the failing branch, and a route that compares a
+    requested name against an empty set then answers that the operator's own
+    profiles are not on this machine. ``cli_doctor._aws_profile_names`` draws the
+    same line for the doctor report, for the same reason.
+
+    Windows is the other ``None``: the sandboxed subprocess backend deploy needs
+    is POSIX-only (fail-loud policy), so discovery cannot run there rather than
+    running and finding nothing. A caller with something more useful to say about
+    the platform than about the failure branches on ``os.name`` itself, which is
+    how the aws-control listing gets to name WSL.
     """
     if os.name == "nt":
         logger.debug("deploy-web: profile discovery unsupported on Windows")
-        return []
+        return None
     rc, out, err = engine.run_aws(["configure", "list-profiles"], "")
     if rc != 0:
         logger.debug("deploy-web: list-profiles failed: %s", (err or "")[:200])
-        return []
+        return None
     names: list[str] = []
     for line in (out or "").splitlines():
         line = line.strip()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import threading
@@ -23,7 +24,8 @@ from chat_test_helpers import (
     _make_state,
 )
 
-from kiro_crew.acp.types import TurnUsage
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO, TurnUsage
+from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.dashboard.chat_runner import _tool_call_ws_payload
 from kiro_crew.dashboard.state import (
     _MAX_SLOT_MESSAGES,
@@ -824,6 +826,45 @@ class TestBroadcastCompactionResultBackoff:
             c for c in state.broadcast_ws.call_args_list if c.args and c.args[0] == "context_usage"
         ]
 
+    def test_notice_prefixes_pin_the_frontend_parser_contract(self, tmp_path, monkeypatch):
+        """The dashboard folds the compaction row by parsing its TEXT: the
+        frontend (``website/src/pages/chat/CompactionCard.tsx``,
+        ``parseCompactionNotice``) keys on the exact ``✅ Conversation compacted``
+        lead (colon or period) for the folded card and on a ``❌`` lead for the
+        error notice, and the row is tagged ``kind="compaction"`` so the registry
+        can claim it. Nothing else pins the writer side, so a wording change here
+        would silently unfold a multi-KB summary back into a plain notice. This
+        test is that pin — change both sides together."""
+        from kiro_crew.dashboard.chat_utils import _broadcast_compaction_result
+
+        state, slot = self._make_slot_and_state(tmp_path, monkeypatch)
+
+        with_summary = _broadcast_compaction_result(
+            state, slot, self._completed_event("## Goal\nship")
+        )
+        assert with_summary == "\u2705 Conversation compacted: ## Goal\nship"
+        without_summary = _broadcast_compaction_result(state, slot, self._completed_event(""))
+        assert without_summary == "\u2705 Conversation compacted."
+        failed = _broadcast_compaction_result(state, slot, self._failed_event("too large"))
+        assert failed is not None and failed.startswith("\u274c Compaction failed: ")
+
+        tagged = [m for m in slot.messages if m.get("role") == "assistant"]
+        assert tagged and all((m.get("meta") or {}).get("kind") == "compaction" for m in tagged)
+
+    def test_state_notice_glyphs_pin_the_frontend_status_regex(self):
+        """The other half of the same contract: ``state.py`` writes three more
+        ``kind="compaction"`` shapes whose LEAD GLYPH the frontend strips
+        (``STATUS_LEAD_RE`` in ``CompactionCard.tsx``: 🔄 U+1F504, ♻ U+267B,
+        ⏳ U+23F3) and one ⚠-led failure it routes to the error surface. A glyph
+        swap here (⏳ U+23F3 vs ⌛ U+231B was a real review-round slip) would
+        leave a raw emoji beside the card's icon with nothing red on this side."""
+        from kiro_crew.dashboard import state as st
+
+        assert st._AUTO_COMPACT_NOTICE.startswith("\U0001f504 ")
+        assert st._SESSION_RECYCLED_NOTICE.startswith("\u267b\ufe0f ")
+        assert st.stuck_turn_notice(120).startswith("\u23f3 ")
+        assert st._AUTO_COMPACT_FAILED_NOTICE.startswith("\u26a0 Auto-compact failed")
+
 
 @pytest.mark.asyncio
 class TestApiChatDrainOnDisconnect:
@@ -1348,20 +1389,20 @@ class TestSlotDetailPagination:
         """
         state = await self._slot_with_history(tmp_path, monkeypatch, "offloop")
         log = state.conversation_log
-        real = log.read_messages_chained
+        real = log.read_messages_chained_full
         seen: list[int] = []
 
         def recording(key):
             seen.append(threading.get_ident())
             return real(key)
 
-        monkeypatch.setattr(log, "read_messages_chained", recording)
+        monkeypatch.setattr(log, "read_messages_chained_full", recording)
         loop_thread = threading.get_ident()
 
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.get("/api/chat/slots/offloop?limit=5")
             assert resp.status == 200
-        assert seen, "read_messages_chained was never called"
+        assert seen, "read_messages_chained_full was never called"
         assert loop_thread not in seen
 
     @pytest.mark.asyncio
@@ -3623,7 +3664,7 @@ class TestPrepareMessages:
             {"role": "done", "content": ""},
             {"role": "assistant", "content": "hi"},
         ]
-        out = _prepare_messages(msgs, running=False)
+        out = _prepare_messages(msgs, running=False, live_child="")
         roles = [m["role"] for m in out]
         assert "queued" in roles, "queued must be preserved for tab-switch indicator"
         assert "done" not in roles, "done must be stripped"
@@ -3637,7 +3678,7 @@ class TestPrepareMessages:
             {"role": "chunk", "content": "Hel"},
             {"role": "chunk", "content": "lo"},
         ]
-        out = _prepare_messages(msgs, running=True)
+        out = _prepare_messages(msgs, running=True, live_child="")
         assert out[-1]["role"] == "streaming"
         assert "Hel" in out[-1]["content"]
 
@@ -5983,8 +6024,8 @@ class TestRunChatCompactDeferredWait:
 
     @pytest.mark.asyncio
     async def test_claude_backend_skips_wait_for_compaction(self, tmp_path, monkeypatch):
-        """When ``is_claude_backend(client)`` is True, the dashboard must
-        report success immediately and never call ``wait_for_compaction``."""
+        """When the backend compacts INLINE, the dashboard must report success
+        immediately and never call ``wait_for_compaction``."""
         from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
 
         events = [LLMEvent(kind=EVENT_COMPLETE)]
@@ -5993,14 +6034,12 @@ class TestRunChatCompactDeferredWait:
         slot = state.get_or_create_slot("s1")
 
         client = self._make_mock_client(events)
+        # The claude backend finishes compaction inside the prompt turn, so the
+        # double carries that backend's capability record. Set on the client, not
+        # patched at module scope: ``capabilities_of`` serves three call sites in
+        # ``_run_chat`` and patching it would answer for all three.
+        client.capabilities = capabilities_for(ACP_BACKEND_CLAUDE)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        # Patch the binding chat_runner imported at module load.
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: True
-        )
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: False
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -6036,19 +6075,23 @@ class TestRunChatCompactDeferredWait:
     async def test_non_kiro_backend_does_not_enter_deferred_compaction_wait(
         self, tmp_path, monkeypatch
     ):
-        """A backend without Kiro's notification protocol must finish the turn."""
+        """A backend without Kiro's notification protocol must finish the turn.
+
+        Expressed through ``manual_compact_unsupported_backend`` rather than a
+        backend predicate: the runner no longer branches on which harness it is,
+        so a backend outside ``ACP_BACKENDS_COMPACT`` is refused at the pre-turn
+        gate and never reaches the deferred wait at all.
+        """
+        from types import SimpleNamespace
+
         from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
 
         state = self._make_state_for_run_chat(tmp_path, monkeypatch)
         slot = state.get_or_create_slot("s1")
         client = self._make_mock_client([LLMEvent(kind=EVENT_COMPLETE)])
+        client.manual_compact_unsupported_backend = "codex"
+        state.sessions._sessions = {"dashboard:s1": SimpleNamespace(provider=client)}
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
-        )
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: False
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -6112,13 +6155,8 @@ class TestRunChatCompactDeferredWait:
         # (AcpPromptStats.reset_after_compaction) — model that so the
         # end-of-turn payload broadcast reflects the post-compaction state.
         client.context_usage_pct = MagicMock(return_value=0.0)
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
-        )
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: True
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -6161,13 +6199,8 @@ class TestRunChatCompactDeferredWait:
         client.context_usage_pct = MagicMock(return_value=5.0)
         client.context_window_tokens = MagicMock(return_value=1_000_000)
         client.context_used_tokens = MagicMock(return_value=50_000)
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
-        )
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: True
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -6203,13 +6236,8 @@ class TestRunChatCompactDeferredWait:
         client.wait_for_compaction = AsyncMock(return_value={"type": "failed"})
         client.context_window_tokens = MagicMock(return_value=200_000)
         client.context_used_tokens = MagicMock(return_value=150_000)
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
-        )
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: True
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -6253,13 +6281,8 @@ class TestRunChatCompactDeferredWait:
         client.wait_for_compaction = AsyncMock(return_value=result)
         client.context_window_tokens = MagicMock(return_value=200_000)
         client.context_used_tokens = MagicMock(return_value=150_000)
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
-        )
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: True
-        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -6627,25 +6650,23 @@ class TestTokenPersistenceBackfill:
         # 'opus-4.8-1m'. Under the acp label the backfill (correctly) leaves a
         # kiro/acp model unchanged.
         #
-        # The provider is now resolved from the LIVE CLIENT via is_claude_backend,
-        # not from cfg.agent.provider: that field is declared enum=["acp"] and
-        # validate_config_data deletes an out-of-enum value, so no real config can
-        # ever say "claude_code" and this branch was unreachable in production
-        # while the test mocked it green. The client here is a bare AsyncMock, so
-        # the predicate is patched at the seam instead -- a real CC session's
-        # client answers True.
+        # The provider label is resolved from the LIVE CLIENT's
+        # ``SessionCapabilities.provider_seam``, not from cfg.agent.provider: that
+        # field is declared enum=["acp"] and validate_config_data deletes an
+        # out-of-enum value, so no real config can ever say "claude_code" and this
+        # branch was unreachable in production while the test mocked it green. The
+        # client here is a bare AsyncMock, so it is given the claude backend's
+        # record below -- a real CC session's client resolves the same one.
         _cc_cfg = MagicMock()
         _cc_cfg.dashboard.merge_queued_messages = False
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", lambda: _cc_cfg)
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _client: True
-        )
 
         # Build a mock whose inner._model starts EMPTY so the early backfill
         # branch (chat_runner.py:471-476) finds nothing and leaves slot.model
         # blank. Then mutate inner._model mid-stream — just before yielding
         # EVENT_COMPLETE — so only the late backfill branch can populate it.
         client = AsyncMock()
+        client.capabilities = capabilities_for(ACP_BACKEND_CLAUDE)
         client.context_usage_pct = MagicMock(return_value=10.0)
         inner = MagicMock()
         inner._model = ""  # empty at session-create time
@@ -7033,7 +7054,12 @@ class TestPinnedModelWithheld:
     def _client(advertised, *, claude_backend=False):
         client = MagicMock()
         client.available_models = MagicMock(return_value=[{"modelId": m} for m in advertised])
-        client.is_claude_backend = claude_backend
+        # The verdict is skipped for a backend that resolves its wire id from its
+        # OWN advertised list, so the double carries that backend's record rather
+        # than an identity flag.
+        client.capabilities = capabilities_for(
+            ACP_BACKEND_CLAUDE if claude_backend else ACP_BACKEND_KIRO
+        )
         return client
 
     def test_pin_absent_from_advertised_is_withheld(self):
@@ -7082,16 +7108,67 @@ class TestPinnedModelWithheld:
 
         client = MagicMock()
         del client.available_models
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         assert _pinned_model_verdict(client, "claude-opus-5", "acp") is None
 
     def test_getter_raising_keeps_the_pin(self):
         from kiro_crew.dashboard.chat_runner import _pinned_model_verdict
 
         client = MagicMock()
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(side_effect=RuntimeError("boom"))
         assert _pinned_model_verdict(client, "claude-opus-5", "acp") is None
+
+    def test_namespaced_pin_matches_bare_advertised(self):
+        from kiro_crew.dashboard.chat_runner import _pinned_model_verdict
+
+        # Regression #8521: a persisted pin can carry a `<namespace>::<bare-id>`
+        # qualifier from the catalog that advertised it when it was stored,
+        # while the session being judged advertises the BARE id. The literal
+        # comparison missed for every such pin and the banner claimed a fully
+        # supported model "isn't offered right now". The verdict must peel the
+        # qualifier and resolve to runnable — for ANY namespace vocabulary, not
+        # just `agent.provider` (a fixed enum that no catalog qualifies ids
+        # with, so keying on it would leave the fold unreachable).
+        client = self._client(["auto", "z-ai/glm-5.3-flash"])
+        assert _pinned_model_verdict(client, "openrouter::z-ai/glm-5.3-flash", "acp") is False
+
+    def test_namespaced_pin_judged_even_when_provider_unreadable(self):
+        from kiro_crew.dashboard.chat_runner import _pinned_model_verdict
+
+        # _run_chat passes provider_name="" when the config could not be read.
+        # The fold keys on the pin's own qualifier, not on the provider string,
+        # so an unreadable config must not degrade the verdict back to the
+        # false withhold (nor is it needed for the peel to fire).
+        client = self._client(["auto", "z-ai/glm-5.3-flash"])
+        assert _pinned_model_verdict(client, "openrouter::z-ai/glm-5.3-flash", "") is False
+
+    def test_pin_absent_after_peel_is_still_withheld(self):
+        from kiro_crew.dashboard.chat_runner import _pinned_model_verdict
+
+        # The peel must not turn the verdict into a rubber stamp: a pin the
+        # backend serves under NEITHER spelling still answers withheld.
+        client = self._client(["auto", "z-ai/glm-5.3-flash"])
+        assert _pinned_model_verdict(client, "openrouter::no-such-model", "acp") is True
+
+    def test_only_one_qualifier_level_is_peeled(self):
+        from kiro_crew.dashboard.chat_runner import _pinned_model_verdict
+
+        # The fold peels exactly ONE leading qualifier. A doubly-qualified pin
+        # whose innermost tail happens to be advertised is not a spelling of
+        # that model — unbounded stripping would rubber-stamp arbitrary junk
+        # around any advertised id.
+        client = self._client(["auto", "glm-5.3-flash"])
+        assert _pinned_model_verdict(client, "a::b::glm-5.3-flash", "acp") is True
+
+    def test_pin_advertised_verbatim_needs_no_peel(self):
+        from kiro_crew.dashboard.chat_runner import _pinned_model_verdict
+
+        # A backend that advertises the qualified spelling itself matches on
+        # the first (full) comparison — the peel is a miss-only retry, so it
+        # can only clear a false withhold, never create one.
+        client = self._client(["openrouter::z-ai/glm-5.3-flash"])
+        assert _pinned_model_verdict(client, "openrouter::z-ai/glm-5.3-flash", "acp") is False
 
     def test_slot_reports_no_verdict_until_one_is_recorded(self):
         slot = _ChatSlot("s1")
@@ -7108,6 +7185,24 @@ class TestPinnedModelWithheld:
         assert slot.to_dict()["model_withheld"] is True
         slot.record_model_withheld(False)
         assert slot.to_dict()["model_withheld"] is False
+
+    def test_served_model_is_unknown_until_a_session_reports_one(self):
+        slot = _ChatSlot("s1")
+        # Nothing has run, so nothing can name the model a turn would use. The
+        # frontend keeps showing `auto` on this.
+        assert slot.to_dict()["served_model"] == ""
+
+    def test_served_model_is_carried_and_forgotten_with_the_session(self):
+        """It describes the SESSION, so a teardown drops it.
+
+        Unlike the withhold verdict it is not pinned to `slot.model`: an
+        inheriting slot has no pin to pin it to.
+        """
+        slot = _ChatSlot("s1")
+        slot.record_served_model("gpt-5.6-sol")
+        assert slot.to_dict()["served_model"] == "gpt-5.6-sol"
+        slot.record_served_model(None)
+        assert slot.to_dict()["served_model"] == ""
 
     def test_verdict_is_reported_only_for_the_model_it_was_computed_for(self):
         """Re-pinning must invalidate the verdict without anyone remembering to.
@@ -7168,9 +7263,10 @@ class TestPinnedModelWithheld:
                 # returns False when a turn is in flight), so the trailing half is
                 # the wider one.
                 window = "\n".join(lines[max(0, i - 12) : i + 23])
-                assert "record_model_withheld(None)" in window, (
+                assert "forget_session_model_state()" in window, (
                     f"{module.__name__}:{i + 1} replaces the session the withhold "
-                    f"verdict describes without dropping it -> {lines[i].strip()}"
+                    f"verdict and served model describe without dropping them -> "
+                    f"{lines[i].strip()}"
                 )
 
     @pytest.mark.asyncio
@@ -7255,7 +7351,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # The live session advertises the free tier only.
         client.available_models = MagicMock(
             return_value=[{"modelId": "auto"}, {"modelId": "claude-sonnet-5"}]
@@ -7317,6 +7413,63 @@ class TestPinnedModelWithheld:
         assert slot.to_dict()["model_withheld"] is True
 
     @pytest.mark.asyncio
+    async def test_run_chat_records_the_served_model_of_an_unpinned_slot(
+        self, tmp_path, monkeypatch
+    ):
+        """The inheriting slot is the one whose chip has nothing else to name.
+
+        `slot.model == ""` takes the backfill branch (which keeps the slot
+        unpinned on purpose), so the served model must be recorded OUTSIDE the
+        pinned-verdict branch. And it must be read through the provider's public
+        `served_model` accessor: `client` is the AcpProvider wrapper, which has
+        no `_resolved_model_id` — a private-field read would store `""` forever
+        and the chip would keep saying `auto`.
+        """
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        events = [LLMEvent(kind=EVENT_COMPLETE, usage=TurnUsage(input_tokens=3, output_tokens=4))]
+        state = TestTokenPersistenceBackfill._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        slot.model = ""  # inheriting: no pin
+
+        client = AsyncMock()
+        client.context_usage_pct = MagicMock(return_value=10.0)
+        client.is_claude_backend = False
+        client.available_models = MagicMock(
+            return_value=[{"modelId": "auto"}, {"modelId": "gpt-5.6-sol"}]
+        )
+        # The wrapper's public accessor is the ONLY thing that names the served
+        # model; the ACP-private field is not on this shape.
+        client.served_model = "gpt-5.6-sol"
+        del client._resolved_model_id
+        inner = MagicMock()
+        inner._model = ""  # the session still inherits; only the wire was fixed
+        client.client = _arm_inner_client_handlers(inner)
+
+        async def _stream(msg):
+            del msg
+            for ev in events:
+                yield ev
+
+        client.stream = _stream
+        client.stream_command = _stream
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        async def _fake_persist(k, m, e, provider="", **kwargs):
+            del k, m, e, provider, kwargs
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.persist_token_record_async", _fake_persist
+        )
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        assert slot.model == "", "an inheriting slot must stay unpinned"
+        assert slot.to_dict()["served_model"] == "gpt-5.6-sol"
+
+    @pytest.mark.asyncio
     async def test_run_chat_records_an_entitled_pin_as_not_withheld(self, tmp_path, monkeypatch):
         """The false answer must be carried too, not just the withhold.
 
@@ -7340,7 +7493,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # The session serves the replacement the pin normalizes to.
         client.available_models = MagicMock(
             return_value=[{"modelId": "auto"}, {"modelId": "claude-opus-4.6"}]
@@ -7398,7 +7551,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[])  # advertises nothing
         inner = MagicMock()
         inner._model = ""
@@ -7471,7 +7624,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-5"}])
         inner = MagicMock()
         inner._model = ""
@@ -7515,7 +7668,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # This account CAN run the pin, so nothing is withheld.
         client.available_models = MagicMock(
             return_value=[{"modelId": "auto"}, {"modelId": "claude-opus-5"}]
@@ -7570,7 +7723,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-5"}])
         inner = MagicMock()
         inner._model = ""
@@ -7627,7 +7780,7 @@ class TestPinnedModelWithheld:
 
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
-        client.is_claude_backend = False
+        client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(
             return_value=[{"modelId": "auto"}, {"modelId": "claude-sonnet-5"}]
         )
@@ -7677,7 +7830,7 @@ class TestPrepareMessagesInterleaved:
             {"role": "chunk", "content": "streaming"},
         ]
 
-        result = _prepare_messages(messages, running=True)
+        result = _prepare_messages(messages, running=True, live_child="")
 
         # user, assistant, tool, assistant, streaming (collapsed chunks)
         assert len(result) == 5
@@ -7701,7 +7854,7 @@ class TestPrepareMessagesInterleaved:
             {"role": "assistant", "content": "Segment 2", "cls": "msg msg-a"},
         ]
 
-        result = _prepare_messages(messages, running=False)
+        result = _prepare_messages(messages, running=False, live_child="")
 
         assert len(result) == 4
         roles = [m["role"] for m in result]
@@ -7828,7 +7981,19 @@ class TestRuntimeWiring:
         slot.agent = "oncall"
         slot.workspace = "oncall-ws"
         slot.project = "/tmp/oncall"
-        state.sessions.reset = AsyncMock(side_effect=RuntimeError("shutdown blew up"))
+        old = MagicMock()
+        old.has_active_turn.return_value = False
+        state.sessions.get_provider = MagicMock(return_value=old)
+
+        async def _pop_then_raise(*_a, **_k):
+            # The canonical post-pop shape: the provider is deregistered
+            # before the shutdown raises, so the helper's identity probe
+            # classifies the raise as post-pop and the handler answers the
+            # committed switch.
+            state.sessions.get_provider = MagicMock(return_value=None)
+            raise RuntimeError("shutdown blew up")
+
+        state.sessions.reset = AsyncMock(side_effect=_pop_then_raise)
 
         mock_cfg = MagicMock()
         mock_cfg.agents = {"research": MagicMock(workspace="research-ws", memory_store="default")}
@@ -7883,7 +8048,8 @@ class TestRuntimeWiring:
     ):
         """A failed switch never disturbs values written while it was in flight.
 
-        Commit-after-reset means the failure path touches nothing, so state
+        The handler commits before the reset and its failure path touches
+        nothing further, so state
         written by a concurrent actor during the (failing) reset — e.g. the
         project endpoint, which does not take the slot lock — survives
         untouched. Restoring captured priors here (the old rollback shape)
@@ -7905,6 +8071,10 @@ class TestRuntimeWiring:
             raise RuntimeError("shutdown blew up")
 
         state.sessions.reset = AsyncMock(side_effect=_concurrent_switch_lands_then_reset_fails)
+        # No live session was ever registered for the key, so the helper's
+        # identity probe classifies the raise as post-pop and answers the
+        # committed switch rather than a 500.
+        state.sessions.get_provider = MagicMock(return_value=None)
 
         mock_cfg = MagicMock()
         mock_cfg.agents = {"research": MagicMock(workspace="research-ws", memory_store="default")}
@@ -7946,6 +8116,112 @@ class TestRuntimeWiring:
             assert slot.agent == "writer"
             assert slot.workspace == "writing-ws"
             assert slot.project == "/tmp/writing"
+
+    def _patch_agent_resolution(self, monkeypatch):
+        """Stub config + binding resolution so the agent switch reaches its reset."""
+        mock_cfg = MagicMock()
+        mock_cfg.agents = {"research": MagicMock(workspace="research-ws", memory_store="default")}
+        mock_cfg.workspaces = {"research-ws": MagicMock(dir="/tmp/research")}
+        mock_cfg.default_workspace = "default"
+        mock_cfg.default_memory_store = "default"
+        mock_cfg.memory_stores = {}
+        mock_cfg.memory = MagicMock()
+        mock_bindings = MagicMock()
+        mock_bindings.workspace_dir = Path("/tmp/research")
+        mock_bindings.memory_store_name = "default"
+        mock_bindings.model = ""
+        monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", lambda: mock_cfg)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", lambda: mock_cfg
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat.resolve_agent_bindings",
+            lambda cfg, name, project_dir=None: mock_bindings,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
+            lambda cfg, name, project_dir=None: mock_bindings,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat._workspace_name_for_dir",
+            lambda cfg, ws_dir: "research-ws",
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers._workspace_name_for_dir",
+            lambda cfg, ws_dir: "research-ws",
+        )
+
+    @pytest.mark.asyncio
+    async def test_api_chat_slot_agent_reset_raise_before_pop_propagates(
+        self, tmp_path, monkeypatch
+    ):
+        """A raise with the session STILL REGISTERED propagates as a 500.
+
+        The SAME provider instance registered before and after the raise
+        means the failure came BEFORE the session pop (e.g. in the
+        pending-wait unblock): the old session survives on the old agent, so
+        a 200 + warning would report a switch that did not take. The
+        committed values are rolled back before the raise escapes — the
+        acting tab keeps its old store value on a non-2xx, and the probe has
+        proven the surviving session still runs the old binding.
+        """
+        from kiro_crew.providers.base import LLMProvider
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.agent = "oncall"
+        alive = MagicMock(spec=LLMProvider)
+        alive.has_active_turn.return_value = False
+        state.sessions.get_provider = MagicMock(return_value=alive)
+        state.sessions.reset = AsyncMock(side_effect=RuntimeError("pre-pop boom"))
+        self._patch_agent_resolution(monkeypatch)
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
+            assert resp.status == 500
+            assert slot.agent == "oncall"
+
+    @pytest.mark.asyncio
+    async def test_api_chat_slot_agent_reset_raise_with_successor_succeeds(
+        self, tmp_path, monkeypatch
+    ):
+        """A successor registered post-pop is not the unpopped old session.
+
+        A concurrent send can register a SUCCESSOR session for the same key
+        after the pop and before the old session's shutdown raises: the
+        helper's probe compares instance IDENTITY, so a different registered
+        provider still classifies as post-pop — the switch is committed, the
+        successor cold-started from the committed bindings, and the answer is
+        200 + warning.
+        """
+        from kiro_crew.providers.base import LLMProvider
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.agent = "oncall"
+        old = MagicMock(spec=LLMProvider)
+        old.has_active_turn.return_value = False
+        state.sessions.get_provider = MagicMock(return_value=old)
+
+        async def _pop_register_successor_and_raise(*_a, **_k):
+            successor = MagicMock(spec=LLMProvider)
+            successor.has_active_turn.return_value = False
+            state.sessions.get_provider = MagicMock(return_value=successor)
+            raise RuntimeError("shutdown boom")
+
+        state.sessions.reset = AsyncMock(side_effect=_pop_register_successor_and_raise)
+        self._patch_agent_resolution(monkeypatch)
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
+            data = await resp.json()
+            assert resp.status == 200
+            assert data["ok"] is True
+            assert data["agent"] == "research"
+            assert data["warning"] == "old session teardown incomplete"
+            assert slot.agent == "research"
 
     @pytest.mark.asyncio
     async def test_api_chat_slot_agent_success_commit_spares_concurrent_pick(
@@ -8631,6 +8907,56 @@ class TestRuntimeWiring:
         assert all(
             c["kwargs"].get("needs_reinjection") is False for c in build_message_calls
         ), "the flag must be one-shot, not sticky for every later turn"
+
+    @pytest.mark.asyncio
+    async def test_member_first_turn_that_never_lands_rearms_reinjection(
+        self, tmp_path, monkeypatch
+    ):
+        """A member DM's FIRST turn that ends without landing — a user Stop's
+        cancelled completion, an empty stream, a graceful cancel — never enters
+        the except arm, so an except-arm-only re-arm leaves the warm session
+        running WITHOUT [PERMANENT RULES] for the rest of its life. The re-arm
+        must live in the finally, on every exit path."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+
+        from kiro_crew.context import ContextBuilder
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.skills import SkillsLoader
+
+        ctx_builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        monkeypatch.setattr(
+            ctx_builder,
+            "build_message",
+            lambda text, is_new, session_key=None, **kw: (text, MagicMock(action=None, text="")),
+        )
+
+        state = _make_state(tmp_path, context_builder=ctx_builder)
+        slot = state.get_or_create_slot("member-rearm-test", mode="member")
+
+        mock_client = MagicMock()
+        _arm_inner_client_handlers(mock_client.client)
+        # Empty stream: the turn ends with no landing and NO exception — the
+        # same observable shape as a Stop's cancelled completion.
+        mock_client.stream = MagicMock(return_value=AsyncIterator([]))
+        # is_new=True: this is the member session's FIRST turn.
+        state.sessions.get_or_create = AsyncMock(return_value=(mock_client, True, False))
+        state.sessions.get_pid = MagicMock(return_value=None)
+        # The compaction flag is OFF, so only the member condition can re-arm.
+        state.sessions.consume_needs_reinjection = MagicMock(return_value=False)
+        state.sessions.mark_needs_reinjection = MagicMock()
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "first member turn")
+
+        assert state.sessions.mark_needs_reinjection.called, (
+            "a member first turn that never landed must re-arm reinjection on "
+            "EVERY exit path (finally), or the next warm turn runs without the "
+            "member section and its [PERMANENT RULES]"
+        )
 
 
 class TestRunChatToolBoundarySegments:
@@ -10805,7 +11131,7 @@ class TestPythonStageLoop:
     def _isolate_config_dir(self, tmp_path, monkeypatch):
         """Redirect every config_dir used by the stage loop to a per-test tmp dir.
 
-        ``_capture_stage_result`` (in ``chat_orchestrator``) writes stage results
+        ``_write_stage_result`` (in ``chat_orchestrator``) writes stage results
         under ``config_dir() / "sessions" / slot.key``. The orchestrator imports
         ``config_dir`` into its own namespace, so patching only the ``chat`` /
         ``state`` namespaces leaves results writing to the live
@@ -11091,6 +11417,31 @@ class TestPythonStageLoop:
 
         run_chat_mock.assert_not_called()  # queued, not run concurrently with the plan
         assert any(i["content"] == "queued mid-plan" for i in slot._queue)
+
+    @pytest.mark.asyncio
+    async def test_queued_receipt_carries_the_entry_queue_id(self, tmp_path, monkeypatch):
+        """The `queued: true` receipt names the entry it created: `queue_id`
+        must equal the queue entry's id, because the sender binds its pre-send
+        composer state to that id for the cancel-queued restore (#560) — a
+        content-based key cannot do this (serialization is not injective and
+        other tabs can queue colliding content)."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("busy-chat")
+        slot._in_stage_execution = True  # force the busy queue path
+
+        run_chat_mock = AsyncMock()
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", run_chat_mock)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat", json={"message": "queued while busy", "slot": "busy-chat"}
+            )
+            assert resp.status == 200
+            body = await resp.json()
+            assert body.get("queued") is True
+            entry = next(i for i in slot._queue if i["content"] == "queued while busy")
+            assert body.get("queue_id") == entry["id"]
 
     @pytest.mark.asyncio
     async def test_go_button_uses_stage_loop(self, tmp_path, monkeypatch):
@@ -13802,7 +14153,7 @@ class TestRegenerateAndVariants:
         ]
         from kiro_crew.dashboard.chat import _prepare_messages
 
-        prepared = _prepare_messages(slot.messages, False)
+        prepared = _prepare_messages(slot.messages, False, live_child="")
         ai = [m for m in prepared if m.get("role") == "assistant"][0]
         for v in ai["variants"]:
             assert "AKIAIOSFODNN7EXAMPLE" not in v.get("content", "")
@@ -14458,19 +14809,67 @@ class TestForkSlot:
         assert "prompt_len=0" in kw["resources"]
 
     @pytest.mark.asyncio
-    async def test_fork_rejects_ephemeral_slot(self, tmp_path):
+    async def test_fork_of_incognito_parent_inherits_incognito(self, tmp_path):
+        """A restricted session forks; the child is born restricted.
+
+        A refusal would buy no privacy -- the parent's transcript is already on
+        disk for tab recovery -- and would only cost the user the conversation.
+        What must hold is that the child never LOOSENS the mode: it is registered
+        restricted at birth, so consolidation and lessons stay closed to the
+        copied content.
+        """
         state = _make_state(tmp_path)
-        slot = state.get_or_create_slot("src")
-        slot.memory_mode = "incognito"
+        slot = state.get_or_create_slot("src", memory_mode="incognito")
         slot.append("user", "secret", "msg msg-u")
+        slot.append("assistant", "kept between us", "msg msg-a")
         slot.drain()
 
         app = _make_app(state)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post("/api/chat/slots/src/fork", json={})
-            assert resp.status == 400
+            assert resp.status == 200
             data = await resp.json()
-            assert "persistent" in data["error"].lower()
+
+        assert data["ok"] is True
+        assert data["memory_mode"] == "incognito"
+        child = state._slots[data["key"]]
+        assert child.memory_mode == "incognito"
+        assert child.is_restricted is True
+        assert child.blocks_reads is False
+        assert f"dashboard:{data['key']}" in state._restricted_keys
+        assert [m["content"] for m in child.messages] == ["secret", "kept between us"]
+
+    @pytest.mark.asyncio
+    async def test_fork_of_temporary_parent_stays_temporary_with_its_history(self, tmp_path):
+        """Temporary blocks memory READS, not the session's own thread history.
+
+        ``build_session_context`` assembles the thread-history block from the
+        child's conversation log before any ``blocks_reads`` gate, so a temporary
+        fork still hands the copied turns to its fresh kiro-cli process -- the
+        fork is useful, and the child is as blank to memory as its parent.
+        """
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("src", memory_mode="temporary")
+        slot.append("user", "parent question", "msg msg-u")
+        slot.append("assistant", "parent answer", "msg msg-a")
+        slot.drain()
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/chat/slots/src/fork", json={})
+            assert resp.status == 200
+            data = await resp.json()
+
+        child = state._slots[data["key"]]
+        assert child.memory_mode == "temporary"
+        assert child.blocks_reads is True
+        assert f"dashboard:{data['key']}" in state._restricted_keys
+
+        from kiro_crew.dashboard.chat import _history_key_for
+
+        recent = state.conversation_log.recent(_history_key_for(data["key"]))
+        visible = [m["content"] for m in recent if m.get("role") in ("user", "assistant")]
+        assert visible == ["parent question", "parent answer"]
 
     @pytest.mark.asyncio
     async def test_fork_history_visible_to_new_kiro_via_context_builder(self, tmp_path):
@@ -14677,29 +15076,34 @@ class TestForkSlot:
             assert [m["content"] for m in visible] == ["q1", "a1", "q2", "a2"]
 
     @pytest.mark.asyncio
-    async def test_fork_audits_denied_on_ephemeral(self, tmp_path, monkeypatch):
-        """M-1 regression: ephemeral rejection must emit a denied SEL event."""
+    async def test_fork_audit_records_inherited_memory_mode(self, tmp_path, monkeypatch):
+        """The SEL event for a restricted fork is ``allowed`` and names the mode.
+
+        A restricted parent is not a denial ground, but the boundary the child
+        inherited must still be visible in the audit log.
+        """
         from unittest.mock import MagicMock
 
         mock_sel = MagicMock()
         monkeypatch.setattr("kiro_crew.dashboard.chat_fork.sel", lambda: mock_sel)
 
         state = _make_state(tmp_path)
-        slot = state.get_or_create_slot("src")
-        slot.memory_mode = "incognito"
+        slot = state.get_or_create_slot("src", memory_mode="incognito")
         slot.append("user", "hi", "msg msg-u")
         slot.drain()
 
         app = _make_app(state)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post("/api/chat/slots/src/fork", json={})
-            assert resp.status == 400
+            assert resp.status == 200
 
-        mock_sel.log_api_access.assert_called_once()
-        kw = mock_sel.log_api_access.call_args[1]
-        assert kw["operation"] == "chat.slot_fork"
-        assert kw["outcome"] == "denied"
-        assert "memory_mode=incognito" in kw["resources"]
+        calls = [c[1] for c in mock_sel.log_api_access.call_args_list]
+        assert calls, "fork emitted no SEL event"
+        assert all(kw["operation"] == "chat.slot_fork" for kw in calls)
+        assert not [kw for kw in calls if kw["outcome"] == "denied"]
+        allowed = [kw for kw in calls if kw["outcome"] == "allowed"]
+        assert len(allowed) == 1
+        assert "memory_mode=incognito" in allowed[0]["resources"]
 
     @pytest.mark.asyncio
     async def test_fork_app_isolation_rejects_cross_app(self, tmp_path, monkeypatch):
@@ -16528,6 +16932,7 @@ class TestEmptyResponseRetry:
         mock_client = state.sessions.get_or_create.return_value[0]
         mock_client.context_usage_pct = MagicMock(return_value=50.0)
         mock_client.shutdown = AsyncMock()
+        _arm_inner_client_handlers(mock_client.client)
         return state, slot, mock_client, _run_chat
 
     def _make_empty_stream(self, mock_client):
@@ -16540,6 +16945,22 @@ class TestEmptyResponseRetry:
 
         mock_client.stream = _stream
         mock_client.stream_command = _stream
+
+    @staticmethod
+    async def _cancel_background_tasks(state) -> None:
+        """Cancel AND await every task this isolated state spawned.
+
+        `_run_chat` starts title/summary work that is irrelevant to these
+        recovery assertions. A bare `task.cancel()` leaves the coroutine pending
+        until the loop gets another tick, which surfaces as unawaited-coroutine
+        and destroyed-pending-task warnings under xdist. Await the cancellation
+        exactly; never sleep and never let one test's teardown spill into another.
+        """
+        tasks = list(state._background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_first_empty_response_requeues_message(self, tmp_path: Path) -> None:
@@ -16655,8 +17076,7 @@ class TestEmptyResponseRetry:
 
         with patch.object(_ChatSlot, "queue_insert", spy):
             await _run_chat(state, slot, "test message")
-            for _bg_task in list(state._background_tasks):
-                _bg_task.cancel()
+            await self._cancel_background_tasks(state)
 
         # The nudge (NOT the original message) is queued at the front.
         assert (0, _EMPTY_AUTO_CONTINUE_MSG) in calls
@@ -16718,6 +17138,87 @@ class TestEmptyResponseRetry:
         assert slot._empty_response_retries == 0
 
     @pytest.mark.asyncio
+    async def test_productive_giveup_notice_does_not_claim_nothing_happened(
+        self, tmp_path: Path
+    ) -> None:
+        """A PRODUCTIVE turn reaching give-up (its one continuation also ended
+        without a closing reply) must not be described as "returned nothing":
+        the card is read by the model via the transcript, and telling it the
+        completed work produced no output invites a redo of side effects that
+        already landed. Same distinction the continue rung draws one rung up."""
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TOOL_CALL,
+            EVENT_TOOL_RESULT,
+            LLMEvent,
+        )
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        slot._empty_response_retries = 2  # the single continuation is spent
+
+        async def _stream(msg):
+            yield LLMEvent(kind=EVENT_TOOL_CALL, tool_call_id="tc-1", title="send_message")
+            yield LLMEvent(kind=EVENT_TOOL_RESULT, tool_call_id="tc-1", text="sent")
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _stream
+        client.stream_command = _stream
+
+        await _run_chat(state, slot, "test message")
+        await self._cancel_background_tasks(state)
+
+        notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
+        assert notice_msgs, "give-up produced no notice card"
+        assert not any("returned nothing" in m.get("content", "") for m in notice_msgs), (
+            "the give-up card claims the turn produced nothing, but this turn "
+            "ran a tool whose side effects already landed"
+        )
+        assert any("without a closing reply" in m.get("content", "") for m in notice_msgs)
+        # The card reassures rather than inviting a redo: completed steps stay done.
+        assert any("will not re-run" in m.get("content", "") for m in notice_msgs)
+        # Terminal rung still resets the budget for the next genuine user turn.
+        assert slot._empty_response_retries == 0
+
+    @pytest.mark.asyncio
+    async def test_giveup_without_recoveries_drops_retry_claim(self, tmp_path: Path) -> None:
+        """A give-up reached with the recovery counter still at zero (here: a
+        nested depth>0 turn) must not assert that a retry and an auto-continue
+        ran — neither did. The counter is the evidence, not the rung."""
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        self._make_empty_stream(client)
+
+        await _run_chat(state, slot, "test message", _prompt_depth=1)
+
+        notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
+        assert any("returned nothing this turn" in m.get("content", "") for m in notice_msgs)
+        assert not any("retried" in m.get("content", "") for m in notice_msgs), (
+            "the give-up card claims a retry ran, but slot._empty_response_retries "
+            "is still 0 on this path"
+        )
+        assert not any("auto-continued" in m.get("content", "") for m in notice_msgs)
+        assert not any("recovery was attempted" in m.get("content", "") for m in notice_msgs)
+
+    @pytest.mark.asyncio
+    async def test_giveup_after_spent_recoveries_reports_recovery(self, tmp_path: Path) -> None:
+        """When the recovery budget was actually spent (counter exhausted, turn
+        not productive), the card reports that automatic recovery was
+        attempted. Phrased phase-neutrally on purpose: the counter counts
+        budget spent, not which rungs ran."""
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        slot._empty_response_retries = 2  # re-queue + nudge both spent
+        self._make_empty_stream(client)
+
+        await _run_chat(state, slot, "test message")
+
+        notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
+        assert any("automatic recovery was attempted" in m.get("content", "") for m in notice_msgs)
+        # The counter alone cannot prove WHICH rungs ran (a productive turn's
+        # continuation arrives here at 2 with no verbatim retry), so the card
+        # must not name specific recovery phases.
+        assert not any("auto-continued automatically" in m.get("content", "") for m in notice_msgs)
+
+    @pytest.mark.asyncio
     async def test_second_empty_flag_off_shows_notice(self, tmp_path: Path) -> None:
         """With session.empty_response_auto_continue disabled, the second empty
         surfaces the terminal notice immediately (pre-feature behavior)."""
@@ -16736,6 +17237,14 @@ class TestEmptyResponseRetry:
 
         notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
         assert any("returned nothing this turn" in m.get("content", "") for m in notice_msgs)
+        # Counter is 1 here: ONLY the silent verbatim re-queue ran (rung 1's
+        # guard ignores the gate); the auto-continue was forbidden by config.
+        # The card reports budget spent phase-neutrally and must not assert
+        # the auto-continue that provably did not run. This is also the
+        # boundary case for the counter gate: budget WAS spent, so the bare
+        # zero-recoveries wording would be wrong too.
+        assert any("automatic recovery was attempted" in m.get("content", "") for m in notice_msgs)
+        assert not any("auto-continued" in m.get("content", "") for m in notice_msgs)
         assert slot._empty_response_retries == 0
 
     @pytest.mark.asyncio
@@ -16813,6 +17322,472 @@ class TestEmptyResponseRetry:
 
         notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
         assert not any("returned nothing this turn" in m.get("content", "") for m in notice_msgs)
+
+
+class TestProductiveTurnNeverReplaysVerbatim:
+    """A turn that DID work must never have the user's message replayed verbatim.
+
+    ``assistant_text`` is reset at every tool boundary, so a turn that streamed a
+    preamble and then called a tool arrives at the terminal chain with an empty
+    final segment and takes the empty-response branch. Rung 1 of that ladder
+    re-queues the ORIGINAL message, which re-runs every tool call that already
+    completed — a second ``send_message``, a second write, a second PR — and
+    re-derives an answer the user has already read.
+
+    The field incident these tests pin: two consecutive billed turns, each with an
+    assistant preamble and successful tool calls and each ending on a clean
+    ``end_turn``, were both classified empty; the first verbatim-replayed the
+    user's message.
+
+    Reuses ``TestEmptyResponseRetry``'s harness rather than a second one, so a
+    change to how a slot is built cannot leave these tests driving a different
+    runner than the ladder tests beside them.
+    """
+
+    _make_state_and_slot = TestEmptyResponseRetry._make_state_and_slot
+
+    @staticmethod
+    def _spy_queue(monkeypatch=None):
+        """Record ``(index, content)`` for every queue insert."""
+        calls: list[tuple] = []
+        orig = _ChatSlot.queue_insert
+
+        def spy(self_slot, *a, **kw):
+            calls.append(a)
+            return orig(self_slot, *a, **kw)
+
+        return calls, spy
+
+    _cancel_background_tasks = staticmethod(TestEmptyResponseRetry._cancel_background_tasks)
+
+    @staticmethod
+    def _text_then_tool_stream(client, executed):
+        """TEXT -> TOOL_CALL -> TOOL_RESULT -> COMPLETE(end_turn).
+
+        ``executed`` counts dispatches so a replay of the original message would
+        be observable as a second execution rather than only as a queue entry.
+        """
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            EVENT_TOOL_CALL,
+            EVENT_TOOL_RESULT,
+            LLMEvent,
+        )
+
+        async def _stream(msg):
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="checking")
+            executed.append(msg)
+            yield LLMEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="tc-1",
+                title="send_message",
+            )
+            yield LLMEvent(kind=EVENT_TOOL_RESULT, tool_call_id="tc-1", text="sent")
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _stream
+        client.stream_command = _stream
+
+    @staticmethod
+    def _tool_only_stream(client):
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TOOL_CALL,
+            EVENT_TOOL_RESULT,
+            LLMEvent,
+        )
+
+        async def _stream(msg):
+            yield LLMEvent(kind=EVENT_TOOL_CALL, tool_call_id="tc-1", title="send_message")
+            yield LLMEvent(kind=EVENT_TOOL_RESULT, tool_call_id="tc-1", text="sent")
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _stream
+        client.stream_command = _stream
+
+    @staticmethod
+    def _thinking_only_stream(client):
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_THINKING_CHUNK, LLMEvent
+
+        async def _stream(msg):
+            yield LLMEvent(kind=EVENT_THINKING_CHUNK, text="hmm")
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _stream
+        client.stream_command = _stream
+
+    @pytest.mark.asyncio
+    async def test_text_then_tool_turn_continues_instead_of_replaying(self, tmp_path: Path) -> None:
+        """The incident's own shape: preamble + a completed tool call, clean
+        end_turn. The original message must NOT be re-queued; exactly one
+        synthetic continuation may be, and the completed tool must not re-run."""
+        from kiro_crew.dashboard.chat_utils import (
+            _ACTIVITY_NO_REPLY_CONTINUE_MSG,
+            _EMPTY_AUTO_CONTINUE_MSG,
+        )
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        executed: list[str] = []
+        self._text_then_tool_stream(client, executed)
+        calls, spy = self._spy_queue()
+
+        with patch.object(_ChatSlot, "queue_insert", spy):
+            await _run_chat(state, slot, "send the summary")
+            await self._cancel_background_tasks(state)
+
+        # The verbatim replay is the defect. It must be absent.
+        assert (0, "send the summary") not in calls, (
+            "the ORIGINAL user message was re-queued after a turn that already "
+            "ran a tool — the replay re-executes completed side effects"
+        )
+        # Exactly one continuation, and it is the one whose body does not claim
+        # the turn produced nothing (which would invite the model to redo the
+        # completed call).
+        _continuations = [c for c in calls if c and c[1] == _ACTIVITY_NO_REPLY_CONTINUE_MSG]
+        assert len(_continuations) == 1, f"expected one continuation, got {calls}"
+        # The productive turn skipped rung 1 (verbatim replay), so this one
+        # continuation consumes the whole bounded ladder. If the continuation
+        # itself returns empty, it gives up rather than enqueueing a SECOND
+        # continuation whose wording would again invite rework.
+        assert slot._empty_response_retries == 2
+        assert (0, _EMPTY_AUTO_CONTINUE_MSG) not in calls, (
+            "the empty-response body tells the model its turn produced no "
+            "output, which is false for a turn that ran a tool"
+        )
+        # The tool ran once. The queue was not drained in this test, so a second
+        # execution could only come from a replay dispatched inside this turn.
+        assert executed == ["send the summary"], f"tool dispatched more than once: {executed}"
+
+    @pytest.mark.asyncio
+    async def test_tool_only_turn_does_not_replay_verbatim(self, tmp_path: Path) -> None:
+        """A turn with tool calls and no text at all still counts as productive."""
+        from kiro_crew.dashboard.chat_utils import _ACTIVITY_NO_REPLY_CONTINUE_MSG
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        self._tool_only_stream(client)
+        calls, spy = self._spy_queue()
+
+        with patch.object(_ChatSlot, "queue_insert", spy):
+            await _run_chat(state, slot, "post it")
+            await self._cancel_background_tasks(state)
+
+        assert (0, "post it") not in calls, "tool-only turn verbatim-replayed the prompt"
+        assert (0, _ACTIVITY_NO_REPLY_CONTINUE_MSG) in calls
+
+    @pytest.mark.asyncio
+    async def test_thinking_only_turn_does_not_replay_verbatim(self, tmp_path: Path) -> None:
+        """Thinking is work the replay would discard and re-charge for."""
+        from kiro_crew.dashboard.chat_utils import _ACTIVITY_NO_REPLY_CONTINUE_MSG
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        self._thinking_only_stream(client)
+        calls, spy = self._spy_queue()
+
+        with patch.object(_ChatSlot, "queue_insert", spy):
+            await _run_chat(state, slot, "think about it")
+            await self._cancel_background_tasks(state)
+
+        assert (0, "think about it") not in calls, "thinking-only turn verbatim-replayed the prompt"
+        assert (0, _ACTIVITY_NO_REPLY_CONTINUE_MSG) in calls
+
+    @pytest.mark.asyncio
+    async def test_activity_free_turn_keeps_the_verbatim_replay_rung(self, tmp_path: Path) -> None:
+        """The guard is scoped: a GENUINELY activity-free empty turn keeps rung 1.
+
+        Without this, the fix could be 'never replay', which would silently
+        remove the self-heal that a real provider-side empty depends on.
+        """
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        TestEmptyResponseRetry._make_empty_stream(self, client)
+        calls, spy = self._spy_queue()
+
+        with (
+            patch.object(_ChatSlot, "queue_insert", spy),
+            patch(
+                "kiro_crew.dashboard.chat_runner._start_next_queued_turn",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            await _run_chat(state, slot, "test message")
+            await self._cancel_background_tasks(state)
+
+        assert (0, "test message") in calls, "the activity-free replay rung was removed"
+        assert slot._empty_response_retries == 1
+
+
+class TestEmptyTurnDiagnostics:
+    """The empty-response WARNING must name a CLOSED cause, and carry no content.
+
+    The incident it exists for had three attempts with three different causes and
+    one log line that could not tell them apart. These tests assert on the closed
+    vocabulary only — never on a prompt, a response, a tool argument, a path, an
+    identity, a token count or a cost, because asserting on those would pin
+    exactly the leak the diagnostics are designed to avoid.
+    """
+
+    _make_state_and_slot = TestEmptyResponseRetry._make_state_and_slot
+    _cancel_background_tasks = staticmethod(TestEmptyResponseRetry._cancel_background_tasks)
+
+    @staticmethod
+    def _causes(caplog):
+        """The ``cause=`` values of every empty-response warning captured."""
+        out = []
+        for rec in caplog.records:
+            msg = rec.getMessage()
+            if "Empty model response" not in msg:
+                continue
+            for field in msg.split():
+                if field.startswith("cause="):
+                    out.append(field.split("=", 1)[1])
+        return out
+
+    @staticmethod
+    def _fields(caplog):
+        """``key=value`` pairs of the first empty-response warning captured."""
+        for rec in caplog.records:
+            msg = rec.getMessage()
+            if "Empty model response" not in msg:
+                continue
+            return dict(
+                tuple(f.split("=", 1)) for f in msg.split() if "=" in f and not f.startswith("%")
+            )
+        return {}
+
+    def test_the_cause_and_rung_vocabularies_are_closed(self) -> None:
+        """Pure-unit: every cause the classifier can return, from its own inputs.
+
+        Kept as a unit test over ``classify_empty_turn`` rather than seven
+        ``_run_chat`` drives: the ranking between overlapping causes is the part
+        that can regress silently, and a stream fixture cannot express
+        'synthesized terminal AND tool activity' as cleanly as the snapshot can.
+        """
+        from kiro_crew.dashboard.chat_utils import (
+            EMPTY_CAUSE_NO_TERMINAL,
+            EMPTY_CAUSE_OTHER,
+            EMPTY_CAUSE_PROVIDER_EMPTY,
+            EMPTY_CAUSE_SYNTHETIC,
+            EMPTY_CAUSE_THINKING_ONLY,
+            EMPTY_CAUSE_TOOL_ONLY,
+            EMPTY_CAUSE_VISIBLE_PARTIAL,
+            STOP_REASON_ABSENT,
+            EmptyTurnActivity,
+            classify_empty_turn,
+        )
+
+        # No terminal outranks everything, including activity.
+        assert (
+            classify_empty_turn(EmptyTurnActivity(saw_terminal=False, had_tools=True))
+            == EMPTY_CAUSE_NO_TERMINAL
+        )
+        # A synthesized terminal outranks activity: the emptiness is ours.
+        assert (
+            classify_empty_turn(
+                EmptyTurnActivity(saw_terminal=True, terminal_synthetic=True, had_tools=True)
+            )
+            == EMPTY_CAUSE_SYNTHETIC
+        )
+        # A flushed visible segment outranks tools: the user read an answer.
+        assert (
+            classify_empty_turn(
+                EmptyTurnActivity(saw_terminal=True, flushed_visible=True, had_tools=True)
+            )
+            == EMPTY_CAUSE_VISIBLE_PARTIAL
+        )
+        assert (
+            classify_empty_turn(EmptyTurnActivity(saw_terminal=True, had_tools=True))
+            == EMPTY_CAUSE_TOOL_ONLY
+        )
+        assert (
+            classify_empty_turn(EmptyTurnActivity(saw_terminal=True, had_thinking=True))
+            == EMPTY_CAUSE_THINKING_ONLY
+        )
+        # A clean end_turn with nothing at all is the only genuine provider empty.
+        assert (
+            classify_empty_turn(EmptyTurnActivity(saw_terminal=True, stop_reason="end_turn"))
+            == EMPTY_CAUSE_PROVIDER_EMPTY
+        )
+        # An OMITTED stop reason is NOT a provider empty — the distinction the
+        # incident's third attempt needed and did not have.
+        assert (
+            classify_empty_turn(
+                EmptyTurnActivity(saw_terminal=True, stop_reason=STOP_REASON_ABSENT)
+            )
+            == EMPTY_CAUSE_OTHER
+        )
+
+    def test_normalize_stop_reason_never_returns_a_raw_backend_string(self) -> None:
+        """Closed output set, and the ACP spellings it mirrors are pinned.
+
+        ``chat_utils`` may not import ``kiro_crew.acp.types`` (the agent-SDK
+        boundary gate baselines it at one edge and a baselined file may not grow),
+        so it spells the three stop reasons as literals. The test tree is outside
+        that gate, so the pin lives here — a change to the backend's vocabulary
+        reddens here instead of silently reclassifying every turn as ``other``.
+        """
+        from kiro_crew.acp.types import (
+            STOP_REASON_CANCELLED,
+            STOP_REASON_END_TURN,
+            STOP_REASON_REFUSAL,
+        )
+        from kiro_crew.dashboard.chat_utils import (
+            _STOP_CANCELLED_REASON,
+            _STOP_END_TURN,
+            _STOP_REFUSAL,
+            STOP_REASON_ABSENT,
+            STOP_REASON_OTHER,
+            normalize_stop_reason,
+        )
+
+        assert _STOP_END_TURN == STOP_REASON_END_TURN
+        assert _STOP_CANCELLED_REASON == STOP_REASON_CANCELLED
+        assert _STOP_REFUSAL == STOP_REASON_REFUSAL
+
+        assert normalize_stop_reason(None) == STOP_REASON_ABSENT
+        assert normalize_stop_reason("") == STOP_REASON_ABSENT
+        assert normalize_stop_reason(STOP_REASON_END_TURN) == STOP_REASON_END_TURN
+        assert normalize_stop_reason("error: tool stall") == "error"
+        # An invented backend reason is folded, never echoed.
+        _invented = "the model said stop because of /home/someone/secret.txt"
+        assert normalize_stop_reason(_invented) == STOP_REASON_OTHER
+
+    @pytest.mark.asyncio
+    async def test_provider_empty_and_no_terminal_event_report_distinct_causes(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Two turns that look identical to the old log line must not any more."""
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.dashboard.chat_utils import (
+            EMPTY_CAUSE_NO_TERMINAL,
+            EMPTY_CAUSE_PROVIDER_EMPTY,
+        )
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        # A clean end_turn with nothing in it.
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+
+        async def _clean(msg):
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _clean
+        client.stream_command = _clean
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.chat_runner"):
+            await _run_chat(state, slot, "a", _prompt_depth=1)
+        await self._cancel_background_tasks(state)
+        assert self._causes(caplog) == [EMPTY_CAUSE_PROVIDER_EMPTY]
+
+        # A stream that ends without any terminal event at all.
+        caplog.clear()
+        state2, slot2, client2, _run_chat2 = self._make_state_and_slot(tmp_path)
+
+        async def _no_terminal(msg):
+            return
+            yield  # pragma: no cover -- makes this an async generator
+
+        client2.stream = _no_terminal
+        client2.stream_command = _no_terminal
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.chat_runner"):
+            await _run_chat2(state2, slot2, "a", _prompt_depth=1)
+        await self._cancel_background_tasks(state2)
+        assert self._causes(caplog) == [EMPTY_CAUSE_NO_TERMINAL]
+
+    @pytest.mark.asyncio
+    async def test_omitted_stop_reason_is_not_reported_as_provider_empty(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A terminal with no stopReason is its own observation."""
+        from kiro_crew.dashboard.chat_utils import (
+            EMPTY_CAUSE_OTHER,
+            STOP_REASON_ABSENT,
+        )
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+
+        async def _stream(msg):
+            yield LLMEvent(kind=EVENT_COMPLETE)  # no stop_reason
+
+        client.stream = _stream
+        client.stream_command = _stream
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.chat_runner"):
+            await _run_chat(state, slot, "a", _prompt_depth=1)
+        await self._cancel_background_tasks(state)
+
+        assert self._causes(caplog) == [EMPTY_CAUSE_OTHER]
+        assert self._fields(caplog).get("stop_reason") == STOP_REASON_ABSENT
+
+    @pytest.mark.asyncio
+    async def test_productive_turn_reports_visible_partial_and_the_continue_rung(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The incident's shape gets its own cause AND the rung it took.
+
+        Asserting the rung is what makes the diagnostic answer 'what did the
+        runner DO', not only 'what did it see'.
+        """
+        from kiro_crew.dashboard.chat_utils import (
+            EMPTY_CAUSE_VISIBLE_PARTIAL,
+            EMPTY_RUNG_CONTINUE,
+        )
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        TestProductiveTurnNeverReplaysVerbatim._text_then_tool_stream(client, [])
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.chat_runner"):
+            await _run_chat(state, slot, "send the summary")
+            await self._cancel_background_tasks(state)
+
+        assert self._causes(caplog) == [EMPTY_CAUSE_VISIBLE_PARTIAL]
+        _fields = self._fields(caplog)
+        assert _fields.get("rung") == EMPTY_RUNG_CONTINUE
+        assert _fields.get("flushed_visible") == "True"
+        assert _fields.get("tools") == "True"
+
+    @pytest.mark.asyncio
+    async def test_the_warning_carries_no_content_and_no_billing_amounts(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The privacy floor, asserted against the rendered line.
+
+        Every diagnostic value is a bool or a closed constant, so the prompt text,
+        the streamed text, the tool title and the billed amounts must be absent
+        from the line even though the turn carried all of them.
+        """
+        from kiro_crew.acp.types import STOP_REASON_END_TURN, TurnUsage
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            EVENT_TOOL_CALL,
+            LLMEvent,
+        )
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+
+        async def _stream(msg):
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="SECRETPREAMBLE")
+            yield LLMEvent(kind=EVENT_TOOL_CALL, tool_call_id="tc-1", title="SECRETTOOL")
+            yield LLMEvent(
+                kind=EVENT_COMPLETE,
+                stop_reason=STOP_REASON_END_TURN,
+                usage=TurnUsage(credits=4.25, input_tokens=1234, output_tokens=99),
+            )
+
+        client.stream = _stream
+        client.stream_command = _stream
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.chat_runner"):
+            await _run_chat(state, slot, "SECRETPROMPT")
+            await self._cancel_background_tasks(state)
+
+        _line = next(
+            rec.getMessage() for rec in caplog.records if "Empty model response" in rec.getMessage()
+        )
+        for forbidden in ("SECRETPROMPT", "SECRETPREAMBLE", "SECRETTOOL", "4.25", "1234", "99"):
+            assert forbidden not in _line, f"{forbidden!r} leaked into {_line!r}"
+        # Billing presence IS reported — as a bool, which is the point.
+        assert "billed=True" in _line
 
 
 class TestExpandDollarSkills:
@@ -17000,6 +17975,19 @@ class TestRunChatTransientRetry:
     def _client(stream):
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=0.0)
+        # These are sync accessors on the real provider client; _run_chat
+        # calls them without awaiting, so a bare AsyncMock attribute here
+        # would leave an unawaited coroutine per turn.
+        client.context_window_tokens = MagicMock(return_value=0)
+        client.context_used_tokens = MagicMock(return_value=0)
+        client.mcp_session_report = MagicMock(return_value=None)
+        client.pop_pending_oauth_requests = MagicMock(return_value=[])
+        client.available_models = MagicMock(return_value=[])
+        # _drain_session_init_oauth_requests reaches pop_pending_oauth_requests
+        # via client.client (the nested ACP client), not the front client
+        # itself; leaving client.client as a bare AsyncMock attribute would
+        # make that nested lookup resolve to another never-awaited coroutine.
+        client.client = None
         client.stream = stream
         client.stream_command = stream
         # The poisoned-conversation canary reads the session's served model
@@ -18143,6 +19131,33 @@ class TestRunChatModelFallback:
     _TRANSIENT = "Prompt error: {'message': 'Internal error: API Error: Internal server error'}"
 
     @pytest.mark.asyncio
+    async def test_fallback_swap_refreshes_the_served_model_cache(self, tmp_path, monkeypatch):
+        """The swap moves the LIVE session onto the candidate without a spawn,
+        so the spawn-time cache would keep naming the primary; it must follow
+        the provider's served model instead."""
+        from kiro_crew.dashboard.chat_runner import _fallback_swap_for_turn
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._agent_fallback_chain",
+            lambda: ("fallback-model",),
+        )
+        state = self._make_state(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        slot.record_served_model("primary-model")
+
+        class _Client:
+            served_model = "primary-model"
+
+            async def set_model(self, target):
+                self._model = target
+                self.served_model = target
+
+        client = _Client()
+        candidate = await _fallback_swap_for_turn(slot, client)
+        assert candidate == "fallback-model"
+        assert slot.served_model == "fallback-model"
+
+    @pytest.mark.asyncio
     async def test_fallback_swap_serialises_on_the_pick_lock(self, tmp_path, monkeypatch):
         """REGRESSION (GPT finding on c97f2f2d): the swap awaits set_model, and
         an explicit pick landing during that await could be overwritten and
@@ -19216,11 +20231,16 @@ class TestSlotModelLiveSwitch:
         supports_effort: bool = False,
         change_effort: bool = True,
     ):
-        """A live AcpProvider double. ``spec=`` keeps isinstance() working."""
+        """A live AcpProvider double. ``spec=`` keeps isinstance() working.
+
+        Carries the real capability record for the backend it stands in for:
+        ``capabilities_of`` requires a genuine ``SessionCapabilities``, so an
+        attribute-shaped flag on a spec'd mock would claim every capability at once.
+        """
         from kiro_crew.providers.acp import AcpProvider
 
         provider = MagicMock(spec=AcpProvider)
-        provider.is_claude_backend = claude
+        provider.capabilities = capabilities_for(ACP_BACKEND_CLAUDE if claude else ACP_BACKEND_KIRO)
         provider.has_active_turn.return_value = active_turn
         provider.available_models.return_value = [{"modelId": m} for m in models]
         provider.supports_effort.return_value = supports_effort
@@ -19269,10 +20289,12 @@ class TestSlotModelLiveSwitch:
         state.sessions.reset.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_active_turn_falls_back_to_reset(self, tmp_path):
+    async def test_active_turn_answers_409_without_reset(self, tmp_path):
         # Awaiting a response mid-turn would race the streaming prompt loop on
         # stdout for the non-multiplexed client (same hazard the effort handler
-        # documents), so a turn in flight takes the old reset path.
+        # documents), and the old reset fallback tore down the in-flight turn
+        # mid-stream for any programmatic caller. A turn in flight now answers
+        # busy: no live switch, no reset, slot model untouched.
         state = _make_state(tmp_path)
         state.sessions.reset = AsyncMock()
         provider = self._provider(active_turn=True)
@@ -19282,10 +20304,13 @@ class TestSlotModelLiveSwitch:
 
         async with TestClient(TestServer(self._app(state))) as client:
             resp = await client.post("/api/chat/slots/a/model", json={"model": "gpt-5.6-sol"})
+            data = await resp.json()
 
-        assert resp.status == 200
+        assert resp.status == 409
+        assert data["code"] == "turn_in_flight"
         provider.client.set_model.assert_not_awaited()
-        state.sessions.reset.assert_awaited_once()
+        state.sessions.reset.assert_not_awaited()
+        assert state._slots["a"].model == "claude-opus-4.8"
 
     @pytest.mark.asyncio
     async def test_live_switch_failure_falls_back_to_reset(self, tmp_path):
@@ -19795,6 +20820,50 @@ class TestSlotModelSwitchContextBroadcast:
                 "reset": True,
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_live_switch_to_auto_refreshes_the_served_model_cache(self, tmp_path):
+        """REGRESSION (GPT finding on 33ef1122e): ``slot.served_model`` was
+        written only at spawn, so selecting Auto on a warm, preserved session
+        left the concrete id the session was spawned with in the cache and the
+        composer chip kept naming the OLD model as "the default". After the live
+        switch lands the cache follows the provider -- ``""`` here, because
+        AcpProvider collapses the ``auto`` sentinel (chip reads "auto")."""
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(models=("auto", "claude-opus-4.8"))
+        provider.served_model = ""
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        slot = state.get_or_create_slot("a", model="claude-opus-4.8")
+        slot.record_served_model("claude-opus-4.8")
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/a/model", json={"model": "auto"})
+
+        assert resp.status == 200
+        provider.client.set_model.assert_awaited_once_with("auto")
+        state.sessions.reset.assert_not_awaited()
+        assert slot.served_model == ""
+
+    @pytest.mark.asyncio
+    async def test_live_switch_to_a_pin_refreshes_the_served_model_cache(self, tmp_path):
+        # Pin -> pin: the cache names the model the live session runs NOW.
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(models=("auto", "claude-opus-4.8", "gpt-5.6-sol"))
+        provider.served_model = "gpt-5.6-sol"
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        slot = state.get_or_create_slot("a", model="claude-opus-4.8")
+        slot.record_served_model("claude-opus-4.8")
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/a/model", json={"model": "gpt-5.6-sol"})
+
+        assert resp.status == 200
+        provider.client.set_model.assert_awaited_once_with("gpt-5.6-sol")
+        assert slot.served_model == "gpt-5.6-sol"
 
     @pytest.mark.asyncio
     async def test_reset_fallback_broadcasts_token_clearing_event(self, tmp_path):

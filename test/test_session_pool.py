@@ -753,6 +753,40 @@ class TestModelMatchesPoolDefault:
         pooled.client.set_model.assert_not_awaited()
         assert provider is pooled
 
+    @pytest.mark.asyncio
+    async def test_namespaced_pin_resolves_on_claim_like_a_cold_start(self):
+        """#8521: a warm claim must run exactly what a cold start of the pin runs.
+
+        The pin carries a stale `<namespace>::` qualifier while the pooled
+        session advertises the bare id. The cold-start spawn resolves it via
+        resolve_pin_spelling and sends the advertised spelling; withholding it
+        here instead would make whether the pinned model runs depend on whether
+        a pooled process happened to exist — the exact failure class the
+        withhold test above guards from the other direction.
+        """
+        from kiro_crew.providers.acp import AcpProvider
+
+        mgr, factory = _make_manager(pool_agent="kirocrew")
+        pooled = _make_provider()
+        pooled.__class__ = AcpProvider
+        pooled.client = MagicMock()
+        pooled.client.set_model = AsyncMock()
+        pooled.client.resumed = False
+        pooled.client._session_id = "fake-sid"
+        pooled.available_models = MagicMock(return_value=[{"modelId": "z-ai/glm-5.3-flash"}])
+        mgr._drain_and_claim = AsyncMock(return_value=pooled)
+        mgr._schedule_replenish = MagicMock()
+
+        with patch.object(type(mgr), "_resolve_agent_model", return_value="claude-sonnet-4.6"):
+            provider, _is_new, _resumed = await mgr.get_or_create(
+                "test-key", agent="kirocrew", model="openrouter::z-ai/glm-5.3-flash"
+            )
+
+        # Resolved to the ADVERTISED spelling and sent — not withheld, and not
+        # sent under the qualified spelling the backend never advertised.
+        pooled.client.set_model.assert_awaited_once_with("z-ai/glm-5.3-flash")
+        assert provider is pooled
+
 
 # ---------------------------------------------------------------------------
 # Stateless sessions must not claim from pool
@@ -862,8 +896,8 @@ class TestPoolHealthLoop:
 
     @pytest.mark.asyncio
     async def test_keeps_healthy_provider(self):
-        """Healthy provider survives health sweep."""
-        mgr, _ = _make_manager(pool_agent="kirocrew")
+        """Healthy provider at target survives health sweep with no churn."""
+        mgr, _ = _make_manager(pool_size=1, pool_agent="kirocrew")
         healthy = _make_provider()
         mgr._warm_pool.put_nowait((healthy, time.monotonic()))
         mgr._schedule_replenish = MagicMock()
@@ -885,8 +919,8 @@ class TestPoolHealthLoop:
         mgr._schedule_replenish.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_skips_when_pool_empty(self):
-        """No crash when pool is empty during sweep."""
+    async def test_empty_pool_schedules_replenish(self):
+        """Empty pool self-heals: sweep schedules a refill instead of skipping."""
         mgr, _ = _make_manager(pool_agent="kirocrew")
         mgr._schedule_replenish = MagicMock()
 
@@ -901,6 +935,43 @@ class TestPoolHealthLoop:
         with patch("asyncio.sleep", side_effect=_sleep_once):
             with pytest.raises(asyncio.CancelledError):
                 await mgr._pool_health_loop()
+
+        mgr._schedule_replenish.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_under_target_pool_schedules_replenish(self):
+        """A short-but-healthy pool is a deficit: sweep schedules a refill."""
+        mgr, _ = _make_manager(pool_size=3, pool_agent="kirocrew")
+        healthy = _make_provider()
+        mgr._warm_pool.put_nowait((healthy, time.monotonic()))
+        mgr._schedule_replenish = MagicMock()
+
+        await mgr._sweep_warm_pool_once()
+
+        assert mgr._warm_pool.qsize() == 1
+        healthy.shutdown.assert_not_awaited()
+        mgr._schedule_replenish.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_at_target_pool_does_not_replenish(self):
+        """A full healthy pool has no deficit: sweep schedules nothing."""
+        mgr, _ = _make_manager(pool_size=2, pool_agent="kirocrew")
+        for _ in range(2):
+            mgr._warm_pool.put_nowait((_make_provider(), time.monotonic()))
+        mgr._schedule_replenish = MagicMock()
+
+        await mgr._sweep_warm_pool_once()
+
+        assert mgr._warm_pool.qsize() == 2
+        mgr._schedule_replenish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disabled_pool_sweep_is_noop(self):
+        """pool_size=0 keeps the sweep a no-op: no refill for a disabled pool."""
+        mgr, _ = _make_manager(pool_size=0)
+        mgr._schedule_replenish = MagicMock()
+
+        await mgr._sweep_warm_pool_once()
 
         mgr._schedule_replenish.assert_not_called()
 

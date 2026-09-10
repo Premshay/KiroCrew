@@ -50,7 +50,7 @@ from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.history import SESSIONS_DIR_NAME
-from kiro_crew.platform_compat import file_lock, is_link_or_junction
+from kiro_crew.platform_compat import file_lock, is_link_or_junction, open_lock_file
 from kiro_crew.sel import sel
 from kiro_crew.snapshot import snapshot_main
 
@@ -174,8 +174,8 @@ def _locked_state_update(mutate) -> Any:
     """
     lock_path = _state_path().with_suffix(".lock")
     _state_path().parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as fd:
-        with file_lock(fd.fileno(), exclusive=True, required=True):
+    with open_lock_file(lock_path) as fd:
+        with file_lock(fd, exclusive=True, required=True):
             state = _read_state_for_update()
             result = mutate(state)
             write_state(state)
@@ -787,6 +787,27 @@ def run_sessions_backup(
 #: The two Job SDK kinds this app registers. Same strings as ``KIND_*`` so a run
 #: record read by a human names the backup the owner asked for.
 JOB_KINDS = (KIND_SNAPSHOT, KIND_SESSIONS)
+
+
+def kind_unavailable_reason(kind: str) -> str | None:
+    """Why ``kind`` cannot run on THIS platform, or ``None`` when it can.
+
+    The refusal itself is not new -- :func:`run_sessions_backup` has always
+    raised on a platform without descriptor-pinned traversal, and that fail-close
+    is correct and stays. What was missing is a way to ASK before starting: the
+    kind was registered and offered identically everywhere, so on Windows the
+    owner pressed a button and got a ``RuntimeError`` back as a failed run
+    record. A capability question deserves an answer before the work, not an
+    exception after it, so the same condition is readable up front here and the
+    route layer turns it into a stated refusal.
+
+    Returns the prose reason so every surface quotes ONE explanation. Callers
+    must treat a non-``None`` result as "offer this as unavailable", not as an
+    error to log.
+    """
+    if kind == KIND_SESSIONS and not _CAN_PIN_TRAVERSAL:
+        return _NO_PINNING_REASON
+    return None
 
 
 def make_job_runner(sdk: Any, kind: str) -> Any:

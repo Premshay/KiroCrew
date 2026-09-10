@@ -30,13 +30,42 @@ with the theme CSS custom properties or Tailwind classes mapped to them,
 <div className="bg-[var(--card)] text-[var(--card-fg)]" />
 ```
 
-The 54 CSS variables are the single source of truth for color. They are the
+The 56 CSS variables are the single source of truth for color. They are the
 customization surface a theme (built-in, custom, or installed) can set.
+
+**Fills are flat.** The brand system is flat: a new decorative gradient fill
+(`linear-`, `radial-`, or `conic-gradient` used as a background or surface
+color) on chrome, a dialog, or an exported image such as a share card is a UX
+review finding. A fill is one solid token, or the brand purple `#7c3aed` on an
+outward-facing artifact. "Looks premium" is not an exception; a gradient also
+bands under every social platform's re-encode. Functional gradients are not
+fills and are fine: `mask-image` scroll-edge fades, loading shimmer, and the
+streaming glow. So are the shipped gradient mechanisms — the appstore gradient
+art in `components/appstore/gradient.ts` (which reads as content, not chrome)
+and the session `'gradient'` color mode. The UX review lane
+(`.github/workflows/ux-review.yml` and its fork variant) applies this rule.
 Theme blocks in `index.css` also set a few non-color properties that are
 deliberately NOT on the allowlist: the font tokens (`--font-body`, `--mono`)
 and radii are injected as fixed defaults by `buildCustomThemeCss` (fonts are a
 pack-level L1 surface, not per-color-mode data), and the `--search-highlight*`
 trio is an internal find-in-page surface not exposed to theme packs.
+
+**A card must carry its own edge.** `--card` is not guaranteed to differ from
+`--bg`: in `kiro-light` both are `#ffffff`, because the canvas is white and the
+shell (nav rail, sessions list) steps back onto `--panel` instead. So a `bg-card`
+surface that sits directly on the page and has no `border`, `ring`, or `shadow`
+paints nothing visible there — it "works" in every other theme and ships invisible
+in that one, with no gate failing. The rule for a new component: a `bg-card` box on
+`--bg` gets a `border-border`, a `ring-1 ring-border`, or a `shadow-*`, the way the
+top-bar search field and the settings cards already do. The three surfaces that
+deliberately stay borderless (the user bubble, the two top-bar capsules) are
+handled by kiro-light-scoped hooks in `index.css`, and
+`src/test/kiroLightShellHooks.test.ts` pins that list; a new borderless card is a
+fourth hook there, not an unmarked exception. The inverse holds too: a `bg-bg`
+well nested inside a `bg-card` container is the same pair of values seen from the
+other side, so a code or output block that relies on the well being darker than its
+card gets the same `border-border` — and a `hover:bg-card` on a row that sits on
+the page is not a hover at all in this theme; hover states use `bg-bg-hover`.
 
 ## Adding a new color role
 
@@ -72,13 +101,23 @@ otherwise always win and silently ignore the active theme.
 
 | Tier | Surface |
 |---|---|
-| **L0 Color** | the 54 CSS vars (dark + light) |
+| **L0 Color** | the 56 CSS vars (dark + light) |
 | **L1 Brand** | logo, favicon, wordmark, botName, fonts, scoped `overrides.css` |
 | **L2 Experience** | sandboxed overlays, topbar, audio, persona |
 
 Out of contract: app structure/routing, functional-control behavior, security
 chrome, and anything outside the CSS-var set + the `overrides.css` selector
 allowlist.
+
+**L2 overlay stacking.** A pack's `assets.overlays` render inside the dashboard
+shell's own stacking context, strictly below the top bar (`OVERLAY_Z_MAX` in
+`src/lib/themeDecorLayer.ts`, derived from the header's z-indexes), whatever
+`zIndex` the manifest asks for — so a `fullscreen` overlay decorates the chat
+surface but never paints over the header's controls (#7377). The `topbar` asset
+is the opposite by design: it is branding laid OVER the header strip and stays
+above it. The `body::before` / `body::after` idiom in `overrides.css` is not
+covered by this rule: it paints at the document root and therefore over the
+whole shell, header included.
 
 ## Brand identity
 
@@ -319,6 +358,28 @@ because swapping an icon changes the rendered component type and remounts its
 element, and animating the icon itself would restart that animation and desync it
 from the other layer. If your loader swaps artwork on a timer, animate a stable
 wrapper for the same reason.
+
+### Installed packs: custom loader art
+
+`registerThemeBranding()` is compiled-theme only. An **installed pack** (a
+`theme.json` dropped in via Settings) reaches the loader through **files**, not
+code:
+
+- **`loaderIcons`** — the allowlisted stock symbols (Level 1), as above.
+- **`loader/*.png` `.webp` `.gif` `.svg`** — ship your **own images** (Level 1).
+  Ship **one** and it renders on its own; ship **2–8** and the stock carousel
+  cycles them. Animated WebP/APNG/GIF and animated SVG **self-animate** inside
+  the `<img>`, so a single fully-authored loop is a first-class loader. Ordered
+  by filename; each is served with a strict Content-Type + `nosniff` under the
+  sandboxed asset CSP (`default-src 'none'; sandbox`), referenced only as an
+  `<img>`. SVG is safe here for the same reason `logo.svg` is: an `<img>`-loaded
+  SVG runs in the browser's **secure static/animated mode** — scripts disabled,
+  external references not fetched — so it cannot run code or beacon out, while
+  its SMIL/CSS animation still plays. A count outside 1–8 fails install.
+
+Precedence, highest first: compiled `loader` → pack `loader/*` images (one on its
+own, 2–8 cycled) → `loaderIcons` (pack manifest, then compiled) → the default
+mascot pool.
 
 Registration is read at module load (see `src/extensions.ts`); registering after
 the shell has rendered does not take effect until the next theme switch.

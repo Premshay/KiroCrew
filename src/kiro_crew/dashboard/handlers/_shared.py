@@ -64,10 +64,27 @@ def _redact_memory_field(val: object) -> object:
     return val
 
 
+#: The session-search row fields carrying LLM-authored or peer-supplied prose,
+#: which every pass returning such a row must put through
+#: :func:`kiro_crew.security.redact` before egress.
+#:
+#: Three passes return these rows -- ``api_sessions_search``, and
+#: ``api_instances_search_sessions``' local-row and peer-row passes -- and each
+#: would otherwise hand-copy both the redaction chain AND this field list. The
+#: chain already has an owner (``security.redact`` composes the exfiltration-URL
+#: and credential passes in that order); this tuple gives the field list one too,
+#: so a caller cannot redact ``title`` and quietly forget ``snippet``. A missing
+#: field reads as correct at the call site, which is why the list is shared
+#: rather than restated.
+#:
+#: Order is irrelevant; membership is the contract.
+SESSION_SEARCH_TEXT_FIELDS: tuple[str, ...] = ("title", "snippet")
+
+
 # Shared body cap for the small JSON-object endpoints that must bound the
 # request BEFORE decoding (the strict-internal notification routes). Kept
 # module-level and in one place so the security-relevant cap cannot drift
-# between the two call sites (issue #490). 64 KB is generous — payload fields
+# between the two call sites. 64 KB is generous — payload fields
 # have their own caps.
 _MAX_BODY_BYTES = 64 * 1024
 
@@ -85,25 +102,24 @@ async def read_bounded_json(
     endpoints routed through it: ``await request.json()`` happily returns a
     list, string, or number for a body that is valid JSON but not an object, and
     a handler that then calls ``.get()`` on the result turns a client mistake
-    into a 500 (issue #5587).
+    into a 500.
 
     NOT yet the dashboard's only such guard. Four siblings survive and diverge:
     ``handlers_channel._json_object`` (same ``invalid_json``/``body_not_object``
     codes, but raises ``HTTPBadRequest`` instead of returning the response),
     ``handlers/hooks.py::_json_object`` (``default_empty=True`` collapses a
-    MALFORMED body to defaults -- the defect this issue fixed in
-    ``api_memory_promote``), ``handlers/session_storage.py::_json_body``
+    MALFORMED body to defaults), ``handlers/session_storage.py::_json_body``
     (deliberately different: an empty body is legitimate there, and it
     documents why), and ``handlers/artifacts.py::_read_json_body`` (raises
     ``ArtifactValidationError``, carries its own cap). Folding or narrowing each
-    is tracked on issue #5587 alongside the remaining handler sweep -- claiming
-    one owner before that is done would be a claim the tree does not support.
+    is still outstanding -- claiming one owner before that is done would be a
+    claim the tree does not support.
 
     The cap is enforced BEFORE decoding: a Content-Length precheck rejects an
     oversized declared body, and the stream is then read incrementally so a
     chunked body (which carries no Content-Length) cannot buffer past
     ``max_bytes + one chunk`` on the event-loop thread. That bound is the point
-    of the helper for the strict-internal notification routes (issue #490).
+    of the helper for the strict-internal notification routes.
 
     ``max_bytes=None`` reads the body whole with no pre-decode ceiling, for the
     endpoints that have no principled byte limit today (a knowledge bundle
@@ -1058,7 +1074,7 @@ def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "")
     *session_key* scopes ``kiro-workspace/`` to the requesting chat slot's
     project. Without it, resolution falls back to the single project shared by
     every slot — and fails closed to ``None`` when open slots disagree, since
-    guessing could read the wrong checkout (#2457).
+    guessing could read the wrong checkout.
 
     The returned path is always under one of the allowed roots — paths
     that try to escape via ``..`` or symlinks are rejected.
@@ -1076,7 +1092,7 @@ def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "")
         # boundary that matters -- an unconsented project skill never reaching the
         # agent's context -- is enforced in SkillsLoader. Uses the permissive
         # resolver so the documented keyless single-project fallback and the
-        # #2457 two-project behaviour stay as they are.
+        # two-project behaviour stay as they are.
         proj = active_project_dir(state, session_key)
         if proj is None:
             return None
@@ -1190,7 +1206,7 @@ def _skill_key_roots(state: DashboardState, session_key: str = "") -> list[tuple
     edition roots) are omitted. *session_key* scopes the ``kiro-workspace/``
     root to the requesting chat slot's project, exactly as
     :func:`_resolve_skill_root` does — the two MUST agree or an enumerated key
-    would not resolve (#2457).
+    would not resolve.
     """
     out: list[tuple[str, Path]] = [("kiro-user/", Path.home() / ".kiro" / "skills")]
     proj = active_project_dir(state, session_key)
@@ -1893,17 +1909,15 @@ async def require_owner_dashboard_request(
     """Owner gate shared across dashboard handler modules.
 
     Returns ``None`` when the caller IS the dashboard owner, allowing the
-    request to proceed.  Otherwise audits the denial via SEL (off-thread so a
-    first-process SEL construction cannot stall the event loop), checks for
-    a stale pre-owner bootstrap subject (relabelling the denial to a 401), and
-    falls back to a 403 with the standard ``owner_only`` code.
+    request to proceed.  Otherwise audits the denial via SEL (an enqueue —
+    the singleton is warmed at startup, see ``sel.warm_sel_singleton``),
+    checks for a stale pre-owner bootstrap subject (relabelling the denial
+    to a 401), and falls back to a 403 with the standard ``owner_only`` code.
 
     Imports ``is_owner_dashboard_request`` and ``stale_owner_session_response``
     inside the function body to avoid a circular import: ``source_providers``
     imports chat-state helpers that reach back into sibling handler modules.
     """
-    import asyncio
-
     from kiro_crew.dashboard.handlers.source_providers import (
         is_owner_dashboard_request,
     )
@@ -1911,21 +1925,20 @@ async def require_owner_dashboard_request(
     if is_owner_dashboard_request(request):
         return None
 
-    # Off the loop: the FIRST sel() of a process CONSTRUCTS the log (trust-dir
-    # creation, key validation — blocking file IO), so on a fresh gateway whose
-    # first mutating request is non-owner this would stall every other request.
+    # SEL is warmed at gateway startup (sel.warm_sel_singleton), so this
+    # ``log_api_access`` only enqueues to the writer thread — no thread hop
+    # needed. Guarded because a FAILED warm leaves construction to
+    # retry here and possibly raise.
     caller = str(request.get("user") or "unknown")
     try:
         from kiro_crew.sel import sel as _sel
 
-        await asyncio.to_thread(
-            lambda: _sel().log_api_access(
-                caller=caller,
-                operation=operation,
-                outcome="denied",
-                source="dashboard",
-                resources="non_owner_block",
-            )
+        _sel().log_api_access(
+            caller=caller,
+            operation=operation,
+            outcome="denied",
+            source="dashboard",
+            resources="non_owner_block",
         )
     except Exception:  # pragma: no cover - audit must never change the outcome
         logger.debug("SEL audit for non-owner %s failed", operation, exc_info=True)

@@ -29,6 +29,12 @@ from kiro_crew.vector_memory import (
     _tokenize,
 )
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_vector_memory")
+
 
 class TestSemanticCRUD:
     def test_set_and_get(self, tmp_path: Path) -> None:
@@ -2126,6 +2132,141 @@ class TestEmbeddingDimPlumbing:
         assert captured_kwargs.get("embedding_dim") == 384
 
 
+class TestDedupThresholdPlumbing:
+    """`memory.episodic_dedup_threshold` must reach the store it configures.
+
+    The loader parses the key into ``MemorySection``; before #8903 no production
+    ``VectorMemoryStore(...)`` site passed it on, so the store always used
+    ``_DEFAULT_DEDUP_THRESHOLD`` and the documented knob was inert regardless of
+    faiss (the separate faiss gating of the cosine check is #4738's concern, not
+    this one). These tests pin the plumbing only — no embedding or index needed.
+    """
+
+    # Production stores whose episodic writes reach the inline similarity check
+    # (history consolidation, migrate_from_markdown, import_memory). Deferred
+    # writers (ledger_index, onboarding_import) skip that check by contract and
+    # the bench harness (eval/bench/ingest.py) supplies its own sweep value, so
+    # neither is required to plumb the config key.
+    _PLUMBED_SITES = (
+        "slack/gateway.py",
+        "cli_server.py",
+        "dashboard/handlers/memory.py",
+    )
+
+    def test_dashboard_fallback_passes_dedup_threshold(self, tmp_path: Path, monkeypatch) -> None:
+        """The dashboard standalone fallback builds a store carrying cfg's value."""
+        from unittest.mock import MagicMock
+
+        import kiro_crew.dashboard.handlers.memory as mem_mod
+
+        mock_cfg = MagicMock()
+        mock_cfg.memory.embedding_dim = 1024
+        mock_cfg.memory.decay_rates = {}
+        # Deliberately NOT 0.88: a test written against the default would pass
+        # against the module constant even with nothing plumbed.
+        mock_cfg.memory.episodic_dedup_threshold = 0.42
+
+        built: list[VectorMemoryStore] = []
+
+        class TmpPathStore(VectorMemoryStore):
+            """Real store (so __init__ stores the value) on a throwaway db."""
+
+            def __init__(self, **kwargs):
+                kwargs.setdefault("db_path", tmp_path / "dashboard.db")
+                super().__init__(**kwargs)
+                built.append(self)
+
+            def init(self) -> None:  # sqlite/migrations are not what this pins
+                return None
+
+        import kiro_crew.config.loader as loader_mod
+        import kiro_crew.vector_memory as vm_mod
+
+        mock_config_cls = MagicMock()
+        mock_config_cls.load.return_value = mock_cfg
+        monkeypatch.setattr(loader_mod, "KiroCrewConfig", mock_config_cls)
+        monkeypatch.setattr(vm_mod, "VectorMemoryStore", TmpPathStore)
+
+        mock_memory = MagicMock()
+        mock_memory.vector_store = None
+        monkeypatch.setattr(mem_mod, "_get_memory", lambda state: mock_memory)
+
+        fresh_state = type("FreshState", (), {})()
+        mem_mod._get_vector_store(fresh_state)
+
+        assert len(built) == 1, "fallback did not construct the standalone store"
+        assert built[0]._dedup_threshold == 0.42
+
+    @staticmethod
+    def _find_unplumbed_sites(tree, where: str = "") -> list[str]:
+        """Report every ``VectorMemoryStore(...)`` call that drops the key.
+
+        Structural rather than behavioural for the gateway and `kirocrew run`:
+        both construct inside long async bootstraps (`_init_services`,
+        `_run_task`) that cannot be driven in a unit test without mocking the
+        whole service graph, and the regression this guards is a missing
+        keyword at a call site.
+        """
+        import ast
+
+        violations: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name != "VectorMemoryStore":
+                continue
+            kw = next((k for k in node.keywords if k.arg == "dedup_threshold"), None)
+            if kw is None:
+                violations.append(
+                    f"{where}line {node.lineno}: VectorMemoryStore(...) omits "
+                    "dedup_threshold — pass memory.episodic_dedup_threshold (#8903)"
+                )
+                continue
+            if not ast.unparse(kw.value).endswith("memory.episodic_dedup_threshold"):
+                violations.append(
+                    f"{where}line {node.lineno}: dedup_threshold is not bound to "
+                    f"memory.episodic_dedup_threshold (got {ast.unparse(kw.value)!r})"
+                )
+        return violations
+
+    def test_production_sites_pass_the_configured_threshold(self) -> None:
+        import ast
+        import inspect
+        from pathlib import Path as _Path
+
+        import kiro_crew
+
+        pkg_root = _Path(inspect.getfile(kiro_crew)).parent
+        violations: list[str] = []
+        for rel in self._PLUMBED_SITES:
+            src = pkg_root / rel
+            assert src.is_file(), f"construction site moved: {rel}"
+            tree = ast.parse(src.read_text(encoding="utf-8"))
+            violations.extend(self._find_unplumbed_sites(tree, where=f"{rel}:"))
+        assert not violations, "config key never reaches the store:\n" + "\n".join(violations)
+
+    def test_guard_catches_a_seeded_violation(self) -> None:
+        """The guard must flag both failure shapes and stay quiet on the good
+        one — otherwise a refactor could silently disarm it."""
+        import ast
+
+        seeded = ast.parse(
+            "a = VectorMemoryStore(embedding_dim=1024)\n"
+            "b = VectorMemoryStore(dedup_threshold=0.88)\n"
+            "c = VectorMemoryStore(dedup_threshold=cfg.memory.episodic_dedup_threshold)\n"
+            "d = vm.VectorMemoryStore(dedup_threshold=self._cfg.memory.episodic_dedup_threshold)\n"
+        )
+        violations = self._find_unplumbed_sites(seeded)
+        # `a` omits the keyword, `b` hardcodes it; `c` and `d` are the two
+        # spellings the production sites use (module-local and attribute call,
+        # plain and `self._cfg`).
+        assert len(violations) == 2
+        assert "omits dedup_threshold" in violations[0]
+        assert "not bound to" in violations[1]
+
+
 @pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not available (Linux-compiled binary)")
 class TestWriteEpisodicWithoutEmbedding:
     """write_episodic must not crash when the write has no embedding but the
@@ -2820,6 +2961,98 @@ class TestSharedConnectionLockDiscipline:
         entry = store.get_semantic("pref.editor")
         assert entry is not None
         assert entry["value_json"] == '"emacs"'
+
+    def test_retire_search_skips_mmr_rerank(self, tmp_path: Path) -> None:
+        """``_retire_stale_episodic``'s internal lookup passes ``mmr=False`` (#8902).
+
+        The caller applies its own ``cosine_sim > 0.7`` threshold, so diversity
+        reranking buys nothing there, and the default MMR rerank cost ~71ms per
+        superseding semantic write at 1,000 pooled candidates.
+        """
+        dim = 16
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=dim)
+        store.init()
+        embed = self._fake_embed(dim)
+        store.embed_fn = embed
+
+        # Matches the retire query "editor: vim" exactly, so the vector path
+        # clears its cosine threshold regardless of tokenizer details.
+        text = "editor: vim"
+        assert store.write_episodic(text, embedding=embed(text)) is True
+
+        calls: list[dict] = []
+        returned: list[list[dict]] = []
+        real_search = store.search_episodic
+
+        def _spy(*args: object, **kwargs: object) -> list[dict]:
+            calls.append(dict(kwargs))
+            out = real_search(*args, **kwargs)  # type: ignore[arg-type]
+            returned.append(out)
+            return out
+
+        store.search_episodic = _spy  # type: ignore[assignment]
+        assert store.set_semantic("pref.editor", "vim", 0.9, "consolidation") is None
+        # The superseding write triggers _retire_stale_episodic on "vim".
+        assert store.set_semantic("pref.editor", "emacs", 0.9, "consolidation") is None
+
+        retire_calls = [c for c in calls if c.get("query_embedding") is not None]
+        assert retire_calls, "superseding write never reached search_episodic"
+        assert all(
+            c.get("mmr") is False for c in retire_calls
+        ), f"retirement search must skip the MMR rerank: {retire_calls}"
+
+        # The VECTOR branch itself cleared the threshold: without this, the
+        # is_deleted check below would be satisfied by the text-LIKE fallback
+        # alone (the fixture text matches its first pattern verbatim) and a
+        # broken vector path under mmr=False would keep the test green.
+        assert any(
+            r.get("cosine_sim", 0) > 0.7 for out in returned for r in out
+        ), "vector retirement path returned no row above the cosine threshold"
+
+        # The superseded episodic row is still soft-deleted without the rerank.
+        row = store.db.execute(
+            "SELECT is_deleted FROM episodic_memories WHERE text = ?", (text,)
+        ).fetchone()
+        assert row is not None
+        assert row["is_deleted"] == 1
+
+    def test_retire_recall_survives_without_the_mmr_pool(self, tmp_path: Path) -> None:
+        """Retirement recall must not collapse to ten rows when MMR is off (#8902).
+
+        ``mmr`` does not only pick a reranker — it sizes the candidate pool
+        (``_MMR_MAX_POOL`` vs ``limit``), so the retirement lookup keeps a wide
+        ``limit``: the caller's own ``cosine_sim > 0.7`` threshold, not the pool
+        cut, decides what gets retired. The row texts avoid both text-LIKE
+        fallback patterns ("editor: vim" / "editor vim"), so only the vector
+        branch can retire them; with a limit of 10 (or the old MMR top-10) five
+        of the fifteen conflicting rows would escape retirement.
+        """
+        dim = 64
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=dim)
+        store.init()
+        embed = self._fake_embed(dim)
+        store.embed_fn = embed
+        store._faiss_index = None  # deterministic: exercise the fallback tier
+
+        fillers = [
+            "alpha", "bravo", "charlie", "delta", "echo",
+            "foxtrot", "golf", "hotel", "india", "juliet",
+            "kilo", "lima", "mike", "november", "oscar",
+        ]
+        # Tokens {vim, editor, <filler>} give cosine ~0.82 against the retire
+        # query "editor: vim" (tokens {editor, vim}) under the bag-of-words
+        # fake embed — above the 0.7 threshold, below the 0.88 dedup gate.
+        texts = [f"vim editor {w}" for w in fillers]
+        for t in texts:
+            assert store.write_episodic(t, embedding=embed(t)) is True
+
+        assert store.set_semantic("pref.editor", "vim", 0.9, "consolidation") is None
+        assert store.set_semantic("pref.editor", "emacs", 0.9, "consolidation") is None
+
+        remaining = store.db.execute(
+            "SELECT COUNT(*) FROM episodic_memories WHERE is_deleted = 0"
+        ).fetchone()[0]
+        assert remaining == 0, f"{remaining} superseded episodic rows escaped retirement"
 
 
 class TestLockedFetchHelpers:
@@ -4017,3 +4250,92 @@ class TestEpisodicKeywordFallbackCjk:
         store = self._store(tmp_path)
         assert store.write_episodic("用户决定用这个模型来做推理")
         assert store.search_episodic(query_text="的", limit=8) == []
+
+
+class TestDedupThresholdLoaderValidation:
+    """The loader must normalize `memory.episodic_dedup_threshold` like its siblings.
+
+    Review finding on #8948: a bare `memory_data.get(..., 0.88)` let a string
+    typo in config.json survive to the store, where
+    `cosine_sim > self._dedup_threshold` raises TypeError and aborts the
+    episodic write. Sibling numeric fields (`embedding_bulk_duty`) already
+    route through `_safe_float`; this class pins the same guard here.
+    """
+
+    def _memory_section(self, tmp_path: Path, monkeypatch, raw_value: object):
+        import json as _json
+
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(
+            _json.dumps({"memory": {"episodic_dedup_threshold": raw_value}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: cfg_path)
+        return KiroCrewConfig.load().memory
+
+    def test_a_string_typo_falls_back_to_the_default(self, tmp_path: Path, monkeypatch) -> None:
+        section = self._memory_section(tmp_path, monkeypatch, "0.9x")
+        assert section.episodic_dedup_threshold == 0.88
+        assert isinstance(section.episodic_dedup_threshold, float)
+
+    def test_a_numeric_string_is_coerced_not_crashed(self, tmp_path: Path, monkeypatch) -> None:
+        section = self._memory_section(tmp_path, monkeypatch, "0.5")
+        assert section.episodic_dedup_threshold == 0.5
+
+    def test_out_of_range_values_are_clamped_into_cosine_range(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        assert self._memory_section(tmp_path, monkeypatch, 7).episodic_dedup_threshold == 1.0
+        assert self._memory_section(tmp_path, monkeypatch, -3).episodic_dedup_threshold == 0.0
+
+    def test_a_valid_float_passes_through(self, tmp_path: Path, monkeypatch) -> None:
+        assert self._memory_section(tmp_path, monkeypatch, 0.42).episodic_dedup_threshold == 0.42
+
+    def _section_with(self, tmp_path: Path, monkeypatch, memory: dict):
+        import json as _json
+
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(_json.dumps({"memory": memory}), encoding="utf-8")
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: cfg_path)
+        return KiroCrewConfig.load().memory
+
+    def test_sibling_numeric_fields_absorb_typos_the_same_way(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The whole MemorySection numeric block shares one validation rule.
+
+        Same defect class as the dedup threshold: `semantic_confidence_threshold`
+        is plumbed to the same production stores, and the two int fields feed
+        LIMIT/retention arithmetic. A typo in any of them must fall back, not
+        surface as a TypeError at first use.
+        """
+        section = self._section_with(
+            tmp_path,
+            monkeypatch,
+            {
+                "semantic_confidence_threshold": "high",
+                "episodic_max_results": "many",
+                "episodic_max_count": None,
+            },
+        )
+        assert section.semantic_confidence_threshold == 0.8
+        assert section.episodic_max_results == 8
+        assert section.episodic_max_count == 10_000
+
+    def test_sibling_fields_still_accept_valid_values(self, tmp_path: Path, monkeypatch) -> None:
+        section = self._section_with(
+            tmp_path,
+            monkeypatch,
+            {
+                "semantic_confidence_threshold": 0.6,
+                "episodic_max_results": 12,
+                "episodic_max_count": 500,
+            },
+        )
+        assert section.semantic_confidence_threshold == 0.6
+        assert section.episodic_max_results == 12
+        assert section.episodic_max_count == 500

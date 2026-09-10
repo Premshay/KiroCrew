@@ -3,6 +3,7 @@ import { Upload, Plus, X, ChevronLeft, ChevronRight, PencilRuler } from 'lucide-
 import { KIND_LABEL, kindLabel } from './constants'
 import { detectKind, recognise } from './utils'
 import { S } from './styles'
+import ErrorNotice from '../../components/ErrorNotice'
 import type { Blocked, ProjectContext, ReviewBrief, StagedItem } from './types'
 import AgentSelector, { type KiroCrewAgent } from '../../components/AgentSelector'
 import ScopeBuilder from './ScopeBuilder'
@@ -27,6 +28,8 @@ interface Props {
   saveContext: () => void
   deleteContext: () => void
   err: string
+  /** A client-side check or a not-failed status — plain text, never an error surface. */
+  hint: string
   inputRef: RefObject<HTMLInputElement>
   onPick: (e: React.ChangeEvent<HTMLInputElement>) => void
   onDrop: (e: React.DragEvent) => void
@@ -45,7 +48,7 @@ interface Props {
 
 export default function Composer(p: Props) {
   const ime = useImeGuard()
-  const { staged, refText, dragging, blocked, showAuth, busy, err, inputRef } = p
+  const { staged, refText, dragging, blocked, showAuth, busy, err, hint, inputRef } = p
 
   const canStart = !busy && (staged.length > 0 || !!refText.trim())
   const det = detectKind(refText)
@@ -156,7 +159,10 @@ export default function Composer(p: Props) {
           onSaveContext={p.saveContext}
           onDeleteContext={p.deleteContext}
         />
-        {err ? <div style={{ fontSize: '12.5px', color: 'var(--error, #e5484d)', textAlign: 'center' }}>{err}</div> : null}
+        {hint ? <div style={{ fontSize: '12.5px', color: 'var(--warn)', textAlign: 'center' }}>{hint}</div> : null}
+        {/* No hand-off: the staged screens, the pasted link and the brief in this
+            composer are unsaved until a critique starts. */}
+        <ErrorNotice message={err} />
         {middle}
         {/* Decorative separator between the drop zone and the link field. A lone
             connector word ("OR") cannot be translated in isolation

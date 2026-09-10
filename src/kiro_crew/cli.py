@@ -56,6 +56,7 @@ from kiro_crew.crash_guard import install as _install_crash_guard
 from kiro_crew.env import git_build_info
 from kiro_crew.gateway_lock import GatewayLock, GatewayLockError
 from kiro_crew.history import ConversationLog, HistoryConsolidator
+from kiro_crew.knowledge import store as knowledge_store
 from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.log_redaction import install_log_redaction
@@ -582,14 +583,100 @@ def _diagnostic_port(gw_kwargs: dict) -> int | None:
         return None
 
 
+def _knowledge_stats(args) -> None:
+    """``kirocrew knowledge stats [--json]`` -- read-only counts, no repair verb."""
+
+    db_path = config_dir() / "workspace" / "knowledge" / "knowledge.db"
+    as_json = bool(getattr(args, "json", False))
+    if not db_path.exists():
+        sel().log_tool_invocation(
+            session_key="cli", source="cli", tool_name="knowledge_stats", outcome="not_configured"
+        )
+        if as_json:
+            print(json.dumps({"error": "not_configured"}))
+        else:
+            print("Knowledge Library is not configured (no knowledge.db). Ingest documents first.")
+        return
+    # Read-only means the FILE is opened read-only. A normal open runs the
+    # schema migration, whose orphan sweep takes the writer lock and deletes
+    # itemless source rows -- a write this verb must not make. The trade is
+    # that a library behind this schema is reported, not repaired here.
+    store = KnowledgeStore.open_read_only(str(db_path))
+    try:
+        stats = store.aggregate_stats()
+    except knowledge_store.sqlite3.OperationalError as exc:
+        if "no such" not in str(exc):
+            raise
+        sel().log_tool_invocation(
+            session_key="cli", source="cli", tool_name="knowledge_stats", outcome="schema_behind"
+        )
+        if as_json:
+            print(json.dumps({"error": "schema_behind", "detail": str(exc)}))
+        else:
+            print(
+                f"Knowledge database is behind this schema ({exc}). Stats opens it "
+                "read-only and does not migrate; start the gateway or run "
+                "`kirocrew knowledge dedup --apply` once to migrate it, then retry."
+            )
+        return
+    finally:
+        store.db.close()
+    sel().log_tool_invocation(
+        session_key="cli",
+        source="cli",
+        tool_name="knowledge_stats",
+        outcome="success",
+        metadata={"sources": stats.sources, "documents": stats.documents, "items": stats.items},
+    )
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "sources": stats.sources,
+                    "documents": stats.documents,
+                    "items": stats.items,
+                    "per_source": [
+                        {
+                            "id": s.source_id,
+                            "name": s.name,
+                            "documents": s.documents,
+                            "items": s.items,
+                        }
+                        for s in stats.per_source
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+    print(
+        f"Knowledge Library: {stats.sources} source(s), "
+        f"{stats.documents} document(s), {stats.items} item(s)"
+    )
+    if not stats.per_source:
+        return
+    # Width from the data, so a long source name does not wrap the count columns.
+    name_width = max(len(s.name) for s in stats.per_source)
+    print(f"\n  {'SOURCE'.ljust(name_width)}  {'DOCS':>6}  {'ITEMS':>6}")
+    for s in stats.per_source:
+        print(f"  {s.name.ljust(name_width)}  {s.documents:>6}  {s.items:>6}")
+
+
 def _knowledge(args) -> None:
-    """Run Knowledge Library maintenance and private retrieval evaluation commands."""
+    """``kirocrew knowledge dedup|stats|evaluate`` -- duplicate collapse, read-only
+    counts, and private retrieval evaluation."""
     action = getattr(args, "knowledge_action", None)
+    if action == "stats":
+        _knowledge_stats(args)
+        return
     if action == "evaluate":
         _knowledge_evaluate(args)
         return
     if action != "dedup":
-        print("Usage: kirocrew knowledge {dedup,evaluate}")
+        print(
+            "Usage: kirocrew knowledge dedup [--apply] | "
+            "kirocrew knowledge stats [--json] | kirocrew knowledge evaluate"
+        )
         return
     apply = bool(getattr(args, "apply", False))
     db_path = config_dir() / "workspace" / "knowledge" / "knowledge.db"
@@ -599,9 +686,29 @@ def _knowledge(args) -> None:
         )
         print("Knowledge Library is not configured (no knowledge.db). Ingest documents first.")
         return
-    store = KnowledgeStore(str(db_path))
+    if apply:
+        store = KnowledgeStore(str(db_path))
+    else:
+        # The dry run promises "no changes", and an ordinary open breaks that
+        # promise before the sweep starts: the constructor runs the schema
+        # migration, whose orphan reap deletes itemless source rows. So the
+        # preview opens the file read-only (SQLite mode=ro) and only --apply
+        # takes the migrating, writing open.
+        store = KnowledgeStore.open_read_only(str(db_path))
     try:
         results = dedup_sweep(store, apply=apply)
+    except knowledge_store.sqlite3.OperationalError as exc:
+        if apply or "no such" not in str(exc):
+            raise
+        sel().log_tool_invocation(
+            session_key="cli", source="cli", tool_name="knowledge_dedup", outcome="schema_behind"
+        )
+        print(
+            f"Knowledge database is behind this schema ({exc}). The dry run opens it "
+            "read-only and does not migrate; start the gateway or run "
+            "`kirocrew knowledge dedup --apply` once to migrate it, then retry."
+        )
+        return
     finally:
         store.db.close()
     sel().log_tool_invocation(
@@ -1503,6 +1610,12 @@ Examples:
         help="Suppress auto-delivery; agent controls notifications",
     )
     cron_add.add_argument(
+        "--folder",
+        default="",
+        help="Schedule-page folder to file the job in (existing folder name or id). "
+        "The CLI does not create folders — create them in the dashboard's Schedule page.",
+    )
+    cron_add.add_argument(
         "--approval-mode",
         dest="approval_mode",
         choices=["auto"],
@@ -1855,6 +1968,12 @@ Examples:
     )
     kn_eval.add_argument("--limit", type=int, default=5, help="Results per query (default: 5)")
     kn_eval.add_argument("--stem", default=None, help="Private report filename stem")
+    kn_stats = kn_sub.add_parser(
+        "stats", help="Count sources, documents and items in the knowledge library (read-only)"
+    )
+    kn_stats.add_argument(
+        "--json", action="store_true", help="Emit the counts as JSON instead of a table"
+    )
 
     # secrets — encrypted vault maintenance. Only the migration importer lives
     # here; the set/list/rm surface is owned by a separate change.
@@ -1874,7 +1993,7 @@ Examples:
     pod_parser = cli_help.add_command(sub, "pod")
     pod_sub = pod_parser.add_subparsers(
         dest="pod_action",
-        metavar="{up,down,ls,prune,status,token,url,scenarios,logs,exec,provision,install}",
+        metavar="{up,down,ls,prune,status,token,url,scenarios,api,logs,exec,provision,install}",
     )
     pod_up = pod_sub.add_parser("up", help="Schedule an isolated pod for a worktree")
     pod_up.add_argument("name", help="Worktree name")
@@ -1915,6 +2034,20 @@ Examples:
             "Run the pod's cron scheduler. Pods boot with --no-crons by default. "
             "Without --seed the HOME starts with no cron definitions; a named "
             "scenario may provide them. Persisted per pod; applies at boot."
+        ),
+    )
+    pod_up.add_argument(
+        "--no-embeddings",
+        dest="no_embeddings",
+        action="store_true",
+        help=(
+            "Boot without the embedding model: the pod never downloads it and "
+            "memory/knowledge search falls back to keyword matching (a documented "
+            "mode). Use it to load-test ingestion without paying per-chunk embed "
+            "compute. Affects the pod's env only, never your own home. Persisted "
+            "per pod as EMBEDDINGS='0' in its env file (hand-edit that line to flip "
+            "a kept pod); applies at boot. The switch is subsystem-wide, so the pod "
+            "skips its speech-to-text (whisper) model download too."
         ),
     )
     pod_down = pod_sub.add_parser("down", help="Evict a pod (zero residue)")
@@ -1961,6 +2094,54 @@ Examples:
         help="List the seed scenarios `pod up --seed <scenario>` accepts",
     )
     pod_scenarios.add_argument("--json", action="store_true", help="Emit rows as JSON")
+    pod_api = pod_sub.add_parser(
+        "api",
+        help="Call a running pod's HTTP API with its own token",
+        description=(
+            "Make one authenticated request against a running pod and print a "
+            "fixed-key JSON document: {name, method, path, status, ok, body}. "
+            "GET and HEAD are permitted by default; other methods require "
+            "--allow-write."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  kirocrew pod api my-wt GET sessions\n"
+            "  kirocrew pod api my-wt GET /api/health\n"
+            '  kirocrew pod api my-wt POST config --data \'{"key":"agent.model"}\' '
+            "--allow-write\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pod_api.add_argument("name", help="Worktree name")
+    pod_api.add_argument(
+        "method",
+        # No `choices=`: argparse would reject an unrecognised method with its own
+        # usage prose on stderr and exit 2, escaping the fixed-key JSON envelope
+        # this command promises on EVERY exit. `pod.runtime.pod_api` validates the
+        # method against API_METHODS and raises PodError, which the envelope
+        # reports as a status-0 document an agent can parse. `type=str.upper` stays
+        # so a lowercase method still normalises.
+        type=str.upper,
+        metavar="METHOD",
+        help="HTTP method: GET, HEAD, POST, PUT, PATCH or DELETE (case-insensitive)",
+    )
+    pod_api.add_argument(
+        "path",
+        help=(
+            "API path; /api/ is prepended when absent. Existing query parameters "
+            "are preserved, but caller-supplied token parameters are refused."
+        ),
+    )
+    pod_api.add_argument(
+        "--data",
+        default="",
+        help="Request body, sent verbatim as application/json",
+    )
+    pod_api.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="Permit POST, PUT, PATCH, or DELETE (off by default)",
+    )
     pod_logs = pod_sub.add_parser("logs", help="Tail a pod's journal")
     pod_logs.add_argument("name", help="Worktree name")
     pod_logs.add_argument("-n", "--lines", type=int, default=50, help="Lines to tail (default: 50)")
@@ -2190,6 +2371,22 @@ Examples:
     _c_login.add_argument(
         "--no-browser", action="store_true", help="Print the device URL but don't open a browser"
     )
+    _c_login.add_argument(
+        "--identity-provider",
+        default="",
+        help="IAM Identity Center start URL (for enterprise SSO login)",
+    )
+    _c_login.add_argument(
+        "--license",
+        default="",
+        choices=["", "free", "pro"],
+        help="Kiro license tier (pro for Identity Center, free for Builder ID/social)",
+    )
+    _c_login.add_argument(
+        "--idp-region",
+        default="",
+        help="IAM Identity Center region (e.g. us-east-1), NOT the EC2 instance region",
+    )
     _c_logout = cloud_sub.add_parser(
         "logout", help="Sign kiro-cli out on the instance (to switch Kiro account)"
     )
@@ -2300,6 +2497,10 @@ Examples:
     # Mounted only for an agent whose spec grants it, so an unassigned set costs
     # a session nothing: kiro-cli loads a server only when `tools` names it.
     sub.add_parser("mcp-dashboard")
+    # mcp-work (MCP server — the conductor work ledger's four tools). Opt-in
+    # like mcp-dashboard: mounted only for an agent whose spec grants it, so a
+    # session that is neither a conductor nor a worker spends nothing on it.
+    sub.add_parser("mcp-work")
 
     # Stable product endpoint for the bundled goal-conductor skill.  Its
     # underscore name keeps it out of the public CLI taxonomy: the supported
@@ -2591,10 +2792,25 @@ Examples:
     app_info = app_sub.add_parser("info", help="Show app details")
     app_info.add_argument("name", help="App name")
     app_dev = app_sub.add_parser(
-        "dev", help="Toggle dev mode (no-store UI serving + live reload on file change)"
+        "dev",
+        help="Toggle dev mode (no-store UI serving + live reload on file change)",
+        # No flag abbreviations: --confirm-out-of-install-root is the
+        # operator's out-of-install attestation and the builtin agent deny
+        # rule matches its LITERAL text, so an accepted abbreviation
+        # (`--confirm`, `--c`) would sail past the rule and let an agent
+        # shell self-supply the attestation. Only the exact flag parses.
+        allow_abbrev=False,
     )
     app_dev.add_argument("name", help="App name")
     app_dev.add_argument("--off", action="store_true", help="Turn dev mode off")
+    app_dev.add_argument(
+        "--confirm-out-of-install-root",
+        action="store_true",
+        help=(
+            "Confirm enabling dev mode on a ui root that resolves outside the "
+            "app's install directory (e.g. a ui/ symlinked to your source tree)"
+        ),
+    )
     app_init = app_sub.add_parser("init", help="Scaffold a new app")
     app_init.add_argument("name", help="App name (kebab-case)")
     app_init.add_argument("--dir", default=".", help="Output directory (default: current)")
@@ -2612,6 +2828,9 @@ Examples:
   kirocrew config get agent.provider    # Get a specific value
   kirocrew config set dashboard.url http://localhost:5476
   kirocrew config edit                  # Open in $EDITOR
+  kirocrew config defaults              # Stored values holding a superseded default
+  kirocrew config defaults --adopt      # Take the current defaults for all of them
+  kirocrew config defaults --keep session.autocompact_pct   # Affirm one as intentional
 
 The dashboard port is set with the KIROCREW_PORT env var, not a config key.
 """,
@@ -2630,6 +2849,26 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         help="Save to config.local.json (persists across upgrades)",
     )
     cfg_sub.add_parser("edit", help="Open config in $EDITOR")
+    cfg_defaults = cfg_sub.add_parser(
+        "defaults",
+        help="Review stored values that still hold a superseded default",
+    )
+    cfg_defaults.add_argument(
+        "keys",
+        nargs="*",
+        help="Limit to these dotted keys (default: every drifted key)",
+    )
+    _cfg_def_mode = cfg_defaults.add_mutually_exclusive_group()
+    _cfg_def_mode.add_argument(
+        "--adopt",
+        action="store_true",
+        help="Remove the stored keys so the current defaults apply",
+    )
+    _cfg_def_mode.add_argument(
+        "--keep",
+        action="store_true",
+        help="Record the stored values as intentional and stop reporting them",
+    )
 
     # Last registration done: stop argparse from answering an unknown command
     # with the internal mcp-* server names. Must come after every add_parser,
@@ -2762,6 +3001,14 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # DashboardContributor.start_services (which never fires for `token`
         # and only inside gateway async startup). Public default = no checks.
         run_preflight_checks()
+        # Under the desktop shell this process inherited Electron's Crashpad
+        # exception port, and so would every child it spawns (kiro-cli, MCP
+        # servers, and whatever THEY run). Their crashes would then land in
+        # OUR Crashpad database as foreign dumps nobody prunes. Cleared here,
+        # before the first child, so children fall back to the OS default.
+        from kiro_crew.crashpad_inherit import detach_inherited_crash_handler
+
+        detach_inherited_crash_handler()
         # Enable faulthandler for the long-lived gateway process: it makes
         # `kill -ABRT <pid>` dump every thread's stack to stderr (the gateway
         # log) on demand, and it is the signal the dashboard's stall watchdog
@@ -2865,6 +3112,10 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         rc = work_acceptance_main()
         if rc:
             raise SystemExit(rc)
+    elif args.command == "mcp-work":
+        # Same importlib form and the same reason as mcp-dashboard above: a
+        # default-off optional subsystem must not be imported to start the gateway.
+        importlib.import_module("kiro_crew.mcp_work").run_mcp_server()
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
         # Registration gates this verb on _builtin_mcp_server_available, and
         # _run_app_mcp_server is the ONE dispatch-time spelling of "import the

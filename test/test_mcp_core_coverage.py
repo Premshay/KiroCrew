@@ -1012,6 +1012,44 @@ class TestRegisterHook:
         assert "hooks.json is corrupted" in out
         assert hook_file.read_text() == "{not json"
 
+    def test_acquiring_the_lock_does_not_truncate_the_lock_file(self):
+        """The lock-file open must be WRITABLE but MUST NOT truncate.
+
+        ``msvcrt.locking`` needs a writable handle, so the fd cannot be opened
+        ``"r"``; but ``"w"`` truncates at open, and on Windows a truncating
+        open of a lock file whose first byte another holder already locked
+        raises a sharing violation instead of waiting — the contending acquirer
+        crashes before it reaches ``flock_exclusive`` and the serialisation the
+        lock exists to provide never happens. POSIX ``flock`` tolerates the
+        truncate, which is why the defect is invisible on Linux.
+
+        Issue #9248; same fix as ``work_ledger._open_lock`` (PR #9237) and
+        ``session_pid.py`` (PR #9250). ``hooks.json.lock`` is the SAME file
+        ``webhooks.locked`` guards from another module, so cross-process
+        contention on it is the store's normal state — which is why truncation
+        (the platform-independent observable those PRs pinned) is asserted
+        here: seed the lock file, register a hook, require the bytes survived.
+        """
+        seed = b"lock-file-content-that-must-survive"
+        lock_path = mcp_core.config_dir() / "hooks.json.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(seed)
+
+        out = _call_tool("register_hook", {"hook_id": "review-bot", "context_summary": "c"})
+
+        assert "Hook registered: review-bot" in out
+        assert lock_path.read_bytes() == seed
+
+    def test_registration_works_when_the_lock_file_is_absent(self):
+        """First registration must create the lock file rather than raise."""
+        lock_path = mcp_core.config_dir() / "hooks.json.lock"
+        assert not lock_path.exists()
+
+        out = _call_tool("register_hook", {"hook_id": "first-run", "context_summary": "c"})
+
+        assert "Hook registered: first-run" in out
+        assert lock_path.exists()
+
 
 class TestReadSlackProfile:
     def test_profile_values_are_redacted_but_id_is_preserved(self):
@@ -1136,7 +1174,13 @@ class TestFileSend:
         src = tmp_path / "creds.txt"
         src.write_text("AKIA" + "P" * 16)
         out = _call_tool("file_send", {"path": str(src)})
-        assert out == "Error: file content contains sensitive data; send aborted"
+        assert out.startswith("Error: file content contains sensitive data; send aborted")
+        # The refusal now names the remedy. A wall that does not say a consented
+        # path exists is the reported complaint behind issue #7770, so this
+        # asserts MORE than the previous exact-equality pin, not less -- and it
+        # asserts the never-grantable legs are named as such.
+        assert "/api/file-delivery/consent" in out
+        assert "can never be granted" in out
 
     def test_disallowed_binary_mime_is_refused(self, tmp_path):
         src = tmp_path / "payload.bin"
@@ -1211,8 +1255,14 @@ class TestFileSend:
 
         with patch.object(mcp_core, "_post", side_effect=_post) as m:
             out = _call_tool("file_send", {"path": str(src)})
-        assert out == "File sent: report.txt"
+        # The invariant this test owns: a channel SKIP does not disturb the
+        # Slack leg, which still runs as the fallback.
         assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+        # The skip is also REPORTED. It used to read a bare "File sent:
+        # report.txt", which is indistinguishable from a delivery for a file
+        # that only reached the dashboard (see test_file_send_skip_reason.py).
+        assert out.startswith("File sent: report.txt")
+        assert "no_channel_destination" in out
 
     def test_channel_failure_warns_and_falls_back_to_slack(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")

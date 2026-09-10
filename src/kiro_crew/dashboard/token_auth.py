@@ -35,6 +35,7 @@ from kiro_crew.dashboard.origin import (
 from kiro_crew.dashboard.refresh_tokens import (
     MAX_REFRESH_TTL_SECS,
     REFRESH_COOKIE_PATH,
+    bind_chain_peer,
     cookie_jar_needs_pruning,
     foreign_port_cookies,
     generate_refresh_token,
@@ -1492,10 +1493,10 @@ def _api_pattern_matches(pattern: str, path: str) -> bool:
 # them in ``permissions.api`` adds no security value and produces silent 403
 # regressions whenever a new app forgets to list them.
 #
-# ``/api/ws`` is safe to allow implicitly ONLY because the WS layer now applies
+# ``/api/ws`` is safe to allow implicitly ONLY because the WS layer applies
 # per-app event scope filtering (``ws_event_scope.py``): a connected app token
 # receives just the events matching its ``permissions.events`` declarations, so
-# connecting no longer grants the full event stream. Contrast with functional
+# connecting does not grant the full event stream. Contrast with functional
 # paths like /api/chat/* or /api/spawn/* — those grant real capabilities and
 # MUST stay explicitly declared.
 #
@@ -1737,9 +1738,9 @@ def derive_caller_app(
     **Why this exists.** App-ownership checks gate on ``request["app"]``, which
     the app-token branch publishes. The internal-secret branch (the managed MCP
     set) carries no app claim at all: the secret proves the call came from
-    inside, not who made it. Every ownership check therefore became a no-op on
-    that transport, and an app agent granted ``@kirocrew-dashboard`` arrived
-    indistinguishable from the dashboard user (issue #3690).
+    inside, not who made it. Without this, every ownership check is a no-op on
+    that transport, and an app agent granted ``@kirocrew-dashboard`` arrives
+    indistinguishable from the dashboard user.
 
     The identity comes from the authenticated CALLING SESSION, resolved against
     server-side registries in four steps -- one per way a session can be owned:
@@ -2344,7 +2345,7 @@ def token_auth_middleware(
                     # auth ran at all".
                     request["internal_auth"] = True
                     # Derive the app identity ONCE, here, so every ownership
-                    # check downstream sees it (issue #3690). The secret proves
+                    # check downstream sees it. The secret proves
                     # the call came from inside, not who made it, so identity
                     # comes from the authenticated calling session.
                     #
@@ -2422,10 +2423,10 @@ def token_auth_middleware(
                 )
                 _log_auth(request, "internal", "denied", f"cookie auth failed: {_reason}")
                 return _deny(request, "Forbidden")
-            # Session-pin enforcement (RFC §3). Internal paths validated the
-            # cookie but historically skipped the pin, which would let a
-            # peer-pinned session be replayed against /api/chat, /api/spawn
-            # and friends from a client the pin excludes.
+            # Session-pin enforcement (RFC §3). Internal paths validate the
+            # cookie, and skipping the pin here would let a peer-pinned session
+            # be replayed against /api/chat, /api/spawn and friends from a
+            # client the pin excludes.
             _pin_ok, _pin_mismatch = _check_pin(_tok)
             if not _pin_ok:
                 _log_auth(request, _audit_uid(_uid), "denied", _pin_mismatch)
@@ -2979,14 +2980,55 @@ def token_auth_middleware(
                     # at restart while a 30-day refresh credential beside it
                     # re-minted a fresh session on the next visit, and "ends at
                     # restart" would be false by one rotation.
+                    #
+                    # Peer binding for the CHAIN. The QR "persistent" session
+                    # shape carries its own ``require_peer`` claim on the link;
+                    # an ordinary Phase-3 session does not, so without this its
+                    # chain would be minted UNBOUND even though its access token
+                    # is pinned to a verified peer. That asymmetry is a
+                    # laundering path: a refresh cookie stolen from allowed node
+                    # A, replayed from allowed node B, rotated cleanly and handed
+                    # back an access token pinned to B. Binding here closes it at the mint, so
+                    # the chain says who owns it from its first byte rather than
+                    # relying on the rotation handler to infer it.
+                    #
+                    # Gated on a RESOLVED peer, not on ``peer_key``: that helper
+                    # answers ``ip:<addr>`` when no peer resolved, and binding a
+                    # chain to the tunnel's shared loopback address would read as
+                    # a pin while excluding nobody. ``bind_refresh_chains`` is the
+                    # operator's documented opt-out for cross-device roaming at
+                    # node scope.
+                    _refresh_require_peer = str(data.get("require_peer", "")) == "1"
+                    _refresh_peer_key = _session_peer_key
+                    if (
+                        not _refresh_require_peer
+                        and peer is not None
+                        and tailnet_trust is not None
+                        and tailnet_trust.bind_refresh_chains
+                        and peer_key.startswith("ts:")
+                    ):
+                        _refresh_require_peer = True
+                        _refresh_peer_key = peer_key
                     refresh_token, chain_id, _jti, refresh_exp = generate_refresh_token(
                         user_id,
                         boot=str(data.get("boot", "")),
-                        require_peer=str(data.get("require_peer", "")) == "1",
-                        peer_key=_session_peer_key,
+                        require_peer=_refresh_require_peer,
+                        peer_key=_refresh_peer_key,
                     )
                     refresh_remaining = int(refresh_exp - time.time())
                     if refresh_remaining > 0:
+                        if _refresh_peer_key:
+                            # Server-side twin of the signed claim above. The
+                            # claim is authoritative and cannot be forged, but it
+                            # only binds chains whose mint path remembered to set
+                            # it — and this issue exists because one did and the
+                            # others did not. A record the presented token cannot
+                            # influence makes the next forgetful mint path fail
+                            # closed instead of silently unbound. Offloaded
+                            # because it writes refresh_chains.json.
+                            await asyncio.to_thread(
+                                bind_chain_peer, chain_id, _refresh_peer_key, refresh_exp
+                            )
                         resp.set_cookie(
                             refresh_cookie_name(_cookie_port_from_host(request, port)),
                             refresh_token,

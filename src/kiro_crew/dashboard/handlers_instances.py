@@ -28,8 +28,9 @@ from urllib.parse import unquote
 
 from aiohttp import web
 
-import kiro_crew.dashboard.handlers as _h
+import kiro_crew
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard.handlers._shared import SESSION_SEARCH_TEXT_FIELDS
 from kiro_crew.dashboard.session_transfer import (
     SnapshotUnstable,
     build_transfer_bundle_async,
@@ -51,6 +52,7 @@ from kiro_crew.instances.registry import (
 )
 from kiro_crew.instances.ssh_tunnel_manager import ProxyRequestError, TunnelState
 from kiro_crew.instances.warm_set import resolve_warm_set_cap
+from kiro_crew.security import redact
 from kiro_crew.sel import sel
 from kiro_crew.validation import sanitize_string
 
@@ -212,10 +214,17 @@ async def api_instances_list(request: web.Request) -> web.Response:
     # its fsync — so every registry touch in these handlers goes off the loop.
     items = [_instance_view(state, i) for i in await asyncio.to_thread(reg.list)]
     # Resolved here rather than served raw: the automatic mode (0) means "as many
-    # as are connected", and this is the only place that holds both the stored
-    # value and the live per-instance status. The browser therefore always
-    # receives a concrete integer and needs no notion of automatic.
-    connected = sum(1 for i in items if (i.get("status") or {}).get("state") == "connected")
+    # as could be warm at once", and this is the only place that holds both the
+    # stored value and the registry. The browser therefore always receives a
+    # concrete integer and needs no notion of automatic.
+    #
+    # Counted from the REGISTRY, not from live status. A connected-count made the
+    # cap race tunnel startup: a crew that finished connecting just after this
+    # poll was not counted, the cap came back one short, and the viewport evicted
+    # a pane to honour it -- so one crew looked broken, and which one depended on
+    # connection order. Registered crews cannot race, and the count rises by
+    # itself when a crew is added.
+    eligible = len(items)
     _audit("list", "success")
     return web.json_response(
         {
@@ -227,7 +236,7 @@ async def api_instances_list(request: web.Request) -> web.Response:
             "active": getattr(state, "instances_manager", None) is not None,
             "instances": items,
             "warm_set_cap": resolve_warm_set_cap(
-                KiroCrewConfig.load().instances.warm_set_cap, connected
+                KiroCrewConfig.load().instances.warm_set_cap, eligible
             ),
         }
     )
@@ -600,12 +609,59 @@ async def api_instances_connect(request: web.Request) -> web.Response:
             {"error": "instances manager not running", "code": "instances_manager_unavailable"},
             status=503,
         )
+    # `?rebuild=1` is the pane's Retry after a load watchdog fired on a document
+    # that DID navigate: every probe says the tunnel is fine, yet one stream in it
+    # stalled and the pane will wait on it forever. Only a fresh forwarder on a
+    # different local port clears that; the
+    # idempotent connect would hand
+    # the same stalled tunnel straight back. Opt-in and explicit so the
+    # auto-connect fan-out and plain tab clicks keep their no-op-when-up cost.
+    rebuild = request.query.get("rebuild") in ("1", "true")
+    # `?only_if_connected=1` is the viewport's auto-warm: pre-mount a pane for a
+    # tunnel that is ALREADY up, never bring one up. Evaluated atomically under
+    # the manager lock, so an auto-warm racing an explicit disconnect can never
+    # re-open the tunnel (or re-persist the intent) the user just closed.
+    only_if_connected = request.query.get("only_if_connected") in ("1", "true")
+    if rebuild and only_if_connected:
+        # A refusal, so it leaves the same `denied` SEL line as every other
+        # early exit here: the audit trail must see an owner hand-crafting a
+        # pair the frontend never sends, not just the connects that went through.
+        _audit(
+            "connect",
+            "denied",
+            request_id=instance_id,
+            error="rebuild and only_if_connected are mutually exclusive",
+        )
+        return web.json_response(
+            {
+                "error": "rebuild and only_if_connected are mutually exclusive",
+                "code": "bad_request",
+            },
+            status=400,
+        )
     try:
-        status = await mgr.connect(instance_id)
+        # Keyword only when asked: the default call keeps the manager's existing
+        # positional contract (and every fake that implements it).
+        if rebuild:
+            status = await mgr.connect(instance_id, rebuild=True)
+        elif only_if_connected:
+            status = await mgr.connect(instance_id, only_if_connected=True)
+        else:
+            status = await mgr.connect(instance_id)
     except KeyError:
         _audit("connect", "denied", request_id=instance_id, error="not found")
         return web.json_response({"error": "not found", "code": "instance_not_found"}, status=404)
+    if rebuild:
+        _audit("connect", "rebuild", request_id=instance_id)
     body = status.to_dict()
+    if only_if_connected and status.state.value != "connected":
+        # Declined, not failed: the tunnel is simply not up, which is the one
+        # answer a connected-only caller asked to be given without side effects.
+        # 200 with a non-connected state is what the shared connect step reads
+        # as `warm-declined`.
+        _audit("connect", "declined", request_id=instance_id, error="not connected")
+        body["code"] = "instance_not_connected"
+        return web.json_response(body)
     if status.state.value == "connected":
         token = mgr.get_token(instance_id)
         # Validate the stored token before handing it to the browser. connect()
@@ -827,9 +883,8 @@ async def api_instances_search_sessions(request: web.Request) -> web.Response:
                 # ship megabyte strings to the browser (or feed the redaction
                 # regexes unbounded input).
                 value = value[:_PEER_FIELD_MAX_CHARS]
-                if field in ("title", "snippet"):
-                    value, _ = _h.redact_exfiltration_urls(value)
-                    value, _ = _h.redact_credentials(value)
+                if field in SESSION_SEARCH_TEXT_FIELDS:
+                    value = redact(value)
                 out[field] = value
         for field in ("modified", "messages"):
             value = row.get(field)
@@ -858,12 +913,10 @@ async def api_instances_search_sessions(request: web.Request) -> web.Response:
         # here before the rows reach the browser.
         redacted_local: list[dict] = []
         for row in local_rows:
-            for field in ("title", "snippet"):
+            for field in SESSION_SEARCH_TEXT_FIELDS:
                 value = row.get(field)
                 if isinstance(value, str) and value:
-                    value, _ = _h.redact_exfiltration_urls(value)
-                    value, _ = _h.redact_credentials(value)
-                    row[field] = value
+                    row[field] = redact(value)
             redacted_local.append(row)
         sources.append(redacted_local)
     for iid, result in zip(connected, results[1:]):
@@ -1181,6 +1234,204 @@ def _proxy_canonical_path(raw: str) -> tuple[str, str]:
         if len(prefix) >= 2 and tuple(segments[: len(prefix)]) == prefix:
             return _URL_PATH_SEP.join(segments), ""
     return "", _PROXY_PATH_DENIED_REASON
+
+
+#: Caps applied to a peer's capability reply before it reaches the browser. The
+#: peer is the user's own machine but its reply is still untrusted input crossing
+#: a trust boundary, and these lists feed pickers — an unbounded roster would
+#: render an unusable menu and an unbounded string would break the layout.
+_CAP_MAX_ROWS = 500
+_CAP_MAX_STR = 512
+_CAP_MAX_VERSION_STR = 64
+
+
+def _cap_str(value: object, limit: int = _CAP_MAX_STR) -> str:
+    """A peer-supplied string, redacted and clamped, or "" for anything else.
+
+    Every one of these lands in a dashboard picker, so the peer's text is an
+    output boundary: it runs the relay's credential + exfiltration-URL chain
+    BEFORE the clamp, so a credential cannot survive by sitting past the limit.
+    """
+    if not isinstance(value, str):
+        return ""
+    # Deferred: this module is imported on the gateway's boot path and the relay
+    # pulls in the chat-slot machinery, which a capability read does not need.
+    from kiro_crew.dashboard.remote_relay import redact_peer_text
+
+    return redact_peer_text(sanitize_string(value))[:limit]
+
+
+def _cap_list(payload: object, key: str) -> object:
+    """The row list out of a peer reply that is either bare or wrapped in *key*.
+
+    The five capability endpoints do not agree on a shape: ``/api/models`` and
+    ``/api/effort-levels`` answer a bare list, while ``/api/agents`` and
+    ``/api/workspaces`` answer ``{"<key>": [...]}`` next to a sibling default.
+    Normalizing here is what keeps a wrapped reply from reaching ``_cap_rows``,
+    which accepts only a list — a dict would come back as an empty picker rather
+    than an error, so the failure would look like "this crew has no agents".
+    """
+    return payload.get(key) if isinstance(payload, dict) else payload
+
+
+def _cap_rows(payload: object, fields: dict[str, int]) -> list[dict[str, object]]:
+    """Re-shape a peer's list reply to *fields*, dropping everything unlisted.
+
+    Allowlist, not passthrough: the browser gets the keys this gateway knows how
+    to render and nothing else, so a peer on a build with extra fields cannot
+    inject content into a picker. ``context_window`` is the one numeric field and
+    is coerced rather than clamped — a bogus value reads as "unknown", which the
+    frontend already handles by falling back to the reference window.
+    """
+    if not isinstance(payload, list):
+        return []
+    rows: list[dict[str, object]] = []
+    for entry in payload[:_CAP_MAX_ROWS]:
+        if not isinstance(entry, dict):
+            continue
+        row: dict[str, object] = {}
+        for field, limit in fields.items():
+            raw = entry.get(field)
+            if field == "context_window":
+                row[field] = int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else 0
+            else:
+                row[field] = _cap_str(raw, limit)
+        rows.append(row)
+    return rows
+
+
+async def api_instances_capabilities(request: web.Request) -> web.Response:
+    """GET /api/instances/{id}/capabilities — what a connected peer can do.
+
+    A local session bound to a peer for execution must offer the PEER's agents,
+    models, effort levels and workspaces in its header — showing this machine's
+    would let the user pick a crew or model that does not exist over there. Those
+    rosters are gateway-wide reads, and every existing frontend control fetches
+    them same-origin from the local gateway, so this route is the per-instance
+    counterpart the frontend switches to when the active slot is peer-bound.
+
+    Deliberately NOT served through ``/api/instances/{id}/proxy/*``: that route
+    forwards a caller-supplied path and is fenced to the ``api/chat`` /
+    ``api/stream`` prefixes. Widening it to reach ``api/agents`` would have
+    granted the peer's mutating ``PUT /api/agents/{name}`` in the same stroke,
+    because the fence matches prefixes and cannot distinguish verbs. So the reads
+    go through ``SshTunnelManager.peer_capability``, whose target is chosen from a
+    closed set in the backend.
+
+    One peer read failing does not fail the request: each result is independent
+    and a missing one is reported in ``unavailable`` so the frontend can disable
+    exactly that control instead of showing an empty menu that looks like the peer
+    has no models.
+    """
+    denied = _guard(request, "capabilities")
+    if denied is not None:
+        return denied
+    # Owner-only, same bar as the proxy and the federated search: the reads run
+    # on a peer with the OWNER's manager-held credential, so a Slack-minted
+    # `!dashboard` subject (an authenticated non-owner) must not reach them.
+    from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+    from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+    if not is_owner_dashboard_request(request):
+        _audit("capabilities", "denied", error="non-owner identity rejected")
+        return _owner_denial_response(request, "remote-crew capabilities are owner-only")
+    state: DashboardState = request.app["state"]
+    instance_id = request.match_info.get("id", "")
+    mgr = getattr(state, "instances_manager", None)
+    if mgr is None:
+        _audit("capabilities", "denied", error="instances manager unavailable")
+        return web.json_response(
+            {"error": "remote crews are not available", "code": "instances_unavailable"},
+            status=503,
+        )
+
+    paths = ("/api/version", "/api/agents", "/api/models", "/api/effort-levels", "/api/workspaces")
+    results = await asyncio.gather(
+        *(mgr.peer_capability(instance_id, path) for path in paths),
+        return_exceptions=True,
+    )
+    raw: dict[str, object] = {}
+    unavailable: dict[str, str] = {}
+    for path, outcome in zip(paths, results):
+        field = path.rsplit("/", 1)[-1].replace("-", "_")
+        if isinstance(outcome, BaseException):
+            logger.info(
+                "Peer capability %s on %s raised (%s)",
+                path,
+                instance_id,
+                type(outcome).__name__,
+            )
+            unavailable[field] = "capability_unreachable"
+            continue
+        ok, payload = outcome
+        if ok:
+            raw[field] = payload
+        else:
+            unavailable[field] = (
+                _cap_str(payload.get("code"), 64)
+                if isinstance(payload, dict)
+                else "capability_error"
+            )
+
+    peer_version = ""
+    version_payload = raw.get("version")
+    if isinstance(version_payload, dict):
+        peer_version = _cap_str(version_payload.get("version"), _CAP_MAX_VERSION_STR)
+    agents_payload = raw.get("agents")
+    workspaces_payload = raw.get("workspaces")
+    workspaces = _cap_rows(
+        _cap_list(workspaces_payload, "workspaces"), {"name": 128, "path": _CAP_MAX_STR}
+    )
+    effort_payload = _cap_list(raw.get("effort_levels"), "effort_levels")
+    effort_levels = (
+        [_cap_str(level, 32) for level in effort_payload[:_CAP_MAX_ROWS] if isinstance(level, str)]
+        if isinstance(effort_payload, list)
+        else []
+    )
+
+    _audit("capabilities", "success", request_id=instance_id)
+    return web.json_response(
+        {
+            "instance_id": instance_id,
+            "version": peer_version,
+            "local_version": kiro_crew.__version__,
+            # The gate the relay enforces on every dispatch, surfaced so the UI
+            # can explain a refusal BEFORE the user types a message rather than
+            # after their first send fails.
+            "version_match": bool(peer_version) and peer_version == kiro_crew.__version__,
+            "agents": _cap_rows(
+                _cap_list(agents_payload, "agents"),
+                {"name": 128, "description": _CAP_MAX_STR, "scope": 32, "model": 128},
+            ),
+            # What answers when the bound session has picked nothing. A local
+            # session falls back to THIS machine's default agent, which for a
+            # peer-bound session would name a crew the peer may not have — so the
+            # shelf needs the peer's own default to render honestly before the
+            # first pick.
+            "default_agent": (
+                _cap_str(agents_payload.get("default_agent"), 128)
+                if isinstance(agents_payload, dict)
+                else ""
+            ),
+            "models": _cap_rows(
+                _cap_list(raw.get("models"), "models"),
+                {
+                    "model_name": 128,
+                    "display_name": 128,
+                    "description": _CAP_MAX_STR,
+                    "context_window": 0,
+                },
+            ),
+            "effort_levels": effort_levels,
+            "workspaces": workspaces,
+            "default_workspace": (
+                _cap_str(workspaces_payload.get("default"), 128)
+                if isinstance(workspaces_payload, dict)
+                else ""
+            ),
+            "unavailable": unavailable,
+        }
+    )
 
 
 async def api_instances_proxy(request: web.Request) -> web.StreamResponse:

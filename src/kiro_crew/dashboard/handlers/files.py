@@ -12,6 +12,7 @@ import logging
 import mimetypes
 import ntpath
 import os
+import posixpath
 import re
 import stat as _stat_mod
 import subprocess
@@ -21,6 +22,7 @@ import time
 import urllib.parse
 import uuid
 import zipfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import BinaryIO, NamedTuple
 
@@ -28,20 +30,35 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.multipart import BodyPartReader
 
-from kiro_crew import pinned_fs, platform_compat
+from kiro_crew import file_delivery_consent, pinned_fs, platform_compat
 from kiro_crew.atomic_write import (
     atomic_write,
     open_access_control_source,
     pinned_parent_replace_supported,
 )
 from kiro_crew.config import loader as config_loader
-from kiro_crew.config.loader import KiroCrewConfig, WorkspaceConfig, config_dir, data_home
+from kiro_crew.config.loader import (
+    KiroCrewConfig,
+    WorkspaceConfig,
+    coerce_dict_section,
+    config_dir,
+    data_home,
+    update_config_locked,
+)
 from kiro_crew.dashboard import part_stream, upload_destination
-from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+from kiro_crew.dashboard.chat_utils import (
+    dashboard_slot_key,
+    drained_to_thread,
+    run_config_write,
+)
 from kiro_crew.dashboard.file_index import _SKIP_DIRS as _WALK_SKIP_DIRS
 from kiro_crew.dashboard.handlers._shared import _probe_persisted_session, read_bounded_json
 from kiro_crew.dashboard.origin import is_direct_local_request
-from kiro_crew.dashboard.state import DashboardState, append_and_surface
+from kiro_crew.dashboard.state import (
+    VALID_MEMORY_MODES,
+    DashboardState,
+    append_and_surface,
+)
 from kiro_crew.doc_parser import extract_text
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, safe_read_prefix
 from kiro_crew.messaging.display_safety import redact_for_display
@@ -54,6 +71,7 @@ from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
+    redact_path_segments,
 )
 from kiro_crew.slack.handler import is_tracked_channel
 from kiro_crew.validation import (
@@ -103,11 +121,10 @@ def _audit_file_send(
 
     Every record the Slack and channel endpoints emit is the same tool
     invocation under a different ``tool_kind`` (the leg), so the shape lives
-    here rather than being spelled out at each of the dozen decision sites it
-    used to be copied to -- one drifted field was previously a one-line edit
-    away. Optional fields are OMITTED when unset, exactly as the shipped call
-    sites omitted them: skips carry no ``downstream_service``, refusals and
-    deliveries do.
+    here rather than being spelled out at each of the dozen decision sites that
+    write it -- a copy per site puts a drifted field one edit away. Optional
+    fields are OMITTED when unset: skips carry no ``downstream_service``,
+    refusals and deliveries do.
     """
     extra: dict[str, str] = {}
     if error is not None:
@@ -143,7 +160,7 @@ def _body_err_code(body_err: web.Response) -> str:
 
 async def api_reveal_path(request: web.Request) -> web.Response:
     """POST /api/reveal — reveal a file/folder in Finder or open with default app."""
-    # Default cap: the body is a path and an action flag (issue #5587 sweep).
+    # Default cap: the body is a path and an action flag.
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
@@ -286,7 +303,14 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
     # and validate MIME against the shared BINARY_MIME_ALLOWLIST.
     try:
         text = raw.decode("utf-8")
-        if redact(text) != text:
+        # The owner's grant covers this leg: the card renders in the owner's own
+        # authenticated dashboard. No audit event here -- the delivery decision is
+        # already recorded by the tool leg, and the byte handover is recorded by
+        # the download route; a third entry for rendering a card would only bury
+        # the two that answer a real question.
+        if redact(text) != text and not file_delivery_consent.is_granted(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD
+        ):
             _sel().log_tool_invocation(
                 session_key="api",
                 source="api",
@@ -406,16 +430,52 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
     if is_text:
         redacted = redact(text)
         if redacted != text:
+            # This is where the flagged bytes actually leave for the owner's
+            # browser, so a grant is honoured here AND the handover is audited --
+            # the refusal it replaces was self-evident in the 400, whereas a
+            # successful consented download would otherwise leave no trace.
+            #
+            # TWO conjuncts, and the second is not redundant. This route is absent
+            # from every ``token_auth`` bypass list, which establishes that it needs
+            # AUTHENTICATION -- not that it needs OWNER IDENTITY. A Slack
+            # allow-listed non-owner running ``!dashboard`` authenticates with
+            # ``app == ""`` and ``sub != owner_id``, so ordinary token auth admits
+            # them while ``is_owner_dashboard_request`` does not. Without the owner
+            # conjunct the grant would convert a clean 400-for-everyone into raw
+            # bytes for every authenticated caller -- widening the audience as a
+            # side effect of a control meant to narrow it, and contradicting the
+            # "owner's own authenticated browser" audience this class is scoped to.
+            from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
+                is_owner_dashboard_request,
+            )
+
+            if not (
+                file_delivery_consent.is_granted(file_delivery_consent.CLASS_OWNER_DASHBOARD)
+                and is_owner_dashboard_request(request)
+            ):
+                _sel().log_tool_invocation(
+                    session_key="api",
+                    source="api",
+                    tool_name="file_send",
+                    tool_kind="download",
+                    outcome="denied",
+                    error="content_redacted",
+                )
+                return web.json_response(
+                    {"error": "file content was redacted; download aborted"}, status=400
+                )
             _sel().log_tool_invocation(
                 session_key="api",
                 source="api",
                 tool_name="file_send",
                 tool_kind="download",
-                outcome="denied",
-                error="content_redacted",
+                outcome="completed",
+                error="sensitive_content_delivered_with_consent",
             )
-            return web.json_response(
-                {"error": "file content was redacted; download aborted"}, status=400
+            file_delivery_consent.audit_decision(
+                file_delivery_consent.CLASS_OWNER_DASHBOARD,
+                outcome="delivered",
+                detail=f"download: {path.name}",
             )
     safe_name = urllib.parse.quote(path.name, safe="")
     content_type, _ = mimetypes.guess_type(path.name)
@@ -657,12 +717,11 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
     restricted-session ceiling, then a request-named channel, a
     session-map-linked thread, or the owner-DM fallback with its tracked-channel
     authorization — next to the non-Slack leg's, so the two cannot drift apart
-    rung by rung (issue #6060). What stays here is what only this leg can
+    rung by rung. What stays here is what only this leg can
     answer: the Slack client, its upload verb, and the response shapes.
 
-    The client-presence check stays AHEAD of the body parse, where it shipped: a
-    gateway with no Slack client answers ``skipped: no_slack`` even for a
-    malformed body.
+    The client-presence check stays AHEAD of the body parse: a gateway with no
+    Slack client answers ``skipped: no_slack`` even for a malformed body.
     """
     state: DashboardState = request.app["state"]
     slack = state.slack_client
@@ -724,8 +783,8 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
     try:
         # The filename was already cleared by the shared admission gate above —
         # same predicate, same value, strictly earlier in this function — so the
-        # leg no longer re-checks it. #6044 made that gate the one site for the
-        # rule; a second copy here could only drift from it.
+        # leg does not re-check it. That gate is the one site for the rule; a
+        # second copy here could only drift from it.
         await slack.upload_file(
             destination.channel,
             destination.thread_ts,
@@ -768,11 +827,11 @@ async def api_channel_upload_file(request: web.Request) -> web.Response:
     this file land here": Telegram and Discord today, each via its own
     purpose-built name-preserving ``send_document``; every other channel is a
     skip until its transport grows that verb. The Slack counterpart above
-    resolves through the same module, one rung table away (issue #6060).
+    resolves through the same module, one rung table away.
 
     "Cannot deliver here" is a SKIP (``delivered: false``), not an error: most
     sessions mirror nowhere, and the caller falls back to the dashboard card
-    and the Slack leg exactly as before this endpoint existed.
+    and the Slack leg.
     """
     state: DashboardState = request.app["state"]
     # Default cap: same shape as the Slack leg — a path, a filename, and a
@@ -1139,13 +1198,10 @@ async def _stream_video_part(
 
     All the file handling lives in :func:`~kiro_crew.dashboard.part_stream.
     stream_part_to_file`, which owns the temp through a synchronous context
-    manager. This function is now only the translation between that helper's
-    exceptions and this endpoint's audit reasons and error codes -- deliberately,
-    because the hand-rolled version of the streaming here collected SEVEN
-    blocking review findings in seven rounds, three of them introduced while
-    fixing the previous one. That module's docstring carries the ledger and the
-    invariant; the short version is that a cancellable coroutine cannot own a
-    file safely, so it no longer does.
+    manager. This function is only the translation between that helper's
+    exceptions and this endpoint's audit reasons and error codes: a cancellable
+    coroutine cannot own a file safely, so ownership stays in that module,
+    whose docstring carries the invariant.
     """
     ext = dest.suffix.lower()
     try:
@@ -1199,9 +1255,9 @@ async def api_upload_file(request: web.Request) -> web.Response:
         path in a 20-file request may unlink up to 20 paths (a video among them
         up to 512 MB), and `Path.unlink` is a synchronous syscall: on a slow or
         network filesystem doing that inline stalls chat and heartbeat for the
-        whole gateway. It also absorbs the destination itself via *also*, so the
-        sites that previously paired a bare ``dest.unlink()`` with a cleanup call
-        have one call and cannot drift back to unlinking on the loop.
+        whole gateway. It also absorbs the destination itself via *also*, so no
+        site pairs a bare ``dest.unlink()`` with a cleanup call and none can
+        drift back to unlinking on the loop.
         """
         targets = [*paths, *(str(p) for p in also)]
 
@@ -1477,11 +1533,44 @@ async def api_workspaces(request: web.Request) -> web.Response:
     return web.json_response({"workspaces": result, "default": default_ws})
 
 
+def _resolve_ws_dir(d: str) -> Path:
+    """Resolve a workspace dir string the way collision checks compare them."""
+    p = Path(d).expanduser()
+    return p.resolve() if p.is_absolute() else (data_home() / d).resolve()
+
+
+class _WorkspaceConflict(Exception):
+    """A workspace precondition failed against FRESH state inside the lock.
+
+    The handlers validate on a snapshot loaded before their awaits (fast 4xxs
+    for the common case), but the decision that guards config integrity --
+    name/directory collisions, default-workspace and agent references -- must
+    be re-made against the state the mutation actually lands on, inside the
+    run_config_write critical section, or two overlapping owner requests can
+    both pass the stale check and persist a conflicting document. Carries the
+    response payload the handler returns.
+    """
+
+    def __init__(self, status: int, error: str, code: str) -> None:
+        super().__init__(error)
+        self.status = status
+        self.error = error
+        self.code = code
+
+
 async def api_workspaces_create(request: web.Request) -> web.Response:
     """POST /api/workspaces — create a new workspace."""
     import shutil  # noqa: F811
 
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
     from kiro_crew.validation import WORKSPACE_NAME_RE  # noqa: F811
+
+    # Ahead of the body read: a workspace entry carries a caller-supplied
+    # directory, so the traversal and sensitive-path guards below are defending
+    # against input that only the owner may supply in the first place.
+    owner_denied = await require_owner_dashboard_request(request, "workspace.create")
+    if owner_denied is not None:
+        return owner_denied
 
     # Default cap: the body is a workspace name plus optional dir/copy_from.
     body, body_err = await read_bounded_json(request)
@@ -1500,6 +1589,13 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
     if name in cfg.workspaces:
         return web.json_response({"error": f"Workspace '{name}' already exists"}, status=409)
     copy_from = body.get("copy_from", "").strip()
+    # Set only once ALL validation has passed (staging is the LAST pre-persist
+    # step): the staged tree awaiting install, and the destination it installs
+    # into once the in-lock checks pass. copy_pending records that the branch
+    # wants a copy, deferred until after the shared path validation below.
+    staged_path: Path | None = None
+    install_dst: Path | None = None
+    copy_pending = False
     if copy_from:
         if copy_from not in cfg.workspaces:
             return web.json_response(
@@ -1550,27 +1646,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
                 {"error": "Cannot use config root as workspace directory"}, status=400
             )
         if src_path.is_dir():
-            # Use the module-level is_sensitive_path alias to filter entries
-            # instead of hardcoded names -- one binding for one guard.
-
-            def _ignore_sensitive(directory: str, entries: list[str]) -> set[str]:
-                from pathlib import Path as _Path  # noqa: F811
-
-                skip: set[str] = set()
-                for entry in entries:
-                    full = str(_Path(directory, entry).resolve())
-                    if is_sensitive_path(full):
-                        skip.add(entry)
-                return skip
-
-            await asyncio.to_thread(
-                shutil.copytree,
-                src_path,
-                dst_path,
-                dirs_exist_ok=True,
-                symlinks=True,
-                ignore=_ignore_sensitive,
-            )
+            copy_pending = True
     else:
         ws_dir = body.get("dir", f"workspace-{name}")
     # Guard against path traversal for relative paths; absolute paths are allowed
@@ -1584,10 +1660,6 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
     )
 
     # Check for directory collision with existing workspaces (resolve both sides)
-    def _resolve_ws_dir(d: str) -> Path:
-        p = Path(d).expanduser()
-        return p.resolve() if p.is_absolute() else (data_home() / d).resolve()
-
     existing_resolved = {_resolve_ws_dir(ws.dir) for ws in cfg.workspaces.values()}
     if _resolve_ws_dir(ws_dir) in existing_resolved:
         return web.json_response(
@@ -1623,8 +1695,130 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "Cannot use config root as workspace directory"}, status=400
         )
-    cfg.workspaces[name] = WorkspaceConfig(dir=ws_dir)
-    cfg.save()
+    if copy_pending:
+        # STAGE the copy_from tree only now, after EVERY validation above has
+        # passed -- a stage before validation leaks the copied tree on any 4xx
+        # It is INSTALLED into place inside the locked
+        # persist below, so a losing create never mutates the destination.
+
+        def _ignore_sensitive(directory: str, entries: list[str]) -> set[str]:
+            # Module-level is_sensitive_path alias -- one binding for one guard.
+            from pathlib import Path as _Path  # noqa: F811
+
+            skip: set[str] = set()
+            for entry in entries:
+                full = str(_Path(directory, entry).resolve())
+                if is_sensitive_path(full):
+                    skip.add(entry)
+            return skip
+
+        staging = dst_path.parent / f".{dst_path.name}.staging-{uuid.uuid4().hex[:8]}"
+
+        def _copy_staged() -> None:
+            shutil.copytree(src_path, staging, symlinks=True, ignore=_ignore_sensitive)
+
+        def _drop_staging() -> None:
+            shutil.rmtree(staging, ignore_errors=True)
+
+        try:
+            # drained_to_thread, not bare to_thread: a cancellation at the
+            # await would leave the copytree THREAD still writing while the
+            # cleanup below rmtrees the same tree -- the race can strand
+            # partial ``.staging-*`` residue. Draining
+            # runs the copy to completion first, so the cleanup only ever
+            # starts on a quiescent tree, and the cleanup itself is drained so
+            # it cannot be abandoned mid-delete either.
+            await drained_to_thread(_copy_staged)
+        except BaseException:
+            await drained_to_thread(_drop_staging)
+            raise
+        staged_path = staging
+        install_dst = dst_path
+
+    # Persist as ONE delta read-modify-write on the raw document, inside a
+    # single hold of the sidecar flock (update_config_locked), dispatched off
+    # the loop with both locks via run_config_write -- the transaction shape
+    # run_config_write's own docstring prescribes. The
+    # handler's `cfg` was loaded before awaits above (the copytree can run for
+    # seconds), so the state-dependent preconditions are re-decided against
+    # the document as read INSIDE the lock, and only the keys this create owns
+    # are written -- a concurrent write to any other setting is untouchable.
+    def _mutate_create(doc: dict) -> dict:
+        workspaces = coerce_dict_section(doc, "workspaces")
+        if name in workspaces:
+            raise _WorkspaceConflict(409, f"Workspace '{name}' already exists", "workspace_exists")
+        raw_dirs = {
+            _resolve_ws_dir(str(ws.get("dir", "")))
+            for ws in workspaces.values()
+            if isinstance(ws, dict)
+        }
+        if _resolve_ws_dir(ws_dir) in raw_dirs:
+            raise _WorkspaceConflict(
+                409,
+                f"Directory '{ws_dir}' is already used by another workspace",
+                "workspace_dir_in_use",
+            )
+        # Checks passed: INSTALL the staged tree now (we are in a worker
+        # thread, inside the flock hold), before the config write, so a
+        # directory only ever appears at the destination for a create that is
+        # actually being persisted. The install invariant that makes rollback
+        # TOTAL: the destination must not exist AT ALL -- any pre-existing
+        # directory (even empty: its inode and metadata are not ours to
+        # replace) is refused. publish_dir_noreplace, not check-then-rename:
+        # POSIX os.rename silently replaces an EMPTY destination, so a racer's
+        # directory created between a check and the rename would be destroyed;
+        # the no-replace rename closes that window in the filesystem itself.
+        if staged_path is not None and install_dst is not None:
+            if install_dst.exists():
+                raise _WorkspaceConflict(
+                    409,
+                    f"Destination directory '{ws_dir}' already exists; choose "
+                    "another dir or remove it first",
+                    "workspace_dir_occupied",
+                )
+            try:
+                platform_compat.publish_dir_noreplace(staged_path, install_dst)
+            except (FileExistsError, OSError) as exc:
+                # A filesystem racer created the destination between the check
+                # and the rename; refuse rather than replace anything.
+                raise _WorkspaceConflict(
+                    409,
+                    f"Destination directory '{ws_dir}' already exists; choose "
+                    "another dir or remove it first",
+                    "workspace_dir_occupied",
+                ) from exc
+            install_state["installed"] = True
+        workspaces[name] = asdict(WorkspaceConfig(dir=ws_dir))
+        return doc
+
+    install_state: dict = {"installed": False}
+    try:
+        await run_config_write(update_config_locked, mutate=_mutate_create)
+    except _WorkspaceConflict as conflict:
+        # The staged tree was never installed; drop it in a worker -- an
+        # inline rmtree of a large copied workspace would stall the loop.
+        if staged_path is not None:
+            await asyncio.to_thread(shutil.rmtree, staged_path, ignore_errors=True)
+        return web.json_response({"error": conflict.error, "code": conflict.code}, status=409)
+    except asyncio.CancelledError:
+        # run_config_write SHIELDS and DRAINS the worker: a CancelledError
+        # surfacing here means the worker ran to completion -- the install
+        # landed AND the config write registered the workspace (a worker
+        # failure would surface as that failure, not as cancellation).
+        # Rolling back would delete a directory config.json now points at.
+        # Nothing to clean: the staged tree was consumed by the install.
+        raise
+    except BaseException:
+        # The worker itself failed (unreadable config, a failed atomic
+        # write): the workspace was NOT registered, so an installed tree is a
+        # phantom -- roll it back; an uninstalled staging tree is residue --
+        # drop it. Both off the loop. The rollback can only remove a tree
+        # this request created (see the install invariant above).
+        if install_state["installed"] and install_dst is not None:
+            await asyncio.to_thread(shutil.rmtree, install_dst, ignore_errors=True)
+        elif staged_path is not None:
+            await asyncio.to_thread(shutil.rmtree, staged_path, ignore_errors=True)
+        raise
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="workspace.create",
@@ -1637,6 +1831,12 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
 
 async def api_workspaces_update(request: web.Request) -> web.Response:
     """PUT /api/workspaces/{name} — update a workspace."""
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    # Ahead of the 404: whether a workspace exists is not a non-owner's to learn.
+    owner_denied = await require_owner_dashboard_request(request, "workspace.update")
+    if owner_denied is not None:
+        return owner_denied
 
     name = request.match_info["name"]
     cfg = KiroCrewConfig.load()
@@ -1696,8 +1896,43 @@ async def api_workspaces_update(request: web.Request) -> web.Response:
                 {"error": f"Directory '{new_dir}' is already used by another workspace"},
                 status=409,
             )
-        cfg.workspaces[name].dir = new_dir
-    cfg.save()
+
+    # Persist as ONE delta RMW on the raw document inside the flock hold (see
+    # workspace.create): the mutation AND its state-dependent precondition
+    # (dir collision) are re-decided against the document as read inside the
+    # lock, and only this workspace's entry is written.
+    def _mutate_update(doc: dict) -> dict | None:
+        workspaces = coerce_dict_section(doc, "workspaces")
+        ws = workspaces.get(name)
+        if not isinstance(ws, dict):
+            # A concurrent delete won the race after our 404 check; recreating
+            # the workspace from this handler's older view would undo it.
+            raise _WorkspaceConflict(404, f"Workspace '{name}' not found", "workspace_not_found")
+        if "dir" in body:
+            new_resolved = _resolve_ws_dir(body["dir"])
+            others = {
+                _resolve_ws_dir(str(w.get("dir", "")))
+                for n2, w in workspaces.items()
+                if n2 != name and isinstance(w, dict)
+            }
+            if new_resolved in others:
+                raise _WorkspaceConflict(
+                    409,
+                    f"Directory '{body['dir']}' is already used by another workspace",
+                    "workspace_dir_in_use",
+                )
+            ws["dir"] = body["dir"]
+            return doc
+        return None  # nothing to change -- skip the write
+
+    try:
+        await run_config_write(update_config_locked, mutate=_mutate_update)
+    except _WorkspaceConflict as conflict:
+        if conflict.status == 404:
+            return web.json_response(
+                {"error": conflict.error, "code": conflict.code}, status=404
+            )
+        return web.json_response({"error": conflict.error, "code": conflict.code}, status=409)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="workspace.update",
@@ -1710,6 +1945,13 @@ async def api_workspaces_update(request: web.Request) -> web.Response:
 
 async def api_workspaces_delete(request: web.Request) -> web.Response:
     """DELETE /api/workspaces/{name} — delete a workspace."""
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    # Ahead of the 404/409 guards: those are referential, not authorization, and
+    # this handler reaches `cfg.save()` with an entry removed.
+    owner_denied = await require_owner_dashboard_request(request, "workspace.delete")
+    if owner_denied is not None:
+        return owner_denied
 
     name = request.match_info["name"]
     cfg = KiroCrewConfig.load()
@@ -1726,8 +1968,38 @@ async def api_workspaces_delete(request: web.Request) -> web.Response:
             {"error": f"Workspace '{name}' is referenced by agents: {', '.join(referencing)}"},
             status=409,
         )
-    del cfg.workspaces[name]
-    cfg.save()
+    # Persist as ONE delta RMW on the raw document inside the flock hold (see
+    # workspace.create); the referential guards (default workspace, agent
+    # references) are re-run against the document as read inside the lock.
+
+    def _mutate_delete(doc: dict) -> dict | None:
+        workspaces = coerce_dict_section(doc, "workspaces")
+        if name not in workspaces:
+            return None  # already gone -- a concurrent delete landed first
+        if name == doc.get("default_workspace", "default"):
+            raise _WorkspaceConflict(
+                409,
+                f"Cannot delete default workspace '{name}'. Change default_workspace first.",
+                "workspace_is_default",
+            )
+        fresh_refs = [
+            a
+            for a, ac in coerce_dict_section(doc, "agents").items()
+            if isinstance(ac, dict) and ac.get("workspace") == name
+        ]
+        if fresh_refs:
+            raise _WorkspaceConflict(
+                409,
+                f"Workspace '{name}' is referenced by agents: {', '.join(fresh_refs)}",
+                "workspace_referenced",
+            )
+        del workspaces[name]
+        return doc
+
+    try:
+        await run_config_write(update_config_locked, mutate=_mutate_delete)
+    except _WorkspaceConflict as conflict:
+        return web.json_response({"error": conflict.error, "code": conflict.code}, status=409)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="workspace.delete",
@@ -2225,7 +2497,7 @@ async def api_file_download(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "invalid input"}, status=400)
 
-    # Envelope shared with api_file_raw (#4031). No header sniff: this endpoint
+    # Envelope shared with api_file_raw. No header sniff: this endpoint
     # serves attachment + nosniff rather than choosing a content type. Offloaded
     # to a worker thread: the envelope is synchronous file I/O (realpath, open,
     # fstat, full read up to the cap) and must not block the event loop.
@@ -2521,7 +2793,7 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
 async def api_file_raw(request: web.Request) -> web.Response:
     """GET /api/file-raw?path=... — serve a file with its native content type (images, etc.)."""
     # Envelope (validate -> sensitive -> nofollow-open -> bounded read) is
-    # shared with api_file_download so a hardening change lands on both (#4031).
+    # shared with api_file_download so a hardening change lands on both.
     # Offloaded to a worker thread: the envelope is synchronous file I/O and
     # must not block the event loop (same shape as api_file_stream's _open_media).
     opened = await asyncio.to_thread(
@@ -2935,10 +3207,10 @@ def _file_write_blocking(path: str, content: str) -> str | None:
         # always hands back a descriptor, so the mode comes from the same inode
         # the ACL does and neither is re-resolved.
         src_stat = os.fstat(src_fd) if src_fd is not None else os.stat(path)
-        # mode= keeps the previous copymode behaviour (permission bits), and
-        # preserve_access_control_from is ADDITIVE to it: copymode carried BITS
-        # only, so a named POSIX ACL (system.posix_acl_access) the owner set was
-        # silently dropped the moment the replace installed a fresh inode. The
+        # mode= carries copymode's permission bits, and
+        # preserve_access_control_from is ADDITIVE to it: bits alone drop a named
+        # POSIX ACL (system.posix_acl_access) the owner set, silently, the moment
+        # the replace installs a fresh inode. The
         # carry is allowlisted to the ACL and user.* names -- it must NOT replay a
         # privilege-bearing security.capability onto caller-supplied content.
         atomic_write(
@@ -2967,7 +3239,7 @@ async def api_file_write(request: web.Request) -> web.Response:
     )
 
     # max_bytes=None: the body carries the file's whole contents, which has no
-    # defensible byte ceiling (issue #5587 sweep).
+    # defensible byte ceiling.
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
@@ -3182,7 +3454,7 @@ async def api_file_search(request: web.Request) -> web.Response:
     # candidates; only skip_dirs below are dropped from both descent and results.
     # skip_dirs is the SAME shared set the indexed fast path uses (imported from
     # file_index), so the two paths of this endpoint cannot diverge on which
-    # directories are suppressed -- see #5677.
+    # directories are suppressed.
     skip_dirs = _WALK_SKIP_DIRS
 
     max_scan = _WALK_MAX_SCAN_SCOPED if scoped else _WALK_MAX_SCAN_UNSCOPED
@@ -3260,8 +3532,6 @@ async def api_file_search(request: web.Request) -> web.Response:
                 dirs_visited += 1
                 # A dot-prefixed directory (.github, .kiro, .claude) should be
                 # OFFERED as a candidate even though we must not DESCEND into it.
-                # These were previously conflated: ``dirnames`` was pruned in
-                # place (dropping dot-dirs) before _collect saw it.
                 #
                 # Build the candidate list (offered AND stat'd) first, then
                 # derive the narrower descent list from it. Both drop skip_dirs
@@ -3779,7 +4049,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             )
             return body_err
         assert body is not None  # read_bounded_json returns (dict, None) on success
-        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled", "session_card_source_links"}
+        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "default_memory_mode", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled", "session_card_source_links"}
         # One-release backward-compat shim for removed key; delete after all clients update.
         deprecated_ignored_keys = {"tail_fork_head_handling"}
         # Read-only keys the GET exposes: both settings surfaces save with
@@ -3787,7 +4057,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         # PUT body. Drop them here instead of listing them in _allowed -- they
         # stay unwritable, but a round-tripped read-only field must not 400 an
         # unrelated toggle save.
-        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts"}
+        read_only_ignored_keys = {"gitlab_hosts", "jira_hosts", "social_share_enabled"}
         body = {
             k: v
             for k, v in body.items()
@@ -3832,6 +4102,23 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     {"error": "merge_queued_messages must be a boolean"}, status=400
                 )
             updates["merge_queued_messages"] = val
+        if "default_memory_mode" in body:
+            val = body["default_memory_mode"]
+            if val not in VALID_MEMORY_MODES:
+                _sel().log_tool_invocation(
+                    session_key="dashboard",
+                    tool_name="dashboard_config_write",
+                    outcome="failure",
+                )
+                return web.json_response(
+                    {
+                        "error": "default_memory_mode must be 'persistent', "
+                        "'incognito' or 'temporary'",
+                        "code": "invalid_default_memory_mode",
+                    },
+                    status=400,
+                )
+            updates["default_memory_mode"] = val
         if "widget_density" in body:
             val = body["widget_density"]
             if val not in ("more", "less"):
@@ -4083,11 +4370,20 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
     _sel().log_tool_invocation(
         session_key="dashboard", tool_name="dashboard_config_read", outcome="success"
     )
+    # Governance-derived, not a config value: the dashboard draws the "Share as
+    # image" entry only when this is true, and it has no other way to know — the
+    # share card has no server-side action to refuse, so this read IS the
+    # enforcement point. Resolved off-thread (profile resolution may read from
+    # disk); every decision is SEL-audited by the probe itself.
+    from kiro_crew.dashboard import social_share
+
+    social_share_denied = await asyncio.to_thread(social_share.is_share_denied)
     return web.json_response(
         {
             "restore_sessions": cfg.dashboard.restore_sessions,
             "restore_window_minutes": cfg.dashboard.restore_window_minutes,
             "merge_queued_messages": cfg.dashboard.merge_queued_messages,
+            "default_memory_mode": cfg.dashboard.default_memory_mode,
             "widget_density": cfg.dashboard.widget_density,
             "use_builtin_browser": cfg.dashboard.use_builtin_browser,
             "verbosity": cfg.dashboard.verbosity,
@@ -4107,6 +4403,10 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             # Same discipline for Jira: Atlassian Cloud (*.atlassian.net) is
             # auto-recognized; self-hosted instances need explicit allowlisting.
             "jira_hosts": list(cfg.dashboard.jira_hosts),
+            # Read-only: the `capabilities.social_share` governance answer. False
+            # withdraws the "Share as image" menu entry; there is no toggle behind
+            # it, so nothing here is writable.
+            "social_share_enabled": not social_share_denied,
         }
     )
 
@@ -4820,6 +5120,10 @@ async def api_project_git_status(request: web.Request) -> web.Response:
             pass
 
         result: dict = {"repo": True, "repoRoot": repo_root, "files": files[:500]}
+        # Status paths are repo-root-relative; when the project directory sits
+        # below the repo root, every path starts with this prefix.
+        rel = os.path.relpath(base, repo_root)
+        result["_prefix"] = "" if rel in (".", "") or rel.startswith("..") else rel.replace(os.sep, posixpath.sep)
         if len(files) > 500:
             result["truncated"] = True
         if branch:
@@ -4839,27 +5143,60 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         result["repoRoot"] = redact(result["repoRoot"])
     if result.get("branch"):
         result["branch"] = redact(result["branch"])
-    # Redact each file path, then drop entries that duplicate an earlier one
-    # (preserving order and first occurrence). Same collision class as
-    # api_project_tree: redact() can collapse two genuinely-different paths to
-    # the same placeholder. This list feeds GitPanel, which keys its rows on
+    # Redact each file path with redact_path_segments over the same
+    # context-aware redact(): each path is redacted segment-wise, and every
+    # redacted segment carries an opaque label keyed per gateway process, so two
+    # genuinely-different paths that collapse to the same tag stay two entries
+    # instead of one placeholder -- the whole-string redact() is still the
+    # floor, never less. The label is stable across responses within this
+    # process, which is what lets the dashboard join this listing with the
+    # tree listing by path.
+    # Then drop entries that duplicate an earlier one (preserving order and
+    # first occurrence): this is the fallback for a collision the helper does
+    # not separate. This list feeds GitPanel, which keys its rows on
     # `${path}:${staged}` and takes its file total from files.length, so a
     # collision would render two indistinguishable rows under one React key and
-    # overstate the count. (It cannot reach @pierre/trees as a duplicate the way
-    # api_project_tree's list can: the tree's "changed" mode already collapses
-    # status entries by path before handing them over.) The files[:500] cap was
-    # already applied to the raw listing above, so this only removes collisions.
+    # overstate the count. (It cannot reach @pierre/trees as a duplicate the
+    # way api_project_tree's list can: the tree's "changed" mode already
+    # collapses status entries by path before handing them over.) The
+    # files[:500] cap was already applied to the raw listing above, so this
+    # only removes collisions.
     #
     # The key is (path, status, staged), NOT path alone: one file with both
     # staged and unstaged changes ("MM", "AM", "MD") legitimately yields two
     # entries sharing a path but differing in status/staged, and GitPanel
-    # renders them as separate rows. Keying on path alone would drop the
+    # renders them as separate rows (identical originals redact identically, so
+    # the pair still shares its path). Keying on path alone would drop the
     # unstaged lane and undercount the file total. A real redaction collision
     # has an identical tuple, so it still collapses.
+    # The project directory's own repo-relative prefix is redacted the same
+    # way the tree root and repoRoot are (whole-string, unlabelled), so a
+    # credential-shaped project directory reads identically on both sides of
+    # the dashboard join; only the part beneath it is labelled per segment.
+    prefix = str(result.pop("_prefix", "") or "")
+    prefix_slash = posixpath.join(prefix, "") if prefix else ""
+    redacted_prefix = redact(prefix) if prefix else ""
+
+    def _redact_status_path(path: str) -> str:
+        if prefix_slash and path.startswith(prefix_slash):
+            below = redact_path_segments(path[len(prefix_slash) :], redact)
+            joined = posixpath.join(redacted_prefix, below)
+            # Same floor redact_path_segments applies to its own assembly: the
+            # prefix and the part beneath it are redacted separately, so a
+            # token that straddles the joining slash is matched by neither
+            # half. The joined result must be a fixed point of the redactor;
+            # when it is not, the whole-path result wins, exactly as it does
+            # inside the helper.
+            return joined if redact(joined) == joined else redact(path)
+        if prefix and path == prefix:
+            return redacted_prefix
+        return redact_path_segments(path, redact)
+
     deduped_files: list[dict] = []
     seen_keys: set[tuple[str, str | None, bool | None]] = set()
-    for f in result.get("files", []):
-        f["path"] = redact(f["path"])
+    files = result.get("files", [])
+    for f in files:
+        f["path"] = _redact_status_path(f["path"])
         key = (f["path"], f.get("status"), f.get("staged"))
         if key in seen_keys:
             continue
@@ -4972,7 +5309,25 @@ async def api_project_tree(request: web.Request) -> web.Response:
                 timeout=15,
             )
             if ls_rc == 0:
-                listed = [p for p in ls_out.split("\0") if p]
+                # SORT BEFORE THE CAP. `ls-files --cached --others` is not one
+                # sorted stream: git emits every untracked entry as a complete
+                # block and only then the tracked ones (its own emission order
+                # -- unchanged if the flags are written the other way round, and
+                # git-ls-files(1) documents no order at all). A prefix cut of
+                # that therefore never reaches the tracked block once untracked
+                # alone fill the cap, and the whole source tree loses its rows:
+                # the dashboard infers a directory row only from the file paths
+                # present, so those folders go absent rather than collapsed.
+                # Sorting spends the budget by path instead of by whichever
+                # block git happened to emit first. It does NOT make the two
+                # branches emit the same order: the fallback walk below sorts
+                # within each level but is depth-first overall, so it yields a
+                # root `z.txt` before `a/x` where sorted() orders them the other
+                # way. What the branches share is narrower and is the actual
+                # warrant for sorting here -- this handler establishes its own
+                # path order rather than passing through a source's arbitrary
+                # emission order.
+                listed = sorted(p for p in ls_out.split("\0") if p)
                 truncated = len(listed) > _PROJECT_TREE_MAX_ENTRIES
                 return {
                     "root": base,
@@ -5003,15 +5358,25 @@ async def api_project_tree(request: web.Request) -> web.Response:
     # Egress redaction, same rationale as api_project_git_status: listed names
     # are repo content and this body is rendered by the dashboard.
     result["root"] = redact(result["root"])
-    # De-duplicate after redaction, preserving order and first occurrence.
-    # redact() collapses each matched token to a fixed placeholder, so two
-    # genuinely-different project-relative paths (e.g. a src/ vs target/ Maven
-    # prefix and a credential-shaped filename token) can flatten to the same
-    # redacted string. The dashboard tree hands this list straight to
-    # @pierre/trees, whose appendPresortedPaths throws "Duplicate path" on
-    # adjacent identical entries. dict.fromkeys keeps first occurrence. This
-    # does not affect "truncated": the cap is applied to the raw listing above.
-    result["paths"] = list(dict.fromkeys(redact(p) for p in result["paths"]))
+    # Redact each path with redact_path_segments over the same context-aware
+    # redact(): the whole-string redact() collapses each matched token to a
+    # fixed placeholder, so two genuinely-different project-relative paths
+    # whose only differing segment is credential-shaped redact to the same
+    # string. The helper redacts each path segment-wise and suffixes every
+    # redacted segment with an opaque label keyed per gateway process, so both
+    # stay in the tree; it never emits less redaction than redact() itself, and
+    # the label is stable across responses within this process, so the git
+    # status listing labels the same path identically and the dashboard's join
+    # by path holds.
+    # Then de-duplicate, preserving order and first occurrence, as the fallback
+    # for a collision the helper does not separate: the dashboard tree hands
+    # this list straight to @pierre/trees, whose appendPresortedPaths throws
+    # "Duplicate path" on adjacent identical entries. dict.fromkeys keeps first
+    # occurrence. This does not affect "truncated": the cap is applied to the
+    # raw listing above.
+    result["paths"] = list(
+        dict.fromkeys(redact_path_segments(p, redact) for p in result["paths"])
+    )
     return web.json_response(result)
 
 

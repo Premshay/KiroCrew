@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shutil
 import socket
 import tempfile
@@ -35,6 +34,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
+from tmpdir_helpers import short_tmp_base
 
 import kiro_crew.dashboard.token_auth as ta
 from kiro_crew import platform_compat
@@ -42,30 +42,24 @@ from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_gateway.socketsec import PeerCredResult
 from kiro_crew.peer_resolve import resolve_peer_identity
 
+
+@pytest.fixture
+def short_sock_dir() -> "Iterator[Path]":
+    """A SHORT base for every AF_UNIX bind/connect path in this module.
+
+    ``sun_path`` caps at 104 bytes on macOS, and a pytest ``tmp_path`` under a
+    deep TMPDIR (or xdist) exceeds it, failing ``bind()`` with ``OSError:
+    AF_UNIX path too long`` (#8610). Same pattern as ``test_socketsec.py``:
+    ``mkdtemp`` under :func:`short_tmp_base`, removed at teardown because
+    ``mkdtemp`` registers no finalizer.
+    """
+    base = Path(tempfile.mkdtemp(dir=short_tmp_base()))
+    yield base
+    shutil.rmtree(base, ignore_errors=True)
+
+
 SECRET = "test-internal-secret"
 INTERNAL = frozenset({"/api/spawn"})
-
-
-@pytest.fixture()
-def socket_dir() -> Iterator[Path]:
-    """A directory short enough to bind an AF_UNIX socket in.
-
-    ``sun_path`` holds 108 bytes and ``tmp_path`` is not built to fit it: under
-    a session-scoped ``TMPDIR`` the per-test directory alone runs past 130
-    characters, so every bind here fails with "AF_UNIX path too long" and the
-    transport under test is never exercised. Two of these tests then fail for a
-    reason that has nothing to do with them, and the ones asserting a bind
-    FAILURE pass for the wrong reason, which is worse.
-
-    The user runtime directory is both short and where a user's sockets belong;
-    ``/tmp`` is the fallback where it is unset.
-    """
-    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-    path = Path(tempfile.mkdtemp(prefix="kc-sock-", dir=base))
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +425,7 @@ def _unix_http_request(
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
 @pytest.mark.asyncio
 async def test_unix_site_end_to_end_peer_verification(
-    tmp_path: Path, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, short_sock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Real UnixSite + real AF_UNIX connect: the kernel reports OUR pid/uid,
     so with a session_pid file for an ancestor of this test process the
@@ -468,7 +462,7 @@ async def test_unix_site_end_to_end_peer_verification(
     app.router.add_get("/api/spawn", handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    sock_path = str(socket_dir / "dash-test.sock")
+    sock_path = str(short_sock_dir / "dash-test.sock")
     site = web.UnixSite(runner, sock_path)
     await site.start()
     try:
@@ -527,17 +521,17 @@ def test_check_origin_still_rejects_plain_remote_without_origin() -> None:
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
 @pytest.mark.asyncio
 async def test_start_unix_site_binds_and_removes_stale(
-    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
+    short_sock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from kiro_crew.dashboard import server as srv
 
     monkeypatch.setattr(
         "kiro_crew.dashboard.server.dashboard_socket_path",
-        lambda port: socket_dir / f"dashboard-{port}.sock",
+        lambda port: short_sock_dir / f"dashboard-{port}.sock",
     )
     # Plant a stale socket file (bound then abandoned) to prove self-healing.
     stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    stale.bind(str(socket_dir / "dashboard-5999.sock"))
+    stale.bind(str(short_sock_dir / "dashboard-5999.sock"))
     stale.close()
 
     app = web.Application()
@@ -565,13 +559,13 @@ async def test_start_unix_site_skipped_on_windows(monkeypatch: pytest.MonkeyPatc
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
 @pytest.mark.asyncio
 async def test_start_unix_site_bind_failure_degrades(
-    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
+    short_sock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A non-socket file squatting the path makes the bind fail; startup must
     degrade to TCP-only (return None), never raise."""
     from kiro_crew.dashboard import server as srv
 
-    squatter = socket_dir / "dashboard-6001.sock"
+    squatter = short_sock_dir / "dashboard-6001.sock"
     squatter.write_text("not a socket", encoding="utf-8")
     monkeypatch.setattr("kiro_crew.dashboard.server.dashboard_socket_path", lambda port: squatter)
     app = web.Application()
@@ -590,7 +584,7 @@ async def test_start_unix_site_bind_failure_degrades(
 
 
 @pytest.fixture()
-def unix_http_server(socket_dir: Path):
+def unix_http_server(short_sock_dir: Path):
     """A minimal threaded HTTP server on an AF_UNIX socket."""
     import http.server
     import socketserver
@@ -617,7 +611,7 @@ def unix_http_server(socket_dir: Path):
             request, _ = super().get_request()
             return request, ("unix", 0)
 
-    sock_path = str(socket_dir / "client-test.sock")
+    sock_path = str(short_sock_dir / "client-test.sock")
     server = _UnixServer(sock_path, _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -633,15 +627,15 @@ def test_loopback_urlopen_uses_unix_socket(unix_http_server: str) -> None:
         assert json.loads(resp.read()) == {"via": "unix"}
 
 
-def test_loopback_urlopen_absent_socket_falls_back_to_tcp(socket_dir: Path) -> None:
+def test_loopback_urlopen_absent_socket_falls_back_to_tcp(short_sock_dir: Path) -> None:
     """Socket file missing → straight to TCP (refused on a dead port)."""
     req = urllib.request.Request("http://127.0.0.1:1/api/x")
     with pytest.raises(urllib.error.URLError):
-        loopback_urlopen(req, timeout=2, unix_socket_path=str(socket_dir / "nope.sock"))
+        loopback_urlopen(req, timeout=2, unix_socket_path=str(short_sock_dir / "nope.sock"))
 
 
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
-def test_loopback_urlopen_stale_socket_falls_back_to_tcp(socket_dir: Path) -> None:
+def test_loopback_urlopen_stale_socket_falls_back_to_tcp(short_sock_dir: Path) -> None:
     """Socket file exists but nobody listens → connect refused → TCP fallback.
 
     The TCP side serves a real response, proving the fallback actually runs
@@ -649,7 +643,7 @@ def test_loopback_urlopen_stale_socket_falls_back_to_tcp(socket_dir: Path) -> No
     import http.server
     import threading
 
-    stale_path = socket_dir / "stale.sock"
+    stale_path = short_sock_dir / "stale.sock"
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.bind(str(stale_path))
     s.close()  # bound but never listened/accepting → ECONNREFUSED
@@ -679,7 +673,7 @@ def test_loopback_urlopen_stale_socket_falls_back_to_tcp(socket_dir: Path) -> No
 
 
 @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="AF_UNIX transport is POSIX-only")
-def test_loopback_urlopen_http_error_propagates_no_fallback(socket_dir: Path) -> None:
+def test_loopback_urlopen_http_error_propagates_no_fallback(short_sock_dir: Path) -> None:
     """A 4xx over the unix socket is a REAL response — it must propagate as
     HTTPError, never trigger a duplicate TCP send."""
     import http.server
@@ -702,7 +696,7 @@ def test_loopback_urlopen_http_error_propagates_no_fallback(socket_dir: Path) ->
             request, _ = super().get_request()
             return request, ("unix", 0)
 
-    sock_path = str(socket_dir / "err.sock")
+    sock_path = str(short_sock_dir / "err.sock")
     server = _UnixServer(sock_path, _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -735,12 +729,12 @@ def test_mcp_core_post_prefers_unix_socket(
 
 
 def test_mcp_core_post_falls_back_to_tcp_when_socket_absent(
-    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
+    short_sock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Error shape of _get is unchanged when neither transport answers."""
     import kiro_crew.mcp_core as mcp_core
 
-    monkeypatch.setattr(mcp_core, "_API_UNIX_SOCKET", str(socket_dir / "absent.sock"))
+    monkeypatch.setattr(mcp_core, "_API_UNIX_SOCKET", str(short_sock_dir / "absent.sock"))
     monkeypatch.setattr(mcp_core, "_API", "http://127.0.0.1:1")
     monkeypatch.setattr(mcp_core, "_internal_secret", lambda: "s")
     monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:chat-1")
@@ -776,14 +770,12 @@ async def test_non_loopback_mixed_denial_names_which_credential_was_wrong(
     assert resp.status == 403
 
     denials = [
-        c
-        for c in calls
-        if c.get("operation") == "internal_auth" and c.get("outcome") == "denied"
+        c for c in calls if c.get("operation") == "internal_auth" and c.get("outcome") == "denied"
     ]
     assert len(denials) == 1
     err = denials[0]["error"]
     assert "non-loopback mixed" in err, err
-    assert "received=absent" in err, (
-        "the mixed arm still cannot say an absent credential from a wrong one"
-    )
+    assert (
+        "received=absent" in err
+    ), "the mixed arm still cannot say an absent credential from a wrong one"
     assert f"expected={ta._credential_fingerprint(SECRET)}" in err, err
