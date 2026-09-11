@@ -149,7 +149,11 @@ class ClaudeCodeMirror(AgentConfigMirror):
         ``spawn_run``, ``cron_add``, ``send_message`` and every configured server
         into a permission surface Crew does not control.
 
-        So the array is withheld unless Crew authored the file. The cost is
+        So the array is withheld unless the file on disk carries the seed this
+        session requires — because Crew authored it, or because a sibling of the
+        same agent in the same ``work_dir`` wrote byte for byte the same one. What
+        this decision turns on is the ``defaultMode`` and ``deny`` rules the adapter
+        will read, not which client's write put them there. The cost is
         stated rather than hidden: such a session runs with no Crew MCP tools,
         which is exactly how every claude session behaved before this array
         existed, so nothing regresses — it simply does not gain tools Crew could
