@@ -1271,9 +1271,35 @@ class TestClaudeAutonomousReader:
             mcp_gateway_claude_servers=["context7"],
             mcp_gateway_overlay=overlay,
         )
+        # Seed the permission surface, as the spawn path does before it binds a
+        # session. Without it the array is withheld entirely, and a session holding
+        # no Crew profile has nothing to exclude the user's sources FOR -- so the
+        # unseeded form asserted a state no production caller can reach.
+        client._write_claude_local_settings()
+        assert client._claude_settings_authored is True
 
         options = client._claude_session_meta()["claudeCode"]["options"]
 
+        assert options["settingSources"] == ["project", "local"]
+
+    def test_a_wholly_pooled_profile_still_excludes_the_user_registry(self, tmp_path, monkeypatch):
+        """The session that was leaking: a real profile, nothing surviving translation.
+
+        When every one of an agent's servers is a pooled broker stub the translation
+        comes back empty, yet the session still receives a complete Crew profile as
+        stubs. Keying the decision off the translation missed exactly those sessions,
+        so they discovered the user's interactive MCP registry on top of the profile
+        -- the browser/filesystem/research fleet this option exists to keep out.
+        """
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._write_claude_local_settings()
+        monkeypatch.setattr(client, "_translated_session_mcp_servers", lambda: [])
+        monkeypatch.setattr(client, "_claude_session_mcp_servers", lambda: [])
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [{"name": "kirocrew-core"}])
+        client._session_mcp_withheld = False
+
+        assert client._session_mcp_servers()  # a profile does reach the adapter
+        options = client._claude_session_meta()["claudeCode"]["options"]
         assert options["settingSources"] == ["project", "local"]
 
     def test_unavailable_explicit_profile_preserves_user_setting_source(self, tmp_path):

@@ -4111,7 +4111,17 @@ class AcpClient:
     def _claude_session_meta(self) -> dict[str, Any]:
         """Return the adapter extension requested on every Claude session bind."""
         options: dict[str, Any] = {}
-        if self._translated_session_mcp_servers() or self._claude_session_mcp_servers():
+        # Asks for the roster the adapter will actually be handed, which is the
+        # thing this decision is about. The former test read the TRANSLATION twice
+        # -- ``_claude_session_mcp_servers`` returns exactly what
+        # ``_translated_session_mcp_servers`` does -- so it missed every session
+        # whose profile arrives as pooled stubs or the capability server with
+        # nothing surviving translation. Those sessions DO receive a complete Crew
+        # profile, and they were the ones left discovering the user's registry on
+        # top of it: the browser/filesystem/research fleet this exists to prevent.
+        # An empty roster still leaves the key unset, so a session Crew withheld
+        # tools from keeps the adapter's own sources -- the disclosed fallback.
+        if self._session_mcp_servers():
             # The explicit ACP list above is the complete KiroCrew profile. Do
             # not also discover the user's interactive MCP registry, or every
             # dashboard worker recreates its browser/filesystem/research fleet.
