@@ -3549,6 +3549,12 @@ class AcpClient:
         # (harness-parity H13). None = not resolved yet; cleared on reset so the
         # next spawn re-reads the spec. See _session_mcp_servers.
         self._session_mcp_cache: list[dict[str, Any]] | None = None
+        # The withholding VERDICT from that same resolve, kept beside the cache
+        # because an empty cache does not carry it: a mirror that refused and a
+        # mirror that authorized an array whose every entry was then excluded as a
+        # pooled stub both produce []. Defaults to withholding, so a roster built
+        # before any resolve declines rather than assuming authorization.
+        self._session_mcp_withheld: bool = True
         self._session_key = session_key
         # When set, this client emits a per-tool-call SEL audit from the ACP
         # dispatch loop. Used by app/worker-pool clients (e.g. code-review-sage,
@@ -3944,11 +3950,17 @@ class AcpClient:
             stubbed = frozenset()
         mirror = mirror_for(self.backend)
         if mirror is None:
+            self._session_mcp_withheld = True
             return []
+        owned = _permission_surface_owned(self)
+        # Recorded HERE, beside the call that decides it, because the caller cannot
+        # recover it from the returned list: an authorized array and a withheld one
+        # are both empty when every entry is a pooled stub.
+        self._session_mcp_withheld = not owned
         params = mirror.session_params(
             self._agent,
             stub_server_names=stubbed,
-            permission_surface_owned=_permission_surface_owned(self),
+            permission_surface_owned=owned,
             work_dir=self._work_dir,
         )
         servers = params.get("mcpServers") or []
@@ -4131,10 +4143,21 @@ class AcpClient:
         """
         if self.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY:
             return []
+        # Resolve FIRST: a cold cache decides the withholding verdict as a side
+        # effect, so the flag is only meaningful once the translation has run.
         translated = self._translated_session_mcp_servers()
-        # Translation is the authorization gate: a missing mirror or an
-        # unowned native permission surface must withhold every dynamic entry.
-        if not translated:
+        # The gate is the VERDICT, never the emptiness of the result. Reading
+        # "no entries" as "the gate said no" conflates two unrelated outcomes of
+        # the same call: a mirror that withheld the array (missing mirror, or a
+        # native permission surface Crew does not own -- logged), and a mirror
+        # that authorized it and then had every entry removed by stub exclusion
+        # because the broker pools them all -- silent, and the NORMAL shape for
+        # an agent whose whole server set is pooled. Conflated, that agent's
+        # session wired an empty array on every work_dir: the pooled stubs and
+        # the capability server below were discarded by a return that was meant
+        # to enforce authorization and instead enforced "the agent declares a
+        # server the broker does not pool".
+        if self._session_mcp_withheld:
             return []
         candidates = [
             *self._session_capability_mcp_servers(),
@@ -4381,19 +4404,46 @@ class AcpClient:
             return (False, None)
         return (True, data)
 
-    @classmethod
-    def _settings_path_permissions(cls, path: Path) -> tuple[bool, Any]:
-        """``(True, permissions)`` from *path*, or ``(False, None)`` if it cannot be read.
+    def _await_sibling_seed_governance(
+        self, path: Path, attempts: int = 5, pause: float = 0.01
+    ) -> bool:
+        """:meth:`_settings_surface_already_says_what_we_would`, tolerant of a half-written file.
 
-        The ABSENT block is a value, not a failure -- a seed carrying no
-        ``permissions`` key reads as ``(True, None)`` and compares equal to another
-        that carries none. ``(False, None)`` means "no answer", which can never
-        satisfy the caller's equality test.
+        For the create race ONLY. The winner creates with ``O_EXCL`` and writes its
+        payload on the next statement, so the loser -- whose own create raised
+        precisely because the winner's succeeded -- can arrive while the file is
+        still empty. A single check there would decide against bytes nobody meant to
+        publish, and the outcome would be a coin flip.
+
+        Waiting is confined to that one case: an UNREADABLE file may still be
+        filling, so retry; a file that parses and does not match is a real
+        disagreement, and no amount of waiting changes it, so return at once. The
+        bound is a few milliseconds against a process spawn, and exhausting it falls
+        back to the old leave-it-alone behaviour rather than hanging the seed path.
+
+        Blocking, like its caller: ``_write_claude_local_settings`` already runs in a
+        thread.
         """
-        readable, document = cls._settings_path_document(path)
-        if not readable or document is None:
-            return (False, None)
-        return (True, document.get("permissions"))
+        for remaining in range(attempts - 1, -1, -1):
+            readable, document = self._settings_path_document(path)
+            if readable and document is not None:
+                if not self._seed_document_governs(document):
+                    return False
+                self._claude_settings_governed = True
+                return True
+            if not remaining:
+                return False
+            time.sleep(pause)
+        return False
+
+    def _seed_document_governs(self, document: dict[str, Any]) -> bool:
+        """Whether *document* puts this session under the gate its own seed would.
+
+        The comparison itself, factored out so the two callers -- the ordinary
+        ownership branch and the create-race wait -- can never drift into asking
+        different questions of the same file, and so each reads the path once.
+        """
+        return document.get("permissions") == self._claude_local_settings_data().get("permissions")
 
     def _settings_surface_already_says_what_we_would(self, path: Path) -> bool:
         """Whether *path* already governs this session the way its own seed would.
@@ -4442,8 +4492,8 @@ class AcpClient:
         resolution falls to the adapter's provider list exactly as it does on a cold
         advertised-model cache. The caller logs that divergence when it occurs.
         """
-        readable, theirs = self._settings_path_permissions(path)
-        if not readable or theirs != self._claude_local_settings_data().get("permissions"):
+        readable, document = self._settings_path_document(path)
+        if not readable or document is None or not self._seed_document_governs(document):
             return False
         self._claude_settings_governed = True
         return True
@@ -4814,7 +4864,26 @@ class AcpClient:
                 try:
                     fd = os.open(local_settings, flags, 0o600)
                 except FileExistsError:
-                    logger.info("%s was created concurrently; leaving it alone", local_settings)
+                    # A sibling won the create between the exists() check above and
+                    # this open. What it wrote is THIS session's seed whenever the
+                    # permission blocks agree, so ask -- the loser used to return
+                    # here and spend the rest of its life without Crew's MCP tools,
+                    # which is the same defect as the leave-it-alone branch, reached
+                    # by a different route.
+                    if self._await_sibling_seed_governance(local_settings):
+                        logger.info(
+                            "%s was created concurrently by a sibling, and it governs this "
+                            "session the way this session's own seed would; adopting that "
+                            "governance rather than losing Crew's MCP tools to a create race.",
+                            local_settings,
+                        )
+                    else:
+                        logger.info(
+                            "%s was created concurrently and does not carry this session's "
+                            "permission block; leaving it alone. This session runs without "
+                            "Crew's MCP tools.",
+                            local_settings,
+                        )
                     return
                 with os.fdopen(fd, "wb") as handle:
                     handle.write(payload.encode("utf-8"))
@@ -6659,8 +6728,11 @@ class AcpClient:
         self._claude_settings_governed = False
         # Drop the translated MCP array: the spec is read PER SPAWN, which is what
         # lets installing or toggling a server take effect on the next session, so
-        # a replacement process must not inherit this one's snapshot.
+        # a replacement process must not inherit this one's snapshot. The verdict
+        # goes with it, back to withholding: it describes the resolve just dropped,
+        # and the next spawn re-derives both together.
         self._session_mcp_cache = None
+        self._session_mcp_withheld = True
         # Save PIDs before clearing state — needed for untracking
         saved_pid = self._pid
         saved_child_pids = self._child_pids

@@ -515,6 +515,56 @@ class TestClientSeam:
         assert "pooled" not in names
         assert "direct" in names
 
+    def test_an_all_pooled_agent_still_receives_its_stubs_and_capabilities(
+        self, tmp_path, agents_dir, monkeypatch
+    ):
+        """Every server pooled is the NORMAL shape, and it is not a withhold.
+
+        Stub exclusion empties the translation, and reading that emptiness as
+        "authorization refused" discarded the pooled stubs and the capability
+        server -- exactly what such a session was supposed to receive. Every agent
+        whose whole server set is pooled therefore wired an EMPTY array, on every
+        work_dir, however well its permission surface was owned.
+        """
+        _write_spec(
+            agents_dir,
+            servers={"pooled": {"command": "/bin/raw"}, "also": {"command": "/bin/also"}},
+            tools=["@pooled", "@also"],
+        )
+        monkeypatch.setattr(
+            client_mod, "injection_server_names", lambda _o, _a: frozenset({"pooled", "also"})
+        )
+        client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
+        monkeypatch.setattr(
+            client, "_session_capability_mcp_servers", lambda: [{"name": "kirocrew-core"}]
+        )
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [{"name": "pooled"}])
+
+        # Nothing survived translation -- and that is not the gate.
+        assert client._translated_session_mcp_servers() == []
+        assert client._session_mcp_withheld is False
+        assert sorted(_by_name(client._session_mcp_servers())) == ["kirocrew-core", "pooled"]
+
+    def test_an_unowned_permission_surface_still_withholds_everything(
+        self, tmp_path, agents_dir, monkeypatch
+    ):
+        """The authorization gate itself, unchanged and now stated directly.
+
+        Skipping the seed leaves the permission surface unowned, which is the real
+        refusal -- and it must take the capability server and the pooled stubs with
+        it, not merely the translated entries.
+        """
+        _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
+        client = AcpClient(work_dir=tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
+        assert client._claude_settings_authored is False
+        monkeypatch.setattr(
+            client, "_session_capability_mcp_servers", lambda: [{"name": "kirocrew-core"}]
+        )
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [{"name": "pooled"}])
+
+        assert client._session_mcp_servers() == []
+        assert client._session_mcp_withheld is True
+
     def test_an_unreadable_overlay_does_not_cost_the_session_its_servers(
         self, tmp_path, agents_dir, monkeypatch
     ):

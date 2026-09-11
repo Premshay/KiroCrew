@@ -1757,14 +1757,98 @@ class TestGovernanceTurnsOnThePermissionBlockAlone:
 
         path.write_text("{not json at all", encoding="utf-8")
         client = _client(tmp_path, permission_mode="default")
-        assert client._settings_path_permissions(path) == (False, None)
+        assert client._settings_path_document(path) == (False, None)
         client._write_claude_local_settings()
         assert client._claude_settings_governed is False
 
         # A JSON document that is not an object answers nothing either.
         path.write_text("[1, 2, 3]\n", encoding="utf-8")
-        assert client._settings_path_permissions(path) == (False, None)
+        assert client._settings_path_document(path) == (False, None)
 
-        # An absent permissions key is a VALUE, and reads as one.
+        # An absent permissions key is a VALUE, not a failure to read: the document
+        # answers, and the block it reports is None.
         path.write_text('{"availableModels": ["sonnet"]}\n', encoding="utf-8")
-        assert client._settings_path_permissions(path) == (True, None)
+        readable, document = client._settings_path_document(path)
+        assert readable is True
+        assert document is not None and document.get("permissions") is None
+
+
+class TestTheCreateRaceLoserKeepsItsTools:
+    """Losing an O_EXCL create is not a reason to lose the MCP array.
+
+    The same defect as the leave-it-alone branch, reached by a different route: two
+    clients both found the path absent, one won the create, and the loser returned
+    without ever asking whether the file the winner had just written was the seed it
+    wanted. It almost always is -- same agent, same ``work_dir``.
+    """
+
+    def test_the_loser_adopts_the_winners_governance(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        winner = _client(tmp_path, permission_mode="default")
+        loser = _client(tmp_path, permission_mode="default")
+
+        # The winner's file appears between the loser's exists() check and its create.
+        real_exists = Path.exists
+
+        def _absent_once(self, *a, **kw):
+            if self == _settings(tmp_path):
+                Path.exists = real_exists  # type: ignore[method-assign]
+                winner._write_claude_local_settings()
+                return False
+            return real_exists(self, *a, **kw)
+
+        Path.exists = _absent_once  # type: ignore[method-assign]
+        try:
+            loser._write_claude_local_settings()
+        finally:
+            Path.exists = real_exists  # type: ignore[method-assign]
+
+        assert winner._claude_settings_authored is True
+        assert loser._claude_settings_authored is False, "the loser must not own the file"
+        assert loser._claude_settings_governed is True
+        assert acp_client._permission_surface_owned(loser) is True
+
+    def test_a_half_written_file_is_waited_for_not_judged(self, tmp_path, monkeypatch):
+        """The winner creates, then writes; the loser can arrive in between.
+
+        A single check would decide against bytes nobody meant to publish. The wait
+        is bounded and only ever applies while the file cannot be parsed.
+        """
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        client = _client(tmp_path, permission_mode="default")
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")  # created, not yet written
+
+        settled = client._claude_local_settings_payload(path)
+        calls = {"n": 0}
+        real = AcpClient._settings_path_document
+
+        def _fills_on_the_third_look(p):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                path.write_text(settled, encoding="utf-8")
+            return real(p)
+
+        monkeypatch.setattr(AcpClient, "_settings_path_document", staticmethod(_fills_on_the_third_look))
+        assert client._await_sibling_seed_governance(path) is True
+        assert calls["n"] > 1, "an empty file must be retried, not judged on first read"
+
+    def test_a_readable_mismatch_is_not_retried(self, tmp_path, monkeypatch):
+        """Waiting cannot turn a real disagreement into agreement, so it does not wait."""
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        client = _client(tmp_path, permission_mode="default")
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"permissions": {"defaultMode": "bypassPermissions"}}\n', encoding="utf-8")
+
+        calls = {"n": 0}
+        real = AcpClient._settings_path_document
+
+        def _counted(p):
+            calls["n"] += 1
+            return real(p)
+
+        monkeypatch.setattr(AcpClient, "_settings_path_document", staticmethod(_counted))
+        assert client._await_sibling_seed_governance(path) is False
+        assert calls["n"] == 1, "a parseable mismatch must be decided on the first read"
