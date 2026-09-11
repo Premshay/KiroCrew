@@ -757,8 +757,27 @@ class WorkflowService:
                 matches = await asyncio.to_thread(self._search_definitions, intent)
                 references = _authoring_references(matches)
                 prompt = _AUTHOR_SYSTEM.format(intent=intent, references=references)
+                rendered_chars = len(prompt)
                 if errors:
                     prompt += f"\n\nYour previous script was INVALID: {'; '.join(errors)}. Fix it."
+                # Sized per component, because an overflow rejection names only the
+                # totals the BACKEND measured and those cannot be attributed from
+                # here: a request far larger than what this loop assembled means the
+                # size arrives from somewhere other than the parts below, while one
+                # that matches means the intent or a matched reference is simply too
+                # big. Those have different fixes, and the rejection distinguishes
+                # neither.
+                logger.info(
+                    "workflow_author prompt: total=%d chars (rendered=%d of which "
+                    "intent=%d, references=%d over %d match(es)) attempt=%d/%d",
+                    len(prompt),
+                    rendered_chars,
+                    len(intent),
+                    len(references),
+                    len(matches),
+                    i + 1,
+                    attempts,
+                )
                 text = await stream_and_collect(
                     provider, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
                 )
