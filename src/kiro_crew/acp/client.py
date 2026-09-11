@@ -840,6 +840,12 @@ def _permission_surface_owned(client: object) -> bool:
     )
 
 
+# Upper bound on a settings file Crew will parse to compare permission blocks. A
+# seed is a few hundred bytes, so this is roomy for a hand-edited project file and
+# still refuses anything a caller would not want to load into memory and decode.
+_SETTINGS_READ_CAP_BYTES = 256 * 1024
+
+
 def _claude_settings_usable(path: Path) -> bool:
     """Whether Crew may create *path* at all.
 
@@ -4339,27 +4345,89 @@ class AcpClient:
             self._claude_local_settings_path(), getattr(self, "_seed_owner", "")
         )
 
+    @staticmethod
+    def _settings_path_document(path: Path) -> tuple[bool, dict[str, Any] | None]:
+        """``(True, document)`` parsed from *path*, or ``(False, None)`` if it cannot be.
+
+        A bounded, symlink-refusing read in the same discipline as
+        :meth:`_settings_path_holds`: ``O_NOFOLLOW`` so a planted link cannot redirect
+        it, a regular-file check so a FIFO cannot block it, and a size cap so an
+        arbitrarily large file is refused rather than parsed. A settings seed is a few
+        hundred bytes; anything near the cap is not one.
+
+        The two-part return keeps "no answer" distinct from "answered, and the value
+        is absent" -- a distinction the callers depend on, since an absent key is a
+        legitimate value that must compare equal to another absent key.
+        """
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            return (False, None)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > _SETTINGS_READ_CAP_BYTES:
+                return (False, None)
+            raw = os.read(fd, _SETTINGS_READ_CAP_BYTES)
+        except OSError:
+            return (False, None)
+        finally:
+            os.close(fd)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return (False, None)
+        if not isinstance(data, dict):
+            return (False, None)
+        return (True, data)
+
+    @classmethod
+    def _settings_path_permissions(cls, path: Path) -> tuple[bool, Any]:
+        """``(True, permissions)`` from *path*, or ``(False, None)`` if it cannot be read.
+
+        The ABSENT block is a value, not a failure -- a seed carrying no
+        ``permissions`` key reads as ``(True, None)`` and compares equal to another
+        that carries none. ``(False, None)`` means "no answer", which can never
+        satisfy the caller's equality test.
+        """
+        readable, document = cls._settings_path_document(path)
+        if not readable or document is None:
+            return (False, None)
+        return (True, document.get("permissions"))
+
     def _settings_surface_already_says_what_we_would(self, path: Path) -> bool:
-        """Whether *path* already holds, byte for byte, the seed this session would write.
+        """Whether *path* already governs this session the way its own seed would.
 
         The permission surface is the point of the seed, not the authorship of the
         file: ``permissions.defaultMode`` plus the spec's ``permissions.deny`` are
-        what put a session under Crew's gate. When the file already carries exactly
-        those bytes, this session's governance IS in force, and writing them a second
-        time would change nothing that any reader can observe.
+        what put a session under Crew's gate. When the file already carries that
+        block, this session's governance IS in force, and writing it a second time
+        would change nothing any reader can observe.
 
         Which makes the pre-existing refusal wider than its own justification. It
         exists because a second client would otherwise write ITS ``defaultMode`` over
         a file a live session is running against, and delete that file on its own
-        reset. Two sessions of the same agent, in the same ``work_dir``, on the same
-        model render an IDENTICAL payload -- there is no mode to overwrite and
-        nothing to disagree about -- yet only the first was handed the MCP array, so
-        every later session in a repository lost ``session_checkpoint``,
-        ``spawn_run`` and the rest for the life of the process. Equality is checked
-        on the RENDERED payload rather than on the path or the provenance record, so
-        a different agent, a different permission mode or a different model allowlist
-        still takes the leave-it-alone branch below, which is the case the refusal
-        was written for.
+        reset. Sessions of the same agent in the same ``work_dir`` agree on that
+        block -- there is no mode to overwrite and nothing to disagree about -- yet
+        only the first was handed the MCP array, so every later session in a
+        repository lost ``session_checkpoint``, ``spawn_run`` and the rest for the
+        life of the process.
+
+        **Equality is on the permissions block ALONE, and the narrowness is the
+        point.** Comparing the whole rendered document instead makes this test
+        stricter than the property it guards, and then it fails the same way the
+        refusal it replaces did. ``availableModels`` and ``model`` are
+        model-resolution metadata; neither can pre-approve a tool, which is the
+        entire hazard the mirror names. In the field they differ routinely -- an
+        unpinned session omits the ``model`` key a pinned one writes, so one
+        repository's seed was 116 bytes where another's was 139 from the SAME agent,
+        and a whole-document test refused every pinned session in the first. Because
+        the path holds ONE file while N sessions render N documents, no choice of
+        bytes can satisfy them all: the requirement had to narrow, not the content.
+
+        A file carrying a ``permissions.allow`` entry -- the pre-approval the mirror
+        is guarding against -- still takes the leave-it-alone branch, because this
+        session renders no such entry and the two blocks therefore differ.
 
         **Governed is not owned, and the two must not collapse into one flag.**
         ``_claude_settings_authored`` is what teardown reads to decide whether to
@@ -4369,12 +4437,13 @@ class AcpClient:
         this sets a separate flag that only the MCP-array precondition reads: the
         sharer writes nothing, claims nothing, records nothing, and removes nothing.
 
-        Reuses :meth:`_settings_path_holds` for the read, so a FIFO, a symlink, a
-        directory or a file of the wrong size is refused before any content is read.
+        The remaining cost is stated rather than hidden: a sharer does not write its
+        own ``model``/``availableModels`` either, so when those differ its model
+        resolution falls to the adapter's provider list exactly as it does on a cold
+        advertised-model cache. The caller logs that divergence when it occurs.
         """
-        payload = self._claude_local_settings_payload(path)
-        fingerprint = (len(payload.encode("utf-8")), seed_provenance.digest(payload))
-        if not self._settings_path_holds(path, fingerprint):
+        readable, theirs = self._settings_path_permissions(path)
+        if not readable or theirs != self._claude_local_settings_data().get("permissions"):
             return False
         self._claude_settings_governed = True
         return True
@@ -4382,10 +4451,26 @@ class AcpClient:
     def _claude_local_settings_payload(self, local_settings: Path) -> str:
         """The exact bytes this session's seed holds, as the str whose utf-8 IS them.
 
+        The serialisation of :meth:`_claude_local_settings_data`, kept separate from
+        it because the ownership branches compare a SUBSET of that structure against
+        a file they may not write, while the writer needs the whole document as
+        bytes. One builder either way, so the two can never describe different seeds.
+        """
+        return (
+            json.dumps(
+                self._claude_local_settings_data(local_settings), indent=2, ensure_ascii=False
+            )
+            + "\n"
+        )
+
+    def _claude_local_settings_data(self, local_settings: Path | None = None) -> dict[str, Any]:
+        """This session's seed as a structure, before it is rendered to bytes.
+
         Split out of :meth:`_write_claude_local_settings` so the ownership branches
         there can compare a file they may not write against the content they would
         have written. Pure: it reads this client's own resolved state and the
-        advertised-model cache, and touches no path.
+        advertised-model cache, and touches no path. ``local_settings`` names the
+        path only for the cold-cache log line below.
         """
         data: dict[str, Any] = {}
         perms: dict[str, Any] = {}
@@ -4444,7 +4529,7 @@ class AcpClient:
                 local_settings,
             )
 
-        return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        return data
 
     def _write_claude_local_settings(self) -> None:
         """Seed ``<work_dir>/.claude/settings.local.json`` for this session.
@@ -4597,20 +4682,39 @@ class AcpClient:
                 authored = True
                 adopted = True
             elif self._settings_surface_already_says_what_we_would(local_settings):
-                # Someone else's file, byte for byte what this session would have
-                # written: a sibling of the same agent, in the same work_dir, on the
-                # same model. Its seed carries THIS session's ``defaultMode`` and
-                # THIS session's ``permissions.deny``, so the surface is governed as
-                # required and there is nothing left to write. Take the governance
-                # without taking the ownership -- see
+                # Someone else's file, already carrying THIS session's
+                # ``defaultMode`` and ``permissions.deny``: a sibling of the same
+                # agent in the same work_dir. The surface is governed as required and
+                # there is nothing left to write. Take the governance without taking
+                # the ownership -- see
                 # :meth:`_settings_surface_already_says_what_we_would` for why those
                 # two must stay apart.
                 logger.info(
-                    "%s already holds exactly the seed this session would have written; adopting "
-                    "its governance without claiming it, so this session keeps Crew's MCP tools "
+                    "%s already governs this session the way its own seed would; adopting that "
+                    "governance without claiming the file, so this session keeps Crew's MCP tools "
                     "without a second client rewriting a file the first one is running against.",
                     local_settings,
                 )
+                # The permission block matched; the REST of the document may not
+                # have. Saying so is the disclosure half of the trade: a sharer
+                # writes nothing, so where the incumbent's model metadata differs
+                # this session resolves its model from the adapter's provider list
+                # instead of from the seed -- the cold-cache path, which can hand it
+                # the base context window rather than the one its id names. Logged
+                # rather than silently accepted, and never a reason to withhold the
+                # tools, because model metadata gates no permission.
+                readable, incumbent = self._settings_path_document(local_settings)
+                if readable and incumbent is not None:
+                    ours = self._claude_local_settings_data(local_settings)
+                    keys = ("availableModels", "model")
+                    if {k: incumbent.get(k) for k in keys} != {k: ours.get(k) for k in keys}:
+                        logger.info(
+                            "%s carries different availableModels/model than this session would "
+                            "have written; the sharer leaves them in place, so this session's "
+                            "model resolves from claude-agent-acp's own provider list rather than "
+                            "from the seed.",
+                            local_settings,
+                        )
                 return
             else:
                 # Someone else's file: either the user's own project settings, or a

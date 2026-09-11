@@ -1515,11 +1515,14 @@ class TestPostCaptureModelResolution:
         """
         import inspect
 
-        # The rendering moved into _claude_local_settings_payload so the ownership
-        # branches can compare against a payload they may not write; the fold has to
-        # travel with it, so the pair is what this asserts.
-        source = inspect.getsource(AcpClient._write_claude_local_settings) + inspect.getsource(
-            AcpClient._claude_local_settings_payload
+        # The seed is built in _claude_local_settings_data and serialised by
+        # _claude_local_settings_payload, so the ownership branches can compare a
+        # subset of the structure against a file they may not write. The fold travels
+        # with the builder, so all three are what this asserts.
+        source = (
+            inspect.getsource(AcpClient._write_claude_local_settings)
+            + inspect.getsource(AcpClient._claude_local_settings_payload)
+            + inspect.getsource(AcpClient._claude_local_settings_data)
         )
         assert 'data["model"] = self._model' not in source
         assert "resolve_wire_model_id" in source
@@ -1691,3 +1694,77 @@ class TestASiblingSeedGovernsWithoutBeingOwned:
         sibling._write_claude_local_settings()
         assert sibling._claude_settings_governed is False
         assert acp_client._permission_surface_owned(sibling) is False
+
+
+class TestGovernanceTurnsOnThePermissionBlockAlone:
+    """The field case a whole-document test refused, and the hazards it must not.
+
+    Comparing the entire rendered seed is stricter than the property the MCP
+    precondition guards, and it failed the same way the refusal it replaced did. An
+    UNPINNED session omits the ``model`` key a pinned one writes, so one repository's
+    seed was 116 bytes where another's was 139 from the same agent -- and every
+    pinned session in the first was refused, which is the whole reported symptom.
+    ``availableModels`` and ``model`` cannot pre-approve a tool; only
+    ``permissions`` can, so only ``permissions`` is compared.
+    """
+
+    def test_a_sibling_differing_only_in_model_metadata_governs(self, tmp_path, monkeypatch):
+        """The reported case: unpinned incumbent, pinned sibling, same permissions."""
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        live = _client(tmp_path, permission_mode="default", model=acp_client.DEFAULT_MODEL)
+        live._write_claude_local_settings()
+        before = _settings(tmp_path).read_text(encoding="utf-8")
+        assert "model" not in json.loads(before), "an unpinned seed must omit the model key"
+
+        pinned = _client(tmp_path, permission_mode="default", model=_SERVED[0])
+        pinned._write_claude_local_settings()
+
+        # The documents differ, the permission blocks do not...
+        assert json.loads(pinned._claude_local_settings_payload(_settings(tmp_path))) != json.loads(
+            before
+        )
+        # ...so nothing is written and the tools are delivered anyway.
+        assert _settings(tmp_path).read_text(encoding="utf-8") == before
+        assert pinned._claude_settings_authored is False
+        assert pinned._claude_settings_governed is True
+        assert acp_client._permission_surface_owned(pinned) is True
+
+    def test_a_file_carrying_a_permissions_allow_is_still_refused(self, tmp_path, monkeypatch):
+        """The hazard the mirror names, unchanged.
+
+        A pre-approving ``permissions.allow`` would let a Crew tool skip
+        ``session/request_permission`` entirely. This session renders no such entry,
+        so the blocks differ and the array stays withheld.
+        """
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"permissions": {"defaultMode": "default", "allow": ["Bash"]}}\n', encoding="utf-8"
+        )
+
+        client = _client(tmp_path, permission_mode="default")
+        client._write_claude_local_settings()
+
+        assert client._claude_settings_governed is False
+        assert acp_client._permission_surface_owned(client) is False
+
+    def test_an_unparseable_or_irregular_file_governs_nothing(self, tmp_path, monkeypatch):
+        """No answer is not a match: withholding is the safe direction."""
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        path.write_text("{not json at all", encoding="utf-8")
+        client = _client(tmp_path, permission_mode="default")
+        assert client._settings_path_permissions(path) == (False, None)
+        client._write_claude_local_settings()
+        assert client._claude_settings_governed is False
+
+        # A JSON document that is not an object answers nothing either.
+        path.write_text("[1, 2, 3]\n", encoding="utf-8")
+        assert client._settings_path_permissions(path) == (False, None)
+
+        # An absent permissions key is a VALUE, and reads as one.
+        path.write_text('{"availableModels": ["sonnet"]}\n', encoding="utf-8")
+        assert client._settings_path_permissions(path) == (True, None)
