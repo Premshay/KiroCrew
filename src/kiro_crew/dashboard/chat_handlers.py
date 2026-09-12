@@ -5658,6 +5658,42 @@ def _make_stop_resolver(
     return _resolve
 
 
+async def _cancel_terminal_stop_task(
+    slot: _ChatSlot, task_at_stop: asyncio.Task[Any] | None
+) -> bool:
+    """Cancel a captured runner that is still PREPARING, after a terminal outcome.
+
+    A terminal stop outcome is the only event that may cancel the slot's own
+    runner, and then only while that runner is preparing: before the prompt is
+    handed to the provider there is no provider turn whose own machinery can
+    honour the stop, so the runner is cancelled directly. Once the provider has
+    the turn (its first event), cancellation here would kill a turn the stop
+    machinery already owns, so it is refused.
+
+    Returns True when a cancel was issued, False otherwise.
+    """
+    if (
+        task_at_stop is None
+        or task_at_stop is not slot._preparing_task
+        or not isinstance(task_at_stop, asyncio.Task)
+        or task_at_stop is asyncio.current_task()
+        or task_at_stop.done()
+    ):
+        return False
+    task_at_stop.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task_at_stop), timeout=2.0)
+    except asyncio.CancelledError:
+        # A cancelled runner raises here too, but cancellation of this request
+        # must still abort its response and shutdown path.
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+    except asyncio.TimeoutError:
+        logger.warning("Stopped turn task did not settle within 2 seconds; inspect the slot")
+    return True
+
+
 def _slot_not_found() -> web.Response:
     """The one 404 every cancel-route refusal returns.
 
@@ -5883,6 +5919,11 @@ async def stop_slot_turn(
         # the mirrored chat_done. Nothing local to tear down.
         return {"ok": True}
 
+    # Capture the runner before stopping the provider. A provider that reports
+    # no active turn cannot drive this task's finally block, while a newer
+    # runner must never be cancelled by an older stop request.
+    task_at_stop = slot.task
+
     # Escalation path: a second stop press while a cooperative cancel is
     # already pending hard-kills. We escalate on ANY second press — not only
     # when the client computed force=true — because the client derives force
@@ -5957,6 +5998,7 @@ async def stop_slot_turn(
             preserve_queue=compaction_escape,
             on_hard=_on_hard_force,
         )
+        await _cancel_terminal_stop_task(slot, task_at_stop)
         sel().log_tool_invocation(
             session_key=_history_key_for(name),
             agent=getattr(slot, "agent", "") or "kirocrew",
@@ -6065,9 +6107,12 @@ async def stop_slot_turn(
         on_soft=_on_soft,
         on_hard=_on_hard,
     )
+    if outcome in {"hard", "idle"}:
+        await _cancel_terminal_stop_task(slot, task_at_stop)
     # Resolve orphaned card when provider reports no active turn
-    if outcome == "idle" and slot._stop_event_id:
-        _resolve_stop_event(slot, "soft")
+    if outcome == "idle":
+        if slot._stop_event_id:
+            _resolve_stop_event(slot, "soft")
         slot._stop_state = "idle"
         state.push_slots_update()
     elif outcome == "compacting":
@@ -6625,6 +6670,7 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "info": "stop already in progress"})
     if not slot._queue:
         return web.json_response({"error": "queue empty, use /stop instead"}, status=400)
+    task_at_stop = slot.task
 
     # An automatic compaction holds the session: the interrupt is declined
     # BEFORE the claim below mutates the running turn (``_stop_state``) and
@@ -6779,11 +6825,36 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         on_soft=_on_soft,
         on_hard=_on_hard,
     )
+    if outcome in {"hard", "idle"}:
+        await _cancel_terminal_stop_task(slot, task_at_stop)
     # Resolve orphaned card when provider reports no active turn
-    if outcome == "idle" and slot._stop_event_id:
-        _resolve_stop_event(slot, "soft")
+    if outcome == "idle":
+        if slot._stop_event_id:
+            _resolve_stop_event(slot, "soft")
         slot._stop_state = "idle"
         state.push_slots_update()
+        # The runner can clear slot.task before its asynchronous teardown ends.
+        # A timed-out cancellation must not dispatch over that unfinished work.
+        # These checks authorize only the queue HANDOFF. The interrupt itself
+        # already happened (the turn was stopped and pending approvals were
+        # rejected), so a refusal skips the dispatch and still reports and audits
+        # that interrupt below.
+        async with slot._lock:
+            handoff_allowed = not _slot_replaced_while_queued(
+                state, slot, name, request, "chat.slot_interrupt"
+            ) and (
+                _app_cancel_denied(request, slot, "chat_interrupt", effective_session_key(slot))
+                is None
+            )
+            if (
+                handoff_allowed
+                and slot.task is None
+                and (task_at_stop is None or task_at_stop.done())
+                and not slot._last_turn_auth_required
+                and slot._stop_generation == claim_generation
+                and slot._stop_state == "idle"
+            ):
+                await _start_next_queued_turn(state, slot)
     elif outcome == "compacting":
         # The window the two probes above cannot close: a compaction commits
         # between the second probe and ``stop_turn`` taking the registry lock,
