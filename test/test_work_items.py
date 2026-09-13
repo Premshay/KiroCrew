@@ -293,20 +293,33 @@ def test_legacy_terminal_items_become_one_closed_archive_and_bad_values_warn():
 
 
 @pytest.mark.asyncio
-async def test_permanent_history_delete_purges_active_and_archived_work_items():
+async def test_permanent_history_delete_preserves_active_and_archived_work_items(monkeypatch):
+    """Work items outlive a history delete, like upstream's other session sidecars.
+
+    Another process can recreate or restore the same session key after the
+    delete's owner scan, so a purge here could wipe a successor's durable
+    delegation record. A stale store is reversible; that loss is not.
+    """
     from unittest.mock import AsyncMock, MagicMock
 
     from kiro_crew.dashboard.handlers.sessions import _remove_slot_for_history_key
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("history deletion must preserve work items")
+
+    monkeypatch.setattr(wi, "purge", unexpected)
+    monkeypatch.setattr(wi, "purge_matching", unexpected)
 
     key = "dashboard_chat-9-999"
     item = _create(key)
     wi.transition_item(key, item["id"], state_name=wi.STATE_CANCELLED, event="finished")
     wi.close_cycle(key, summary="archived before history delete")
-    assert wi.coordinator_dir(key).exists()
+    assert wi.list_archives(key)
 
     state = MagicMock()
     state._slots = {}
     state.crew = None
     state.remove_chat_pins_for_slots = AsyncMock()
     await _remove_slot_for_history_key(state, key)
-    assert not wi.coordinator_dir(key).exists()
+    assert wi.coordinator_dir(key).exists()
+    assert wi.list_archives(key)

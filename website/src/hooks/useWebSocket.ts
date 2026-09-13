@@ -17,6 +17,7 @@ import {
   triggerRefresh,
   fetchSlots,
   markSlotUnread,
+  remoteSlotRead,
   setUpdateProgress,
   sseSubagentStatus,
   sseSubagentText,
@@ -42,6 +43,12 @@ import {
 import { shouldNotifyOnChatComplete } from "./chatCompleteNotify";
 import { emitThemeSound } from "./themeSound";
 import { streamingFlushHoldMs } from "../lib/streamHold";
+import { registerPendingChunkDrain } from "../lib/pendingChunkDrain";
+import {
+  bindSlotReadSender,
+  emitSlotRead,
+  flushSlotRead,
+} from "../lib/slotReadRelay";
 import {
   VoicePcmPlayer,
   createVoiceRequestId,
@@ -50,7 +57,6 @@ import {
 import { reportVoiceFailure } from "../lib/voiceFailure";
 import {
   fetchHistory,
-  missedChunkMarker,
   sseChatMessage,
   sseChatMessageUpdate,
   sseChatMessagePatchByTs,
@@ -135,6 +141,31 @@ type LogCallback = ((data: { level: string; msg: string }) => void) | null;
  *  is a correctness backstop for a lost terminal frame rather than the progress
  *  channel (that is the live event stream), and the tick makes no request at all
  *  while no row is running. */
+/** True when this window is rendering the active slot's transcript: the chat
+ *  routes (the root path serves ChatPage too) plus the popout and embed chat
+ *  frames. Passive read relays (arrival, completion, tab reveal) must check
+ *  this: `chat.activeSlot` is RETAINED across navigation, so on Settings or
+ *  any other route "slot === activeSlot" says nothing about what the user can
+ *  see, and relaying there would erase sibling windows' badges for messages
+ *  nobody displayed. Passive relays must ALSO require document.hasFocus():
+ *  Page Visibility reports occluded or unfocused windows as "visible"
+ *  (Firefox tracks no occlusion; side-by-side windows always report
+ *  visible), so a window parked behind other apps would otherwise mark
+ *  every arrival read within ~1s — unseen work looking read, the inverse
+ *  of the stale-badge defect. Deliberate gestures (switchSlot,
+ *  mark-as-read) need no gate — they only occur on surfaces that show the
+ *  slot, under real focus. */
+const isChatSurfaceVisible = (): boolean => {
+  if (typeof window === "undefined") return false;
+  const path = window.location.pathname;
+  return (
+    path === "/" ||
+    path === "/chat" ||
+    path.startsWith("/chat/") ||
+    path.startsWith("/popout/chat") ||
+    path.startsWith("/embed/chat")
+  );
+};
 const WORKFLOW_HEAL_MS = 15000;
 const LEGACY_AUTOMATION_SEED_QUERY_KEY = ["automation-seed", "legacy"] as const;
 const STRUCTURED_AUTOMATION_SEED_QUERY_KEY = [
@@ -366,6 +397,22 @@ export function emitSlotFocused(slot: string | null): void {
   sendSlotFocusedImpl(slot);
 }
 
+/** One buffered chunk: its text (gap marker included) and the seq it carried,
+ *  kept apart so the reducer can hold each part against the slot's replay
+ *  floor and drop exactly the chunks a snapshot already covers. */
+type ChunkPart = { seq: number | undefined; text: string };
+type ChunkBufEntry = {
+  parts: ChunkPart[];
+  lastSeq: number | undefined;
+  gen: string | undefined;
+  thinking: string;
+};
+const newChunkBufEntry = (): ChunkBufEntry => {
+  return { parts: [], lastSeq: undefined, gen: undefined, thinking: "" };
+};
+const bufferedText = (entry: ChunkBufEntry): string =>
+  entry.parts.map((p) => p.text).join("");
+
 export function useWebSocket() {
   const dispatch = useAppDispatch();
   const queryClient = useQueryClient();
@@ -444,12 +491,14 @@ export function useWebSocket() {
   // so both content types share one flush cycle and one lifecycle (reconnect
   // clear, chat_done delete, unmount cancel); the flush dispatches thinking
   // before content, matching a turn's thought-then-answer arrival order.
-  const chunkBufRef = useRef<
-    Map<
-      string,
-      { content: string; lastSeq: number | undefined; thinking: string }
-    >
-  >(new Map());
+  const chunkBufRef = useRef<Map<string, ChunkBufEntry>>(new Map());
+  // A fresh entry (first frame of a turn, or the first after a reconnect cleared
+  // the buffer) starts with no seq. The buffer's lastSeq is about WS delivery
+  // only: a repeated delivery of the same seq and a forward gap between two
+  // deliveries. The snapshot replay floor (`lastChunkSeq`) is the reducer's;
+  // each flush hands it the buffered parts with their seqs and the reducer drops
+  // the ones a snapshot already holds. The hook has no view of that floor and
+  // needs none.
   const chunkFlushScheduledRef = useRef(false);
   const chunkRafRef = useRef<number | null>(null);
   const chunkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1123,17 +1172,22 @@ export function useWebSocket() {
         dispatch(sseThinkingChunk({ slot, content: entry.thinking }));
         entry.thinking = "";
       }
-      if (!entry.content) continue;
+      // The reducer holds each part against the slot's replay floor and drops
+      // what a snapshot already holds; the hook only batches.
+      const text = bufferedText(entry);
+      if (!text) continue;
       dispatch(
         sseChatMessage({
           slot,
           role: "chunk",
-          content: entry.content,
+          content: text,
           seq: entry.lastSeq,
+          gen: entry.gen,
           batched: true,
+          parts: entry.parts,
         }),
       );
-      entry.content = "";
+      entry.parts = [];
       if (slot === activeSlot) dispatchedActive = true;
     }
     // Auto-speak the active slot's newly-streamed sentences once per flush,
@@ -1156,6 +1210,13 @@ export function useWebSocket() {
       }
     }
   }, [dispatch, enqueueVoiceSynthesis, voiceProgressFor]);
+
+  // Expose the synchronous flush to steer initiators (ChatPage / ChatPane):
+  // an optimistic steer card dispatched while a chunk is still in this
+  // buffer would land ABOVE text that belongs before it (see
+  // lib/pendingChunkDrain.ts). Identity-guarded unregister, so a StrictMode
+  // double-mount cannot strip the live registration.
+  useEffect(() => registerPendingChunkDrain(flushChunks), [flushChunks]);
 
   const scheduleChunkFlush = useCallback(() => {
     if (chunkFlushScheduledRef.current) return;
@@ -2094,7 +2155,37 @@ export function useWebSocket() {
               data.slot !== store.getState().chat.activeSlot &&
               !reconnectingRef.current
             )
-              dispatch(markSlotUnread(data.slot));
+              dispatch(
+                markSlotUnread({ slot: data.slot, ts: data.ts || undefined }),
+              );
+            // The message landed in THIS window's active slot while the tab is
+            // visible: the user is watching it arrive, so the fresh bubble the
+            // other windows just lit for it is already read — relay that, with
+            // this message's ts as the read watermark (receivers keep badges
+            // lit by anything newer). A hidden window isn't reading: relay
+            // nothing — the visibilitychange handler relays the active slot's
+            // read on reveal, watermarked at its post-flush last_ts, which
+            // covers every arrival buffered while hidden. No per-arrival state
+            // is kept, so a later timestamp-less frame cannot regress the
+            // reveal watermark. Reconnect catch-up replays aren't reads either
+            // (mirrors the markSlotUnread suppression above).
+            else if (
+              data.slot &&
+              !reconnectingRef.current &&
+              !document.hidden &&
+              document.hasFocus() &&
+              isChatSurfaceVisible()
+            ) {
+              // Watermark = this message's own server ts, else the slot's
+              // last_ts (also server-minted); never client time — windows
+              // minting their own clocks disagree about the same message.
+              const arrivalTs =
+                data.ts ||
+                store
+                  .getState()
+                  .dashboard.slots?.find((s) => s.key === data.slot)?.last_ts;
+              emitSlotRead(data.slot, arrivalTs);
+            }
             // Theme audio: an agent reply arriving is the `message-received`
             // trigger (no-op unless an L2 theme with that manifest sound is
             // active + unmuted). User/tool messages don't chime.
@@ -2184,6 +2275,11 @@ export function useWebSocket() {
             // target slot's transcript. Uses appendSlotMessage so the bubble
             // appears whether or not the slot is currently active (background
             // tabs). Persisted server-side — survives page reload.
+            // Drain the per-frame chunk buffer FIRST: a pre-steer chunk still
+            // pending here means the reducer's finalize-on-steer would find no
+            // streaming row to freeze, so that text would later flush BELOW
+            // this card and post-steer chunks would append to the same row.
+            flushChunks();
             // `sendId` (present when the initiating client minted one) rides
             // into the meta so the reconcile in appendSlotMessage can match the
             // optimistic bubble by id instead of by content (#6075).
@@ -2265,16 +2361,20 @@ export function useWebSocket() {
               const buf = chunkBufRef.current;
               let entry = buf.get(cs);
               if (!entry) {
-                entry = { content: "", lastSeq: undefined, thinking: "" };
+                entry = newChunkBufEntry();
                 buf.set(cs, entry);
               }
-              // Idempotency guard: drop a replayed/repeated chunk (seq <= lastSeq).
+              // Idempotency guard: drop a repeated WS delivery (seq <= lastSeq).
               // WS delivery is at-least-once (reconnect replay, retry re-stream), so a
-              // chunk can arrive twice. missedChunkMarker below only flags FORWARD gaps
-              // (curSeq - prevSeq - 1 > 0), so a repeat slips through and its content is
-              // appended a second time with no marker — the silent mid-stream "stutter".
-              // chat_done deletes the buffer entry, so lastSeq resets each turn and a
-              // fresh turn's seq is never suppressed.
+              // chunk can arrive twice. The reducer's gap markers only flag FORWARD
+              // gaps (curSeq - prevSeq - 1 > 0), so a repeat would slip through and its
+              // content be appended a second time with no marker — the silent
+              // mid-stream "stutter".
+              // chat_done deletes the buffer entry; seqs are the slot's and never
+              // restart, so a later turn's chunks are never suppressed. This guard is about WS
+              // delivery only; a chunk a slot SNAPSHOT already holds is dropped
+              // by the reducer, which owns that floor and receives every part's
+              // seq at flush.
               if (
                 entry.lastSeq !== undefined &&
                 data.seq !== undefined &&
@@ -2282,13 +2382,13 @@ export function useWebSocket() {
               ) {
                 break;
               }
-              // Cross-chunk gap detection via the shared missedChunkMarker,
-              // single-sourced with the reducer so the two copies can't drift.
-              if (entry.lastSeq !== undefined && data.seq !== undefined) {
-                entry.content += missedChunkMarker(entry.lastSeq, data.seq);
-              }
-              entry.content += data.content ?? "";
+              // No gap marker here: the reducer derives markers from the seqs
+              // of the parts it keeps, after filtering against the snapshot
+              // floor, so a gap the snapshot filled in is not flagged.
+              entry.parts.push({ seq: data.seq, text: data.content ?? "" });
               if (data.seq !== undefined) entry.lastSeq = data.seq;
+              // The gateway generation that numbered the seqs (see floorForGen).
+              if (typeof data.gen === "string") entry.gen = data.gen;
               if (
                 store.getState().chat.slotStatusDetail[cs]?.kind !== "streaming"
               ) {
@@ -2451,6 +2551,26 @@ export function useWebSocket() {
                   slot: raw.slot,
                   items,
                   ...(typeof raw.ts === "number" ? { ts: raw.ts } : {}),
+                }),
+              );
+            }
+            break;
+          }
+          case "slot_read": {
+            // Another window read this slot (relayed via the gateway): retire
+            // the bubble here too, honoring the read watermark — a badge lit
+            // by a message NEWER than what the reader saw stays lit, and a
+            // manual mark-as-unread is never cleared remotely. remoteSlotRead
+            // (never the emitter) so a relayed read can't echo back out.
+            const r = data as { slot?: string; read_ts?: string };
+            if (typeof r.slot === "string" && r.slot) {
+              dispatch(
+                remoteSlotRead({
+                  slot: r.slot,
+                  readTs:
+                    typeof r.read_ts === "string" && r.read_ts
+                      ? r.read_ts
+                      : undefined,
                 }),
               );
             }
@@ -2837,7 +2957,7 @@ export function useWebSocket() {
               const buf = chunkBufRef.current;
               let entry = buf.get(thinkSlot);
               if (!entry) {
-                entry = { content: "", lastSeq: undefined, thinking: "" };
+                entry = newChunkBufEntry();
                 buf.set(thinkSlot, entry);
               }
               entry.thinking += thinkText;
@@ -2986,10 +3106,33 @@ export function useWebSocket() {
               data.slot !== store.getState().chat.activeSlot &&
               !reconnectingRef.current
             ) {
-              dispatch(markSlotUnread(data.slot));
+              dispatch(
+                markSlotUnread({
+                  slot: data.slot,
+                  ts: (data as { ts?: string }).ts || undefined,
+                }),
+              );
               // #2: warm the per-slot cache so switching to this background
               // session renders the finished answer instantly (no on-switch fetch).
               dispatch(warmSlotCache(data.slot));
+            }
+            // Turn finished in this window's active slot: same visible-only
+            // read-relay as the chat_message arrival branch above (a hidden
+            // window relays on reveal instead).
+            else if (
+              data.slot &&
+              !reconnectingRef.current &&
+              !document.hidden &&
+              document.hasFocus() &&
+              isChatSurfaceVisible()
+            ) {
+              // Same actual-timestamp rule as the chat_message branch above.
+              const doneTs =
+                (data as { ts?: string }).ts ||
+                store
+                  .getState()
+                  .dashboard.slots?.find((s) => s.key === data.slot)?.last_ts;
+              emitSlotRead(data.slot, doneTs);
             }
             if (data.slot) {
               dispatch(
@@ -3516,27 +3659,89 @@ export function useWebSocket() {
       ws.send(JSON.stringify({ type: "slot_focused", slot }));
     };
     sendSlotFocusedImpl = sendFocus;
+    // Read-relay sender rides the same socket with the same best-effort
+    // contract; slotReadRelay owns the per-slot throttle and the watermark.
+    bindSlotReadSender((slot: string, readTs?: string) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(
+        JSON.stringify(
+          readTs
+            ? { type: "slot_read", slot, read_ts: readTs }
+            : { type: "slot_read", slot },
+        ),
+      );
+    });
     let lastFocusSent: string | null = store.getState().chat.activeSlot;
     const unsubFocus = store.subscribe(() => {
       const active = store.getState().chat.activeSlot;
       if (active === lastFocusSent) return; // store.subscribe fires on EVERY action
+      // The outgoing slot stops being visible-active NOW: flush its pending
+      // trailing read-relay so the timer can't fire after a newer message
+      // re-badges the slot and wipe a bubble nobody read.
+      if (lastFocusSent) flushSlotRead(lastFocusSent);
       lastFocusSent = active;
       stopVoice();
       voiceMutedRef.current = false;
       voiceProgressRef.current = null;
       sendFocus(active);
     });
-    const onVisibility = () => {
+    const onVisibility = (event?: Event) => {
       if (document.hidden) {
+        // Going hidden: no pending trailing read-relay may outlive visibility
+        // (a newer message could re-badge the slot before the timer fired).
+        flushSlotRead();
         // Blur cancels a pending prefetch server-side while the tab is away.
         sendFocus(null);
         return;
       }
-      // Backgrounded browsers can retain an OPEN socket after its transport no
-      // longer delivers frames; reconnecting is what reconciles missed turns.
-      forceReconnect();
+      // Returning to the tab IS the read of whatever the active slot shows.
+      // Flush buffered recency bumps first — rAF doesn't fire in hidden
+      // tabs, so arrivals from the hidden stretch are still buffered — then
+      // relay the active slot's read at its post-flush last_ts (server-
+      // minted, monotonic in the reducer). Receivers keep badges lit by
+      // anything newer (readCovers), so an idle reveal clears nothing it
+      // shouldn't. Dropped during reconnect catch-up, mirroring the
+      // arrival branches. Sent BEFORE the forced reconnect below, while the
+      // current socket is still the one the relay rides.
+      flushSlotActivity();
+      const active = store.getState().chat.activeSlot;
+      if (
+        active &&
+        !reconnectingRef.current &&
+        document.hasFocus() &&
+        isChatSurfaceVisible()
+      ) {
+        emitSlotRead(
+          active,
+          store.getState().dashboard.slots?.find((s) => s.key === active)
+            ?.last_ts,
+        );
+      }
+      if (event?.type === "visibilitychange") {
+        // Backgrounded browsers can retain an OPEN socket after its transport no
+        // longer delivers frames; reconnecting is what reconciles missed turns.
+        // The reconnect's onopen re-announces the active slot's focus. Only a
+        // real visibility return reconnects: a focus-only change (window
+        // occluded -> foreground) never backgrounded the tab, and forcing a
+        // reconnect on every window focus would churn the socket.
+        forceReconnect();
+        return;
+      }
+      // Focus-only return: re-announce the active slot even if unchanged,
+      // since the server may have expired the previous prefetch meanwhile.
+      sendFocus(active);
     };
     document.addEventListener("visibilitychange", onVisibility);
+    // Also on window focus: the passive-relay gate requires hasFocus(), and
+    // a focus-only change (window occluded -> foreground) fires NO
+    // visibilitychange — without this listener the relay suppressed while
+    // unfocused never re-fires and sibling badges stay stale until the next
+    // gesture. onVisibility's hidden branch is unreachable here (a focused
+    // document is never hidden), so the focus path re-announces the slot,
+    // flushes buffered activity, and relays the read under the same
+    // visible+focused gate.
+    window.addEventListener("focus", onVisibility);
     return () => {
       closingRef.current = true;
       clearTimeout(reconnectTimerRef.current);
@@ -3575,6 +3780,7 @@ export function useWebSocket() {
       );
       window.removeEventListener("voice-play-url", onVoicePlayUrl);
       document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", onVisibility);
       unsubFocus();
       sendSlotFocusedImpl = () => {};
     };

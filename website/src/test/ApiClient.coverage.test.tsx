@@ -601,6 +601,22 @@ describe('session-expired banner', () => {
 /* ──────────────────── 2. URL and body construction ──────────────────── */
 
 describe('query-string builders', () => {
+  it('memory records preserve the chosen store, filter and page without leaking query delimiters', async () => {
+    await api.memoryRecords('member-reviewer', { q: 'owner+team@example.com & release', kind: 'fact' }, 50, 25)
+    const query = new URL(call().url, 'http://localhost').searchParams
+    expect(Object.fromEntries(query)).toEqual({ store: 'member-reviewer', q: 'owner+team@example.com & release', kind: 'fact', offset: '50', limit: '25' })
+    await api.memoryRecords('', { q: '', kind: 'all' })
+    expect(call(1).url).toBe('/api/memory/records?store=default&q=&kind=all&offset=0&limit=50')
+  })
+
+  it('memory history encodes record identity and keeps later pages in the same store', async () => {
+    await api.memoryRecordHistory('member-reviewer', { kind: 'fact', id: 'user.contact+team&release' }, 25, 50)
+    const query = new URL(call().url, 'http://localhost').searchParams
+    expect(Object.fromEntries(query)).toEqual({ store: 'member-reviewer', kind: 'fact', id: 'user.contact+team&release', limit: '25', offset: '50' })
+    await api.memoryRecordHistory('', { kind: 'fact', id: 'user.contact' })
+    expect(call(1).url).toBe('/api/memory/records/history?store=default&kind=fact&id=user.contact&limit=25')
+  })
+
   it('wakatimeExportUrl builds the export href with encoded dates and the format', () => {
     expect(api.wakatimeExportUrl('2026-09-01', '2026-09-07', 'csv')).toBe(
       '/api/wakatime/export?start=2026-09-01&end=2026-09-07&format=csv',
@@ -887,10 +903,39 @@ describe('request bodies with conditionally-omitted keys', () => {
     expect(call().url).toBe('/api/dashboard/config')
     expect(call(1).body).toEqual({ memory_mode: 'temporary' })
 
-    await api.createChatSlot('n', 'a', 'm', 'mode', 'mem', 't', false, 'slug', 'f1')
+    await api.createChatSlot('n', 'a', 'm', 'mode', 'mem', 't', 'slug', 'f1')
     expect(call(2).body).toEqual({
       name: 'n', agent: 'a', model: 'm', mode: 'mode', memory_mode: 'mem',
-      title: 't', clean_mode: false, artifact: 'slug', folder_id: 'f1',
+      title: 't', artifact: 'slug', folder_id: 'f1',
+    })
+  })
+
+  it('createChatSlot carries adopt_remote_slot and resolves NO default memory mode for it', async () => {
+    // THE ADOPT WIRE FORMAT. `adopt_remote_slot` is the peer session's own slot
+    // key, and it rides the SAME create route beside `instance_id` — the contract
+    // deliberately adds no second endpoint, because the local slot is created the
+    // same way either way and only what it binds to changes.
+    await api.createChatSlot(
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, 'inst-a', 'chat-9',
+    )
+    expect(call().url).toBe('/api/chat/slots')
+    expect(call().body).toEqual({ instance_id: 'inst-a', adopt_remote_slot: 'chat-9' })
+    // No `/api/dashboard/config` read at all: an adopt inherits the PEER
+    // session's `memory_mode`, so resolving this machine's default would send a
+    // value the server has to ignore — and if it ever stopped ignoring it, an
+    // incognito peer session would land here as a persistent transcript. That is
+    // why `memory_mode` is ABSENT above rather than defaulted, and why exactly
+    // one request went out.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    // An explicit mode still wins: a caller that names one means it.
+    await api.createChatSlot(
+      undefined, undefined, undefined, undefined, 'incognito', undefined,
+      undefined, undefined, 'inst-a', 'chat-9',
+    )
+    expect(call(1).body).toEqual({
+      memory_mode: 'incognito', instance_id: 'inst-a', adopt_remote_slot: 'chat-9',
     })
   })
 
@@ -1565,6 +1610,10 @@ describe('every api method issues one well-formed /api request', () => {
   // URL from `undefined` — a harness artifact, not a defect in the method — so
   // each one names the minimal shape its URL is read from.
   const ARGS: Record<string, unknown[]> = {
+    // Memory reads take typed objects; positional strings do not satisfy the
+    // query/record contract and would manufacture undefined URL parameters.
+    memoryRecords: ['member-reviewer', { q: 'contact', kind: 'fact' }, 0, 50],
+    memoryRecordHistory: ['member-reviewer', { kind: 'fact', id: 'user.contact' }, 25, 0],
     // `invokeFileMenuItem(item, ctx)`: the URL is `item.endpoint`.
     invokeFileMenuItem: [
       { id: 'send', app: 'doc-store', endpoint: '/api/apps/doc-store/send' },

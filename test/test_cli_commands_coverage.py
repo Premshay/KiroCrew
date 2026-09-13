@@ -30,6 +30,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from member_memory_helpers import PRIVATE_EXECUTION_GATE
 
 from kiro_crew import cli_commands as cc
 from kiro_crew import sel as sel_mod
@@ -100,14 +101,15 @@ def _cfg_with(
 def _seed_doc_file(tmp_path: Path, cfg: KiroCrewConfig) -> Path:
     """Materialize *cfg* as a real config.json for the locked-delta writers.
 
-    The CLI CRUD commands no longer mutate the loaded snapshot and ``save()``
+    The CLI CRUD commands do not mutate the loaded snapshot and ``save()``
     it -- they write a delta on the document read inside the sidecar flock
-    (#4767 round 7), so tests that check persistence must seed and read the
+    so tests that check persistence must seed and read the
     FILE, not the in-memory dataclass.
     """
     doc = {
         "workspaces": {n: dataclasses.asdict(w) for n, w in cfg.workspaces.items()},
         "agents": {n: dataclasses.asdict(a) for n, a in cfg.agents.items()},
+        "memory_stores": {n: dataclasses.asdict(m) for n, m in cfg.memory_stores.items()},
         "agent": {"default_agent": cfg.default_agent},
     }
     p = tmp_path / "config.json"
@@ -150,31 +152,38 @@ class TestSmallHelpers:
 
 
 class TestWorkspaceDirGuard:
-    """``_ws_dir_resolves_inside_home`` must fail CLOSED, never raise."""
+    """``_ws_dir_resolves_inside_home`` must fail CLOSED, never raise.
+
+    An accepted dir comes back as the ONE resolved path the guard judged (the
+    caller materializes that object, never a second resolution); a refusal is None.
+    """
 
     def test_relative_name_inside_home_is_accepted(self, tmp_path: Path) -> None:
         with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
-            assert cc._ws_dir_resolves_inside_home("workspace-demo") is True
+            assert (
+                cc._ws_dir_resolves_inside_home("workspace-demo")
+                == (tmp_path / "workspace-demo").resolve()
+            )
 
     def test_home_root_itself_is_refused(self, tmp_path: Path) -> None:
         with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
-            assert cc._ws_dir_resolves_inside_home(".") is False
+            assert cc._ws_dir_resolves_inside_home(".") is None
 
     def test_escaping_path_is_refused(self, tmp_path: Path) -> None:
         with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
-            assert cc._ws_dir_resolves_inside_home("../elsewhere") is False
+            assert cc._ws_dir_resolves_inside_home("../elsewhere") is None
 
     def test_unknown_user_tilde_fails_closed(self, tmp_path: Path) -> None:
         """``expanduser`` raises RuntimeError here -- it must not escape."""
         with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
-            assert cc._ws_dir_resolves_inside_home("~nosuchuser1234/x") is False
+            assert cc._ws_dir_resolves_inside_home("~nosuchuser1234/x") is None
 
     def test_sensitive_target_is_refused(self, tmp_path: Path) -> None:
         with (
             patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
             patch("kiro_crew.cli_commands.is_sensitive_path", return_value=True),
         ):
-            assert cc._ws_dir_resolves_inside_home("profiles") is False
+            assert cc._ws_dir_resolves_inside_home("profiles") is None
 
     def test_error_message_names_boundary_and_value(self, tmp_path: Path) -> None:
         with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
@@ -423,7 +432,7 @@ class TestAppCli:
         assert "off" in capsys.readouterr().out
 
     def test_disable_flips_the_flag_before_deregistering(self) -> None:
-        """Order is a security control, not cosmetics (#5726 review).
+        """Order is a security control, not cosmetics.
 
         A running gateway is a DIFFERENT process: it watches this app's backend and
         re-registers its MCP servers and agents on a health recovery, gated on the
@@ -740,6 +749,7 @@ class TestAgentCli:
         with (
             patch.object(KiroCrewConfig, "load", return_value=cfg),
             patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            patch(PRIVATE_EXECUTION_GATE, return_value=True),
         ):
             cc._handle_agent(
                 _ns(
@@ -747,12 +757,16 @@ class TestAgentCli:
                     name="new",
                     kiro_agent="ka",
                     workspace="ws",
-                    memory_store="ms",
+                    memory_store="",
                 )
             )
         doc = _read_doc(cfg_path)
         assert doc["agents"]["new"]["kiro_agent"] == "ka"
         assert doc["agents"]["new"]["workspace"] == "ws"
+        store = doc["agents"]["new"]["memory_store"]
+        assert store != "default"
+        assert doc["memory_stores"][store]["owner_member"] == "new"
+        assert doc["memory_stores"][store]["memory_version"] == 2
         assert "Created agent: new" in capsys.readouterr().out
 
     def test_create_duplicate_exits_1_without_saving(
@@ -799,8 +813,11 @@ class TestAgentCli:
         assert agent["workspace"] == "ws0"
         assert agent["memory_store"] == "m0"
 
-    def test_update_all_fields(self, tmp_path: Path) -> None:
+    def test_update_template_and_workspace_preserves_private_memory(self, tmp_path: Path) -> None:
+        from kiro_crew.memory_stores import provision_member_memory
+
         cfg = _cfg_with(agents={"a": KiroCrewAgentConfig()})
+        store = provision_member_memory(cfg, "a")
         cfg_path = _seed_doc_file(tmp_path, cfg)
         with (
             patch.object(KiroCrewConfig, "load", return_value=cfg),
@@ -812,14 +829,14 @@ class TestAgentCli:
                     name="a",
                     kiro_agent="k",
                     workspace="w",
-                    memory_store="m",
+                    memory_store=None,
                 )
             )
         agent = _read_doc(cfg_path)["agents"]["a"]
         assert (agent["kiro_agent"], agent["workspace"], agent["memory_store"]) == (
             "k",
             "w",
-            "m",
+            store,
         )
 
     def test_update_missing_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -979,7 +996,13 @@ class TestWorkspaceCopyFrom:
         assert "already used by another workspace" in capsys.readouterr().err
 
     def test_copy_from_missing_source_dir_still_registers(self, tmp_path: Path) -> None:
-        """A source workspace with no directory on disk is a config-only copy."""
+        """A source workspace with no directory on disk registers a USABLE copy.
+
+        With no source tree to publish, the create falls through to the plain
+        branch, which materializes the destination. A registered ``dir`` that does
+        not exist is precisely the entry that makes the V2 private-memory layout
+        refuse every private member.
+        """
         cfg = self._base()
         cfg_path = _seed_doc_file(tmp_path, cfg)
         with (
@@ -992,7 +1015,7 @@ class TestWorkspaceCopyFrom:
                 _ns(workspace_action="create", name="copy3", dir=None, copy_from="src")
             )
         assert "copy3" in _read_doc(cfg_path)["workspaces"]
-        assert not (tmp_path / "workspace-copy3").exists()
+        assert (tmp_path / "workspace-copy3").is_dir()
 
 
 # ── security subcommands ──
@@ -1070,7 +1093,7 @@ class TestSecurityCli:
         assert "No security events recorded." in capsys.readouterr().out
 
     def test_events_passes_the_time_window_through(self) -> None:
-        """``-n`` alone cannot express "the last two hours" (issue #4843)."""
+        """``-n`` alone cannot express "the last two hours"."""
         with patch("kiro_crew.cli_commands.sel") as sel:
             sel.return_value.recent.return_value = []
             cc._security(
@@ -1265,7 +1288,7 @@ class TestPolicyCli:
     def test_show_without_policy_includes_denied_command_summary(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Regression for #3454: an agent's only prior discovery mechanism for
+        """An agent's only other discovery mechanism for
         the built-in denied-command rules was to attempt one and be refused.
         `policy show` must surface them even on a standalone (non-enterprise)
         install, which is the common case the early-return branch serves.
@@ -1555,7 +1578,7 @@ class TestLearnCli:
     def test_add_does_not_write_jsonl_when_the_store_declines(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """This replaces a test that PINNED the defect (issue #2325).
+        """This replaces a test that PINNED the defect.
 
         It asserted the JSONL fallback fires whenever the vector store returns a
         falsy value -- which is most often "the lesson is already stored exactly as
@@ -2814,7 +2837,7 @@ print("wrote=" + report_path.name + "," + json_path.name)
 
 
 class TestDevConfirmFlagNoAbbreviation:
-    """The dev subparser must reject flag abbreviations (#7169 review).
+    """The dev subparser must reject flag abbreviations.
 
     The builtin agent deny rule for `--confirm-out-of-install-root` matches
     the flag's LITERAL text, but argparse's default `allow_abbrev=True` would

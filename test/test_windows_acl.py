@@ -329,6 +329,19 @@ class TestWellknownWindowsDirs:
             os.path.join(root, "GitHub CLI", "bin"),
         )
 
+    def test_windows_keeps_azure_cli_install_path_nested(self, monkeypatch) -> None:
+        monkeypatch.setattr(runner.sys, "platform", "win32")
+        monkeypatch.setenv("ProgramFiles", r"C:\PF")
+        monkeypatch.delenv("ProgramW6432", raising=False)
+        monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+        root = r"C:\PF"
+        install_dir = os.path.join(root, "Microsoft SDKs", "Azure", "CLI2", "wbin")
+
+        assert runner._wellknown_windows_dirs("az") == (
+            install_dir,
+            os.path.join(install_dir, "bin"),
+        )
+
     def test_an_unset_root_is_skipped_rather_than_joined_as_empty(self, monkeypatch) -> None:
         monkeypatch.setattr(runner.sys, "platform", "win32")
         monkeypatch.delenv("ProgramFiles", raising=False)
@@ -946,15 +959,6 @@ class TestDescribeAgainstRealAcls:
     def test_the_current_user_sid_is_a_well_formed_sid(self) -> None:
         assert platform_compat.current_user_sid().startswith("S-1-")
 
-    def test_elevation_is_reported_as_a_tri_state(self) -> None:
-        """``None`` (token unreadable) is distinct from ``False`` (not elevated).
-
-        Lives in ``platform_compat`` rather than here: it already owns reading
-        this process's own token, and a second copy of the OpenProcessToken /
-        GetTokenInformation prototype pair is plumbing that drifts.
-        """
-        assert platform_compat.is_token_elevated() in (True, False, None)
-
 
 class TestLoadRefusesOffWindows:
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX behaviour")
@@ -1037,8 +1041,8 @@ class TestApplyOwnerOnlyOffWindows:
     def test_the_volume_is_never_consulted_by_this_mechanism(self, monkeypatch) -> None:
         """The writer applies the DACL on ANY volume; the gate is not its job.
 
-        local=False would have refused while the gate lived here. It no longer
-        does: an on-loop caller has to ask before it starts (see
+        This mechanism does not consult the volume; an on-loop caller has to ask
+        before it starts (see
         :func:`windows_acl.volume_is_local`), because a refusal at this depth
         arrives after the caller already paid the cost it was avoiding.
         """

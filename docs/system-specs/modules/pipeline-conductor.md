@@ -92,7 +92,8 @@ with the defaults that apply when the spec omits them:
   "work_source": {"kind": "gh_issues", "select_labels": ["auto-fixable"],
                   "skip_signals": ["claimed", "in-progress"]},
   "worker_contract": {"branch_pattern": "fix/{slug}-{n}",
-                      "worktree_pattern": "../{repo_name}-fix-{n}"},
+                      "worktree_pattern": "../{repo_name}-fix-{n}",
+                      "max_commits": 2},
   "verifier": {"repro_gate": "best_effort"},
   "governance": {"max_in_flight": 32, "max_per_cycle": 3,
                  "idle_alert_secs": 900, "session_ceiling": 30,
@@ -286,18 +287,19 @@ is not granted them; its durable state is the session work ledger
 `conductor-status/v1`. The work-ledger tool family generalized from the Issue
 Radar one, proposed in
 [`../../request-for-change/rfc-conductor-work-ledger.md`](../../request-for-change/rfc-conductor-work-ledger.md),
-is now built through Phase 2 — but this conductor does **not** mount it. It was
-mounted here briefly and the mount was retracted: the ledger flow inverts the
-dispatch order and replaces the patrol cycle, so it is a different procedure
-rather than two extra tools, and it lives on its own agent. See that RFC's
-rollout note for the criteria under which the two fold back together.
+is now built and is what `kirocrew-conductor` runs — but this conductor does
+**not** mount it. It was mounted here briefly and the mount was retracted: the
+ledger flow binds before it seeds and reads a record instead of a transcript, so
+it is a different procedure rather than two extra tools, and this conductor's
+children report through the `pipeline-conductor` skill's own scripts.
 
-Two sibling agents share this one's installer mechanics and nothing else:
-`kirocrew-conductor` (the `goal-conductor` skill) decomposes a free-form goal,
-and `kirocrew-ledger-conductor` (the `goal-ledger-conductor` skill) does the same
-while tracking items in the work ledger. All three narrow `mcpServers`, withhold
-every file-writing tool, grant verb by verb and derive `permissions` from the
-filtered list; only the third mounts `kirocrew-work`.
+One sibling agent shares this one's installer mechanics and nothing else:
+`kirocrew-conductor` (the `goal-conductor` skill) decomposes a free-form goal and
+tracks its items in the work ledger. `kirocrew-ledger-conductor` is a deprecated
+alias emitting that same spec under the flow's old name for one release. Both
+narrow `mcpServers`, withhold every file-writing tool, grant verb by verb and
+derive `permissions` from the filtered list; only the conductor mounts
+`kirocrew-work`.
 
 ## Tests that pin this
 

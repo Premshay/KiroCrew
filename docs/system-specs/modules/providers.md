@@ -14,6 +14,23 @@ Several are selectable on a plain public build, so "one provider" never meant
 
 ### Architecture
 
+Private V2 process isolation is a trusted provider preparation decision. The
+synchronous factory leaves identity reads to `AcpProvider.prepare_private_memory`,
+which resolves persisted/protected session memory in a worker before `start`
+chooses a runtime or starts a process. Session allocation also calls preparation
+before its existing pre-start privacy comparison. The result updates provider
+and client flags together on the event loop, removes shared MCP routing for a
+private provider, and retains the original socket for private-path validation.
+Successful preparation is reused by `start` and recovery; failure or cancellation
+does not publish it. `private_memory=True` is preserved through `AcpProvider`,
+`AcpClient` and `AcpRuntime`, including a recovery respawn. Caller extra kwargs and
+environment variables cannot opt into or out of that decision. The actual sandbox
+spawn applies the member-specific Global V1 masks
+and refuses an unenforced mode; the earlier context check is not a substitute.
+Private sessions bypass the global warm/shared runtime inventory. Dedicated
+private consolidation uses the same preparation boundary; V1 factory call shapes
+and background/pool behavior remain unchanged.
+
 ```
 ┌─────────────────────────────────────────────┐
 │  Consumers (handler, gateway, cli, session) │
@@ -207,7 +224,6 @@ are always present; user-configured servers from the agent config are merged in.
 
 - Provider-agnostic via factory (one provider, `AcpProvider`, over the resolved backend)
 - Calls `repair_agent_configs()` on gateway startup and periodically
-- context_info() reports model/agent
 - Resume: calls `set_resume_session_id()` before `start()`
 
 ### Subagent Approval Mode Inheritance (`subagent.py`)
@@ -248,7 +264,7 @@ spawn+initialize handshakes per gateway loop); admission is backend-neutral, so 
 adapted runtime harness neither bypasses the bound nor changes the Kiro path.
 
 - **A runtime backend (`is_acp_runtime_backend`, i.e. membership in
-  `ACP_BACKENDS_ACP_RUNTIME`)** → `_start_kiro_runtime()`. This spawns an
+  `acp_runtime_backends()`)** → `_start_kiro_runtime()`. This spawns an
   `AcpRuntime` (carrying the provider's sandbox mode, extra env, and MCP-gateway
   overlay/socket), resumes via `runtime.load_session()` when a prior transcript
   exists or otherwise `runtime.create_session()`, applies the configured model,
@@ -256,10 +272,38 @@ adapted runtime harness neither bypasses the bound nor changes the Kiro path.
   same interface as `AcpClient`, so downstream callers are unchanged). Any
   failure after `spawn()` kills the runtime so a half-initialised session never
   leaks an orphaned `kiro-cli`.
+
+  This path refuses pooled MCP servers it cannot project.
+  `AcpRuntime._refuse_unprojected_pooled_servers` raises the non-retryable
+  `AcpToolGateUnroutable` — before `session/new`, so there is no session to tear
+  down — when `pooled_session_servers` returns a non-empty array for a backend
+  whose MCP surface is reached through an agent-config mirror
+  (`providers.mirrors.registry.has_mirror`). The reason is that the mirror's
+  `session_projection` is what withholds a pooled stub the agent's `tools` never
+  references and what returns the per-tool deny set the client enforces at the
+  approval request, and it runs only on the `AcpClient` path; a mirrored host
+  approves its own tools internally, so an unprojected stub would be a live tool
+  surface Crew never granted. The gate reads the registry rather than naming a
+  backend, so a future mirrored host on this runtime inherits the refusal instead
+  of the gap. `has_mirror` is False for kiro and KAS, which reach their servers
+  natively, so their paths are untouched. Carrying the projection onto this path
+  is what lifts the refusal.
 - **A non-runtime backend (not a member)** → `AcpClient.ensure_ready()`, one
   process per session with no shared runtime. The branch is expressed as
   positive membership, not `not is_claude_backend`, so a harness added later
   does not inherit the kiro-family path (harness-parity H5).
+
+`acp_runtime_backends()` and not the frozenset itself is what the FOREGROUND start
+path reads (`AcpProvider.is_acp_runtime_backend`, its only consumer). The
+background path (`session._bg_runtime_backends`) reads the frozenset on purpose,
+so the switch does not reach it — see `session.md`, "Multiplexed _bg runtime". It
+returns `ACP_BACKENDS_ACP_RUNTIME` verbatim unless `KIROCREW_CODEX_ACP_RUNTIME` is
+set to `1`/`true`/`yes`/`on`, which adds codex for the life of that process. The
+switch is a preview and is **off** by default: it exists so codex's `AcpRuntime`
+path can be exercised before the membership itself changes, and the frozenset
+stays the shipped answer. A future harness author looking for "the one gate" is
+looking for that function; the set is vocabulary, and `harness_for()` serves a
+host whether or not the switch names it.
 
 `AcpProvider.is_session_sharing_eligible` is membership in
 `ACP_BACKENDS_SESSION_SHARING` (harness-parity H6), not `not is_claude_backend`:

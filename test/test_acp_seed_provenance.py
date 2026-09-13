@@ -510,7 +510,7 @@ class TestProvenanceRecord:
         A cap can only ever evict entries whose file still EXISTS -- the dead ones
         are already gone -- and those are precisely the adoptable orphans this
         module exists to keep. Evicting one makes its path unrecorded, which is
-        worse in both directions at once: its own owner can no longer recognize it
+        worse in both directions at once: its own owner cannot recognize it
         on reset, so it leaks, and no later session is permitted to repair it
         either, so whatever it holds (a stale ``availableModels``, a stale
         ``permissions.defaultMode``, up to an inherited ``bypassPermissions``)
@@ -674,8 +674,8 @@ class TestCrossSessionAdoption:
         """Re-seeding an orphan is also the only way to clean one up.
 
         ``bypassPermissions`` takes every tool call out of the host gate. A seed
-        carrying it that outlived its session used to be frozen in place and kept
-        being read by the adapter; adoption overwrites the mode with THIS session's.
+        carrying it that outlives its session would otherwise stay frozen in place
+        and be read by the adapter; adoption overwrites the mode with THIS session's.
         """
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
         first = _client(tmp_path, permission_mode="bypassPermissions")
@@ -1158,7 +1158,7 @@ class TestTheGrantIsATransaction:
     A grant is only real once it is on disk, so both directions have to commit or
     roll back together: a seed with no durable record is a permission mode nothing
     can clean up, and a revoked record with the file still there is a grant that
-    outlives what it described. These pin the two cases where the pairing used to
+    outlives what it described. These pin the two cases where the pairing can
     come apart -- a sidecar publish that fails, and a teardown that is cancelled.
     """
 
@@ -1347,7 +1347,7 @@ class TestTheGrantIsATransaction:
     def test_a_project_file_at_the_move_aside_name_is_not_clobbered(self, tmp_path, monkeypatch):
         """A file already at the fixed ``.crew-gc`` name must survive the capture.
 
-        The move-aside destination used to be a FIXED sibling (``<name>.crew-gc``),
+        The move-aside destination must not be a FIXED sibling (``<name>.crew-gc``),
         which is itself a pathname a project can own -- and ``os.replace`` onto it
         clobbers it atomically, relocating the very data loss the inode-pin exists to
         prevent. The capture now lands on a fresh ``mkstemp`` name that provably did
@@ -1515,7 +1515,15 @@ class TestPostCaptureModelResolution:
         """
         import inspect
 
-        source = inspect.getsource(AcpClient._write_claude_local_settings)
+        # The seed is built in _claude_local_settings_data and serialised by
+        # _claude_local_settings_payload, so the ownership branches can compare a
+        # subset of the structure against a file they may not write. The fold travels
+        # with the builder, so all three are what this asserts.
+        source = (
+            inspect.getsource(AcpClient._write_claude_local_settings)
+            + inspect.getsource(AcpClient._claude_local_settings_payload)
+            + inspect.getsource(AcpClient._claude_local_settings_data)
+        )
         assert 'data["model"] = self._model' not in source
         assert "resolve_wire_model_id" in source
 
@@ -1570,3 +1578,277 @@ class TestPostCaptureModelResolution:
         assert client._seeds_local_settings is False
         assert not _settings(tmp_path).exists()
         assert not os.path.exists(_settings(tmp_path))
+
+
+class TestASiblingSeedGovernsWithoutBeingOwned:
+    """One session per work_dir got the MCP array; every later one lost its tools.
+
+    The live-slot claim is the race arbiter, and it has to be: two clients reading
+    the same orphan as adoptable would both rewrite it, leaving one session running
+    under the other's ``permissions.defaultMode``. But the refusal it produces was
+    wider than that justification. Two sessions of the SAME agent, in the same
+    ``work_dir``, on the same model render an identical payload -- there is no mode
+    to overwrite and nothing to disagree about -- and the loser was still handed no
+    ``mcpServers`` array at all, so it ran without ``session_checkpoint``,
+    ``spawn_run`` and every other Crew tool for the life of the process.
+
+    What the MCP precondition actually needs is that the file the adapter reads
+    carries this session's ``defaultMode`` and ``deny`` rules. A byte-identical
+    sibling seed satisfies that already. So the sharer takes the governance and
+    writes nothing -- and must not take the ownership, because ownership is what
+    teardown reads to decide whether to DELETE the file.
+    """
+
+    def test_an_identical_sibling_seed_governs_this_session(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        live = _client(tmp_path, permission_mode="default")
+        live._write_claude_local_settings()
+        before = _settings(tmp_path).read_text(encoding="utf-8")
+
+        sibling = _client(tmp_path, permission_mode="default")
+        sibling._write_claude_local_settings()
+
+        # Nothing written, nothing claimed, nothing recorded...
+        assert _settings(tmp_path).read_text(encoding="utf-8") == before
+        assert sibling._claude_settings_authored is False
+        assert sibling._claude_settings_written is None
+        assert live._claude_settings_is_still_ours() is True
+        # ...and the tools are delivered anyway, which is the whole point.
+        assert sibling._claude_settings_governed is True
+        assert acp_client._permission_surface_owned(sibling) is True
+
+    def test_a_sibling_that_would_write_a_different_mode_is_still_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """The case the refusal was written for, unchanged.
+
+        Equality is on the RENDERED payload, so a sibling whose seed would carry a
+        different ``permissions.defaultMode`` governs nothing here: the file on disk
+        does not say what this session requires, and writing it would change the mode
+        under a session already running against it.
+        """
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        live = _client(tmp_path, permission_mode="bypassPermissions")
+        live._write_claude_local_settings()
+        before = _settings(tmp_path).read_text(encoding="utf-8")
+
+        sibling = _client(tmp_path, permission_mode="default")
+        sibling._write_claude_local_settings()
+
+        assert _settings(tmp_path).read_text(encoding="utf-8") == before
+        assert sibling._claude_settings_governed is False
+        assert acp_client._permission_surface_owned(sibling) is False
+
+    def test_a_users_own_settings_file_governs_nothing(self, tmp_path, monkeypatch):
+        """A project that carries its own file is the disclosed cost, and it stays.
+
+        Nothing about sharing widens this: the user's bytes are not the bytes this
+        session would write, so the surface is not Crew's and the array is withheld.
+        """
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"permissions": {"allow": ["Bash"]}}\n', encoding="utf-8")
+
+        client = _client(tmp_path, permission_mode="default")
+        client._write_claude_local_settings()
+
+        assert path.read_text(encoding="utf-8") == '{"permissions": {"allow": ["Bash"]}}\n'
+        assert client._claude_settings_governed is False
+        assert acp_client._permission_surface_owned(client) is False
+
+    def test_a_sharers_teardown_leaves_the_authors_file_alone(self, tmp_path, monkeypatch):
+        """Governed is not owned, and this is the test that keeps them apart.
+
+        Collapsing the two into one flag would make the sharer's reset unlink a file
+        the authoring session is still running against -- the same harm the live-slot
+        claim exists to prevent, entered from the other side.
+        """
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        live = _client(tmp_path, permission_mode="default")
+        live._write_claude_local_settings()
+        before = _settings(tmp_path).read_text(encoding="utf-8")
+
+        sibling = _client(tmp_path, permission_mode="default")
+        sibling._write_claude_local_settings()
+        _teardown(sibling)
+
+        assert _settings(tmp_path).read_text(encoding="utf-8") == before
+        assert live._claude_settings_is_still_ours() is True
+        assert sibling._claude_settings_governed is False
+
+    def test_the_governed_flag_is_re_derived_per_seed(self, tmp_path, monkeypatch):
+        """A sharer that runs again after the sibling seed is gone is not still governed.
+
+        The file a re-seed finds may not be the one the last run matched against, so
+        the flag is cleared on entry rather than carried.
+        """
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        live = _client(tmp_path, permission_mode="default")
+        live._write_claude_local_settings()
+        sibling = _client(tmp_path, permission_mode="default")
+        sibling._write_claude_local_settings()
+        assert sibling._claude_settings_governed is True
+
+        _settings(tmp_path).write_text('{"permissions": {"allow": ["Bash"]}}\n', encoding="utf-8")
+        sibling._write_claude_local_settings()
+        assert sibling._claude_settings_governed is False
+        assert acp_client._permission_surface_owned(sibling) is False
+
+
+class TestGovernanceTurnsOnThePermissionBlockAlone:
+    """The field case a whole-document test refused, and the hazards it must not.
+
+    Comparing the entire rendered seed is stricter than the property the MCP
+    precondition guards, and it failed the same way the refusal it replaced did. An
+    UNPINNED session omits the ``model`` key a pinned one writes, so one repository's
+    seed was 116 bytes where another's was 139 from the same agent -- and every
+    pinned session in the first was refused, which is the whole reported symptom.
+    ``availableModels`` and ``model`` cannot pre-approve a tool; only
+    ``permissions`` can, so only ``permissions`` is compared.
+    """
+
+    def test_a_sibling_differing_only_in_model_metadata_governs(self, tmp_path, monkeypatch):
+        """The reported case: unpinned incumbent, pinned sibling, same permissions."""
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        live = _client(tmp_path, permission_mode="default", model=acp_client.DEFAULT_MODEL)
+        live._write_claude_local_settings()
+        before = _settings(tmp_path).read_text(encoding="utf-8")
+        assert "model" not in json.loads(before), "an unpinned seed must omit the model key"
+
+        pinned = _client(tmp_path, permission_mode="default", model=_SERVED[0])
+        pinned._write_claude_local_settings()
+
+        # The documents differ, the permission blocks do not...
+        assert json.loads(pinned._claude_local_settings_payload(_settings(tmp_path))) != json.loads(
+            before
+        )
+        # ...so nothing is written and the tools are delivered anyway.
+        assert _settings(tmp_path).read_text(encoding="utf-8") == before
+        assert pinned._claude_settings_authored is False
+        assert pinned._claude_settings_governed is True
+        assert acp_client._permission_surface_owned(pinned) is True
+
+    def test_a_file_carrying_a_permissions_allow_is_still_refused(self, tmp_path, monkeypatch):
+        """The hazard the mirror names, unchanged.
+
+        A pre-approving ``permissions.allow`` would let a Crew tool skip
+        ``session/request_permission`` entirely. This session renders no such entry,
+        so the blocks differ and the array stays withheld.
+        """
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"permissions": {"defaultMode": "default", "allow": ["Bash"]}}\n', encoding="utf-8"
+        )
+
+        client = _client(tmp_path, permission_mode="default")
+        client._write_claude_local_settings()
+
+        assert client._claude_settings_governed is False
+        assert acp_client._permission_surface_owned(client) is False
+
+    def test_an_unparseable_or_irregular_file_governs_nothing(self, tmp_path, monkeypatch):
+        """No answer is not a match: withholding is the safe direction."""
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        path.write_text("{not json at all", encoding="utf-8")
+        client = _client(tmp_path, permission_mode="default")
+        assert client._settings_path_document(path) == (False, None)
+        client._write_claude_local_settings()
+        assert client._claude_settings_governed is False
+
+        # A JSON document that is not an object answers nothing either.
+        path.write_text("[1, 2, 3]\n", encoding="utf-8")
+        assert client._settings_path_document(path) == (False, None)
+
+        # An absent permissions key is a VALUE, not a failure to read: the document
+        # answers, and the block it reports is None.
+        path.write_text('{"availableModels": ["sonnet"]}\n', encoding="utf-8")
+        readable, document = client._settings_path_document(path)
+        assert readable is True
+        assert document is not None and document.get("permissions") is None
+
+
+class TestTheCreateRaceLoserKeepsItsTools:
+    """Losing an O_EXCL create is not a reason to lose the MCP array.
+
+    The same defect as the leave-it-alone branch, reached by a different route: two
+    clients both found the path absent, one won the create, and the loser returned
+    without ever asking whether the file the winner had just written was the seed it
+    wanted. It almost always is -- same agent, same ``work_dir``.
+    """
+
+    def test_the_loser_adopts_the_winners_governance(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        winner = _client(tmp_path, permission_mode="default")
+        loser = _client(tmp_path, permission_mode="default")
+
+        # The winner's file appears between the loser's exists() check and its create.
+        real_exists = Path.exists
+
+        def _absent_once(self, *a, **kw):
+            if self == _settings(tmp_path):
+                Path.exists = real_exists  # type: ignore[method-assign]
+                winner._write_claude_local_settings()
+                return False
+            return real_exists(self, *a, **kw)
+
+        Path.exists = _absent_once  # type: ignore[method-assign]
+        try:
+            loser._write_claude_local_settings()
+        finally:
+            Path.exists = real_exists  # type: ignore[method-assign]
+
+        assert winner._claude_settings_authored is True
+        assert loser._claude_settings_authored is False, "the loser must not own the file"
+        assert loser._claude_settings_governed is True
+        assert acp_client._permission_surface_owned(loser) is True
+
+    def test_a_half_written_file_is_waited_for_not_judged(self, tmp_path, monkeypatch):
+        """The winner creates, then writes; the loser can arrive in between.
+
+        A single check would decide against bytes nobody meant to publish. The wait
+        is bounded and only ever applies while the file cannot be parsed.
+        """
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        client = _client(tmp_path, permission_mode="default")
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")  # created, not yet written
+
+        settled = client._claude_local_settings_payload(path)
+        calls = {"n": 0}
+        real = AcpClient._settings_path_document
+
+        def _fills_on_the_third_look(p):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                path.write_text(settled, encoding="utf-8")
+            return real(p)
+
+        monkeypatch.setattr(AcpClient, "_settings_path_document", staticmethod(_fills_on_the_third_look))
+        assert client._await_sibling_seed_governance(path) is True
+        assert calls["n"] > 1, "an empty file must be retried, not judged on first read"
+
+    def test_a_readable_mismatch_is_not_retried(self, tmp_path, monkeypatch):
+        """Waiting cannot turn a real disagreement into agreement, so it does not wait."""
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        client = _client(tmp_path, permission_mode="default")
+        path = _settings(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"permissions": {"defaultMode": "bypassPermissions"}}\n', encoding="utf-8")
+
+        calls = {"n": 0}
+        real = AcpClient._settings_path_document
+
+        def _counted(p):
+            calls["n"] += 1
+            return real(p)
+
+        monkeypatch.setattr(AcpClient, "_settings_path_document", staticmethod(_counted))
+        assert client._await_sibling_seed_governance(path) is False
+        assert calls["n"] == 1, "a parseable mismatch must be decided on the first read"

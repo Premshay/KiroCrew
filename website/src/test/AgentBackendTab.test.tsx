@@ -31,6 +31,14 @@ vi.mock('../components/settingRef/useConfigSchema', () => ({
   useConfigSchema: () => schemaMock(),
 }))
 
+// The card under the switch is a sentinel: its own behaviour (status query,
+// chooser, sign-out) is pinned in KiroSignInCard.test.tsx, and the real card
+// would need the kas-login API this file does not mock. Unlike the real card it
+// renders unconditionally, so its absence below can only be the tab's gate.
+vi.mock('../pages/developer/KiroSignInCard', () => ({
+  KiroSignInCard: () => <div data-testid="kiro-sign-in-card" />,
+}))
+
 import { AgentBackendTab } from '../pages/developer/AgentBackendTab'
 
 /** A schema map advertising exactly `values` for the backend field. */
@@ -68,18 +76,24 @@ function probeRow(
   }
 }
 
-function wrap() {
+function wrapWithClient() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   render(
     <QueryClientProvider client={qc}>
       <AgentBackendTab />
     </QueryClientProvider>,
   )
+  return { qc }
+}
+
+function wrap() {
+  wrapWithClient()
 }
 
 const button = (name: string) => screen.getByRole('button', { name })
 
 beforeEach(() => {
+  localStorage.clear()
   patchConfigMock.mockClear()
   patchConfigMock.mockResolvedValue({})
   kirocrewConfigMock.mockClear()
@@ -144,6 +158,57 @@ describe('AgentBackendTab', () => {
     wrap()
     fireEvent.click(await screen.findByRole('button', { name: 'KAS (kiro-agent)' }))
     await waitFor(() => expect(patchConfigMock).toHaveBeenCalledWith('agent.acp_backend', 'kas'))
+  })
+
+  it('re-clicking the already-selected backend saves nothing and leaves the model list alone', async () => {
+    // The chip group fires onChange for the pressed option as well, and a PATCH
+    // writing the current value would still succeed -- which would reset the
+    // model list and spawn `--list-models` for a backend that never changed.
+    localStorage.setItem('kc.acp.models.v1', JSON.stringify({ ts: Date.now(), models: [{ name: 'auto', description: '' }] }))
+    const { qc } = wrapWithClient()
+    qc.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'kiro-model' }])
+    const reset = vi.spyOn(qc, 'resetQueries')
+    fireEvent.click(await screen.findByRole('button', { name: 'Kiro CLI' }))
+    await waitFor(() => expect(button('Kiro CLI')).toHaveAttribute('aria-pressed', 'true'))
+    expect(patchConfigMock).not.toHaveBeenCalled()
+    expect(reset).not.toHaveBeenCalled()
+    expect(qc.getQueryData(['available-models', 'acp'])).toHaveLength(2)
+    expect(localStorage.getItem('kc.acp.models.v1')).not.toBeNull()
+  })
+
+  it('resets the model list and drops its localStorage cache after a switch', async () => {
+    // The picker's list belongs to the OLD backend until something re-asks
+    // `/api/models`, and nothing but a session spawn does -- so without this the
+    // list only changed after a gateway restart. RESET, not invalidate: the old
+    // rows must leave the screen before the refetch lands, or a pick during a
+    // slow `--list-models` spawn writes an id the new backend rejects. The cache
+    // drop keeps a failing first fetch from serving the old backend's ids.
+    localStorage.setItem('kc.acp.models.v1', JSON.stringify({ ts: Date.now(), models: [{ name: 'auto', description: '' }] }))
+    const { qc } = wrapWithClient()
+    qc.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'old-backend-model' }])
+    const reset = vi.spyOn(qc, 'resetQueries')
+    fireEvent.click(await screen.findByRole('button', { name: 'KAS (kiro-agent)' }))
+    await waitFor(() => expect(patchConfigMock).toHaveBeenCalledWith('agent.acp_backend', 'kas'))
+    await waitFor(() => expect(reset).toHaveBeenCalledWith({ queryKey: ['available-models'] }))
+    // The old rows are gone the moment the switch saves, not after a refetch.
+    expect(qc.getQueryData(['available-models', 'acp'])).toBeUndefined()
+    expect(localStorage.getItem('kc.acp.models.v1')).toBeNull()
+  })
+
+  it('leaves the model list alone when the save is rejected', async () => {
+    // A refused PATCH means the backend did NOT change; refetching would spawn
+    // `--list-models` for nothing, and dropping the cache would throw away a
+    // list that is still correct.
+    patchConfigMock.mockRejectedValueOnce(new Error('403'))
+    localStorage.setItem('kc.acp.models.v1', JSON.stringify({ ts: Date.now(), models: [{ name: 'auto', description: '' }] }))
+    const { qc } = wrapWithClient()
+    qc.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'still-valid-model' }])
+    const reset = vi.spyOn(qc, 'resetQueries')
+    fireEvent.click(await screen.findByRole('button', { name: 'KAS (kiro-agent)' }))
+    await screen.findByText('Could not save the agent backend.')
+    expect(reset).not.toHaveBeenCalled()
+    expect(qc.getQueryData(['available-models', 'acp'])).toHaveLength(2)
+    expect(localStorage.getItem('kc.acp.models.v1')).not.toBeNull()
   })
 
   it('hides a backend the deployment may not select, rather than dimming it', async () => {
@@ -689,5 +754,40 @@ describe('AgentBackendTab', () => {
     wrap()
     await waitFor(() => expect(button('Kiro CLI')).toBeEnabled())
     expect(screen.getByText(/decided when the gateway starts/)).toBeInTheDocument()
+  })
+
+  it('renders the Kiro sign-in card under the switch while KAS is on offer', async () => {
+    // The identity the card stores is consumed by the KAS relay alone, so the
+    // card lives beside the switch that selects KAS -- not on Settings >
+    // Overview, where a sign-in chooser read as a required step to every user.
+    // Offered, not selected: the shipped default is Kiro CLI, and the card must
+    // still be here so the user can sign in BEFORE switching.
+    wrap()
+    await waitFor(() => expect(button('KAS (kiro-agent)')).toBeEnabled())
+    expect(button('Kiro CLI')).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTestId('kiro-sign-in-card')).toBeInTheDocument()
+  })
+
+  it('renders no sign-in card when this deployment cannot select KAS', async () => {
+    // A build or policy that hides the KAS option has nothing for the user to
+    // sign in for; a chooser here would be a sign-in to nothing. The gate reads
+    // the same `visible` set the rows render, so the switch and the card cannot
+    // disagree about whether KAS is offered.
+    schemaMock.mockReturnValue(schemaWith(['', 'claude']))
+    wrap()
+    await waitFor(() => expect(button('Claude Code')).toBeEnabled())
+    expect(screen.queryByRole('button', { name: 'KAS (kiro-agent)' })).toBeNull()
+    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
+  })
+
+  it('keeps the sign-in card while KAS is the saved backend, even if it reads as unselectable', async () => {
+    // `visible` always keeps the saved value so the control has a pressed chip;
+    // the card follows it, so an operator whose sessions still run as the Crew
+    // identity keeps the one place that can sign it out.
+    kirocrewConfigMock.mockResolvedValue({ agent: { acp_backend: 'kas' } })
+    schemaMock.mockReturnValue(schemaWith(['', 'claude']))
+    wrap()
+    await waitFor(() => expect(button('KAS (kiro-agent)')).toHaveAttribute('aria-pressed', 'true'))
+    expect(screen.getByTestId('kiro-sign-in-card')).toBeInTheDocument()
   })
 })

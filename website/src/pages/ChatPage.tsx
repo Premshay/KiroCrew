@@ -1,4 +1,9 @@
 import {
+  WorkspacePanelContext,
+  WorkspaceFullscreenContext,
+} from "../components/WorkspacePanelContext";
+import {
+  useContext,
   Fragment,
   useState,
   useRef,
@@ -6,7 +11,6 @@ import {
   useEffect,
   useLayoutEffect,
   useMemo,
-  useId,
 } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -28,6 +32,7 @@ import { useImeGuard } from "../hooks/useImeGuard";
 import { useRailWidth } from "../hooks/useRailWidth";
 import { SETTINGS_DEFAULT_MODEL_ID } from "../hooks/useSettingHighlight";
 import { settingsPath } from "../components/settingsPath";
+import { KIRO_SIGN_IN_PATH } from "./developer/kiroSignInLink";
 import { isTouchDevice } from "../utils/isTouchDevice";
 import { agentOrDefaultLabel } from "../utils/agentLabel";
 import { toApiDecision } from "../utils/approvalDecision";
@@ -70,10 +75,12 @@ import {
   loadOlderMessages,
   abortActiveOlderFetch,
   isSupersededPagingRejection,
+  clearSwitchSlotGone,
   appendMessage,
   appendSlotMessage,
   endLocalTurn,
   clearUnresumableResume,
+  clearUndeletableHistory,
   forkSlot,
   setSlotRunning,
   startLocalTurn,
@@ -84,6 +91,7 @@ import {
   resolveByApprovalId,
   clearPendingPermissions,
   selectComposerBusy,
+  selectSendConfirmed,
   selectContinuable,
   selectTurnInterrupted,
   setVoiceAudio,
@@ -134,6 +142,7 @@ import {
   updateSlot,
 } from "../store/dashboardSlice";
 import { performSlotSwitch } from "../lib/slotSwitch";
+import { drainPendingChunks } from "../lib/pendingChunkDrain";
 import { performAgentSlotSwitch } from "../lib/agentSwitch";
 import { api } from "../api/client";
 import { resolveAskAfterSend } from "../lib/resolveAskAfterSend";
@@ -369,6 +378,7 @@ import AgentDropdownList, {
   ManageAgentsFooter,
 } from "../components/AgentDropdownList";
 import { agentSwitchFailureMessage } from "../utils/agentSwitchFeedback";
+import { historyDeleteRefusalMessage } from "../utils/historyDeleteRefusal";
 import ProjectPicker from "../components/ProjectPicker";
 import InboundLinkChip from "../components/InboundLinkChip";
 import ModelEffortDropdown from "../components/ModelEffortDropdown";
@@ -391,13 +401,14 @@ import {
   sessionSlots,
 } from "../hooks/splitLayoutStore";
 import { modelSupportsEffort } from "../lib/effort";
-import { providerLabel } from "../lib/sttProviders";
+import { mcpAppTabTitle } from "../lib/mcpAppSrcdoc";
 import { countCompletedTurns } from "../lib/completedTurns";
 import { displayModel, pinIsWithheld } from "../lib/model";
 import FollowUpCard from "../components/FollowUpCard";
 import FolderSuggestionCard from "./chat/FolderSuggestionCard";
 import { useMoveSlotToFolder } from "../hooks/useMoveSlotToFolder";
 import PendingQuestionCard from "../components/PendingQuestionCard";
+import PendingDecisionCard from "../components/PendingDecisionCard";
 import SessionPulseSurveyCard from "../components/SessionPulseSurveyCard";
 import type { FollowupItem } from "../store/chatSlice";
 
@@ -424,20 +435,10 @@ import QueueStack, {
 import { runBelongsToSlot } from "../apps/workflows/runModel";
 import { TipCard, useTipTrigger } from "../components/TipCard";
 import {
-  useVoiceInput,
-  voiceInputSupported,
-  type TranscriptOrigin,
-} from "../hooks/useVoiceInput";
-import { dictationSeparator, spliceDictationText } from "../lib/dictationText";
-import { usePushToTalk } from "../hooks/usePushToTalk";
-import {
-  useHandsFreeLoop,
-  type HandsFreeLoop,
-} from "../hooks/useHandsFreeLoop";
-import { isSendableTranscript, HANDS_FREE_LS_KEY } from "../hooks/handsFreeVad";
-import { markEndOfSpeech, clearTurnMarks } from "../utils/voiceTurnMetrics";
-import { usePersistedBool } from "../hooks/usePersistedBool";
-import VoiceDisabledModal from "../components/VoiceDisabledModal";
+  Composer,
+  type ComposerHandle,
+  type ComposerVoiceOptions,
+} from "../chat-core/composer/Composer";
 import {
   ChatFooter,
   AssistantMessage,
@@ -552,11 +553,7 @@ import {
   X,
 } from "lucide-react";
 import { EdgeFade, JumpToBottomButton } from "../app-sdk/ChatScrollChrome";
-import {
-  PanelLeftSolid,
-  PanelLeftLight,
-  PanelRightSolid,
-} from "../components/icons/panels";
+import { PanelLeftSolid, PanelLeftLight } from "../components/icons/panels";
 
 import InfoTip from "../components/InfoTip";
 import SlotTagPopover from "../components/SlotTagPopover";
@@ -567,6 +564,7 @@ import {
   motion,
   useMotionValue,
   useTransform,
+  useReducedMotion,
 } from "framer-motion";
 import DetailPanel from "../components/DetailPanel";
 
@@ -736,7 +734,6 @@ export default function ChatPage({
   popout?: boolean;
   noUrlSync?: boolean;
 } = {}) {
-  const handsFreeSpeechSource = useId();
   const dispatch = useAppDispatch();
   const moveSlotToFolder = useMoveSlotToFolder();
   const navigate = useNavigate();
@@ -766,6 +763,9 @@ export default function ChatPage({
       ? 0
       : Math.max(0, window.innerHeight - vv.offsetTop - vv.height);
   const slots = useAppSelector((s) => s.dashboard.slots);
+  // A user-facing switch gesture hit a session the server no longer has
+  // (#6372); rendered through the pane ErrorNotice below (errors-use-error-notice).
+  const switchSlotGone = useAppSelector((s) => s.chat.switchSlotGone);
   // Unified chat view: show default, orchestrator and crew slots together.
   // App-owned worker slots (s.app) are excluded by the sidebar itself.
   const filteredSlots = useMemo(
@@ -789,7 +789,13 @@ export default function ChatPage({
   // The one post-resolve answer for every resume entry point (#5925); rendered
   // above the composer, which is the only place all of them can see.
   const unresumableResume = useAppSelector((s) => s.chat.unresumableResume);
+  const undeletableHistory = useAppSelector((s) => s.chat.undeletableHistory);
   const activeSlot = useAppSelector((s) => s.chat.activeSlot);
+  // The store this page is rendered under (not the module singleton): the
+  // opener reads live state after an await, and it must be the same store
+  // its dispatches went to. Also read by the MCP-app openers below, so it is
+  // declared ahead of the auto-open effect.
+  const boundStore = useAppStore();
   // Reveal eligible completed replies while recovery is offered, including an
   // older reply the user chose to read aloud. Slot identity prevents bleed-over.
   const [voiceRecoverySlot, setVoiceRecoverySlot] = useState<string | null>(
@@ -847,13 +853,20 @@ export default function ChatPage({
       // a tab the user had deliberately closed.
       if (!claimAppAutoOpen(activeSlot, id)) continue;
       dispatch(openActivityPanel());
+      // Chip title comes from the render payload already in the store -- the
+      // payload IS what created this id (appToolCallIds keys off chat.mcpApps).
+      // Read at effect time from the Provider-bound store (never the module
+      // singleton, which a test harness does not mount) so unrelated chat
+      // updates do not re-run the effect.
+      const payload =
+        boundStore.getState().chat.mcpApps?.[mcpAppKey(activeSlot, id)];
       tabsCtlRef.current?.openApp(
         id,
-        i18nT("pages.chatPage.mcp_app_tab_title"),
+        mcpAppTabTitle(payload, i18nT("pages.chatPage.mcp_app_tab_title")),
         activeSlot,
       );
     }
-  }, [mcpAppPanel, activeSlot, appToolCallIds, dispatch]);
+  }, [mcpAppPanel, activeSlot, appToolCallIds, dispatch, boundStore]);
 
   const messages = useAppSelector((s) => s.chat.messages);
   const probeServerTotal = useAppSelector((s) =>
@@ -1455,11 +1468,18 @@ export default function ChatPage({
       };
       const row = (message: ChatMessage) =>
         dispatch(appendSlotMessage({ slot, message }));
-      // - `refused` / `transport-error`: nothing was accepted -- the same two
-      //   outcomes `send()` reports with an error row (the server's reason,
-      //   framed, or the connection copy that names the restore) and a
-      //   restore. The optimistic bubble is dropped first (the reducer's drop
-      //   arm; a no-op once the server owns the row): left standing it would be
+      // A confirmed echo is stronger evidence than a missing HTTP response,
+      // including when a steer raced onto a new turn and lost its steer flag.
+      if (
+        (receipt.status === "response-late" ||
+          receipt.status === "transport-error") &&
+        sendId &&
+        selectSendConfirmed(store.getState(), slot, sendId)
+      )
+        return;
+      // - `refused` / unconfirmed `transport-error`: report the server's reason
+      //   or the connection error, and restore the draft. The reducer drops only
+      //   an optimistic bubble; left standing it would be
       //   a third, false representation of the same text next to the error row
       //   and the refilled composer.
       if (
@@ -1494,15 +1514,6 @@ export default function ChatPage({
       //   resending -- a duplicate is visible and deletable, a lost steer is not.
       if (receipt.status === "response-late") {
         if (sendId) {
-          const chat = store.getState().chat;
-          const rows =
-            slot === chat.activeSlot
-              ? chat.messages
-              : (chat.slotMessages[slot] ?? chat.messages);
-          const bubble = rows.find(
-            (m) => m.role === "user" && m.meta?.sendId === sendId,
-          );
-          if (bubble && !bubble.meta?.optimistic) return;
           // `queued` is the reducer's DROP arm (its other arm, `turn`, demotes):
           // an unconfirmed steer drops its bubble for the same reason a
           // demoted-to-queue one does -- the server-side row, if any, is the
@@ -2074,8 +2085,12 @@ export default function ChatPage({
     }
     sp.delete("prefill");
     const qs = sp.toString();
+    // PRESERVE the existing state: react-router keeps its stack position in
+    // history.state.idx, and replacing it with {} makes idx NaN for every
+    // later push — permanently disabling the top-bar Back/Forward arrows and
+    // the ⌘/Ctrl+arrow chords (routeHistoryPosition reads that bookkeeping).
     window.history.replaceState(
-      {},
+      window.history.state,
       "",
       window.location.pathname + (qs ? `?${qs}` : ""),
     );
@@ -2111,7 +2126,12 @@ export default function ChatPage({
       return;
     }
     // Always strip token from URL to prevent leakage via referrer/history
-    window.history.replaceState({}, "", window.location.pathname);
+    // Preserves history.state for the same reason as the prefill strip above.
+    window.history.replaceState(
+      window.history.state,
+      "",
+      window.location.pathname,
+    );
     const prompt = extractPromptFromToken(token);
     if (!prompt) {
       tokenConsumingRef.current = false;
@@ -2505,792 +2525,101 @@ export default function ChatPage({
   );
   const isMac =
     useAppSelector((s) => s.dashboard.status?.platform) === "darwin";
-  const { data: sttCfg } = useQuery({
-    queryKey: ["sttConfig"],
-    queryFn: () =>
-      api.sttConfig() as Promise<{
-        streaming?: boolean;
-        enabled?: boolean;
-        dictation_panel?: boolean;
-        available?: boolean;
-        provider?: string;
-      }>,
-  });
-  const sttStreaming = !!sttCfg?.streaming;
-  const sttEnabled = !!sttCfg?.enabled;
-  // The backend probes for the provider's binary and reports `available`.
-  // Default true so a not-yet-loaded config doesn't flash the modal; the
-  // separate sttConfigLoaded guard already covers the pre-load case.
-  const sttAvailable = sttCfg?.available !== false;
-  // The LOCALISED provider name, not the wire id: the modal puts it in a
-  // sentence, and a bare id reads as a typo there ("local is not installed").
-  const sttProvider = providerLabel(sttCfg?.provider || "");
-  // Default true so the panel is the standard recording surface; the backend
-  // sends an explicit boolean, so `undefined` here means "config not loaded yet"
-  // rather than "off", and a pre-load recording would otherwise flash the bar.
-  const sttDictationPanel = sttCfg?.dictation_panel !== false;
-  // Treat "config not loaded yet" as disabled so the guard never lets a
-  // recording start before STT is confirmed on. Stable boolean so toggleVoice's
-  // deps don't churn on every sttCfg object identity from a refetch.
-  const sttConfigLoaded = !!sttCfg;
-  // Opened when the user clicks the mic while STT is disabled — points them at
-  // the setting that turns it on instead of starting a recording that would
-  // never be transcribed.
-  const [voiceSetupOpen, setVoiceSetupOpen] = useState(false);
-  const frozenInputRef = useRef<string | null>(null);
-  // Caret snapshot taken alongside frozenInputRef, so a streaming partial (and
-  // the final that replaces it) keeps inserting at the same spot. The batch
-  // path leaves both null and reads the LIVE composer caret instead.
-  const frozenCaretRef = useRef<{ start: number; end: number } | null>(null);
-  // Live composer caret, kept current by ChatInput (onSelect / click / typing).
-  // Dictation splices the transcript in HERE instead of always appending at end.
-  const voiceCaretRef = useRef<{ start: number; end: number } | null>(null);
-  // Caret offset ChatInput should restore after a dictation-driven value update
-  // lands (set by the splice below, consumed + cleared inside ChatInput).
-  const voicePendingCaretRef = useRef<number | null>(null);
-  // Drops late-arriving partials/finals for the CURRENT slot after a send.
-  // `stop()` is async (up to 5s for backend close) — without this guard, a
-  // delayed onFinal would repopulate the composer with text the user already
-  // sent. Cross-SLOT safety is handled separately by session-scoped routing
-  // (see applyVoiceText + voice.sessionOwner).
-  const sttDisarmedRef = useRef(false);
-  // Narrower sibling of `sttDisarmedRef`, for a MANUAL STOP of a streaming
-  // recording that already put a hypothesis in the composer.
+  // Voice dictation is the Composer's Voice atom (chat-core P3-b): ChatPage no
+  // longer runs the hook or wires 23 props. It supplies, through the `Composer`
+  // root below, only what the atom cannot know on its own: which slot the
+  // composer currently shows (the draft-settlement predicate), where an
+  // off-screen batch transcript goes (that slot's persisted draft), the
+  // endpointer's auto-submit, and that this is the surface owning the
+  // document-wide push-to-talk key. `composerRef` reaches the atom's controls
+  // from send().
   //
-  // One flag was doing two jobs, and a manual stop only wants one of them.
-  // `applyVoiceText` APPENDS (`base + ' ' + text`), so the close-time final
-  // landing on a composer that already holds the hypothesis duplicates the
-  // utterance ("hello hello") — that has to stay suppressed. But `onPartial`
-  // REPLACES the region at the frozen boundary, and the hook re-emits
-  // `finals.join(' ')` through it on every `final` message while `stop()`
-  // deliberately leaves the socket draining. Suppressing that too meant every
-  // segment Transcribe stabilised AFTER the release was dropped, so the user
-  // was left holding the last UNSTABLE hypothesis. On a push-to-talk hold that
-  // is the common case, not a corner: the hold is short, so the tail of the
-  // utterance is exactly the part still unstable at release.
-  //
-  // So: this flag suppresses the append only, and leaves the drain's own
-  // corrections free to keep replacing the region until the socket closes.
-  // Cancel, send and slot-switch still want EVERYTHING suppressed and keep
-  // using `sttDisarmedRef` — the user discarded, already sent, or left.
-  const sttAppendDisarmedRef = useRef(false);
-  // The composer content UP TO the end of the region onPartial last inserted,
-  // plus the whole value it wrote. Dictation splices at the caret, so it can sit
-  // mid-draft with an existing tail after it — and typing after the release
-  // lands at the restored caret, i.e. between the two. Anchoring on the PREFIX
-  // (not the whole value) is what lets a drain-time update replace the corrected
-  // region and keep everything after it verbatim; anchoring on the whole value
-  // would fail its own startsWith check mid-draft and drop the correction.
-  // The full value distinguishes "the user typed" from "nothing changed", which
-  // decides whether the caret may be moved.
-  const lastDictationAnchorRef = useRef<string | null>(null);
-  const lastDictationValueRef = useRef<string | null>(null);
-  // Sticky for the whole post-stop drain: once the user has typed, the caret is
-  // theirs until dictation restarts. Recomputing "did they edit?" per update is
-  // not enough — after the first correction carries the suffix across, the
-  // composer matches what we wrote again, so a second correction would decide
-  // nothing was edited and yank the caret back in front of the typed text.
-  const postStopEditedRef = useRef(false);
-  // Suppresses ONLY the auto-submit route, and unlike the append flag it is set
-  // by EVERY manual stop of a streaming recording — including a cold-stream stop
-  // where no partial landed. "Stop capturing" is never "send": without this, a
-  // short press against a cold stream leaves the endpointer armed, and a
-  // trailing final's endpoint verdict submits the turn the user never asked to
-  // send. The append flag cannot carry this, because with no partial landed the
-  // close-time final is the only copy of the utterance and must still land.
-  const sttEndpointDisarmedRef = useRef(false);
-  // A frozen caret is a position in the composer as it stood at the release. Once
-  // the user edits after that, it can go stale in two ways, and both corrupt the
-  // splice: a RANGE (dictating over a selection replaces it) whose selection they
-  // have since typed over, and an OFFSET whose meaning shifts when they edit text
-  // BEFORE it. Rebase it onto the current text instead of trusting or discarding
-  // it wholesale — discarding it would put the transcript after text they wrote
-  // later, trusting it would cut into text they wrote earlier.
-  const rebaseFrozenCaret = useCallback(() => {
-    if (!sttEndpointDisarmedRef.current) return;
-    const frozen = frozenCaretRef.current;
-    const released = lastDictationValueRef.current;
-    const cur = inputRef.current ?? "";
-    // Untouched composer: a selection here is still a legitimate replacement
-    // target, which is what dictating over a selection is supposed to do.
-    if (!frozen || released === null || cur === released) return;
-    // Bound the edit to the region between the longest common prefix and suffix.
-    let lcp = 0;
-    while (
-      lcp < released.length &&
-      lcp < cur.length &&
-      released[lcp] === cur[lcp]
-    )
-      lcp++;
-    let lcs = 0;
-    while (
-      lcs < released.length - lcp &&
-      lcs < cur.length - lcp &&
-      released[released.length - 1 - lcs] === cur[cur.length - 1 - lcs]
-    )
-      lcs++;
-    const start = frozen.start;
-    let next: number;
-    if (start <= lcp)
-      next = start; // edit is after it
-    else if (start >= released.length - lcs)
-      next = start + (cur.length - released.length);
-    else next = voiceCaretRef.current?.start ?? start; // edit straddles it
-    next = Math.max(0, Math.min(next, cur.length));
-    frozenCaretRef.current = { start: next, end: next };
-  }, []);
-  // The hook's EFFECTIVE streaming mode: streaming is only truly active when the
-  // config asks for it AND the browser supports it (AudioWorklet/WS). Mirrored
-  // from voice.streamEnabled (set by the effect below, once `voice` exists) so
-  // the disarm + cross-slot-routing decisions gate on what the hook ACTUALLY
-  // runs, not the raw config. Keying those on the config alone would, in a
-  // browser without AudioWorklet, treat a batch-fallback session as streaming
-  // and disarm/drop its (only) transcript.
-  const streamEnabledRef = useRef(false);
   // Forward ref to send() (defined far below) so the streaming endpointer's
-  // auto-submit callback — wired into the voice hook here, above send — can
-  // fire it. Kept fresh by an effect after send is declared.
+  // auto-submit callback — handed to the atom here, above send — can fire it.
+  // Kept fresh by an effect after send is declared.
   const sendRef = useRef<
     ((optionText?: string, targetSlot?: string) => void) | null
   >(null);
-  // Forward ref to the hands-free loop (instantiated below cancelVoice — it
-  // needs the capture controls) so applyVoiceText, declared first, can consume
-  // its auto-send flag. Assigned in render, like sendRef.
-  const handsFreeRef = useRef<HandsFreeLoop | null>(null);
-  // Deliver a finished transcript to the slot that INITIATED the recording,
-  // using the session id useVoiceInput snapshotted at record-start (falling back
-  // to the active slot for the ordinary same-slot case). Same-slot splices into
-  // the live composer; a background slot gets it appended to its persisted draft
-  // (recoverable, shown on return) instead of leaking into the active session or
-  // being dropped. Mirrors handleOptimizeResult's cross-slot routing.
-  // Splice a dictation transcript into `base` at the caret (frozen snapshot
-  // when streaming, else the live caret), returning the new value and the caret
-  // offset to restore. Falls back to appending when no caret is known (e.g. the
-  // composer was never focused).
-  const spliceDictation = useCallback(
-    (base: string, text: string): { value: string; caret: number } =>
-      spliceDictationText(
-        base,
-        text,
-        frozenCaretRef.current ?? voiceCaretRef.current,
-      ),
+  const composerRef = useRef<ComposerHandle>(null);
+  // Live composer caret, kept current by ChatInput; the resources controller
+  // splices a picked file token at it, and dictation splices the transcript at
+  // it — so ChatPage owns the refs and hands them to the atom.
+  const voiceCaretRef = useRef<{ start: number; end: number } | null>(null);
+  const voicePendingCaretRef = useRef<number | null>(null);
+  // Splice into the LIVE composer only when the target slot is both the active
+  // slot AND the slot the composer's `input` currently belongs to. On a slot
+  // switch, activeSlotRef updates synchronously in render, but the composer's
+  // draft-restore + composerSlotRef advance run in LATER effects — splicing in
+  // that unsettled window would let the pending draft restore overwrite the
+  // transcript.
+  const voiceIsComposerFor = useCallback(
+    (target: string | null) =>
+      target === activeSlotRef.current && composerSlotRef.current === target,
     [],
   );
-  const applyVoiceText = useCallback(
-    (text: string, sessionId: string | null, origin: TranscriptOrigin) => {
-      // Disarmed after a send (streaming) — the transcript was already sent, so
-      // drop it for EVERY route. Checked FIRST (before the cross-slot branch) so a
-      // late final can't slip the already-sent text back into the originating
-      // slot's draft.
-      //
-      // `sttAppendDisarmedRef` covers the narrower case: a manual stop whose
-      // hypothesis is already in the composer. This route APPENDS, so letting the
-      // close-time final through there would duplicate the utterance.
-      //
-      // Both are STREAMING-only states — every site that arms them is gated on
-      // streaming — so they are keyed on where the text came from, not on the mode
-      // selected right now. A batch transcription can outlive the page that started
-      // it and land after streaming was switched on, and its onstop transcript is
-      // always the only copy: suppressing it would delete what the user said.
-      if (
-        origin === "stream" &&
-        (sttDisarmedRef.current || sttAppendDisarmedRef.current)
-      )
-        return;
-      const target = sessionId ?? activeSlotRef.current;
-      // Hands-free: this transcript came from a capture the VAD endpointer
-      // stopped, so it is sent rather than inserted. Direct send with the text
-      // (the same optionText path a follow-up double-click uses) bypasses the
-      // composer entirely — no setInput race, and a draft the user left in the
-      // composer stays untouched. A trivial transcript (noise) is dropped; the
-      // loop re-arms either way via useHandsFreeLoop's cycle effect.
-      if (handsFreeRef.current?.consumeAutoSend()) {
-        const trimmed = text.trim();
-        // Dead-end auto-sends drop their end-of-speech mark: no turn will
-        // follow, and a stale mark would attribute a later, unrelated turn's
-        // first token to this abandoned utterance.
-        if (!isSendableTranscript(trimmed)) {
-          clearTurnMarks();
-          return;
-        }
-        if (target === activeSlotRef.current) {
-          handsFreeRef.current.noteSent();
-          sendRef.current?.(trimmed);
-          return;
-        }
-        clearTurnMarks();
-        // Slot changed while the transcript was in flight (the switch disarms
-        // the loop, but this delivery raced it): fall through to the normal
-        // routing below so the words land in the originating slot's draft
-        // instead of auto-sending into a session the user just left.
-      }
-      const append = (base: string) =>
-        base + dictationSeparator(base, text) + text;
-      // Splice into the LIVE composer only when the target slot is both the active
-      // slot AND the slot the composer's `input` currently belongs to. On a slot
-      // switch, activeSlotRef updates synchronously in render, but the composer's
-      // draft-restore + composerSlotRef advance run in LATER effects — splicing in
-      // that unsettled window would let the pending draft restore overwrite the
-      // transcript. Otherwise route to the target slot's persisted draft.
-      const onScreen =
-        target === activeSlotRef.current && composerSlotRef.current === target;
-      if (!onScreen) {
-        // Off-screen (or not-yet-settled) delivery is BATCH ONLY. Streaming splices
-        // its live hypothesis into `input`, which is flushed into the draft on
-        // switch, so a cross-slot append would double it — a streaming final that
-        // lands off its slot is dropped (pre-existing behaviour). Batch has no
-        // partial, so appending to the slot's draft is unambiguous. Keyed on the
-        // text's origin rather than the live streaming setting, which is a proxy
-        // that goes wrong for a batch transcript arriving after the mode changed.
-        if (!target || origin === "stream") return;
-        const next = append(drafts.current[target] ?? "");
-        setDraft(drafts.current, target, next);
-        // Mid-switch guard: if the composer still belongs to `target` (activeSlot
-        // has advanced in render but the outgoing-slot persist effect hasn't run
-        // yet), that effect will flush inputRef.current into drafts[target] and
-        // would overwrite this transcript with the pre-transcript input. Carry the
-        // appended value into inputRef too so the flush preserves the transcript.
-        if (composerSlotRef.current === target) inputRef.current = next;
-        saveDrafts();
-        return;
-      }
-      // Foreground: streaming seeds frozenInputRef/frozenCaretRef in onPartial
-      // (the pre-dictation snapshot); the batch path never fires onPartial so both
-      // are null — fall back to the live composer text + caret so the transcript
-      // inserts at the cursor instead of overwriting (or blindly appending to)
-      // what the user typed.
-      rebaseFrozenCaret();
-      const spliced = spliceDictation(
-        frozenInputRef.current ?? inputRef.current ?? "",
-        text,
-      );
-      // Only arm the caret restore when the value actually changes. If a streaming
-      // final equals the last partial, setInput is a no-op and the restore effect
-      // (keyed on `value`) never fires — leaving a stale pending caret that would
-      // hijack the user's NEXT edit.
-      if (spliced.value !== inputRef.current) {
-        setInput(spliced.value);
-        voicePendingCaretRef.current = spliced.caret;
-      }
-      frozenInputRef.current = null;
-      lastDictationAnchorRef.current = null;
-      lastDictationValueRef.current = null;
-      postStopEditedRef.current = false;
-      frozenCaretRef.current = null;
+  // Off-screen batch transcript: append to the target slot's persisted draft
+  // (recoverable, shown on return). Mirrors handleOptimizeResult's cross-slot
+  // routing.
+  const voiceDeliverOffScreen = useCallback(
+    (target: string, append: (base: string) => string) => {
+      const next = append(drafts.current[target] ?? "");
+      setDraft(drafts.current, target, next);
+      // Mid-switch guard: if the composer still belongs to `target` (activeSlot
+      // has advanced in render but the outgoing-slot persist effect hasn't run
+      // yet), that effect will flush inputRef.current into drafts[target] and
+      // would overwrite this transcript with the pre-transcript input. Carry the
+      // appended value into inputRef too so the flush preserves the transcript.
+      if (composerSlotRef.current === target) inputRef.current = next;
+      saveDrafts();
     },
-    [saveDrafts, spliceDictation, rebaseFrozenCaret],
+    [saveDrafts],
   );
-  // Capture can end from a manual release or from the readiness-buffer ceiling.
-  // Both release the composer for typing while the same socket still sends finals.
-  const protectStoppedDictation = useCallback(() => {
-    if (!streamEnabledRef.current || sttEndpointDisarmedRef.current) return;
-    sttEndpointDisarmedRef.current = true;
-    if (frozenInputRef.current !== null) {
-      // Partials already own the region; close-time delivery would duplicate it.
-      sttAppendDisarmedRef.current = true;
-    } else {
-      // Freeze the release caret, but keep the live draft for a cold stream's first
-      // result so typing before that result is preserved at its authored position.
-      frozenCaretRef.current = voiceCaretRef.current;
-      lastDictationValueRef.current = inputRef.current;
-    }
+  const voiceAutoSubmit = useCallback(() => {
+    sendRef.current?.();
   }, []);
-  const voice = useVoiceInput(applyVoiceText, {
-    streaming: sttStreaming,
-    sessionId: activeSlot,
-    onCaptureStop: protectStoppedDictation,
-    onPartial: useCallback(
-      (text: string, sessionId: string | null) => {
-        // Streaming partials only fire while the originating slot is on screen
-        // (switching slots stops the stream), so a partial attributed to any
-        // other slot is a late straggler — drop it rather than smear a
-        // half-word into the wrong session.
-        if (sessionId && sessionId !== activeSlotRef.current) return;
-        // Deliberately NOT gated on `sttAppendDisarmedRef`: after a manual stop
-        // the socket is still draining, and this is the route that carries the
-        // stabilised text. It REPLACES the region at the frozen boundary rather
-        // than appending, so letting it keep firing cannot duplicate anything —
-        // it is what turns the last unstable hypothesis into the real transcript.
-        if (sttDisarmedRef.current) return;
-        // Snapshot the pre-dictation text AND caret on the first partial
-        // (before setInput, so the updater stays pure — no ref mutation inside a
-        // function React may invoke twice) so every later partial and the final
-        // insert at the same spot, replacing the growing hypothesis.
-        if (frozenInputRef.current === null) {
-          frozenInputRef.current = inputRef.current;
-          // Do not clobber a caret a cold-stream stop already froze: that one is
-          // the release-time insertion point, and the live caret is now wherever
-          // the user has typed since.
-          frozenCaretRef.current =
-            frozenCaretRef.current ?? voiceCaretRef.current;
-        }
-        rebaseFrozenCaret();
-        const spliced = spliceDictation(frozenInputRef.current ?? "", text);
-        // Everything up to and including the dictated insertion. What follows it
-        // in the composer (an existing tail, and anything typed after release) is
-        // carried across untouched rather than rebuilt from the snapshot.
-        const anchor = spliced.value.slice(0, spliced.caret);
-        let next = spliced.value;
-        // Where the caret should end up. Defaults to the end of the dictated
-        // region (the ordinary "we own the composer" case); the post-stop branch
-        // overrides it when the text is the user's to steer.
-        let caretTarget: number | null = spliced.caret;
-        if (sttEndpointDisarmedRef.current) {
-          // POST-STOP DRAIN. The user has let go, so as far as they are concerned
-          // dictation is over and they may already be typing — at the restored
-          // caret, which for mid-draft dictation sits in the MIDDLE of the text.
-          // Rebuilding from the frozen snapshot would delete that typing, so
-          // verify our own prefix is still intact and splice the correction in
-          // ahead of whatever now follows it. If the prefix cannot be verified
-          // the user edited inside the dictated region; leave the composer alone
-          // rather than guess — same policy as cancelVoice, for the same reason:
-          // a heuristic here deletes user-authored text.
-          //
-          // Gated on the ENDPOINT flag, not the append flag: a cold-stream stop
-          // deliberately leaves the append armed (the close-time final is the
-          // only copy of the utterance), so keying off it would skip this branch
-          // in exactly the case where it is still needed.
-          //
-          // During recording this does not apply: the region is being actively
-          // rewritten and that behaviour is unchanged.
-          const prev = lastDictationAnchorRef.current;
-          const cur = inputRef.current ?? "";
-          // The composer now holds a copy of the utterance, which is the exact
-          // condition the append flag encodes — so close the close-time route
-          // here rather than at stop time. stopVoice could not decide this: with
-          // frozenInputRef still null it had to leave the append armed, because
-          // back then the close-time final really was the only copy. Once a drain
-          // partial has landed that is no longer true, and letting the final
-          // through would re-splice from the snapshot and delete whatever the
-          // user typed after the release.
-          sttAppendDisarmedRef.current = true;
-          // Checked OUTSIDE the anchor guard: on a cold stream the first drain
-          // partial has no anchor yet, but the user may already have typed since
-          // the release, and their caret must still be left alone.
-          if (cur !== lastDictationValueRef.current)
-            postStopEditedRef.current = true;
-          // A null anchor means no partial has landed yet — the cold-stream stop.
-          // This IS the first write: there is nothing to preserve and nothing to
-          // verify, and returning here would drop the utterance. Fall through to
-          // the plain write, which establishes the anchor for the next update.
-          // The typed text is inside the snapshot (taken from the LIVE composer)
-          // and the insertion point is the caret stopVoice froze at the release,
-          // so the transcript lands where the user was speaking rather than after
-          // what they wrote afterwards.
-          if (prev !== null) {
-            if (!cur.startsWith(prev)) return;
-            next = anchor + cur.slice(prev.length);
-            if (postStopEditedRef.current) {
-              // Their caret is in their own text, so it must not be dragged to the
-              // end of the dictation — but NOT arming it is not "leaving it
-              // alone" either: React replaces the textarea value and the browser
-              // resets the DOM caret to the end. Re-arm it at the same LOGICAL
-              // spot, shifted by how much the region ahead of it grew or shrank.
-              const live = voiceCaretRef.current;
-              caretTarget =
-                live && live.start >= prev.length
-                  ? live.start + (anchor.length - prev.length)
-                  : null;
-            }
-          } else if (postStopEditedRef.current) {
-            // Cold-stream first write with typing already done: there is no old
-            // anchor to measure a shift against, and the value commit leaves the
-            // caret at the end — which is past their text, a sane place to be.
-            caretTarget = null;
-          }
-        }
-        if (next !== inputRef.current) {
-          setInput(next);
-          if (caretTarget !== null) voicePendingCaretRef.current = caretTarget;
-        }
-        lastDictationAnchorRef.current = anchor;
-        lastDictationValueRef.current = next;
-      },
-      [spliceDictation, rebaseFrozenCaret],
-    ),
-    // Semantic endpointing (stt.endpointing) judged the utterance complete:
-    // auto-submit. The composer already holds the streamed transcript via
-    // onPartial, and send() reads inputRef.current + stops the live capture
-    // itself (its recording+streaming branch), so this is the same path as
-    // pressing Enter mid-dictation — just triggered by the backend verdict.
-    onEndpoint: useCallback(() => {
-      // A manual stop is the user saying "stop capturing", so a backend
-      // endpoint verdict arriving during the drain must not turn that into an
-      // unrequested send. The endpoint flag is what covers a COLD-stream stop,
-      // where no partial landed and the append flag is deliberately left unset
-      // so the close-time final can still deliver the utterance.
-      if (
-        sttDisarmedRef.current ||
-        sttAppendDisarmedRef.current ||
-        sttEndpointDisarmedRef.current
-      )
-        return;
-      sendRef.current?.();
-    }, []),
-  });
-  // Keep a ref to the latest `voice` so effects that intentionally omit
-  // `voice` from their deps always invoke the current instance — otherwise
-  // they'd capture a stale `toggle`/`recording` whenever `voice` identity
-  // changes (e.g. when `sttStreaming` flips).
-  const voiceRef = useRef(voice);
-  useEffect(() => {
-    voiceRef.current = voice;
-  }, [voice]);
-  // Same reason as voiceRef: send() deliberately keeps a minimal dep array (with
-  // an exhaustive-deps suppression), so reading `sttStreaming` directly there
-  // would close over the value from the render that created that send().
-  // Keep streamEnabledRef in sync with the hook's EFFECTIVE streaming mode (see
-  // its declaration above). send()/the slot-switch effect/toggleVoice read it to
-  // decide whether a draining final should be disarmed — which must reflect what
-  // the hook actually runs, not the raw config.
-  useEffect(() => {
-    streamEnabledRef.current = voice.streamEnabled;
-  }, [voice.streamEnabled]);
-  // Re-arm when the user explicitly (re)starts recording — wrap toggle.
-  // Depend on the individual stable members actually read so this callback
-  // is only re-created when they change. `[voice]` would recreate every
-  // render (hooks don't memoize their return by default), re-rendering all
-  // child components that receive `toggleVoice` as a prop.
-  /**
-   * Start voice capture, with the gating and state resets every entry point
-   * needs. Extracted from `toggleVoice` so the push-to-talk key driver
-   * (`usePushToTalk`) goes through the SAME preamble — calling `voice.start()`
-   * raw would skip the disarm reset and the frozen-snapshot clear, and a
-   * key-started dictation would then be rebuilt from stale pre-dictation text.
-   *
-   * RETURNS the start promise. Load-bearing, not incidental: `usePushToTalk`
-   * chains on it to stop a session whose async startup only finished after the
-   * key was already released. Swallowing it here leaves that guard unreachable
-   * and the microphone open with nothing holding it.
-   *
-   * `silent` suppresses the "voice needs setting up" modal. The key binding is a
-   * PASSIVE trigger — a bare modifier is also an ordinary typing modifier — so a
-   * keystroke that used to type a character must never throw an unsolicited
-   * dialog. Clicking the mic button is a deliberate request and still explains
-   * itself.
-   */
-  const startVoice = useCallback(
-    (opts?: { silent?: boolean }): Promise<void> | void => {
-      // Starting a recording while server-side STT is disabled would capture
-      // audio that never gets transcribed. Point the user at the enable setting
-      // instead — unless this came from the keyboard (see `silent`).
-      if (!sttConfigLoaded || !sttEnabled || !sttAvailable) {
-        if (!opts?.silent) setVoiceSetupOpen(true);
-        return;
-      }
-      // Exclusive sessions: the mic is a single shared device, so refuse to
-      // START a new recording while another session's transcription is still
-      // in flight (voice.transcribing). This is what keeps voice single-session
-      // — no two recordings/transcriptions ever overlap — so the busy state
-      // needs only a single owner and can never be misattributed.
-      if (voice.transcribing) return;
-      sttDisarmedRef.current = false;
-      sttAppendDisarmedRef.current = false;
-      sttEndpointDisarmedRef.current = false;
-      // Reset stale snapshot from a prior session that ended without
-      // finals — otherwise onPartial sees a non-null ref, skips
-      // re-snapshotting, and text typed between sessions is dropped.
-      frozenInputRef.current = null;
-      lastDictationAnchorRef.current = null;
-      lastDictationValueRef.current = null;
-      postStopEditedRef.current = false;
-      frozenCaretRef.current = null;
-      return voice.start();
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    },
+  // Hands-free ("car mode") dictation lives in the Composer's Voice atom; the
+  // page supplies what the atom cannot know without the store. The assistant
+  // holds the floor while a turn runs or its reply audio pipeline is busy
+  // (synthesis in flight / audio queued / playing) — the loop must not re-open
+  // the mic into the reply. An endpointer-committed transcript is sent
+  // directly with its text (the same optionText path a follow-up double-click
+  // uses), bypassing the composer so a draft left there stays untouched.
+  const voiceBusy = useAppSelector((s) => s.chat.voiceBusy);
+  const assistantHoldsFloor = !!slotRunning || voiceBusy;
+  const voiceHandsFreeSend = useCallback((text: string) => {
+    sendRef.current?.(text);
+  }, []);
+  const composerVoiceOptions = useMemo<ComposerVoiceOptions>(
+    () => ({
+      isComposerFor: voiceIsComposerFor,
+      deliverOffScreen: voiceDeliverOffScreen,
+      onAutoSubmit: voiceAutoSubmit,
+      pushToTalk: true,
+      caretRef: voiceCaretRef,
+      pendingCaretRef: voicePendingCaretRef,
+      settingsRoute: embedded
+        ? "/embed/settings"
+        : settingsPath({ tab: "voice" }),
+      handsFree: { send: voiceHandsFreeSend, assistantHoldsFloor },
+    }),
     [
-      voice.transcribing,
-      voice.start,
-      sttEnabled,
-      sttConfigLoaded,
-      sttAvailable,
+      voiceIsComposerFor,
+      voiceDeliverOffScreen,
+      voiceAutoSubmit,
+      embedded,
+      voiceHandsFreeSend,
+      assistantHoldsFloor,
     ],
   );
-
-  /** Stop voice capture. Always allowed — only starting is gated. */
-  const stopCapture = voice.stop;
-  const stopVoice = useCallback(() => {
-    protectStoppedDictation();
-    stopCapture();
-  }, [protectStoppedDictation, stopCapture]);
-
-  const toggleVoice = useCallback(() => {
-    if (voice.recording) stopVoice();
-    else startVoice();
-    // Depends on the individual member actually read (`voice.recording`), not the
-    // whole `voice` object — `[voice]` would recreate this callback every render
-    // and re-render every child that receives `toggleVoice`. No suppression is
-    // needed here because the split into startVoice/stopVoice left this list
-    // genuinely exhaustive.
-  }, [voice.recording, startVoice, stopVoice]);
-  // Cancel (discard) the in-progress dictation — Esc. Batch simply drops the
-  // pending audio (the hook's onstop skips transcription), so nothing lands in
-  // the composer. Streaming additionally disarms the draining final AND removes
-  // the live dictated region from the composer at the frozenInputRef boundary:
-  // the region is recomputed with the same `spliceDictation` call onPartial used
-  // (so it matches a mid-draft caret splice, not just an append), and we drop
-  // exactly that region — preserving the pre-dictation text verbatim (including
-  // its own trailing whitespace) AND any suffix typed after the dictation. When
-  // the region can't be verified (the user replaced/edited it), leave the
-  // composer unchanged rather than restoring the snapshot and losing that edit.
-  // Uses voiceRef.current (not `voice`) so this prop stays referentially stable
-  // and does not re-render the composer every render — matching toggleVoice.
-  const cancelVoice = useCallback(() => {
-    // Esc is a manual act: the hands-free loop must not re-arm (or auto-send)
-    // after it. Idempotent when the loop itself routed here to discard.
-    handsFreeRef.current?.disarm();
-    if (streamEnabledRef.current) {
-      sttDisarmedRef.current = true;
-      // Remove the dictated region at the frozenInputRef boundary, preserving
-      // the pre-dictation text EXACTLY (including its own trailing whitespace)
-      // and any suffix the user typed after the dictation. onPartial rebuilt the
-      // composer as `frozen [+ ' ' separator] + partial`, so reconstruct that
-      // exact region and drop only it — never a blanket trailing-space strip.
-      const cur = inputRef.current ?? "";
-      const frozen = frozenInputRef.current;
-      const p = voiceRef.current.partial;
-      if (frozen !== null && p) {
-        // Reconstruct the composer value through the SAME pure function that
-        // wrote it. onPartial splices at the snapshotted caret, so for a
-        // mid-draft caret the value is `before + lead + partial + trail + after`
-        // — NOT `frozen + separator + partial`. Re-deriving the region with an
-        // append-only formula failed `startsWith` for every mid-draft dictation
-        // and fell through to the leave-unchanged branch, stranding the partial
-        // in the draft. spliceDictation reads the same frozen caret, so this
-        // reproduces the write exactly for both the append and mid-caret shapes.
-        const written = spliceDictation(frozen, p).value;
-        if (cur.startsWith(written)) {
-          // The composer still begins with exactly the region onPartial wrote.
-          // Restore the pre-dictation text verbatim and keep any suffix the user
-          // typed after it.
-          setInput(frozen + cur.slice(written.length));
-        }
-        // else: the dictated region can't be verified exactly — the user edited
-        // or replaced it (e.g. deleted the separator, or typed their own text
-        // that merely ends in the same word as the partial). Leave the composer
-        // UNCHANGED: a suffix-match heuristic here would delete user-authored
-        // text ("say hello" -> "say"). The disarm above still drops the draining
-        // final, so no dictation is committed; at worst the visible partial
-        // lingers for the user to clear.
-      }
-      // (frozen===null, or no current partial: nothing verifiably removable —
-      // leave the composer as-is rather than risk clobbering user text.)
-      // Clear BOTH halves of the snapshot: they are written together in
-      // onPartial and a surviving caret would aim the next session's first
-      // splice at a position from the discarded one.
-      frozenInputRef.current = null;
-      lastDictationAnchorRef.current = null;
-      lastDictationValueRef.current = null;
-      postStopEditedRef.current = false;
-      frozenCaretRef.current = null;
-    }
-    voiceRef.current.cancel();
-  }, [spliceDictation]);
-
-  // Push-to-talk / tap-to-toggle keyboard binding (default: hold right ⌥ on
-  // macOS, ⌥⇧Space elsewhere). Routed through startVoice/stopVoice rather than
-  // voice.start/stop so a key-driven dictation gets the same gating and
-  // snapshot resets as the mic button, and `cancelVoice` — NOT the hook's raw
-  // cancel — for the discard. Since capture now opens on the keydown, a fast
-  // partial can reach the composer before the press is revealed as a chord or a
-  // sub-threshold tap, and the raw cancel would strand that text; `cancelVoice`
-  // runs the streaming rollback that removes the dictated region (and no-ops
-  // when nothing verifiably removable was written). No `prewarm`: the driver
-  // opens capture on the keydown itself, so there is no warm-up step to
-  // schedule.
-  usePushToTalk(
-    {
-      recording: voice.recording,
-      // silent: a bare modifier is also an ordinary typing modifier, so a
-      // keystroke must never raise the voice-setup modal on its own.
-      start: () => startVoice({ silent: true }),
-      stop: stopVoice,
-      cancel: cancelVoice,
-    },
-    { disabled: !voiceInputSupported },
-  );
-  // Hands-free ("car mode") dictation: an opt-in loop over the BATCH pipeline
-  // where end-of-speech silence stops the capture, the transcript auto-sends,
-  // and listening re-arms (see useHandsFreeLoop). Batch-only by design:
-  // streaming providers ship their own semantic endpointer (onEndpoint above),
-  // so the toggle is withheld when streaming is active.
-  const handsFreeUsable =
-    voiceInputSupported &&
-    sttConfigLoaded &&
-    sttEnabled &&
-    sttAvailable &&
-    !voice.streamEnabled;
-  const [handsFreePref, setHandsFreePref] = usePersistedBool(
-    HANDS_FREE_LS_KEY,
-    false,
-  );
-  const handsFreePrefRef = useRef(handsFreePref);
-  handsFreePrefRef.current = handsFreePref;
-  const handsFreeUsableRef = useRef(handsFreeUsable);
-  handsFreeUsableRef.current = handsFreeUsable;
-  // ---- Conversation turn-taking (fast turn-taking, NOT duplex) ----
-  // While auto-speak is on and the assistant holds the floor — turn running,
-  // or its TTS pipeline busy (synthesis in flight / audio queued / playing) —
-  // the hands-free loop must not re-open the mic: it would record the reply.
-  // The mic re-arms when BOTH end (the audio queue drains after the turn).
-  // With auto-speak off there is no reply audio, so the loop keeps its
-  // dictate-while-streaming behavior unchanged.
-  const voiceBusy = useAppSelector((s) => s.chat.voiceBusy);
-  const voiceCfgQ = useQuery<{ autoSpeak?: boolean }>({
-    queryKey: ["voiceConfig"],
-    queryFn: () => api.voiceConfig(),
-  });
-  const [autoSpeakOn, setAutoSpeakOn] = useState(false);
-  useEffect(() => {
-    if (voiceCfgQ.data) setAutoSpeakOn(!!voiceCfgQ.data.autoSpeak);
-  }, [voiceCfgQ.data]);
-  // ChatSettings flips the config without writing the query cache; the event
-  // is the live signal both it and VoicePanel emit (mirrors useWebSocket).
-  useEffect(() => {
-    const onCfg = (e: Event) => {
-      const d = (e as CustomEvent).detail;
-      if (d && "autoSpeak" in d) setAutoSpeakOn(!!d.autoSpeak);
-    };
-    window.addEventListener("voice-config-changed", onCfg);
-    return () => window.removeEventListener("voice-config-changed", onCfg);
-  }, []);
-  const [handsFreeSpeechOn, setHandsFreeSpeechOn] = useState(false);
-  // Barge-in: a mic tap while the reply is speaking stops the audio and hands
-  // the floor back to the user for the REST OF THIS TURN — the hold must not
-  // re-assert while the interrupted turn is still streaming, so the flag
-  // holds until the turn and its audio pipeline are both fully idle.
-  const [bargedIn, setBargedIn] = useState(false);
-  useEffect(() => {
-    if (!slotRunning && !voiceBusy) setBargedIn(false);
-  }, [slotRunning, voiceBusy]);
-  useEffect(() => {
-    setBargedIn(false);
-  }, [activeSlot]);
-  const spokenConversation = autoSpeakOn || handsFreeSpeechOn;
-  const convoHold =
-    spokenConversation && !bargedIn && (!!slotRunning || voiceBusy);
-  const convoHoldRef = useRef(convoHold);
-  convoHoldRef.current = convoHold;
-  const handsFree = useHandsFreeLoop({
-    enabled: handsFreePref && handsFreeUsable,
-    recording: voice.recording,
-    transcribing: voice.transcribing,
-    error: voice.error,
-    clearError: voice.clearError,
-    sampleRef: voice.sampleRef,
-    hold: convoHold,
-    // Capture controls. Read via the loop's own opts ref, so inline closures
-    // are fine — and toggleVoice keeps owning the config gates + disarm resets.
-    start: () => {
-      if (!voiceRef.current.recording && !voiceRef.current.transcribing)
-        toggleVoice();
-    },
-    stopCommit: () => {
-      if (voiceRef.current.recording) toggleVoice();
-    },
-    // The endpointer judged end-of-speech: anchor this turn's latency spans.
-    onAutoCommit: markEndOfSpeech,
-    cancelDiscard: cancelVoice,
-  });
-  handsFreeRef.current = handsFree;
-  useEffect(() => {
-    setHandsFreeSpeechOn(handsFree.armed);
-    window.dispatchEvent(
-      new CustomEvent("handsfree-speech-changed", {
-        detail: { source: handsFreeSpeechSource, enabled: handsFree.armed },
-      }),
-    );
-    return () => {
-      window.dispatchEvent(
-        new CustomEvent("handsfree-speech-changed", {
-          detail: { source: handsFreeSpeechSource, enabled: false },
-        }),
-      );
-    };
-  }, [handsFree.armed, handsFreeSpeechSource]);
-  // The mic button: in hands-free mode it arms/exits the LOOP instead of a
-  // one-shot dictation. Exiting commits the in-flight utterance to the
-  // composer — after a manual act nothing may auto-send. While the reply is
-  // SPEAKING, the same tap is the barge-in: audio stops, queued synthesis is
-  // cancelled, and the loop re-arms the mic instead of exiting.
-  const handleVoiceToggle = useCallback(() => {
-    if (handsFreeRef.current?.armed && convoHoldRef.current) {
-      window.dispatchEvent(new Event("voice-stop"));
-      setBargedIn(true);
-      return;
-    }
-    if (handsFreeRef.current?.armed) {
-      handsFreeRef.current.exit("commit");
-      return;
-    }
-    if (handsFreePrefRef.current && handsFreeUsableRef.current) {
-      handsFreeRef.current?.arm();
-      return;
-    }
-    toggleVoice();
-  }, [toggleVoice]);
-  // The headset button: flips the persisted preference. Turning it ON also
-  // arms the loop right away (the "tap once to start" promise); turning it
-  // OFF exits, committing any capture in flight. The preference alone never
-  // starts listening on page load — arming always requires a tap.
-  const handleHandsFreeToggle = useCallback(() => {
-    const next = !handsFreePrefRef.current;
-    setHandsFreePref(next);
-    if (next) {
-      if (handsFreeUsableRef.current) handsFreeRef.current?.arm();
-    } else handsFreeRef.current?.exit("commit");
-  }, [setHandsFreePref]);
-  // Typing is the user taking the composer back: exit the loop and discard
-  // any capture in flight so nothing they are editing gets auto-sent.
+  // Typing is the user taking the composer back: exit the hands-free loop and
+  // discard any capture in flight so nothing they are editing gets auto-sent.
+  // Wired to ChatInput's onChange only — dictation writes through the Composer
+  // root's own onChange (plain setInput), which must not end the loop.
   const handleComposerChange = useCallback((v: string) => {
-    if (handsFreeRef.current?.armed) handsFreeRef.current.exit("discard");
+    const handsFree = composerRef.current?.voice()?.handsFree;
+    if (handsFree?.armed) handsFree.exit("discard");
     setInput(v);
   }, []);
-  // The mic-disabled modal opening means the loop cannot run (STT off/absent).
-  useEffect(() => {
-    if (voiceSetupOpen) handsFreeRef.current?.disarm();
-  }, [voiceSetupOpen]);
-  // Stop any in-flight recording and clear the streaming prefix when the user
-  // switches slots. The mic is a single shared device, so a recording can't
-  // follow the user to another session; a BATCH transcript is still delivered
-  // to the originating slot via applyVoiceText's session-scoped routing (which
-  // prevents cross-slot leakage precisely — no blanket disarm needed here).
-  // Clearing frozenInputRef here means a streaming final that lands after a
-  // switch-and-return rebases on the LIVE input, so edits made after returning
-  // are preserved rather than clobbered by a stale snapshot.
-  useEffect(() => {
-    frozenInputRef.current = null;
-    lastDictationAnchorRef.current = null;
-    lastDictationValueRef.current = null;
-    postStopEditedRef.current = false;
-    frozenCaretRef.current = null;
-    // Drop the previous slot's caret so dictating in a freshly switched-to slot
-    // (without touching its composer) appends to that slot's draft instead of
-    // inserting at the old slot's offset.
-    voiceCaretRef.current = null;
-    // Streaming ONLY: disarm so a delayed streaming final arriving after this
-    // switch is dropped instead of appended. Its live partial was already
-    // flushed into the outgoing slot's draft, so appending the full final on
-    // return would duplicate the dictated text ("hello hello"). Batch is NOT
-    // disarmed — its single final is routed to the originating slot's draft by
-    // applyVoiceText. (Cross-slot streaming delivery is a follow-up; streaming
-    // is opt-in and off by default.)
-    if (streamEnabledRef.current) sttDisarmedRef.current = true;
-    // A slot switch is a manual act: stop the hands-free loop (clearing its
-    // auto-send flag) so the in-flight capture below commits to the
-    // originating slot's draft instead of auto-sending.
-    handsFreeRef.current?.disarm();
-    if (voiceRef.current.recording) voiceRef.current.toggle();
-  }, [activeSlot]);
-  // True when the current voice session (owned by the slot where recording
-  // actually started — see useVoiceInput's sessionOwner) is the slot on screen.
-  // Gates the recording/transcribing UI so a session transcribing in the
-  // background never shows a busy/locked mic in the session the user switched to.
-  const voiceOwned = voice.sessionOwner === activeSlot;
-  // (Streaming-off teardown now lives in useVoiceInput — see its effect on
-  // [streamEnabled, streamRecording, streamStop]. Routing through voice.toggle
-  // here is racy because `useVoiceInput` flips its returned `recording` to the
-  // batch value on the same render that `streamEnabled` goes false.)
 
   // The project ref is read by the resources controller's drop/paste handlers at
   // event time, so it is declared before the controller and refreshed every render.
@@ -3692,29 +3021,10 @@ export default function ChatPage({
       )
         return false;
 
-      // Sending while STREAMING dictation is live ends the dictation. The panel
-      // advertises "Enter to send", so this path is reachable by design — and
-      // without it, streaming STT keeps running past the send: `onPartial`
-      // re-derives the composer value from `frozenInputRef`, which was snapshotted
-      // BEFORE the send cleared it, so the next partial repopulates the composer
-      // with text the user already sent. Disarm FIRST so any partial/final already
-      // in flight is dropped, then stop capture (stop() is async — up to 5s for
-      // the backend close).
-      //
-      // STREAMING ONLY, deliberately. In batch mode the transcription arrives
-      // exactly once, from `MediaRecorder.onstop` AFTER capture ends, and it
-      // arrives through `onText` — which honours `sttDisarmedRef`. Disarming here
-      // would throw away the entire recording, which is the opposite of the bug
-      // being fixed. Batch therefore keeps its pre-existing behaviour untouched:
-      // capture continues, and the transcript lands when the user stops.
-      if (voiceRef.current.recording && streamEnabledRef.current) {
-        sttDisarmedRef.current = true;
-        frozenInputRef.current = null;
-        lastDictationAnchorRef.current = null;
-        lastDictationValueRef.current = null;
-        postStopEditedRef.current = false;
-        voiceRef.current.toggle();
-      }
+      // Sending while STREAMING dictation is live ends the dictation (see
+      // `useComposerVoice.disarmForSend` for the full rationale — streaming only,
+      // batch keeps capturing and lands its transcript when the user stops).
+      composerRef.current?.voice()?.disarmForSend();
 
       // The session actually on screen at send time. Read from the ref (fresh
       // every render), not the closure `activeSlot` (stale until send() is
@@ -3760,7 +3070,12 @@ export default function ChatPage({
       // (so a paste after "/side " reaches the side chat as content) and
       // delegated. On failure keep the composer intact so the question stays
       // recoverable — same rules as steer()'s guard.
-      if (isInterceptedSlashCommand(raw)) {
+      // An option answer (optionText — a question-card, follow-up or decision-
+      // card choice) is an answer payload for the agent, never a typed UI
+      // command: a choice that happens to look like "/side …" must reach the
+      // turn as text rather than open Side Chat and strand the card. Same
+      // carve-out the knowledge-fetch branch below applies.
+      if (!optionText && isInterceptedSlashCommand(raw)) {
         const slashPastes = pasteBlocksRef.current;
         const slashTxt = slashPastes.length
           ? expandPasteTokens(raw, slashPastes)
@@ -4164,12 +3479,8 @@ export default function ChatPage({
       const sendId = mintSendId();
       meta.sendId = sendId;
       const metaPayload = meta;
-      // Skip optimistic user bubble when the slot is busy (shared rule:
-      // chatSlice.selectComposerBusy) — the backend sends a "queued" role
-      // message instead, avoiding a duplicate. A steer-flagged send usually
-      // bypasses the queue and starts a turn, so nothing would represent it; its
-      // bubble is appended from the response instead (see below), because only
-      // the server knows whether this particular send got queued after all.
+      // A busy snapshot may be stale. The server's user event supplies the
+      // bubble for an immediate dispatch; a real queue has its own card.
       const _busy = selectComposerBusy(store.getState(), slot ?? null);
       if (!_busy || forceNew) {
         dispatch(
@@ -4269,11 +3580,10 @@ export default function ChatPage({
         colorTheme: colorThemeRef.current,
       });
       const { body } = receipt;
-      // - `transport-error`: the fetch itself rejected -- the send never left, so
-      //   restore-and-report is safe (the old catch branch).
-      // - `response-late`: the deadline fired -- the message was received and the
-      //   WS will deliver the answer; the optimistic bubble stays pending and its
-      //   delivery indicator says so (the old AbortError branch).
+      // - `transport-error`: the fetch rejected. Restore and report only when
+      //   no correlated server echo has already proved delivery.
+      // - `response-late`: the deadline fired; the request may have arrived.
+      //   The optimistic bubble stays pending and its delivery indicator says so.
       // - `unknown`: a 2xx whose body would not parse. The request was accepted
       //   and only its answer is mangled, so it may have started a turn that is
       //   streaming right now. Reporting a refusal would hand the payload back
@@ -4297,6 +3607,8 @@ export default function ChatPage({
         }
       };
       if (receipt.status === "transport-error") {
+        if (slot && selectSendConfirmed(store.getState(), slot, sendId))
+          return true;
         // Cause-stating and naming the restore ("...and try again"), the shared
         // core copy the other surfaces use, instead of a bare "Connection error".
         failLocalTurn({
@@ -4307,10 +3619,8 @@ export default function ChatPage({
         restoreComposerAfterFailedSend();
         return false;
       }
-      // Received by the server; only the answer is late — a delivery for the verdict.
+      // Keep the pending-send verdict while WS delivery settles.
       if (receipt.status === "response-late") return true;
-      const accepted =
-        receipt.status === "dispatched" || receipt.status === "queued";
       if (body.queued && llmTxt === typedTxtDirs) {
         // The server queued this send and its receipt names the entry:
         // `queue_id` is the same id `queue_push` broadcasts and the card's
@@ -4362,7 +3672,13 @@ export default function ChatPage({
         // The server explicitly accepted neither (`ok` nor `queued`), so nothing
         // was sent — recovering the composer cannot duplicate a delivered turn.
         restoreComposerAfterFailedSend();
-      } else if (accepted && _busy && !body.queued && !body.steered) {
+      } else if (
+        (receipt.status === "dispatched" || receipt.status === "queued") &&
+        _busy &&
+        !body.queued &&
+        !body.steered &&
+        !(slot && selectSendConfirmed(store.getState(), slot, sendId))
+      ) {
         // The client believed this slot was busy, so it skipped the optimistic
         // bubble. If the server instead accepted an immediate turn, nothing
         // will echo the user row: dashboard-originated user messages suppress
@@ -4370,6 +3686,11 @@ export default function ChatPage({
         // one. This commonly occurs just after a gateway restart, when the
         // browser has not yet reconciled its stale busy flag. Append only once
         // the receipt rules out both queue and steer echoes.
+        // Since #9757 the gateway echoes correlated dashboard sends and that
+        // echo owns insertion; this is only the fallback for when it has not
+        // landed. A row already carrying this sendId means it has, so nothing is
+        // appended — and an echo arriving AFTER this row reconciles into it by
+        // sendId (reconcileOptimisticEcho) instead of pushing a second bubble.
         // Addressed to the SENDING slot, not the active one: the user can
         // switch sessions while the POST is in flight, and this text belongs to
         // the transcript it was typed into (same reason `steer_push` uses this).
@@ -4395,23 +3716,11 @@ export default function ChatPage({
         dispatch(startRemoteTurn(slot));
       }
       if (slot && confirmedDelivered(body)) {
-        // The response IS the delivery receipt (#4131). The server accepted the
-        // message and appended (or queued) the row, so the optimistic bubble is
-        // confirmed and must stop being a candidate for the 30s "may not have
-        // been delivered" sweep. Nothing else can retire it on this surface: the
-        // `chat_message` user echo `reconcileOptimisticEcho` waits for is
-        // suppressed for every dashboard send by design (`DashboardState.append`
-        // defaults `broadcast_user=False` precisely because the composer already
-        // rendered this bubble), so before this the flag survived the whole turn
-        // and only vanished when `chat_done`'s refresh rebuilt the transcript
-        // from disk.
-        //
-        // Addressed to the SENDING slot for the same reason as the steer-echo
-        // append above. Harmless when the busy rule appended no bubble — no row
-        // carries this `sendId`, so it is a no-op. Deliberately NOT dispatched on
-        // a rejected response, a queued acceptance, or the abort-timeout path:
-        // there delivery of THIS row is unknown, which is what the indicator
-        // exists to say (see `confirmedDelivered`).
+        // The response remains a delivery receipt (#4131), even if the correlated
+        // user echo is missed. The echo owns insertion before streaming, so the
+        // receipt must never append another row.
+        // Addressed to the SENDING slot because the user can switch sessions
+        // while the POST is in flight. A queued acceptance is not delivery.
         // The receipt carries the server-minted user-row `mid` (when the send
         // dispatched immediately); handing it to the reconcile stamps it onto
         // this optimistic bubble so message-pinning works this turn instead of
@@ -4427,8 +3736,7 @@ export default function ChatPage({
       if (body.ok && !body.queued && cardAtSend && slot === entrySendSlot) {
         // Immediate dispatch confirmed (`ok`): the message consumed the slot's
         // next-turn channel, so the card captured at entry is now stale. An
-        // independent check, not part of the else-if chain above — the
-        // steer-echo branch also implies `ok && !queued`, and the card must
+        // independent check, not part of the else-if chain above — the card must
         // retire regardless of which transcript-echo rule applied. A QUEUED
         // acceptance deliberately does NOT retire here — the queued message is
         // still cancellable, and cancelling must keep the card; it retires at
@@ -4770,9 +4078,16 @@ export default function ChatPage({
     (toolCallId: string) => {
       search.close();
       dispatch(openActivityPanel());
+      // Same title derivation as the auto-open effect: an event-time read from
+      // the Provider-bound store keeps the payload out of this callback's deps.
+      const payload = activeSlot
+        ? boundStore.getState().chat.mcpApps?.[
+            mcpAppKey(activeSlot, toolCallId)
+          ]
+        : undefined;
       tabsCtlRef.current?.openApp(
         toolCallId,
-        i18nT("pages.chatPage.mcp_app_tab_title"),
+        mcpAppTabTitle(payload, i18nT("pages.chatPage.mcp_app_tab_title")),
         activeSlot ?? null,
       );
       // As at handleFileOpen: the rule asks for the whole `search` object only because
@@ -4780,7 +4095,7 @@ export default function ChatPage({
       // because this body reads `search` itself.
       // eslint-disable-next-line react-hooks/exhaustive-deps -- `search.close` is a useCallback([]) in useMessageSearch, so the listed member already pins everything this body calls; naming the enclosing object would make this a new function every render and churn renderMessage below
     },
-    [dispatch, activeSlot, search.close],
+    [dispatch, activeSlot, boundStore, search.close],
   );
 
   // "Add to context" from the file-browser rail's row context menu: insert the
@@ -5843,6 +5158,13 @@ export default function ChatPage({
       settingsPath({ tab: "chat", highlight: SETTINGS_DEFAULT_MODEL_ID }),
     );
   }, [navigate]);
+  // The Kiro sign-in card (an `auth_required` error row's fix) lives on the
+  // full dashboard's Developer > Agent Backend tab, under the switch that
+  // selects the KAS backend the row can only come from; same surface rule as
+  // the Default Model link above.
+  const openKiroSignIn = useCallback(() => {
+    navigate(KIRO_SIGN_IN_PATH);
+  }, [navigate]);
 
   const handleContinue = useCallback(() => {
     if (!activeSlot || continuing || !continuable) return;
@@ -5899,10 +5221,6 @@ export default function ChatPage({
   // useChatPageSessionController, keeps its ref the same way).
   const connectedRef = useRef(connected);
   connectedRef.current = connected;
-  // The store this page is rendered under (not the module singleton): the
-  // opener reads live state after an await, and it must be the same store
-  // its dispatches went to.
-  const boundStore = useAppStore();
   const openSideChatForPane = useCallback(
     (slot: string): boolean | Promise<boolean> => {
       if (slot === activeSlot) {
@@ -6024,6 +5342,19 @@ export default function ChatPage({
   );
 
   const cancelTitleRef = useRef(false);
+  // #10203: per-slot recovery state for header-rename failures. `gen` is a
+  // monotonic attempt generation: a recovery may apply ONLY while its own
+  // attempt is still the slot's latest, so a delayed recovery can never
+  // overwrite anything a newer attempt (failed or successful) did -- title
+  // equality alone cannot tell a stale optimistic value from a newer confirmed
+  // rename to the identical string. `baseline` is the last CONFIRMED title;
+  // `inflight` holds this slot's own un-settled optimistic titles, so a store
+  // title outside that set refreshes the baseline at commit time (a success
+  // here, or another client's rename delivered over SSE). The entry is dropped
+  // when the last pending attempt settles.
+  const renameRecoveryRef = useRef(
+    new Map<string, { baseline: string; inflight: Set<string>; gen: number }>(),
+  );
   // The session-title field is an Enter-to-commit input; the guard owns both the
   // composition latch and the keypress, so the rename cannot fire on the Enter that
   // commits an IME candidate.
@@ -6105,11 +5436,26 @@ export default function ChatPage({
     winW,
     railW: railWidth,
   });
+  const workspaceFullscreen =
+    useContext(WorkspaceFullscreenContext)?.fullscreen ?? false;
+  const reduceWorkspaceMotion = useReducedMotion();
+  const reportWorkspaceSearch = useContext(WorkspacePanelContext);
+  useEffect(() => {
+    reportWorkspaceSearch(search.isOpen);
+    return () => reportWorkspaceSearch(false);
+  }, [search.isOpen, reportWorkspaceSearch]);
+  const { isOpen: workspaceSearchIsOpen, close: closeWorkspaceSearch } = search;
   const toggleAct = useCallback(() => {
+    if (workspaceSearchIsOpen) {
+      closeWorkspaceSearch();
+      dispatch(openActivityPanel());
+      return;
+    }
+
     // Opening with no tabs shows the empty-state launcher grid (no seeded
     // default view) -- the user picks what to open.
     dispatch(toggleActivity());
-  }, [dispatch]);
+  }, [dispatch, workspaceSearchIsOpen, closeWorkspaceSearch]);
   // Header-launched toggle: the top-bar Activity button (App.tsx) dispatches
   // this event so the panel-close coordination above stays in ChatPage.
   useEffect(() => {
@@ -6633,6 +5979,12 @@ export default function ChatPage({
 
   // Legacy aliases so the JSX below keeps reading the same names.
   const visibleDisplayItems = virt.virtualItems;
+  // A window replacement can commit after the scroll frame that requested it.
+  // Re-read geometry from the committed rows so an incomplete old window cannot
+  // leave its banner at rest over a different part of the transcript.
+  useLayoutEffect(() => {
+    updatePinnedPrompt();
+  }, [visibleDisplayItems, updatePinnedPrompt]);
 
   // A reader parked within one viewport of the absolute top while older
   // history remains is a STANDING request for more. Every edge-triggered
@@ -6904,6 +6256,12 @@ export default function ChatPage({
     const raw = inputRef.current.trim();
     const files = pendingFilesRef.current;
     if (!raw && !files.length) return;
+    // Same rule as send(): a steer while STREAMING dictation is live ends the
+    // dictation before the composer is cleared below. AFTER the empty-payload
+    // check, like send(): an Enter on an empty composer before the first
+    // partial has landed sends nothing, so it must not end the capture — that
+    // would drop the utterance in flight with nothing to show for it.
+    composerRef.current?.voice()?.disarmForSend();
     // Client-side slash commands (/side, /onboarding) are UI commands, not
     // turn content: they must work identically whether the agent is mid-turn
     // or idle. Without this guard the command text is steered into the
@@ -6978,6 +6336,11 @@ export default function ChatPage({
     // races chat_done falls onto — so the bubble is resolvable by id identity
     // whichever path the server took (#6075).
     const steerSendId = mintSendId();
+    // Drain the per-frame chunk buffer first: a pre-steer chunk still pending
+    // in useWebSocket's buffer means appendMessage's finalize-on-steer finds
+    // no streaming row to freeze, so that text would flush BELOW this card
+    // and post-steer chunks would append to it (see lib/pendingChunkDrain.ts).
+    drainPendingChunks();
     dispatch(
       appendMessage({
         role: "user",
@@ -7881,6 +7244,7 @@ export default function ChatPage({
       onPickModel: openModelPickerFromError,
       onOpenDefaultModel:
         embedded || popout ? undefined : openDefaultModelSetting,
+      onOpenSignIn: embedded || popout ? undefined : openKiroSignIn,
       onSessionOpen: selectSessionTab,
       sessions: connected ? sessionTitles : undefined,
       activeSession: activeSlot || undefined,
@@ -7966,6 +7330,7 @@ export default function ChatPage({
     handleContinue,
     openModelPickerFromError,
     openDefaultModelSetting,
+    openKiroSignIn,
     handleFolderOpen,
     handleSpeak,
     handleApplyPlan,
@@ -8798,7 +8163,9 @@ export default function ChatPage({
   }, [sidebarOpen]);
   const flyoutSwitch = useCallback(
     (key: string) => {
-      dispatch(switchSlot(key));
+      // User gesture on a listed session row (collapsed-sidebar flyout): the
+      // announced class, same as the expanded sidebar's own rows.
+      dispatch(switchSlot({ key, announceOnMissing: true }));
       setSplitMode(false);
       flyout.close();
     },
@@ -9163,6 +8530,31 @@ export default function ChatPage({
                   className="mx-4 mt-2 mb-0 animate-rise"
                   testId="action-error"
                 />
+                {/* A click on a listed-but-gone session (#6372): the fact at the click
+            locus, through the required ErrorNotice surface. The store carries
+            the NAME; the sentence resolves here so a locale switch re-renders it. */}
+                <ErrorNotice
+                  message={
+                    switchSlotGone
+                      ? switchSlotGone.kind === "failed"
+                        ? switchSlotGone.name
+                          ? i18nT("store.chatSlice.session_open_error_named", {
+                              name: switchSlotGone.name,
+                            })
+                          : i18nT("store.chatSlice.session_open_error")
+                        : switchSlotGone.name
+                          ? i18nT(
+                              "store.chatSlice.session_gone_open_failed_named",
+                              { name: switchSlotGone.name },
+                            )
+                          : i18nT("store.chatSlice.session_gone_open_failed")
+                      : ""
+                  }
+                  onDismiss={() => dispatch(clearSwitchSlotGone())}
+                  askAgent
+                  className="mx-4 mt-2 mb-0 animate-rise"
+                  testId="switch-slot-gone"
+                />
                 <VoicePlaybackNotice
                   slot={activeSlot}
                   onBlockedSlotChange={setVoiceRecoverySlot}
@@ -9224,6 +8616,25 @@ export default function ChatPage({
                     <ErrorNotice
                       message={unresumableNoticeMessage(unresumableResume)}
                       onDismiss={() => dispatch(clearUnresumableResume())}
+                      variant="block"
+                      askAgent
+                    />
+                  </div>
+                )}
+                {undeletableHistory && (
+                  <div
+                    className="mx-4 mt-2 mb-0"
+                    data-testid="undeletable-history-error"
+                  >
+                    {/* Same site and shape as the unresumable notice above: a sidebar
+                click the gateway answered with a refusal, narrated here because
+                the row it names is still in the sidebar and looks untouched.
+                The sentence is chosen from the gateway's `code`, so the remedy
+                matches the cause (release the cron jobs / retry / repair). */}
+                    <ErrorNotice
+                      message={historyDeleteRefusalMessage(undeletableHistory)}
+                      report={undeletableHistory.report}
+                      onDismiss={() => dispatch(clearUndeletableHistory())}
                       variant="block"
                       askAgent
                     />
@@ -9304,7 +8715,11 @@ export default function ChatPage({
                     openSideChat={connected ? openSideChatForPane : undefined}
                     onClose={() => setSplitMode(false)}
                     onCollapse={(slot, anchorTs, anchorMid) => {
-                      dispatch(switchSlot(slot));
+                      // User gesture on a session reference (split-pane collapse): the
+                      // announced class.
+                      dispatch(
+                        switchSlot({ key: slot, announceOnMissing: true }),
+                      );
                       setSplitMode(false);
                       // switchSlot.pending sets activeSlot synchronously, so the pending-jump
                       // effect pages back to the anchor instead of landing on the newest turn.
@@ -9380,7 +8795,7 @@ export default function ChatPage({
                   class flip here reads as the title jumping sideways at the
                   start of the slide. */}
                         <div
-                          className={`relative pr-1.5 pt-[9px] pb-2 flex items-center gap-2 bg-bg pointer-events-none transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${!isMobile && embedMode !== "chat" && filteredSlots.length > 0 && !sidebarOpen ? "pl-[60px]" : isMobile ? (embedMode === "chat" ? "pl-4" : "pl-3") : "pl-5"}`}
+                          className={`panel-toolbar relative pr-0.5 flex items-center gap-2 bg-bg pointer-events-none transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${!isMobile && embedMode !== "chat" && filteredSlots.length > 0 && !sidebarOpen ? "pl-[60px]" : isMobile ? (embedMode === "chat" ? "pl-4" : "pl-3") : "pl-5"}`}
                         >
                           {/* Divider between toggle and title — ALWAYS mounted and
                     absolute (zero width, no flex-gap participation) so it can
@@ -9476,6 +8891,19 @@ export default function ChatPage({
                                     />
                                   </span>
                                 )}
+                                {/* #10203: a refused rename must also revert the optimistic sseSlotTitle.
+                      Recovery re-reads the server truth (deduped through queryClient.fetchQuery)
+                      and applies ONLY this slot's title -- never the whole snapshot, whose late
+                      fulfillment could transiently clobber a newer concurrent write of another
+                      slot. A recovery may apply only while ITS OWN attempt is the slot's latest
+                      generation AND the store still holds its refused value, so a delayed
+                      recovery can never overwrite a newer attempt's outcome -- including a newer
+                      confirmed rename to the identical string, which title equality alone cannot
+                      distinguish. When the re-read fails (transport or auth failure takes
+                      renameSlot and chatSlots down together) fall back to a local revert to the
+                      recovery baseline in renameRecoveryRef: the last CONFIRMED title, refreshed
+                      at commit time from any store title that is not one of this slot's own
+                      pending optimistic values. */}
                                 <Input
                                   className="session-header-title text-sm font-semibold text-muted font-body bg-transparent border-0 rounded-none p-0 m-0 min-w-0 flex-1 outline-none md:max-w-[50vw] focus:!shadow-none focus-visible:border-b focus-visible:border-accent"
                                   size={Math.min(
@@ -9496,18 +8924,61 @@ export default function ChatPage({
                                           activeSlot &&
                                           titleDraft !== title
                                         ) {
+                                          const key = activeSlot;
+                                          const refused = titleDraft.trim();
+                                          const rec =
+                                            renameRecoveryRef.current.get(
+                                              key,
+                                            ) ?? {
+                                              baseline: title,
+                                              inflight: new Set<string>(),
+                                              gen: 0,
+                                            };
+                                          const current =
+                                            boundStore
+                                              .getState()
+                                              .dashboard.slots.find(
+                                                (s) => s.key === key,
+                                              )?.title ?? title;
+                                          if (!rec.inflight.has(current))
+                                            rec.baseline = current;
+                                          rec.inflight.add(refused);
+                                          rec.gen++;
+                                          const myGen = rec.gen;
+                                          renameRecoveryRef.current.set(
+                                            key,
+                                            rec,
+                                          );
+                                          const settle = () => {
+                                            rec.inflight.delete(refused);
+                                            if (
+                                              rec.inflight.size === 0 &&
+                                              rec.gen === myGen
+                                            )
+                                              renameRecoveryRef.current.delete(
+                                                key,
+                                              );
+                                          };
+                                          const mayRecover = () =>
+                                            rec.gen === myGen &&
+                                            boundStore
+                                              .getState()
+                                              .dashboard.slots.find(
+                                                (s) => s.key === key,
+                                              )?.title === refused;
                                           dispatch(
                                             sseSlotTitle({
-                                              key: activeSlot,
-                                              title: titleDraft.trim(),
+                                              key,
+                                              title: refused,
                                             }),
                                           );
-                                          api
-                                            .renameSlot(
-                                              activeSlot,
-                                              titleDraft.trim(),
-                                            )
-                                            .catch((e) =>
+                                          api.renameSlot(key, refused).then(
+                                            () => {
+                                              if (rec.gen === myGen)
+                                                rec.baseline = refused;
+                                              settle();
+                                            },
+                                            async (e) => {
                                               showActionError(
                                                 errMessage(e) ||
                                                   i18nT(
@@ -9516,8 +8987,49 @@ export default function ChatPage({
                                                 i18nT(
                                                   "pages.chatPage.could_not_rename_session",
                                                 ),
-                                              ),
-                                            );
+                                              );
+                                              try {
+                                                const server = (
+                                                  await queryClient.fetchQuery({
+                                                    queryKey: ["chat-slots"],
+                                                    queryFn: () =>
+                                                      api.chatSlots(),
+                                                    staleTime: 0,
+                                                    gcTime: 0,
+                                                  })
+                                                ).find(
+                                                  (s: {
+                                                    key: string;
+                                                    title?: string;
+                                                  }) => s.key === key,
+                                                );
+                                                if (
+                                                  server?.title !== undefined &&
+                                                  rec.gen === myGen
+                                                )
+                                                  rec.baseline = server.title;
+                                                if (mayRecover())
+                                                  dispatch(
+                                                    sseSlotTitle({
+                                                      key,
+                                                      title:
+                                                        server?.title ??
+                                                        rec.baseline,
+                                                    }),
+                                                  );
+                                              } catch {
+                                                if (mayRecover())
+                                                  dispatch(
+                                                    sseSlotTitle({
+                                                      key,
+                                                      title: rec.baseline,
+                                                    }),
+                                                  );
+                                              } finally {
+                                                settle();
+                                              }
+                                            },
+                                          );
                                         }
                                         cancelTitleRef.current = false;
                                         setEditingTitleSlot(null);
@@ -9666,12 +9178,12 @@ export default function ChatPage({
                           {/* focus-caption-reserve: this group owns the window's top-trailing
                   corner — where Windows and frameless Linux paint their caption
                   controls — whenever the side panel is not holding that edge, i.e.
-                  while it is closed (the state that renders the reopen toggle
-                  below) or docked at the bottom. Right-docked and showing, the
+                  while it is closed or docked at the bottom. Right-docked and showing, the
                   panel is at that edge instead and carries the reserve itself, so
                   reserving here too would indent these controls for nothing. */}
                           <div
-                            className={`ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none${!sidePanelWantsMount || sidePanelDock === "bottom" ? " focus-caption-reserve" : ""}`}
+                            data-panel-controls-host="chat"
+                            className={`panel-toolbar-actions ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none${!sidePanelWantsMount || sidePanelDock === "bottom" ? " focus-caption-reserve" : ""}`}
                           >
                             {/* Pop-out control, promoted to the title bar (menu items remain for
                   sidebar parity). Mirrors the split-view pattern to its left: a
@@ -9727,27 +9239,6 @@ export default function ChatPage({
                                   <ExternalLink size={15} />
                                 </Clickable>
                               ))
-                            )}
-                            {/* Activity panel open toggle — relocated here from the top bar
-                  (item 2.4) so opening the panel no longer narrows the now
-                  full-width header. Shown only while the panel is closed; the
-                  panel's own header carries the close button. Never disabled:
-                  below the mobile breakpoint the panel opens full width, at or
-                  above it opens beside the chat. There is no width at which
-                  the button does nothing. */}
-                            {!embedMode && !popout && !activityOpen && (
-                              <Clickable
-                                className="pi-morph flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 pointer-events-auto text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
-                                onClick={toggleAct}
-                                title={i18nT(
-                                  "pages.chatPage.open_activity_panel",
-                                )}
-                                aria-label={i18nT(
-                                  "pages.chatPage.open_activity_panel",
-                                )}
-                              >
-                                <PanelRightSolid size={15} />
-                              </Clickable>
                             )}
                             {!embedMode &&
                               splitFeatureEnabled &&
@@ -9823,7 +9314,6 @@ export default function ChatPage({
                             memoryMode={
                               currentSlot?.memory_mode ?? "persistent"
                             }
-                            cleanMode={currentSlot?.clean_mode}
                             onSwitchMode={async (newMode) => {
                               if (!activeSlot) return;
                               // Create-first-then-delete: deleting the active slot first
@@ -9837,31 +9327,6 @@ export default function ChatPage({
                                 model: old?.model || undefined,
                                 mode,
                                 memory_mode: newMode,
-                                folder_id: old?.folder_id ?? null,
-                                color_index: old?.color_index ?? null,
-                                color_hex: old?.color_hex ?? null,
-                                project: old?.project ?? null,
-                                instanceId: old?.instance_id || undefined,
-                              };
-                              try {
-                                await dispatch(createSlot(opts)).unwrap();
-                              } catch {
-                                return;
-                              }
-                              try {
-                                await dispatch(deleteSlot(activeSlot)).unwrap();
-                              } catch {
-                                /* new slot already active */
-                              }
-                            }}
-                            onToggleClean={async (clean) => {
-                              if (!activeSlot) return;
-                              const old = currentSlot;
-                              const opts = {
-                                agent: old?.agent || defaultAgent || undefined,
-                                model: old?.model || undefined,
-                                mode,
-                                clean_mode: clean,
                                 folder_id: old?.folder_id ?? null,
                                 color_index: old?.color_index ?? null,
                                 color_hex: old?.color_hex ?? null,
@@ -10472,6 +9937,52 @@ export default function ChatPage({
                               />
                             </div>
                           )}
+                          {/* Buried [OPTIONS:] decision — pinned until answered or
+                  dismissed. A pending question card owns the above-composer
+                  band outright (same precedence the sidebar uses: needs_input
+                  outranks pending_decision). needs_input travels in the SAME
+                  slot payload as pending_decision, so it cannot lose a
+                  hydration race; !pendingQuestion alone can — the questions
+                  map fills over an async fetch, and a decision answered in
+                  that window would append a user row that retires the
+                  still-unhydrated stateless question unanswered. */}
+                          {!pendingQuestion &&
+                            !currentSlot?.needs_input &&
+                            currentSlot?.pending_decision &&
+                            activeSlot && (
+                              <div
+                                className="px-4 pb-2 mx-auto w-full"
+                                style={{
+                                  maxWidth: "var(--mc-content-width, 900px)",
+                                }}
+                              >
+                                <PendingDecisionCard
+                                  slotKey={activeSlot}
+                                  decision={currentSlot.pending_decision}
+                                  onPick={(o) =>
+                                    setInput((prev) =>
+                                      prev.trim()
+                                        ? `${prev.trimEnd()}, ${o}`
+                                        : o,
+                                    )
+                                  }
+                                  onSendDirect={(o) => {
+                                    // Offline, a direct send would silently drop the answer —
+                                    // fall back to the composer, the same recovery the
+                                    // question card's direct send uses.
+                                    if (!connected) {
+                                      setInput((prev) =>
+                                        prev.trim()
+                                          ? `${prev.trimEnd()}, ${o}`
+                                          : o,
+                                      );
+                                      return;
+                                    }
+                                    void send(o, activeSlot || undefined);
+                                  }}
+                                />
+                              </div>
+                            )}
                           {pendingFollowup && activeSlot && (
                             <div
                               className="px-4 pb-2 mx-auto w-full"
@@ -10496,10 +10007,17 @@ export default function ChatPage({
                               />
                             </div>
                           )}
-                          <ChatInput
-                            aboveComposer={
-                              <>
-                                {/* Session-control failures surface HERE, beside the chips they
+                          <Composer
+                            ref={composerRef}
+                            slotKey={activeSlot}
+                            value={input}
+                            onChange={setInput}
+                            voice={composerVoiceOptions}
+                          >
+                            <ChatInput
+                              aboveComposer={
+                                <>
+                                  {/* Session-control failures surface HERE, beside the chips they
                       are about, rather than on the chat. Both hooks fail closed —
                       a failed `/api/apps` renders no chips, a failed status probe
                       renders a stateless one — and either is indistinguishable
@@ -10519,31 +10037,31 @@ export default function ChatPage({
                       actually existing, though: with no chips on screen a folder
                       failure is not a session-control problem, and calling it one
                       would put an unexplained notice on every composer. */}
-                                {(sessionControlsError ||
-                                  sessionControlStatusError ||
-                                  (chatFoldersError &&
-                                    sessionControls.length > 0)) && (
-                                  <div
-                                    className="pt-1.5"
-                                    key="session-controls-error"
-                                  >
-                                    <ErrorNotice
-                                      title={i18nT(
-                                        "components.sessionControlHost.controls_unavailable",
-                                      )}
-                                      message={
-                                        (
-                                          sessionControlsError ||
-                                          sessionControlStatusError ||
-                                          chatFoldersError
-                                        )?.message
-                                      }
-                                      askAgent
-                                      variant="inline"
-                                    />
-                                  </div>
-                                )}
-                                {/* In-flow tip inside the composer's own width wrapper: shares
+                                  {(sessionControlsError ||
+                                    sessionControlStatusError ||
+                                    (chatFoldersError &&
+                                      sessionControls.length > 0)) && (
+                                    <div
+                                      className="pt-1.5"
+                                      key="session-controls-error"
+                                    >
+                                      <ErrorNotice
+                                        title={i18nT(
+                                          "components.sessionControlHost.controls_unavailable",
+                                        )}
+                                        message={
+                                          (
+                                            sessionControlsError ||
+                                            sessionControlStatusError ||
+                                            chatFoldersError
+                                          )?.message
+                                        }
+                                        askAgent
+                                        variant="inline"
+                                      />
+                                    </div>
+                                  )}
+                                  {/* In-flow tip inside the composer's own width wrapper: shares
                    the composer's exact box geometry (Raymond 2026-07-21: tip
                    width must always match the input box) while still pushing
                    chat content up like QueueStack (team decision: never cover
@@ -10551,291 +10069,249 @@ export default function ChatPage({
                    tipSuppressed). ChatInput renders this slot LAST in the
                    above-composer stack, so the card stays flush against the
                    input box and an options row sits above it. */}
-                                <AnimatePresence>
-                                  {folderSuggestion && activeSlot ? (
-                                    <div
-                                      className="pt-1.5"
-                                      key="folder-suggestion"
-                                    >
-                                      <FolderSuggestionCard
-                                        folderName={folderSuggestion.folderName}
-                                        breadcrumb={folderSuggestion.breadcrumb}
-                                        onAccept={folderSuggestionAccept}
-                                        onDecline={folderSuggestionDecline}
-                                      />
-                                    </div>
-                                  ) : (
-                                    activeTip && (
-                                      <div className="pt-1.5" key="tip">
-                                        <TipCard
-                                          tip={activeTip}
-                                          onDismiss={dismissTip}
+                                  <AnimatePresence>
+                                    {folderSuggestion && activeSlot ? (
+                                      <div
+                                        className="pt-1.5"
+                                        key="folder-suggestion"
+                                      >
+                                        <FolderSuggestionCard
+                                          folderName={
+                                            folderSuggestion.folderName
+                                          }
+                                          breadcrumb={
+                                            folderSuggestion.breadcrumb
+                                          }
+                                          onAccept={folderSuggestionAccept}
+                                          onDecline={folderSuggestionDecline}
                                         />
                                       </div>
-                                    )
-                                  )}
-                                </AnimatePresence>
-                              </>
-                            }
-                            value={input}
-                            onChange={handleComposerChange}
-                            onSend={() => send()}
-                            canSteer={composerBusy}
-                            onSteer={steer}
-                            onFollowUpSend={(
-                              text?: string,
-                              sourceKeyAtClick?: string | null,
-                            ) => {
-                              // Double-click and Send-now share dispatchPlanFollowUp with
-                              // single-click (#6240). First-click row identity refuses a
-                              // straddled double-click on a replaced footer.
-                              if (
-                                text &&
-                                dispatchPlanFollowUp(text, sourceKeyAtClick)
-                              )
-                                return;
-                              send(text);
-                            }}
-                            disabled={
-                              /* Streaming, compaction, and stopping all
+                                    ) : (
+                                      activeTip && (
+                                        <div className="pt-1.5" key="tip">
+                                          <TipCard
+                                            tip={activeTip}
+                                            onDismiss={dismissTip}
+                                          />
+                                        </div>
+                                      )
+                                    )}
+                                  </AnimatePresence>
+                                </>
+                              }
+                              value={input}
+                              onChange={handleComposerChange}
+                              onSend={() => send()}
+                              canSteer={composerBusy}
+                              onSteer={steer}
+                              onFollowUpSend={(
+                                text?: string,
+                                sourceKeyAtClick?: string | null,
+                              ) => {
+                                // Double-click and Send-now share dispatchPlanFollowUp with
+                                // single-click (#6240). First-click row identity refuses a
+                                // straddled double-click on a replaced footer.
+                                if (
+                                  text &&
+                                  dispatchPlanFollowUp(text, sourceKeyAtClick)
+                                )
+                                  return;
+                                send(text);
+                              }}
+                              disabled={
+                                /* Streaming, compaction, and stopping all
                    keep the input interactive: api_chat queues on slot.running and
                    stop preserves the queue, so typing + Enter queues a
                    follow-up during the stop window instead of being silently blocked. */
-                              false
-                            }
-                            autoFocusKey={activeSlot}
-                            prefillHint={prefillHint}
-                            onDismissHint={() => setPrefillHint(false)}
-                            onScreenshot={handleCapture}
-                            onUploadFiles={uploadFiles}
-                            /* The one collapsible composer. Opt-in rather than default so the
+                                false
+                              }
+                              autoFocusKey={activeSlot}
+                              prefillHint={prefillHint}
+                              onDismissHint={() => setPrefillHint(false)}
+                              onScreenshot={handleCapture}
+                              onUploadFiles={uploadFiles}
+                              /* The one collapsible composer. Opt-in rather than default so the
                  shared preference key and the window-level expand event stay
                  correct by construction -- see ChatInput's `collapsible` prop. */
-                            collapsible
-                            uploading={uploading}
-                            pendingFiles={pendingFiles}
-                            pendingDirs={pendingDirs}
-                            resizedInfo={resizedInfo}
-                            onRemoveFile={(p) => {
-                              setPendingFiles((prev) =>
-                                prev.filter((x) => x !== p),
-                              );
-                              // A picker-picked file also inserted an `@rel` token into the
-                              // composer, so its remove strips that token too — the same
-                              // contract folder chips have, so the two chip kinds cannot
-                              // disagree about what "remove" means. The exact token is
-                              // recorded at pick time, but the ref is in-memory only: a
-                              // restored draft or a failed-send restore re-stages the file
-                              // without it. Fall back to deriving the token from the path —
-                              // the shortest boundary-checked `@suffix` present in the text
-                              // (the same walk buildRelMap uses), which is exactly the form
-                              // the picker inserts. Uploaded/dropped files have no token in
-                              // the text, so the derivation finds nothing and their remove
-                              // stays state-only. On no match the text is left alone —
-                              // visible and editable is the safe fallback.
-                              const token =
-                                pickedFileTokens.current[p] ??
-                                [
-                                  ...buildRelMap([p], inputRef.current).keys(),
-                                ].map((s) => `@${s}`)[0];
-                              delete pickedFileTokens.current[p];
-                              if (!token) return;
-                              const esc = token.replace(
-                                /[.*+?^${}()|[\]\\]/g,
-                                "\\$&",
-                              );
-                              setInput((prev) =>
-                                prev.replace(
-                                  new RegExp(
-                                    `(^|\\s)${esc}(?: |(?=\\s)|$)`,
-                                    "g",
+                              collapsible
+                              uploading={uploading}
+                              pendingFiles={pendingFiles}
+                              pendingDirs={pendingDirs}
+                              resizedInfo={resizedInfo}
+                              onRemoveFile={(p) => {
+                                setPendingFiles((prev) =>
+                                  prev.filter((x) => x !== p),
+                                );
+                                // A picker-picked file also inserted an `@rel` token into the
+                                // composer, so its remove strips that token too — the same
+                                // contract folder chips have, so the two chip kinds cannot
+                                // disagree about what "remove" means. The exact token is
+                                // recorded at pick time, but the ref is in-memory only: a
+                                // restored draft or a failed-send restore re-stages the file
+                                // without it. Fall back to deriving the token from the path —
+                                // the shortest boundary-checked `@suffix` present in the text
+                                // (the same walk buildRelMap uses), which is exactly the form
+                                // the picker inserts. Uploaded/dropped files have no token in
+                                // the text, so the derivation finds nothing and their remove
+                                // stays state-only. On no match the text is left alone —
+                                // visible and editable is the safe fallback.
+                                const token =
+                                  pickedFileTokens.current[p] ??
+                                  [
+                                    ...buildRelMap(
+                                      [p],
+                                      inputRef.current,
+                                    ).keys(),
+                                  ].map((s) => `@${s}`)[0];
+                                delete pickedFileTokens.current[p];
+                                if (!token) return;
+                                const esc = token.replace(
+                                  /[.*+?^${}()|[\]\\]/g,
+                                  "\\$&",
+                                );
+                                setInput((prev) =>
+                                  prev.replace(
+                                    new RegExp(
+                                      `(^|\\s)${esc}(?: |(?=\\s)|$)`,
+                                      "g",
+                                    ),
+                                    "$1",
                                   ),
-                                  "$1",
-                                ),
-                              );
-                            }}
-                            onRemoveDir={(rel) => {
-                              // The chip derives from the `@rel/` token, so removing the
-                              // reference IS removing the token. Boundary-checked so
-                              // "@src/pages/" never eats a longer "@src/pages/sub/" token.
-                              const esc = `@${rel}`.replace(
-                                /[.*+?^${}()|[\]\\]/g,
-                                "\\$&",
-                              );
-                              setInput((prev) =>
-                                prev.replace(
-                                  new RegExp(
-                                    `(^|\\s)${esc}(?: |(?=\\s)|$)`,
-                                    "g",
+                                );
+                              }}
+                              onRemoveDir={(rel) => {
+                                // The chip derives from the `@rel/` token, so removing the
+                                // reference IS removing the token. Boundary-checked so
+                                // "@src/pages/" never eats a longer "@src/pages/sub/" token.
+                                const esc = `@${rel}`.replace(
+                                  /[.*+?^${}()|[\]\\]/g,
+                                  "\\$&",
+                                );
+                                setInput((prev) =>
+                                  prev.replace(
+                                    new RegExp(
+                                      `(^|\\s)${esc}(?: |(?=\\s)|$)`,
+                                      "g",
+                                    ),
+                                    "$1",
                                   ),
-                                  "$1",
-                                ),
-                              );
-                            }}
-                            pendingSessions={pendingSessions}
-                            onRemoveSessionRef={unstageSessionRef}
-                            // A folder pick is complete once ChatInput inserts its `@rel/`
-                            // token — the chip derives from the text, so there is no state
-                            // to stage here. Files stay list-backed (uploads have no token)
-                            // and additionally record their inserted token for remove.
-                            onFileSelect={(path, kind, token) => {
-                              if (kind === "dir") return;
-                              // Stage under the canonical (forward-slash Windows) identity —
-                              // the same form the tree context menu stages — so the SAME file
-                              // picked through both entry points dedupes instead of sending
-                              // twice. Token bookkeeping keys on the staged form so remove
-                              // finds it.
-                              const canon = normalizeWindowsPath(path);
-                              if (token)
-                                pickedFileTokens.current[canon] = token;
-                              setPendingFiles((prev) =>
-                                addPendingFile(prev, canon),
-                              );
-                            }}
-                            onFileOpen={handleFileOpen}
-                            project={currentSlot?.project || ""}
-                            projectBranch={projectBranch}
-                            projectDetached={
-                              !projectGitError && !!projectGit?.detached
-                            }
-                            projectGitDirty={gitBadge?.dirty ?? 0}
-                            projectGitAhead={gitBadge?.ahead ?? 0}
-                            projectGitBehind={gitBadge?.behind ?? 0}
-                            isMac={isMac}
-                            onDrop={dropTargetProps.onDrop}
-                            onDragOver={dropTargetProps.onDragOver}
-                            onDragLeave={dropTargetProps.onDragLeave}
-                            voiceRecording={voiceOwned && voice.recording}
-                            voiceTranscribing={voiceOwned && voice.transcribing}
-                            /* Ungated: `startVoice` refuses on `voice.transcribing` outright,
-                 so the voice controls have to read the same global fact. */
-                            voiceTranscribeActive={voice.transcribing}
-                            voiceError={voice.error}
-                            voiceLevel={voiceOwned ? voice.level : 0}
-                            voiceDeviceLabel={
-                              voiceOwned ? voice.deviceLabel : ""
-                            }
-                            voiceDeviceId={voiceOwned ? voice.deviceId : ""}
-                            onSelectVoiceDevice={voice.switchDevice}
-                            voiceDeviceSwitchIsLive={
-                              voiceOwned && voice.deviceSwitchIsLive
-                            }
-                            onClearVoiceError={voice.clearError}
-                            voiceDictationPanel={sttDictationPanel}
-                            handsFreeAvailable={handsFreeUsable}
-                            handsFreeOn={handsFreePref}
-                            onHandsFreeToggle={
-                              voiceInputSupported
-                                ? handleHandsFreeToggle
-                                : undefined
-                            }
-                            handsFreePhase={handsFree.phase}
-                            voiceStreaming={voice.streamEnabled}
-                            voiceSampleRef={voice.sampleRef}
-                            voicePartial={voiceOwned ? voice.partial : ""}
-                            voiceDownload={voiceOwned ? voice.download : null}
-                            voiceCaretRef={voiceCaretRef}
-                            voicePendingCaretRef={voicePendingCaretRef}
-                            onVoiceToggle={
-                              voiceInputSupported
-                                ? handleVoiceToggle
-                                : undefined
-                            }
-                            onVoiceCancel={
-                              voiceInputSupported ? cancelVoice : undefined
-                            }
-                            onVoicePrewarm={
-                              voiceInputSupported ? voice.prewarm : undefined
-                            }
-                            onVoiceStart={
-                              voiceInputSupported ? startVoice : undefined
-                            }
-                            onVoiceStop={
-                              voiceInputSupported ? stopVoice : undefined
-                            }
-                            voiceCaptureActive={voice.recording}
-                            agentName={activeAgentName}
-                            // The chip shows the inherited-default marker; `agentName` stays
-                            // the raw resolved alias for the skills query and switch title.
-                            // Uses the SLOT's stored agent (not `activeAgentName`, which has
-                            // already collapsed empty->default) so an agent-less slot reads
-                            // `<default> · default` and a pinned one reads the bare alias (#8770).
-                            agentLabel={agentOrDefaultLabel(
-                              currentSlot?.agent,
-                              effectiveDefaultAgent,
-                            )}
-                            agentIsInheritedDefault={
-                              !currentSlot?.agent && !!effectiveDefaultAgent
-                            }
-                            agentSource={
-                              effectiveAgents.find(
-                                (a) => a.name === activeAgentName,
-                              )?.source
-                            }
-                            modelName={shownModel}
-                            // The served default is shown exactly when the pin alone would
-                            // have read `auto`; that is the inherited case the marker names.
-                            modelIsInheritedDefault={
-                              shownModel !== "auto" &&
-                              shownModel !== _pinShownModel
-                            }
-                            onAgentClick={
-                              provider.capabilities.agentTemplates
-                                ? (rect) => {
-                                    setAgentBtnRect(rect);
-                                    setAgentDropdown(!agentDropdown);
-                                  }
-                                : undefined
-                            }
-                            onModelClick={(rect) => {
-                              setModelBtnRect(rect);
-                              setModelDropdown(!modelDropdown);
-                            }}
-                            onProjectClick={(rect) => {
-                              setProjectBtnRect(rect);
-                              setProjectPickerOpen((o) => !o);
-                            }}
-                            sessionControls={sessionControls.map((sc) => ({
-                              key: sc.key,
-                              label: sc.label,
-                              icon: sc.icon,
-                              active:
-                                openSessionControl?.key === sc.key &&
-                                openSessionControl.slot === activeSlot,
-                              state: sessionControlStatuses[sc.key]?.state,
-                              statusTooltip:
-                                sessionControlStatuses[sc.key]?.tooltip,
-                            }))}
-                            onSessionControlClick={(key, rect) => {
-                              setSessionControlRect(rect);
-                              // Two independent setState calls, not one updater with a side
-                              // effect: React may run an updater twice (StrictMode does in
-                              // dev), which would bump the refresh token twice per toggle and
-                              // fire a redundant status poll.
-                              if (openSessionControl?.key === key) {
-                                setOpenSessionControl(null);
-                                refreshSessionControlStatuses();
-                              } else {
-                                // Capture the slot the control is opened in: the host render
-                                // is gated on it still matching activeSlot, so a chat switch
-                                // can never mount the control against the next session.
-                                setOpenSessionControl({
-                                  key,
-                                  slot: activeSlot,
-                                });
+                                );
+                              }}
+                              pendingSessions={pendingSessions}
+                              onRemoveSessionRef={unstageSessionRef}
+                              // A folder pick is complete once ChatInput inserts its `@rel/`
+                              // token — the chip derives from the text, so there is no state
+                              // to stage here. Files stay list-backed (uploads have no token)
+                              // and additionally record their inserted token for remove.
+                              onFileSelect={(path, kind, token) => {
+                                if (kind === "dir") return;
+                                // Stage under the canonical (forward-slash Windows) identity —
+                                // the same form the tree context menu stages — so the SAME file
+                                // picked through both entry points dedupes instead of sending
+                                // twice. Token bookkeeping keys on the staged form so remove
+                                // finds it.
+                                const canon = normalizeWindowsPath(path);
+                                if (token)
+                                  pickedFileTokens.current[canon] = token;
+                                setPendingFiles((prev) =>
+                                  addPendingFile(prev, canon),
+                                );
+                              }}
+                              onFileOpen={handleFileOpen}
+                              project={currentSlot?.project || ""}
+                              projectBranch={projectBranch}
+                              projectDetached={
+                                !projectGitError && !!projectGit?.detached
                               }
-                            }}
-                            contextPct={contextPct}
-                            contextUsedTokens={contextTokens?.used}
-                            contextWindowTokens={
-                              contextTokens?.window ||
-                              remoteContextWindow ||
-                              provider.getContextWindow(shownModel)
-                            }
-                            showContextPct={chatConfig.showContextPct}
-                            showContextTokens={chatConfig.showContextTokens}
-                            isRunning={composerBusy}
-                            /* Composed with `interrupted`, matching the ErrorCard gate above.
+                              projectGitDirty={gitBadge?.dirty ?? 0}
+                              projectGitAhead={gitBadge?.ahead ?? 0}
+                              projectGitBehind={gitBadge?.behind ?? 0}
+                              isMac={isMac}
+                              onDrop={dropTargetProps.onDrop}
+                              onDragOver={dropTargetProps.onDragOver}
+                              onDragLeave={dropTargetProps.onDragLeave}
+                              agentName={activeAgentName}
+                              // The chip shows the inherited-default marker; `agentName` stays
+                              // the raw resolved alias for the skills query and switch title.
+                              // Uses the SLOT's stored agent (not `activeAgentName`, which has
+                              // already collapsed empty->default) so an agent-less slot reads
+                              // `<default> · default` and a pinned one reads the bare alias (#8770).
+                              agentLabel={agentOrDefaultLabel(
+                                currentSlot?.agent,
+                                effectiveDefaultAgent,
+                              )}
+                              agentIsInheritedDefault={
+                                !currentSlot?.agent && !!effectiveDefaultAgent
+                              }
+                              agentSource={
+                                effectiveAgents.find(
+                                  (a) => a.name === activeAgentName,
+                                )?.source
+                              }
+                              modelName={shownModel}
+                              // The served default is shown exactly when the pin alone would
+                              // have read `auto`; that is the inherited case the marker names.
+                              modelIsInheritedDefault={
+                                shownModel !== "auto" &&
+                                shownModel !== _pinShownModel
+                              }
+                              onAgentClick={
+                                provider.capabilities.agentTemplates
+                                  ? (rect) => {
+                                      setAgentBtnRect(rect);
+                                      setAgentDropdown(!agentDropdown);
+                                    }
+                                  : undefined
+                              }
+                              onModelClick={(rect) => {
+                                setModelBtnRect(rect);
+                                setModelDropdown(!modelDropdown);
+                              }}
+                              onProjectClick={(rect) => {
+                                setProjectBtnRect(rect);
+                                setProjectPickerOpen((o) => !o);
+                              }}
+                              sessionControls={sessionControls.map((sc) => ({
+                                key: sc.key,
+                                label: sc.label,
+                                icon: sc.icon,
+                                active:
+                                  openSessionControl?.key === sc.key &&
+                                  openSessionControl.slot === activeSlot,
+                                state: sessionControlStatuses[sc.key]?.state,
+                                statusTooltip:
+                                  sessionControlStatuses[sc.key]?.tooltip,
+                              }))}
+                              onSessionControlClick={(key, rect) => {
+                                setSessionControlRect(rect);
+                                // Two independent setState calls, not one updater with a side
+                                // effect: React may run an updater twice (StrictMode does in
+                                // dev), which would bump the refresh token twice per toggle and
+                                // fire a redundant status poll.
+                                if (openSessionControl?.key === key) {
+                                  setOpenSessionControl(null);
+                                  refreshSessionControlStatuses();
+                                } else {
+                                  // Capture the slot the control is opened in: the host render
+                                  // is gated on it still matching activeSlot, so a chat switch
+                                  // can never mount the control against the next session.
+                                  setOpenSessionControl({
+                                    key,
+                                    slot: activeSlot,
+                                  });
+                                }
+                              }}
+                              contextPct={contextPct}
+                              contextUsedTokens={contextTokens?.used}
+                              contextWindowTokens={
+                                contextTokens?.window ||
+                                remoteContextWindow ||
+                                provider.getContextWindow(shownModel)
+                              }
+                              showContextPct={chatConfig.showContextPct}
+                              showContextTokens={chatConfig.showContextTokens}
+                              isRunning={composerBusy}
+                              /* Composed with `interrupted`, matching the ErrorCard gate above.
                  Availability alone would put a filled primary button on the
                  composer of every idle chat that holds a conversation — an
                  accent-filled control reads as "this is your next move", so on
@@ -10852,235 +10328,229 @@ export default function ChatPage({
                  one-click nudge; typing anything still resumes it. Closing that
                  hole needs a persisted turn-in-flight marker (backend), not a
                  louder button here. */
-                            continuable={continuable && interrupted}
-                            continueIsRecovery={interrupted}
-                            onContinue={handleContinue}
-                            continuing={continuing}
-                            onStop={() => {
-                              const slot = activeSlot;
-                              if (!slot) return;
-                              const isEscalation = isEscalationState(
-                                currentSlot?.stop_state,
-                              );
-                              // Per-slot view over the map, satisfying SoftStopRef so the
-                              // arming window is measured against THIS slot's soft press.
-                              const map = softStopAtMapRef.current;
-                              const slotRef = {
-                                get current() {
-                                  return map.get(slot) ?? 0;
-                                },
-                                set current(v: number) {
-                                  map.set(slot, v);
-                                },
-                              };
-                              const action = handleStopPress(
-                                isEscalation,
-                                Date.now(),
-                                slotRef,
-                                () =>
-                                  dispatch(
-                                    requestStop({ slotId: slot, force: false }),
-                                  ),
-                                () =>
-                                  dispatch(
-                                    requestStop({ slotId: slot, force: true }),
-                                  ),
-                              );
-                              // 'ignore' = accidental rapid double-tap during the arming window
-                              if (action !== "ignore")
-                                dispatch(clearPendingPermissions());
-                            }}
-                            isQueued={slotStopping}
-                            stopState={currentSlot?.stop_state}
-                            approvalMode={displayMode}
-                            providerId={provider.id}
-                            reasoningEffort={effectiveEffort}
-                            onReasoningEffortClick={
-                              provider.capabilities.reasoningEffort &&
-                              modelSupportsEffort(
-                                shownModel === "auto" ? "" : shownModel,
-                              )
-                                ? (rect) => {
-                                    setReasoningEffortBtnRect(rect);
-                                    setReasoningEffortDropdown(
-                                      !reasoningEffortDropdown,
-                                    );
-                                  }
-                                : undefined
-                            }
-                            onAutomationClick={setAutomationOpen}
-                            automation={automation}
-                            automationOpen={automationOpen}
-                            automationCreationReady={automationCreationReady}
-                            automationSnapshotFailed={automationSnapshotFailed}
-                            sessionMode={currentSlot?.mode || mode}
-                            onAutomationChange={(
-                              next: AutomationRecord | null,
-                            ) => {
-                              if (next) {
-                                queryClient.setQueryData(
-                                  ["session-automation", next.slotKey],
-                                  next,
+                              continuable={continuable && interrupted}
+                              continueIsRecovery={interrupted}
+                              onContinue={handleContinue}
+                              continuing={continuing}
+                              onStop={() => {
+                                const slot = activeSlot;
+                                if (!slot) return;
+                                const isEscalation = isEscalationState(
+                                  currentSlot?.stop_state,
                                 );
-                                dispatch(sseAutomation(next));
-                              } else if (
-                                automation?.kind === "legacy_goal_loop"
-                              ) {
-                                queryClient.setQueryData(
-                                  ["session-automation", automation.slotKey],
-                                  null,
+                                // Per-slot view over the map, satisfying SoftStopRef so the
+                                // arming window is measured against THIS slot's soft press.
+                                const map = softStopAtMapRef.current;
+                                const slotRef = {
+                                  get current() {
+                                    return map.get(slot) ?? 0;
+                                  },
+                                  set current(v: number) {
+                                    map.set(slot, v);
+                                  },
+                                };
+                                const action = handleStopPress(
+                                  isEscalation,
+                                  Date.now(),
+                                  slotRef,
+                                  () =>
+                                    dispatch(
+                                      requestStop({
+                                        slotId: slot,
+                                        force: false,
+                                      }),
+                                    ),
+                                  () =>
+                                    dispatch(
+                                      requestStop({
+                                        slotId: slot,
+                                        force: true,
+                                      }),
+                                    ),
                                 );
-                                dispatch(
-                                  sseAutomation({
-                                    ...automation,
-                                    active: false,
-                                  }),
-                                );
-                              }
-                            }}
-                            onOptimizeResult={handleOptimizeResult}
-                            memoryMode={
-                              currentSlot?.memory_mode ?? "persistent"
-                            }
-                            cleanMode={currentSlot?.clean_mode}
-                            sentMessages={sentMessages}
-                            sendOnEnter={
-                              isMobile ? "ctrl-enter" : chatConfig.sendOnEnter
-                            }
-                            followUpOptions={followUpOptions}
-                            followUpPicked={followUpPicked}
-                            quickSend={dashCfg?.quick_send}
-                            followUpLayout={chatConfig.followUpLayout}
-                            followUpSourceKey={followUpSourceKey}
-                            onFollowUpSelect={(
-                              o: string,
-                              e: React.MouseEvent,
-                              sourceKeyAtClick?: string | null,
-                            ) => {
-                              // Plan options (Go / Go All / Cancel) dispatch directly — no input fill.
-                              // Non-protocol labels on a plan-shaped message keep the composer path:
-                              // the endpoint would 400 them while the append was already skipped.
-                              if (dispatchPlanFollowUp(o, sourceKeyAtClick))
-                                return;
-                              // One-click: enabled + no shift + not busy + not already in multi-select
-                              if (
-                                tryQuickSend(
-                                  o,
-                                  dashCfg?.quick_send,
-                                  e.shiftKey,
-                                  slotRunning,
-                                  followUpPickedRef.current.size,
-                                  send,
+                                // 'ignore' = accidental rapid double-tap during the arming window
+                                if (action !== "ignore")
+                                  dispatch(clearPendingPermissions());
+                              }}
+                              isQueued={slotStopping}
+                              stopState={currentSlot?.stop_state}
+                              approvalMode={displayMode}
+                              providerId={provider.id}
+                              reasoningEffort={effectiveEffort}
+                              onReasoningEffortClick={
+                                provider.capabilities.reasoningEffort &&
+                                modelSupportsEffort(
+                                  shownModel === "auto" ? "" : shownModel,
                                 )
-                              )
-                                return;
-                              // Regular options: toggle. Click unpicked → append + mark; click
-                              // picked → try to remove text + unmark (if the user edited the
-                              // text so it no longer matches, leave text alone — the chip
-                              // still un-highlights for consistency).
-                              if (followUpPickedRef.current.has(o)) {
-                                const pickedSuffix = Array.from(
-                                  followUpPickedRef.current,
-                                ).join(", ");
-                                const next = new Set(followUpPickedRef.current);
-                                next.delete(o);
-                                const remainingSuffix =
-                                  Array.from(next).join(", ");
-                                followUpPickedRef.current = next;
-                                setInput((prev) => {
-                                  // Options are appended as one ordered suffix. Remove only
-                                  // from that complete generated structure: searching for a
-                                  // last occurrence still corrupts an earlier ", Go" if the
-                                  // user has already deleted the appended ", Go" by hand.
-                                  if (prev === pickedSuffix)
-                                    return remainingSuffix;
-                                  const delimitedSuffix = ", " + pickedSuffix;
-                                  if (!prev.endsWith(delimitedSuffix))
-                                    return prev;
-                                  const draft = prev.slice(
-                                    0,
-                                    -delimitedSuffix.length,
-                                  );
-                                  return remainingSuffix
-                                    ? draft + ", " + remainingSuffix
-                                    : draft;
-                                });
-                                setFollowUpPicked(next);
-                              } else {
-                                const next = new Set(followUpPickedRef.current);
-                                next.add(o);
-                                followUpPickedRef.current = next;
-                                setInput((prev) =>
-                                  prev.trim() ? prev.trimEnd() + ", " + o : o,
-                                );
-                                setFollowUpPicked(next);
-                              }
-                            }}
-                            pasteBlocks={pasteBlocks}
-                            onPasteBlocksChange={setPasteBlocks}
-                            knowledgeChip={
-                              knowledgeFetch.pendingKnowledge ? (
-                                <div className="flex items-start gap-1">
-                                  <KnowledgeBubbleChip
-                                    knowledge={{
-                                      items:
-                                        knowledgeFetch.pendingKnowledge.items
-                                          .length,
-                                      tokens:
-                                        knowledgeFetch.pendingKnowledge
-                                          .totalTokens,
-                                      titles:
-                                        knowledgeFetch.pendingKnowledge.items.map(
-                                          (i) => i.title,
-                                        ),
-                                      content:
-                                        knowledgeFetch.pendingKnowledge.items.map(
-                                          (i) => ({
-                                            title: i.title,
-                                            text: i.content.slice(0, 2000),
-                                          }),
-                                        ),
-                                    }}
-                                  />
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      knowledgeFetch.clearPending()
+                                  ? (rect) => {
+                                      setReasoningEffortBtnRect(rect);
+                                      setReasoningEffortDropdown(
+                                        !reasoningEffortDropdown,
+                                      );
                                     }
-                                    className="shrink-0 mt-0.5 p-0.5 text-muted hover:text-danger bg-transparent border-none cursor-pointer rounded hover:bg-danger/10 transition-colors"
-                                    aria-label={i18nT(
-                                      "pages.chatPage.remove_knowledge_context",
-                                    )}
-                                    title={i18nT(
-                                      "pages.chatPage.remove_knowledge_context",
-                                    )}
-                                  >
-                                    &times;
-                                  </button>
-                                </div>
-                              ) : undefined
-                            }
-                            connected={connected}
-                          />
+                                  : undefined
+                              }
+                              onAutomationClick={setAutomationOpen}
+                              automation={automation}
+                              automationOpen={automationOpen}
+                              automationCreationReady={automationCreationReady}
+                              automationSnapshotFailed={
+                                automationSnapshotFailed
+                              }
+                              sessionMode={currentSlot?.mode || mode}
+                              onAutomationChange={(
+                                next: AutomationRecord | null,
+                              ) => {
+                                if (next) {
+                                  queryClient.setQueryData(
+                                    ["session-automation", next.slotKey],
+                                    next,
+                                  );
+                                  dispatch(sseAutomation(next));
+                                } else if (
+                                  automation?.kind === "legacy_goal_loop"
+                                ) {
+                                  queryClient.setQueryData(
+                                    ["session-automation", automation.slotKey],
+                                    null,
+                                  );
+                                  dispatch(
+                                    sseAutomation({
+                                      ...automation,
+                                      active: false,
+                                    }),
+                                  );
+                                }
+                              }}
+                              onOptimizeResult={handleOptimizeResult}
+                              memoryMode={
+                                currentSlot?.memory_mode ?? "persistent"
+                              }
+                              sentMessages={sentMessages}
+                              sendOnEnter={
+                                isMobile ? "ctrl-enter" : chatConfig.sendOnEnter
+                              }
+                              followUpOptions={followUpOptions}
+                              followUpPicked={followUpPicked}
+                              quickSend={dashCfg?.quick_send}
+                              followUpLayout={chatConfig.followUpLayout}
+                              followUpSourceKey={followUpSourceKey}
+                              onFollowUpSelect={(
+                                o: string,
+                                e: React.MouseEvent,
+                                sourceKeyAtClick?: string | null,
+                              ) => {
+                                // Plan options (Go / Go All / Cancel) dispatch directly — no input fill.
+                                // Non-protocol labels on a plan-shaped message keep the composer path:
+                                // the endpoint would 400 them while the append was already skipped.
+                                if (dispatchPlanFollowUp(o, sourceKeyAtClick))
+                                  return;
+                                // One-click: enabled + no shift + not busy + not already in multi-select
+                                if (
+                                  tryQuickSend(
+                                    o,
+                                    dashCfg?.quick_send,
+                                    e.shiftKey,
+                                    slotRunning,
+                                    followUpPickedRef.current.size,
+                                    send,
+                                  )
+                                )
+                                  return;
+                                // Regular options: toggle. Click unpicked → append + mark; click
+                                // picked → try to remove text + unmark (if the user edited the
+                                // text so it no longer matches, leave text alone — the chip
+                                // still un-highlights for consistency).
+                                if (followUpPickedRef.current.has(o)) {
+                                  const pickedSuffix = Array.from(
+                                    followUpPickedRef.current,
+                                  ).join(", ");
+                                  const next = new Set(
+                                    followUpPickedRef.current,
+                                  );
+                                  next.delete(o);
+                                  const remainingSuffix =
+                                    Array.from(next).join(", ");
+                                  followUpPickedRef.current = next;
+                                  setInput((prev) => {
+                                    // Options are appended as one ordered suffix. Remove only
+                                    // from that complete generated structure: searching for a
+                                    // last occurrence still corrupts an earlier ", Go" if the
+                                    // user has already deleted the appended ", Go" by hand.
+                                    if (prev === pickedSuffix)
+                                      return remainingSuffix;
+                                    const delimitedSuffix = ", " + pickedSuffix;
+                                    if (!prev.endsWith(delimitedSuffix))
+                                      return prev;
+                                    const draft = prev.slice(
+                                      0,
+                                      -delimitedSuffix.length,
+                                    );
+                                    return remainingSuffix
+                                      ? draft + ", " + remainingSuffix
+                                      : draft;
+                                  });
+                                  setFollowUpPicked(next);
+                                } else {
+                                  const next = new Set(
+                                    followUpPickedRef.current,
+                                  );
+                                  next.add(o);
+                                  followUpPickedRef.current = next;
+                                  setInput((prev) =>
+                                    prev.trim() ? prev.trimEnd() + ", " + o : o,
+                                  );
+                                  setFollowUpPicked(next);
+                                }
+                              }}
+                              pasteBlocks={pasteBlocks}
+                              onPasteBlocksChange={setPasteBlocks}
+                              knowledgeChip={
+                                knowledgeFetch.pendingKnowledge ? (
+                                  <div className="flex items-start gap-1">
+                                    <KnowledgeBubbleChip
+                                      knowledge={{
+                                        items:
+                                          knowledgeFetch.pendingKnowledge.items
+                                            .length,
+                                        tokens:
+                                          knowledgeFetch.pendingKnowledge
+                                            .totalTokens,
+                                        titles:
+                                          knowledgeFetch.pendingKnowledge.items.map(
+                                            (i) => i.title,
+                                          ),
+                                        content:
+                                          knowledgeFetch.pendingKnowledge.items.map(
+                                            (i) => ({
+                                              title: i.title,
+                                              text: i.content.slice(0, 2000),
+                                            }),
+                                          ),
+                                      }}
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        knowledgeFetch.clearPending()
+                                      }
+                                      className="shrink-0 mt-0.5 p-0.5 text-muted hover:text-danger bg-transparent border-none cursor-pointer rounded hover:bg-danger/10 transition-colors"
+                                      aria-label={i18nT(
+                                        "pages.chatPage.remove_knowledge_context",
+                                      )}
+                                      title={i18nT(
+                                        "pages.chatPage.remove_knowledge_context",
+                                      )}
+                                    >
+                                      &times;
+                                    </button>
+                                  </div>
+                                ) : undefined
+                              }
+                              connected={connected}
+                            />
+                          </Composer>
                         </div>
-                        <VoiceDisabledModal
-                          open={voiceSetupOpen}
-                          reason={
-                            sttEnabled && !sttAvailable
-                              ? "unavailable"
-                              : "disabled"
-                          }
-                          provider={sttProvider}
-                          onClose={() => setVoiceSetupOpen(false)}
-                          onOpenSettings={() => {
-                            setVoiceSetupOpen(false);
-                            navigate(
-                              embedded
-                                ? "/embed/settings"
-                                : settingsPath({ tab: "voice" }),
-                            );
-                          }}
-                        />
                         {/* Agent dropdown portal — triggered from input bar */}
                         {agentDropdown &&
                           agentBtnRect &&
@@ -11164,7 +10634,7 @@ export default function ChatPage({
                                   error={defaultAgentFailed}
                                   onManage={() => {
                                     setAgentDropdown(false);
-                                    navigate("/capabilities?tab=templates");
+                                    navigate("/capabilities?tab=crews");
                                   }}
                                 />
                               )}
@@ -11354,6 +10824,7 @@ export default function ChatPage({
             {search.isOpen && (
               <DetailPanel
                 key="search-panel"
+                headerClassName="border-border bg-bg workspace-search-header"
                 title={
                   <SearchBar
                     docked
@@ -11437,6 +10908,9 @@ export default function ChatPage({
                   }) && !activitySlot) && (
                 <motion.div
                   key="side-panel-inline"
+                  layout={reduceWorkspaceMotion ? false : "position"}
+                  layoutDependency={workspaceFullscreen}
+                  data-workspace-panel-host
                   ref={isMobile ? sideOverlayPanelRef : undefined}
                   initial={isMobile ? false : { width: 0 }}
                   animate={isMobile ? undefined : { width: "auto" }}
@@ -11533,8 +11007,17 @@ export default function ChatPage({
                   }) && (
                     <motion.div
                       key="side-panel"
+                      data-workspace-panel-host
                       initial={sidePanelDockAnim.initial}
-                      animate={sidePanelDockAnim.animate}
+                      animate={
+                        workspaceFullscreen
+                          ? {
+                              ...sidePanelDockAnim.animate,
+                              width: "100%",
+                              height: "100%",
+                            }
+                          : sidePanelDockAnim.animate
+                      }
                       exit={sidePanelDockAnim.exit}
                       transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
                       className={

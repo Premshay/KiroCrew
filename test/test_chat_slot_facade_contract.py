@@ -31,6 +31,10 @@ _TO_DICT_KEYS = (
     # "runs locally" from "the field is missing on an older gateway".
     "executor",
     "instance_id",
+    # The row's identity, resolved server-side. `<instance_id>:<peer_key>` for a
+    # remote-bound session, the slot key otherwise. The peer's own slot key is NOT
+    # projected; this is what the sidebar needs from it.
+    "row_identity",
     "artifact",
     "messages",
     "running",
@@ -42,6 +46,7 @@ _TO_DICT_KEYS = (
     "last_activity_ts",
     "waiting_for_input",
     "needs_input",
+    "pending_decision",
     "interrupted",
     "stop_state",
     "wait_state",
@@ -65,6 +70,7 @@ _TO_DICT_KEYS = (
     "folder_id",
     "pinned",
     "tags",
+    "tags_revision",
     "color_index",
     "color_hex",
     "color_theme",

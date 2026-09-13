@@ -11,7 +11,7 @@ per-instance (`connection_method`) — see §13.
 > top-header switcher group ("Remote Instances" / "Switch instance"), and the
 > keyboard shortcuts. This is deliberately distinct from the product name
 > **Kiro Crew** and from an agent **crew** (an assistant with its own
-> workspace/memory — `kiroCrewAgentsPage`, "Crew Mode"). Earlier UI copy called
+> workspace/memory — `kiroCrewAgentsPage`, the Crew Members page). Earlier UI copy called
 > this feature "Remote Crew"; that wording was retired in favour of "instance" to
 > match the code and config it already sits on (`/api/instances`,
 > `instances.json`, `InstancesPanel`, EC2 `instance_id` / `ssm_target`). Only the
@@ -255,7 +255,14 @@ non-POSIX (§12). Treat a Windows hub as unverified.
    capped-exponential backoff (`recover_backoff_max_secs`, 30s; the wait grows
    1, 2, 4, 8, 16 then holds at the cap), which spans roughly a two-minute
    window: long enough to outlast a transient drop (screen lock, proxy warmup).
-   The counter resets on a successful rebuild or a successful `connect()`. If it
+   The counter resets on a successful rebuild or a successful `connect()`. A
+   successful rebuild records the replacement child's `local_port` alongside its
+   `forwarder_pid` / `forwarder_start` / `forwarder_sig` in one write — the same
+   field set `connect()` persists. A rebuild takes its port from the live
+   tunnel, and `forwarder_sig` is a MAC over that port, so the port travels with
+   the identity that signs it; recording one without the other points both the
+   pane URL and the reclaim's signature check at a port the recorded child is
+   not bound to. If it
    gives up, the diagnosis ladder runs automatically. The slow SSH I/O runs
    *without* the manager lock so self-heal cannot stall a concurrent
    connect/disconnect/shutdown.
@@ -318,6 +325,32 @@ kirocrew config set instances.mint_timeout_secs 60
 Constants that are **not** user-configurable: the probe interval (30s), the token
 refresh fraction (0.8), and the stored-token probe timeout (2s).
 
+**Which of these a config write reaches (`SshTunnelManager.apply_config`).** The
+manager registers `live.watch_section(self, "instances", method="apply_config",
+fail_closed=False)` in its own `__init__` — `method` because the `reconfigure`
+name is already taken here, and `fail_closed=False` because the section carries
+no authorization, so a degraded document's defaults are the right answer. A config
+write pushes `connect_timeout_secs`, `mint_timeout_secs`, `ssh_compression`,
+`max_recovery_attempts`, `recover_backoff_max_secs` and `probe_failure_threshold`
+onto the running manager. Every one of those is consulted per operation — per
+connect, per mint, per recovery attempt — so pushing it is a genuine hot apply
+rather than a value that only mattered at construction. The probe threshold is
+additionally propagated into the tunnels ALREADY running: each one copied it when
+it was built, and would otherwise keep tearing itself down on the old count. The
+push is an attribute set on the live tunnel, not a restart, because the threshold
+is compared against a running counter — so the new value takes effect on the next
+probe without dropping a healthy forward.
+
+`tunnel_base_port` is deliberately left alone. The allocator has already handed out
+ports from the old base and live tunnels hold them, so moving the base mid-flight
+would only fragment the range; it applies to a manager built after the change.
+`instances.enabled` stays a startup read (§1), and `warm_set_cap` is applied by the
+warm table rather than here.
+
+`apply_config` is not `reconfigure`: the latter is the per-instance edit barrier
+described under `PATCH /api/instances/{id}`, which tears one tunnel down and
+rewrites its coordinates under the manager lock. They share no code.
+
 ### 5.2 `instances.ssh_compression`
 
 Adds `-C` (zlib transport compression) to the supervised `ssh -N -L` argv. It is
@@ -331,11 +364,12 @@ reached over a higher-latency link, where spending remote CPU to save bandwidth
 is the right trade. On a fast or local link the CPU cost can outweigh the
 bandwidth win, which is why it stays tunable.
 
-The flag is read once, at startup, into the `SshTunnelManager`, and each
-`_SshTunnel` inherits it; changing it takes effect on the next gateway restart.
-Only the *tunnel* argv is affected. The token-mint and diagnostics `ssh`
-invocations do not compress (they are single short commands, so there is nothing
-to gain).
+The flag is held on the `SshTunnelManager` and re-read from config on every write
+(§5.1), but each `_SshTunnel` copies it into its argv when the child is spawned, so
+a change applies to tunnels built AFTER it — a live forward keeps the setting it
+started with until it reconnects. Only the *tunnel* argv is affected. The
+token-mint and diagnostics `ssh` invocations do not compress (they are single short
+commands, so there is nothing to gain).
 
 ### 5.3 Registry file
 
@@ -539,7 +573,13 @@ what its own edit invalidated, and never reopens anything on the user's behalf.
 - **Untrusted ssh stderr.** A proxy banner is ANSI-stripped, credential- and
   exfiltration-redacted, and truncated before it is surfaced in status, and it is
   a secondary detail only: failure *classification* keys on real ssh signals, so
-  banner prose can never be read as an auth verdict.
+  banner prose can never be read as an auth verdict. When a classification phrase
+  matched, the fixed-width truncation window is centered on the matched phrase
+  rather than the head of the buffer -- on the phrase itself, not its line, since
+  the proxy controls the buffer and can make a single line arbitrarily long -- so
+  benign stderr written earlier (e.g. arbitrary `LocalCommand` output) cannot
+  consume the budget and truncate the classified reason out of the surfaced
+  detail.
 - **Trust root.** `<data-home>/run/` (the run-marker dir) is on the
   `is_sensitive_path` floor, so agent file tools can neither read nor write it.
   See §12 and [security.md](security.md).
@@ -811,7 +851,7 @@ its real jobs.
 |---|---|
 | `GET /api/cloud/preflight?profile=&region=` | AWS reachability + the prerequisite checklist (the doctor checks as JSON). |
 | `GET /api/cloud/iam-policy` | The minimum IAM policy document to paste into the user's account. |
-| `GET /api/cloud/provisioners` | The lanes the Set-up tab may offer: `{id, kind, label, posix_only, steps}` per provisioner, from the CPP `remote_provisioners` seam ([platform-context.md](platform-context.md)). The stock build lists the single `aws_ec2` lane. Answers on every platform, like the two history routes: the tab needs it to pick a form, and each row's `posix_only` carries the platform answer for that lane. |
+| `GET /api/cloud/provisioners` | The lanes the Set-up tab may offer: `{id, kind, label, posix_only, steps}` per provisioner, from the CPP `remote_provisioners` seam ([platform-context.md](platform-context.md)). The stock build lists the single `aws_ec2` lane. Answers on every platform, like the two history routes: the tab needs it to pick a form, and each row's `posix_only` carries the platform answer for that lane. Adding a lane: [adding-a-remote-provisioner.md](../../guides/adding-a-remote-provisioner.md). |
 | `GET /api/cloud/launch` | List launch jobs, in progress and finished. |
 | `POST /api/cloud/launch` | Start a launch job; returns the job immediately. `409` when one is already in flight. Body `{provider_id?, profile, region, size_key}`; `provider_id` defaults to `aws_ec2`, and an id the seam does not list or cannot back answers `400 unknown_provisioner` before any job file exists. The job carries `provider_id`, and its step labels are the provisioner's. |
 | `GET /api/cloud/launch/{id}` | Poll one job: per-step state plus the device-code prompt while signing in. |
@@ -1346,7 +1386,7 @@ existing session, on either side. Consequences worth stating:
 | **`project`** | **no** | The headline decision. The source's checkout path almost never exists on the target (a Mac worktree path on a Linux dev desk), and a slot pointing at a missing directory scopes file search and steering to nothing. The session arrives **unscoped** and the user re-picks a project. |
 | `model` | no | Accounts differ in entitlement, so an id the source is served can fail at runtime on the target. The target resolves its own default ([model-selection](../common/model-selection.md)). |
 | `workspace` | no | Workspaces are per-instance memory scopes; a matching name still means a different memory. |
-| `folder_id`, `tags`, `pinned`, `artifact`, `app`, `linked_session_key`, `forked_from` | no | Local-graph references that would dangle. |
+| `folder_id`, `tags`, `tags_revision`, `pinned`, `artifact`, `app`, `linked_session_key`, `forked_from` | no | Local-graph references that would dangle (`tags_revision` is the per-instance change identity of `tags`; it travels with them). |
 
 `bundle_version` is refused when **outside the supported set** (`{1, 2}`) rather
 than best-effort parsed: the two ends are independently-updated installs, and a

@@ -72,6 +72,33 @@ def _run(argv: list[str], cwd: str | None = None) -> tuple[str, str]:
     return ("fail", f"exit {proc.returncode}: {output}")
 
 
+def _pr_is_draft(pr: int, repo: object = None) -> bool:
+    """Is this pull request still a draft? ``True`` only on an unambiguous yes.
+
+    Asked only to explain a pending check run. One-sided on purpose: gh absent,
+    no such PR, an auth failure or a forge without the field all return
+    ``False``, so a probe that cannot answer never turns a wait into a refusal.
+    Ported from upstream's bundled evaluator (kirodotdev/KiroCrew#9946).
+    """
+    argv = ["gh", "pr", "view", str(pr)]
+    if repo:
+        argv += ["--repo", str(repo)]
+    argv += ["--json", "isDraft", "-q", ".isDraft"]
+    try:
+        proc = subprocess.run(  # noqa: S603 - argv is product-built; no shell
+            argv,
+            capture_output=True,
+            shell=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=TIMEOUT_SECS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0 and (proc.stdout or "").strip().lower() == "true"
+
+
 def evaluate(item: dict[Any, Any]) -> tuple[str, str]:
     """Return one verdict for a durable work-item acceptance spec."""
     accept = item.get("accept") or {}
@@ -85,7 +112,21 @@ def evaluate(item: dict[Any, Any]) -> tuple[str, str]:
         repo = accept.get("repo")
         if repo:
             argv += ["--repo", str(repo)]
-        return _run(argv)
+        verdict, evidence = _run(argv)
+        # The probe explains a PENDING run and nothing else: a green draft is a
+        # met acceptance, and a failed run is already terminal. A stateless
+        # evaluator cannot tell a draft-gated readiness check (never resolves)
+        # from CI still running, and answers both the same on purpose -- a draft
+        # is the author's own "not ready", so the next step is a person's.
+        if verdict == "pending" and _pr_is_draft(pr, repo):
+            return (
+                "refused",
+                f"PR #{pr} is a draft and its checks have not finished; a draft "
+                "is not a review-ready PR, and where readiness is gated on the "
+                "draft flag no further polling resolves it -- mark it ready for "
+                "review or change the acceptance kind",
+            )
+        return (verdict, evidence)
     if kind == "file":
         path = accept.get("path")
         if not isinstance(path, str) or not path:

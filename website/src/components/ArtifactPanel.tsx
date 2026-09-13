@@ -278,9 +278,12 @@ export default memo(function ArtifactPanel({
     active.requestAnchoredComment();
     window.getSelection()?.removeAllRanges();
   }, [active]);
-  const handleCopyAction = useCallback((text: string) => {
-    if (text) copyToClipboard(text);
-  }, []);
+  // Returns the clipboard result so the toolbar's checkmark is truthful; a
+  // blank selection is ignored (nothing to copy, nothing to report).
+  const handleCopyAction = useCallback(
+    (text: string) => (text ? copyToClipboard(text) : undefined),
+    [],
+  );
   const selectionActions: SelectionAction[] = useMemo(
     () => [
       {

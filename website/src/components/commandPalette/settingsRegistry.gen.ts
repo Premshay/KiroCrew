@@ -830,6 +830,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.compact-empty-folders",
+    "label": "Compact Empty Folders",
+    "labelKey": "pages.settings.chatPanel.compact_empty_folders",
+    "description": "A folder with no chats takes one row instead of two, and its New chat button moves onto the folder's own row",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.completion-event-characters",
     "label": "Completion Event Characters",
     "labelKey": "pages.settings.chatPanel.completion_event_characters",
@@ -1133,6 +1142,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.split-side-by-side-diffs",
+    "label": "Split (side-by-side) diffs",
+    "labelKey": "settings.chat.diffLayout.label",
+    "description": "Show old and new code in two columns; off shows one unified column. Changing it here or on any diff sets it everywhere.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.split-view-session-grid",
     "label": "Split View (Session Grid)",
     "labelKey": "pages.settings.chatPanel.split_view_session_grid",
@@ -1173,6 +1191,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "select",
     "occurrence": 1
+  },
+  {
+    "id": "chat.text-link-patterns",
+    "label": "Text Link Patterns",
+    "labelKey": "pages.settings.chatPanel.link_patterns",
+    "tab": "chat",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "dashboard.link_patterns"
   },
   {
     "id": "chat.text-streaming-style",
@@ -1264,10 +1291,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
-    "id": "developer.crew-members-and-crew-mode",
-    "label": "Crew Members and Crew Mode",
-    "labelKey": "pages.developer.featurePreviewsTab.crew",
-    "description": "The Crew Members page and Crew Mode chats. Both are still being built, so neither is offered until you turn this on.",
+    "id": "developer.crew-members",
+    "label": "Crew Members",
+    "labelKey": "pages.developer.featurePreviewsTab.crew_members",
+    "description": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -1277,6 +1304,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Developer Mode",
     "labelKey": "pages.settings.developerPanel.developer_mode",
     "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.remote-instance-sessions",
+    "label": "Remote instance sessions",
+    "labelKey": "pages.developer.featurePreviewsTab.remote_instance_sessions",
+    "description": "Merge a connected remote instance's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
