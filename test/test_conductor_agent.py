@@ -1039,6 +1039,59 @@ class TestAcceptEvaluator:
             work_acceptance.main(StringIO('{"items": []}'), StringIO())
 
 
+class TestDraftPullRequest:
+    """A draft PR whose checks stay PENDING is ``refused``, and only then.
+
+    The probe explains a pending verdict rather than pre-empting the check, so a
+    draft whose checks resolve is judged on them and pass/fail cost no probe.
+    """
+
+    def _wire(self, monkeypatch, script):
+        seen: list[list[str]] = []
+
+        def _fake_run(argv, **kwargs):
+            seen.append(list(argv))
+            rc, out, err = script[len(seen) - 1]
+            return subprocess.CompletedProcess(argv, rc, out, err)
+
+        monkeypatch.setattr(work_acceptance.subprocess, "run", _fake_run)
+        return seen
+
+    def test_a_pending_draft_is_refused(self, monkeypatch):
+        seen = self._wire(monkeypatch, [(8, "3 checks still running", ""), (0, "true\n", "")])
+        verdict, evidence = work_acceptance.evaluate(
+            {"accept": {"kind": "pr_checks", "pr": 123, "repo": "owner/name"}}
+        )
+        assert verdict == "refused"
+        assert "PR #123 is a draft" in evidence
+        assert "mark it ready for review" in evidence
+        assert seen[0] == ["gh", "pr", "checks", "123", "--repo", "owner/name"]
+        assert seen[1] == [
+            "gh", "pr", "view", "123", "--repo", "owner/name", "--json", "isDraft", "-q", ".isDraft"
+        ]
+
+    @pytest.mark.parametrize("first", [(0, "all checks pass", ""), (1, "2 checks failing", "")])
+    def test_a_resolved_run_is_never_probed(self, monkeypatch, first):
+        seen = self._wire(monkeypatch, [first])
+        verdict, _ = work_acceptance.evaluate({"accept": {"kind": "pr_checks", "pr": 123}})
+        assert verdict == ("pass" if first[0] == 0 else "fail")
+        assert len(seen) == 1
+
+    def test_a_non_draft_pr_still_reports_pending(self, monkeypatch):
+        seen = self._wire(monkeypatch, [(8, "still running", ""), (0, "false", "")])
+        verdict, evidence = work_acceptance.evaluate({"accept": {"kind": "pr_checks", "pr": 7}})
+        assert (verdict, "still running" in evidence) == ("pending", True)
+        assert seen[1] == ["gh", "pr", "view", "7", "--json", "isDraft", "-q", ".isDraft"]
+
+    @pytest.mark.parametrize(
+        "probe", [(1, "", "no pull requests found"), (0, "", ""), (0, "null", "")]
+    )
+    def test_a_probe_that_cannot_answer_leaves_the_pending_standing(self, monkeypatch, probe):
+        self._wire(monkeypatch, [(8, "still running", ""), probe])
+        verdict, _ = work_acceptance.evaluate({"accept": {"kind": "pr_checks", "pr": 9}})
+        assert verdict == "pending"
+
+
 class TestAcceptEvaluatorAdapter:
     def test_adapter_invokes_only_the_fixed_product_command(self, monkeypatch):
         adapter = _load_adapter()
