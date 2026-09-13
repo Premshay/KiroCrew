@@ -29,8 +29,10 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Collection, Mapping
@@ -40,12 +42,44 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.env import mcp_search_path, spec_path_key
 from kiro_crew.mcp_gateway import STUB_MODULE
-from kiro_crew.mcp_gateway.hashing import hash_command, is_secret_env_key
+from kiro_crew.mcp_gateway.hashing import (
+    decode_target_args,
+    encode_target_args,
+    hash_command,
+    is_secret_env_key,
+)
 from kiro_crew.mcp_gateway.manager import is_credential_env_key
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.sandbox import scrub_agent_denied_env
 
 logger = logging.getLogger(__name__)
+
+# cmd.exe's ceiling is smaller than CreateProcessW's; warn without rejecting
+# launchers that do not pass through cmd.exe.
+_WINDOWS_CMD_LINE_LIMIT = 8191
+
+# Normalized ``KIROCREW_MCP_TARGET_<SERVER>`` keys already warned about as a
+# base-name collision, so the notice fires once per distinct colliding key per
+# process instead of once per rewrite pass. ``_collect_target_env`` runs on
+# every pass (one call per agent spec, plus one per kept overlay), so a
+# genuinely single ambiguous config would otherwise print the same WARNING line
+# on every boot pass -- a wall of identical text an operator cannot count
+# distinct problems from. Guarded by ``_collision_warn_lock`` so two threads
+# rewriting at once cannot both report the same key. Repeats drop to DEBUG.
+_collision_warn_lock = threading.Lock()
+_collision_warned_keys: set[str] = set()
+
+
+def _reset_collision_warnings() -> None:
+    """Clear the per-process env-key collision warning latch.
+
+    A test hook: the module-level ``_collision_warned_keys`` set persists for
+    the life of the process, so a test that asserts on the WARNING record must
+    reset it between cases to see the first-occurrence notice again.
+    """
+    with _collision_warn_lock:
+        _collision_warned_keys.clear()
+
 
 # Fingerprint of the last completed rewrite, stored inside the overlay dir so
 # an unchanged boot can skip re-parsing every agent spec, re-resolving every
@@ -68,7 +102,7 @@ _FINGERPRINT_NAME = ".rewrite-fingerprint"
 # relock — so an older fingerprint still validates correctly, and bumping would
 # gratuitously defeat the transient-keep gate (which compares stored vs current
 # inputs) on the first upgraded boot.
-_FINGERPRINT_SCHEMA = 3
+_FINGERPRINT_SCHEMA = 4
 
 
 @dataclass
@@ -130,11 +164,10 @@ _WRAPPER_MARKER = "_kirocrew_mcp_gateway_wrapped"
 _WRAPPER_MARKER_LEGACY = "_mc_mcp_gateway_wrapped"
 
 
-# Argument separator for the stub's ``--target-args`` flag. `|` is
-# printable, preserved through argv, and not legal in a kiro MCP command
-# path. If a real MCP arg contains `|`, override via stub's
-# ``--target-args-sep`` flag (not used here; not a problem in practice).
+# Read compatibility for overlays carrying delimiter-separated arguments.
 _TARGET_ARGS_SEP = "|"
+_TARGET_ARGS_FLAG = "--target-args-b64"
+_TARGET_ARGS_FLAG_LEGACY = "--target-args"
 
 # A deliberately uninteresting identity and workspace for a service the
 # operator explicitly marked safe to share across all KiroCrew sessions. The
@@ -396,9 +429,8 @@ def _build_stub_entry(
         "--server", server_name,
         "--agent", agent_name,
         "--target-command", target_command,
-        # Use ``=`` so argparse treats the `|`-joined value as the flag's
-        # value even when it contains `--` (e.g. `--skill-paths|...`).
-        f"--target-args={_TARGET_ARGS_SEP.join(target_args)}",
+        # Keep both argument boundaries and shell metacharacters inside the payload.
+        f"{_TARGET_ARGS_FLAG}={encode_target_args(target_args)}",
         "--sandbox-mode", sandbox_mode,
         "--work-dir", str(work_dir),
         "--approval-mode", approval_mode,
@@ -416,7 +448,8 @@ def _build_stub_entry(
     # rewrite fingerprint's skip path effective.
     entry_identity_keys = sorted(k for k in frozenset(identity_keys) if k in env_pairs)
     if entry_identity_keys:
-        stub_args.extend(["--pool-identity-env", _TARGET_ARGS_SEP.join(entry_identity_keys)])
+        # A names-only list still needs encoding: its delimiter can be a pipe.
+        stub_args.extend(["--pool-identity-env-b64", encode_target_args(entry_identity_keys)])
     if env_pairs:
         # JSON-encode env so values containing ',' or '=' round-trip
         # intact. A prior CSV serialisation ``K=V,K2=V2`` silently
@@ -543,6 +576,15 @@ def _build_stub_entry(
         # not via kiro-cli's subprocess environment.
         "env": {},
     })
+    if platform_compat.IS_WINDOWS:
+        command_line = subprocess.list2cmdline([wrapped["command"], *wrapped["args"]])
+        command_units = len(command_line.encode("utf-16-le")) // 2
+        if command_units >= _WINDOWS_CMD_LINE_LIMIT:
+            logger.warning(
+                "rewriter: server %r generated command is %d UTF-16 units; "
+                "cmd.exe limit is %d. Shorten server arguments if initialization fails.",
+                server_name, command_units, _WINDOWS_CMD_LINE_LIMIT,
+            )
     return wrapped
 
 
@@ -2100,30 +2142,41 @@ def _collect_target_env(
         env_key = "KIROCREW_MCP_TARGET_" + server_name.replace("-", "_").upper()
         args = entry.get("args", []) or []
         target_cmd: str | None = None
-        target_args_str = ""
+        target_args_b64: str | None = None
+        target_args_legacy = ""
+        target_args_sep = _TARGET_ARGS_SEP
         i = 0
         while i < len(args):
-            a = args[i]
-            if a == "--target-command" and i + 1 < len(args):
-                target_cmd = str(args[i + 1])
-                i += 2
-                continue
-            if isinstance(a, str) and a.startswith("--target-args="):
-                target_args_str = a.split("=", 1)[1]
+            token = str(args[i])
+            flag, equals, value = token.partition("=")
+            if flag in {
+                "--target-command", _TARGET_ARGS_FLAG,
+                _TARGET_ARGS_FLAG_LEGACY, "--target-args-sep",
+            }:
+                if not equals:
+                    if i + 1 >= len(args):
+                        break
+                    i += 1
+                    value = str(args[i])
+                if flag == "--target-command":
+                    target_cmd = value
+                elif flag == _TARGET_ARGS_FLAG:
+                    target_args_b64 = value
+                elif flag == _TARGET_ARGS_FLAG_LEGACY:
+                    target_args_legacy = value
+                else:
+                    target_args_sep = value
             i += 1
         if target_cmd:
-            # Target args arrive separated by ``_TARGET_ARGS_SEP`` (the same
-            # constant _build_stub_entry joins them with). Split on it rather
-            # than a hardcoded literal so this reconstruction — which feeds
-            # hash_command — stays in lock-step with the stub's PoolKey hash if
-            # the separator ever changes. Quote each one (incl. the command)
-            # before space-joining so env_target_resolver's shlex.split
-            # round-trips args containing embedded spaces. The old
-            # ``replace("|"," ")`` split such an arg into multiple tokens,
-            # corrupting the backend command line.
-            raw_target_args = (
-                target_args_str.split(_TARGET_ARGS_SEP) if target_args_str else []
-            )
+            # Same precedence and decode as the stub: both sides must hash
+            # identical argv for daemon target lookup to find the backend.
+            if target_args_b64 is not None:
+                raw_target_args = decode_target_args(target_args_b64)
+            else:
+                raw_target_args = (
+                    target_args_legacy.split(target_args_sep) if target_args_legacy else []
+                )
+            # This is a matched quote/split codec, never a shell command.
             spec = " ".join(shlex.quote(p) for p in [target_cmd, *raw_target_args])
             # Bare server-name key: first-wins fallback. Two DISTINCT server
             # names can normalize to the same key ("my-server" vs "my_server",
@@ -2132,12 +2185,24 @@ def _collect_target_env(
             # ambiguous config is visible rather than silently first-wins.
             existing = target_env.get(env_key)
             if existing is not None and existing != spec:
-                logger.warning(
-                    "mcp-gateway rewriter: KIROCREW_MCP_TARGET env-key collision on "
-                    "%s (distinct server names normalize identically); the "
-                    "args-hashed key is used at resolve time, base stays "
-                    "first-wins", env_key,
-                )
+                with _collision_warn_lock:
+                    first = env_key not in _collision_warned_keys
+                    if first:
+                        _collision_warned_keys.add(env_key)
+                if first:
+                    logger.warning(
+                        "mcp-gateway rewriter: KIROCREW_MCP_TARGET env-key collision on "
+                        "%s (distinct server names normalize identically); the "
+                        "args-hashed key is used at resolve time, base stays "
+                        "first-wins",
+                        env_key,
+                    )
+                else:
+                    logger.debug(
+                        "mcp-gateway rewriter: KIROCREW_MCP_TARGET env-key collision on "
+                        "%s again (already reported this pass or a prior one)",
+                        env_key,
+                    )
             target_env.setdefault(env_key, spec)
             # Args-disambiguated key: idempotent per (server, command+args), so
             # divergent same-named servers do not collide on first-wins.

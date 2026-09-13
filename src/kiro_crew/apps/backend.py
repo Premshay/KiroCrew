@@ -1208,11 +1208,17 @@ def provision_app_deps(app_name: str, root: Path) -> str:
             # O_NOFOLLOW arm refuses a link planted at the lock name itself.
             # O_RDWR (not read-only): Windows msvcrt.locking requires write
             # access on the fd (same reason as bridges' _mcp_lock).
-            lflags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-            if pin.fd is not None:
-                lfd = os.open(lock_path.name, lflags, 0o644, dir_fd=pin.fd)
-            else:
-                lfd = os.open(str(lock_path), lflags, 0o644)
+            lflags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            lock_name = lock_path.name if pin.fd is not None else str(lock_path)
+            # Concurrent openat(O_CREAT) of an absent file can return ENOENT on
+            # macOS. Elect one creator, then let contenders open its existing
+            # inode. Never recreate a lock that disappears before the reopen.
+            try:
+                lfd = os.open(
+                    lock_name, lflags | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=pin.fd
+                )
+            except FileExistsError:
+                lfd = os.open(lock_name, lflags, dir_fd=pin.fd)
             with os.fdopen(lfd, "r+") as lf:
                 with platform_compat.file_lock(lf.fileno(), exclusive=True):
                     provision_error = _provision_app_deps_locked(app_name, root, pin)
@@ -1897,7 +1903,7 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
         _platform_extra["KIROCREW_PROFILE"] = os.environ["KIROCREW_PROFILE"]
     for _policy_env in ("KIROCREW_SECURITY_POLICY", "KIROCREW_ADMISSION_POLICY"):
         # Forward the governance trust-root path overrides alongside the profile.
-        # These are the fleet operator's highest-priority policy sources
+        # These are the operator's local policy sources
         # (governance.load_security_policy / admission), and minimal_env() strips
         # them. Now that the backend boots the platform context itself, dropping
         # them would make the child resolve its ceiling from the on-disk /
@@ -2648,6 +2654,34 @@ def spawned_backend_names() -> list[str]:
         return sorted(name for name, ap in _processes.items() if ap.proc is not None)
 
 
+def spawned_backend_owns_pid(pid: int) -> bool:
+    """Whether a backend THIS gateway spawned owns *pid*.
+
+    Owning means *pid* is the spawned root or descends from it, because
+    ``wrap_argv`` places a sandbox launcher between us and the real server —
+    the same ownership shape :func:`_spawn_owns_listener` reads off a listener.
+
+    Only a record holding a LIVE ``Popen`` answers, and that is the whole
+    security value: an unreaped child's pid cannot be recycled by the kernel, so
+    a root that answers here is a process this gateway started and still owns.
+    ``poll() is None`` is what carries that, not ``proc is not None`` on its own —
+    once a child exits and is reaped its pid is free for anyone. An ADOPTED
+    backend belongs to another supervisor and carries no handle at all (see
+    :func:`spawned_backend_names`), so it is refused rather than trusted on a pid
+    this gateway cannot vouch for.
+
+    The ancestry walk runs OUTSIDE ``_lock``: it reads ``/proc`` per candidate,
+    and the snapshot taken under the lock is all the registry state it needs.
+    """
+    with _lock:
+        roots = [
+            ap.pid
+            for ap in _processes.values()
+            if ap.proc is not None and ap.pid > 0 and ap.proc.poll() is None
+        ]
+    return any(_pid_is_self_or_descendant_of(pid, root) for root in roots)
+
+
 def get_app_backend_port(app_name: str) -> int | None:
     """Get the port for a running app backend (used by reverse proxy)."""
     with _lock:
@@ -2915,7 +2949,7 @@ def _health_check_loop(ap: AppProcess, health_path: str) -> AppProcess | None:
     probed. Deriving both from the record leaves nothing to disagree.
 
     Returns the record if this call promoted it to healthy, else None (never answered, or
-    no longer the tracked entry).
+    not the tracked entry).
     """
     app_name = ap.app_name
     port = ap.port
@@ -3009,7 +3043,7 @@ def _watch_backend_health(ap: AppProcess, health_path: str) -> None:
             )
             with _lock:
                 if _processes.get(ap.app_name) is not ap:
-                    return  # no longer tracked — nothing left to watch
+                    return  # not the tracked record — nothing left to watch
 
 
 def _watch_backend_health_sweeps(ap: AppProcess, health_path: str) -> None:
@@ -3031,9 +3065,9 @@ def _watch_backend_health_sweeps(ap: AppProcess, health_path: str) -> None:
     and stays REVERSIBLE — the watch keeps running and re-promotes on the next success,
     which is what lets an app that wedged briefly heal without operator action.
 
-    Exits when the record is no longer the tracked one for its app: ``stop_app_backend``
+    Exits when the record stops being the tracked one for its app: ``stop_app_backend``
     pops it and a restart replaces it, so this needs no separate teardown — the same
-    "no longer tracked" guard the startup poll already uses.
+    "not the tracked record" guard the startup poll uses.
     """
     consecutive_failures = 0
     while True:
@@ -3220,7 +3254,7 @@ def _set_backend_health(ap: AppProcess, *, healthy: bool) -> bool:
     """
     with _health_reconcile_lock:
         # IDENTITY FIRST. The undo below deregisters by app NAME, so running it for a
-        # record that is no longer the tracked one would delete the SUCCESSOR's
+        # record that is not the tracked one would delete the SUCCESSOR's
         # resources — and an unreadable enabled state is exactly the case that would
         # send a retired watcher down that path.
         with _lock:
@@ -3370,7 +3404,7 @@ def _pidfile_path() -> Path:
 def _proc_start_time(pid: int) -> str | None:
     """Stable per-process start time, or None if unavailable.
 
-    PID-reuse guard: a recorded pid whose live start_time no longer matches has
+    PID-reuse guard: a recorded pid whose live start_time does not match has
     been recycled to an unrelated process and MUST NOT be killed. The value must
     be stable across gateway restarts (the reap compares a string recorded by a
     prior generation against one read now), so it cannot use ``hash()`` — that

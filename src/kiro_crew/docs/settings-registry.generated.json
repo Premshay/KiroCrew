@@ -454,6 +454,13 @@
       "route": "/settings/chat?highlight=chat.background-model"
     },
     {
+      "id": "chat.compact-empty-folders",
+      "label": "Compact Empty Folders",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=chat.compact-empty-folders",
+      "description": "A folder with no chats takes one row instead of two, and its New chat button moves onto the folder's own row"
+    },
+    {
       "id": "chat.completion-event-characters",
       "label": "Completion Event Characters",
       "tab": "chat",
@@ -689,6 +696,13 @@
       "route": "/settings/chat?highlight=chat.soft-stop-budget-seconds"
     },
     {
+      "id": "chat.split-side-by-side-diffs",
+      "label": "Split (side-by-side) diffs",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=chat.split-side-by-side-diffs",
+      "description": "Show old and new code in two columns; off shows one unified column. Changing it here or on any diff sets it everywhere."
+    },
+    {
       "id": "chat.split-view-session-grid",
       "label": "Split View (Session Grid)",
       "tab": "chat",
@@ -719,6 +733,13 @@
       "tab": "chat",
       "route": "/settings/chat?highlight=chat.technical-comfort",
       "description": "Sets how deep explanations go — plain language vs. full technical detail"
+    },
+    {
+      "id": "chat.text-link-patterns",
+      "label": "Text Link Patterns",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=key%3Adashboard.link_patterns",
+      "configKey": "dashboard.link_patterns"
     },
     {
       "id": "chat.text-streaming-style",
@@ -790,11 +811,11 @@
       "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote instance — another machine you have connected under Settings > Remote Instances. Unfinished: the session opens in that instance’s own pane and is not listed in this dashboard’s sessions yet, so to return to it later, switch to that instance’s pane."
     },
     {
-      "id": "developer.crew-members-and-crew-mode",
-      "label": "Crew Members and Crew Mode",
+      "id": "developer.crew-members",
+      "label": "Crew Members",
       "tab": "developer",
-      "route": "/settings/developer?highlight=developer.crew-members-and-crew-mode",
-      "description": "The Crew Members page and Crew Mode chats. Both are still being built, so neither is offered until you turn this on."
+      "route": "/settings/developer?highlight=developer.crew-members",
+      "description": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on."
     },
     {
       "id": "developer.developer-mode",
@@ -802,6 +823,13 @@
       "tab": "developer",
       "route": "/settings/developer?highlight=developer.developer-mode",
       "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals"
+    },
+    {
+      "id": "developer.remote-instance-sessions",
+      "label": "Remote instance sessions",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.remote-instance-sessions",
+      "description": "Merge a connected remote instance's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished."
     },
     {
       "id": "developer.run-a-local-gateway",

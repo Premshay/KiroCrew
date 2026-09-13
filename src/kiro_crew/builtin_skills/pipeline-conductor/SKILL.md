@@ -1,6 +1,6 @@
 ---
 name: pipeline-conductor
-description: Operating procedure for the kirocrew-pipeline-conductor agent - run one issue/PR pipeline on one repository as a supervised fleet. Auto-pick items, preflight every candidate to one deterministic claim verdict, stand up one worker session per item in a dedicated folder, probe them each cycle with one script call, verify claimed greens independently, intervene when a worker loops or stalls, adjudicate blocked items under the override protocol, throttle admission on delivery capacity, enforce per-item credit budgets, track the conductor's own obligations in a status file, digest verified greens to the human, and clean up on merge. Use when a pipeline conductor session is being seeded, or when inspecting/debugging one.
+description: Use when a pipeline conductor session is being seeded, or when inspecting/debugging one. Operating procedure for the kirocrew-pipeline-conductor agent - run one issue/PR pipeline on one repository as a supervised fleet. Auto-pick items, preflight every candidate to one deterministic claim verdict, stand up one worker session per item in a dedicated folder, probe them each cycle with one script call, verify claimed greens independently, intervene when a worker loops or stalls, adjudicate blocked items under the override protocol, throttle admission on delivery capacity, enforce per-item credit budgets, track the conductor's own obligations in a status file, digest verified greens to the human, and clean up on merge.
 ---
 
 # Pipeline Conductor
@@ -40,7 +40,8 @@ The operator's seed message names a spec file (JSON). Fields you consume now:
   "work_source": {"kind": "gh_issues", "select_labels": ["auto-fixable"],
                    "skip_signals": ["claimed", "in-progress"]},
   "worker_contract": {"branch_pattern": "fix/{slug}-{n}",
-                       "worktree_pattern": "../{repo_name}-fix-{n}"},
+                       "worktree_pattern": "../{repo_name}-fix-{n}",
+                       "max_commits": 2},
   "verifier": {"repro_gate": "best_effort"},
   "governance": {"max_in_flight": 32, "max_per_cycle": 3,
                   "idle_alert_secs": 900, "session_ceiling": 30,
@@ -117,15 +118,12 @@ never relabel it success in the friction report.
    provenance entry and for the whole-map write rule.
 3. Open your own status file beside the spec — `conductor-status/v1`, schema
    below. The ledger tracks the items; the status file tracks YOU.
-4. Arm the patrol: `monitor_start` (interval ~90s) with the standing
-   instruction below. **Patrol with `monitor_start`, never `wait`.** Pass
-   `max_cycles` explicitly — the default is 24, so a 90-second patrol expires in
-   well under an hour, long before a fleet drains, and the loop simply stops
-   with no symptom. Size it to the run, raise it mid-run with `monitor_update`,
-   or pass `max_runtime_secs` when a wall-clock bound fits better than a cycle
-   count. Call
-   `autonudge_stop` yourself when the exit condition fires — coasting into the
-   cycle cap is a failure, not a finish.
+4. Arm the patrol with `monitor_start` using an interval near 90 seconds, an
+   explicit `max_cycles=960`, and an explicit `max_runtime_secs=259200`. **Patrol
+   with `monitor_start`, never `wait`.** If live work needs a larger or renewed
+   bound, raise it with `monitor_update` before it expires; `monitor_start` is
+   create-only. Call `autonudge_stop` yourself when the exit condition fires —
+   coasting into the cycle cap is a failure, not a finish.
 
 Standing patrol instruction template (keep it CURRENT — steering edits go here
 via `monitor_update`, see "Live steering"):
@@ -504,7 +502,10 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > PATH, and nothing else. Name the ban rather than implying it — no `make test`,
 > no `tox`, no `nox`, no `run-tests`/`local-gate`/"run the gates" wrapper of any
 > kind: a wrapper that escalates to the full suite satisfies the letter of a
-> targeted-only brief. Pass `-n0` **explicitly** on every run: omitting `-n`
+> targeted-only brief. The ban is on suite wrappers, NOT on the push gate
+> below — `preflight.py` and `push_guard.py` shell out only to `git` and `gh`
+> and run no test at all, so a targeted-test brief never licenses an unguarded
+> push. Pass `-n0` **explicitly** on every run: omitting `-n`
 > does not mean single process, it inherits whatever the project's pytest
 > `addopts` sets, and `-n auto` is a common default. Canonical line —
 > `timeout 900 python3 -m pytest -n0 <test file> -x -q </dev/null`. Do not
@@ -516,6 +517,35 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > on an interactive prompt indefinitely. If a push exceeds ~2 minutes, time the
 > actual pre-push hook over the real payload before naming a cause: process
 > liveness cannot distinguish a credential prompt from a slow hook.
+> PUSH GATE (mandatory, every push): the scripts live in `<gate>` =
+> `<crew-home>/skills/kirocrew-dev/prepare-pr/scripts`, where `<crew-home>` is
+> `KIROCREW_HOME` when set and `$HOME/.kiro/crew` otherwise. Invoke them through
+> Kiro Crew's runtime interpreter the way Startup invokes `spec_check.py`, and
+> quote the resolved path: on POSIX `"$KIROCREW_RUNTIME_PYTHON" -B
+> "<gate>/preflight.py"`, on PowerShell `& $env:KIROCREW_RUNTIME_PYTHON -B
+> "<gate>/preflight.py"`. `-B` preserves the desktop bundle's no-bytecode-write
+> rule. Do NOT add `-I` here even though Startup passes it: `preflight.py` imports
+> its sibling `push_guard`, and isolated mode drops the script's own directory
+> from the import path, so `-I` turns the gate into a `ModuleNotFoundError` on
+> every push.
+> Run `preflight.py` before the first commit. Then before EVERY push confirm
+> `git status --porcelain` is empty and run `<gate>/push_guard.py
+> --base {default_branch} --max-ahead {max_commits}`, which refuses a stale base
+> or a replayed upstream commit. Pass `--max-ahead` explicitly and fill it from
+> the spec, never from memory: the script defaults to 5, which is looser than
+> most repositories' own PR commit-count gate, so omitting it lets a branch read
+> `SAFE TO PUSH` and then fail that gate. Add `--require-single-on-base` only
+> when you actually squashed to one commit; it asserts `HEAD~1 ==
+> origin/<base>` and refuses a legitimate multi-commit branch.
+> Read the exit code, do not just test for zero: `0` proceed; `30`/`40` the gate
+> REFUSED, so do not push and report the code with the branch state; `2` the gate
+> could not RUN — an environment error, not a verdict — so do not push and report
+> `BLOCKED: push gate inoperative` with the code and stderr, because a worker
+> whose sandbox cannot reach the scripts has to surface that once instead of
+> stalling every item silently. A non-empty `git status --porcelain` is also a
+> stop.
+> Unstaged work and a stale base are what otherwise reach the
+> PR and cost a review round to find what a git-only check catches in a second.
 > PR: English body (What/Why/How/Tests/Other), `Closes #{n}`, full URL in
 > your reply. Babysit to green (`monitor_start` ~300s, staggered off a round
 > number so a dozen loops do not poll in lockstep, preferring REST over

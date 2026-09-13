@@ -141,6 +141,7 @@ class SlotQueueRepository:
         directive_user_origin: bool = False,
         peer_channel_id: str = "",
         peer_message_id: str = "",
+        directive_channel_origin: bool = False,
     ) -> str:
         """Append an entry and return its process-local queue ID."""
         queue_id = self._id_provider()
@@ -159,6 +160,8 @@ class SlotQueueRepository:
         if peer_channel_id and peer_message_id:
             item["peer_channel_id"] = peer_channel_id
             item["peer_message_id"] = peer_message_id
+        if directive_channel_origin:
+            item["_directive_channel_origin"] = True
         owner._queue.append(item)
         owner._note_enqueue()
         return queue_id
@@ -182,6 +185,7 @@ class SlotQueueRepository:
         directive_user_origin: bool = False,
         peer_channel_id: str = "",
         peer_message_id: str = "",
+        directive_channel_origin: bool = False,
     ) -> str:
         """Insert one entry while preserving retry callbacks and provenance."""
         queue_id = self._id_provider()
@@ -204,6 +208,8 @@ class SlotQueueRepository:
         if peer_channel_id and peer_message_id:
             item["peer_channel_id"] = peer_channel_id
             item["peer_message_id"] = peer_message_id
+        if directive_channel_origin:
+            item["_directive_channel_origin"] = True
         owner._queue.insert(index, item)
         owner._note_enqueue()
         return queue_id
@@ -258,6 +264,7 @@ class SlotQueueRepository:
         content: str,
         *,
         directive_user_origin: bool = False,
+        directive_channel_origin: bool = False,
     ) -> bool:
         """Edit a user-owned entry without changing its identity or position."""
         for item in owner._queue:
@@ -279,6 +286,10 @@ class SlotQueueRepository:
                 item["_directive_user_origin"] = True
             else:
                 item.pop("_directive_user_origin", None)
+            if directive_channel_origin:
+                item["_directive_channel_origin"] = True
+            else:
+                item.pop("_directive_channel_origin", None)
             return True
         return False
 

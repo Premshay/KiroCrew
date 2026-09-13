@@ -54,6 +54,7 @@ from kiro_crew.context import (
     ContextBuilder,
     build_cancelled_turn_preamble,
     compress_thread_history,
+    session_store_for_turn,
     window_for_provider_client,
 )
 from kiro_crew.cron import CronService
@@ -80,6 +81,7 @@ from kiro_crew.llm_helpers import (
     record_interaction_event,
     save_conversation_turn_off_loop,
 )
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging import auto_title, privacy_mode
 from kiro_crew.messaging.commands import (
     compact_unsupported_backend,
@@ -88,7 +90,9 @@ from kiro_crew.messaging.commands import (
     spawn_command_reply,
     task_command_reply,
 )
+from kiro_crew.messaging.dispatch import admit_inbound_callback
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
+from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.messaging.renderer import credential_redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
@@ -120,6 +124,7 @@ from kiro_crew.security import (
     redact,
     redact_credentials,
     redact_exfiltration_urls,
+    redact_local_paths,
 )
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionClosingError, SessionManager
@@ -323,6 +328,32 @@ if _unknown_phases:
 del _unknown_phases
 
 
+def phase_emojis() -> dict[str, str | None]:
+    """The phase -> emoji table currently in force (follows ``slack.reactions``).
+
+    The one read path for every reaction site. Returns the live table object,
+    which :func:`refresh_phase_emojis` rebuilds in place when the config changes
+    -- so a caller that resolves a phase now sees the operator's latest
+    overrides, not the ones captured when this module was imported.
+    """
+    return _PHASE_EMOJIS
+
+
+def refresh_phase_emojis(overrides: dict[str, str | None] | None) -> list[str]:
+    """Rebuild the live phase-emoji table from *overrides*, in place.
+
+    Called by the gateway's Slack config applier with the reloaded
+    ``slack.reactions``. In place, because ``StatusReactionController``
+    instances and the reaction sites hold the table object, not a copy. Returns
+    the unknown keys so the caller can warn about them, as the import-time build
+    does.
+    """
+    built, unknown = _build_phase_emojis(overrides or {})
+    _PHASE_EMOJIS.clear()
+    _PHASE_EMOJIS.update(built)
+    return unknown
+
+
 async def _add_phase_reaction(slack: SlackClientOps, channel: str, ts: str, phase: str) -> None:
     """Add the reaction for *phase* if the user hasn't suppressed it.
 
@@ -330,7 +361,7 @@ async def _add_phase_reaction(slack: SlackClientOps, channel: str, ts: str, phas
     (e.g. ``!command`` handlers).  Honours ``slack.reactions`` ``null``
     suppression sentinels.
     """
-    emoji = _PHASE_EMOJIS.get(phase)
+    emoji = phase_emojis().get(phase)
     if emoji is None:
         return
     await slack.add_reaction(channel, ts, emoji)
@@ -412,7 +443,7 @@ class StatusReactionController:
 
         if phase in _IMMEDIATE_PHASES:
             self._cancel_debounce()
-            emoji = _PHASE_EMOJIS.get(phase, phase)
+            emoji = phase_emojis().get(phase, phase)
             asyncio.ensure_future(self._swap_emoji(emoji))
             self._reset_stall_watchdog()
             return
@@ -457,7 +488,7 @@ class StatusReactionController:
             except Exception:
                 pass
             self._stall_emoji = None
-        terminal = _PHASE_EMOJIS["error" if error else "done"]
+        terminal = phase_emojis()["error" if error else "done"]
         await self._swap_emoji(terminal)
 
     def _fire_debounce(self) -> None:
@@ -467,7 +498,7 @@ class StatusReactionController:
     async def _apply_pending(self) -> None:
         if self._finalized or self._pending_phase is None:
             return
-        emoji = _PHASE_EMOJIS.get(self._pending_phase, self._pending_phase)
+        emoji = phase_emojis().get(self._pending_phase, self._pending_phase)
         self._pending_phase = None
         await self._swap_emoji(emoji)
         self._reset_stall_watchdog()
@@ -913,20 +944,21 @@ def _get_default_agent() -> str:
     return _cached_default_agent
 
 
-def _hydrate_thread_overrides(session_key: str, conversation_log: ConversationLog | None) -> None:
-    """Populate in-memory caches from conversation log metadata if not already set."""
-    if session_key in _hydrated_sessions:
-        return
-    _hydrated_sessions.add(session_key)
+def _read_thread_overrides(
+    session_key: str, conversation_log: ConversationLog | None
+) -> tuple[str, str]:
+    """Read and resolve persisted overrides without mutating the live maps."""
     if not conversation_log:
-        return
+        return "", ""
     try:
         meta = conversation_log.get_metadata(session_key)
     except Exception:
         logger.debug("Failed to hydrate thread overrides for %s", session_key, exc_info=True)
-        return
-    if meta.get("agent"):
-        _thread_agents[session_key] = meta["agent"]
+        return "", ""
+    from kiro_crew.messaging.session_resume import session_agent_from_metadata
+
+    resolved_agent = session_agent_from_metadata(meta) or meta.get("agent") or ""
+    project = ""
     if meta.get("project"):
         # Defense-in-depth: re-validate the persisted path at this input
         # boundary. Conversation-log metadata is normally written through the
@@ -934,12 +966,36 @@ def _hydrate_thread_overrides(session_key: str, conversation_log: ConversationLo
         # with, a sensitive credential path (~/.aws, ~/.ssh, …) must never be
         # loaded into the in-memory cache.
         if not is_sensitive_path(meta["project"]):
-            _thread_projects[session_key] = meta["project"]
+            project = meta["project"]
         else:
             logger.warning(
                 "Ignoring sensitive project path from thread metadata for %s",
                 session_key,
             )
+    return resolved_agent, project
+
+
+async def _hydrate_thread_overrides(
+    session_key: str, conversation_log: ConversationLog | None
+) -> None:
+    """Resolve private identity off-loop, then preserve any newer live selections."""
+    if session_key in _hydrated_sessions:
+        return
+    if not conversation_log:
+        _hydrated_sessions.add(session_key)
+        return
+    agent_before = _thread_agents.get(session_key)
+    project_before = _thread_projects.get(session_key)
+    agent, project = await asyncio.to_thread(_read_thread_overrides, session_key, conversation_log)
+    # A concurrent hydration/command may have settled this session while the
+    # worker read it. Never publish a stale result over that live selection.
+    if session_key in _hydrated_sessions:
+        return
+    _hydrated_sessions.add(session_key)
+    if agent and _thread_agents.get(session_key) == agent_before:
+        _thread_agents[session_key] = agent
+    if project and _thread_projects.get(session_key) == project_before:
+        _thread_projects[session_key] = project
 
 
 def _get_agent_for_session(session_key: str) -> str:
@@ -1318,10 +1374,80 @@ def get_orch_cfg() -> "KiroCrewConfig | None":
     return _orch_cfg
 
 
-def _reload_orch_cfg() -> None:
-    """Reload in-memory config after !channel writes so changes take effect immediately."""
+def slack_cfg(orch: object | None = None) -> KiroCrewConfig:
+    """The config every Slack read consults -- one object, whichever door you enter by.
+
+    ``orch._cfg``, this module's ``_orch_cfg`` and every dispatcher's captured
+    ``cfg`` are the SAME object in a running gateway: :func:`set_orch_cfg`
+    installs the orchestrator's own config, and nothing rebinds it any more --
+    the ``!channel`` path and the config applier both mutate it IN PLACE
+    (:func:`_reload_orch_cfg`, :func:`adopt_slack_config`). That is what closes
+    the divergence a rebind would otherwise open, and it is why reading through the
+    caller's *orch* is safe rather than a second view.
+
+    Resolution order: the caller's orchestrator, then the installed global, then
+    the config watcher's snapshot, then a load. So a Slack read reaches the same
+    object whether it holds the orchestrator or not, and a process with no
+    orchestrator at all (a dashboard-only gateway) still reads live config.
+    """
+    cfg = getattr(orch, "_cfg", None)
+    if cfg is not None:
+        return cfg  # type: ignore[return-value]
     if _orch_cfg is not None:
-        fresh = KiroCrewConfig.load()
+        return _orch_cfg
+    from kiro_crew.config import live
+
+    return live.snapshot() or KiroCrewConfig.load()
+
+
+#: The Slack-owned attributes of :class:`KiroCrewConfig` that a reload copies
+#: onto the shared config object. Sections are replaced whole (the dataclass
+#: instance from the new load), so a read of ``slack_cfg().slack.<field>`` sees
+#: the loader's own coercion of the new value, never a raw copy.
+#: ``slack_enterprise_ids`` is absent because it is a derived property over
+#: ``slack.allowed_enterprise_ids`` and follows the section automatically.
+_SLACK_OWNED_FIELDS: tuple[str, ...] = (
+    "slack",
+    "messaging",
+    "slack_channels",
+    "slack_dm_activation",
+    "observe_max_messages",
+    "observe_ttl_hours",
+)
+
+
+def copy_slack_fields(source: KiroCrewConfig, target: KiroCrewConfig) -> None:
+    """Copy the Slack-owned fields of *source* onto *target* in place."""
+    for name in _SLACK_OWNED_FIELDS:
+        if hasattr(source, name):
+            setattr(target, name, getattr(source, name))
+
+
+def adopt_slack_config(fresh: KiroCrewConfig) -> None:
+    """Bring the shared config object up to date with *fresh*, in place.
+
+    In place and never rebound: the object installed by :func:`set_orch_cfg` is
+    the same one the orchestrator and every dispatcher hold, so replacing the
+    binding here would leave those holders on the old object. Called by the
+    gateway's config applier with the reloaded config; a no-op before the
+    orchestrator has installed one.
+    """
+    if _orch_cfg is not None and _orch_cfg is not fresh:
+        copy_slack_fields(fresh, _orch_cfg)
+
+
+def _reload_orch_cfg(fresh: "KiroCrewConfig | None" = None) -> None:
+    """Refresh channel activations on the shared config object after a ``!channel`` write.
+
+    Synchronous on purpose: the write just landed and the next inbound message
+    may arrive before the config watcher's poll, so the caller must not wait for
+    it. The watcher applies the same two fields again when it sees the write,
+    which is idempotent. *fresh* lets a caller that already holds the reloaded
+    config skip the load.
+    """
+    if _orch_cfg is not None:
+        if fresh is None:
+            fresh = KiroCrewConfig.load()
         _orch_cfg.slack_channels = fresh.slack_channels
         _orch_cfg.slack_dm_activation = fresh.slack_dm_activation
 
@@ -2685,6 +2811,7 @@ async def maybe_route_linked_thread(
                 _linked_slot,
                 text,
                 _directive_user_origin=True,
+                _directive_channel_origin=True,
             )
         )
         _linked_slot.task = _chat_task
@@ -2701,6 +2828,7 @@ async def maybe_route_linked_thread(
             text,
             meta=containment_meta(_dashboard_state, _linked_slot),  # type: ignore[arg-type]
             directive_user_origin=True,
+            directive_channel_origin=True,
         )
     _dashboard_state.push_slots_update()  # type: ignore[attr-defined]
     sel().log_tool_invocation(
@@ -2780,8 +2908,22 @@ async def handle_message(
         logger.info("slack inbound dropped: denied by channels governance policy")
         return
 
-    _hydrate_thread_overrides(session_key, conversation_log)
+    await _hydrate_thread_overrides(session_key, conversation_log)
     _hydrate_conv_flags(sessions, session_key)
+
+    if not await admit_inbound_callback(
+        sessions,
+        channel_type="slack",
+        route=InboundRoute(
+            conversation_id=channel,
+            text=text,
+            user_id=user_id,
+            thread_id=reply_ts,
+            message_id=msg_ts,
+        ),
+        restricted=_is_slack_restricted(session_key),
+    ):
+        return
 
     # Resolve agent early so ALL persist paths (hook auto-reply, command
     # intercepts, review-mode drafts, main LLM path) can forward it.
@@ -3068,17 +3210,38 @@ async def handle_message(
     _tool_gap = False
 
     async def _rotate_stream() -> str | None:
-        """Stop the dead stream and start a fresh one. Returns new ts or None."""
+        """Stop the dead stream and start a fresh one. Returns new ts or None.
+
+        Best-effort: MUST NOT raise. The
+        real ``SlackClient`` swallows its own API errors, but a client or
+        transport that does not would send the exception up into the streaming
+        loop, where the typed ``except`` arms are all ``kiro_crew.acp.client``
+        errors — it reaches the generic ``except Exception`` catch-all, renders
+        the terminal "🔧 Something went wrong" message, and records a session
+        failure on a turn that is still live. A failed rotation is the existing,
+        handled outcome (``new_ts`` None → demote to chat.update), so map a
+        raise onto it.
+        """
         nonlocal stream_ts, use_slack_stream
         if stream_ts:
-            await slack.stop_stream(channel, stream_ts)
-        new_ts = await slack.start_stream(
-            channel,
-            reply_ts,
-            initial_text=_STREAM_CONTINUED,
-            team_id=team_id or None,
-            user_id=user_id or None,
-        )
+            try:
+                await slack.stop_stream(channel, stream_ts)
+            except Exception:
+                logger.warning(
+                    "Slack stop_stream failed during rotation — abandoning old stream",
+                    exc_info=True,
+                )
+        try:
+            new_ts = await slack.start_stream(
+                channel,
+                reply_ts,
+                initial_text=_STREAM_CONTINUED,
+                team_id=team_id or None,
+                user_id=user_id or None,
+            )
+        except Exception:
+            logger.warning("Slack start_stream failed during rotation", exc_info=True)
+            new_ts = None
         if new_ts:
             stream_ts = new_ts
             logger.info("Stream rotated: new ts=%s", new_ts)
@@ -3107,11 +3270,30 @@ async def handle_message(
             return True  # whole delta withheld (partial credential) — nothing to send yet
         if "[REDACTED" in safe:
             _stream_had_redaction = True
-        ok = await slack.append_stream(channel, stream_ts, safe)
+        # Best-effort: MUST NOT raise. A raising append is the same event as a
+        # refused append — the text is not on the stream — and the refusal path
+        # below (rotate, then retry once) already handles it. Letting it raise
+        # would escape into the generic catch-all below the loop and fake a
+        # terminal error on a live turn.
+        try:
+            ok = await slack.append_stream(channel, stream_ts, safe)
+        except Exception:
+            logger.warning("Slack append_stream failed — attempting rotation", exc_info=True)
+            ok = False
         if not ok and use_slack_stream:
             if await _rotate_stream():
                 assert stream_ts is not None
-                return await slack.append_stream(channel, stream_ts, safe)
+                try:
+                    ok = await slack.append_stream(channel, stream_ts, safe)
+                except Exception:
+                    logger.warning("Slack append_stream failed after rotation", exc_info=True)
+                    ok = False
+        # A delta that failed both the append and the post-rotation retry is
+        # not re-delivered: the real ``stop_stream`` deliberately ignores
+        # ``final_text``, and this is the same outcome the shipped client's
+        # REFUSED append produces on this path. Confirmed-delivery recovery
+        # for this class is a designed subsystem tracked as its own issue
+        # (delivery debt), deliberately not grown inside this guard sweep.
         return ok
 
     async def _append_task(task_id: str, title: str, status: str, details: str = "") -> bool:
@@ -3220,9 +3402,19 @@ async def handle_message(
                 thinking_ts = await slack.post_message(channel, _THINKING_PLACEHOLDER, reply_ts)
             except Exception:
                 logger.debug("Failed to reserve thinking slot", exc_info=True)
-        stream_ts = await slack.start_stream(
-            channel, reply_ts, team_id=team_id or None, user_id=user_id or None
-        )
+        # Best-effort: MUST NOT raise. The real ``SlackClient.start_stream``
+        # swallows its own errors and returns None, but a client or transport
+        # that raises instead would escape into the loop's generic catch-all
+        # from the first TEXT_CHUNK or TOOL_CALL event. A raise is the same
+        # event as a None return — streaming is unavailable — so map it onto
+        # the existing demotion path below.
+        try:
+            stream_ts = await slack.start_stream(
+                channel, reply_ts, team_id=team_id or None, user_id=user_id or None
+            )
+        except Exception:
+            logger.warning("Slack start_stream failed — demoting to chat.update", exc_info=True)
+            stream_ts = None
         use_slack_stream = stream_ts is not None
         if not use_slack_stream:
             # ``SlackClient.start_stream`` swallows its own errors and returns
@@ -3255,7 +3447,7 @@ async def handle_message(
     # namespaced session key. A self-linked Slack thread resolves to our own
     # canonical key (no-op rewrite); a dashboard-linked thread resolves to its
     # ``dashboard:chat-N`` key.
-    # Read the thread's owner ONCE and keep it truthful. Three separate decisions
+    # Keep the thread's owner truthful. Three separate decisions
     # below consume it -- whether to re-route this turn, whether to CLAIM the
     # thread, and whether to mirror into a dashboard slot -- and a pinned answer
     # needs a different answer for each. Falsifying this single value to steer all
@@ -3285,26 +3477,43 @@ async def handle_message(
             # the asker's own metadata records correctly. The pinned path needs it
             # exactly as much: `asker_key` is a different conversation, which is
             # the whole reason it is substituted here.
-            _hydrate_thread_overrides(session_key, conversation_log)
-    elif thread_owner_key and thread_owner_key != session_key:
-        logger.info(
-            "🔗 Slack thread %s linked to dashboard session %s — routing there",
-            session_key,
-            thread_owner_key,
-        )
-        session_key = thread_owner_key
-        # Thread overrides are keyed BY SESSION, and the hydration at entry ran
-        # for the previous key. Re-hydrate for the new owner in the same breath
-        # as the reroute -- otherwise the agent re-resolution below reads a key
-        # that was never hydrated and falls through to the channel or default
-        # agent, discarding a binding the session's own metadata records
-        # correctly. Same shape as transport_dispatch._resolve_thread_owner.
-        # The helper guards repeated I/O per session, so this is cheap.
-        _hydrate_thread_overrides(session_key, conversation_log)
+            await _hydrate_thread_overrides(session_key, conversation_log)
 
     client: LLMProvider | None = None
     try:
         task.start()
+        while True:
+            candidate_key = session_key
+            if not route_pinned:
+                thread_owner_key = sessions.get_session_for_thread(reply_ts)
+                candidate_key = thread_owner_key or canonical_key(reply_ts)
+                if candidate_key != session_key:
+                    await _hydrate_thread_overrides(candidate_key, conversation_log)
+                    if sessions.get_session_for_thread(reply_ts) != thread_owner_key:
+                        continue
+            # Both private identity hydration and store resolution can yield to
+            # a link/unlink. Commit the route only after those reads agree with
+            # the current owner; a pinned answer always keeps its asker instead.
+            memory_error = None
+            try:
+                _memory_store = await session_store_for_turn(context_builder, candidate_key)
+            except UnknownMemoryStore as exc:
+                memory_error = exc
+            if not route_pinned:
+                if sessions.get_session_for_thread(reply_ts) != thread_owner_key:
+                    continue
+                if candidate_key != session_key:
+                    logger.info(
+                        "🔗 Slack thread %s linked to dashboard session %s — routing there",
+                        session_key,
+                        candidate_key,
+                    )
+                session_key = candidate_key
+                linked_session_key = thread_owner_key
+                _hydrate_conv_flags(sessions, session_key)
+            if memory_error is not None:
+                raise memory_error
+            break
         # Re-resolve _agent against (possibly linked) session_key for the main
         # LLM path — linked dashboard sessions may carry a different thread agent.
         _agent = _thread_agents.get(session_key) or channel_agent or _get_default_agent() or None
@@ -3443,6 +3652,16 @@ async def handle_message(
                         thread_ts,
                     )
 
+            # This conversation's own silo, resolved from the session's RECORDED
+            # binding and never from ``_agent`` -- on Slack that value is a kiro
+            # agent name, a namespace disjoint from ``cfg.agents``, so deriving a
+            # store from it answers ``default`` for exactly the crew that
+            # configured otherwise. A thread taken over from a crew-bound
+            # dashboard session carries that crew's key here, which is what stops
+            # the takeover from reading the operator's own memory instead.
+            #
+            # The private tier was prepared before provider acquisition. Missing
+            # or unreadable member memory refuses the turn with its own error.
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 context_builder.build_message,
@@ -3452,6 +3671,7 @@ async def handle_message(
                 channel_id=channel,
                 thread_ts=thread_ts or msg_ts,
                 agent=_agent,
+                memory_store=_memory_store,
                 resumed=resumed,
                 user_display_name=user_display_name,
                 compressed_history=compressed,
@@ -3506,7 +3726,17 @@ async def handle_message(
                 accumulated += event.text
 
                 if _status_dirty and use_slack_stream:
-                    await slack.set_thread_status(channel, reply_ts, _STATUS_WORKING)
+                    # Best-effort: MUST NOT raise. The thread
+                    # status is decoration, and a raise here escapes into the
+                    # generic ``except Exception`` catch-all below the loop,
+                    # faking a terminal error on a live turn.
+                    try:
+                        await slack.set_thread_status(channel, reply_ts, _STATUS_WORKING)
+                    except Exception:
+                        logger.warning(
+                            "Slack set_thread_status failed — skipping status refresh",
+                            exc_info=True,
+                        )
                     _status_dirty = False
 
                 # ── Bracket hold-back: filter [OPTIONS: ...] from stream ──
@@ -3622,7 +3852,16 @@ async def handle_message(
                 tool_status = f"\n🫆 `{tool_name}`\n"
                 await _ensure_stream_started()
                 if use_slack_stream:
-                    await slack.set_thread_status(channel, reply_ts, f"is using {tool_name}")
+                    # Best-effort: MUST NOT raise. Decoration
+                    # only — a raise escapes to the catch-all and fakes a
+                    # terminal error on a live turn.
+                    try:
+                        await slack.set_thread_status(channel, reply_ts, f"is using {tool_name}")
+                    except Exception:
+                        logger.warning(
+                            "Slack set_thread_status failed — skipping tool status",
+                            exc_info=True,
+                        )
                     _status_dirty = True
                 if use_slack_stream:
                     # Flush any buffered text before the tool status
@@ -3676,7 +3915,19 @@ async def handle_message(
                         )
                         await _append_task(_active_task_id, _ct, "complete")
                         _active_task_id = ""
-                    await slack.stop_stream(channel, stream_ts)
+                    # Best-effort: MUST NOT raise. The stream is being
+                    # abandoned either way (``stream_ts`` is cleared just
+                    # below, and ``_ensure_stream_started`` opens a fresh
+                    # message after wait returns), so a raising ``stop_stream``
+                    # changes nothing except — unguarded — faking a terminal
+                    # error on a live turn via the catch-all.
+                    try:
+                        await slack.stop_stream(channel, stream_ts)
+                    except Exception:
+                        logger.warning(
+                            "Slack stop_stream failed at wait finalize — abandoning stream",
+                            exc_info=True,
+                        )
                     stream_ts = None
                     accumulated = ""
 
@@ -3936,6 +4187,11 @@ async def handle_message(
         task.fail(str(e))
         await sessions.record_failure(session_key)
         Stats().inc_message_failed()
+    except UnknownMemoryStore as exc:
+        _had_error = True
+        accumulated = redact_local_paths(redact(str(exc)))[0][:1000]
+        task.fail("memory_unavailable")
+        Stats().inc_message_failed()
     except Exception:
         _had_error = True
         logger.exception("Unexpected error handling message")
@@ -4158,8 +4414,8 @@ async def handle_message(
         # either per-chunk during streaming (_stream_had_redaction), inside the
         # final render (_render_redacted), or caught by the post-decorator scan
         # (exfil_warnings/cred_warnings). The security invariant requires the
-        # final visible message reflect the redacted accumulated text; all other
-        # cases leave the rich render intact.
+        # final visible message reflect the redacted accumulated text; all
+        # other cases leave the rich render intact.
         #
         # _render_redacted is the one that catches an ANSI-obfuscated credential:
         # the per-chunk StreamRedactor sees raw chunks and does not strip escapes,

@@ -4,10 +4,14 @@ import { Bot, Boxes, Sparkles, Terminal } from 'lucide-react'
 
 import { api } from '../../api/client'
 import type { AcpBackendProbe } from '../../api/client'
+import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
 import { SettingsCard, SettingsButtonGroup } from '../../components/settings'
 import { useConfigSchema } from '../../components/settingRef/useConfigSchema'
 import { i18nT } from '../../i18n/t'
+import { clearCachedModels } from '../../providers/adapters/acp'
+import { KiroSignInCard } from './KiroSignInCard'
+import { KIRO_SIGN_IN_BACKEND } from './kiroSignInLink'
 
 /** The config field the switch owns. Also the schema path the options are gated on. */
 const CONFIG_KEY = 'agent.acp_backend'
@@ -167,6 +171,25 @@ export function AgentBackendTab() {
     onSuccess: () => {
       setSaveError('')
       qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      // The model list is the NEW backend's now. `/api/models` re-reads
+      // `agent.acp_backend` on every call, so the server side needs no restart;
+      // only the frontend cache did, because `['available-models']` is refetched
+      // in exactly one other place — a spawned session (`useWebSocket`'s
+      // `activity_event`) — and the global `staleTime: Infinity` plus the
+      // self-heal poll stopping after one live success mean nothing else ever
+      // re-asks. That is why the picker looked like it needed a gateway restart:
+      // the restart was just the next session spawn.
+      //
+      // `resetQueries`, not `invalidateQueries`: invalidate keeps the OLD
+      // backend's rows on screen until the refetch lands, and a cold
+      // `--list-models` spawn can take the gateway's full 10s. A pick in that
+      // window writes an id the new backend rejects. Reset drops the data to
+      // `undefined` first, so every picker shows the auto-only placeholder for
+      // those seconds, then refetches. Drop the last-good localStorage list
+      // FIRST for the same reason: a failing first fetch must degrade to
+      // auto-only, not to the old backend's ids.
+      clearCachedModels()
+      qc.resetQueries({ queryKey: ['available-models'] })
     },
     // No optimistic write and no local mirror of the value: the button group reads
     // straight from the query, so a rejected PATCH needs no revert — the cache was
@@ -482,7 +505,12 @@ export function AgentBackendTab() {
             disabled: disabledOption(value),
             describedById: statusId(value),
           }))}
-          onChange={v => patchMut.mutate(v)}
+          // `SettingsButtonGroup` fires for the pressed option too, and a PATCH
+          // that writes the value already stored still resolves successfully —
+          // which would run `onSuccess` and reset the model list, blanking every
+          // picker and spawning `--list-models` for a backend that did not
+          // change. Only a real change is a save.
+          onChange={v => { if (v !== current) patchMut.mutate(v) }}
         />
         {/* One line per agent the panel offers — the reader is choosing BETWEEN them,
             so showing only the selected one's status would hide the very comparison
@@ -519,6 +547,21 @@ export function AgentBackendTab() {
           {i18nT('pages.developer.agentBackendTab.set_is_fixed_at_gateway_start')}
         </p>
       </SettingsCard>
+      {/* Kiro sign-in, under the switch that gives it a purpose. The identity the
+          card stores is consumed by the KAS relay alone
+          (`ACP_BACKENDS_HOST_AUTH_CALLBACK`), so the card is offered exactly when
+          KAS is: on a build or policy that hides that option there is nothing to
+          sign in for, and a chooser there would be a sign-in to nothing. Keyed on
+          `visible` — the same set the rows above render — so the switch and the
+          card cannot disagree about whether KAS is on offer. Gated on KAS being
+          OFFERED rather than SELECTED, so the user can sign in first and switch
+          second instead of paying one "not signed in" turn to find the card.
+          Isolated so a throwing card cannot take the switch down with it. */}
+      {visible.includes(KIRO_SIGN_IN_BACKEND) && (
+        <ErrorBoundary scope="developer-kiro-sign-in" fallback={null}>
+          <KiroSignInCard />
+        </ErrorBoundary>
+      )}
     </>
   )
 }

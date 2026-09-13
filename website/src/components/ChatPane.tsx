@@ -6,7 +6,7 @@ import { SplitGlyph } from './SplitGlyph'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
 import ChatMessageList from '../app-sdk/ChatMessageList'
-import { useChatScrollFollow } from '../app-sdk/useChatScrollFollow'
+import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
@@ -14,6 +14,7 @@ import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
 import ChatDropOverlay, { useChatFileDrop } from './ChatDropOverlay'
 import PendingQuestionCard from './PendingQuestionCard'
+import PendingDecisionCard from './PendingDecisionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
 import ChatFooter from '../pages/chat/ChatFooter'
@@ -35,7 +36,7 @@ import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutat
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
@@ -48,11 +49,13 @@ import FlyingQuote from './FlyingQuote'
 import { revealComposer } from '../pages/chat/composerFocus'
 import { triggerRefresh, updateSlot } from '../store/dashboardSlice'
 import { performSlotSwitch } from '../lib/slotSwitch'
+import { drainPendingChunks } from '../lib/pendingChunkDrain'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
 import { api } from '../api/client'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import { classifyDrop } from '../utils/dropClassify'
 import { prepareSendPayload, serializeDirTokens, spliceDirTokens, VIDEO_EXT } from '../utils/fileTokens'
+import { Composer, type ComposerHandle, type ComposerVoiceOptions } from '../chat-core/composer/Composer'
 import { displayModel } from '../lib/model'
 
 
@@ -80,6 +83,7 @@ export default function ChatPane({
   followContentWidth,
   hideEmptyHint,
   openSideChat,
+  hostsPanelControls,
   busyMode = 'split',
 }: {
   slotKey: string
@@ -120,6 +124,9 @@ export default function ChatPane({
    *  split view's lives in the chat page's activity panel, the Members page's
    *  in its detail drawer. Capability by omission, like `onOpenFull`. */
   openSideChat?: (slot: string) => boolean | void | Promise<boolean | void>
+  /** This pane occupies the workspace's top-right corner. Its title bar hosts
+   *  the reservation for App-owned Side and Terminal toggles. */
+  hostsPanelControls?: boolean
   /** What the composer's send does while the slot is busy. Defaults to
    *  `'split'` — the same Steer/Queue split button as the main chat, which
    *  split-view (⌘D) panes keep: they are the main chat's own sessions seen
@@ -242,15 +249,21 @@ export default function ChatPane({
   const [stopError, setStopError] = useState('')
   const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
   const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
-  // Shared stick-to-bottom follow (same FollowController core as the main
-  // chat's virtualizer): RO-driven re-pin on any content growth or collapse,
-  // released only by a genuine user scroll up, re-armed at the bottom.
-  const follow = useChatScrollFollow({ resetKey: slotKey })
+  // The transcript is virtualized (chat-core P5-e): ChatMessageList owns the
+  // scroller and the stick-to-bottom follow through VirtualTranscript. The pane
+  // keeps the element ref for the pinned-prompt hook, a handle for the jump
+  // pill, and the rendered at-bottom state that shows it.
+  const scrollerRef = useRef<HTMLDivElement | null>(null)
+  const listRef = useRef<VirtualTranscriptHandle | null>(null)
+  const [isAtBottom, setIsAtBottom] = useState(true)
+  const scrollToBottom = useCallback(() => { listRef.current?.scrollToBottom() }, [])
   // Pinned-prompt banner — the same hook the main chat's transcript controller
-  // wears (chat-core P5-d). The pane's transcript is unvirtualized, so the
-  // list to index comes from ChatMessageList (`onDisplayItems` turns its row
-  // indexing on) and the jump back is the hook's in-place glide.
-  const pin = usePinnedPrompt({ scrollerRef: follow.scrollerRef })
+  // wears (chat-core P5-d). The list to index comes from ChatMessageList
+  // (`onDisplayItems` turns its row indexing on); with only the viewport
+  // window mounted, a gap at the hand-off line is unmounted spacer, so the
+  // hook must wait for the row (`requiresMountedHandoff`) exactly as the main
+  // chat does.
+  const pin = usePinnedPrompt({ scrollerRef, requiresMountedHandoff: true })
   const { displayItemsRef: pinItemsRef, updatePinnedPrompt, onScrollPin, setPinned, setPinExpanded } = pin
   const onDisplayItems = useCallback((items: DisplayItem[]) => {
     pinItemsRef.current = items
@@ -259,8 +272,6 @@ export default function ChatPane({
     // timing: the rows carrying the new indices are already in the DOM.
     updatePinnedPrompt()
   }, [pinItemsRef, updatePinnedPrompt])
-  const followOnScroll = follow.onScroll
-  const onScroll = useCallback(() => { followOnScroll(); onScrollPin() }, [followOnScroll, onScrollPin])
   // A different session starts collapsed with nothing pinned.
   useEffect(() => { setPinned(null); setPinExpanded(false) }, [slotKey, setPinned, setPinExpanded])
 
@@ -274,6 +285,19 @@ export default function ChatPane({
   // has_more freezes at mount while a later bounded warm can truncate the cache.
   const warmHasMore = useAppSelector((s) => s.chat.slotPaneHasMore?.[slotKey])
   const paneSlot = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey))
+  // The composer is a `Composer` root around the ChatInput preset (chat-core
+  // P3-b). Its Voice atom is what gives the pane a microphone: the pane wires no
+  // voice props, only the two things the atom cannot know — the endpointer's
+  // auto-submit, and (through the root) that a pane's composer IS its slot's, so
+  // the atom's default on-screen predicate is exact. No push-to-talk here: that
+  // key binding is document-wide and ChatPage owns it (follow-up: focused-pane
+  // ownership). The pane's steer-not-queue rule (#8852) stays on `canSteer`
+  // below until the Send atom exists.
+  const composerRef = useRef<ComposerHandle>(null)
+  const doSendRef = useRef<((optionText?: string) => void) | null>(null)
+  const composerVoiceOptions = useMemo<ComposerVoiceOptions>(() => ({
+    onAutoSubmit: () => { doSendRef.current?.() },
+  }), [])
   // Shared composer-busy rule (chatSlice.selectComposerBusy): main turn
   // streaming OR sub-agents running (dual signal). Drives the queue affordance
   // and skips the optimistic user bubble (the backend returns a "queued"
@@ -467,9 +491,8 @@ export default function ChatPane({
     if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running }))
   }, [slotDetail, slotKey, dispatch, hydrateLimit])
 
-  // Scroll follow (auto-pin, release, jump pill) is owned by useChatScrollFollow
-  // above — the ResizeObserver on the content wrapper replaces the old
-  // message-hash effect, so growth on EARLIER rows (a tool result updating, a
+  // Scroll follow (auto-pin, release, jump pill) is owned by the virtualizer
+  // inside ChatMessageList — growth on EARLIER rows (a tool result updating, a
   // thinking block expanding) and turn-collapse shrink re-pin too.
 
 
@@ -668,6 +691,9 @@ export default function ChatPane({
     // start a real turn instead of queueing. Same `/api/chat` flag as a steer.
     const text = (optionText || input).trim()
     if (!text && !pendingFiles.length) return
+    // A send while STREAMING dictation is live ends the dictation, before the
+    // composer is read and cleared (see useComposerVoice.disarmForSend).
+    composerRef.current?.voice()?.disarmForSend()
     // Capture the stateless card pending at ENTRY (before any state updates
     // or yields): this send consumes the answer channel of the card the user
     // saw when they hit send. Retired only after the server confirms it
@@ -718,7 +744,8 @@ export default function ChatPane({
     const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     // Optimistic user bubble: show immediately in the right position (mirrors the
     // single-chat send). Skipped while busy (main turn streaming OR sub-agents
-    // running) — the backend returns a "queued" message instead, avoiding a duplicate.
+    // running). A real queue has its own card; an immediate dispatch supplies
+    // the skipped row through its correlated user echo.
     const meta = {
       ...(filePaths.length ? { files: filePaths } : {}),
       ...(dirPaths.length ? { dirs: dirPaths } : {}),
@@ -753,6 +780,8 @@ export default function ChatPane({
     // invite a retry that duplicates a turn already in flight, side effects
     // included, so the optimistic composer row stays pending.
     void sendTurn({ message: llm, slot: slotKey, meta, ...(steerNow ? { steer: true } : {}) }).then((receipt) => {
+      if ((receipt.status === 'response-late' || receipt.status === 'transport-error')
+        && selectSendConfirmed(store.getState(), slotKey, sendId)) return
       if (receipt.status === 'refused' || receipt.status === 'transport-error') {
         reportFailedSend(receipt.reason, receipt.status)
         return
@@ -774,26 +803,14 @@ export default function ChatPane({
           // The cost is a visible duplicate (card + refilled draft + notice)
           // when the card did belong to this send; the alternative is silent
           // loss, and the notice says to check the conversation first.
-          const echoed = selectSlotMessages(store.getState(), slotKey).some(m => m.role === 'user' && m.meta?.sendId === sendId)
-          if (!echoed) {
-            restoreIntoComposer(text, files, slotKey)
-            dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } }))
-          }
+          restoreIntoComposer(text, files, slotKey)
+          dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } }))
         }
         return
       }
-      // A steer-flagged send the server neither queued nor injected started a
-      // turn: no `queue_push` or `steer_push` echo is coming, and the busy
-      // rule above skipped the optimistic bubble, so nothing represents the
-      // text. Append it now, addressed to the SENDING slot (ChatPage does the
-      // same, for the same reason). It goes in before the confirm below so
-      // the confirm retires exactly this row.
-      if (steerNow && busy && receipt.status === 'dispatched' && !(receipt.body as { steered?: boolean }).steered && (text || files.length)) {
-        dispatch(appendSlotMessage({
-          slot: slotKey,
-          message: { role: 'user', content: displayTxt, cls: 'msg msg-u', ts: new Date().toISOString(), meta },
-        }))
-      }
+      // The correlated user echo owns insertion before streaming, including
+      // when a busy snapshot skipped the optimistic bubble. A receipt only
+      // confirms an existing row; appending here would duplicate or reorder it.
       // The receipt names the queue entry this send became: bind the
       // pre-send composer state to it so cancelling that card restores the
       // TYPED text and re-stages the files (issue #560). The stash is the
@@ -808,7 +825,7 @@ export default function ChatPane({
         queuedSendStash.set(receipt.body.queue_id, { raw: text, files, sent: llm })
       }
       // The response is the delivery receipt for this pane's optimistic bubble
-      // because no `chat_message` echo is coming for a dashboard send. Only
+      // independently of when its correlated user echo arrives. Only
       // an IMMEDIATE dispatch counts: a queued acceptance is not a receipt for
       // this bubble.
       if (receipt.status === 'dispatched') {
@@ -825,6 +842,9 @@ export default function ChatPane({
       void resolveAskAfterSend(receipt.body, askAtSend, dispatch)
     })
   }, [input, pendingFiles, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure])
+  // The endpointer auto-submit (handed to the Voice atom above) reads the
+  // latest send through this ref.
+  doSendRef.current = doSend
 
   // Mid-turn steer: inject the composer content into the RUNNING turn instead
   // of queueing behind it. The pane's counterpart to ChatPage.steer, on the
@@ -853,6 +873,12 @@ export default function ChatPane({
     // A steer cannot restore what it cleared on an empty payload, so refuse a
     // payload of nothing (mirrors ChatPage.steer's `!raw && !files.length`).
     if (!raw && !files.length) return
+    // A steer while STREAMING dictation is live ends the dictation, like
+    // doSend: this path clears the composer below, and a partial landing after
+    // the clear would rebuild the sent text (see useComposerVoice.disarmForSend).
+    // AFTER the empty-payload check, like doSend: an Enter on an empty composer
+    // before the first partial lands sends nothing and must not end the capture.
+    composerRef.current?.voice()?.disarmForSend()
     const { txt, filePaths } = prepareSendPayload(raw, files)
     const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     // `meta.files` is the ORDERED non-image list the `[attached_file N]`
@@ -862,6 +888,10 @@ export default function ChatPane({
     // channel itself is text-only, but the echo reconciles by merging meta
     // onto this bubble, so the index rides the row from here.
     const steerMeta = { sendId, ...(filePaths.length ? { files: filePaths } : {}) }
+    // Drain the per-frame chunk buffer first, same as ChatPage's steer(): a
+    // pre-steer chunk still pending in useWebSocket's buffer would otherwise
+    // flush BELOW this card (see lib/pendingChunkDrain.ts).
+    drainPendingChunks()
     dispatch(appendSlotMessage({
       slot: slotKey,
       message: { role: 'user', content: txt, cls: 'msg msg-u', ts: new Date().toISOString(), meta: { steer: true, optimistic: true, ...steerMeta } },
@@ -870,8 +900,10 @@ export default function ChatPane({
     setInput('')
     setPendingFiles([])
     void sendTurn({ message: txt, slot: slotKey, steer: true, meta: steerMeta }).then((receipt) => {
+      if ((receipt.status === 'response-late' || receipt.status === 'transport-error')
+        && selectSendConfirmed(store.getState(), slotKey, sendId)) return
       // Receipt policy, same rulings as ChatPage's steerMutation:
-      // - refused / transport-error: nothing was accepted. Drop the bubble
+      // - refused / unconfirmed transport-error: drop the bubble
       //   (left standing it would be a false third copy next to the error row
       //   and the refilled composer), say so in this transcript, hand the
       //   payload back.
@@ -887,8 +919,6 @@ export default function ChatPane({
       //   as delivered), hand the text back, and warn — a duplicate is visible
       //   and deletable, a lost steer is not.
       if (receipt.status === 'response-late') {
-        const bubble = selectSlotMessages(store.getState(), slotKey).find(m => m.role === 'user' && m.meta?.sendId === sendId)
-        if (bubble && !bubble.meta?.optimistic) return
         dispatch(resolveOptimisticSteer({ slot: slotKey, sendId, outcome: 'queued' }))
         restoreIntoComposer(raw, files, slotKey)
         // \u26A0 is NoticeCard's warn-tone selector (parseNotice).
@@ -1125,11 +1155,7 @@ export default function ChatPane({
            auditing focus behaviour. */
         data-chat-pane={focused ? 'focused' : ''}
         {...dropTargetProps}
-        className={`relative flex flex-col h-full min-h-0 overflow-hidden bg-bg ${
-          frameless
-            ? ''
-            : `rounded-lg border transition-colors ${focused ? 'border-accent' : 'border-border'}`
-        }`}
+        className="relative flex flex-col h-full min-h-0 overflow-hidden bg-bg"
         style={{
           '--mc-content-width': followContentWidth ? CONTENT_WIDTH[chatConfig.contentWidth].messages : '100%',
           // Split-view panes leave --mc-input-width UNSET so ChatInput keeps
@@ -1137,35 +1163,41 @@ export default function ChatPane({
           ...(followContentWidth ? { '--mc-input-width': CONTENT_WIDTH[chatConfig.contentWidth].input } : {}),
         } as React.CSSProperties}
       >
+        {/* The title row sits at z-10: above the pane's own layers (the z-[1] /
+            z-[2] message chrome below) and nothing else. The pane root opens no
+            stacking context, so a page-level value here competes with the shell:
+            at z-50 the split-pane headers painted over the mobile workspace
+            overlay (z-[47]) and the drawer scrim (z-[46]), hiding the panel's
+            tab strip under the pane titles. This row is flex-flow chrome, not
+            an overlay, and stays below every shell layer. */}
         {!frameless && (
-        <div className="relative z-50 flex items-center gap-2 px-3 py-2 border-b border-border bg-card shrink-0">
-          <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-ok animate-pulse' : 'bg-accent'}`} />
-          <span className="text-[13px] font-semibold text-text-strong truncate min-w-0">{title}</span>
-          {parentKey && (
-            <span
-              className="shrink-0 text-[10px] text-accent bg-accent/10 rounded-full px-1.5 py-0.5 truncate max-w-[38%]"
-              title={i18nT('components.chatPane.forked_from', { name: parentTitle || parentKey })}
-            >
-              ↳ {parentTitle || parentKey}
-            </span>
-          )}
-          <span className="flex-1" />
-          {running && <span className="shrink-0 text-[10px] text-ok font-mono">{streamState}</span>}
-          {onSplitRight && (
-            <button onClick={onSplitRight} title={i18nT('components.chatPane.split_right_d')} aria-label={i18nT('components.chatPane.split_right')} className="shrink-0 p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer bg-transparent border-none transition-colors">
-              <SplitGlyph />
-            </button>
-          )}
-          {onSplitDown && (
-            <button onClick={onSplitDown} title={i18nT('components.chatPane.split_down')} aria-label={i18nT('components.chatPane.split_down')} className="shrink-0 p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer bg-transparent border-none transition-colors">
-              <SplitGlyph down />
-            </button>
-          )}
-          {onRemove && (
-            <button onClick={onRemove} title={i18nT('components.chatPane.close_pane')} aria-label={i18nT('components.chatPane.close_pane')} className="shrink-0 rounded text-muted hover:text-danger hover:bg-danger/10 cursor-pointer p-1 transition-colors bg-transparent border-none">
-              <X size={15} />
-            </button>
-          )}
+        <div className="panel-toolbar relative z-10 flex items-center gap-2 pl-3 pr-2 bg-bg shrink-0">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-ok animate-pulse' : 'bg-accent'}`} />
+            <span className="text-[13px] font-semibold text-text-strong truncate min-w-0">{title}</span>
+            {parentKey && <span className="shrink-0 text-[10px] text-accent bg-accent/10 rounded-full px-1.5 py-0.5 truncate max-w-[38%]" title={i18nT('components.chatPane.forked_from', { name: parentTitle || parentKey })}>↳ {parentTitle || parentKey}</span>}
+            {running && <span className="shrink-0 text-[10px] text-ok font-mono">{streamState}</span>}
+          </div>
+          {/* The host attribute sits on the actions group, not the toolbar: the
+              reservation it adds must stack on the toolbar's 8px trailing inset,
+              which putting it on the toolbar would replace. */}
+          <div data-pane-controls data-panel-controls-host={hostsPanelControls ? 'chat' : undefined} className="panel-toolbar-actions flex items-center shrink-0">
+            {onSplitRight && (
+              <button onClick={onSplitRight} title={i18nT('components.chatPane.split_right_d')} aria-label={i18nT('components.chatPane.split_right')} className="shrink-0 p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer bg-transparent border-none transition-colors">
+                <SplitGlyph />
+              </button>
+            )}
+            {onSplitDown && (
+              <button onClick={onSplitDown} title={i18nT('components.chatPane.split_down')} aria-label={i18nT('components.chatPane.split_down')} className="shrink-0 p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer bg-transparent border-none transition-colors">
+                <SplitGlyph down />
+              </button>
+            )}
+            {onRemove && (
+              <button onClick={onRemove} title={i18nT('components.chatPane.close_pane')} aria-label={i18nT('components.chatPane.close_pane')} className="shrink-0 rounded text-muted hover:text-danger hover:bg-danger/10 cursor-pointer p-1 transition-colors bg-transparent border-none">
+                <X size={15} />
+              </button>
+            )}
+          </div>
         </div>
         )}
 
@@ -1206,67 +1238,84 @@ export default function ChatPane({
           )}
         </div>
 
-        {/* stable theming hook 'chat-container' — see website/docs/theming-contract.md */}
-        {/* overflow-x-hidden: `overflow-y-auto` alone leaves overflow-x at
-            `visible`, which CSS then forces to compute to `auto` — so any single
-            over-wide child (a long unbroken path, a wide code block, a widget)
-            gives the WHOLE message list a draggable horizontal scrollbar that
-            sits right above the composer. The conversation should never pan
-            sideways; wide children scroll within themselves. */}
-        <div ref={follow.scrollerRef} onScroll={onScroll} className="chat-container flex-1 overflow-y-auto overflow-x-hidden py-3 min-h-0">
-          <div ref={follow.contentRef}>
-          {slotDetailFailed && (
-            <div className="mx-4 my-2 flex items-start gap-2">
-              {/* No hand-off: the composer draft (`input`) in this pane is unsaved local
-                  state. The retry is the recovery path for the hydration read. */}
-              <ErrorNotice
-                className="flex-1"
-                testId="chat-pane-hydrate-error"
-                message={i18nT('components.chatPane.history_load_failed')}
+        {/* The scroller (theming hook 'chat-container', overflow contract,
+            sentinels/spacers) is ChatMessageList's virtualized mount — see
+            TranscriptScrollShell for the style contract it enforces. */}
+        <ChatMessageList
+          ref={listRef}
+          messages={messages}
+          // The slot's own liveness too, not only this session's stream: a
+          // DM/member pane observing a turn driven elsewhere still follows.
+          running={running || !!paneSlot?.running}
+          renderers={renderers}
+          hideCardOwnedOAuth={connectionsUiOn}
+          onDisplayItems={onDisplayItems}
+          hiddenRow={pinHiddenRow}
+          onQuote={onQuote}
+          onAsk={onAsk}
+          transcript={{
+            sessionId: `pane:${slotKey}`,
+            scrollerRef,
+            onScroll: onScrollPin,
+            onAtBottomChange: setIsAtBottom,
+            scrollerStyle: { paddingTop: 12, paddingBottom: 12, minHeight: 0 },
+            aboveRows: (
+              <>
+                {slotDetailFailed && (
+                  <div className="mx-4 my-2 flex items-start gap-2">
+                    {/* No hand-off: the composer draft (`input`) in this pane is unsaved local
+                        state. The retry is the recovery path for the hydration read. */}
+                    <ErrorNotice
+                      className="flex-1"
+                      testId="chat-pane-hydrate-error"
+                      message={i18nT('components.chatPane.history_load_failed')}
+                    />
+                    <Btn onClick={() => { void refetchSlotDetail() }}>{i18nT('components.chatPane.retry')}</Btn>
+                  </div>
+                )}
+                {messages.length === 0 && !running && !slotDetailFailed && !hideEmptyHint && (
+                  <div className="text-center text-muted text-[13px] py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
+                )}
+                {/* Suppressed on the active slot: that pane renders the store's full
+                    history, so the bound does not apply and the row would be false. */}
+                {warmHasMore && slotKey !== activeSlot && onOpenFull && (
+                  <button
+                    onClick={() => onOpenFull(slotKey, messages[0]?.ts, messages[0]?.meta?.mid as string | undefined)}
+                    className="block w-full text-center text-accent text-[12px] underline py-2 bg-transparent border-none cursor-pointer hover:text-accent-hover transition-colors"
+                  >
+                    {i18nT('components.chatPane.earlier_messages_open_session')}
+                  </button>
+                )}
+              </>
+            ),
+            belowRows: (
+              /* The same working indicator the full chat page shows (the ghost-pose
+                 carousel, theme-swappable via themeBranding): a running turn in a
+                 pane — a member DM, a split pane — was otherwise invisible between
+                 tool steps. Inside the scroll container, after the last message,
+                 so it reads as "the reply is coming" exactly where the reply will
+                 land. Stop/regenerate chrome stays page-level: the pane derives
+                 the footer's inputs from its own per-slot stream state. */
+              <ChatFooter
+                running={running || !!paneSlot?.running}
+                stopping={streamState === 'stopping' || !!paneSlot?.stopping}
+                state={streamState}
+                lastRole={messages[messages.length - 1]?.role ?? ''}
+                streamTick={
+                  messages[messages.length - 1]?.role === 'streaming'
+                    ? (messages[messages.length - 1]?.content.length ?? 0)
+                    : 0
+                }
               />
-              <Btn onClick={() => { void refetchSlotDetail() }}>{i18nT('components.chatPane.retry')}</Btn>
-            </div>
-          )}
-          {messages.length === 0 && !running && !slotDetailFailed && !hideEmptyHint && (
-            <div className="text-center text-muted text-[13px] py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
-          )}
-          {/* Suppressed on the active slot: that pane renders the store's full
-              history, so the bound does not apply and the row would be false. */}
-          {warmHasMore && slotKey !== activeSlot && onOpenFull && (
-            <button
-              onClick={() => onOpenFull(slotKey, messages[0]?.ts, messages[0]?.meta?.mid as string | undefined)}
-              className="block w-full text-center text-accent text-[12px] underline py-2 bg-transparent border-none cursor-pointer hover:text-accent-hover transition-colors"
-            >
-              {i18nT('components.chatPane.earlier_messages_open_session')}
-            </button>
-          )}
-          <ChatMessageList messages={messages} running={running} renderers={renderers} hideCardOwnedOAuth={connectionsUiOn} onDisplayItems={onDisplayItems} hiddenRow={pinHiddenRow} onQuote={onQuote} onAsk={onAsk} />
-          {/* The same working indicator the full chat page shows (the ghost-pose
-              carousel, theme-swappable via themeBranding): a running turn in a
-              pane — a member DM, a split pane — was otherwise invisible between
-              tool steps. Inside the scroll container, after the last message,
-              so it reads as "the reply is coming" exactly where the reply will
-              land. Stop/regenerate chrome stays page-level: the pane derives
-              the footer's inputs from its own per-slot stream state. */}
-          <ChatFooter
-            running={running || !!paneSlot?.running}
-            stopping={streamState === 'stopping' || !!paneSlot?.stopping}
-            state={streamState}
-            lastRole={messages[messages.length - 1]?.role ?? ''}
-            streamTick={
-              messages[messages.length - 1]?.role === 'streaming'
-                ? (messages[messages.length - 1]?.content.length ?? 0)
-                : 0
-            }
-          />
-          </div>
-        </div>
+            ),
+          }}
+        />
         {/* Bottom fade overlays the scroller's last 24px above the status bars
             and composer (in-flow height cancelled by its own negative margin). */}
         <EdgeFade side="bottom" />
 
         <div className="relative">
-        <JumpToBottomButton visible={!follow.isAtBottom && messages.length > 0} onClick={follow.scrollToBottom} />
+        <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={scrollToBottom} />
 
         <SubagentProgressBar slot={slotKey} />
 
@@ -1310,6 +1359,33 @@ export default function ChatPane({
           }}
         />
 
+        {/* Buried [OPTIONS:] decision, per pane like the question card above —
+            in split mode the loop that buried its ask may not be the pane the
+            user is looking at. The question card owns the band when both are
+            pending (sidebar precedence: needs_input outranks pending_decision);
+            needs_input rides the same slot payload as pending_decision, so the
+            gate holds even while the async questions map is still hydrating. */}
+        {!pendingQuestion && !paneSlot?.needs_input && paneSlot?.pending_decision && (
+          <div className="mx-4 mb-2">
+            <PendingDecisionCard
+              slotKey={slotKey}
+              decision={paneSlot.pending_decision}
+              onPick={(o) => setInput((prev) => (prev.trim() ? `${prev.trimEnd()}, ${o}` : o))}
+              onSendDirect={(o) => {
+                // Same failure recovery as the question card's fallback send:
+                // a refused/failed direct send goes back into the composer
+                // rather than vanishing.
+                void sendTurn({ message: o, slot: slotKey }).then((receipt) => {
+                  if (receipt.status === 'refused' || receipt.status === 'transport-error' || receipt.status === 'response-late') {
+                    reportSendFailure(receipt.reason, receipt.status)
+                    restoreIntoComposer(o, [], slotKey)
+                  }
+                })
+              }}
+            />
+          </div>
+        )}
+
         {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
         <ErrorNotice
           className="mx-4 mt-2 mb-0 animate-rise"
@@ -1342,6 +1418,13 @@ export default function ChatPane({
             shape as ChatPage's inputAreaRef). */}
         {quoteFlight && <FlyingQuote text={quoteFlight.text} from={quoteFlight.from} targetRef={inputAreaRef} onComplete={endQuoteFlight} />}
         <div ref={inputAreaRef} className="relative z-10">
+        <Composer
+          ref={composerRef}
+          slotKey={slotKey}
+          value={input}
+          onChange={setInput}
+          voice={composerVoiceOptions}
+        >
         <ChatInput
           value={input}
           onChange={setInput}
@@ -1441,6 +1524,7 @@ export default function ChatPane({
           onDragOver={dropTargetProps.onDragOver}
           onDragLeave={dropTargetProps.onDragLeave}
         />
+        </Composer>
         </div>
         </div>
 
@@ -1476,7 +1560,7 @@ export default function ChatPane({
               <AgentDropdownList agents={agentDD.filtered} activeAgent={paneAgentName} defaultAgent={defaultAgent} onSelect={(name) => { switchAgent(name); agentDD.setOpen(false) }} />
             </div>
             <DefaultAgentRow agentName={paneAgentName} isDefault={paneAgentName === defaultAgent} onSetDefault={() => toggleDefaultAgent(paneAgentName)} />
-            <ManageAgentsFooter error={defaultAgentFailed} onManage={() => { agentDD.setOpen(false); navigate('/capabilities?tab=templates') }} />
+            <ManageAgentsFooter error={defaultAgentFailed} onManage={() => { agentDD.setOpen(false); navigate('/capabilities?tab=crews') }} />
           </div>,
           document.body,
         )}

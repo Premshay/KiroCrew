@@ -1088,7 +1088,7 @@ class TranscriptReadProjection:
                     return cached[2], True
                 with open(path, encoding="utf-8") as handle:
                     first = handle.readline().strip()
-            except OSError:
+            except (OSError, UnicodeError):
                 if attempt + 1 < attempts:
                     self._log._pause_for_transient_retry()
                     continue
@@ -1108,7 +1108,10 @@ class TranscriptReadProjection:
                     data if isinstance(data, dict) and data.get("_type") == "metadata" else {}
                 )
             except json.JSONDecodeError:
-                metadata = {}
+                # A damaged first line cannot establish whether this was a
+                # member session. Keep get_metadata's legacy empty-dict view,
+                # but tell identity-sensitive readers to refuse the operation.
+                return {}, False
             self._log._publish_if_current(
                 self._log._meta_cache,
                 key,
@@ -1338,8 +1341,8 @@ class SessionMetadataProjection:
         only_if_closed_before: float | None = None,
     ) -> None:
         """Remove a stale closed marker with an optional compare-and-clear."""
-        path = self._log._path(key)
         with self._log._locked(key):
+            path = self._log._path(key)
             if not path.exists():
                 return
             previous_mtime = _history_facade()._safe_mtime(path)

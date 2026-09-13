@@ -70,14 +70,28 @@ def test_runtime_binding_is_whitelisted_and_preserves_caller_settings(monkeypatc
     assert binding["extra_env"] == {"API_TIMEOUT_MS": "300000"}
 
 
+async def _plan_claude_spawn(runtime: AcpRuntime, monkeypatch) -> None:
+    """Resolve the runtime's spawn plan through the claude harness, binary pinned.
+
+    The model and the ``claudeCode`` envelope are what the harness's plan says
+    every session on the process needs, so a session started without the plan
+    having run would test a runtime no production caller can build.
+    """
+    from kiro_crew.acp import client as client_mod
+
+    monkeypatch.setattr(client_mod, "_resolve_claude_acp_bin", lambda: (["claude-agent-acp"], ""))
+    await runtime._resolve_spawn_plan()
+
+
 @pytest.mark.asyncio
-async def test_claude_runtime_uses_bound_session_set_model():
+async def test_claude_runtime_uses_bound_session_set_model(monkeypatch):
     runtime = AcpRuntime(
         work_dir="/tmp",
         acp_backend=ACP_BACKEND_CLAUDE,
         model="fast",
         model_switch_method="session_set_model",
     )
+    await _plan_claude_spawn(runtime, monkeypatch)
     runtime._initialized = True
     runtime._send_and_await = AsyncMock(return_value={"sessionId": "claude-session"})
 
@@ -98,8 +112,9 @@ async def test_claude_runtime_uses_bound_session_set_model():
 
 
 @pytest.mark.asyncio
-async def test_claude_runtime_uses_config_option_without_bound_switch_method():
+async def test_claude_runtime_uses_config_option_without_bound_switch_method(monkeypatch):
     runtime = AcpRuntime(work_dir="/tmp", acp_backend=ACP_BACKEND_CLAUDE, model="fast")
+    await _plan_claude_spawn(runtime, monkeypatch)
     runtime._initialized = True
     runtime._send_and_await = AsyncMock(return_value={"sessionId": "claude-session"})
 

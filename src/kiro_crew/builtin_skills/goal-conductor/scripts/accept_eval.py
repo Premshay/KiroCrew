@@ -8,6 +8,11 @@ verb: no field from stdin contributes to a command or argv.
 
 Usage:
     python3 accept_eval.py < items.json
+    python3 accept_eval.py --help      # this block, on stderr, exit 2
+
+The input arrives on STDIN. Invoked with nothing piped in (a terminal) or with
+``-h``/``--help``, this script prints this block and exits 2 instead of
+blocking on a read that would look like a hang.
 
 stdin (JSON):
     {"items": [
@@ -37,7 +42,40 @@ import sys
 _PRODUCT_COMMAND = ("kirocrew", "_acceptance-evaluate")
 
 
+def _usage_text() -> str:
+    """The Usage..exit-code part of the module docstring, verbatim.
+
+    Sliced out of ``__doc__`` instead of duplicated, so help a caller reads can
+    never drift from the contract documented above it. ``python -OO`` strips
+    docstrings, hence the one-line fallback.
+    """
+    doc = __doc__ or ""
+    start = doc.find("Usage:")
+    end = doc.find("The adapter is stdlib-only")
+    if start < 0 or end <= start:
+        return "Usage: python3 accept_eval.py < items.json"
+    return doc[start:end].rstrip()
+
+
+def _stdin_is_a_tty() -> bool:
+    """Is stdin a terminal? A closed or detached stdin counts as not one."""
+    try:
+        return bool(sys.stdin is not None and sys.stdin.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
 def main() -> int:
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args or _stdin_is_a_tty():
+        # Run with nothing piped in, the product evaluator's stdin read blocks
+        # on a read that never completes: from a caller's side that is a tool
+        # timeout, an approval spent, and no output - not "you forgot the
+        # input". Say what the input is and stop, before any subprocess starts.
+        # Exit 2 is the code malformed input already uses, so nothing that
+        # pipes real input sees a new outcome.
+        print(_usage_text(), file=sys.stderr)
+        return 2
     try:
         return subprocess.run(
             _PRODUCT_COMMAND,
