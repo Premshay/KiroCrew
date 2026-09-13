@@ -638,6 +638,17 @@ class TestSpawn:
         assert "gpt-5-codex" not in plan.argv
 
     @pytest.mark.asyncio
+    async def test_the_model_is_handed_to_the_runtime_per_session(self, adapter, mask_resolved):
+        """A direct runtime consumer has no provider to apply it; unset stays unset."""
+        from kiro_crew.acp import client as client_mod
+
+        with patch.object(
+            client_mod, "_resolve_codex_acp_bin", return_value=(["/n/node", "/p/index.js"], "/s")
+        ):
+            assert (await adapter.resolve_spawn(_ctx())).session_model == "gpt-5-codex"
+            assert (await adapter.resolve_spawn(_ctx(model=None))).session_model is None
+
+    @pytest.mark.asyncio
     async def test_crew_never_owns_this_host_credential(self, adapter, mask_resolved):
         """codex raises nothing at Crew, so a process expecting a callback would wait."""
         from kiro_crew.acp import client as client_mod

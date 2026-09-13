@@ -193,10 +193,14 @@ class CodexHarness(MembershipHarness):
             # "searched ..." line can never name a directory the search skipped.
             raise AcpRuntimeError(client_mod.codex_acp_not_found_message(search_path))
         hidden, expose = await resolve_spawn_masks(ctx.sandbox_mode)
+        # The model still goes over the pipe, never argv. A direct runtime consumer
+        # (Sage's review pool) has no provider behind it to apply one, so without
+        # this every review silently ran the adapter's default model.
         return SpawnPlan(
             argv=list(argv),
             extra_hidden_dirs=hidden,
             extra_expose_files=expose,
+            session_model=ctx.model or None,
         )
 
     def apply_spawn_env(self, env: dict[str, str]) -> None:
