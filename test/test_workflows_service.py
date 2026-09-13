@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import kiro_crew.llm_helpers as llm_helpers
+import kiro_crew.workflows.service as workflow_service
 from kiro_crew.acp.runtime import AcpRequestTimeout
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.session import SessionManager
@@ -152,8 +153,14 @@ async def test_author_returns_valid_script(monkeypatch) -> None:
     assert out["ok"] is True
 
 
-async def test_author_uses_isolated_destroyed_lite_session(monkeypatch) -> None:
-    """Authoring destroys its production SessionManager session completely."""
+async def test_author_uses_isolated_destroyed_lite_session(monkeypatch, tmp_path) -> None:
+    """Authoring destroys its production SessionManager session completely.
+
+    The agents dir is pinned empty, so this exercises the fallback identity. Left
+    to the environment, the assertion would pass or fail by whether the machine
+    running it happens to have the dedicated author spec installed.
+    """
+    monkeypatch.setattr(workflow_service, "kiro_agents_dir", lambda: tmp_path)
     _patch_stream(monkeypatch, [GOOD_SCRIPT])
     config = KiroCrewConfig()
     providers: list[AsyncMock] = []
@@ -190,6 +197,50 @@ async def test_author_uses_isolated_destroyed_lite_session(monkeypatch) -> None:
         await sessions.close_all()
         assert flush_task.done()
         assert sessions._session_map._flush_task is None
+
+
+async def test_author_runs_under_its_own_identity_when_installed(monkeypatch, tmp_path) -> None:
+    """With the dedicated spec present, authoring asks for that agent by name.
+
+    The name is what an engine map keys on, so this is the whole point of the
+    identity: an author turn carries far more input than a background one-liner,
+    and sharing kirocrew-lite's name pins both to one lane.
+    """
+    (tmp_path / "kirocrew-workflow-author.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(workflow_service, "kiro_agents_dir", lambda: tmp_path)
+    _patch_stream(monkeypatch, [GOOD_SCRIPT])
+    agents: list[str] = []
+
+    def provider_factory(session_key=None, agent=None, channel_id=None, **kwargs):
+        provider = AsyncMock()
+        provider.start = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.is_process_alive = lambda: True
+        provider.context_usage_pct = lambda: 0.0
+        provider.has_active_turn = lambda: False
+        provider.cwd = ""
+        agents.append(agent or "")
+        return provider
+
+    sessions = SessionManager(KiroCrewConfig(), provider_factory=provider_factory)
+    svc = WorkflowService(sessions=sessions, persist=False)
+    try:
+        out = await svc.author("do a tiny thing")
+        assert out["ok"] is True
+        assert agents == ["kirocrew-workflow-author"]
+    finally:
+        sessions._session_map.set("dashboard:pending-close", "sid-pending-close")
+        await sessions.close_all()
+
+
+def test_an_unreadable_agents_dir_falls_back_to_lite(monkeypatch) -> None:
+    """No answer about the spec is treated as not installed, never as a failure."""
+
+    def _boom():
+        raise OSError("agents dir unreadable")
+
+    monkeypatch.setattr(workflow_service, "kiro_agents_dir", _boom)
+    assert workflow_service._resolve_author_agent() == "kirocrew-lite"
 
 
 async def test_author_success_survives_teardown_failure(monkeypatch, caplog) -> None:

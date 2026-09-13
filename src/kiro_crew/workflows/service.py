@@ -29,6 +29,7 @@ from typing import Any, Callable, Optional
 from kiro_crew import autonudge
 from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.runtime import AcpRequestTimeout, AcpRuntimeDead
+from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.llm_helpers import (
     ToolApprovalPolicy,
     acp_error_is_transient,
@@ -68,6 +69,36 @@ _AUTHOR_REFERENCE_SOURCE_CHARS = 16000
 # transients qualify, and every retry receives a fresh isolated session key.
 _AUTHOR_STARTUP_ATTEMPTS = 3
 _AUTHOR_STARTUP_BACKOFF_SECS = (0.25, 0.75)
+
+# Authoring runs under its own agent identity, not the generic tool-less
+# ``kirocrew-lite``. The two are the same shape — no tools, no MCP, no prompt —
+# but they are not the same WORKLOAD: a background one-liner is a few hundred
+# tokens, while an author turn carries the template, the user's intent and any
+# matched saved workflows, observed at 19k-42k. Where a deployment routes agents
+# to engines by identity, sharing one identity forces both onto the lane sized
+# for the small one, and every author turn then overflows on arrival. A distinct
+# name is the lever that lets the author be placed on a lane its input fits.
+_AUTHOR_AGENT = "kirocrew-workflow-author"
+# Used when the dedicated agent is not installed, so an install that never
+# created it keeps authoring exactly as before rather than failing to start.
+_AUTHOR_FALLBACK_AGENT = "kirocrew-lite"
+
+
+def _resolve_author_agent() -> str:
+    """The dedicated author agent when its spec is installed, else ``kirocrew-lite``.
+
+    Resolved per authoring run rather than at import, so installing or removing
+    the spec takes effect on the next workflow without a gateway restart. Any
+    failure to inspect the agents directory reads as "not installed": falling
+    back keeps authoring working, which is the safe direction for a name whose
+    only purpose is routing.
+    """
+    try:
+        if (kiro_agents_dir() / f"{_AUTHOR_AGENT}.json").is_file():
+            return _AUTHOR_AGENT
+    except Exception:  # noqa: BLE001 - an unreadable agents dir must not break authoring
+        logger.debug("could not inspect the agents dir for the author agent", exc_info=True)
+    return _AUTHOR_FALLBACK_AGENT
 
 
 def _author_startup_retryable(exc: BaseException) -> bool:
@@ -687,21 +718,24 @@ class WorkflowService:
         # never pollutes (or is polluted by) chat, consolidation, or other runs.
         #
         # Cost: authoring is pure text generation (intent → Python script), so it
-        # uses the tool-less ``kirocrew-lite`` agent. That is the lever that makes a
-        # fresh session cheap: the dominant cold-start cost was loading the full
-        # MCP toolset + system prompt; lite carries no tools, so the turn is just
-        # the generation. REJECT_ALL is belt-and-suspenders against an alternate
-        # ACP backend injecting tools without set_mode. The session is destroyed
-        # the instant authoring finishes — nothing remains registered or resumable.
+        # uses a tool-less agent. That is the lever that makes a fresh session
+        # cheap: the dominant cold-start cost was loading the full MCP toolset +
+        # system prompt; a tool-less agent carries none, so the turn is just the
+        # generation. The identity is its own (see _resolve_author_agent) so it can
+        # be placed on a lane sized for an author's input. REJECT_ALL is
+        # belt-and-suspenders against an alternate ACP backend injecting tools
+        # without set_mode. The session is destroyed the instant authoring
+        # finishes — nothing remains registered or resumable.
         provider: Any = None
         key = ""
+        author_agent = _resolve_author_agent()
         for startup_attempt in range(1, _AUTHOR_STARTUP_ATTEMPTS + 1):
             # A fresh key per attempt prevents a half-created session from being
             # reclaimed after a timeout. SessionManager owns provider hard-kill
             # cleanup when startup fails before registration.
             key = f"wf-author:{self._new_run_id()}:a{startup_attempt}"
             try:
-                provider, *_ = await self._sessions.get_or_create(key, agent="kirocrew-lite")
+                provider, *_ = await self._sessions.get_or_create(key, agent=author_agent)
             except Exception as exc:
                 try:
                     await self._sessions.destroy(key)
