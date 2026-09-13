@@ -31,9 +31,12 @@ record is a visible `work_item_store_corrupt` failure; unlike the small resume
 ledger, it is never treated as an empty store. A missing record is the only
 empty state.
 
-Closing a dashboard tab preserves active cycles and archives. Permanent history
-deletion cancels/destroys the session first, then purges matching work-item
-stores by exact key and breadcrumb fold alongside the session ledger.
+Closing a dashboard tab preserves active cycles and archives, and so does
+permanent history deletion. Like the session ledger, pins and autocompact
+overrides, a work-item store is independent session state: another process can
+recreate or restore the same key after the delete's owner scan, so purging it
+could destroy a successor's delegation record. A stale store is reversible; that
+loss is not. `purge` and `purge_matching` remain for explicit cleanup.
 
 ## Data and state machine
 
