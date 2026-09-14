@@ -307,6 +307,23 @@ def test_every_tier_routes_all_six_mounts_through_the_guard() -> None:
         assert script.count("_mount_or_die(") == 7  # 1 def + 6 call sites
 
 
+def test_launcher_refuses_before_mounts_if_the_child_keeps_the_host_namespace() -> None:
+    """A successful handshake is not enough: the child must have a distinct mount NS.
+
+    This is deliberately placed before the mount-control checks.  A child that has
+    not crossed the namespace boundary must never reach the propagation or bind-mount
+    calls, because those calls would alter the gateway's live mount table.
+    """
+    script = _build_launcher_script("strict")
+    host_marker = '_host_mount_namespace = os.stat("/proc/self/ns/mnt").st_ino'
+    child_marker = '_child_mount_namespace = os.stat(f"/proc/{pid}/ns/mnt").st_ino'
+    refuse_marker = "child did not enter a distinct mount namespace"
+    assert host_marker in script
+    assert child_marker in script
+    assert refuse_marker in script
+    assert script.index(refuse_marker) < script.index("# Private mount propagation")
+
+
 # --------------------------------------------------------------------------
 # Write carve-out: the ONE access-WIDENING pair, and it fails OPEN
 # --------------------------------------------------------------------------
