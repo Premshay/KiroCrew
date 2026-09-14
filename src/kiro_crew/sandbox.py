@@ -4944,6 +4944,10 @@ def main():
     if not argv:
         sys.exit("sandbox_launcher: no command given")
 
+    # A child must have a separate mount namespace before it mounts Crew ceilings;
+    # otherwise a bind mount can conceal or overwrite the gateway's live state.
+    _host_mount_namespace = os.stat("/proc/self/ns/mnt").st_ino
+
     # Export this launcher's HOST pid before any fork/namespace work. The
     # gateway records exactly this pid (its direct Popen child) when it
     # writes ``session_pid_<pid>.txt`` on session claim, so in-sandbox
@@ -4975,6 +4979,17 @@ def main():
         # before allowing it to run. A nested private view cannot forge this.
         if os.read(c2p_r, 1) != b"n":
             sys.exit("sandbox: FATAL - child did not publish its namespace readiness")
+        try:
+            _child_mount_namespace = os.stat(f"/proc/{{pid}}/ns/mnt").st_ino
+        except OSError as exc:
+            sys.exit(
+                "sandbox: FATAL - could not inspect the child mount namespace: %s" % exc
+            )
+        if _child_mount_namespace == _host_mount_namespace:
+            sys.exit(
+                "sandbox: FATAL - child did not enter a distinct mount namespace; "
+                "refusing before any bind mount can affect gateway state"
+            )
         os.close(c2p_r)
         _namespace_dir = {str(config_dir().resolve() / "member-memory-bindings" / "pids")!r}
         os.makedirs(_namespace_dir, mode=0o700, exist_ok=True)
