@@ -40,10 +40,16 @@ class TestConsolidateAgent:
     def test_consolidation_call_uses_its_own_identity(self) -> None:
         """Pin the identity at the call site: falling back to the shared lite
         identity would silently re-inherit lite's small-context routing."""
-        import kiro_crew.history as history
+        # The identity is a constructor default the call site forwards, and both
+        # live in ``history_consolidation`` -- ``history`` is only a facade.
+        import kiro_crew.history_consolidation as history_consolidation
+        from kiro_crew.history import HistoryConsolidator
 
-        src = inspect.getsource(history)
-        assert 'agent="kirocrew-consolidate"' in src
+        src = inspect.getsource(history_consolidation)
+        assert 'consolidation_agent: str = "kirocrew-consolidate"' in src
+        assert "agent=self._consolidation_agent" in inspect.getsource(
+            HistoryConsolidator._call_llm
+        )
 
     def test_consolidation_uses_its_own_session_key(self) -> None:
         """Pin the dedicated session key: under the shared BACKGROUND_KEY the
@@ -60,8 +66,11 @@ class TestConsolidateAgent:
         # the call site, or the assertion inspects a facade and always passes.
         import kiro_crew.history_consolidation as history_consolidation
 
+        # The shared-store turn passes the key in a kwargs dict, because a
+        # private V2 store turn must NOT pass one (background_turn mints and
+        # retires its own key, and rejects a caller-supplied one).
         src = inspect.getsource(history_consolidation)
-        assert "session_key=_CONSOLIDATE_SESSION_KEY" in src
+        assert '"session_key": _CONSOLIDATE_SESSION_KEY' in src
 
     def test_consolidation_session_is_bounded(self) -> None:
         import kiro_crew.history as history
@@ -69,7 +78,7 @@ class TestConsolidateAgent:
         from kiro_crew.session import CONSOLIDATE_KEY
 
         call_llm_src = inspect.getsource(HistoryConsolidator._call_llm)
-        assert "reset_conversation=True" in call_llm_src
+        assert '"reset_conversation": True' in call_llm_src
         assert history._CONSOLIDATE_SESSION_KEY == CONSOLIDATE_KEY
 
     def test_consolidate_key_registered_stateless(self) -> None:
@@ -77,10 +86,15 @@ class TestConsolidateAgent:
         # key through the constants it is handed, so both halves are pinned: the
         # allocator consults ``consolidate_key``, and the manager binds that slot
         # to ``CONSOLIDATE_KEY``. Either half alone lets the key resume.
+        # ``get_or_create`` only wraps the allocation in an ownership reservation;
+        # the resume decision is made in ``_get_or_create_impl``.
         from kiro_crew.session_allocation import SessionAllocationService
 
-        assert "constants.consolidate_key" in inspect.getsource(
+        assert "_get_or_create_impl(" in inspect.getsource(
             SessionAllocationService.get_or_create
+        )
+        assert "constants.consolidate_key" in inspect.getsource(
+            SessionAllocationService._get_or_create_impl
         )
 
         import kiro_crew.session as session

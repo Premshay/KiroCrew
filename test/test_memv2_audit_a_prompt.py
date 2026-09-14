@@ -21,6 +21,20 @@ from kiro_crew.skills import SkillsLoader
 env = _essential_env
 
 
+def _inner_client():
+    """Inner AcpClient mock that matches the handlers ``_run_chat`` registers.
+
+    ``set_claude_autonomous_turn_handler`` is ``async def`` on the fork's
+    ``AcpClient`` and ``_run_chat`` awaits it; awaiting a bare ``Mock`` child
+    raises before the prompt is ever sent. ``set_claude_idle_handler`` is sync.
+    """
+    return Mock(
+        pop_pending_oauth_requests=Mock(return_value=[]),
+        set_claude_autonomous_turn_handler=AsyncMock(),
+        set_claude_idle_handler=Mock(),
+    )
+
+
 def builder(tmp_path, log=None):
     return ContextBuilder(
         memory=MemoryStore(workspace=tmp_path / "memory"),
@@ -88,7 +102,7 @@ def test_distinct_execution_template_still_has_its_instructions(env):
 async def test_runner_merges_disk_and_unflushed_tail_once(tmp_path, disk_current, extra_reply):
     state, client = _runner_state(tmp_path)
     client.mcp_session_report = Mock(return_value=None)
-    client.client = Mock(pop_pending_oauth_requests=Mock(return_value=[]))
+    client.client = _inner_client()
     state.sessions._sessions = {}
     state.sessions.consume_replay_suppression = Mock(return_value=False)
     state.sessions.consume_needs_reinjection = Mock(return_value=False)
@@ -383,7 +397,7 @@ async def test_current_inject_is_not_historical_input(
 ):
     state, client = _runner_state(tmp_path)
     client.mcp_session_report = Mock(return_value=None)
-    client.client = Mock(pop_pending_oauth_requests=Mock(return_value=[]))
+    client.client = _inner_client()
     state.sessions._sessions = {}
     state.sessions.get_or_create = AsyncMock(return_value=(client, True, resumed))
     slot = _slot()

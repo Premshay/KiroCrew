@@ -85,14 +85,22 @@ async def test_client_session_requests_do_not_restore_private_broker_routing(
             cache.append({"name": "builder", "command": "broker-stub", "args": [], "env": []})
         return cache
 
-    client._session_mcp_cache = _projected_cache()
+    def _model_spawn() -> None:
+        # The spawn-path resolve records its withholding verdict beside the cache
+        # it fills; a cache planted without it reads as withheld and yields [].
+        # Model the owned permission surface a real spawn records for claude
+        # (kiro-cli's roster does not consult the verdict).
+        client._session_mcp_cache = _projected_cache()
+        client._session_mcp_withheld = False
+
+    _model_spawn()
     claims = Mock()
     monkeypatch.setattr(client_mod, "schedule_claim", claims)
     if entry == "reset-and-rekey":
         client._reset_state()
         client.rekey("dashboard:next", channel_id="next-channel")
         client._agent = "another-agent"
-        client._session_mcp_cache = _projected_cache()
+        _model_spawn()
         assert claims.call_args.args[0] == (None if private else str(socket))
 
     sent = []

@@ -344,10 +344,11 @@ def test_accept_list_covers_every_accepted_extension() -> None:
     cannot find their own recording.
     """
     accept = re.search(
-        r"const VIDEO_ACCEPT = '([^']+)'", _website_source("components/ChatInput.tsx")
+        r"const VIDEO_ACCEPT\s*=\s*(['\"])([^'\"]+)\1",
+        _website_source("components/ChatInput.tsx"),
     )
     assert accept, "VIDEO_ACCEPT not found in ChatInput.tsx"
-    offered = set(accept.group(1).split(","))
+    offered = set(accept.group(2).split(","))
     # Every accepted extension needs a MIME a picker can filter on. `.m4v` is the
     # trap: its `video/x-m4v` type is not implied by `video/mp4`.
     required = {"video/mp4", "video/x-m4v", "video/quicktime", "video/webm"}
@@ -357,12 +358,15 @@ def test_accept_list_covers_every_accepted_extension() -> None:
 
 def test_file_picker_covers_every_text_and_document_extension() -> None:
     """The browser picker exposes every text/document type the server accepts."""
+    # Quote- and whitespace-agnostic: the fork runs Prettier over the website, so
+    # the same constant is spelled with double quotes across several lines there.
     match = re.search(
-        r"const FILE_ACCEPT = IMAGE_ACCEPT \+ ',' \+ VIDEO_ACCEPT \+ '([^']+)'",
+        r"const FILE_ACCEPT\s*=\s*IMAGE_ACCEPT\s*\+\s*(['\"]),\1\s*\+\s*VIDEO_ACCEPT"
+        r"\s*\+\s*(['\"])([^'\"]+)\2",
         _website_source("components/ChatInput.tsx"),
     )
     assert match, "FILE_ACCEPT not found in ChatInput.tsx"
-    offered = {value for value in match.group(1).split(",") if value}
+    offered = {value for value in match.group(3).split(",") if value}
     required = files_mod._ALLOWED_TEXT_EXT | files_mod._ALLOWED_DOC_EXT
     assert offered == required, (offered - required, required - offered)
 

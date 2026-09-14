@@ -1307,26 +1307,36 @@ class TestSpecDisabledToolRefusal:
         assert ("my tool", "x") not in projection.denied_tools
 
     def test_every_site_that_answers_a_permission_request_runs_the_refusal(self):
-        """Structural: the refusal is paired with EVERY ``_build_permission_event``.
+        """Structural: every Codex permission path enforces ``disabledTools``.
 
-        Three sites answer a ``session/request_permission`` -- the event-yielding
-        dispatch loop and the two auto-approve paths through ``_handle_permission``
-        -- and a restriction that holds on two of them is not a restriction. Pinned
-        on the source in this file's neighbour's idiom, because the sites have no
-        unit-level seam of their own.
+        The event-yielding dispatch loop and the auto-approve paths through
+        ``_handle_permission`` are the two Codex paths.  A Claude-only autonomous
+        reader also builds permission events, but rejects every request outright;
+        it cannot use the Codex-specific refusal.  The distinction was introduced
+        by 0b3f3c17 and must stay explicit rather than turning a count into a
+        misleading cross-backend invariant.
         """
         import inspect
 
         from kiro_crew.acp import client as client_mod
 
-        source = inspect.getsource(client_mod)
-        builds = source.count("self._build_permission_event(")
-        # One per answering site; `_build_permission_event` is defined once more.
-        assert builds == 2, "a site that answers a permission request was added or removed"
-        for site in ("_dispatch_events", "_handle_permission"):
+        direct_permission_sites = ("_dispatch_events", "_handle_permission")
+        event_builders = {
+            name
+            for name, method in inspect.getmembers(client_mod.AcpClient, inspect.isfunction)
+            if "self._build_permission_event(" in inspect.getsource(method)
+        }
+        assert event_builders == {
+            "_collect_claude_autonomous_frame",
+            *direct_permission_sites,
+        }, "a permission-response site was added or removed"
+        for site in direct_permission_sites:
             body = inspect.getsource(getattr(client_mod.AcpClient, site))
             assert "_build_permission_event(" in body and "_deny_spec_disabled_tool(" in body, site
-        # And the two other loops answer ONLY through _handle_permission.
+        claude_body = inspect.getsource(client_mod.AcpClient._collect_claude_autonomous_frame)
+        assert "await self.reject_tool(permission.request_id)" in claude_body
+        source = inspect.getsource(client_mod)
+        # The two other foreground loops answer only through _handle_permission.
         assert source.count("await self._handle_permission(msg)") == 2
 
 

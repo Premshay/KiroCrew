@@ -4730,8 +4730,16 @@ class TestAcpRuntimeLoadSession:
             "_new_session_following_substitution",
             "_initialize_session",
         } <= builders.keys(), f"expected builders missing from scan: {sorted(builders)}"
+        # The fork builds AcpClient's array through one deduplicated roster,
+        # ``_session_mcp_servers``; it only counts if EVERY branch of it (the
+        # kiro-cli one and the session-array one) still appends the pooled stubs.
+        roster = inspect.getsource(client_mod.AcpClient._session_mcp_servers)
+        assert roster.count("self._pooled_mcp_servers()") >= 2, (
+            "_session_mcp_servers has a branch that no longer appends the pooled stubs"
+        )
+        pooled = ("pooled_session_servers", "_pooled_mcp_servers", "self._session_mcp_servers")
         for name, body in builders.items():
-            assert "pooled_session_servers" in body or "_pooled_mcp_servers" in body, (
+            assert any(ref in body for ref in pooled), (
                 f"{name} issues session/new or session/load but never consults "
                 "the pooled broker stubs — it would un-pool its sessions (#3528)"
             )

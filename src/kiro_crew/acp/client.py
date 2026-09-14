@@ -4715,43 +4715,54 @@ class AcpClient:
         Explicit Claude profiles can contain broker stubs.  The broker roster
         is also appended for every backend, so retain the earlier capability
         entry and prevent the adapter from receiving one server name twice.
+
+        Blocking for a mirror-less backend (the pooled read opens the gateway
+        overlay), so the session/new and session/load sites call it off the loop.
         """
         if self.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY:
-            return []
-        # Resolve FIRST: a cold cache decides the withholding verdict as a side
-        # effect, so the flag is only meaningful once the translation has run.
-        translated = self._translated_session_mcp_servers()
-        # The gate is the VERDICT, never the emptiness of the result. Reading
-        # "no entries" as "the gate said no" conflates two unrelated outcomes of
-        # the same call: a mirror that withheld the array (missing mirror, or a
-        # native permission surface Crew does not own -- logged), and a mirror
-        # that authorized it and then had every entry removed by stub exclusion
-        # because the broker pools them all -- silent, and the NORMAL shape for
-        # an agent whose whole server set is pooled. Conflated, that agent's
-        # session wired an empty array on every work_dir: the pooled stubs and
-        # the capability server below were discarded by a return that was meant
-        # to enforce authorization and instead enforced "the agent declares a
-        # server the broker does not pool".
-        if self._session_mcp_withheld:
-            return []
-        # Each per-harness hook is spliced only for ITS OWN backend: codex's narrows
-        # the array to the transports THIS session's handshake advertised, and one
-        # unadvertised element fails the whole session/new there, so the raw
-        # translation must not reach it beside the narrowed copy. A member with no
-        # hook of its own takes the translation as it stands.
-        if self._is_claude:
-            projected = self._claude_session_mcp_servers()
-        elif self._is_codex:
-            projected = self._codex_session_mcp_servers()
-        elif self._is_opencode:
-            projected = self._opencode_session_mcp_servers()
+            # kiro-cli reads the agent spec itself via --agent, so nothing is
+            # translated here -- but the pooled broker stubs can arrive on NO other
+            # channel, and the injection outranking the same-named spec entry is
+            # what pools them. Returning [] here silently ran every kiro session's
+            # servers direct instead of through the broker. A private-memory
+            # session has no overlay (see __init__), so this stays empty for it.
+            candidates = self._pooled_mcp_servers()
         else:
-            projected = translated
-        candidates = [
-            *self._session_capability_mcp_servers(),
-            *projected,
-            *self._pooled_mcp_servers(),
-        ]
+            # Resolve FIRST: a cold cache decides the withholding verdict as a side
+            # effect, so the flag is only meaningful once the translation has run.
+            translated = self._translated_session_mcp_servers()
+            # The gate is the VERDICT, never the emptiness of the result. Reading
+            # "no entries" as "the gate said no" conflates two unrelated outcomes
+            # of the same call: a mirror that withheld the array (missing mirror,
+            # or a native permission surface Crew does not own -- logged), and a
+            # mirror that authorized it and then had every entry removed by stub
+            # exclusion because the broker pools them all -- silent, and the NORMAL
+            # shape for an agent whose whole server set is pooled. Conflated, that
+            # agent's session wired an empty array on every work_dir: the pooled
+            # stubs and the capability server below were discarded by a return
+            # that was meant to enforce authorization and instead enforced "the
+            # agent declares a server the broker does not pool".
+            if self._session_mcp_withheld:
+                return []
+            # Each per-harness hook is spliced only for ITS OWN backend: codex's
+            # narrows the array to the transports THIS session's handshake
+            # advertised, and one unadvertised element fails the whole session/new
+            # there, so the raw translation must not reach it beside the narrowed
+            # copy. A member with no hook of its own takes the translation as it
+            # stands.
+            if self._is_claude:
+                projected = self._claude_session_mcp_servers()
+            elif self._is_codex:
+                projected = self._codex_session_mcp_servers()
+            elif self._is_opencode:
+                projected = self._opencode_session_mcp_servers()
+            else:
+                projected = translated
+            candidates = [
+                *self._session_capability_mcp_servers(),
+                *projected,
+                *self._pooled_mcp_servers(),
+            ]
         seen: set[str] = set()
         roster: list[dict[str, Any]] = []
         for entry in candidates:
@@ -7752,20 +7763,18 @@ class AcpClient:
             # ACP_BACKENDS_SESSION_MCP_ARRAY must be told here -- it reads no
             # agent spec of its own, so this array is the whole MCP surface of
             # the session (translated from that same spec, see
-            # acp/session_mcp.py). Empty on the kiro-cli path.
-            # Pooled broker stubs are appended for kiro-cli: a session-injected
-            # server outranks the same-named entry in the agent spec, which is
-            # how pooling takes effect without writing a spec anywhere.
-            # Each per-harness hook is spliced only for ITS OWN backend. An
-            # edition overriding both would otherwise hand a claude session
-            # codex's entries and vice versa -- and one entry whose transport the
-            # adapter does not advertise fails the whole session/new, not just
-            # that server. Both hooks are in-memory reads of a cache the spawn
-            # path warmed, NOT executor hops: this call site is shared with
-            # kiro-cli, and adapter work must not add a scheduling or failure
-            # point to that backend's construction path (harness-parity H13).
-            # The pooled read stays off the loop, as it already was.
-            "mcpServers": self._session_mcp_servers(),
+            # acp/session_mcp.py). On the kiro-cli path the array carries only
+            # the pooled broker stubs: a session-injected server outranks the
+            # same-named entry in the agent spec, which is how pooling takes
+            # effect without writing a spec anywhere.
+            # _session_mcp_servers splices each per-harness hook only for ITS
+            # OWN backend -- one entry whose transport the adapter does not
+            # advertise fails the whole session/new, not just that server.
+            # The whole roster is built in ONE worker-thread hop, the same single
+            # hop the pooled read (an overlay file read) always took, so kiro-cli
+            # gains no scheduling or failure point (harness-parity H13); the
+            # adapter hooks it also runs are reads of a cache the spawn warmed.
+            "mcpServers": await asyncio.to_thread(self._session_mcp_servers),
         }
         if self._is_claude:
             new_params["_meta"] = self._claude_session_meta()
@@ -7915,9 +7924,9 @@ class AcpClient:
                         # session re-declares its whole MCP surface or comes back
                         # with no tools (see session/new above). Pooled stubs are
                         # re-declared so a resumed session keeps talking to the
-                        # broker. Gated per backend, and in-memory here vs
-                        # off-loop there, for the same reasons as session/new.
-                        "mcpServers": self._session_mcp_servers(),
+                        # broker. Built by the same gated roster, in the same
+                        # single worker-thread hop, as session/new above.
+                        "mcpServers": await asyncio.to_thread(self._session_mcp_servers),
                     }
                     if self._is_claude:
                         load_params["_meta"] = self._claude_session_meta()

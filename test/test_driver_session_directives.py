@@ -111,6 +111,9 @@ def _core_call(tool: str = "monitor_start", tcid: str = "tc-1") -> AcpEvent:
         title=tool,
         tool_name=tool,
         mcp_server_name=session_directive.CORE_MCP_SERVER,
+        # The provenance flag the ACP dispatch parser sets beside a _meta.kiro
+        # identity; directive_tool_for refuses the pair without it.
+        mcp_identity_trusted=True,
     )
 
 
