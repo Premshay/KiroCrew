@@ -22,7 +22,7 @@ from kiro_crew import agent as agent_mod
 from kiro_crew.acp import client as client_mod
 from kiro_crew.acp import session_mcp
 from kiro_crew.acp.client import AcpClient
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX
 from kiro_crew.providers.mirrors import claude_code as claude_mirror
 from kiro_crew.providers.mirrors import registry as mirrors_registry
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
@@ -718,6 +718,34 @@ class TestClientSeam:
         assert client._translated_session_mcp_servers() == []
         assert client._session_mcp_withheld is False
         assert sorted(_by_name(client._session_mcp_servers())) == ["kirocrew-core", "pooled"]
+
+    def test_a_projected_core_stub_beats_the_generic_capability_entry(
+        self, tmp_path, agents_dir, monkeypatch
+    ):
+        """Codex must reach pooled Core through the gateway, not its sandbox.
+
+        The generic capability entry launches ``mcp-core`` as a child of the
+        Codex adapter.  The broker stub has the same name but is deliberately
+        gateway-owned, so its Core process can read the Crew state that the adapter
+        sandbox masks.  First-wins deduplication therefore has to see the projected
+        stub before the generic fallback.
+        """
+        client = AcpClient(work_dir=tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CODEX)
+        client._session_mcp_cache = []
+        client._session_mcp_withheld = False
+        monkeypatch.setattr(
+            client,
+            "_codex_session_mcp_servers",
+            lambda: [{"name": "kirocrew-core", "command": "gateway-stub"}],
+        )
+        monkeypatch.setattr(
+            client,
+            "_session_capability_mcp_servers",
+            lambda: [{"name": "kirocrew-core", "command": "direct-core"}],
+        )
+
+        core = _by_name(client._session_mcp_servers())["kirocrew-core"]
+        assert core["command"] == "gateway-stub"
 
     def test_an_unowned_permission_surface_still_withholds_everything(
         self, tmp_path, agents_dir, monkeypatch
