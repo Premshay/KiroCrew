@@ -1573,6 +1573,62 @@ class TestLinkedSlotSessionKey:
             assert meta_call.args[0] == "dashboard:test"
 
     @pytest.mark.asyncio
+    async def test_rollback_restores_the_model_past_a_concurrent_normalize(self, monkeypatch):
+        # A concurrent turn rewrites slot.model without picking anything --
+        # chat_runner normalizes it and backfills its canonical id, replacing
+        # the token object while _model_pick_gen stands still. Authorizing the
+        # unwind on token identity read that as a concurrent pick and skipped
+        # it, so a 409'd switch kept its own cleared model and the slot lost
+        # the pin it had before the request.
+        # Owner-gated, so the handler skips the agent-binding resolution this
+        # test is not about and reaches the concurrent-normalize rollback.
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.is_owner_dashboard_request",
+            lambda request: True,
+        )
+        slot = _ChatSlot("test")
+        slot.agent = "old-agent"
+        slot.model = "claude-opus-5"
+        state = _mock_state(slot, provider=None)
+
+        async def _normalize_then_rebind(*_a, **_k):
+            # What the runner does mid-turn: same value, new object, no pick.
+            slot.model = str(slot.model)
+            if not slot.linked_session_key:
+                slot.linked_session_key = "cron:job-1"
+            return True
+
+        state.sessions.reset = AsyncMock(side_effect=_normalize_then_rebind)
+        state.conversation_log = MagicMock()
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/agent", json={"agent": "new-agent"})
+            data = await resp.json()
+            assert resp.status == 409
+            assert data["code"] == "session_rebound"
+            assert slot.agent == "old-agent"
+            assert slot.model == "claude-opus-5", "the rejected switch kept its cleared model"
+
+    @pytest.mark.asyncio
+    async def test_failed_agent_metadata_write_rolls_back_and_reports_503(self, monkeypatch):
+        # Upstream's contract: a metadata write that fails does not let the
+        # switch stand. The selection is rolled back and the request reports the
+        # failure, so a restart cannot rehydrate a half-applied switch.
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.is_owner_dashboard_request",
+            lambda request: True,
+        )
+        slot = _ChatSlot("test")
+        slot.agent = "old-agent"
+        state = _mock_state(slot, provider=None)
+        state.sessions.reset = AsyncMock(return_value=True)
+        state.conversation_log = MagicMock()
+        state.conversation_log.update_metadata.side_effect = OSError("disk full")
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/agent", json={"agent": "new-agent"})
+            assert resp.status == 503
+            assert slot.agent == "old-agent"
+
+    @pytest.mark.asyncio
     async def test_agent_switch_sees_the_linked_sessions_active_turn(self):
         # The busy probe lands on the live linked session: an in-flight
         # channel turn answers 409 instead of tearing the turn (or a
@@ -1833,7 +1889,10 @@ class TestLinkedSlotSessionKey:
             assert slot.agent == "old-agent"
             # The restore wrote the rolled-back agent back into the
             # transcript metadata (last call).
-            assert log.update_metadata.call_args.args[1] == {"agent": "old-agent"}
+            assert log.update_metadata.call_args.args[1] == {
+                "agent": "old-agent",
+                "model": "",
+            }
 
     @pytest.mark.asyncio
     async def test_concurrent_same_agent_write_survives_the_rollback(self, monkeypatch):
