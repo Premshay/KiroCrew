@@ -91,10 +91,6 @@ class KnowledgeWatcher:
                 logger.warning("Knowledge watcher abandoned %d stale ingestion job(s)", abandoned)
         except Exception:
             logger.warning("Knowledge watcher could not reconcile stale ingestion jobs", exc_info=True)
-        # Pick up a newly-created workspace drop folder before scanning, so a
-        # folder made since the last sweep is ingested in this same pass.
-        await self._discover_drop_folder()
-        await self._discover_project_docs()
         # Global sweep budget: caps total extraction calls across ALL sources in
         # one sweep. Read live so the knob takes effect without a restart.
         sweep_budget = self._sweep_chunk_budget()
