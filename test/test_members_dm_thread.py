@@ -727,6 +727,11 @@ class TestPinEnforcement:
 
         client = state.sessions.get_or_create.return_value[0]
         client.shutdown = AsyncMock()
+        # `_run_chat` registers two fork-only handlers on the inner AcpClient, and
+        # they differ in kind: the autonomous-turn setter is `async def` (awaited
+        # there), the idle setter is not. A bare MagicMock child cannot be awaited.
+        client.client.set_claude_autonomous_turn_handler = AsyncMock()
+        client.client.set_claude_idle_handler = MagicMock()
 
         from kiro_crew.providers.base import (
             EVENT_AGENT_SWITCHED,

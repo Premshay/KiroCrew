@@ -611,11 +611,24 @@ def test_a_deeply_nested_acceptance_does_not_break_the_read():
 
 
 def test_the_kind_vocabulary_is_derived_from_accept_eval_not_remembered():
-    """``accept_eval.py`` dispatches on an inline ``if kind == "..."`` chain, so a kind
+    """The evaluator dispatches on an inline ``if kind == "..."`` chain, so a kind
     added there would otherwise make every item using it vanish from every batch under
     a misleading "not filled in yet". Read the chain and require agreement, so drift
-    fails here instead of silently dropping work items."""
-    source = _ledger_conductor_accept_eval().read_text(encoding="utf-8")
+    fails here instead of silently dropping work items.
+
+    The conductor's ``accept_eval.py`` is a thin adapter that runs the fixed
+    ``kirocrew _acceptance-evaluate`` verb, so the chain lives in the product module
+    ``work_acceptance.evaluate``. Pin that hop first: a chain read from a module the
+    conductor no longer reaches would agree with the ledger and prove nothing."""
+    import inspect
+
+    from kiro_crew import work_acceptance
+
+    adapter = _ledger_conductor_accept_eval().read_text(encoding="utf-8")
+    assert '"_acceptance-evaluate"' in adapter, "accept_eval.py no longer runs the product verb"
+    cli = (Path(wl.__file__).resolve().parent / "cli.py").read_text(encoding="utf-8")
+    assert "from kiro_crew.work_acceptance import main" in cli, "the verb left work_acceptance"
+    source = inspect.getsource(work_acceptance.evaluate)
     dispatched = set(re.findall(r'kind == "([a-z_]+)"', source))
     assert dispatched, "the dispatch chain could not be read — the pattern moved"
     assert dispatched == set(wl.ACCEPTANCE_READ_FIELDS), (dispatched, wl.ACCEPTANCE_KINDS)
