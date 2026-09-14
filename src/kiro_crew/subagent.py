@@ -1930,14 +1930,6 @@ class SubagentManager:
             self._result_ttl_secs = int(agent.subagent_result_ttl_secs)
         except (TypeError, ValueError):
             pass
-        # Per-parent caps are read at admission (_max_per_parent_for), so they
-        # apply live too; without this a saved change waited for a restart the
-        # schema never announced.
-        try:
-            self._max_per_parent = max(0, int(agent.subagent_max_per_parent))
-            self._max_per_parent_by_agent = dict(agent.subagent_max_per_parent_by_agent)
-        except (TypeError, ValueError):
-            pass
         # ``agent.approval_mode`` is deliberately NOT adopted here: it is
         # boot-only (schema ``restart=True``) because every channel dispatcher
         # resolves it once at start, and one consumer taking it live while the

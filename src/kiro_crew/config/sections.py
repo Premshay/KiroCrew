@@ -1203,7 +1203,10 @@ class AgentConfig:
             "Max SubAgents Per Parent",
             "Maximum active child runs for one parent session. 0 leaves the global "
             "subagent cap as the only limit; set 1 when a routed model lane must "
-            "serve one worker at a time.",
+            "serve one worker at a time. Takes effect at the next restart.",
+            # Boot-only: SubagentManager reads it at construction, and its live
+            # subscription (LIVE_CONFIG_PATHS) does not watch this path.
+            restart=True,
         ),
     )
     subagent_max_per_parent_by_agent: dict[str, int] = field(
@@ -1213,7 +1216,9 @@ class AgentConfig:
             "Optional exact agent-name or shell-pattern overrides for the maximum "
             "active child runs from one parent session. Exact names win; otherwise "
             "the most specific matching pattern wins. Invalid entries are ignored "
-            "and an unmatched agent uses subagent_max_per_parent.",
+            "and an unmatched agent uses subagent_max_per_parent. Takes effect at "
+            "the next restart.",
+            restart=True,
         ),
     )
     max_stop_hook_nudges: int = field(
