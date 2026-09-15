@@ -2312,8 +2312,9 @@ like this transaction's own work.
   field when `.env` is empty, so a crash between the two writes would otherwise
   resurrect a revoked credential on the next restart, and the copy sits in
   agent-readable `config.json`. Both writes go through `asyncio.to_thread`:
-  the atomic write fsyncs, and the owner-only lockdown shells out to `icacls`
-  on Windows, neither of which may block the gateway loop.
+  the atomic write fsyncs, and the owner-only lockdown's Windows DACL write
+  can block on a network volume round-trip, neither of which may block the
+  gateway loop.
 
 ## Telegram channel
 
@@ -3401,7 +3402,11 @@ transient set, which is **wider than the usual 429-only rule**: `412`, `429`, `5
 and `504`, honouring `Retry-After` and otherwise backing off exponentially. The
 status badge is bidirectional — a delivered activity clears a stale failure, and
 `_notify_state` dedupes on the transition so a healthy channel does not republish
-per send nor overwrite the first failure reason.
+per send nor overwrite the first failure reason. Before the request is made,
+`_fit_activity` measures the whole serialized activity (text plus JSON envelope,
+`ensure_ascii=False`) against `TEAMS_MAX_ACTIVITY_TEXT_BYTES` and tail-truncates
+the text to fit — mirroring Webex and WeCom's wire-side `truncate_utf8` guards —
+so an over-budget activity delivers its head instead of dying as a Connector 413.
 
 **serviceUrl durability (`service_urls.py`).** The Bot Framework offers no way to
 look up where a conversation can be reached: `serviceUrl` arrives on an inbound
