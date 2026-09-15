@@ -349,6 +349,15 @@ which testpath asked for the workers.
   invoking an unprotected filesystem or process operation.
 
 - Tests MUST NOT spawn real kiro-cli processes
+- In-process calls to `cli.main()` clear the inherited sandbox-active and tier
+  markers as part of CLI startup hardening, and its real console initializer
+  publishes the UTF-8 process contract. The root isolation floor snapshots
+  `KIROCREW_SANDBOX_ACTIVE`, `KIROCREW_SANDBOX_LEVEL`, `PYTHONUTF8` and
+  `PYTHONIOENCODING`, then restores all four to their exact prior values
+  (including absence and explicit emptiness) after the test's monkeypatches are
+  undone. The CLI still performs both mutations during the call; tests must not
+  disable either guard. The floor regression uses test-owned streams so Windows
+  stream reconfiguration is observed without changing pytest's capture streams.
 - Tests MUST NOT depend on `~/.kiro/crew/` existing
 - Tests MUST NOT write into the operator's real data dir. `KIROCREW_HOME` is pinned
   per test by the rootdir conftest, which is what makes `config_dir()` safe — and it
@@ -684,7 +693,10 @@ which testpath asked for the workers.
   **macOS uses the same list mechanism, not a second one.**
   `test/macos-expected-failures.txt` is applied by the same rootdir
   `_apply_tracked_gap_list` matcher, with the same plain-node-id spelling and the same
-  burn-down semantics: anything not on the list still fails the macOS shards. Prefer a
+  burn-down semantics: anything not on the list still fails the macOS shards — which
+  since the lane moved to `platform-tests.yml` means it fails the NIGHTLY and holds the
+  nightly publish, not a pull request, so a widened list is worth the same scrutiny with
+  a day's delay before anyone notices. Prefer a
   precise `skipif(sys.platform == "darwin", reason=...)` on the test when the reason is
   a named capability difference; use the list when the gap is a real one to be fixed
   later, with a `# TODO` reason line above the entry. `test/macos-collect-ignore.txt`
