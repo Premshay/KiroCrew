@@ -1856,7 +1856,7 @@ class HistoryConsolidator:
                 scope, drop = self._gated_lesson_scope(item)
                 if drop:
                     continue
-                lesson_store.save(
+                outcome = lesson_store.save(
                     Lesson(
                         ts=datetime.now(tz=_tz.utc).isoformat(),
                         rule=item["rule"],
@@ -1867,7 +1867,8 @@ class HistoryConsolidator:
                         repo_scope=scope,
                     )
                 )
-                count += 1
+                if outcome != "refused":
+                    count += 1
         if count:
             self._logger.info("Extracted %d lesson(s) from chat", count)
 
