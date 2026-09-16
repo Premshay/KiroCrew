@@ -102,6 +102,7 @@ from kiro_crew.cron import (
     CronService,
     CronStoreBusy,
     CronStoreUnreadable,
+    agent_sequence_dispatches,
     build_cron_session_context,
     effective_wake_budget,
 )
@@ -189,7 +190,7 @@ from kiro_crew.heartbeat import (
 )
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, HooksConfig, hooks_config_from_config_dict
-from kiro_crew.kiro_cli import resolve_kiro_cli
+from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, pin_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
@@ -1556,21 +1557,6 @@ def _channel_transport_permitted(member: str) -> bool:
 _KIRO_CLI_RESOLVE_TIMEOUT_SECS = 5.0
 
 
-def _kiro_cli_pin_probe() -> tuple[str | None, bool]:
-    """``(pinned path, an unpinned install exists)`` — the sync half of the pin.
-
-    The second element separates the two ways the pin can come back empty, which
-    a caller must report differently: kiro-cli is not installed at all (nothing
-    to say — the backend is optional), or it IS installed somewhere the pin does
-    not accept, which is a state an operator needs told about.
-    """
-
-    pinned = resolve_kiro_cli(include_inherited_path=False)
-    if pinned is not None:
-        return pinned, False
-    return None, resolve_kiro_cli() is not None
-
-
 async def _pinned_kiro_cli(purpose: str) -> str | None:
     """kiro-cli's absolute path for an unattended spawn, or ``None`` to refuse.
 
@@ -1589,12 +1575,15 @@ async def _pinned_kiro_cli(purpose: str) -> str | None:
     override, and hence its condition — an install the pin declined is worth a
     line, a backend that simply is not installed is not.
 
-    Off the loop and bounded: see :data:`_KIRO_CLI_RESOLVE_TIMEOUT_SECS`.
+    The sync half is :func:`kiro_crew.kiro_cli.pin_kiro_cli`, shared with the
+    CLI's update command and the diagnostics bundle; this wrapper adds only
+    what an unattended path on the event loop needs. Off the loop and bounded:
+    see :data:`_KIRO_CLI_RESOLVE_TIMEOUT_SECS`.
     """
 
     try:
         pinned, unpinned_exists = await asyncio.wait_for(
-            asyncio.to_thread(_kiro_cli_pin_probe),
+            asyncio.to_thread(pin_kiro_cli),
             timeout=_KIRO_CLI_RESOLVE_TIMEOUT_SECS,
         )
     except (TimeoutError, asyncio.TimeoutError):
@@ -1605,12 +1594,7 @@ async def _pinned_kiro_cli(purpose: str) -> str | None:
         )
         return None
     if pinned is None and unpinned_exists:
-        logger.warning(
-            "kiro-cli resolves only through PATH, which an unattended spawn does "
-            "not trust, so %s is skipped. Point KIROCREW_KIRO_BIN at the binary "
-            "to have it used here.",
-            purpose,
-        )
+        logger.warning("%s is skipped: %s.", purpose, PATH_ONLY_INSTALL_NOTE)
     return pinned
 
 
@@ -2054,6 +2038,18 @@ class GatewayOrchestrator:
 
     _UPDATE_BUSY_RETRY_SECS = 300.0
     _MANDATORY_UPDATE_MAX_DEFER_SECS = 600.0
+    #: How long the pre-restart drain waits for callbacks and refusal writes to
+    #: become durable before giving up and deferring the restart.
+    #:
+    #: Named rather than inlined at the call site so a test that is about the
+    #: fetch/reset/venv SEQUENCE can shorten it. When nothing makes the drain
+    #: condition true, ``_drain_update_callback_work`` polls at 10ms to the
+    #: deadline, so an inlined 30.0 cost eleven such tests thirty seconds EACH --
+    #: ~330s of pure sleeping per full suite run, asserted on by none of them.
+    #: The value itself stays pinned by the test that IS about it
+    #: (``test_restart_fences_then_closes_and_final_drains`` asserts
+    #: ``drain:30.0``), so shortening it elsewhere cannot hide a change here.
+    _UPDATE_DRAIN_TIMEOUT_SECS = 30.0
 
     async def _prepare_auto_update_apply(
         self,
@@ -3942,6 +3938,11 @@ class GatewayOrchestrator:
                                     slot,
                                     wrapped,
                                     _directive_user_origin=False,
+                                    # Structural provenance for the session
+                                    # ledger: the queued twin above carries
+                                    # CRON_NOTIFICATION_KIND, and this branch is
+                                    # the same injector dispatching directly.
+                                    _turn_actor="cron",
                                 ),
                             )
                             slot.task = task
@@ -4989,7 +4990,23 @@ class GatewayOrchestrator:
                 """get_or_create honoring job.model; if that model is
                 unavailable, retry once with the registry default.
                 Returns (client, is_new, resumed, downgraded)."""
+
                 assert self.sessions is not None
+                modes = getattr(self.ctx_builder, "_session_memory_modes", None)
+                if isinstance(modes, dict):
+                    from kiro_crew.messaging.privacy_mode import strictest
+                    from kiro_crew.subagent_persistence import bind_session_memory_mode
+                    from kiro_crew.workflows.registry import _await_owned
+
+                    # A separately scheduled run is durable work, not a child
+                    # conversation. Only this trusted dispatch admits its key.
+                    publication = asyncio.create_task(
+                        asyncio.to_thread(bind_session_memory_mode, key, "persistent")
+                    )
+                    admitted_mode = await _await_owned(publication)
+                    modes[key] = (
+                        strictest((admitted_mode, modes.get(key, "persistent"))) or "persistent"
+                    )
                 if cron_memory_store:
                     from kiro_crew.context import prepare_store_vectors
                     from kiro_crew.member_memory_auth import bind_private_session_store
@@ -5057,7 +5074,7 @@ class GatewayOrchestrator:
             # When agent_sequence has multiple agents, run them sequentially
             # with per-agent session keys and per-job env vars.
             agents = job.agent_sequence if job.agent_sequence else []
-            if len(agents) > 1:
+            if agent_sequence_dispatches(agents):
                 assert self.sessions is not None
                 assert self.ctx_builder is not None
                 result_text = "_No response._"
@@ -5092,10 +5109,14 @@ class GatewayOrchestrator:
                         full_message, _ = await run_in_embed_pool(
                             self.ctx_builder.build_message,
                             msg,
-                            True,
+                            is_new,
+                            agent_session_key,
                             interactive=False,
                             agent=agent,
                             memory_store=cron_memory_store or None,
+                            context_provider=client,
+                            resumed=_resumed,
+                            minimal_context=job.minimal_context,
                         )
                         # Wall clock for the cron agent turn: acp never assigns
                         # TurnUsage.duration_ms, so the row falls back to this.
@@ -5234,10 +5255,13 @@ class GatewayOrchestrator:
                 full_message, _ = await run_in_embed_pool(
                     self.ctx_builder.build_message,
                     msg,
-                    True,
+                    is_new,
+                    session_key,
                     interactive=False,
-                    agent=job.agent_id or None,
+                    agent=cron_agent or None,
                     memory_store=cron_memory_store or None,
+                    context_provider=client,
+                    resumed=_resumed,
                     provider_type=_provider,
                     minimal_context=job.minimal_context,
                 )
@@ -6232,6 +6256,8 @@ class GatewayOrchestrator:
                 key,
                 memory_store=_memory_store,
                 provider_type=_provider,
+                context_provider=client,
+                resumed=_resumed,
             )
             _completion_hook = self._monitor_completion_hook(loop)
             if wake_message is not None and _completion_hook is None:
@@ -7985,6 +8011,10 @@ class GatewayOrchestrator:
                         slot,
                         msg,
                         _directive_user_origin=False,
+                        # The text is the re-injected sub-agent completion or
+                        # failure this recovery drains, so the sub-agent is what
+                        # caused the turn.
+                        _turn_actor="subagent",
                     )
                 ),
             )
@@ -8482,15 +8512,51 @@ class GatewayOrchestrator:
                     )
                     if _last:
                         # Final chunk: release the spawn-discipline gate.
+                        #
+                        # The tally counts this wave's DIRECT members only.
+                        # ``wave_has_live_nested_spawns`` reports whether a
+                        # member of this wave has itself spawned work that is
+                        # still running (its own independent batch, so not in
+                        # this total). When it is, the completion wording is
+                        # scoped to the direct members and states that their
+                        # nested work reports on its own; the unconditional
+                        # "This run is complete / All results delivered" claim
+                        # is reserved for a wave with no live nested work. The
+                        # check is read-only and never withholds the digest.
+                        try:
+                            _nested_live = bool(
+                                self.subagent_mgr
+                                and self.subagent_mgr.wave_has_live_nested_spawns(_batch_id)
+                            )
+                        except Exception:
+                            _nested_live = False
+                        if _nested_live:
+                            _completion_line = (
+                                f"These {bp['total']} sub-agents finished: "
+                                f"{bp['ok']} ✅ · {bp['err']} ❌ · "
+                                f"{bp['stopped']} ⏹. Their results are below. "
+                                f"NOTE: a sub-agent in this wave spawned further "
+                                f"work that is still running; that nested work "
+                                f"is tracked as its own wave and reports "
+                                f"separately when it finishes — this digest does "
+                                f"NOT cover it.\n"
+                                f"Finish processing these results before "
+                                f"spawning any follow-up sub-agents.\n"
+                            )
+                        else:
+                            _completion_line = (
+                                f"wave finished: "
+                                f"{bp['ok']} ✅ · {bp['err']} ❌ · "
+                                f"{bp['stopped']} ⏹ of {bp['total']} agents. "
+                                f"All results delivered.\n"
+                                f"This run is complete. Finish processing all "
+                                f"results before spawning any follow-up "
+                                f"sub-agents.\n"
+                            )
                         announce = (
                             f"{SUBAGENT_BATCH_COMPLETION_PREFIX}\n"
-                            f"Batch results {_chunk_k}/{_chunk_j} — wave finished: "
-                            f"{bp['ok']} ✅ · {bp['err']} ❌ · "
-                            f"{bp['stopped']} ⏹ of {bp['total']} agents. "
-                            f"All results delivered.\n"
-                            f"This run is complete. Finish processing all "
-                            f"results before spawning any follow-up "
-                            f"sub-agents.\n"
+                            f"Batch results {_chunk_k}/{_chunk_j} — "
+                            f"{_completion_line}"
                             f"{_footer}\n\n{_digest_body}{_guards}"
                         )
                         # This member's completion is delivered as the wave-close
@@ -8769,6 +8835,11 @@ class GatewayOrchestrator:
                                     _injection_slot,
                                     announce,
                                     _directive_user_origin=False,
+                                    # Structural provenance for the session
+                                    # ledger: the queued twin above carries
+                                    # SUBAGENT_COMPLETION_KIND, and this branch
+                                    # is the same injector dispatching directly.
+                                    _turn_actor="subagent",
                                     **_run_kwargs,
                                 )
                             )
@@ -8882,6 +8953,8 @@ class GatewayOrchestrator:
                                 parent_key,
                                 memory_store=_memory_store,
                                 provider_type=_provider,
+                                context_provider=client,
+                                resumed=_resumed,
                             )
                         else:
                             msg = announce
@@ -9105,6 +9178,8 @@ class GatewayOrchestrator:
                             parent_key,
                             memory_store=_memory_store,
                             provider_type=_provider,
+                            context_provider=client,
+                            resumed=_resumed,
                         )
                     else:
                         msg = announce
@@ -9594,6 +9669,7 @@ class GatewayOrchestrator:
         self._local_only = is_local_only(configured_host, self._slack_enabled)
         self._dashboard_runner, self.dashboard_state = await start_api_server(
             sessions=self.sessions,
+            context_builder=self.ctx_builder,
             crons=self.cron_svc,
             lessons=LessonStore(),
             port=dashboard_port,
@@ -10733,7 +10809,7 @@ class GatewayOrchestrator:
             logger.debug("Breadcrumb flush before update restart failed", exc_info=True)
         exe = await asyncio.to_thread(respawn)
 
-        if not await self._drain_update_callback_work(timeout=30.0):
+        if not await self._drain_update_callback_work(timeout=self._UPDATE_DRAIN_TIMEOUT_SECS):
             self._update_apply_deferred = True
             logger.warning(
                 "Update applied but restart deferred: callback/refusal work did not drain"
@@ -12619,6 +12695,24 @@ class GatewayOrchestrator:
         # session by this point, so the sweep is not racing a mapping publisher --
         # the same position the sweep already held here before this change.
         await asyncio.to_thread(cleanup_orphaned_sessions)
+        # The session ledger's buffered appends, for EVERY gateway mode. The
+        # dashboard registers its own cleanup hook, but a mode that builds no
+        # dashboard app -- slack-only is the plain case -- never runs one, and
+        # os._exit below skips atexit, so without this the buffer dies with the
+        # process. What it drops is the last thing each session did, which is
+        # exactly what a reader looks for after a restart. Bounded inside the
+        # emitter and off-loop, like the log-queue drain that follows; calling it
+        # twice is a no-op, so the dashboard hook stays as it is.
+        try:
+            # Imported HERE, not at module scope: AUTOSDE's
+            # no-new-work-on-gateway-boot-path rule asks for an optional subsystem's
+            # import to be gated, and a shutdown drain is the only use in this module.
+            from kiro_crew import session_ledger_emit
+
+            if not await asyncio.to_thread(session_ledger_emit.drain_for_shutdown):
+                logger.warning("session ledger did not fully drain before exit")
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            logger.debug("session ledger drain failed during shutdown", exc_info=True)
         # This is a hard exit too: os._exit skips atexit, so the log queue's
         # drain hook never runs here either. Without this the whole shutdown
         # tail is lost -- including the "Graceful shutdown timed out" warning

@@ -1,5 +1,3 @@
-import { WorkspacePanelContext, WorkspaceFullscreenContext } from './components/WorkspacePanelContext'
-import PanelToggles from './components/PanelToggles'
 import { useEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
@@ -49,7 +47,7 @@ import type { KiroCreditUsage, KiroUsagePayload } from './api/client'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
 import { isMetricNumber, metricNumber } from './utils/metrics'
-import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, Compass, LayoutGrid, Fullscreen, Menu, SquareTerminal, Bot, Smartphone, Search as SearchIcon } from 'lucide-react'
+import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, Compass, LayoutGrid, Fullscreen, Menu, PanelLeft, SquareTerminal, Bot, Smartphone, Search as SearchIcon } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
@@ -60,7 +58,7 @@ import { OnboardingShellHost } from './components/OnboardingChapterShell'
 import { PREVIEW_EXPAND_EVENT } from './components/WebPreviewPanel'
 import { canRenderMobileConnectKind } from './components/mobileConnectRenderers'
 import { useMayLeaveForNavigation, useIsCurrentUrl, useGuardedLeave } from './components/NavigationLeaveGuard'
-import { motion, AnimatePresence, useMotionValue, useTransform, useReducedMotion } from 'framer-motion'
+import { motion, AnimatePresence, useMotionValue, useTransform } from 'framer-motion'
 import { useDrawerSwipe, animateDrawer, registerDrawerTargets, takeOverDrawer, safeAreaLeft } from './hooks/useDrawerSwipe'
 
 /** Mobile nav drawer travel: its 220px width + the 8px mx-2 inset + border. */
@@ -126,7 +124,9 @@ import UpdateModal from './components/UpdateModal'
 
 import ComputerUseLiveView from './components/ComputerUseLiveView'
 import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTerminalPanel'
-import { toggleBottomTerminal, useBottomTerminalOpen, useTerminalPosition } from './hooks/useBottomTerminal'
+import { confirmRestoredTabs, reconcileRestoredTabs, toggleBottomTerminal, useBottomTerminalOpen, useTerminalPosition } from './hooks/useBottomTerminal'
+import { RUN_IN_TERMINAL_OPENING_GRACE_MS } from './utils/fenceShell'
+import { withDeadline } from './lib/withDeadline'
 import { toggleTerminalByChord } from './lib/terminalChordFocus'
 import { useTerminalPoppedOut, focusPopout as focusTerminalPopout } from './utils/terminalPopout'
 import { setTerminalEnabledFlag } from './utils/terminalRegistry'
@@ -518,6 +518,40 @@ export function MobileNavGlyph({ avatar }: { avatar: string }) {
   )
 }
 
+/** Glyph inside the nav-rail header's expand/collapse button — the same
+ *  load-proof contract as MobileNavGlyph, with the rail's own geometry. When
+ *  the rail is collapsed the logo is the button's ONLY visible content (the
+ *  bot name is unmounted), so a 404 on the avatar asset, a blocked request or
+ *  a hung fetch used to leave an invisible control that still toggled the
+ *  rail when clicked. A PanelLeft glyph therefore fills the box by default,
+ *  the swap to the logo happens only on the img's own `load` event, and
+ *  `error` reverts it. `loadedSrc` records WHICH src loaded so a branding or
+ *  theme swap falls back until the new asset proves itself. `boxClass` is the
+ *  theme-overridable size (`branding.logoClass`, else w-10 collapsed / w-7
+ *  expanded) and is applied to BOTH the fallback and the img so the swap never
+ *  moves the button's geometry; the hover tilt and `transition-all` classes
+ *  live on the img exactly as before. The img stays mounted (display:none)
+ *  while hidden so the browser still fetches it. A sibling rather than a
+ *  generalisation of MobileNavGlyph: that component's literal `w-6 h-6` box is
+ *  pinned by narrowFirstBaseline.test.ts, while this box is a runtime
+ *  expression. */
+export function RailHeaderGlyph({ avatar, boxClass, iconSize }: { avatar: string; boxClass: string; iconSize: number }) {
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(null)
+  const showLogo = !!avatar && loadedSrc === avatar
+  return (
+    <>
+      {!showLogo && (
+        <span data-testid="rail-header-fallback" className={`${boxClass} flex items-center justify-center shrink-0 transition-all duration-300 group-hover:rotate-[-8deg]`} aria-hidden="true">
+          <PanelLeft size={iconSize} />
+        </span>
+      )}
+      {!!avatar && (
+        <img src={avatar} alt="" aria-hidden="true" onLoad={() => setLoadedSrc(avatar)} onError={() => setLoadedSrc(null)} className={`${boxClass} rounded-md shrink-0 object-contain transition-all duration-300 group-hover:rotate-[-8deg] ${showLogo ? '' : 'hidden'}`} />
+      )}
+    </>
+  )
+}
+
 function BadgeIndicator({ count, collapsed, label }: { count: number; collapsed: boolean; label: string }) {
   if (count <= 0) return null
   const ariaLabel = `${count} ${label}`
@@ -704,10 +738,14 @@ function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride,
       // it when collapsed (icon-only, no text).
       role="button"
       tabIndex={0}
-      whileHover={collapsed ? undefined : { scale: 1.02 }}
+      // Hover is a HOVER: the row paints (`hover:bg-bg-hover` / `hover:text-text`
+      // below) and does not move. A scale on hover made every rail row grow a
+      // couple of pixels under the cursor, nudging its neighbours and re-reading
+      // as a layout change rather than as "you are pointing at this". Press still
+      // scales — that one is feedback for an action the user actually took.
       whileTap={{ scale: 0.97 }}
       transition={{ duration: 0.15 }}
-      className={`nav-item group/nav relative flex items-center min-w-0 rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-3 pr-3 transition-colors duration-200 ${collapsed ? '' : 'overflow-hidden'} ${active ? 'nav-active text-text-strong bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
+      className={`nav-item group/nav relative flex items-center min-w-0 rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-3 pr-3 transition-colors duration-200 ${collapsed ? '' : 'overflow-hidden'} ${active ? 'nav-active text-text-strong bg-accent-subtle hover:brightness-110' : 'text-muted hover:text-text hover:bg-bg-hover/60'}`}
       onClick={activate}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate() } }}
       onMouseEnter={showTip}
@@ -837,7 +875,7 @@ function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
   const titleText = showsCollapse ? i18nT('app.show_fewer_apps') : i18nT('app.show_more_apps', { count: hiddenCount })
   return (
     <button ref={rowRef}
-      className="group/nav relative flex items-center rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-3 pr-3 transition-colors duration-200 text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none w-full"
+      className="group/nav relative flex items-center rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-3 pr-3 transition-colors duration-200 text-muted hover:text-text hover:bg-bg-hover/60 bg-transparent border-none w-full"
       // Dismiss the hover label on activation, without the fade-out. Unlike a
       // NavItem (which stays put when clicked, so the pointer is still
       // legitimately over it), activating this toggle re-flows the Apps list and
@@ -1234,6 +1272,14 @@ function NotificationsBellButton() {
   )
 }
 
+/** Deadline on each look at `GET /api/terminal/sessions` during hydrate. The
+ *  restored terminal tabs stay gated until both looks have settled, so a probe
+ *  that never answers must be made to answer: past this bound it reads as a
+ *  failed probe, which keeps every tab. Well above the route's normal
+ *  round-trip (it reads an in-memory registry) and far below any wait a user
+ *  would sit through for an empty panel. */
+const TERMINAL_PROBE_TIMEOUT_MS = 10_000
+
 export default function App() {
   const location = useLocation()
   const isEmbed = location.pathname.startsWith('/embed/')
@@ -1320,10 +1366,15 @@ export default function App() {
     refetchInterval: 30_000,
   })
   const approvalCount = pendingApprovals.filter((a: { id?: string }) => a.id?.startsWith('task-gate-')).length
-  const { data: terminalConfig } = useQuery({
+  const { data: terminalConfig, isError: terminalProbeFailed } = useQuery({
     queryKey: ['terminal-enabled'],
-    queryFn: async () => {
-      const r = await fetch('/api/terminal/sessions')
+    // Bounded because the restored terminal tabs below stay gated until this
+    // query settles one way or the other: a request that hangs would otherwise
+    // hold a blank panel open for as long as the socket did. Same bound as the
+    // confirm look further down.
+    queryFn: async ({ signal }) => {
+      const r = await withDeadline(TERMINAL_PROBE_TIMEOUT_MS, signal, s =>
+        fetch('/api/terminal/sessions', { signal: s }))
       // Default-on: the terminal is enabled unless the server explicitly says
       // otherwise. A transient/auth-timing failure of this probe must NOT hide
       // an enabled terminal by falling back to {enabled:false}, which with
@@ -1338,6 +1389,31 @@ export default function App() {
   // so there is no hidden-until-fetch-resolves flash.
   const terminalEnabled = terminalConfig?.enabled !== false
   useEffect(() => { setTerminalEnabledFlag(terminalEnabled) }, [terminalEnabled])
+  // The same answer weighs the terminal tabs restored from storage (#10977): a
+  // tab whose session the list omits, or reports dead, is a suspect. Absent is
+  // not yet gone — the route skips a session another window is still opening —
+  // so suspects are confirmed by one uncached re-probe after the same opening
+  // grace the run-in-terminal deadline uses, and only the ones still missing
+  // are dropped, before any view reconnects to them. A probe that never answers
+  // must still settle — the hosts draw no terminal until it does — so a failure
+  // in either look, including a request that runs past its deadline, hands
+  // over null, which keeps every tab. Both calls are once-per-load no-ops after
+  // that, so the query's later refetches change nothing.
+  useEffect(() => {
+    if (terminalConfig === undefined && !terminalProbeFailed) return
+    const suspects = reconcileRestoredTabs(terminalProbeFailed ? null : terminalConfig)
+    if (suspects.length === 0) return
+    void (async () => {
+      await new Promise(resolve => setTimeout(resolve, RUN_IN_TERMINAL_OPENING_GRACE_MS))
+      let second: unknown = null
+      try {
+        const r = await withDeadline(TERMINAL_PROBE_TIMEOUT_MS, undefined, s =>
+          fetch('/api/terminal/sessions', { signal: s }))
+        if (r.ok) second = await r.json()
+      } catch { /* null: the confirm look could not rule, so every suspect stays */ }
+      confirmRestoredTabs(second)
+    })()
+  }, [terminalConfig, terminalProbeFailed])
   // True while the terminal panel lives in its own popped-out window: the
   // docked panel is suppressed here and the sidebar toggle focuses that
   // window instead of opening an (empty-handed) panel.
@@ -1346,12 +1422,6 @@ export default function App() {
   // every mousemove during a grip-drag, and a primitive snapshot lets
   // useSyncExternalStore's Object.is check skip those re-renders of App.
   const bottomTerminalOpen = useBottomTerminalOpen()
-  const workspacePanelOpen = useAppSelector(s => s.chat.activityOpen)
-  const [workspaceSearchOpen, setWorkspaceSearchOpen] = useState(false)
-  const reducePanelMotion = useReducedMotion()
-  const [workspaceFullscreen, setWorkspaceFullscreen] = useState(false)
-  const exitWorkspaceFullscreen = useCallback(() => setWorkspaceFullscreen(false), [])
-  const toggleWorkspaceFullscreen = useCallback(() => setWorkspaceFullscreen(value => !value), [])
   // "Connect your phone" rail entry. The methods come from the CPP
   // mobile_connect seam filtered by governance; an empty list (edition
   // returned none, policy denied all, seam degraded) hides the row entirely —
@@ -2459,7 +2529,7 @@ export default function App() {
     // close the terminal in the MAIN window, out of sight of the person pressing
     // the key.
     onToggleTerminal: terminalEnabled && !isPopout && !isEmbed
-      ? () => { exitWorkspaceFullscreen(); if (terminalPoppedOut) focusTerminalPopout(); else toggleTerminalByChord(activeSlotProject) }
+      ? () => { if (terminalPoppedOut) focusTerminalPopout(); else toggleTerminalByChord(activeSlotProject) }
       : undefined,
   })
   // Cmd+1..9 (⌘ mac / Ctrl win-linux) switches instance panes: 1=Local,
@@ -3085,11 +3155,6 @@ export default function App() {
   const libraryNavActive = activePath === '/apps/library' || activePath.startsWith('/apps/library/')
   const discoverNavActive = activePath === '/apps' || activePath.startsWith('/apps/-/') || activePath.startsWith('/apps/detail/') || activePath.startsWith('/apps/migrate/')
   const isChat = activePath === '/chat' || activePath.startsWith('/chat/') || activePath === '/'
-  const panelFullscreen = workspaceFullscreen && isChat && workspacePanelOpen && !workspaceSearchOpen
-  const workspaceFullscreenControls = useMemo(() => ({ fullscreen: panelFullscreen, exit: exitWorkspaceFullscreen, toggle: toggleWorkspaceFullscreen }), [panelFullscreen, exitWorkspaceFullscreen, toggleWorkspaceFullscreen])
-  useEffect(() => {
-    if (!isChat || !workspacePanelOpen || workspaceSearchOpen) setWorkspaceFullscreen(false)
-  }, [isChat, workspacePanelOpen, workspaceSearchOpen])
   // /webhooks is a full-height rail-and-detail shell (like /capabilities), so it
   // owns its own scrolling and must not sit inside <main>'s scroll container.
   const needsFixedHeight = isChat || activePath === '/settings' || activePath.startsWith('/settings/') || activePath === '/developer' || activePath === '/capabilities' || activePath === '/webhooks'
@@ -3200,8 +3265,6 @@ export default function App() {
     <div
       ref={shellRef}
       data-testid="dashboard-shell"
-      data-workspace-fullscreen={panelFullscreen || undefined}
-      data-panel-toggle-owner={isChat ? (panelFullscreen ? 'workspace' : workspacePanelOpen && !workspaceSearchOpen && !bottomDock ? 'workspace' : bottomTerminalOpen && terminalPosition === 'right' && !terminalPoppedOut ? 'terminal' : workspaceSearchOpen ? 'search' : 'chat') : undefined}
       className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg p-safe ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isLinuxFramelessElectron ? 'linux-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : bottomDock ? 'grid-rows-[42px_minmax(0,1fr)_auto]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
       // Retire the entrance animation once it has played, so re-showing this
       // pane cannot replay it. Guarded on BOTH the keyframe name and the event
@@ -3212,10 +3275,6 @@ export default function App() {
         if (e.target === e.currentTarget && e.animationName === 'rise') setShellEntered(true)
       }}
       style={{
-        // The fixed group is the workspace toggle plus the terminal toggle when
-        // terminals are enabled; fullscreen belongs to the workspace panel's own
-        // action group and reserves nothing here.
-        ...{ '--workspace-panel-control-count': Number(terminalEnabled) + 1 },
         gridTemplateAreas: isMobile ? '"topbar" "content"' : bottomDock ? '"topbar topbar" "nav content" "nav actbar"' : '"topbar topbar topbar" "nav content actbar"',
         ...(!isMobile && {
           gridTemplateColumns: bottomDock
@@ -3258,17 +3317,7 @@ export default function App() {
           Activity panel here on desktop so it spans the window top-to-bottom
           instead of sitting below the header row. Empty (0 width) when the
           panel is closed or on non-chat routes. */}
-      {!isMobile && <motion.div id="activity-bar-slot" layout layoutDependency={panelFullscreen}
-        transition={{ layout: { duration: reducePanelMotion ? 0 : 0.18 } }}
-        className="h-full min-h-0 min-w-0" style={{ gridArea: 'actbar' }} />}
-
-      {isChat && (
-        <div data-workspace-panel-controls className="absolute top-0 right-safe-offset-2 z-[60] flex items-center h-[var(--panel-toolbar-height)] focus-caption-reserve"
-          style={{ gridArea: '2 / 1 / 3 / -1' }}>
-          <PanelToggles showWorkspace workspaceOpen={workspacePanelOpen && !workspaceSearchOpen}
-            exitFullscreen={panelFullscreen ? exitWorkspaceFullscreen : undefined} />
-        </div>
-      )}
+      {!isMobile && <div id="activity-bar-slot" className="h-full min-h-0 min-w-0" style={{ gridArea: 'actbar' }} />}
 
       {/* Skip to content — visible only on focus for keyboard users */}
       <a href="#main-content" className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-[9999] focus:px-4 focus:py-2 focus:rounded-lg focus:bg-accent focus:text-accent-fg focus:text-sm focus:font-medium">{i18nT('app.skip_to_content')}</a>
@@ -3812,6 +3861,10 @@ export default function App() {
               />
             </span>
           )}
+          {/* Notifications bell — borderless icon button, rightmost control.
+              (The activity-panel open toggle now lives in the session header,
+              beside the pop-out control — see ChatPage — so opening the panel
+              no longer narrows this full-width header.) */}
           <NotificationsBellButton />
         </div>
       </header>
@@ -4062,7 +4115,7 @@ export default function App() {
               aria-expanded={!effectiveCollapsed}
             >
               <span className="flex items-center gap-2.5 min-w-0">
-                <img src={avatar} alt="" aria-hidden="true" className={`${branding?.logoClass ?? (effectiveCollapsed ? 'w-10 h-10' : 'w-7 h-7')} rounded-md shrink-0 object-contain transition-all duration-300 group-hover:rotate-[-8deg]`} />
+                <RailHeaderGlyph avatar={avatar} boxClass={branding?.logoClass ?? (effectiveCollapsed ? 'w-10 h-10' : 'w-7 h-7')} iconSize={effectiveCollapsed ? 24 : 18} />
                 <AnimatePresence initial={false}>
                   {!effectiveCollapsed && (
                     <motion.span
@@ -4296,7 +4349,7 @@ export default function App() {
                   /* While popped out: focus only (a refused programmatic
                      focus is a harmless no-op). Explicit re-dock lives in the
                      TerminalDetachedBar below -- never a timing heuristic. */
-                  onClickOverride={() => { exitWorkspaceFullscreen(); if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
+                  onClickOverride={() => { if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
                 />
               )}
               {hasRenderableMobileConnect && (
@@ -4498,7 +4551,7 @@ export default function App() {
               on the page the user was on when it happened. */}
           <CrashReportNotice />
           <Routes>
-            <Route path="/chat/:slug?" element={<WorkspacePanelContext.Provider value={setWorkspaceSearchOpen}><WorkspaceFullscreenContext.Provider value={workspaceFullscreenControls}><ErrorBoundary><ChatPage /></ErrorBoundary></WorkspaceFullscreenContext.Provider></WorkspacePanelContext.Provider>} />
+            <Route path="/chat/:slug?" element={<ErrorBoundary><ChatPage /></ErrorBoundary>} />
             <Route path="/orchestrated/:slug?" element={<OrchestratedRedirect />} />
             <Route path="/notifications" element={<ErrorBoundary><NotificationsPage /></ErrorBoundary>} />
             {/* Bookmarkable session chooser: neutral list, no auto-select; rows

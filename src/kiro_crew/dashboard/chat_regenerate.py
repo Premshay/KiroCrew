@@ -10,10 +10,15 @@ from aiohttp import web
 
 from kiro_crew.dashboard.chat_persistence import _save_slot_to_history, save_slot_off_loop
 from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
-from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
+from kiro_crew.dashboard.chat_utils import (
+    effective_session_key,
+    reject_if_slot_under_construction,
+    slot_history_key,
+)
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.remote_relay import remote_bound_refusal
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -52,6 +57,9 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    under_construction = reject_if_slot_under_construction(state, slot)
+    if under_construction is not None:
+        return under_construction
 
     # A crew-bound slot has no local regenerate: it would truncate LOCAL history
     # and re-run the turn on this machine, diverging from the peer.
@@ -68,9 +76,23 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
         msgs = slot.messages
         ai_idx = -1
         for i in range(len(msgs) - 1, -1, -1):
-            if msgs[i].get("role") == "assistant":
-                ai_idx = i
+            role = msgs[i].get("role")
+            # Never cross a real user turn: the truncation below deletes
+            # everything after the target reply's user row, so a reply found
+            # PAST a newer user row (e.g. a /compact row awaiting only its
+            # notice) would take that newer turn with it, irreversibly.
+            if role == "user":
                 break
+            if role != "assistant":
+                continue
+            # A system notice (compaction / session reload) is a status row,
+            # not the reply being regenerated: capturing it as the variant
+            # would silently drop the real reply from variant history. The
+            # frontend's optimistic truncation runs the same skip.
+            if is_system_notice("assistant", msgs[i].get("meta")):
+                continue
+            ai_idx = i
+            break
         if ai_idx < 0:
             return web.json_response(
                 {"error": "no assistant message to regenerate", "code": "no_assistant_message"},
@@ -162,6 +184,9 @@ async def api_chat_slot_switch_variant(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    under_construction = reject_if_slot_under_construction(state, slot)
+    if under_construction is not None:
+        return under_construction
 
     try:
         body = await request.json()
@@ -257,6 +282,9 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
     request_app = request.get("app", "")
     if not slot:
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    under_construction = reject_if_slot_under_construction(state, slot)
+    if under_construction is not None:
+        return under_construction
 
     # App-ownership gate (App Kit §5.2). This endpoint discards the slot's
     # NATIVE ACP conversation below, so an app token reaching a slot it does not

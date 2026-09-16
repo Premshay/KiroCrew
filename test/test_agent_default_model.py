@@ -49,7 +49,7 @@ def _load_from_dict(data: object) -> KiroCrewConfig:
 
 
 class TestNormalizeAgentModel:
-    """"auto" and "" are the same "inherit" state and must store identically."""
+    """ "auto" and "" are the same "inherit" state and must store identically."""
 
     @pytest.mark.parametrize(
         ("raw", "want"),
@@ -189,7 +189,7 @@ class TestPerAgentModelStorage:
         assert resolve_agent_bindings(cfg, "oncall").model == "claude-opus-5"
 
     def test_bindings_normalize_an_auto_pin(self) -> None:
-        """"auto" stored by an older write must still read as inherit."""
+        """ "auto" stored by an older write must still read as inherit."""
         cfg = _load_from_dict(
             {
                 "agents": {"oncall": {"kiro_agent": "kirocrew", "model": "auto"}},
@@ -281,7 +281,9 @@ class TestEffectiveModelPrecedence:
     """One resolver owns the chain, so display and execution cannot diverge."""
 
     def test_agent_model_outranks_the_global(self, specs_dir: Path) -> None:
-        cfg = _cfg({"crew": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5")
+        cfg = _cfg(
+            {"crew": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5"
+        )
         assert resolve_effective_model(cfg, "crew") == "claude-opus-5"
 
     def test_agent_model_outranks_a_template_pin(self, specs_dir: Path) -> None:
@@ -303,7 +305,7 @@ class TestEffectiveModelPrecedence:
         assert resolve_effective_model(cfg, "crew") == "claude-haiku-4.5"
 
     def test_auto_global_is_never_returned_verbatim(self, specs_dir: Path) -> None:
-        """"auto" is the inherit spelling; returning it would pin the chip to a
+        """ "auto" is the inherit spelling; returning it would pin the chip to a
         value no tier actually chose."""
         cfg = _cfg({"crew": {"kiro_agent": "kirocrew", "model": ""}}, "auto")
         assert resolve_effective_model(cfg, "crew") != "auto"
@@ -333,7 +335,9 @@ class TestSessionModelCoversEverySurface:
     """
 
     def test_crew_name_resolves_its_own_model(self, specs_dir: Path) -> None:
-        cfg = _cfg({"oncall": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5")
+        cfg = _cfg(
+            {"oncall": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5"
+        )
         assert _session_model(cfg, "oncall") == "claude-opus-5"
 
     def test_crew_pin_outranks_the_bound_template_pin(self, specs_dir: Path) -> None:
@@ -359,16 +363,16 @@ class TestSessionModelCoversEverySurface:
         assert _session_model(cfg, "pinned") is None
 
     def test_unknown_name_falls_back_to_the_global(self, specs_dir: Path) -> None:
-        cfg = _cfg({"oncall": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5")
+        cfg = _cfg(
+            {"oncall": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5"
+        )
         assert _session_model(cfg, "no-such-thing") == "claude-haiku-4.5"
 
     def test_auto_global_yields_none_so_kiro_resolves(self, specs_dir: Path) -> None:
         cfg = _cfg({"oncall": {"kiro_agent": "unpinned", "model": ""}}, "auto")
         assert _session_model(cfg, "oncall") is None
 
-    def test_non_string_crew_model_does_not_crash_the_session_path(
-        self, specs_dir: Path
-    ) -> None:
+    def test_non_string_crew_model_does_not_crash_the_session_path(self, specs_dir: Path) -> None:
         cfg = _load_from_dict(
             {
                 "agents": {"oncall": {"kiro_agent": "unpinned", "model": 123}},
@@ -377,3 +381,37 @@ class TestSessionModelCoversEverySurface:
         )
         cfg.agent.model = "claude-haiku-4.5"
         assert _session_model(cfg, "oncall") == "claude-haiku-4.5"
+
+
+def test_loader_builders_preserve_fork_multi_agent_and_broker_settings():
+    cfg = _load_from_dict(
+        {
+            "agent": {
+                "subagent_max_per_parent": 4,
+                "subagent_max_per_parent_by_agent": {"reviewer": 2},
+            },
+            "mcp_gateway": {
+                "shared_readonly_servers": ["docs"],
+                "claude_session_servers": ["kirocrew-core"],
+            },
+            "knowledge": {
+                "llm_timeout_secs": 41.0,
+                "auto_register_project_docs": True,
+                "auto_ingest_chunk_budget": 321,
+                "auto_discover_folder": True,
+                "auto_discover_dirname": "research",
+                "max_sources": 71,
+            },
+        }
+    )
+    assert cfg.agent.subagent_max_per_parent == 4
+    assert cfg.agent.subagent_max_per_parent_by_agent == {"reviewer": 2}
+    assert cfg.agent.session_control is True
+    assert cfg.mcp_gateway.shared_readonly_servers == ["docs"]
+    assert cfg.mcp_gateway.claude_session_servers == ["kirocrew-core"]
+    assert cfg.knowledge.llm_timeout_secs == 41.0
+    assert cfg.knowledge.auto_register_project_docs is True
+    assert cfg.knowledge.auto_ingest_chunk_budget == 321
+    assert cfg.knowledge.auto_discover_folder is True
+    assert cfg.knowledge.auto_discover_dirname == "research"
+    assert cfg.knowledge.max_sources == 71

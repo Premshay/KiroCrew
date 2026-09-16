@@ -7,7 +7,8 @@ user's project, their ``~/.kiro/agents/``, or a bind mount.
 
 ``test_real_kiro_cli_prefers_session_injected_server`` is the anti-drift guard:
 that precedence is verified but undocumented, so it is pinned against the
-shipped binary whenever one is on PATH.
+shipped binary — but only when a human sets ``KIROCREW_E2E_REAL_KIRO_CLI=1``,
+because that guard spawns the operator's real, credentialed CLI. See ``REAL_CLI``.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew.mcp_gateway.hashing import expand_stub_flags
 from kiro_crew.mcp_gateway.rewriter import _WRAPPER_MARKER
 from kiro_crew.mcp_gateway.session_servers import (
     _acp_env,
@@ -86,7 +88,7 @@ def test_explicit_profile_injects_only_enabled_named_servers(tmp_path):
     )
 
     assert [entry["name"] for entry in servers] == ["context7"]
-    assert servers[0]["args"][-2:] == ["--channel-id", "channel-1"]
+    assert expand_stub_flags(servers[0]["args"])[-2:] == ["--channel-id", "channel-1"]
 
 
 def test_explicit_profile_does_not_widen_an_empty_allowlist(tmp_path):
@@ -208,7 +210,24 @@ def test_non_dict_server_entry_is_skipped(tmp_path):
 # ── the mechanism itself, pinned against the shipped binary ─────────────────
 
 
-REAL_CLI = shutil.which("kiro-cli")
+#: Opt-in only, and the opt-in is checked BEFORE ``PATH`` (the shape
+#: ``_resolve_backend`` uses at ``test/e2e/scenarios/conftest.py``). This is the one
+#: suite that spawns the REAL, operator-credentialed kiro-cli, which
+#: testing-conventions.md otherwise forbids outright ("Never spawn real `kiro-cli`
+#: in tests" / "Tests MUST NOT spawn real kiro-cli processes"): the driver below
+#: relocates only ``KIRO_HOME``, so the child inherits the real ``$HOME`` and reads
+#: the operator's sign-in store, and on a signed-out host kiro-cli auto-launches an
+#: interactive browser login for any subcommand with no env var to suppress it
+#: (acp-client.md). Gating on ``PATH`` presence alone therefore made a bare
+#: ``pytest`` on any developer desk drive a credentialed external service — or pop
+#: a login window — with nobody having asked for it. Presence is not consent: a
+#: human names the lever, exactly as ``KIROCREW_E2E_SCENARIOS_REAL_AGENT`` gates the
+#: scenario suite's real agent.
+REAL_CLI = (
+    shutil.which("kiro-cli")
+    if os.environ.get("KIROCREW_E2E_REAL_KIRO_CLI") == "1"
+    else None
+)
 
 #: A tiny, portable MCP server that records that it launched. Older kiro-cli
 #: versions tolerated a process that merely slept after creating the marker;
@@ -308,16 +327,22 @@ teardown()
 """
 
 
-@pytest.mark.skipif(not REAL_CLI, reason="kiro-cli not on PATH")
+@pytest.mark.skipif(
+    not REAL_CLI,
+    reason="set KIROCREW_E2E_REAL_KIRO_CLI=1 with kiro-cli on PATH to pin "
+           "session/new precedence against the real binary",
+)
 def test_real_kiro_cli_prefers_session_injected_server():
     """ANTI-DRIFT GUARD. Pins the undocumented precedence pooling relies on.
 
-    Runs on every platform now that both probe servers are launched through
+    Runnable on every platform now that both probe servers are launched through
     ``sys.executable`` instead of a POSIX shell. That matters because the CI
     Windows runner has no kiro-cli, so CI alone can never verify this
-    assumption -- but any Windows machine with the CLI installed verifies it by
-    running the suite, which is the only way this precedence gets checked on the
-    platform where the transport is newest.
+    assumption -- a Windows machine with the CLI installed is the only place this
+    precedence gets checked on the platform where the transport is newest, and it
+    is checked there by opting in (``KIROCREW_E2E_REAL_KIRO_CLI=1``), not by
+    running the suite: see ``REAL_CLI`` for why presence on PATH must not be read
+    as consent to drive a credentialed binary.
 
     kiro-cli documents priority only among the three *file* tiers (agent config
     > workspace mcp.json > global mcp.json); it does not document that a
@@ -350,9 +375,16 @@ def test_real_kiro_cli_prefers_session_injected_server():
         }), encoding="utf-8")
         driver = root / "drive.py"
         driver.write_text(_DRIVER, encoding="utf-8")
+        # kiro-cli writes its own log directory and telemetry spool under TMPDIR;
+        # aimed at this tree, that residue is deleted with the test's directory
+        # instead of outliving it in the shared temp root.
+        child_tmp = root / "tmp"
+        child_tmp.mkdir()
+        child_env = {**os.environ, "TMPDIR": str(child_tmp), "TMP": str(child_tmp), "TEMP": str(child_tmp)}
         result = subprocess.run(
             [sys.executable, str(driver), str(root), str(probe)],
             capture_output=True,
+            env=child_env,
             encoding="utf-8",
             errors="replace",
             timeout=180,

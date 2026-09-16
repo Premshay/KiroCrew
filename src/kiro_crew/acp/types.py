@@ -16,9 +16,12 @@ from typing import Any
 from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing importers
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_COMPACT,
@@ -29,16 +32,21 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_LOAD_WITHOUT_MODES,
+    ACP_BACKENDS_MARKDOWN_AGENT_SPECS,
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
+    ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_MEMBER_DISPATCH,
+    ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_POD_HOME_REMAP,
+    ACP_BACKENDS_RESUME_WITHOUT_LOAD,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     acp_runtime_backends,
+    effort_config_option_id,
     model_registry_namespace,
     selectable_backends,
 )
@@ -59,6 +67,15 @@ EVENT_THINKING_CHUNK = "thinking_chunk"
 EVENT_TOOL_CALL = "tool_call"
 EVENT_TOOL_CALL_UPDATE = "tool_call_update"
 EVENT_TOOL_RESULT = "tool_result"
+#: The ``tool_status`` values that mean a tool call REACHED a terminal state.
+#:
+#: One definition rather than one per site, because three sites have to agree on
+#: it and cannot be checked against each other: the two update parsers decide
+#: whether an output-less frame still reports its status, and the runner's result
+#: handler decides whether to close the call in the durable record. A set that
+#: drifts between them either invents a closer the stream never sent or records
+#: ``unknown`` for an outcome the stream did report.
+TERMINAL_TOOL_STATUSES = frozenset({"completed", "failed", "cancelled", "canceled", "refused"})
 EVENT_PERMISSION_REQUEST = "permission_request"
 EVENT_COMPLETE = "complete"
 EVENT_COMPACTION_STATUS = "compaction_status"
@@ -89,6 +106,12 @@ METHOD_SESSION_UPDATE = "session/update"
 METHOD_METADATA = "_kiro.dev/metadata"
 METHOD_COMMANDS_EXECUTE = "_kiro.dev/commands/execute"
 METHOD_SESSION_LOAD = "session/load"
+#: The other standard restore verb, for an agent that keeps sessions but does not
+#: implement full loading: it restores the session WITHOUT replaying the previous
+#: messages. Its request and response carry the same fields as ``session/load``'s,
+#: which is why one membership set (``ACP_BACKENDS_RESUME_WITHOUT_LOAD``) decides
+#: which of the two a harness is sent rather than each having a restore path.
+METHOD_SESSION_RESUME = "session/resume"
 # kiro-cli extension: evict a session from the multiplexed process, freeing its
 # transcript/context + reaping its MCP children. Without this the shared
 # kiro-cli process retains every session's state for its whole lifetime, so RSS
@@ -121,6 +144,11 @@ CLAUDE_STEER_IDLE_BEHAVIOR = "promptRequired"
 #: ``configId`` under which KAS exposes the session model. KAS implements no
 #: ``session/set_model``, so this is the only way to switch a model on it.
 MODEL_CONFIG_ID = "model"
+# The reasoning-effort ``configId`` is per harness, so it is resolved through
+# ``effort_config_option_id`` (re-exported above) rather than named by a constant
+# here: codex-acp spells it ``reasoning_effort`` and claude-agent-acp spells it
+# ``effort``, and a single constant beside ``MODEL_CONFIG_ID`` would read as one
+# shared spelling and be written to the wrong adapter.
 
 #: JSON-RPC 2.0 reserved error code for an unrecognized method.
 JSONRPC_METHOD_NOT_FOUND = -32601
@@ -193,6 +221,9 @@ PROVIDER_LABEL_CLAUDE = "claude_code"
 PROVIDER_LABEL_KAS = "kas"
 PROVIDER_LABEL_CODEX = "codex"
 PROVIDER_LABEL_OPENCODE = "opencode"
+PROVIDER_LABEL_PI = "pi"
+PROVIDER_LABEL_GOOSE = "goose"
+PROVIDER_LABEL_DEEPSEEK = "deepseek"
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
 # level of clientCapabilities; every other capability it honours lives under
@@ -569,7 +600,22 @@ class AcpEvent:
     #: cannot lose the directive. See
     #: docs/system-specs/modules/agent-host-contract.md §9.
     tool_output: str = ""
+    #: SHA-256 and UTF-8 byte length of the full redacted result before the
+    #: display-only ``tool_output`` bound. Empty digest plus -1 means the frame
+    #: carried no result payload; a measured empty payload has byte length 0.
+    tool_output_digest: str = ""
+    tool_output_bytes: int = -1
     tool_final: bool = False  # True when this tool_result is the final (status=completed) update
+    #: The backend's own status on this ``tool_call_update``, verbatim and
+    #: unmapped: ``completed``, ``failed``, and whatever else it sends.
+    #:
+    #: ``tool_final`` is NOT a substitute. It is true only for ``completed``,
+    #: because the transcript paths that read it credit and finalise a successful
+    #: call -- so a FAILED tool leaves it false and every consumer keyed on it
+    #: skips the frame. A durable record must not: a call that failed reached a
+    #: terminal state and has to be recorded as failed rather than left open and
+    #: swept up later as an unknown outcome.
+    tool_status: str = ""
     usage: TurnUsage = field(default_factory=TurnUsage)
     raw_tool_params: dict | None = (
         None  # original tool params before diff conversion (for file-chip snapshots)
@@ -778,7 +824,13 @@ class AcpEvent:
         (``sub_session_id``), no RESOLVED shell classification to the contrary
         (``not is_shell`` — a frame whose ``kind`` resolved to execute cached
         True, and its deny gates need the command bytes this event lacks; the
-        transport identity must never waive that), the canonical
+        kiro-cli transport identity must never waive that. The one exception
+        is not a waiver but a different classification: codex-acp emits its
+        MCP calls through its shell builder, so a frame carrying the
+        adapter-authored ``_meta.is_mcp_tool_call`` marker is classified as
+        MCP by ``_dispatch.classify_tool_call`` and never caches shell in the
+        first place — its ``server``/``tool`` pair is what the adapter
+        resolved, not model text), the canonical
         ``mcp_server_name`` + ``tool_name`` pair recovered from the tool_call
         cache (empty on a miss, and populated only for genuinely MCP-served
         tools — a host shell/builtin can never carry a server name), and the

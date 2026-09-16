@@ -66,39 +66,43 @@ def inheritable_environment() -> list[str]:
     their own scratch paths and leaves residue outside the session's directory.
     """
     return sorted(
-        name
-        for name in os.environ
-        if name and "=" not in name and name not in _UNIT_MANAGED_ENV
+        name for name in os.environ if name and "=" not in name and name not in _UNIT_MANAGED_ENV
     )
 
 
-def requested_workers(args: list[str]) -> int:
+def _explicit_worker_count(args: list[str]) -> int | None:
     """Return the exact permit count for pytest's xdist options.
 
-    No explicit option still means six: this repository's pytest configuration
-    supplies ``-n auto``.  Explicit values never downsize silently; callers get
+    None denotes automatic selection through the canonical budget policy.
+    Explicit values never downsize silently; callers get
     a clear usage error instead of a command that ran with a different shape.
     """
     values: list[str] = []
     index = 0
     while index < len(args):
         arg = args[index]
+        if arg == "--":
+            break
         if arg in {"-n", "--numprocesses"}:
             if index + 1 >= len(args):
                 raise ValueError(f"{arg} requires a worker count")
             values.append(args[index + 1])
             index += 2
             continue
+        if arg.startswith("-n="):
+            values.append(arg[3:])
+        elif arg.startswith("-n") and len(arg) > 2:
+            values.append(arg[2:])
         if arg.startswith("--numprocesses="):
             values.append(arg.split("=", 1)[1])
         index += 1
     if not values:
-        return xdist_budget._HOST_WORKER_CAP
+        return None
     if len(set(values)) != 1:
         raise ValueError("conflicting pytest worker counts")
     raw = values[0].lower()
     if raw in {"auto", "logical"}:
-        return xdist_budget._HOST_WORKER_CAP
+        return None
     try:
         count = int(raw)
     except ValueError as exc:
@@ -113,6 +117,12 @@ def requested_workers(args: list[str]) -> int:
             f"of {xdist_budget._HOST_WORKER_CAP}"
         )
     return permits
+
+
+def requested_workers(args: list[str]) -> int:
+    """Resolve automatic sizing without reserving permits in the launcher."""
+    explicit = _explicit_worker_count(args)
+    return xdist_budget.automatic_worker_limit() if explicit is None else explicit
 
 
 def _busy(count: int) -> str:
@@ -131,9 +141,16 @@ def contained_main(args: list[str]) -> int:
     """
     try:
         count = int(args[0])
+        if not 1 <= count <= xdist_budget._HOST_WORKER_CAP:
+            raise ValueError("invalid grant")
+        explicit = _explicit_worker_count(args[1:])
+        if explicit is None:
+            count = min(count, xdist_budget.automatic_worker_limit())
+        elif explicit != count:
+            raise ValueError("grant differs from explicit request")
     except (IndexError, ValueError):
         print(
-            f"run_agent_pytest: {SHIM_FLAG} requires a worker count",
+            f"run_agent_pytest: {SHIM_FLAG} requires a valid worker count matching the request",
             file=sys.stderr,
         )
         return 64

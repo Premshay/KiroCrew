@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import json
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,11 @@ def kas_projection_stubbed(monkeypatch, tmp_path):
         session_servers_mod, "injection_server_names", lambda overlay, agent: frozenset()
     )
     monkeypatch.setattr(paths_mod, "kiro_agents_dir", lambda: tmp_path)
+    # A real spec on disk: the harness reads it ITSELF now, under the gate, and hands the
+    # object to the projection -- so the read is part of what these tests exercise.
+    (tmp_path / "a.json").write_text(
+        json.dumps({"name": "a", "prompt": "p", "tools": []}), encoding="utf-8"
+    )
 
 
 # ── Registry ──
@@ -175,6 +181,7 @@ def test_the_contract_declares_every_seam_this_suite_covers():
         "apply_spawn_env",
         "internal_sandbox",
         "pod_home_remap",
+        "reads_markdown_agent_specs",
         "verifies_agent_activation",
         "protocol_version",
         "client_capabilities",
@@ -392,7 +399,7 @@ async def test_kas_projects_the_agent_spec(kas_projection_stubbed, monkeypatch, 
     monkeypatch.setattr(
         kas_agents_mod,
         "build_kas_custom_agents",
-        lambda d, a, *, stub_server_names, member_dispatch: projected,
+        lambda d, a, spec, *, stub_server_names, member_dispatch: projected,
     )
     extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
     assert extras.custom_agents == projected
@@ -431,7 +438,7 @@ async def test_kas_projection_refuses_an_untranslatable_spec(
     from kiro_crew.acp.kas_agents import KasAgentTranslationError
     from kiro_crew.acp.session_handle import AcpRuntimeError
 
-    def _boom(d, a, *, stub_server_names, member_dispatch):
+    def _boom(d, a, spec, *, stub_server_names, member_dispatch):
         raise KasAgentTranslationError("unreadable spec")
 
     monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _boom)
@@ -453,7 +460,7 @@ async def test_kas_projection_survives_an_unreadable_overlay(
     def _boom(overlay, agent):
         raise OSError("overlay unreadable")
 
-    def _build(d, a, *, stub_server_names, member_dispatch):
+    def _build(d, a, spec, *, stub_server_names, member_dispatch):
         seen.append(frozenset(stub_server_names))
         return [{"name": a}]
 
@@ -477,7 +484,7 @@ async def test_kas_member_dispatch_subtracts_the_dashboard_server(
 
     seen: list[frozenset] = []
 
-    def _build(d, a, *, stub_server_names, member_dispatch):
+    def _build(d, a, spec, *, stub_server_names, member_dispatch):
         seen.append(frozenset(stub_server_names))
         return []
 
@@ -738,6 +745,22 @@ def test_the_runtime_resolves_the_kiro_harness_without_spawning():
     assert harness.teardown.method == METHOD_SESSION_TERMINATE
     assert harness.protocol_version == "2025-08-22"
     assert harness.verifies_agent_activation is True
+    assert harness.reads_markdown_agent_specs is False
+
+
+@pytest.mark.parametrize("backend", ALL_BACKENDS)
+def test_reads_markdown_agent_specs_is_a_membership_answer(backend):
+    """The markdown-form seam is the membership set, not an identity test.
+
+    The runtime refuses a markdown-only agent before the spawn for every host that
+    answers False, so a host that reads the form joins
+    ``ACP_BACKENDS_MARKDOWN_AGENT_SPECS`` and the Kiro path gains no branch.
+    """
+    from kiro_crew.acp.types import ACP_BACKENDS_MARKDOWN_AGENT_SPECS
+
+    assert harness_for(backend).reads_markdown_agent_specs is (
+        backend in ACP_BACKENDS_MARKDOWN_AGENT_SPECS
+    )
 
 
 def test_a_projection_only_bare_runtime_still_resolves_its_host():

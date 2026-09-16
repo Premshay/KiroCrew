@@ -9,10 +9,11 @@ resolved the agent's config file inline::
 
 all three on the single event loop every other gateway request shares.
 
-The proof below is thread identity at the real filesystem seam -- ``read_text``
-itself -- not an assertion that ``asyncio.to_thread`` was called. A spy on the
-offload would keep passing if the call were later moved back inline behind some
-other wrapper; the thread the read actually runs on cannot be faked.
+The proof below is thread identity at the real filesystem seam -- the hardened
+``safe_read_file_bytes`` gate the strict spec reader opens the file through --
+not an assertion that ``asyncio.to_thread`` was called. A spy on the offload
+would keep passing if the call were later moved back inline behind some other
+wrapper; the thread the read actually runs on cannot be faked.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from kiro_crew import agent_discovery
 from kiro_crew.dashboard.handlers import sessions as sessions_mod
 
 AGENT = "reviewer"
@@ -69,13 +71,13 @@ async def test_the_agent_config_read_runs_off_the_event_loop(
     )
 
     read_threads: list[int] = []
-    real_read_text = Path.read_text
+    real_read = agent_discovery.safe_read_file_bytes
 
-    def recording_read_text(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+    def recording_read(raw: str) -> bytes | None:
         read_threads.append(threading.get_ident())
-        return real_read_text(self, *args, **kwargs)
+        return real_read(raw)
 
-    monkeypatch.setattr(Path, "read_text", recording_read_text)
+    monkeypatch.setattr(agent_discovery, "safe_read_file_bytes", recording_read)
 
     loop_thread = threading.get_ident()
     response = await _call(monkeypatch, tmp_path)
@@ -184,6 +186,158 @@ async def test_an_unread_config_is_not_logged_as_ok(
 
     assert _body(response) == {}
     assert not sel.log_api_access.called, "an unread config must not report ok"
+
+
+@pytest.mark.asyncio
+async def test_a_namespaced_agent_resolves_its_policy_by_declared_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read resolves an agent the same way the KAS projection does.
+
+    A package-installed agent is namespaced on disk as ``<package>-<name>.json``
+    and dispatched under its bare ``name``. The projection resolves that spec by
+    declared name, so the session starts; if this read still went by filename
+    alone, the same agent would then answer an empty policy and its managed MCP
+    servers would filter against nothing -- a session with the wrong tool
+    surface, not a session that failed to start.
+    """
+    (tmp_path / f"SomePackage-{AGENT}.json").write_text(
+        json.dumps({"name": AGENT, "managedToolPolicy": {"exclude": ["shell"]}}),
+        encoding="utf-8",
+    )
+
+    sel = MagicMock()
+    monkeypatch.setattr(sessions_mod, "kiro_agents_dir", lambda: tmp_path)
+    monkeypatch.setattr(sessions_mod, "_sel", lambda: sel)
+    response = await sessions_mod.api_session_tool_policy(_request(_state()))
+
+    assert response.status == 200
+    assert _body(response) == {"exclude": ["shell"]}
+    assert sel.log_api_access.call_args.kwargs["outcome"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_the_projection_and_the_policy_read_resolve_the_same_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end for one namespaced agent: the spec the KAS projection starts
+    the session from is the spec whose policy its MCP servers are then handed.
+
+    Both go through ``agent_discovery.spec_by_declared_name``, so this pins the
+    agreement rather than two lookups that happen to coincide today.
+    """
+    from kiro_crew.acp.kas_agents import load_agent_spec
+
+    (tmp_path / f"SomePackage-{AGENT}.json").write_text(
+        json.dumps(
+            {
+                "name": AGENT,
+                "description": "namespaced",
+                "managedToolPolicy": {"exclude": ["shell", "browser"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    projected = load_agent_spec(tmp_path, AGENT)
+    response = await _call(monkeypatch, tmp_path)
+
+    assert projected["description"] == "namespaced"
+    assert _body(response) == projected["managedToolPolicy"]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_name_outranks_a_misnamed_direct_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The policy handed to a session's MCP servers is the policy of the spec
+    the KAS projection started that session from. A ``<agent_name>.json`` that
+    declares some other agent must not hand this session that agent's policy
+    while the spec declaring ``agent_name`` sits beside it."""
+    (tmp_path / f"{AGENT}.json").write_text(
+        json.dumps({"name": "other", "managedToolPolicy": {"exclude": ["misnamed"]}}),
+        encoding="utf-8",
+    )
+    (tmp_path / f"SomePackage-{AGENT}.json").write_text(
+        json.dumps({"name": AGENT, "managedToolPolicy": {"exclude": ["namespaced"]}}),
+        encoding="utf-8",
+    )
+    response = await _call(monkeypatch, tmp_path)
+    assert _body(response) == {"exclude": ["namespaced"]}
+
+
+@pytest.mark.asyncio
+async def test_a_direct_file_is_the_fallback_when_nothing_declares_the_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec that declares no ``name`` -- the shape every pre-existing test in
+    this file writes -- still resolves by filename, so nothing that resolved
+    before this read consulted declared names stops resolving."""
+    (tmp_path / f"{AGENT}.json").write_text(
+        json.dumps({"managedToolPolicy": {"exclude": ["direct"]}}), encoding="utf-8"
+    )
+    (tmp_path / "SomePackage-other.json").write_text(
+        json.dumps({"name": "other", "managedToolPolicy": {"exclude": ["unrelated"]}}),
+        encoding="utf-8",
+    )
+    response = await _call(monkeypatch, tmp_path)
+    assert _body(response) == {"exclude": ["direct"]}
+
+
+@pytest.mark.asyncio
+async def test_two_specs_declaring_the_agent_name_are_denied_not_emptied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Which of two same-name specs is live is undefined, so the policy is too.
+
+    The caller still fails open on ``{}`` (its own documented deviation), but
+    the record is a SEL ``denied`` naming both files, not the silence a missing
+    file gets -- and never an ``ok``.
+    """
+    (tmp_path / f"Alpha-{AGENT}.json").write_text(
+        json.dumps({"name": AGENT, "managedToolPolicy": {"exclude": ["a"]}}), encoding="utf-8"
+    )
+    (tmp_path / f"Beta-{AGENT}.json").write_text(
+        json.dumps({"name": AGENT, "managedToolPolicy": {"exclude": ["b"]}}), encoding="utf-8"
+    )
+
+    sel = MagicMock()
+    monkeypatch.setattr(sessions_mod, "kiro_agents_dir", lambda: tmp_path)
+    monkeypatch.setattr(sessions_mod, "_sel", lambda: sel)
+    response = await sessions_mod.api_session_tool_policy(_request(_state()))
+
+    assert response.status == 200
+    assert _body(response) == {}
+    kwargs = sel.log_api_access.call_args.kwargs
+    assert kwargs["outcome"] == "denied"
+    assert f"Alpha-{AGENT}.json" in kwargs["error"]
+    assert f"Beta-{AGENT}.json" in kwargs["error"]
+
+
+@pytest.mark.asyncio
+async def test_the_declared_name_scan_also_runs_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback scan reads every spec in the directory, so it is the more
+    expensive path; it must cross to the worker with the rest of the read."""
+    (tmp_path / f"SomePackage-{AGENT}.json").write_text(
+        json.dumps({"name": AGENT, "managedToolPolicy": {"exclude": ["shell"]}}),
+        encoding="utf-8",
+    )
+    scan_threads: list[int] = []
+    real_scan = sessions_mod.spec_by_declared_name
+
+    def recording_scan(*args, **kwargs):  # type: ignore[no-untyped-def]
+        scan_threads.append(threading.get_ident())
+        return real_scan(*args, **kwargs)
+
+    monkeypatch.setattr(sessions_mod, "spec_by_declared_name", recording_scan)
+
+    loop_thread = threading.get_ident()
+    response = await _call(monkeypatch, tmp_path)
+
+    assert _body(response) == {"exclude": ["shell"]}
+    assert scan_threads and loop_thread not in scan_threads
 
 
 @pytest.mark.asyncio

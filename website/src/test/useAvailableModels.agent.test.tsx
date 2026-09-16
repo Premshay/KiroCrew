@@ -20,7 +20,7 @@ vi.mock('../providers', () => ({
   }),
 }))
 
-import { useAvailableModels } from '../hooks/useAvailableModels'
+import { useAvailableModels, useAvailableModelsQuery } from '../hooks/useAvailableModels'
 
 function queryWrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -81,4 +81,19 @@ describe('useAvailableModels — selectable crew', () => {
     expect(mocks.discover).not.toHaveBeenCalled()
     expect(mocks.generic).not.toHaveBeenCalled()
   })
+  it('exposes a crew discovery failure without consulting another runtime catalog', async () => {
+    mocks.discover.mockRejectedValue(new Error('Crew discovery unavailable'))
+    const { result } = renderHook(
+      () => useAvailableModelsQuery({
+        agent: { name: 'crew-codex', runtime_policy: { model: 'selectable' } },
+        fallback: 'none',
+      }),
+      { wrapper: queryWrapper },
+    )
+    await waitFor(() => expect(result.current.isError).toBe(true))
+    expect(result.current.isDegraded).toBe(true)
+    expect(result.current.data).toEqual([])
+    expect(mocks.generic).not.toHaveBeenCalled()
+  })
+
 })

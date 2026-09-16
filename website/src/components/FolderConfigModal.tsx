@@ -351,7 +351,7 @@ export default function FolderConfigModal({
                     aria-label={i18nT('components.folderConfigModal.set_color_to_name', { name })}
                     aria-pressed={draft.color === value}
                     onClick={() => setDraft(d => ({ ...d, color: value }))}
-                    className={`w-5 h-5 rounded-full cursor-pointer border transition-transform hover:scale-110 ${draft.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                    className={`w-5 h-5 rounded-full cursor-pointer border hover:brightness-125 swatch-cue ${draft.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
                     style={{ background: `color-mix(in srgb, ${value} 30%, var(--bg-elevated))`, borderColor: value }}
                   />
                 )
@@ -411,7 +411,7 @@ export default function FolderConfigModal({
                       key={tag.id}
                       htmlFor={`folder-config-tag-input-${tag.id}`}
                       data-testid={`folder-config-tag-${tag.id}`}
-                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11.5px] cursor-pointer transition-transform hover:scale-105 focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-1 focus-within:ring-offset-bg ${selected ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11.5px] cursor-pointer hover:brightness-110 focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-1 focus-within:ring-offset-bg ${selected ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
                       style={{
                         background: selected
                           ? `color-mix(in srgb, ${tag.color} 30%, var(--bg-elevated))`
@@ -496,6 +496,13 @@ export default function FolderConfigModal({
             </span>
             <SimpleSelect
               aria-label={i18nT('components.folderConfigModal.default_agent')}
+              // Bind the orphan notice to the control so a screen reader reaches
+              // the reason WITH the field, not as text that merely sits near it:
+              // a control whose state has a cause the user cannot hear is the
+              // same defect as a disabled button that never says why. Only while
+              // an orphan is selected — an ordinary selection has nothing to
+              // describe, and a dangling id here would drop the description.
+              aria-describedby={orphanAgent ? 'folder-config-agent-notice' : undefined}
               options={agentOptions}
               optionLabels={agentOptionLabels}
               clearLabel={inheritedAgent
@@ -504,7 +511,22 @@ export default function FolderConfigModal({
               value={draft.defaultAgent}
               onChange={v => setDraft(d => ({ ...d, defaultAgent: v }))}
             />
-            <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.default_agent_hint')}</span>
+            {orphanAgent ? (
+              // The orphan is round-tripped, not blocked — Save stays enabled so
+              // a rename of the folder never wipes a temporarily-uninstalled
+              // agent (the round-trip guarantee this picker was built on). The
+              // notice therefore explains why the SELECTED AGENT will not run and
+              // names the fix. Its id is what `aria-describedby` above targets.
+              <span
+                id="folder-config-agent-notice"
+                data-testid="folder-config-agent-notice"
+                className="text-[11px] text-warn"
+              >
+                {i18nT('components.folderConfigModal.agent_not_installed_notice')}
+              </span>
+            ) : (
+              <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.default_agent_hint')}</span>
+            )}
           </div>
         </div>
       </Modal>

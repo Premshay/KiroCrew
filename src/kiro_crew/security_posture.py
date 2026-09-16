@@ -105,6 +105,27 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Member capability editor responses",
+        "agent_capabilities.py",
+        "Owner-facing capability rows, Parent-change previews and impact summaries. "
+        "safe_view applies redact_via_context before serialization and masks credential "
+        "map values while preserving their structure. Retained secret values and "
+        "source-content digests remain server-side.",
+    ),
+    (
+        "Session ledger entries",
+        "session_ledger_emit.py",
+        "Message bodies written to the append-only per-session ledger under "
+        "`<home>/ledgers/sessions/` -- what the user typed and what the model "
+        "answered. This sink is a FILE rather than "
+        "a response, so what it writes outlives the process and is read back "
+        "later by folds and the session panel; that makes it an output boundary "
+        "with a longer reach than an egress response, not a lesser one. Every "
+        "body passes the shared exfiltration-URL then credential chain in the "
+        "emitter rather than at its call sites, so a new call site cannot forget, "
+        "and a redaction that fails writes the empty string instead of the input.",
+    ),
+    (
         "Memory recovery responses",
         "dashboard/handlers/memory_admin.py",
         "Retired episode text and supersession references, plus backup and restore "
@@ -1371,6 +1392,13 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # a third party — the surfaces that SHOW a refusal (the dashboard's
         # notice line) are the registered sinks.
         "name_grant.py",
+        # Same shape as name_grant: audit_decision scrubs the caller-supplied
+        # detail (a refusal reason, a delivery description) before the 200-char
+        # clip and before writing the file_delivery_consent SEL row. A gate-side
+        # audit record, not an output bound for a human or a third party; the
+        # consent card and the tool's own error string are the surfaces that
+        # show a refusal, and those are owned by their registered sinks.
+        "file_delivery_consent.py",
         # Capture-side, not egress: the opt-in frame recorder scrubs a raw ACP
         # frame as it WRITES it to a local file, so a credential never lands in
         # a recording the operator may later commit to the replay corpus. There
@@ -1672,7 +1700,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "apps/builtins/design_tweak/backend/http_api.py",
         "apps/builtins/design_tweak/backend/request_state.py",
         "apps/builtins/design_tweak/backend/server.py",
-        "sync_bridge.py",
         "suggestions.py",
         "tips.py",
         "task_executor.py",
@@ -1798,9 +1825,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "apps/builtins/code_review_sage/backend/routes.py",
         # Dev Fleet's redactor wrapper and the cohesive owners that apply it to
         # the app's own API/state/worktree surfaces, all carrying the same
-        # non-core-egress classification.
+        # non-core-egress classification. `gateway_routes` is the same surface
+        # served from the gateway process (the live-target cutover), redacting
+        # the target path and error text bound for its SEL record and JSON reply.
         "apps/builtins/dev_fleet/runtime.py",
         "apps/builtins/dev_fleet/http_api.py",
+        "apps/builtins/dev_fleet/gateway_routes.py",
         "apps/builtins/dev_fleet/fleet_state.py",
         "apps/builtins/dev_fleet/repository.py",
         "apps/builtins/dev_fleet/live.py",
@@ -1879,6 +1909,30 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # (an internal model field). The egress boundary is the dashboard API
         # handler that serializes hooks via to_dict() — already a registered sink.
         "hooks.py",
+        # Helper, not a boundary: `redact_oauth_client_secrets` /
+        # `restore_redacted_oauth_client_secrets` are pure functions over an agent
+        # spec dict that mask (and, on the write-back, un-mask) a pre-registered
+        # Connections client's `oauth.clientSecret`. Nothing leaves the process
+        # here; the egress boundaries are the two dashboard reads that CALL the
+        # masker -- `GET /api/agent/config` and `GET /api/agents/detail/{name}`
+        # in `dashboard/handlers/agents.py`, an already-registered sink.
+        "mcp_utils.py",
+        # Pure-type error-envelope constructor, not an egress boundary: the W01
+        # connector control plane's `redacted_detail` / `operation_error` scrub an
+        # error `detail` with `redact_and_truncate` as the typed `OperationError`
+        # is BUILT, so a credential a provider reflected can never enter the
+        # envelope unredacted. The module owns no output and crosses no transport
+        # -- the surface that eventually RENDERS a connector error is the egress
+        # boundary and is a registered sink there, not here.
+        "connections/control_plane/errors.py",
+        # Same class, one layer out: the Zoom vendor slice's `redact_zoom_secrets`
+        # scrubs Zoom-SHAPE credentials (signed `/rec/` media URLs, bare token
+        # fields the site-wide scanner does not recognize) as the error `detail`
+        # is BUILT in `zoom_operation_error`, composed BEFORE the control plane's
+        # `redacted_detail`. It owns no output and crosses no transport -- the
+        # surface that eventually renders a Zoom connector error is the egress
+        # boundary and is a registered sink there, not here.
+        "connections/vendors/zoom/errors.py",
     }
 )
 

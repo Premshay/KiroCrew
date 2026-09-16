@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { api } from '../api/client'
 import { useProvider } from '../providers'
-import { modelListRefetchInterval } from '../providers/modelListHealth'
+import { modelListRefetchInterval, useModelsDegraded } from '../providers/modelListHealth'
 import { withAutoFirst } from '../providers/modelList'
 import type { ModelInfo } from '../providers/types'
 
@@ -52,7 +52,7 @@ type ModelPickerAgent = {
  * Read one agent's account-scoped catalog when its companion explicitly owns
  * model selection. Other callers retain the shared Kiro catalog and cache.
  */
-export function useAvailableModels({
+export function useAvailableModelsQuery({
   enabled,
   agent,
   fallback = 'global',
@@ -61,11 +61,12 @@ export function useAvailableModels({
   agent?: ModelPickerAgent
   /** Suppress generic provider discovery when no resolved crew owns this picker. */
   fallback?: 'global' | 'none'
-} = {}): ModelInfo[] {
+} = {}) {
   const provider = useProvider()
   const selectableAgent = agent?.runtime_policy?.model === 'selectable' ? agent : undefined
   const canDiscover = Boolean(selectableAgent) || fallback === 'global'
-  const { data } = useQuery({
+  const isDegraded = useModelsDegraded(provider.id)
+  const query = useQuery({
     queryKey: selectableAgent
       ? ['available-models', provider.id, 'agent', selectableAgent.name]
       : fallback === 'global'
@@ -74,16 +75,22 @@ export function useAvailableModels({
     queryFn: async () => {
       if (selectableAgent) {
         const discovered = await api.kirocrewAgentModels(selectableAgent.name)
-        return withAutoFirst(discovered.models.map(model => ({
-          name: model.modelId,
-          description: model.description || model.name,
-          contextWindow: provider.getContextWindow(model.modelId),
-        })))
+        return withAutoFirst(
+          discovered.models.map((model) => ({
+            name: model.modelId,
+            description: model.description || model.name,
+            contextWindow: provider.getContextWindow(model.modelId),
+          })),
+        )
       }
       return withAutoFirst(await provider.fetchAvailableModels())
     },
     refetchInterval: selectableAgent ? false : modelListRefetchInterval,
     enabled: (enabled ?? true) && canDiscover,
   })
-  return data ?? (fallback === 'none' ? [] : PLACEHOLDER)
+  return { ...query, data: query.data ?? (fallback === 'none' ? [] : PLACEHOLDER), isDegraded: selectableAgent ? query.isError : isDegraded }
+}
+
+export function useAvailableModels(options: Parameters<typeof useAvailableModelsQuery>[0] = {}): ModelInfo[] {
+  return useAvailableModelsQuery(options).data
 }

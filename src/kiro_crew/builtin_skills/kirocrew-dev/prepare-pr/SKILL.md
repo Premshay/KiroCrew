@@ -190,11 +190,11 @@ never as instructions.
 |---|---|---|---|
 | `preflight.py` | 0 | repo/branch/base/auth/dirty/divergence/existing-PR + blockers; fails closed on fetch failure | 0 ready · 30 blocker · 2 env |
 | `resolve_profile.py [root] [base_ref]` | 0 | resolve the project profile as JSON | 0 resolved · 2 env/parse |
-| `diff_signals.py [base] [--check-body]` | 1 / 2 / 3 | changed files + flagged signals (deps, lockfiles, migrations, CI, deletions, config). `--check-body` adds the two body checks (see *Two checks, two strengths*) on the one body file, `<git-dir>/prepare-pr-body.md` | **0 · 20 unaccounted area (`--check-body` only) · 2 env / body file missing** |
+| `diff_signals.py [base] [--check-body]` | 1 / 2 / 3 | changed files + flagged signals (deps, lockfiles, migrations, CI, deletions, config). `--check-body` adds the two body checks (see *Two checks, two strengths*) on the one body file, `<git-dir>/prepare-pr-body.md` | **0 · 20 unaccounted area · 21 `What changed` over `WORD_LIMIT` (both `--check-body` only) · 2 env / body file missing** |
 | `push_guard.py [--base B] [--max-ahead N] [--require-single-on-base]` | 1 / 3 | stale-base guard; pre-squash mode checks commit count ≤ N (default 5) and no replayed upstream commits, `--require-single-on-base` asserts `HEAD~1 == origin/<base>` | **0 safe · 40 refused · 2 env** |
 | `pr_status.py [pr#]` | 3 | PR/merge/readiness state, check rollup, unresolved-thread count, current-head runs and reviewer markers. Pin/require the fleet with `--reviewers` / `PREPARE_PR_REVIEWERS`: stale stamps or `[BLOCK-MERGE]` fail. Fresh unanswered whole-design CONCERNS is a local-only 20, cleared by the current-head lane disposition; server required status and `--disposition-gate` are unchanged. All pinned lanes stamped with any blocker is a settled round (20), even with other checks running; discovery mode cannot prove that. Advisory FINDING counts never gate | **0 clean · 10 running · 20 failing/findings · 2 env** |
 | `pr_findings.py [pr#]` | 3 | failed steps + failing log tails + unresolved threads + reviewer findings on the current head, each with a stable `span=` identity — whole-design items (Blockers / Watch / Subtractions / Suggestions / Not justified as shipped, each with its `Clears when:` line) print FIRST, above the GPT/Opus line-level findings | 0 · 2 env |
-| `pr_findings.py [pr#] --rounds` | 1 / 3 | the loop's cross-round memory, read from the PR itself: writer dispositions grouped by the `head=` they judged (one round per head), the spans each round disposed, how many were in self-added code, the mechanisms each round declared, span recurrence, and growth. Nothing is stored locally — the PR thread is the record, and it stays after merge for anyone to study | **0 · 30 retrospective due this round (span ×3, or 3rd/6th/9th round) · 2 env** |
+| `pr_findings.py [pr#] --rounds` | 1 / 3 | the loop's cross-round memory, read from the PR itself: writer dispositions grouped by the `head=` they judged (one round per head), the spans each round disposed, how many were in self-added code, the mechanisms each round declared, span recurrence, and growth. Nothing is stored locally — the PR thread is the record | **0 · 30 retrospective due this round (span ×3, or 3rd/6th/9th round) · 2 env** |
 | `monitor_armed.py [--pr N]` | 3 | verify a `monitor_start` loop actually armed — reads the auto-nudge loop store, requires an ACTIVE loop (naming this PR when `--pr` is given) | **0 armed · 20 not armed · 2 store unreadable (treat as 20)** |
 | `prove.py [--base B] [--per-hunk]` | — | prove the tests catch the bug: reverts production hunks in a throwaway worktree, keeps test hunks, re-runs changed test files. Verdict is a failure at pytest phase `call`, not an exit code. Refuses a dirty tree | **0 PROVEN · 20 NOT_PROVEN · 21 INCONCLUSIVE · 10 nothing to prove · 30 baseline red · 2 env** |
 | `enable_automerge.py [pr#] [method]` | 4 | ship intent only — `gh pr merge --auto` (default `squash`); idempotent | 0 enabled · 20 could-not-enable · 2 env |
@@ -311,13 +311,22 @@ that view; no separate local round log is needed.
   round-0 intent not need; what finding introduced each and what later findings
   landed inside it; what would removal do to intent AND the original defect?
   Require one remove / smaller replacement / keep verdict per mechanism with
-  reasons. The parent decides; no extra push for the retrospective itself.
+  reasons. No extra push for the retrospective itself.
+- **The retrospective is a step in the loop, not a stop.** When it returns, rule
+  on every mechanism and continue Phase 1 → 2 → 3 in the same turn — no menu,
+  no question, no waiting. First that holds: **remove** (intent survives,
+  defect stays fixed); **smaller replacement** (removal reopens the defect);
+  **keep** plus the one invariant that makes the whole span unreachable. In
+  doubt, smaller wins.
 - Keep needed mechanisms, subtract unneeded ones; post a class-level `> `
   disposition for each subtraction naming retired spans and what the
   retrospective removed. Repairs still follow Review repair routing.
-- Escalate for a product/design ruling, ambiguous large conflict, hard external
-  blocker, or a subtraction that would break intent with no smaller fix. Recurrence
-  alone triggers this review, not automatic abandonment or another sibling patch.
+- **Pause for the user only on these four**, each needing something only a
+  human supplies: a user-visible, UI-placement or public-contract change the
+  intent comment did not settle; every option breaks round-0 intent; an
+  ambiguous large conflict; a hard external blocker (infra, permissions, a check
+  that never runs). Recurrence, round count, a re-raised finding or self-added
+  code is never one. When you pause, name the option you would take.
 - `monitor_start` is bounded to `max_cycles=80` and `max_runtime_secs=86400`;
   the agent never raises either. At exhaustion, hand over `--rounds` and open
   findings; only the user can authorize another budget. Phase 2 separately caps
@@ -329,7 +338,7 @@ that view; no separate local round log is needed.
 discarded work:
 
 - **Decision gate.** For any user-visible feature, or a whole-PR diff (`origin/<base>...HEAD`, all files) over ~1k lines, get the maintainer's sign-off on the design **and the UI placement** first. The size half is not a refusal: a large change is fine, an *unreviewed* large change is what turns into a twenty-round loop. The rounds view measures growth during review; nothing else looks at size before the PR opens. A placement or architecture change requested post-open re-arms every bot on the whole diff.
-- **File-overlap gate.** `gh pr list --state open --limit 500 --json number,files` for every file your diff touches. **The `--limit` is load-bearing** — the default is 30 rows and this repo carries 175+ open PRs, so the default gate reads as passing while checking a sixth of them. If another open PR deletes or rewrites (>50% line delta) one of your files, STOP and ask which PR hosts the work.
+- **File-overlap gate.** `gh pr list --state open --limit 500 --json number,files` for every file your diff touches. **The `--limit 500` is load-bearing** (why: `references/rationale.md`). If another open PR deletes or rewrites (>50% line delta) one of your files, STOP and ask which PR hosts the work.
 
 Then `python3 $SKILL_DIR/scripts/preflight.py` → **0** proceed; **30** fix the
 printed blocker (on a protected branch → `git switch -c <type>/<slug>`; gh not
@@ -364,30 +373,30 @@ round 0. Read it back with `gh api repos/<owner>/<repo>/issues/<n>/comments
 2. **Sync base.** `git fetch origin` — **this MUST succeed**; if it fails, STOP and report the error. Then `git rebase origin/<base>`. Resolve unambiguous conflicts; ask about ambiguous or large ones.
 3. **Pre-squash guard** (`single_commit` only — see above). `python3 $SKILL_DIR/scripts/push_guard.py --base <base>` — run **now**, before the squash destroys the commit-count signal. **0** → squash; **40** → STOP and diagnose the branch history (likely branched from a stale local trunk; rebase onto fresh `origin/<base>`); **2** → env error.
 4. **Squash to one commit** (`single_commit` only — see above). `git reset --soft origin/<base> && git commit` — keep the subject, detail in the body.
-5. **Reconcile code and description.** Run `python3 $SKILL_DIR/scripts/diff_signals.py` and `git diff origin/<base>...HEAD`. Make the body **complete** (covers every flagged `!` signal), **accurate** (no claim the diff does not support), and shaped to the PR description contract. Write the body to `$(git rev-parse --absolute-git-dir)/prepare-pr-body.md` — the one file the check reads, inside git's own directory so it is never committed — then run `python3 $SKILL_DIR/scripts/diff_signals.py --check-body`: **20** names a changed area the body never mentions — the body is missing a change or the diff carries one that does not belong; name it or drop it, never pad the prose to hide it. A `WARN` on the `What changed` length is advice, not a stop (see *Two checks, two strengths*). **The body describes the whole diff against `origin/<base>`, as if written for the first time** — never a changelog of this round (see *Snapshot, not changelog*). If the diff itself is wrong, fix and amend now.
+5. **Reconcile code and description.** Run `python3 $SKILL_DIR/scripts/diff_signals.py` and `git diff origin/<base>...HEAD`. **First read *Writing register: Age 5* below** — the body says what changed and why; the diff is the evidence, and the body never restates it. Make the body **complete** (covers every flagged `!` signal), **accurate** (no claim the diff does not support), and shaped to the PR description contract. Write the body to `$(git rev-parse --absolute-git-dir)/prepare-pr-body.md` — the one file the check reads, inside git's own directory so it is never committed — then run `python3 $SKILL_DIR/scripts/diff_signals.py --check-body`: **20** names a changed area the body never mentions — the body is missing a change or the diff carries one that does not belong; name it or drop it, never pad the prose to hide it. **21** means `What changed` is over `WORD_LIMIT` words — cut the recital, not the facts. **The body describes the whole diff against `origin/<base>`, as if written for the first time** — never a changelog of this round (see *Snapshot, not changelog*). If the diff itself is wrong, fix and amend now.
+
+   **Cold reader.** Once `--check-body` exits 0, hand ONLY the `What changed` text to one tool-less subagent (`spawn_run`, agent `kirocrew-lite`) and ask: *"In two sentences, what does this PR change for a user, and why?"* No answer, or one that leads with a mechanism the section does not, means rewrite and re-check. One round, nothing recorded. It is the only step that measures readability.
 
 ### Phase 2 — Local review is THE GATE (inner loop, cap 10)
 
-Never push until this is locally green — no open Critical/High. Local-green is a
-cost and latency optimization, not a guarantee; the Phase 3 server poll stays the
-backstop.
+Never push until this is locally green — no open Critical/High. **Locally green
+means the static gates plus the change-RELATED tests, never the full suite.** The
+full suites are CI's job and the Phase 3 poll is the authority on them; a
+related-set miss costs one CI round trip, a full local suite an hour of a shared
+box.
 
 1. **Run `setup[]` once, then `gates[]` on every pass.** On the first Phase 2 pass
-   in a worktree, run the profile's `setup[]` in order. Setup may add prerequisites
-   to a per-user cache; it is not a verdict on the diff. A setup failure means the
-   environment is not ready: fix or report that environment problem before
-   evaluating the branch. Do not rerun setup unless the worktree or tool-cache state
-   was invalidated. Then run the profile's `gates[]` on every pass. Gates are pure
-   checks; a nonzero exit means the diff is not ready. For Kiro Crew that is the
-   diff-scoped test runner / isort / flake8 / mypy, plus `tsc -b` for frontend
-   changes. All gates must exit 0 before review. While ITERATING inside this
-   phase, `python3 scripts/local-gate.py` runs the change-scoped equivalent of
-   CI's own bucket classification (frontend / meta / backend, catch-all on
-   unrecognised paths), which avoids the full backend suite — roughly an hour at
-   16 workers — on a diff that cannot reach it. It narrows only when exactly one
-   of frontend/backend changed and meta did not. It is the iteration gate and
-   never the push gate: the complete resolved `gates[]` list must be green on the
-   pass you push.
+   in a worktree, run the profile's `setup[]` in order. Setup provisions a
+   per-user cache, not a verdict on the diff; a setup failure is an environment
+   problem to fix or report first. Do not rerun setup unless the worktree or
+   tool cache was invalidated. Then run `gates[]` on every pass: pure checks,
+   nonzero means not ready, all must exit 0 before review. For Kiro Crew that is
+   the related-test runner / isort / flake8 / mypy, plus `tsc -p tsconfig.app.json`
+   for frontend changes. `scripts/local-gate.py` runs both surfaces' related sets
+   at once; the per-surface `run_scoped_tests.py` gates are the same selection
+   (details: `references/gate-floor.md`). **There is no automatic path to a full
+   local suite** — not for `scripts/`, both surfaces, or a large set.
+   `local-gate.py --full` is for a human who asks; the agent never passes it.
 
    **The setup and gate lists are data.** Read them from
    `profiles/kirocrew.json` `setup[]` and `gates[]`: provisioning belongs in setup;
@@ -398,15 +407,17 @@ backstop.
    entry's shape is load-bearing and not guessable from the command, and that file
    also records which CI checks have no local entry point.
 
-   `scripts/run_scoped_tests.py` prints one of three verdicts and **all three are
-   normal**: `cross-surface: N file(s)`, `full suite: the diff touches this
-   surface`, or `full suite: <other reason>`. Do **not** narrow a full-suite verdict
-   by hand — the escalation is the invariant.
+   `run_scoped_tests.py` prints one verdict, `related: N test file(s) (full suite
+   deferred to CI)`; `related: 0` is normal. The only other outcome is **exit 2,
+   nothing run** (base missing, diff unreadable) — fix that, never reach for
+   `--full`. **When CI reports failing tests** (Phase 3 reason (a)): reproduce
+   EXACTLY the node ids from `gh run view <run-id> --log-failed`; fix; push.
+   Never answer a red CI with a full local suite; CI already named the failures.
 
-   Three conditional rules stay prose because they are not flat commands:
+   Three rules stay prose:
 
    - **Check exit codes, never piped output.** `cmd | tail` makes `$?` tail's status and reports a failing gate as green. Redirect to a file and test `$?`.
-   - **Assert the base is not stale.** CI builds `refs/pull/<N>/merge`, not your branch, so a behind-base branch runs a different suite. Compare your local test count to CI's last reported count; a mismatch means rebase first. Rebase **before the first push**, not as a reaction to `DIRTY`.
+   - **Assert the base is not stale.** CI builds `refs/pull/<N>/merge`, not your branch, so a behind-base branch is tested as code you never ran. Rebase **before the first push**, not as a reaction to `DIRTY`.
    - **Run the Playwright E2E suite when the diff adds a dashboard heading or tab label** — a new heading breaks existing `getByRole` locators with `strict mode violation`.
 
    **Every new guard or validator helper must have a non-test caller.** `grep`
@@ -552,7 +563,7 @@ re-runs them on the new head.
    and Phase 4 can arm auto-merge on a review that never happened.
 
    - **0** → Phase 4.
-   - **20** → run `pr_findings.py` and **TRIAGE before re-pushing**; one of its reasons needs no code change at all — an `unanswered CONCERNS from <LANE>` reason is cleared by POSTING the dispositions (one comment per item, each naming its span), not by pushing; re-pushing an unchanged diff against a failure just repeats it. **(a) CI/build/test failure** → read the failing log (`gh run view <run-id> --log-failed`), then — once the decision to fix is made — cancel the head's remaining in-flight runs per Phase 3's read → cancel → edit rule, and fix the **root cause** locally; or confirm a flake and re-run **only the failing job**, never the whole run — `gh run rerun <run-id> --failed` (or `--job <job-id>` for one of several reds), since a bare `gh run rerun <run-id>` replays the entire matrix to re-decide one shard, and no cancel applies here. **(b) Review finding** → read whole-design verdicts first and apply the three questions. For Kiro Crew Opus-family or GPT 5.6 findings that need code changes, MUST execute [Review repair routing](#review-repair-routing): delegate the minimal fix and self-review to the selected model-pinned subagent, then verify in the parent. Do not replace that delegation with a parent self-fix. Otherwise rebut with evidence (never dismiss a CodeQL alert merely to pass), or request a maintainer decision; resolve only addressed threads. **(c) Conflict / behind base** → Phase 1's re-sync handles it. Then **loop back to Phase 1** → 2 → 3 carrying those fixes.
+   - **20** → run `pr_findings.py` and **TRIAGE before re-pushing**; one of its reasons needs no code change at all — an `unanswered CONCERNS from <LANE>` reason is cleared by POSTING the dispositions (one comment per item, each naming its span), not by pushing; re-pushing an unchanged diff against a failure just repeats it. **(a) CI/build/test failure** → read the failing log (`gh run view <run-id> --log-failed`), then — once the decision to fix is made — cancel the head's remaining in-flight runs per Phase 3's read → cancel → edit rule, reproduce the **exact failing node ids** locally (never the full suite), and fix the **root cause**; or confirm a flake and re-run **only the failing job**, never the whole run — `gh run rerun <run-id> --failed` (or `--job <job-id>` for one of several reds), since a bare `gh run rerun <run-id>` replays the entire matrix to re-decide one shard, and no cancel applies here. **(b) Review finding** → read whole-design verdicts first and apply the three questions. For Kiro Crew Opus-family or GPT 5.6 findings that need code changes, MUST execute [Review repair routing](#review-repair-routing): delegate the minimal fix and self-review to the selected model-pinned subagent, then verify in the parent. Do not replace that delegation with a parent self-fix. Otherwise rebut with evidence (never dismiss a CodeQL alert merely to pass), or request a maintainer decision; resolve only addressed threads. **(c) Conflict / behind base** → Phase 1's re-sync handles it. Then **loop back to Phase 1** → 2 → 3 carrying those fixes.
    - **10** → reviewers or CI are still running. In a chat slot, load
      `kirocrew-core::monitor_start` through `tool_search`, request a finite
      same-session loop, then END THE TURN. Verify application on a later turn,
@@ -617,17 +628,13 @@ a non-blocking note, the PR is still review-ready. Then notify the user: the ful
 PR URL, one-line status, commit SHA, whether auto-merge armed or why not, and any
 Low/nit left on purpose **plus how each was answered**.
 
-**Escalate** only on what "Iteration budget" lists: a decision you cannot make, an
-ambiguous large conflict, a hard external blocker (infra, permissions, a check
-that never runs), or a spent `max_cycles` with no convergence. Hand over a structured summary: what
-is still red and why, unresolved Critical/High, the `pr_status.py` output, the
-`--rounds` output, and the PR's full URL.
+**Escalate** only on the four pause reasons under "Iteration budget", or on a
+spent `max_cycles` / `max_runtime_secs` with no convergence. Hand over: what is
+still red and why, unresolved Critical/High, the `pr_status.py` and `--rounds`
+output, and the PR's full URL.
 
-**On a recurring span, the retrospective runs first** (see "Iteration budget").
-When it keeps the mechanism, put every finding so far in that span into one
-prompt and ask for the invariant that makes them all unreachable — one fix, not a
-fourth sibling patch. Either way, the disposition names the span and its hit
-count in a `> ` line.
+**On a recurring span, the retrospective runs first** (see "Iteration budget")
+and its disposition names the span and its hit count in a `> ` line.
 
 - **A fix that narrows one branch of a fallback or resolution chain must come with a table of every branch** and why each is now correct. The reviewer hands out siblings one per round, and each point-fix tends to contradict the last.
 - **Never decline a reviewer's wider scope without a failing test proving the narrower scope is sufficient.**
@@ -641,7 +648,7 @@ absent. Phase 1.5 checks them against the diff.
 
 1. **Problem / Motivation** — the concrete symptom, or the gap for a feature.
 2. **Why it matters** — impact if left unfixed.
-3. **What changed (motivation → approach → change)** — symptom → root cause → the specific change, so the reader sees *why this is the right fix*. Three short paragraphs at most — one per arrow, about 300 words of prose; `--check-body` WARNs past that (`SOFT_WORDS`). It describes the **whole diff on this head**, never one round's fix. Write it in the register below.
+3. **What changed (motivation → approach → change)** — symptom → root cause → the specific change, so the reader sees *why this is the right fix*. Three short paragraphs at most — one per arrow, well under 500 words of prose; `--check-body` stops past that (exit 21, `WORD_LIMIT`). It describes the **whole diff on this head**, never one round's fix. Write it in the register below.
 4. **Tests** — what was added/updated and what each locks in.
 5. **Manual verification** — steps done/needed, or "N/A — unit coverage sufficient" with a one-line why.
 6. **Screenshots / video — MANDATORY for any user-visible UI change**, uploaded as GitHub attachments with `gh ... --attach`, never committed. See below.
@@ -651,18 +658,16 @@ Omit a section only when truly not applicable, and say so.
 
 ### Two checks, two strengths
 
-`diff_signals.py --check-body` applies two rules of different weight to the
-finished body:
+`diff_signals.py --check-body` applies two rules to the finished body. Both
+stop the loop; they pull in opposite directions on purpose (why: `references/rationale.md`):
 
 | check | what it measures | on breach | why that strength |
 |---|---|---|---|
-| Accounting | every changed area (the `pr-scope.yml` unit: a module directory under `src/kiro_crew/` or `website/src/`, the top-level component elsewhere) is named in the body — by the area, a changed path or its `dir/file` tail, or a unique non-generic file name | **exit 20** — stop, fix the body or the diff | a change nobody is told about is how an unrelated edit rides along |
-| Length | words of prose in `What changed` (fenced blocks, table rows, image lines excluded) against the 300 of section 3's paragraph rule | **WARN**, exit 0 | a rename or a shared-helper migration needs the words; a hard cap cuts true facts |
+| Accounting | every changed area (the `pr-scope.yml` unit: a module directory under `src/kiro_crew/` or `website/src/`, the top-level component elsewhere) is named in the body — by the area, a changed path or its `dir/file` tail, or a unique non-generic file name | **exit 20** — stop, fix the body or the diff | an unnamed change is how a stray edit rides along |
+| Length | words of prose in `What changed` (fenced blocks, table rows, image lines excluded) against the 500 of section 3's paragraph rule | **exit 21** — stop, compress the prose | with the ledger complete, a cap cuts only restated facts; the diff is the evidence |
 
-The accounting is the leak detector, not the prose: a long walkthrough hides a
-stray file better than a short body does, because the reviewer trusts it and
-skips the diff. Short prose, complete ledger — paths, tables and pictures never
-count against the soft limit.
+Paths, tables and pictures never count against the limit. When both breach,
+20 is reported and both findings print.
 
 ### Snapshot, not changelog
 
@@ -681,6 +686,10 @@ depth or the reader; the facts stay complete and technically exact.
   only the facts needed to support it. One idea per sentence, no chained clauses.
 - **Do not recite the diff.** No per-file walkthrough, nested bullets or numbered
   findings within a section; evidence and history belong in the review thread.
+  One general sentence may cover a whole area ("docs updated to name the
+  nightly").
+- **Lead with a table when the change has more than one moving part** — the
+  punch line and the key mechanisms at the top of `What changed`; prose explains why.
 - Keep identifiers, paths, errors and flags verbatim. Cut decorative jargon.
   Name the thing and what it does, not the abstraction around it.
 - Add a picture only when it explains a changed shape faster than prose.
@@ -702,14 +711,10 @@ fair — flowchart, sequence, state, class, ER, timeline, or whatever fits the d
 and when the delta is a **matrix** (which inputs pass or fail, how each platform
 behaves), a markdown table is the picture: rows are the concrete cases, columns are
 Before and After, each cell is one coloured verdict. Do not force a matrix into
-boxes and arrows. The constraints below are the ones that make every PR read the
-same way at a glance; everything else is your call.
+boxes and arrows. The constraints below make every PR read the same way at a glance.
 
-- **Text, in the body.** A Mermaid fence or a markdown table renders in the PR body
-  directly. Nothing to capture, nothing to upload, and a reviewer can fix a label
-  in the text. A real rendered screen or a pixel before/after is not a picture of
-  the delta — that is a screenshot; see *Screenshots* below, which owns the capture
-  and upload rules.
+- **Text, in the body.** A Mermaid fence or a markdown table, never an image — a
+  rendered screen is a screenshot; see *Screenshots* below.
 - **Before → After, and only the delta.** Two states side by side (two subgraphs,
   or two columns), or one graph where the changed edge is the only thing that
   stands out. Six to ten nodes, or eight rows, is the ceiling.
@@ -739,9 +744,8 @@ Capture each affected surface in its meaningful variants (desktop vs browser, em
 vs populated), **by looking at the change yourself** via the `web-verify` skill — the
 PR's evidence is then the same evidence you used to verify.
 
-Evidence is **uploaded as a GitHub attachment, never committed.** `temp-screenshots/`
-and `.github/screenshots/` are gitignored, and `docs/` and `src/kiro_crew/**` ship in
-the wheel and the desktop DMG — no path in the repository is a place for review media.
+Evidence is **uploaded as a GitHub attachment, never committed** — no path in the
+repository is a place for review media (why: `references/rationale.md`).
 
 - **Capture into a local scratch dir** — `$KIROCREW_SCRATCH/evidence/`, or the gitignored `temp-screenshots/<feature>/` the capture scripts already write to. Neither reaches the commit.
 - **Write ordinary local paths in the body file**, relative to the directory you run `gh` from: `![Settings page, empty state](./evidence/after.png)`. A video MUST stand alone in its own paragraph — `![](./evidence/demo.mp4)` with a blank line above and below — to render as an inline player; inside a sentence it renders as a link.
@@ -808,15 +812,9 @@ first; preserve any existing automation and the user's stop. Neither driver
 grants publication permission.
 
 **Never hand the fix-and-push loop to a cron job or a HEARTBEAT.md task.** Neither
-can push a revision, and both report success while doing nothing: a cron has no
-owning slot, so its tool calls hit a deny-by-default approval path and time out,
-while a denied tool inside a completed turn still records `last_status: ok`;
-heartbeat runs under a name allowlist with no shell and no `git push`.
-
-`monitor_watch` is the zero-turn choice for a provider-fact-only watch, but this
-fix-and-push loop depends on generic reviewer posts and must stay on the bounded
-`monitor_start` path. Do not register the compatibility `pr_watch` script cron for
-new work.
+can push a revision, and both report success while doing nothing (why:
+`references/rationale.md`). `monitor_watch` and the compatibility `pr_watch` cron
+see provider facts only, never reviewer posts, so this loop stays on `monitor_start`.
 
 Cron *is* correct for post-merge cleanup, as a `script` cron at roughly a 5-minute
 interval — an hourly one loses the merge-to-teardown race.

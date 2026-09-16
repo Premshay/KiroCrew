@@ -41,7 +41,13 @@ from kiro_crew.executors import configure_default_executor, subprocess_executor
 from kiro_crew.jsonl_util import bounded_records, rotate_jsonl_at
 from kiro_crew.mcp_caller import CallerContext, _parent_pid
 from kiro_crew.mcp_gateway import transport
-from kiro_crew.mcp_gateway.hashing import decode_target_args, hash_command, hash_effective_env
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
+from kiro_crew.mcp_gateway.hashing import (
+    decode_target_args,
+    expand_stub_flags,
+    hash_command,
+    hash_effective_env,
+)
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES, PoolKey
 from kiro_crew.metrics.events import MCP_RECONNECTS, emit_counter
 
@@ -80,9 +86,36 @@ _BRIDGE_KEEPALIVE_TYPE = "keepalive"
 # ordinary restart -- but the budget must be finite, because a gateway that is
 # gone for good has to reach the terminal exit that tells kiro-cli this server
 # is done rather than leave the session hanging on a socket nobody will bind.
+#
+# It must also cover the supervisor's own recovery, and 60s did not. The owned
+# liveness path takes three 30s cycles, three probe pairs and a 20s SIGTERM wait
+# before it even spawns a replacement -- 91s at its fastest and about 191s at
+# worst -- so a 60s budget guaranteed that an ORDINARY slow recovery cost every
+# attached session its MCP tools for good, which the user sees as
+# ``Transport to MCP server ... is closed`` and cannot fix without a new session.
+# 300s clears that worst case with about 110s to spare. It is deliberately not
+# larger, because the budget also bounds an exposure in the other direction: while
+# the reconnect runs the bridge is down, so a call kiro-cli issues DURING the
+# window waits unanswered until the reattach or the budget ends -- unlike a call
+# already in flight when the connection dropped, which is failed fast with
+# ``-32603`` before any retry begins. Every second of budget is a second such a
+# call can wait, so the number is sized to cover the recovery and no more.
+#
+# It is not a cover for every conceivable recovery: a respawn that keeps failing
+# backs off to 60s per retry with no attempt cap, so a pathological gateway can
+# still outlast this. The trade is deliberate -- past five minutes the honest
+# signal to a waiting session is that its tools are gone, not more silence.
+#
+# The deadline bounds when new ATTEMPTS stop, not the exit itself: an attempt
+# already under way when it passes runs to its own end, so the exit can trail the
+# budget by up to the handshake (``_HANDSHAKE_TIMEOUT_SECS``) plus the replay
+# (``_REPLAY_INIT_TIMEOUT_SECS``) plus one backoff step
+# (``_RECONNECT_BACKOFF_MAX_SECS``) -- about 37s today. That is deliberate:
+# abandoning a handshake that is mid-replay would throw away the most likely
+# successful attempt in exchange for meeting a number exactly.
 _RECONNECT_BACKOFF_START_SECS = 0.5
 _RECONNECT_BACKOFF_MAX_SECS = 4.0
-_RECONNECT_TOTAL_BUDGET_SECS = 60.0
+_RECONNECT_TOTAL_BUDGET_SECS = 300.0
 # Bounds the replayed ``initialize`` on a fresh connection. The daemon answers
 # it either from its init cache or by driving a real upstream handshake, so this
 # has to cover a cold backend spawn; on timeout the reconnect is abandoned and
@@ -157,7 +190,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     is accepted and ignored — older installations' overlay wrappers may
     still pass it; we swallow the flag so the stub stays backward-
     compatible with on-disk agent overlays written by earlier rewriter
-    revisions."""
+    revisions.
+
+    The rewriter emits the flags as one ``--stub-flags-b64`` envelope so raw
+    paths and identifiers cross a cmd.exe launch without ``%NAME%`` expansion;
+    it is spliced back into plain tokens here, ahead of the parser, and an
+    overlay that spells the flags out directly parses the same way.
+    """
+    argv = expand_stub_flags(sys.argv[1:] if argv is None else argv)
     p = argparse.ArgumentParser(
         prog="kirocrew-mcp-stub",
         description="KiroCrew MCP shim: proxies kiro-cli stdio to the local gateway",
@@ -495,8 +535,13 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         work_dir = str(args.work_dir)
 
     caller = _build_caller_block(channel_id)
+    # Per-session token from the injected ACP entry's own env
+    # (``session_servers.attach_stub_session_token``). Absent for a stub
+    # launched from a hand-written config or an overlay predating the token: the
+    # field is then omitted below and gatewayd keeps its PID-keyed behavior.
+    session_token = os.environ.get(STUB_SESSION_TOKEN_ENV, "")
 
-    return {
+    payload = {
         "type": "register",
         "stub_uuid": str(uuid.uuid4()),
         "server_name": args.server,
@@ -552,6 +597,14 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         "session_type": caller["session_type"],
         "principal_id": caller["principal_id"],
     }
+    if session_token:
+        # Sibling field, deliberately NOT a PoolKey dimension: a per-connection
+        # value in the key would give every session its own backend and pooling
+        # would silently stop (see the ``pool`` module docstring). The token says
+        # WHICH session this connection belongs to, never which backends are
+        # interchangeable.
+        payload["stub_session_token"] = session_token
+    return payload
 
 
 async def _write_frame(writer: asyncio.StreamWriter, obj: dict) -> None:
@@ -1075,11 +1128,18 @@ async def run_bridge(
         """Ping the gateway ONLY while requests are outstanding, and declare the
         peer dead after ``ping_max_misses`` consecutive unanswered pings.
 
-        Each ping/miss cycle consumes exactly ONE ``ping_interval``: when
-        something is outstanding the wait for the pong *is* the interval, so the
-        advertised grace is ``ping_interval × ping_max_misses`` rather than twice
-        that. Only an idle bridge sleeps separately, and it resets the miss count
-        so an earlier partial streak cannot carry across an idle gap.
+        Every cycle consumes exactly ONE ``ping_interval``, whichever way it
+        ends: a MISSED pong consumes it as the wait itself, and an ANSWERED pong
+        consumes what is left of it as a sleep. So the advertised grace is
+        ``ping_interval × ping_max_misses`` rather than twice that, and the ping
+        RATE is one per interval rather than one per round-trip. That remainder
+        sleep is load-bearing: the gateway answers a ping inline in its
+        connection handler, so a healthy pong is back in microseconds and a loop
+        that returned straight to the next ping would ping at socket speed for
+        the whole life of an outstanding request -- burning a core on this stub
+        and on the single-loop daemon that has to answer every one of them.
+        An idle bridge also resets the miss count, so an earlier partial streak
+        cannot carry across an idle gap.
 
         Never fires on an idle bridge, nor on a peer that answers while still
         working — that is the distinction between "slow" and "wedged", and the
@@ -1105,7 +1165,11 @@ async def run_bridge(
             except (OSError, ConnectionError, BrokenPipeError):
                 # Socket already broken — bridge will tear down on its own.
                 return
-            # This wait IS the cycle's interval — do not sleep again.
+            # Stamped AFTER the write, not before: _write_frame awaits the
+            # shared writer lock and drain, so a stamp taken first would count
+            # that backpressure against the interval and let the next ping
+            # follow the pong immediately.
+            sent_at = bridge_loop.time()
             # We check immediately after sending: the pong may have arrived
             # between our clear and the send (or during the write).
             # Give the peer the full next interval to reply.
@@ -1117,6 +1181,24 @@ async def run_bridge(
                 pass
             if _pong_received.is_set():
                 consecutive_misses = 0
+                # Answered: the wait above was NOT the interval, so sleep out
+                # the rest of it before the next ping. Measured from the ping on
+                # the wire, so a slow-but-answered pong shortens this sleep
+                # instead of adding to it, keeping the rate at one ping per
+                # interval no matter how fast the peer replies. A stop wakes us
+                # at once, so teardown never waits out a gap. ``_peer_dead_evt``
+                # needs no waiter here: this task is its only setter and it
+                # returns immediately after setting it, so it cannot change
+                # under us.
+                remaining = ping_interval - (bridge_loop.time() - sent_at)
+                if remaining > 0:
+                    try:
+                        await asyncio.wait_for(
+                            stop_event.wait(), timeout=remaining
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        pass
             else:
                 consecutive_misses += 1
                 logger.warning(
@@ -1745,6 +1827,14 @@ def fallback_exec(args: argparse.Namespace) -> None:
     # the real backend directly, so it must run with its declared env to match
     # the non-pooled baseline — the daemon's own environment lacks it.
     exec_env = dict(os.environ)
+    # Never hand the backend this session's stub token. It is a bearer name for
+    # the session's identity at gatewayd, and the process about to replace this
+    # one is the operator's third-party server binary — which on a later gateway
+    # start could register with it and be answered as this session. Its own
+    # declared env is restored below; this one value was never part of it. The
+    # non-fallback path is unaffected: gatewayd spawns backends from its OWN
+    # environment, so the token has never reached one there.
+    exec_env.pop(STUB_SESSION_TOKEN_ENV, None)
     exec_env.update(_parse_env_file(getattr(args, "env_file", "") or ""))
     if platform_compat.IS_WINDOWS:
         _fallback_spawn_child(argv, exec_env)

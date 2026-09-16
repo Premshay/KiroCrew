@@ -3051,7 +3051,9 @@ class TestFinishQueueCycle:
         assert slot.messages[-1]["role"] == "done"
         assert slot.task is None
         state.refresh_slot_source_status.assert_called_once_with(slot.key)
-        state.broadcast_ws.assert_any_call("chat_done", {"slot": slot.key})
+        state.broadcast_ws.assert_any_call(
+            "chat_done", {"slot": slot.key, "continuing": False, "needs_input": False}
+        )
 
 
 class TestTtftMetric:
@@ -3905,6 +3907,49 @@ class TestRunChatAutoApproveRungs:
         client.approve_tool.assert_awaited_once_with("req-cov-1")
 
     @pytest.mark.asyncio
+    async def test_trusted_pattern_append_persists_tool_meta_untruncated(self, tmp_path):
+        """The trusted-pattern rung's persisted meta must be `_tool_meta` exactly.
+
+        A hand-rolled meta dict at this rung diverges from every other
+        approval rung: a shorter purpose cap cuts restored transcripts
+        mid-sentence while live rows (broadcast at `_MAX_TOOL_PURPOSE`)
+        show the whole purpose, and a dict without `input`/`kind` or the
+        `tool_call_id` redaction breaks the live↔replay join. One builder,
+        one cap.
+        """
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        canonical = canonical_non_shell_trust_key("records:primary", "read_record")
+        slot._trusted_patterns = {exact_trust_pattern(canonical)}
+        purpose = (
+            "Get the PMET record header fields (Program/Marketplace/Operation) "
+            "exactly as the LS writes them, from the small current-hour file "
+            "(0 replicas, so few records), to query MWS with the right "
+            "dimensions, then fold the result back into the incident brief"
+        )
+        assert len(purpose) > 200, "purpose long enough that a divergent short cap cuts it"
+        perm = _permission(
+            title="Looking up the record",
+            tool_kind="other",
+            is_shell=False,
+            tool_name="read_record",
+            mcp_server_name="records:primary",
+        )
+        perm.tool_call_id = "call-cov-1"
+        perm.tool_purpose = purpose
+        _set_stream(client, [perm, _complete()])
+
+        await _drive(state, slot)
+
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+        (tool_msg,) = [m for m in slot.messages if m.get("role") == "tool"]
+        meta = tool_msg.get("meta") or {}
+        assert meta.get("purpose") == purpose
+        # Everything `_tool_meta` builds must be persisted verbatim; `append`
+        # additionally stamps its own `mid`, which is not part of the contract.
+        assert chat_runner._tool_meta(perm).items() <= meta.items()
+
+    @pytest.mark.asyncio
     async def test_structured_non_shell_reprompt_never_matches_tool_identity_trust(self, tmp_path):
         """Consumed display input must not erase argument provenance."""
         state, client = _runner_state(tmp_path)
@@ -4653,3 +4698,39 @@ class TestPromptSubmitTranscriptRead:
             "the re-injection probe read the transcript on the event-loop thread; "
             "it must go through asyncio.to_thread"
         )
+
+
+# ── SessionClosingError shutdown race ─────────────────────────────────────
+
+
+class TestSessionClosingQuietAbort:
+    """A gateway-shutdown race during turn prep is a quiet abort, not an error.
+
+    Two dashboard slots were mid ``get_or_create`` when a restart's
+    ``close_all`` set ``_closing``; the allocation gate raised
+    ``SessionClosingError`` (by design) but the generic terminal handler then
+    logged an ERROR traceback, appended an ❌ error card to the slot, and
+    recorded a spurious session failure. The dedicated arm must swallow it: no
+    card, no record_failure, no exception out of ``_run_chat``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_closing_appends_no_error_card(self, tmp_path):
+        from kiro_crew.session import SessionClosingError
+
+        state, _client = _runner_state(tmp_path)
+        state.sessions.get_or_create = AsyncMock(
+            side_effect=SessionClosingError(
+                "SessionManager began closing during provider startup; "
+                "refusing to register a session behind the shutdown snapshot"
+            )
+        )
+        slot = _slot()
+
+        await _drive(state, slot, "hello")
+
+        assert _errors(slot) == [], (
+            "a shutdown race during session creation must not surface an "
+            "error card in the chat slot"
+        )
+        state.sessions.record_failure.assert_not_awaited()

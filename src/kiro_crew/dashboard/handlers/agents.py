@@ -46,6 +46,7 @@ from kiro_crew.agent import (
     install_agent,
     kiro_agents_dir_path,
 )
+from kiro_crew.agent_capabilities import CapabilityError, require_unmanaged_template
 from kiro_crew.agent_discovery import (
     _read_agent_spec,
     clear_list_agents_cache,
@@ -57,6 +58,11 @@ from kiro_crew.agent_discovery import (
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_spec_format import (
+    agent_spec_candidates,
+    is_markdown_spec,
+    iter_agent_spec_files,
+)
 from kiro_crew.apps.bridges import _mcp_lock as _agent_file_lock
 from kiro_crew.apps.bridges import _registration_source
 from kiro_crew.apps.manager import (
@@ -73,6 +79,7 @@ from kiro_crew.config.loader import (
     _safe_color,
     coerce_dict_section,
     coerce_effort,
+    config_local_path,
     config_path,
     inject_kiro_cli_api_key,
     normalize_agent_model,
@@ -155,6 +162,16 @@ _model_discovery_cache: dict[tuple[int, str], tuple[float, dict[str, Any]]] = {}
 _model_discovery_tasks: dict[tuple[int, str], asyncio.Task[dict[str, Any]]] = {}
 
 logger = logging.getLogger(__name__)
+
+
+def _spec_stem_on_disk(agents_dir: Path, name: str) -> bool:
+    """True when ``<name>.json`` OR ``<name>.md`` exists in *agents_dir*.
+
+    Every writer that mints a new ``<name>.json`` asks this rather than testing
+    the JSON path alone: a markdown spec with the same stem is the same agent,
+    and writing a JSON twin beside it would list one name twice.
+    """
+    return any(p.exists() for p in agent_spec_candidates(agents_dir, name))
 
 
 def _namespaced_agent_file_exists(agent_name: str) -> bool:
@@ -961,6 +978,20 @@ def _commit_agent_config_locked(
     # decides namespaced names PRESENT in a stale one. Their order is immaterial (see
     # :func:`_drop_unbacked_app_entries`).
     existing = _on_disk_mcp_servers(installed_path)
+    # The GET masks every ``oauth.clientSecret``; an editor round-trips the
+    # marker. Restore it from the SAME on-disk read the merge below uses, so the
+    # value written back is the one this locked unit observed -- a rotation
+    # that landed during the flock wait is what gets kept, never a snapshot
+    # taken in the handler before the lock. A marker with no on-disk value is
+    # dropped rather than written.
+    from kiro_crew.mcp_utils import restore_redacted_oauth_client_secrets
+
+    restored = restore_redacted_oauth_client_secrets(
+        config, {"mcpServers": existing} if isinstance(existing, dict) else {}
+    )
+    if isinstance(restored.get("mcpServers"), dict):
+        # In place: the caller and every step below hold THIS dict.
+        config["mcpServers"] = restored["mcpServers"]
     dropped = _drop_unbacked_app_entries(config, existing)
     if dropped:
         # WARNING, not info: the client submitted these and they are not being
@@ -1034,6 +1065,11 @@ async def api_agent_config(request: web.Request) -> web.Response:
         config = body.get("config")
         if not isinstance(config, dict):
             return web.json_response({"error": "config must be an object"}, status=400)
+        # The GET above masks every ``oauth.clientSecret``. The marker an editor
+        # sends back is restored inside the locked commit unit
+        # (``_commit_agent_config_locked``), adjacent to the on-disk read it
+        # feeds -- not here, where a read would both block the loop and take a
+        # baseline a concurrent rotation could make stale before the lock.
         try:
             # ── THE INVARIANT THIS BRANCH ENFORCES ────────────────────────────
             # Every validation completes BEFORE the first durable write, and the
@@ -1247,7 +1283,12 @@ async def api_agent_config(request: web.Request) -> web.Response:
         data = json.loads(agent_config_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         data = {}
-    return web.json_response(data)
+    # A pre-registered Connections client projects its secret into the installed
+    # spec for kiro-cli; this read is not kiro-cli, and any dashboard subject can
+    # make it. Mask the value (the PUT branch restores the marker from disk).
+    from kiro_crew.mcp_utils import redact_oauth_client_secrets
+
+    return web.json_response(redact_oauth_client_secrets(data))
 
 
 async def api_default_agent(request: web.Request) -> web.Response:
@@ -2218,6 +2259,12 @@ async def api_models(request: web.Request) -> web.Response:
         # cron and the liveness heartbeat on exactly the host where the probe is
         # slowest. Both reads run in the worker, so the mode is resolved there
         # too rather than passed in.
+        #
+        # A remote hub proxying this endpoint budgets its WHOLE cold path (the
+        # sandbox detection above plus the list-models subprocess below) via
+        # DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS in
+        # kiro_crew/instances/constants.py — growing any bound here means
+        # moving that constant with it.
         argv, cleanup = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(), _wrap_list_models_argv, argv
         )
@@ -2564,7 +2611,7 @@ def _load_template_specs(
     source_path: Path | None = None
     taken: set[str] = set()
     matches: list[Path] = []
-    for f in sorted(agents_dir.glob("*.json")):
+    for f in iter_agent_spec_files(agents_dir):
         # An unreadable spec still occupies its filename.
         taken.add(f.stem.lower())
         spec = _read_agent_spec(f, operation=operation, source="dashboard")
@@ -2640,6 +2687,12 @@ def _rebind_crew_locked(
                     raise FileNotFoundError(new_target)
         if entry.get("kiro_agent") == new_target:
             return None
+        try:
+            require_unmanaged_template(entry.get("kiro_agent", ""))
+        except CapabilityError as exc:
+            if exc.code == "capabilities_editor_required" and exc.status == 409:
+                raise _StaleBinding() from None
+            raise
         # Checked INSIDE the critical section, like the staleness check: a
         # fork recording lineage after a handler's pre-validation must not
         # slip another crew's private copy into this binding.
@@ -2714,7 +2767,16 @@ def _unlink_copy_unless_referenced(copy_file: Path, agents_dir: Path, *names: st
 
     Cleanup callers rebound their own crew away before asking, so any hit is a
     FOREIGN binding (pre-dating the bind-time guard) and deleting the file
-    would break that crew's sessions with "Mode not found". Returns the
+    would break that crew's sessions with "Mode not found". Bindings are read
+    from BOTH config layers: the ``config.json`` document the lock hands over
+    and the user-owned ``config.local.json`` overlay, which deep-merges over
+    it at load time and can therefore hold a crew's effective ``kiro_agent``
+    on its own. The overlay has its own sidecar lock (``config set --local``
+    writes under it, not under the base's), so it is read inside a nested hold
+    of that lock and the unlink runs while both are held — an overlay binding
+    cannot land between the check and the unlink. An unreadable overlay fails
+    closed like an unreadable base: a binding that cannot be ruled out keeps
+    the file. Returns the
     outcome — ``"deleted"``, ``"referenced"``, or ``"error"`` (unlink failure
     or unreadable config, both failing closed with the file kept) — because
     callers treat the retention reasons differently: a REFERENCED file is in
@@ -2724,25 +2786,49 @@ def _unlink_copy_unless_referenced(copy_file: Path, agents_dir: Path, *names: st
     outcome = "error"
     targets = set(names)
 
+    def _referenced(agents: object) -> bool:
+        if not isinstance(agents, dict):
+            return False
+        return any(
+            isinstance(entry, dict) and entry.get("kiro_agent") in targets
+            for entry in agents.values()
+        )
+
     def _check_then_unlink(data: dict) -> None:
         nonlocal outcome
-        for entry in data.get("agents", {}).values():
-            if isinstance(entry, dict) and entry.get("kiro_agent") in targets:
+        if _referenced(data.get("agents")):
+            logger.warning(
+                "another crew is still bound to private copy %r; leaving it in place",
+                copy_file.stem,
+            )
+            outcome = "referenced"
+            return None
+
+        def _check_overlay_then_unlink(local_data: dict) -> None:
+            nonlocal outcome
+            if _referenced(local_data.get("agents")):
                 logger.warning(
-                    "another crew is still bound to private copy %r; leaving it in place",
+                    "another crew is still bound to private copy %r via config.local.json; "
+                    "leaving it in place",
                     copy_file.stem,
                 )
                 outcome = "referenced"
                 return None
-        try:
-            with agents_spec_lock(agents_dir):
-                copy_file.unlink(missing_ok=True)
-        except OSError:
-            logger.debug("could not remove superseded copy %r", copy_file.stem, exc_info=True)
+            try:
+                with agents_spec_lock(agents_dir):
+                    copy_file.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("could not remove superseded copy %r", copy_file.stem, exc_info=True)
+                return None
+            outcome = "deleted"
             return None
-        outcome = "deleted"
-        # None: the reference check mutates nothing — the lock is held for
-        # isolation against binding writers, not for a config write.
+
+        # Nested hold of the overlay's own sidecar lock: the reference check
+        # and the unlink run with BOTH layers pinned. An absent overlay reads
+        # as {}; a malformed one raises and is caught below as an unreadable
+        # config. None from either mutate: nothing is written to either file —
+        # the locks are held for isolation against binding writers only.
+        update_config_locked(config_local_path(), mutate=_check_overlay_then_unlink)
         return None
 
     try:
@@ -2914,7 +3000,7 @@ async def api_agent_fork(request: web.Request) -> web.Response:
                         or copy_name.lower() in bound
                         or copy_name.lower() in managed_stems
                         or _is_reserved_basename(copy_name)
-                        or (agents_dir / f"{copy_name}.json").exists()
+                        or _spec_stem_on_disk(agents_dir, copy_name)
                     ):
                         copy_name = f"{base}-{suffix}"
                         suffix += 1
@@ -3048,6 +3134,12 @@ async def api_agent_publish(request: web.Request) -> web.Response:
             {"error": f"'{new_name}' is reserved", "code": "template_name_reserved"}, status=400
         )
 
+    from kiro_crew.dashboard.handlers.agent_capabilities import inherited_template_action
+
+    inherited = await inherited_template_action(request, crew, "publish", new_name)
+    if inherited is not None:
+        return inherited
+
     state: DashboardState = request.app["state"]
     async with _get_config_lock():
         agents_dir = kiro_agents_dir_path()
@@ -3137,7 +3229,7 @@ async def api_agent_publish(request: web.Request) -> web.Response:
                     data = dict(fresh_source)
                     data["name"] = new_name
                     dest = agents_dir / f"{new_name}.json"
-                    if dest.exists():
+                    if _spec_stem_on_disk(agents_dir, new_name):
                         raise FileExistsError(dest)
                     # Lineage BEFORE the file exists: from its first byte on
                     # disk the destination is this crew's private copy, so no
@@ -3251,6 +3343,9 @@ async def api_agent_publish(request: web.Request) -> web.Response:
 
         try:
             await asyncio.to_thread(_rebind_crew_locked, crew, (name, source_name), new_name)
+        except CapabilityError as exc:
+            await asyncio.to_thread(_undo_publish)
+            return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
         except _StaleBinding:
             await asyncio.to_thread(_undo_publish)
             return web.json_response(
@@ -3336,6 +3431,27 @@ async def api_agent_publish(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+def _agent_detail_candidates(name: str) -> list[tuple[Path, dict[str, Any]]]:
+    """The user-level specs claiming *name* by declared name or stem, in scan order.
+
+    A thread-side read for :func:`api_agent_detail`: the walk and the hardened
+    per-file parse are filesystem work, and the handler only ever acts on the
+    files that match.
+    """
+    matches: list[tuple[Path, dict[str, Any]]] = []
+    for f in iter_agent_spec_files(kiro_agents_dir_path(), ordered=False):
+        spec = _read_agent_spec(
+            f,
+            operation="api_agent_detail",
+            source="dashboard",
+        )
+        if spec is None:
+            continue
+        if spec.get("name") == name or f.stem == name:
+            matches.append((f, spec))
+    return matches
+
+
 async def api_agent_detail(request: web.Request) -> web.Response:
     """GET/PATCH /api/agents/detail/{name} — view or update agent config."""
     name = request.match_info["name"]
@@ -3358,14 +3474,11 @@ async def api_agent_detail(request: web.Request) -> web.Response:
             return web.json_response({"error": "body must be a JSON object"}, status=400)
 
     state: DashboardState = request.app["state"]
-    for f in kiro_agents_dir_path().glob("*.json"):
-        spec = _read_agent_spec(
-            f,
-            operation="api_agent_detail",
-            source="dashboard",
-        )
-        if spec is None:
-            continue
+    # The directory walk and the per-file parse run in a thread: a large agents
+    # directory must not stall every other request on the loop. Only the specs
+    # that claim *name* come back, in scan order, so the body below keeps its
+    # skip-to-next-file shape over exactly the files it would have acted on.
+    for f, spec in await asyncio.to_thread(_agent_detail_candidates, name):
         # Two-step so ``data`` stays typed ``dict`` for the PATCH branch's
         # re-read below, which reassigns it from a raw ``json.loads``.
         data = spec
@@ -3374,206 +3487,221 @@ async def api_agent_detail(request: web.Request) -> web.Response:
         # under the config lock, unlink), and those were -- and remain --
         # skip-to-next-file.
         try:
-            if data.get("name") == name or f.stem == name:
-                if request.method == "PATCH" and patch_body is not None:
-                    if "skills" in patch_body:
-                        raw_skills = patch_body["skills"]
-                        if not isinstance(raw_skills, list) or not all(
-                            isinstance(s, str) for s in raw_skills
-                        ):
-                            return web.json_response(
-                                {"error": "skills must be a list of strings"}, status=400
-                            )
-                        if len(raw_skills) > MAX_AGENT_SKILLS:
-                            return web.json_response(
-                                {"error": f"at most {MAX_AGENT_SKILLS} skills per agent"},
-                                status=400,
-                            )
-                    mapped: list[str] = []
-                    loop = asyncio.get_running_loop()
-                    async with _get_config_lock():
-                        # Re-read under the lock: the copy above was read before
-                        # the lock and a concurrent PATCH may have superseded it.
-                        # The branch writes this data back, so bind the same
-                        # agents directory and apply the stricter no-symlink /
-                        # no-escape fence before the hardened read.  Keep the
-                        # filesystem work off the event loop while the shared
-                        # config lock is held.
-                        agents_dir = kiro_agents_dir_path()
-
-                        def _reread_under_lock(
-                            spec_file: Path = f,
-                            root: Path = agents_dir,
-                        ) -> dict[str, Any] | None:
-                            if not _spec_path_is_safe(spec_file, root):
-                                return None
-                            return _read_agent_spec(
-                                spec_file,
-                                operation="api_agent_detail",
-                                source="dashboard",
-                            )
-
-                        reread_data = await asyncio.to_thread(_reread_under_lock)
-                        if reread_data is None:
-                            return web.json_response(
-                                {
-                                    "error": f"'{name}' changed on disk during update; retry.",
-                                    "code": "agent_changed",
-                                },
-                                status=409,
-                            )
-                        data = reread_data
-                        # Pristine snapshot: the locked write below re-reads the
-                        # CURRENT disk state and re-applies only the keys this
-                        # PATCH changed relative to this snapshot, so it cannot
-                        # clobber a concurrent refresh's writes with stale data.
-                        before_patch = copy.deepcopy(reread_data)
-                        # `spec_str` for the same reason as `declared` above: a
-                        # hand-edited spec can carry a structured (non-string)
-                        # "name", which would crash the sidecar helper's dict
-                        # lookup with an unhashable key.
-                        agent_name = spec_str(data, "name") or name
-                        # Skills FIRST, before any state mutation. The mapping can
-                        # reject the request (unknown key -> 400) and the model
-                        # branch below writes the agent_state sidecar; doing model
-                        # first meant a rejected combined PATCH still froze the
-                        # model against future shipped-default bumps.
-                        #
-                        # Offloaded to the discovery pool: the mapping enumerates
-                        # the skill roots (see enumerate_skill_catalog), which on a
-                        # large or network-backed catalog is enough filesystem work
-                        # to stall the event loop — the same reason /api/skills and
-                        # /api/agents/installed run off the loop.
-                        if "skills" in patch_body:
-                            mapped, unknown = await loop.run_in_executor(
-                                discovery_executor(),
-                                apply_skill_mapping,
-                                data,
-                                f,
-                                state,
-                                list(patch_body["skills"]),
-                                _read_session_key(request),
-                            )
-                            if unknown:
-                                return web.json_response(
-                                    {"error": "unknown skills", "skills": unknown[:20]},
-                                    status=400,
-                                )
-                        else:
-                            mapped = await loop.run_in_executor(
-                                discovery_executor(),
-                                agent_skill_keys,
-                                data,
-                                f,
-                                state,
-                                _read_session_key(request),
-                            )
-                        if "model" in patch_body:
-                            # Stored verbatim (canonical key); translated to a
-                            # provider id at the config.loader factory boundary.
-                            data["model"] = patch_body["model"] or None
-                            if data["model"] is None:
-                                # Cleared/auto: resume tracking the shipped
-                                # default (re-synced by _refresh_dynamic_fields).
-                                # Shared with `kirocrew agent reset-model` so the
-                                # two surfaces cannot disagree on what clearing a
-                                # model means. Offloaded: it writes the sidecar
-                                # under the blocking cross-process lock.
-                                await asyncio.to_thread(clear_model_pin, data, agent_name)
-                            else:
-                                # Explicit pick: freeze it against default bumps.
-                                await asyncio.to_thread(
-                                    agent_state.set_model_managed, agent_name, False
-                                )
-                        # Never persist Kiro Crew bookkeeping into the kiro spec —
-                        # kiro-cli rejects unknown fields and drops the agent. Same
-                        # shared helper as the PUT handler and migrate_agent_specs(),
-                        # so this fourth writer can't drift from the other three.
-                        # The model branch above may have just set the
-                        # sidecar explicitly; the helper only lifts a stale key out
-                        # of `data` when the sidecar is still unset, so it can't
-                        # clobber that just-written value. Offloaded like the PUT
-                        # handler: the helper does synchronous sidecar read/write
-                        # filesystem work that would stall the event loop.
-                        await asyncio.to_thread(
-                            agent_state.lift_and_strip_bookkeeping, data, agent_name
-                        )
-
-                        def _locked_overwrite() -> None:
-                            # Same spec lock as fork/publish and the background
-                            # fork refresh — and a full read-merge-write inside
-                            # it: our `data` snapshot was taken before the lock,
-                            # so a concurrent refresh may have sanitized away a
-                            # ceiling-rejected grant since; writing the snapshot
-                            # verbatim would restore it. Merge only the keys THIS
-                            # patch changed onto the fresh read, then run the
-                            # mandated whole-config governance funnel immediately
-                            # before persisting (same contract as
-                            # _write_spec_file and the PUT handler).
-                            with agents_spec_lock(f.parent):
-                                fresh = _read_agent_spec(
-                                    f, operation="api_agent_detail", source="dashboard"
-                                )
-                                if fresh is None:
-                                    raise FileNotFoundError(f)
-                                for key, value in data.items():
-                                    if key not in before_patch or before_patch[key] != value:
-                                        fresh[key] = value
-                                for key in before_patch:
-                                    if key not in data:
-                                        fresh.pop(key, None)
-                                sanitize_agent_config_governance(fresh)
-                                # Atomic replace: a direct write truncates first,
-                                # so ENOSPC mid-write would destroy the existing
-                                # template. Same tmp+rename helper as the fork
-                                # refresh and install paths.
-                                _atomic_json_write(f, fresh)
-
-                        try:
-                            await asyncio.to_thread(_locked_overwrite)
-                        except FileNotFoundError:
-                            return web.json_response(
-                                {
-                                    "error": f"'{name}' changed on disk during update; retry.",
-                                    "code": "agent_changed",
-                                },
-                                status=409,
-                            )
-                    # The list_agents() cache keys on a (count, newest-mtime-ns)
-                    # signature; two writes inside the same mtime granularity
-                    # would otherwise serve a stale skill list.
-                    clear_list_agents_cache()
-                    state.push_refresh("agents")
-                    return web.json_response(
-                        {"ok": True, "model": data.get("model", ""), "skills": mapped}
-                    )
-                # ``skills`` / ``unmanaged_skills`` are computed, response-only
-                # views of ``resources`` — never written back into the spec
-                # (kiro-cli rejects unknown fields and drops the agent). One
-                # catalog walk for both, off the event loop (filesystem-heavy).
-                keys, unmanaged_uris = await asyncio.get_running_loop().run_in_executor(
-                    discovery_executor(),
-                    agent_skill_views,
-                    data,
-                    f,
-                    state,
-                    _read_session_key(request),
-                )
+            if request.method != "GET" and is_markdown_spec(f):
+                # A markdown spec is one hand-authored document. Serializing
+                # a JSON object over it would drop the prompt body and every
+                # field this handler does not model, so it is read-only here.
                 return web.json_response(
                     {
-                        **data,
-                        # The rest of the spec is passed through verbatim, but
-                        # these two are CONSUMED as display text by the detail
-                        # panel. A foreign spec's structured value rendered as a
-                        # React child throws error #31 and blanks the whole tab,
-                        # so both are coerced on the same "non-string means
-                        # absent" rule list_agents() uses.
-                        "description": spec_str(data, "description"),
-                        "model": spec_model(data),
-                        "skills": keys,
-                        "unmanaged_skills": unmanaged_uris,
-                    }
+                        "error": (
+                            f"agent '{name}' is defined in markdown ({f.name}); "
+                            "edit the file directly"
+                        ),
+                        "code": "markdown_spec_readonly",
+                    },
+                    status=409,
                 )
+            if request.method == "PATCH" and patch_body is not None:
+                try:
+                    # Either lookup spelling can resolve this same file; a
+                    # hand-edited name cannot hide its enrolled stem.
+                    for identity in dict.fromkeys((f.stem, spec_str(data, "name") or f.stem)):
+                        await asyncio.to_thread(require_unmanaged_template, identity)
+                except CapabilityError as exc:
+                    return web.json_response(
+                        {"error": exc.code, "code": exc.code}, status=exc.status
+                    )
+                if "skills" in patch_body:
+                    raw_skills = patch_body["skills"]
+                    if not isinstance(raw_skills, list) or not all(
+                        isinstance(s, str) for s in raw_skills
+                    ):
+                        return web.json_response(
+                            {"error": "skills must be a list of strings"}, status=400
+                        )
+                    if len(raw_skills) > MAX_AGENT_SKILLS:
+                        return web.json_response(
+                            {"error": f"at most {MAX_AGENT_SKILLS} skills per agent"},
+                            status=400,
+                        )
+                mapped: list[str] = []
+                loop = asyncio.get_running_loop()
+                async with _get_config_lock():
+                    # Re-read under the lock: the copy above was read before
+                    # the lock and a concurrent PATCH may have superseded it.
+                    # The branch writes this data back, so bind the same
+                    # agents directory and apply the stricter no-symlink /
+                    # no-escape fence before the hardened read.  Keep the
+                    # filesystem work off the event loop while the shared
+                    # config lock is held.
+                    agents_dir = kiro_agents_dir_path()
+
+                    def _reread_under_lock(
+                        spec_file: Path = f,
+                        root: Path = agents_dir,
+                    ) -> dict[str, Any] | None:
+                        if not _spec_path_is_safe(spec_file, root):
+                            return None
+                        return _read_agent_spec(
+                            spec_file,
+                            operation="api_agent_detail",
+                            source="dashboard",
+                        )
+
+                    reread_data = await asyncio.to_thread(_reread_under_lock)
+                    if reread_data is None:
+                        return web.json_response(
+                            {
+                                "error": f"'{name}' changed on disk during update; retry.",
+                                "code": "agent_changed",
+                            },
+                            status=409,
+                        )
+                    data = reread_data
+                    # Pristine snapshot: the locked write below re-reads the
+                    # CURRENT disk state and re-applies only the keys this
+                    # PATCH changed relative to this snapshot, so it cannot
+                    # clobber a concurrent refresh's writes with stale data.
+                    before_patch = copy.deepcopy(reread_data)
+                    # `spec_str` for the same reason as `declared` above: a
+                    # hand-edited spec can carry a structured (non-string)
+                    # "name", which would crash the sidecar helper's dict
+                    # lookup with an unhashable key.
+                    agent_name = spec_str(data, "name") or name
+                    # Skills FIRST, before any state mutation. The mapping can
+                    # reject the request (unknown key -> 400) and the model
+                    # branch below writes the agent_state sidecar; doing model
+                    # first meant a rejected combined PATCH still froze the
+                    # model against future shipped-default bumps.
+                    #
+                    # Offloaded to the discovery pool: the mapping enumerates
+                    # the skill roots (see enumerate_skill_catalog), which on a
+                    # large or network-backed catalog is enough filesystem work
+                    # to stall the event loop — the same reason /api/skills and
+                    # /api/agents/installed run off the loop.
+                    if "skills" in patch_body:
+                        mapped, unknown = await loop.run_in_executor(
+                            discovery_executor(),
+                            apply_skill_mapping,
+                            data,
+                            f,
+                            state,
+                            list(patch_body["skills"]),
+                            _read_session_key(request),
+                        )
+                        if unknown:
+                            return web.json_response(
+                                {"error": "unknown skills", "skills": unknown[:20]},
+                                status=400,
+                            )
+                    else:
+                        mapped = await loop.run_in_executor(
+                            discovery_executor(),
+                            agent_skill_keys,
+                            data,
+                            f,
+                            state,
+                            _read_session_key(request),
+                        )
+
+                    def _locked_overwrite() -> None:
+                        # Same spec lock as fork/publish and the background
+                        # fork refresh — and a full read-merge-write inside
+                        # it: our `data` snapshot was taken before the lock,
+                        # so a concurrent refresh may have sanitized away a
+                        # ceiling-rejected grant since; writing the snapshot
+                        # verbatim would restore it. Merge only the keys THIS
+                        # patch changed onto the fresh read, then run the
+                        # mandated whole-config governance funnel immediately
+                        # before persisting (same contract as
+                        # _write_spec_file and the PUT handler).
+                        with agents_spec_lock(f.parent):
+                            fresh = _read_agent_spec(
+                                f, operation="api_agent_detail", source="dashboard"
+                            )
+                            if fresh is None:
+                                raise FileNotFoundError(f)
+                            # Check the file stem AND its fresh declared name
+                            # before ALL bookkeeping; the earlier name can be
+                            # stale. Keep the spec -> sidecar lock order.
+                            for identity in dict.fromkeys(
+                                (f.stem, spec_str(fresh, "name") or f.stem)
+                            ):
+                                require_unmanaged_template(identity)
+                            if "model" in patch_body:
+                                data["model"] = patch_body["model"] or None
+                                if data["model"] is None:
+                                    clear_model_pin(data, agent_name)
+                                else:
+                                    agent_state.set_model_managed(agent_name, False)
+                            agent_state.lift_and_strip_bookkeeping(data, agent_name)
+                            for key, value in data.items():
+                                if key not in before_patch or before_patch[key] != value:
+                                    fresh[key] = value
+                            for key in before_patch:
+                                if key not in data:
+                                    fresh.pop(key, None)
+                            sanitize_agent_config_governance(fresh)
+                            # Atomic replace: a direct write truncates first,
+                            # so ENOSPC mid-write would destroy the existing
+                            # template. Same tmp+rename helper as the fork
+                            # refresh and install paths.
+                            _atomic_json_write(f, fresh)
+
+                    try:
+                        await asyncio.to_thread(_locked_overwrite)
+                    except CapabilityError as exc:
+                        return web.json_response(
+                            {"error": exc.code, "code": exc.code}, status=exc.status
+                        )
+                    except FileNotFoundError:
+                        return web.json_response(
+                            {
+                                "error": f"'{name}' changed on disk during update; retry.",
+                                "code": "agent_changed",
+                            },
+                            status=409,
+                        )
+                # The list_agents() cache keys on a (count, newest-mtime-ns)
+                # signature; two writes inside the same mtime granularity
+                # would otherwise serve a stale skill list.
+                clear_list_agents_cache()
+                state.push_refresh("agents")
+                return web.json_response(
+                    {"ok": True, "model": data.get("model", ""), "skills": mapped}
+                )
+            # ``skills`` / ``unmanaged_skills`` are computed, response-only
+            # views of ``resources`` — never written back into the spec
+            # (kiro-cli rejects unknown fields and drops the agent). One
+            # catalog walk for both, off the event loop (filesystem-heavy).
+            keys, unmanaged_uris = await asyncio.get_running_loop().run_in_executor(
+                discovery_executor(),
+                agent_skill_views,
+                data,
+                f,
+                state,
+                _read_session_key(request),
+            )
+            # The spec is otherwise passed through verbatim, so mask the one
+            # value in it that is a credential (a pre-registered Connections
+            # client's projected secret); this read is not owner-gated.
+            from kiro_crew.mcp_utils import redact_oauth_client_secrets
+
+            return web.json_response(
+                {
+                    **redact_oauth_client_secrets(data),
+                    # The rest of the spec is passed through verbatim, but
+                    # these two are CONSUMED as display text by the detail
+                    # panel. A foreign spec's structured value rendered as a
+                    # React child throws error #31 and blanks the whole tab,
+                    # so both are coerced on the same "non-string means
+                    # absent" rule list_agents() uses.
+                    "description": spec_str(data, "description"),
+                    "model": spec_model(data),
+                    "skills": keys,
+                    "unmanaged_skills": unmanaged_uris,
+                }
+            )
         except (json.JSONDecodeError, OSError):
             continue
     # "default" is the built-in agent with no config file
@@ -4204,7 +4332,7 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
                     continue
                 await _drained_to_thread(require_member_memory_creation, disc.name)
                 _has_on_disk = await asyncio.to_thread(
-                    lambda: (kiro_agents_dir_path() / f"{_dn}.json").exists()
+                    lambda: _spec_stem_on_disk(kiro_agents_dir_path(), _dn)
                     or _namespaced_agent_file_exists(_dn)
                 )
                 if not _has_on_disk:
@@ -5018,6 +5146,8 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         try:
             async with _get_config_lock():
                 await asyncio.to_thread(_rebind_crew_locked, name, expected, new_target)
+        except CapabilityError as exc:
+            return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
         except _StaleBinding:
             return web.json_response(
                 {
@@ -5105,6 +5235,11 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     {"error": model_reason, "code": "invalid_model"}, status=400
                 )
         agent = cfg.agents[name]
+        if "kiro_agent" in body and body["kiro_agent"] != agent.kiro_agent:
+            try:
+                await asyncio.to_thread(require_unmanaged_template, agent.kiro_agent)
+            except CapabilityError as exc:
+                return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
         prior_memory_store = agent.memory_store
         if "memory_store" in body and body["memory_store"] != prior_memory_store:
             return web.json_response(
@@ -5364,6 +5499,75 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+def _prune_private_copy_of_deleted_crew(crew: str, bound_template: str) -> bool:
+    """Remove the private template copy that existed only for a now-deleted crew.
+
+    Corroborated on both sides before anything is touched: the agent_state
+    sidecar must name *crew* as the copy's ``private_to`` AND *bound_template*
+    (the crew's persisted binding at delete time) must be that copy. Lineage
+    alone is not enough — a copy the crew had already moved off may hold
+    another crew's customizations — and a binding alone would take a shared
+    template away. Best-effort throughout: an unreadable sidecar, an ambiguous
+    name, a foreign binding, or a file that will not unlink all leave the copy
+    (and its lineage, so private content never lists as shared) in place; the
+    crew's removal is already durable and must not fail on cleanup. Returns
+    True when the file was removed, so the caller can drop the template cache.
+    """
+    if not bound_template:
+        return False
+    agents_dir = kiro_agents_dir_path()
+    try:
+        _spec, copy_name, _taken, copy_path = _load_template_specs(
+            agents_dir, bound_template, "api_kirocrew_agent_delete"
+        )
+    except _AmbiguousTemplateName:
+        logger.debug(
+            "crew delete: private copy name %r is ambiguous; leaving file and lineage",
+            bound_template,
+        )
+        return False
+    # Lineage is keyed by the copy's declared name while a binding resolves by
+    # declared name OR file stem, so the record is looked up under every name
+    # that resolves this file — a stem/name divergence must not hide it.
+    lineage_keys: list[str] = []
+    for key in (bound_template, copy_name, copy_path.stem if copy_path else ""):
+        if key and key not in lineage_keys:
+            lineage_keys.append(key)
+    lineage_key = ""
+    for key in lineage_keys:
+        fork = agent_state.get_fork_info(key)
+        if fork and fork["private_to"] == crew:
+            lineage_key = key
+            break
+    if not lineage_key:
+        return False
+    if copy_path is None:
+        # The name resolved to no READABLE spec. That is not proof the file is
+        # gone: a malformed or unreadable copy still sits on disk (the spec
+        # reader documents these dirs as user-writable and shared), and with
+        # a divergent stem its real filename cannot even be named from here.
+        # Pruning lineage on a guess would surface private content as shared
+        # once the file is repaired, so the record is kept. A stale record
+        # for a file that truly is gone is inert: nothing lists a template
+        # without a spec.
+        logger.debug(
+            "crew delete: private copy %r did not resolve to a readable spec; "
+            "keeping its lineage",
+            lineage_key,
+        )
+        return False
+    if not _spec_path_is_safe(copy_path, agents_dir):
+        return False
+    # The deleted crew's record is gone from config, so any binding still
+    # resolving the copy is another crew's: the locked helper keeps file and
+    # lineage in that case, atomically against concurrent binding writes.
+    if _unlink_copy_unless_referenced(copy_path, agents_dir, *lineage_keys) != "deleted":
+        return False
+    with contextlib.suppress(Exception):
+        agent_state.prune(lineage_key)
+    return True
+
+
 async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
     """DELETE /api/agents/{name} — delete a KiroCrew agent."""
 
@@ -5382,13 +5586,14 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
             )
         created_archive = False
         retired_store = ""
+        bound_template = ""
 
         @memory_store_namespace_lock()
         def _delete_member() -> tuple[str, bool]:
-            nonlocal created_archive, retired_store
+            nonlocal created_archive, retired_store, bound_template
 
             def mutate(doc: dict) -> dict:
-                nonlocal created_archive, retired_store
+                nonlocal created_archive, retired_store, bound_template
                 agents = coerce_dict_section(doc, "agents")
                 if name not in agents:
                     raise UnknownMemoryStore(f"Crew Member {name!r} was removed concurrently")
@@ -5408,6 +5613,11 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
                         )
                     created_archive = archive_member_memory_store(store_name, name)
                     retired_store = store_name
+                # The PERSISTED binding at delete time, read inside the
+                # critical section: it is one half of the corroboration the
+                # private-copy cleanup below needs.
+                bound = entry.get("kiro_agent") if isinstance(entry, dict) else ""
+                bound_template = bound if isinstance(bound, str) else ""
                 del agents[name]
                 return doc
 
@@ -5440,6 +5650,17 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
         # same-name recreation has already uploaded and committed a new
         # picture under the same digest stem.
         await _drained_to_thread(_remove_avatar_files, name)
+        # Likewise the crew's private template copy: a copy the sidecar marks
+        # private to THIS crew, and that the crew was bound to, has no reader
+        # left once the record is gone — kept, it lists in the Agent Templates
+        # tab under a dead crew's name. Same lock, for the same reason as the
+        # avatar: a same-name recreation must not fork a fresh copy only to
+        # have this cleanup remove it. Best-effort: a locked or unreadable
+        # file never blocks the crew's removal.
+        if await _drained_to_thread(_prune_private_copy_of_deleted_crew, name, bound_template):
+            clear_list_agents_cache()
+            if (state := request.app.get("state")) is not None:
+                state.push_refresh("agents")
     # A crew DISAPPEARING is the other half of the same invariant: the captured
     # config still holds the record, so a cron or messaging job still naming the
     # crew would keep resolving its old pin and binding.
@@ -6001,23 +6222,6 @@ async def api_kirocrew_agent_avatar_upload(request: web.Request) -> web.Response
     return web.json_response({"ok": True, "staged": True, "token": _staging_token(bytes(data))})
 
 
-# ── Conductor skill regeneration ────────────────────────────────────
-
-
-def _regen_conductor() -> None:
-    """Regenerate conductor skill after metadata or agent roster changes."""
-    try:
-        cfg = KiroCrewConfig.load()
-        if not cfg.agent.conductor_skill:
-            return
-        from kiro_crew.conductor_skill import generate_conductor_skill  # noqa: F811
-        from kiro_crew.skills import SkillsLoader  # noqa: F811
-
-        generate_conductor_skill(SkillsLoader())
-    except Exception:
-        logger.exception("Failed to regenerate conductor skill")
-
-
 async def api_agent_reset(request: web.Request) -> web.Response:
     """POST /api/agents/detail/{name}/reset — discard a crew's private copy.
 
@@ -6039,6 +6243,12 @@ async def api_agent_reset(request: web.Request) -> web.Response:
     crew = body.get("crew") if isinstance(body, dict) else None
     if not isinstance(crew, str) or not crew:
         return web.json_response({"error": "crew is required", "code": "crew_required"}, status=400)
+
+    from kiro_crew.dashboard.handlers.agent_capabilities import inherited_template_action
+
+    inherited = await inherited_template_action(request, crew, "reset")
+    if inherited is not None:
+        return inherited
 
     state: DashboardState = request.app["state"]
     async with _get_config_lock():
@@ -6083,6 +6293,8 @@ async def api_agent_reset(request: web.Request) -> web.Response:
         origin_path = _path
         try:
             await asyncio.to_thread(_rebind_crew_locked, crew, (name,), origin_name, origin_path)
+        except CapabilityError as exc:
+            return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
         except FileNotFoundError:
             # The origin vanished between validation and the rebind's critical
             # section (a cross-process delete): rebinding would leave the crew

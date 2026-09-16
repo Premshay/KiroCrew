@@ -24,7 +24,15 @@ import type {
   WorkflowRunSummary,
 } from '../types'
 import type { RemoteCrewCapabilities } from '../hooks/useRemoteCapabilities'
-import type { MemoryRecord, MemoryRecordRef, MemoryRecordQuery, MemoryRecordSelection, MemoryEditOperation, MemoryEditPreview, MemoryRecordRevision } from '../types/memoryEditing'
+import type {
+  MemoryRecord,
+  MemoryRecordRef,
+  MemoryRecordQuery,
+  MemoryRecordSelection,
+  MemoryEditOperation,
+  MemoryEditPreview,
+  MemoryRecordRevision,
+} from '../types/memoryEditing'
 import type { AutoNudgeListResponse } from '../components/autoNudgeLoop'
 import { ApiError, friendlyErrText } from './apiError'
 import { SESSION_CONTROL_STATUS_PATH_RE } from '../lib/sessionControlStatusPath'
@@ -189,7 +197,8 @@ export interface RestartBlockerResult {
 
 export type MonitorWrite = {
   slot_key?: string
-  kind?: 'github_pull_request'
+  kind?:
+    | 'github_pull_request'
     | 'gitlab_merge_request'
     | 'azure_devops_pull_request'
     | 'bitbucket_pull_request'
@@ -249,13 +258,13 @@ export type McpMeasureProgress = {
 
 export type McpManagedServer = {
   name: string
-  stub: boolean            // effective: can_stub AND in_allowlist
-  can_stub: boolean       // stdio AND not denylisted — a property of the server, not a choice
-  in_allowlist: boolean    // present in config mcp_gateway.stub_servers
-  entry_poolable: boolean  // some agent entry sets poolable:true — RETIRED, informational only
-  agents: string[]         // agent configs that declare this server
-  transport: string        // "stdio" (stubbable) or "http" (no stdio pipe to interpose on)
-  denylisted: boolean      // in UNPOOLABLE_SERVERS — can never be pooled
+  stub: boolean // effective: can_stub AND in_allowlist
+  can_stub: boolean // stdio AND not denylisted — a property of the server, not a choice
+  in_allowlist: boolean // present in config mcp_gateway.stub_servers
+  entry_poolable: boolean // some agent entry sets poolable:true — RETIRED, informational only
+  agents: string[] // agent configs that declare this server
+  transport: string // "stdio" (stubbable) or "http" (no stdio pipe to interpose on)
+  denylisted: boolean // in UNPOOLABLE_SERVERS — can never be pooled
   // True when stubbing this server cannot produce a SHARED backend anyway: the
   // rewriter leaves an env-declaring entry unwrapped rather than spawn a pooled
   // backend without a declared key. Optional for the same reason as
@@ -269,7 +278,7 @@ export type McpManagedServer = {
   recommendation?: McpShareRecommendation
 }
 
-export const SEARCH_MIN_CHARS = 2  // backend session search threshold (must match kiro_crew.history.SEARCH_MIN_CHARS)
+export const SEARCH_MIN_CHARS = 2 // backend session search threshold (must match kiro_crew.history.SEARCH_MIN_CHARS)
 
 /**
  * A Connections provider's approval-URL mint, as the card reads it.
@@ -309,6 +318,36 @@ export interface ConnectionStatus {
    *  "could not look" rather than "absent". */
   grantIndeterminate?: boolean
   connectedSince?: string
+  /** True for a pre-registered provider whose operator has not entered a usable
+   *  OAuth client; present only when true and never alongside a held grant. */
+  needsClientConfig?: boolean
+}
+
+/** Where a client-record half came from; `null` means not set anywhere. */
+export type ConnectionOAuthClientSource = 'env' | 'config' | 'vault' | 'registry'
+
+/** One pre-registered provider's operator OAuth client, as GET /api/connections/oauth-clients
+ *  reports it. Carries the PUBLIC client id and only a boolean for the secret. */
+export interface ConnectionOAuthClient {
+  slug: string
+  /** The vendor requires a client secret at the token endpoint. */
+  confidential: boolean
+  /** The exact redirect URI to register in the vendor console. */
+  redirect_uri: string
+  /** Path under docs/guides/ of the registration runbook. */
+  registration_guide: string
+  client_id: string | null
+  client_id_source: ConnectionOAuthClientSource | null
+  client_secret_set: boolean
+  client_secret_source: ConnectionOAuthClientSource | null
+  /** A client id is present, plus a secret when `confidential`. */
+  configured: boolean
+}
+
+export interface ConnectionOAuthClientSave {
+  client_id?: string
+  client_secret?: string
+  client_secret_clear?: boolean
 }
 
 /** Authenticated provider-tool verdict returned by POST /api/connections/test. */
@@ -348,7 +387,6 @@ export interface InstallStreamResult {
   needsClientInstall?: boolean
   clientInstall?: { shell?: string; postInstall?: string }
 }
-
 
 /**
  * The Playwright CLI browser view, as reported by `GET /api/browser/view` and
@@ -744,7 +782,7 @@ export interface IMessageConfigSave {
   session_folder?: string
 }
 
-/** Microsoft Teams channel status + config, from GET /api/teams/config. */export interface TeamsConfigData {
+/** Microsoft Teams channel status + config, from GET /api/teams/config. */ export interface TeamsConfigData {
   connected: boolean
   connect_error: string
   configured: boolean
@@ -1125,28 +1163,20 @@ export interface TailnetMobileData {
   /** Per-process marker used only to prove a requested restart completed. */
   boot_id: string
   step: TailnetMobileStep
-  host: string
   origin: string
-  installed: boolean
-  reachable: boolean
-  logged_in: boolean
+  /** Other devices on this tailnet. `0` means there is nothing to reach this
+   *  dashboard FROM — publishing and the QR both still succeed, so this is the
+   *  only signal that the scan is going to fail. */
   peer_count: number
   peers_online: number
-  trusted: boolean
-  startup_trusted: boolean
-  published: boolean | null
   keep_awake: boolean
-  governance_pinned: boolean
+  /** Verbatim daemon/serve text. Shown as-is; never rephrased client-side. */
   detail: string
   download_url: string
-  qr_ttl_secs: number
-  serve_port: number
-  dashboard_port: number
 }
 
 export interface TailnetMobileMutation {
   ok: boolean
-  code: string
   detail: string
 }
 
@@ -1170,7 +1200,6 @@ export interface TailnetMobileQr {
   image: string
   ttl_secs: number
   link_window_secs: number
-  host: string
 }
 
 /**
@@ -1286,7 +1315,11 @@ export function isAuthBannerShown(): boolean {
  */
 function _emitAuthEvent(kind: 'mc-auth-required' | 'mc-auth-cleared'): void {
   if (typeof window === 'undefined') return
-  try { window.dispatchEvent(new CustomEvent(kind)) } catch { /* ignore */ }
+  try {
+    window.dispatchEvent(new CustomEvent(kind))
+  } catch {
+    /* ignore */
+  }
 }
 
 /**
@@ -1393,15 +1426,26 @@ function showSessionExpiredBanner(lead?: string): void {
     'margin-left:12px;padding:4px 8px;border-radius:4px;border:1px solid #fca5a5;' +
     'background:#7f1d1d;color:#fff;font-size:13px;width:280px;cursor:text;caret-color:#fff;' +
     'outline:2px solid transparent;outline-offset:2px;transition:border-color 0.2s,box-shadow 0.2s;'
-  input.addEventListener('focus', () => { input.style.borderColor = '#fff'; input.style.boxShadow = '0 0 0 3px rgba(255,255,255,0.25),0 0 20px rgba(255,255,255,0.1)' })
-  input.addEventListener('blur', () => { input.style.borderColor = '#fca5a5'; input.style.boxShadow = 'none' })
+  input.addEventListener('focus', () => {
+    input.style.borderColor = '#fff'
+    input.style.boxShadow = '0 0 0 3px rgba(255,255,255,0.25),0 0 20px rgba(255,255,255,0.1)'
+  })
+  input.addEventListener('blur', () => {
+    input.style.borderColor = '#fca5a5'
+    input.style.boxShadow = 'none'
+  })
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       const v = input.value.trim()
       if (!v) return
       let t: string | null = null
-      try { t = new URL(v).searchParams.get('token') } catch { t = v }
-      if (t) window.location.href = `${window.location.protocol}//${window.location.host}?token=${encodeURIComponent(t)}`
+      try {
+        t = new URL(v).searchParams.get('token')
+      } catch {
+        t = v
+      }
+      if (t)
+        window.location.href = `${window.location.protocol}//${window.location.host}?token=${encodeURIComponent(t)}`
     }
   })
   el.append(b, ' Run ', code, ' then paste URL: ', input)
@@ -1527,8 +1571,7 @@ export { ApiError, friendlyErrText }
  * the re-auth banner. Call sites use this to swap a futile retry for the one
  * action that recovers.
  */
-export const isAuthExpiredError = (e: unknown): boolean =>
-  e instanceof ApiError && e.authRequired
+export const isAuthExpiredError = (e: unknown): boolean => e instanceof ApiError && e.authRequired
 
 /**
  * Build the ApiError AND journal it.
@@ -1585,8 +1628,14 @@ function sendResponseAuthRecovery(r: Response): Response {
   if (r.status === 401) {
     // Best-effort: a wire may hand back a Response-like without `clone`.
     try {
-      void r.clone().text().then((body) => noteStaleOwnerResponse(r.status, body)).catch(() => {})
-    } catch { /* not a real Response; nothing to read */ }
+      void r
+        .clone()
+        .text()
+        .then((body) => noteStaleOwnerResponse(r.status, body))
+        .catch(() => {})
+    } catch {
+      /* not a real Response; nothing to read */
+    }
   }
   return r
 }
@@ -1654,7 +1703,10 @@ const projectHeader = (projectKey?: string): HeadersInit | undefined =>
   projectKey ? { 'X-Steering-Project': projectKey } : undefined
 
 const get = (url: string, sessionKey?: string, signal?: AbortSignal) =>
-  fetch(url, { headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) }, ...(signal ? { signal } : {}) })
+  fetch(url, {
+    headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) },
+    ...(signal ? { signal } : {}),
+  })
 const post = (
   url: string,
   body?: object,
@@ -1662,36 +1714,72 @@ const post = (
   extra?: HeadersInit,
   redirect?: RequestRedirect,
 ) =>
-  trackArtifactWrite(url, fetch(url, {
-    method: 'POST',
-    // sessionKey overrides the shared `dashboard:ui` placeholder with the REAL
-    // slot. The placeholder satisfies the server's `if sk:` gate but names no
-    // actual session, so a restricted (incognito) slot was never recognised as
-    // restricted and its writes were allowed through. Callers acting on behalf
-    // of a specific chat slot must pass it.
-    // `extra` carries a per-call precondition header (a view the server must
-    // still agree with) without every caller re-implementing the header merge.
-    // `redirect` is for a caller whose URL is not core's to choose: a validated
-    // target that answers 3xx would otherwise be followed automatically, and the
-    // check that approved the FIRST url never sees the second. Defaulted so no
-    // existing caller changes behaviour.
-    ...(redirect ? { redirect } : {}),
-    headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra },
-    body: body ? JSON.stringify(body) : undefined,
-  }))
+  trackArtifactWrite(
+    url,
+    fetch(url, {
+      method: 'POST',
+      // sessionKey overrides the shared `dashboard:ui` placeholder with the REAL
+      // slot. The placeholder satisfies the server's `if sk:` gate but names no
+      // actual session, so a restricted (incognito) slot was never recognised as
+      // restricted and its writes were allowed through. Callers acting on behalf
+      // of a specific chat slot must pass it.
+      // `extra` carries a per-call precondition header (a view the server must
+      // still agree with) without every caller re-implementing the header merge.
+      // `redirect` is for a caller whose URL is not core's to choose: a validated
+      // target that answers 3xx would otherwise be followed automatically, and the
+      // check that approved the FIRST url never sees the second. Defaulted so no
+      // existing caller changes behaviour.
+      ...(redirect ? { redirect } : {}),
+      headers: {
+        'Content-Type': 'application/json',
+        ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk),
+        ...extra,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    }),
+  )
 const put = (url: string, body: object, sessionKey?: string, extra?: HeadersInit) =>
-  trackArtifactWrite(url, fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: JSON.stringify(body) }))
+  trackArtifactWrite(
+    url,
+    fetch(url, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk),
+        ...extra,
+      },
+      body: JSON.stringify(body),
+    }),
+  )
 const del = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
-  trackArtifactWrite(url, fetch(url, { method: 'DELETE', headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk), ...extra }, body: body ? JSON.stringify(body) : undefined }))
-const patch = (url: string, body: object, sessionKey?: string) =>
-  trackArtifactWrite(url, fetch(url, {
-    method: 'PATCH',
-    // Same override as post(): replace the shared `dashboard:ui` placeholder with
-    // the REAL slot when the write belongs to a chat session, so the server's
-    // restricted-session gate applies to it.
-    headers: { 'Content-Type': 'application/json', ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) },
-    body: JSON.stringify(body),
-  }))
+  trackArtifactWrite(
+    url,
+    fetch(url, {
+      method: 'DELETE',
+      headers: {
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+        ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk),
+        ...extra,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    }),
+  )
+const patch = (url: string, body: object, sessionKey?: string, signal?: AbortSignal) =>
+  trackArtifactWrite(
+    url,
+    fetch(url, {
+      method: 'PATCH',
+      // Same override as post(): replace the shared `dashboard:ui` placeholder with
+      // the REAL slot when the write belongs to a chat session, so the server's
+      // restricted-session gate applies to it.
+      headers: {
+        'Content-Type': 'application/json',
+        ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk),
+      },
+      body: JSON.stringify(body),
+      signal,
+    }),
+  )
 
 // Publish the blessed transport so a downstream edition can build its OWN typed
 // API module on the SAME session-key-authenticated helpers as core methods
@@ -1746,6 +1834,8 @@ export interface InstanceView {
   /** SSM-only: AWS region ('' = profile/environment default). */
   aws_region: string
   ssm_run_as: string
+  /** Provisioner that created this crew, when it came from a launcher. */
+  provisioner_id?: string
   was_connected: boolean
   status: InstanceTunnelStatus
 }
@@ -1828,7 +1918,7 @@ export interface RemoteProvisioner {
 }
 
 export type LaunchJobStatus =
-  | 'pending' | 'running' | 'awaiting_signin' | 'done' | 'failed' | 'cancelled'
+  'pending' | 'running' | 'awaiting_signin' | 'done' | 'failed' | 'cancelled'
 export type LaunchStepState = 'pending' | 'active' | 'done' | 'failed' | 'skipped'
 
 /** One step of a launch job (preflight/provision/signin/connect). `label` and
@@ -2168,7 +2258,7 @@ export interface AgentImportApplyResponse {
 export type WebhookFreshness = 'fresh' | 'stale' | 'expired'
 
 export type WebhookOutcome =
-  | 'completed' | 'timeout' | 'error' | 'rejected_capacity' | 'unauthorized' | 'disabled'
+  'completed' | 'timeout' | 'error' | 'rejected_capacity' | 'unauthorized' | 'disabled'
 
 export interface WebhookTokenEntry {
   id: string
@@ -2279,6 +2369,15 @@ export interface MemberRosterRow {
   /** Epoch seconds of the DM transcript's last write; 0 = never talked. */
   last_active_ts?: number
   last_message?: string
+  /** True when the DM thread's NEWEST event is a Stop press. The server skips
+   *  the stop card's raw JSON from `last_message`, so the preview is the last
+   *  conversational line — which reads as ongoing work on a thread the user has
+   *  stopped. This locale-independent boolean lets the roster render a localized
+   *  "Stopped" chip beside that preview; the word itself is never sent from the
+   *  server, where the client's locale is unknown. Omitted (not `false`) when
+   *  the newest event is not a stop, and absent again once a newer
+   *  conversational row lands. */
+  last_message_stopped?: boolean
   kiro_agent?: string
   workspace?: string
   memory_store?: string
@@ -2511,6 +2610,27 @@ const memoryQuery = (q: MemoryCarveQuery): string => {
   return s ? `?${s}` : ''
 }
 
+/**
+ * One row of `GET /api/apps/registries`, in either the `registries` (operator)
+ * or `pinned` (build) list.
+ *
+ * `name` is the IDENTITY: the index cache path and every installed app's
+ * `_registry` tag are keyed by it, so it is what per-registry counts and refresh
+ * calls must use. `label` is a display name shown instead of it, and `review`
+ * says how thoroughly the listings were reviewed before publication. Both are
+ * display-only and neither changes the credential posture — that is `trust`
+ * alone. The backend reports both empty on an operator row and drops them from a
+ * PUT, because only the build may make either claim.
+ */
+export type ExternalRegistryRow = {
+  name: string
+  repo: string
+  branch: string
+  trust?: string
+  label?: string
+  review?: string
+}
+
 export const api = {
   voiceReplay: (slot: string, text: string) => post('/api/voice/replay', { slot, text }).then(j),
   status: () => fetch('/api/status').then(j),
@@ -2518,21 +2638,31 @@ export const api = {
   system: () => fetch('/api/system').then(j),
   sessionStorage: () => get('/api/system/session-storage').then(j) as Promise<SessionStorageReport>,
   sessionStorageCleanup: (olderThanDays: number, dryRun = false) =>
-    post('/api/system/session-storage/cleanup', { older_than_days: olderThanDays, dry_run: dryRun })
-      .then(j) as Promise<SessionStorageCleanup>,
+    post('/api/system/session-storage/cleanup', {
+      older_than_days: olderThanDays,
+      dry_run: dryRun,
+    }).then(j) as Promise<SessionStorageCleanup>,
   sessionStorageRestore: (batchId: string, uids?: string[]) =>
-    post('/api/system/session-storage/restore', uids ? { batch_id: batchId, uids } : { batch_id: batchId })
-      .then(j) as Promise<{ restored: number }>,
+    post(
+      '/api/system/session-storage/restore',
+      uids ? { batch_id: batchId, uids } : { batch_id: batchId },
+    ).then(j) as Promise<{ restored: number }>,
   sessionStorageEmpty: (batchIds: string[]) =>
-    post('/api/system/session-storage/empty', { batch_ids: batchIds }).then(j) as Promise<SessionStorageEmptyJob>,
+    post('/api/system/session-storage/empty', { batch_ids: batchIds }).then(
+      j,
+    ) as Promise<SessionStorageEmptyJob>,
   sessionStorageEmptyStatus: () =>
-    get('/api/system/session-storage/empty').then(j) as Promise<{ job: SessionStorageEmptyJob | null }>,
+    get('/api/system/session-storage/empty').then(j) as Promise<{
+      job: SessionStorageEmptyJob | null
+    }>,
   /** Session inventory — the flat list contract (§1). */
   sessionInventory: () =>
     get('/api/system/session-storage/sessions').then(j) as Promise<SessionInventoryList>,
   /** Session detail — lazy per-row fetch (§2). */
   sessionInventoryDetail: (uid: string) =>
-    get(`/api/system/session-storage/sessions/${encodeURIComponent(uid)}`).then(j) as Promise<SessionInventoryDetail>,
+    get(`/api/system/session-storage/sessions/${encodeURIComponent(uid)}`).then(
+      j,
+    ) as Promise<SessionInventoryDetail>,
   /** Move explicit selection to trash (§3). */
   sessionInventoryTrash: (uids: string[]) =>
     post('/api/system/session-storage/trash', { uids }).then(j) as Promise<SessionTrashResult>,
@@ -2541,12 +2671,13 @@ export const api = {
   // telemetry main switch: the usage rows it reads are always written.
   telemetryContextTrace: (slot: string) =>
     fetch('/api/telemetry/context-trace?slot=' + encodeURIComponent(slot)).then(j),
-  usageTurns: (slot: string) =>
-    fetch('/api/usage/turns?slot=' + encodeURIComponent(slot)).then(j),
+  usageTurns: (slot: string) => fetch('/api/usage/turns?slot=' + encodeURIComponent(slot)).then(j),
   /** WakaTime coding stats for a named range. Returns { configured: false }
    *  when the integration is off; a 502 body carries { code: 'upstream_unavailable' }. */
   wakatimeStats: (range: string) =>
-    fetch('/api/wakatime/stats?range=' + encodeURIComponent(range)).then(j) as Promise<WakaTimeStats>,
+    fetch('/api/wakatime/stats?range=' + encodeURIComponent(range)).then(
+      j,
+    ) as Promise<WakaTimeStats>,
   /** Download URL for the billable-hours export. The browser navigates to it so
    *  the CSV/JSON arrives via the endpoint's own Content-Disposition. */
   wakatimeExportUrl: (start: string, end: string, format: 'csv' | 'json') =>
@@ -2564,7 +2695,8 @@ export const api = {
     const blob = await r.blob()
     const cd = r.headers.get('Content-Disposition') || ''
     const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/.exec(cd)
-    const filename = (m && decodeURIComponent(m[1])) || `wakatime-hours-${start}-to-${end}.${format}`
+    const filename =
+      (m && decodeURIComponent(m[1])) || `wakatime-hours-${start}-to-${end}.${format}`
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -2581,7 +2713,9 @@ export const api = {
    *  opening cannot become a refresh loop. Returns `enabled: false` (not an
    *  error) when the feature is off, so the panel can explain itself. */
   sessionSummary: (slot: string) =>
-    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/summary').then(j) as Promise<SessionSummary>,
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/summary').then(
+      j,
+    ) as Promise<SessionSummary>,
   /** Summarize this session NOW, on the person's explicit request.
    *
    *  Same path as the GET, different verb: reading a summary must stay free of
@@ -2672,7 +2806,13 @@ export const api = {
     put('/api/onboarding/import/state', body).then(jNullable) as Promise<{ ok?: boolean } | null>,
   // Counts are derived server-side from the controls they describe, so a null
   // means "temporarily unresolvable", never "zero".
-  securityStats: () => get('/api/security/stats').then(j) as Promise<{ denied_commands: number | null; suspicious_patterns: number | null; tool_schemas: number | null; redaction_paths: number | null }>,
+  securityStats: () =>
+    get('/api/security/stats').then(j) as Promise<{
+      denied_commands: number | null
+      suspicious_patterns: number | null
+      tool_schemas: number | null
+      redaction_paths: number | null
+    }>,
   securityPosture: () => get('/api/security/posture').then(j) as Promise<SecurityPostureData>,
   // `sessionKey` MUST carry the active slot's key (`dashboard:<slot>`) when one
   // is active: the server's restricted-session guard reads X-Session-Key, and
@@ -2681,9 +2821,9 @@ export const api = {
   // cooperative-honesty contract as the tailnet mobile surface.
   mobileLoginLink: (sessionKey?: string) =>
     post('/api/auth/mobile-link', undefined, sessionKey).then(j) as Promise<{
-    url: string
-    expires_in: number
-  }>,
+      url: string
+      expires_in: number
+    }>,
   // Phone-connection methods available on this deployment under the current
   // governance ceiling (CPP mobile_connect seam). Descriptor-only: minting the
   // credential stays on each method's own endpoint above/below. An empty list
@@ -2708,50 +2848,86 @@ export const api = {
   // render — because the response is a live credential. `sessionKey` carries
   // the caller's REAL slot key so the server's restricted-session guard sees
   // it instead of the shared `dashboard:ui` placeholder.
-  tailnetMobileQr: (ttl?: string, sessionKey?: string) =>
-    post('/api/tailnet/mobile/qr', ttl ? { ttl } : {}, sessionKey).then(j) as Promise<TailnetMobileQr>,
+  tailnetMobileQr: (sessionKey?: string) =>
+    post('/api/tailnet/mobile/qr', {}, sessionKey).then(j) as Promise<TailnetMobileQr>,
   // Denied commands (Settings → Security). Every endpoint returns the full
   // refreshed snapshot so callers can seed their query cache from the response.
   deniedCommands: () => get('/api/security/denied-commands').then(j) as Promise<DeniedCommandsData>,
   toggleBuiltinDeniedCommand: (id: string, enabled: boolean) =>
-    patch('/api/security/denied-commands/builtins/' + encodeURIComponent(id), { enabled }).then(j) as Promise<DeniedCommandsData>,
+    patch('/api/security/denied-commands/builtins/' + encodeURIComponent(id), { enabled }).then(
+      j,
+    ) as Promise<DeniedCommandsData>,
   setDeniedCommandsDisableAll: (value: boolean) =>
-    patch('/api/security/denied-commands/disable-all', { value }).then(j) as Promise<DeniedCommandsData>,
+    patch('/api/security/denied-commands/disable-all', { value }).then(
+      j,
+    ) as Promise<DeniedCommandsData>,
   addUserDeniedCommand: (pattern: string, note = '') =>
-    post('/api/security/denied-commands/user', { pattern, note }).then(j) as Promise<DeniedCommandsData>,
+    post('/api/security/denied-commands/user', { pattern, note }).then(
+      j,
+    ) as Promise<DeniedCommandsData>,
   toggleUserDeniedCommand: (id: string, enabled: boolean) =>
-    patch('/api/security/denied-commands/user/' + encodeURIComponent(id), { enabled }).then(j) as Promise<DeniedCommandsData>,
+    patch('/api/security/denied-commands/user/' + encodeURIComponent(id), { enabled }).then(
+      j,
+    ) as Promise<DeniedCommandsData>,
   deleteUserDeniedCommand: (id: string) =>
-    del('/api/security/denied-commands/user/' + encodeURIComponent(id)).then(j) as Promise<DeniedCommandsData>,
+    del('/api/security/denied-commands/user/' + encodeURIComponent(id)).then(
+      j,
+    ) as Promise<DeniedCommandsData>,
   // Third-party app trust (Settings → Security). Like denied-commands, every
   // endpoint returns the full refreshed snapshot so callers can seed the query
   // cache from the mutation response instead of re-fetching.
   listTrustedApps: () => get('/api/security/trusted-apps').then(j) as Promise<TrustedAppsData>,
   trustApp: (name: string, repository?: string) =>
-    post('/api/security/trusted-apps/' + encodeURIComponent(name), repository ? { repository } : undefined).then(j) as Promise<TrustedAppsData>,
+    post(
+      '/api/security/trusted-apps/' + encodeURIComponent(name),
+      repository ? { repository } : undefined,
+    ).then(j) as Promise<TrustedAppsData>,
   // Returns the snapshot PLUS `disabled` — revoking trust also disables an app
   // that is currently enabled, so its code stops running immediately.
   untrustApp: (name: string) =>
-    del('/api/security/trusted-apps/' + encodeURIComponent(name)).then(j) as Promise<TrustedAppsRevokeResult>,
+    del('/api/security/trusted-apps/' + encodeURIComponent(name)).then(
+      j,
+    ) as Promise<TrustedAppsRevokeResult>,
   setTrustAllApps: (value: boolean) =>
     put('/api/security/trusted-apps/allow-all', { value }).then(j) as Promise<TrustedAppsData>,
   // Read-only governance policy viewer (Settings → Security). No write path —
   // the enterprise ceiling is file-authored and un-editable via the UI.
   governancePolicy: () => get('/api/governance/policy').then(j) as Promise<GovernancePolicyData>,
-  suggestions: (force?: boolean) => fetch(`/api/suggestions${force ? '?force=1' : ''}`).then(j) as Promise<{ suggestions: string[]; generated_at: number; stale: boolean }>,
-  branding: () => fetch('/api/dashboard/branding').then(j) as Promise<{ bot_name: string; avatar: string; direct_local?: boolean }>,
+  suggestions: (force?: boolean) =>
+    fetch(`/api/suggestions${force ? '?force=1' : ''}`).then(j) as Promise<{
+      suggestions: string[]
+      generated_at: number
+      stale: boolean
+    }>,
+  branding: () =>
+    fetch('/api/dashboard/branding').then(j) as Promise<{
+      bot_name: string
+      avatar: string
+      direct_local?: boolean
+    }>,
   // Instances (multi-instance management) — owner-only, gated by instances.enabled.
   // listInstances throws ApiError(403) when the feature is disabled; callers
   // should catch and render the enable toggle rather than an error. `active`
   // is true only when the SSH manager is actually running (the flag was on at
   // gateway startup) — enabled-but-not-active means a restart is required.
-  listInstances: () => get('/api/instances').then(j) as Promise<{ active: boolean; instances: InstanceView[]; warm_set_cap: number; sso: SsoStatus }>,
-  addInstance: (body: AddInstanceBody) => post('/api/instances', body).then(j) as Promise<InstanceView>,
-  updateInstance: (id: string, body: Partial<AddInstanceBody>) =>
-    patch('/api/instances/' + encodeURIComponent(id), body).then(j) as Promise<InstanceView>,
+  listInstances: () =>
+    get('/api/instances').then(j) as Promise<{
+      active: boolean
+      instances: InstanceView[]
+      warm_set_cap: number
+      sso: SsoStatus
+    }>,
+  addInstance: (body: AddInstanceBody) =>
+    post('/api/instances', body).then(j) as Promise<InstanceView>,
+  updateInstance: (id: string, body: Partial<AddInstanceBody>, opts?: { signal?: AbortSignal }) =>
+    patch('/api/instances/' + encodeURIComponent(id), body, undefined, opts?.signal).then(
+      j,
+    ) as Promise<InstanceView>,
   removeInstance: (id: string) => del('/api/instances/' + encodeURIComponent(id)).then(j),
   instanceStatus: (id: string, diagnose = false) =>
-    get('/api/instances/' + encodeURIComponent(id) + '/status' + (diagnose ? '?diagnose=1' : '')).then(j) as Promise<InstanceTunnelStatus>,
+    get(
+      '/api/instances/' + encodeURIComponent(id) + '/status' + (diagnose ? '?diagnose=1' : ''),
+    ).then(j) as Promise<InstanceTunnelStatus>,
   connectInstance: (id: string, opts?: { rebuild?: boolean; onlyIfConnected?: boolean }) =>
     post(
       '/api/instances/' +
@@ -2811,7 +2987,9 @@ export const api = {
     URL.revokeObjectURL(url)
   },
   sendSessionToInstance: (id: string, slot: string) =>
-    post('/api/instances/' + encodeURIComponent(id) + '/send-session', { slot }).then(j) as Promise<{
+    post('/api/instances/' + encodeURIComponent(id) + '/send-session', { slot }).then(
+      j,
+    ) as Promise<{
       ok: boolean
       instance: string
       remote_key: string
@@ -2842,8 +3020,12 @@ export const api = {
   cloudLaunches: () => get('/api/cloud/launch').then(j) as Promise<{ jobs: LaunchJob[] }>,
   // `provider_id` is optional on the wire: the server defaults it to "aws_ec2"
   // and answers 400 `unknown_provisioner` for an id it does not offer.
-  cloudLaunch: (body: { provider_id?: string; profile: string; region: string; size_key: string }) =>
-    post('/api/cloud/launch', body).then(j) as Promise<LaunchJob>,
+  cloudLaunch: (body: {
+    provider_id?: string
+    profile: string
+    region: string
+    size_key: string
+  }) => post('/api/cloud/launch', body).then(j) as Promise<LaunchJob>,
   cloudLaunchStatus: (id: string) =>
     get('/api/cloud/launch/' + encodeURIComponent(id)).then(j) as Promise<LaunchJob>,
   cloudLaunchCancel: (id: string) =>
@@ -2851,18 +3033,28 @@ export const api = {
   // Fetches the device-code prompt while the job is awaiting sign-in; 409 when
   // there is no pending prompt (surfaced as ApiError(409) to the caller).
   cloudLaunchSignin: (id: string) =>
-    post('/api/cloud/launch/' + encodeURIComponent(id) + '/signin').then(j) as Promise<{ signin: CloudLaunchSignin }>,
+    post('/api/cloud/launch/' + encodeURIComponent(id) + '/signin').then(j) as Promise<{
+      signin: CloudLaunchSignin
+    }>,
   // The gateway resolves the stack from the tag but needs the launch's AWS
   // coordinates: a crew created under a non-default profile/region is invisible
   // to the default ones, so omitting them makes stop/start/destroy fail. destroy
   // also needs instance_id to drop the local Instances registration, otherwise
   // the crew keeps appearing in the list after its box is gone.
   cloudStop: (tag: string, coords?: CloudCoords) =>
-    post('/api/cloud/' + encodeURIComponent(tag) + '/stop' + cloudQuery(coords)).then(j) as Promise<{ ok?: boolean }>,
+    post('/api/cloud/' + encodeURIComponent(tag) + '/stop' + cloudQuery(coords)).then(
+      j,
+    ) as Promise<{ ok?: boolean }>,
   cloudStart: (tag: string, coords?: CloudCoords) =>
-    post('/api/cloud/' + encodeURIComponent(tag) + '/start' + cloudQuery(coords)).then(j) as Promise<{ ok?: boolean }>,
+    post('/api/cloud/' + encodeURIComponent(tag) + '/start' + cloudQuery(coords)).then(
+      j,
+    ) as Promise<{ ok?: boolean }>,
   cloudDestroy: (tag: string, coords?: CloudCoords) =>
-    del('/api/cloud/' + encodeURIComponent(tag) + cloudQuery(coords)).then(j) as Promise<{ ok?: boolean; unregistered?: boolean; source_removed?: boolean }>,
+    del('/api/cloud/' + encodeURIComponent(tag) + cloudQuery(coords)).then(j) as Promise<{
+      ok?: boolean
+      unregistered?: boolean
+      source_removed?: boolean
+    }>,
   // Memory
   //
   // `store` is optional on every route here and threads through to
@@ -2871,14 +3063,30 @@ export const api = {
   // owner-gated and an undeclared name answers 404 `unknown_memory_store`. See
   // `memoryStoreQuery`. `/api/memory/settings` is deliberately NOT in the set:
   // the consolidation cadence is one install-wide setting, not a per-store one.
-  memoryPreferences: (store?: string) => fetch('/api/memory/preferences' + memoryStoreQuery(store)).then(j) as Promise<{ content?: string; content_redacted?: boolean }>,
-  saveMemoryPreferences: (content: string, store?: string) => put('/api/memory/preferences' + memoryStoreQuery(store), { content }),
-  memoryProjects: (store?: string) => fetch('/api/memory/projects' + memoryStoreQuery(store)).then(j) as Promise<{ content?: string; content_redacted?: boolean }>,
-  saveMemoryProjects: (content: string, store?: string) => put('/api/memory/projects' + memoryStoreQuery(store), { content }),
-  memoryHistory: (store?: string) => fetch('/api/memory/history' + memoryStoreQuery(store)).then(j) as Promise<{ content?: string; content_redacted?: boolean }>,
-  saveMemoryHistory: (content: string, store?: string) => put('/api/memory/history' + memoryStoreQuery(store), { content }),
+  memoryPreferences: (store?: string) =>
+    fetch('/api/memory/preferences' + memoryStoreQuery(store)).then(j) as Promise<{
+      content?: string
+      content_redacted?: boolean
+    }>,
+  saveMemoryPreferences: (content: string, store?: string) =>
+    put('/api/memory/preferences' + memoryStoreQuery(store), { content }),
+  memoryProjects: (store?: string) =>
+    fetch('/api/memory/projects' + memoryStoreQuery(store)).then(j) as Promise<{
+      content?: string
+      content_redacted?: boolean
+    }>,
+  saveMemoryProjects: (content: string, store?: string) =>
+    put('/api/memory/projects' + memoryStoreQuery(store), { content }),
+  memoryHistory: (store?: string) =>
+    fetch('/api/memory/history' + memoryStoreQuery(store)).then(j) as Promise<{
+      content?: string
+      content_redacted?: boolean
+    }>,
+  saveMemoryHistory: (content: string, store?: string) =>
+    put('/api/memory/history' + memoryStoreQuery(store), { content }),
   memorySettings: () => fetch('/api/memory/settings').then(j),
-  saveMemorySettings: (s: {history_idle_hours?: number; history_max_days?: number}) => put('/api/memory/settings', s),
+  saveMemorySettings: (s: { history_idle_hours?: number; history_max_days?: number }) =>
+    put('/api/memory/settings', s),
   /** Every declared store with its lineage, row counts and backup state.
    *
    *  Owner-gated unconditionally — it enumerates every silo — and takes no
@@ -2894,32 +3102,54 @@ export const api = {
       active: string
     }>,
   memoryRetired: (store?: string, limit?: number, offset = 0) =>
-    fetch('/api/memory/retired' + memoryQuery({ store, limit, ...(offset ? { offset } : {}) })).then(j) as Promise<{ retired: RetiredMemory[] }>,
+    fetch(
+      '/api/memory/retired' + memoryQuery({ store, limit, ...(offset ? { offset } : {}) }),
+    ).then(j) as Promise<{ retired: RetiredMemory[] }>,
   memoryRestoreRetired: (id: string, store?: string) =>
-    post('/api/memory/retired/restore', { id, ...(store ? { store } : {}) }).then(j) as Promise<{ ok: boolean }>,
+    post('/api/memory/retired/restore', { id, ...(store ? { store } : {}) }).then(j) as Promise<{
+      ok: boolean
+    }>,
   memoryBackups: (store?: string) =>
     fetch('/api/memory/backups' + memoryStoreQuery(store)).then(j) as Promise<{
-      backups: MemoryBackup[]; pending?: boolean; restart_required?: boolean
+      backups: MemoryBackup[]
+      pending?: boolean
+      restart_required?: boolean
       pending_restore?: { backup_name: string; staged_at: string } | null
       activation_failed?: boolean
       restore_error?: string
-      recovery?: { journal: string; staged_copies: string[]; previous_copies: string[]; instruction: string }
+      recovery?: {
+        journal: string
+        staged_copies: string[]
+        previous_copies: string[]
+        instruction: string
+      }
     }>,
   memoryBackupNow: (store?: string) =>
     post('/api/memory/backup', store ? { store } : {}).then(j) as Promise<{
-      backed_up: number; skipped: number; pruned: number; failed: number
+      backed_up: number
+      skipped: number
+      pruned: number
+      failed: number
     }>,
   /** Put one backup back in place. `name` is the handle `memoryBackups` returned,
    *  never a path — the gateway resolves it inside the store's own backup
    *  directory. `superseded` names the file the restore moved aside. */
   memoryRestoreBackup: (name: string, store?: string) =>
     post('/api/memory/restore', { name, ...(store ? { store } : {}) }).then(j) as Promise<{
-      ok: boolean; superseded?: string; pending?: boolean; restart_required?: boolean
+      ok: boolean
+      superseded?: string
+      pending?: boolean
+      restart_required?: boolean
     }>,
   cancelMemberMemoryRestore: (store: string) =>
     post('/api/memory/restore/cancel', { store }).then(j) as Promise<{
-      ok: boolean; cancelled: boolean; pending: false; restart_required: boolean; pending_restore: null
-      activation_failed?: boolean; restore_error?: string
+      ok: boolean
+      cancelled: boolean
+      pending: false
+      restart_required: boolean
+      pending_restore: null
+      activation_failed?: boolean
+      restore_error?: string
     }>,
   /** One carve read: `counts` when `countBy` is set, `entries` otherwise. Answers
    *  409 `facets_unsupported` on the v1 lineage, whose rows have no facet
@@ -2927,48 +3157,134 @@ export const api = {
   memoryCarve: (q: MemoryCarveQuery = {}) =>
     fetch('/api/memory/carve' + memoryQuery(q)).then(j) as Promise<MemoryCarveResult>,
   memoryRecall: (query: string, store: string) =>
-    fetch('/api/memory/recall?q=' + encodeURIComponent(query) + memoryStoreQuery(store, '&')).then(j),
+    fetch('/api/memory/recall?q=' + encodeURIComponent(query) + memoryStoreQuery(store, '&')).then(
+      j,
+    ),
   memoryRecords: (store: string, query: MemoryRecordQuery, offset = 0, limit = 50) =>
-    fetch('/api/memory/records?' + new URLSearchParams({ store: store || 'default', q: query.q, kind: query.kind, offset: String(offset), limit: String(limit) })).then(j) as Promise<{ entries: MemoryRecord[]; total: number; has_more: boolean }>,
-  memoryEditPreview: (store: string, selection: MemoryRecordSelection, operation: MemoryEditOperation) =>
-    post('/api/memory/bulk/preview', { store: store || 'default', selection, operation }).then(j) as Promise<MemoryEditPreview>,
+    fetch(
+      '/api/memory/records?' +
+        new URLSearchParams({
+          store: store || 'default',
+          q: query.q,
+          kind: query.kind,
+          offset: String(offset),
+          limit: String(limit),
+        }),
+    ).then(j) as Promise<{ entries: MemoryRecord[]; total: number; has_more: boolean }>,
+  memoryEditPreview: (
+    store: string,
+    selection: MemoryRecordSelection,
+    operation: MemoryEditOperation,
+  ) =>
+    post('/api/memory/bulk/preview', { store: store || 'default', selection, operation }).then(
+      j,
+    ) as Promise<MemoryEditPreview>,
   memoryEditPreviewPage: (store: string, previewId: string, offset: number) =>
-    post('/api/memory/bulk/preview', { store: store || 'default', preview_id: previewId, offset }).then(j) as Promise<MemoryEditPreview>,
+    post('/api/memory/bulk/preview', {
+      store: store || 'default',
+      preview_id: previewId,
+      offset,
+    }).then(j) as Promise<MemoryEditPreview>,
   memoryRecordsRefresh: (store: string, items: MemoryRecordRef[]) =>
-    post('/api/memory/records/refresh', { store: store || 'default', items }).then(j) as Promise<{ entries: MemoryRecord[]; missing: MemoryRecordRef[] }>,
-  memoryQuerySelectionRefresh: (store: string, selection: Extract<MemoryRecordSelection, { query: MemoryRecordQuery }>) =>
-    post('/api/memory/records/refresh', { store: store || 'default', selection }).then(j) as Promise<{ matched_count: number }>,
+    post('/api/memory/records/refresh', { store: store || 'default', items }).then(j) as Promise<{
+      entries: MemoryRecord[]
+      missing: MemoryRecordRef[]
+    }>,
+  memoryQuerySelectionRefresh: (
+    store: string,
+    selection: Extract<MemoryRecordSelection, { query: MemoryRecordQuery }>,
+  ) =>
+    post('/api/memory/records/refresh', { store: store || 'default', selection }).then(
+      j,
+    ) as Promise<{ matched_count: number }>,
   memoryRecordHistory: (store: string, record: MemoryRecordRef, limit = 25, offset = 0) =>
-    fetch('/api/memory/records/history?' + new URLSearchParams({ store: store || 'default', kind: record.kind, id: record.id, limit: String(limit), ...(offset ? { offset: String(offset) } : {}) })).then(j) as Promise<{ entries: MemoryRecordRevision[]; has_more: boolean; current_revision: number }>,
+    fetch(
+      '/api/memory/records/history?' +
+        new URLSearchParams({
+          store: store || 'default',
+          kind: record.kind,
+          id: record.id,
+          limit: String(limit),
+          ...(offset ? { offset: String(offset) } : {}),
+        }),
+    ).then(j) as Promise<{
+      entries: MemoryRecordRevision[]
+      has_more: boolean
+      current_revision: number
+    }>,
   memoryEditApply: (store: string, previewId: string) =>
-    post('/api/memory/bulk/apply', { store: store || 'default', preview_id: previewId }).then(j) as Promise<{ ok: true; changed_count: number }>,
+    post('/api/memory/bulk/apply', { store: store || 'default', preview_id: previewId }).then(
+      j,
+    ) as Promise<{ ok: true; changed_count: number }>,
   memberMemoryPage: (store: string, kind: 'semantic' | 'episodic', offset: number, query = '') =>
-    fetch('/api/memory/' + kind + '?store=' + encodeURIComponent(store) + '&limit=100&offset=' + offset + (query ? '&q=' + encodeURIComponent(query) : '')).then(j),
-  memorySeed: (sourceStore: string, store: string, items: { kind: 'fact' | 'directive' | 'episode'; id: string }[]) =>
+    fetch(
+      '/api/memory/' +
+        kind +
+        '?store=' +
+        encodeURIComponent(store) +
+        '&limit=100&offset=' +
+        offset +
+        (query ? '&q=' + encodeURIComponent(query) : ''),
+    ).then(j),
+  memorySeed: (
+    sourceStore: string,
+    store: string,
+    items: { kind: 'fact' | 'directive' | 'episode'; id: string }[],
+  ) =>
     post('/api/memory/seed', { source_store: sourceStore, store, items }).then(j) as Promise<{
       partial?: boolean
-      results: { outcome: 'imported' | 'existing' | 'rejected' | 'unconfirmed' | 'not_attempted'; id?: string; reason?: string }[]
+      results: {
+        outcome: 'imported' | 'existing' | 'rejected' | 'unconfirmed' | 'not_attempted'
+        id?: string
+        reason?: string
+      }[]
     }>,
   // Vector memory
-  vectorSemantic: (store?: string) => fetch('/api/memory/semantic' + memoryStoreQuery(store)).then(j),
-  vectorSemanticWrite: (key: string, value: unknown, store?: string) => put('/api/memory/semantic' + memoryStoreQuery(store), { key, value, source: 'user_explicit' }).then(j),
-  vectorSemanticDelete: (key: string, store?: string) => del('/api/memory/semantic/' + encodeURIComponent(key) + memoryStoreQuery(store)),
-  vectorEpisodic: (limit = 50, offset = 0, tags?: string, store?: string) => fetch('/api/memory/episodic?limit=' + limit + '&offset=' + offset + (tags ? '&tags=' + encodeURIComponent(tags) : '') + memoryStoreQuery(store, '&')).then(j),
-  vectorEpisodicSearch: (q: string, tags?: string, store?: string) => fetch('/api/memory/episodic/search?q=' + encodeURIComponent(q) + (tags ? '&tags=' + encodeURIComponent(tags) : '') + memoryStoreQuery(store, '&')).then(j),
-  vectorEpisodicDelete: (id: string, store?: string) => del('/api/memory/episodic/' + encodeURIComponent(id) + memoryStoreQuery(store)),
+  vectorSemantic: (store?: string) =>
+    fetch('/api/memory/semantic' + memoryStoreQuery(store)).then(j),
+  vectorSemanticWrite: (key: string, value: unknown, store?: string) =>
+    put('/api/memory/semantic' + memoryStoreQuery(store), {
+      key,
+      value,
+      source: 'user_explicit',
+    }).then(j),
+  vectorSemanticDelete: (key: string, store?: string) =>
+    del('/api/memory/semantic/' + encodeURIComponent(key) + memoryStoreQuery(store)),
+  vectorEpisodic: (limit = 50, offset = 0, tags?: string, store?: string) =>
+    fetch(
+      '/api/memory/episodic?limit=' +
+        limit +
+        '&offset=' +
+        offset +
+        (tags ? '&tags=' + encodeURIComponent(tags) : '') +
+        memoryStoreQuery(store, '&'),
+    ).then(j),
+  vectorEpisodicSearch: (q: string, tags?: string, store?: string) =>
+    fetch(
+      '/api/memory/episodic/search?q=' +
+        encodeURIComponent(q) +
+        (tags ? '&tags=' + encodeURIComponent(tags) : '') +
+        memoryStoreQuery(store, '&'),
+    ).then(j),
+  vectorEpisodicDelete: (id: string, store?: string) =>
+    del('/api/memory/episodic/' + encodeURIComponent(id) + memoryStoreQuery(store)),
   vectorStats: (store?: string) => fetch('/api/memory/stats' + memoryStoreQuery(store)).then(j),
-  vectorEvents: (limit = 50, offset = 0, store?: string) => fetch('/api/memory/events?limit=' + limit + '&offset=' + offset + memoryStoreQuery(store, '&')).then(j),
+  vectorEvents: (limit = 50, offset = 0, store?: string) =>
+    fetch(
+      '/api/memory/events?limit=' + limit + '&offset=' + offset + memoryStoreQuery(store, '&'),
+    ).then(j),
   vectorEmbeddingStatus: () => fetch('/api/memory/embedding-status').then(j),
   vectorEnableEmbeddings: () => post('/api/memory/enable-embeddings').then(j),
   vectorValidateEmbedModel: (path: string) =>
     post('/api/memory/embedding-model', { path, validate_only: true }).then(j),
-  vectorApplyEmbedModel: (path: string) =>
-    post('/api/memory/embedding-model', { path }).then(j),
+  vectorApplyEmbedModel: (path: string) => post('/api/memory/embedding-model', { path }).then(j),
   vectorDisableEmbeddings: () => post('/api/memory/disable-embeddings').then(j),
   vectorImport: (data: object) => post('/api/memory/import', data).then(j),
-  vectorContextPreview: (query?: string) => fetch('/api/memory/context-preview' + (query ? '?q=' + encodeURIComponent(query) : '')).then(j),
+  vectorContextPreview: (query?: string) =>
+    fetch('/api/memory/context-preview' + (query ? '?q=' + encodeURIComponent(query) : '')).then(j),
   memoryGraph: () => fetch('/api/memory/graph').then(j),
-  consolidateMemory: (key: string, includeHistory: boolean) => post('/api/memory/consolidate', { key, include_history: includeHistory }).then(j),
+  consolidateMemory: (key: string, includeHistory: boolean) =>
+    post('/api/memory/consolidate', { key, include_history: includeHistory }).then(j),
   restartSessions: () =>
     post('/api/sessions/restart').then(j) as Promise<{
       ok: boolean
@@ -2992,41 +3308,85 @@ export const api = {
       confirm: true,
       session_keys: sessionKeys,
     }).then(j) as Promise<RestartBlockerReport & { results: RestartBlockerResult[] }>,
-  sessionsMemory: () => fetch('/api/sessions/memory').then(j) as Promise<{
-    sessions: {
-      key: string; title: string; slot_key: string; untitled: boolean
-      agent: string; pid: number | null; owns_runtime: boolean; prompts: number
-      channel: string
-      rss_mb: number | null; procs: number | null; mcp: number | null
-      cpu_cores: number | null; uptime_s: number | null
-      credits: number | null; turns: number | null
-    }[]
-    tasks: {
-      id: string; task: string; agent: string; parent: string
-      rss_mb: number; peak_rss_mb: number; cpu_cores: number
-      procs: number | null; mcp: number | null
-      started_at: number; shared: boolean; pid: number | null; sampled: boolean
-    }[]
-    totals: {
-      rss_mb: number; runtimes: number; host_mb: number | null
-      host_pct: number | null; rss_is_upper_bound: boolean
-    }
-    history: { t: number; mb: number }[]
-  }>,
-  sessionsUsage: () => fetch('/api/sessions/usage').then(j) as Promise<{ usage?: KiroUsagePayload }>,
+  sessionsMemory: () =>
+    fetch('/api/sessions/memory').then(j) as Promise<{
+      sessions: {
+        key: string
+        title: string
+        slot_key: string
+        untitled: boolean
+        agent: string
+        pid: number | null
+        owns_runtime: boolean
+        prompts: number
+        channel: string
+        rss_mb: number | null
+        procs: number | null
+        mcp: number | null
+        cpu_cores: number | null
+        uptime_s: number | null
+        credits: number | null
+        turns: number | null
+      }[]
+      tasks: {
+        id: string
+        task: string
+        agent: string
+        parent: string
+        rss_mb: number
+        peak_rss_mb: number
+        cpu_cores: number
+        procs: number | null
+        mcp: number | null
+        started_at: number
+        shared: boolean
+        pid: number | null
+        sampled: boolean
+      }[]
+      totals: {
+        rss_mb: number
+        runtimes: number
+        host_mb: number | null
+        host_pct: number | null
+        rss_is_upper_bound: boolean
+      }
+      history: { t: number; mb: number }[]
+    }>,
+  sessionsUsage: () =>
+    fetch('/api/sessions/usage').then(j) as Promise<{ usage?: KiroUsagePayload }>,
   providerUsage: () => fetch('/api/usage').then(j),
   mcpProbeCache: () => fetch('/api/mcp/probe').then(j),
   // Agents
   agentsInstalled: () => fetch('/api/agents/installed').then(j),
   agentDetail: (name: string) => fetch('/api/agents/detail/' + encodeURIComponent(name)).then(j),
-  agentPatch: (name: string, body: object) => fetch('/api/agents/detail/' + encodeURIComponent(name), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j),
-  agentFork: (name: string, crew: string) => fetch('/api/agents/detail/' + encodeURIComponent(name) + '/fork', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ crew }) }).then(j),
-  agentPublish: (name: string, crew: string, newName: string) => fetch('/api/agents/detail/' + encodeURIComponent(name) + '/publish', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ crew, name: newName }) }).then(j),
+  agentPatch: (name: string, body: object) =>
+    fetch('/api/agents/detail/' + encodeURIComponent(name), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
+  agentFork: (name: string, crew: string) =>
+    fetch('/api/agents/detail/' + encodeURIComponent(name) + '/fork', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ crew }),
+    }).then(j),
+  agentPublish: (name: string, crew: string, newName: string) =>
+    fetch('/api/agents/detail/' + encodeURIComponent(name) + '/publish', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ crew, name: newName }),
+    }).then(j),
   // Rebind the crew to `name`'s origin AND delete the private copy in one atomic
   // server call, so a reset can no longer end half-done (rebound but copy kept, or
   // vice versa). May reject with origin_missing / stale_binding / not_a_private_copy
   // / ambiguous_template_name / rebind_failed.
-  agentReset: (name: string, crew: string) => fetch('/api/agents/detail/' + encodeURIComponent(name) + '/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ crew }) }).then(j),
+  agentReset: (name: string, crew: string) =>
+    fetch('/api/agents/detail/' + encodeURIComponent(name) + '/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ crew }),
+    }).then(j),
   // KiroCrew agents
   // sessionKey identifies the CHAT SLOT whose project scope applies. The
   // server resolves project-local agents through
@@ -3059,7 +3419,11 @@ export const api = {
   // born ONLY through this route (the generic slot-create endpoint refuses
   // mode="member"), so this is also the only place a member slot key comes from.
   memberThread: (slug: string) =>
-    post('/api/members/' + encodeURIComponent(slug) + '/thread').then(j) as Promise<{ slot_key: string; slug: string; member: string }>,
+    post('/api/members/' + encodeURIComponent(slug) + '/thread').then(j) as Promise<{
+      slot_key: string
+      slug: string
+      member: string
+    }>,
   // A member's recent activity pointers (real recorded signal only: session
   // participations and routing decisions). `member` is the exact crew name —
   // slugs are lossy, so the backend filters the shared log by exact name.
@@ -3076,8 +3440,7 @@ export const api = {
     }>,
   updateKirocrewAgent: (name: string, body: object) =>
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
-  deleteKirocrewAgent: (name: string) =>
-    del('/api/agents/' + encodeURIComponent(name)).then(j),
+  deleteKirocrewAgent: (name: string) => del('/api/agents/' + encodeURIComponent(name)).then(j),
   /** Stage a crew's picture on the server (a `.pending` file only — the
    *  config PUT with `avatar: {kind:'image'}` is what promotes it live,
    *  keeping the editor's Apply→Save two-step a real commit point). */
@@ -3133,34 +3496,65 @@ export const api = {
   },
   models: () => fetch('/api/models').then(j),
   effortLevels: (slot?: string) =>
-    fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
+    fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(
+      j,
+    ) as Promise<string[]>,
   // Bounded HERE, not per initiator: react-query dedupes on the key, so the
   // weakest initiator would otherwise decide whether the promise is bounded.
   slashCommands: (signal?: AbortSignal) =>
-    withDeadline(SLASH_COMMANDS_TIMEOUT_MS, signal, s =>
-      fetch('/api/slash-commands', { signal: s }).then(j)),
+    withDeadline(SLASH_COMMANDS_TIMEOUT_MS, signal, (s) =>
+      fetch('/api/slash-commands', { signal: s }).then(j),
+    ),
   chatSlotAgent: (slot: string, agent: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', { agent }).then(j) as Promise<{ ok?: boolean; agent?: string; workspace?: string }>,
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', { agent }).then(j) as Promise<{
+      ok?: boolean
+      agent?: string
+      workspace?: string
+    }>,
   chatSlotModel: (slot: string, model: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/model', { model }).then(j) as Promise<{ ok?: boolean; model?: string }>,
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/model', { model }).then(j) as Promise<{
+      ok?: boolean
+      model?: string
+    }>,
   /** This slot's auto-compact threshold override (null = follows the global). */
   chatSlotAutocompact: (slot: string) =>
-    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/autocompact').then(j) as Promise<{ pct: number | null; global_pct: number; min: number; max: number }>,
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/autocompact').then(j) as Promise<{
+      pct: number | null
+      global_pct: number
+      min: number
+      max: number
+    }>,
   /** Set (number) or clear (null) this slot's auto-compact threshold override. */
   setChatSlotAutocompact: (slot: string, pct: number | null) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/autocompact', { pct }).then(j) as Promise<{ ok?: boolean; pct: number | null; global_pct: number }>,
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/autocompact', { pct }).then(
+      j,
+    ) as Promise<{ ok?: boolean; pct: number | null; global_pct: number }>,
   chatSlotsModel: (model: string, skip_running: boolean) =>
-    post('/api/chat/slots/model', { model, skip_running }).then(j) as Promise<{ ok: boolean; model: string; switched: string[]; skipped_running: string[]; unchanged: string[]; failed: string[] }>,
+    post('/api/chat/slots/model', { model, skip_running }).then(j) as Promise<{
+      ok: boolean
+      model: string
+      switched: string[]
+      skipped_running: string[]
+      unchanged: string[]
+      failed: string[]
+    }>,
   chatSlotReasoningEffort: (slot: string, reasoning_effort: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', { reasoning_effort }).then(j) as Promise<{ ok?: boolean; reasoning_effort?: string; deferred?: boolean }>,
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', {
+      reasoning_effort,
+    }).then(j) as Promise<{ ok?: boolean; reasoning_effort?: string; deferred?: boolean }>,
   chatSlotWorkspace: (slot: string, workspace: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/workspace', { workspace }).then(j),
   // Relaunch the slot's agent process in place (fresh agent spec, env, and MCP
   // servers; conversation preserved). 409 while a turn is in flight.
   chatSlotReload: (slot: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/reload', {}).then(j) as Promise<{ ok?: boolean; error?: string }>,
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/reload', {}).then(j) as Promise<{
+      ok?: boolean
+      error?: string
+    }>,
   chatSlotProject: (slot: string, project: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/project', { project }).then(j) as Promise<{ ok?: boolean; project?: string }>,
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/project', { project }).then(
+      j,
+    ) as Promise<{ ok?: boolean; project?: string }>,
   // Follow-up card: create a sibling git worktree of `repo` on a new `branch`.
   // Resolves with the created path, or rejects with the server's message
   // (branch/dir already exists, not a git repo, git unavailable).
@@ -3173,67 +3567,139 @@ export const api = {
       error?: string
     }>,
   recentProjects: () => fetch('/api/recent-projects').then(j) as Promise<{ dirs: string[] }>,
-  browseDirs: (path?: string) => fetch('/api/browse-dirs' + (path ? '?path=' + encodeURIComponent(path) : '')).then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string }[] }>,
-  browseFiles: (path?: string) => fetch('/api/browse-files' + (path ? '?path=' + encodeURIComponent(path) : '')).then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string; mtime: number }[]; files: { name: string; path: string; mtime: number }[] }>,
-  projectGit: (path: string) => fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{ path: string; repo: boolean; repoRoot?: string; branch?: string; detached?: boolean; head?: string }>,
-  projectGitStatus: (path: string) => fetch('/api/project/git/status?path=' + encodeURIComponent(path)).then(j) as Promise<{ repo: boolean; repoRoot?: string; branch?: string; ahead?: number; behind?: number; files: { path: string; status: string; staged: boolean; additions?: number; deletions?: number }[] }>,
-  projectGitLog: (path: string, limit = 20) => fetch('/api/project/git/log?path=' + encodeURIComponent(path) + '&limit=' + limit).then(j) as Promise<{ repo: boolean; commits: { sha: string; message: string; author: string; date: string; isHead: boolean }[] }>,
-  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; repo: boolean; truncated?: boolean }>,
+  browseDirs: (path?: string) =>
+    fetch('/api/browse-dirs' + (path ? '?path=' + encodeURIComponent(path) : '')).then(
+      j,
+    ) as Promise<{ path: string; parent: string; dirs: { name: string; path: string }[] }>,
+  browseFiles: (path?: string) =>
+    fetch('/api/browse-files' + (path ? '?path=' + encodeURIComponent(path) : '')).then(
+      j,
+    ) as Promise<{
+      path: string
+      parent: string
+      dirs: { name: string; path: string; mtime: number }[]
+      files: { name: string; path: string; mtime: number }[]
+    }>,
+  projectGit: (path: string) =>
+    fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{
+      path: string
+      repo: boolean
+      repoRoot?: string
+      branch?: string
+      detached?: boolean
+      head?: string
+    }>,
+  projectGitStatus: (path: string) =>
+    fetch('/api/project/git/status?path=' + encodeURIComponent(path)).then(j) as Promise<{
+      repo: boolean
+      repoRoot?: string
+      branch?: string
+      ahead?: number
+      behind?: number
+      files: {
+        path: string
+        status: string
+        staged: boolean
+        additions?: number
+        deletions?: number
+      }[]
+    }>,
+  projectGitLog: (path: string, limit = 20) =>
+    fetch('/api/project/git/log?path=' + encodeURIComponent(path) + '&limit=' + limit).then(
+      j,
+    ) as Promise<{
+      repo: boolean
+      commits: { sha: string; message: string; author: string; date: string; isHead: boolean }[]
+    }>,
+  projectTree: (path: string) =>
+    fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{
+      root: string
+      paths: string[]
+      repo: boolean
+      truncated?: boolean
+    }>,
   workspaces: () => fetch('/api/workspaces').then(j),
   createWorkspace: (body: object) => post('/api/workspaces', body).then(j),
   updateWorkspace: (name: string, body: object) =>
     put('/api/workspaces/' + encodeURIComponent(name), body).then(j),
-  deleteWorkspace: (name: string) =>
-    del('/api/workspaces/' + encodeURIComponent(name)).then(j),
+  deleteWorkspace: (name: string) => del('/api/workspaces/' + encodeURIComponent(name)).then(j),
   // Crons
   crons: () => fetch('/api/crons').then(j),
   createCron: (body: object) => post('/api/crons', body).then(j),
   deleteCron: (id: string) => del('/api/crons/' + id).then(j),
   batchDeleteCron: (ids: string[]) => del('/api/crons', { ids }).then(j),
   updateCron: (id: string, body: object) =>
-    fetch('/api/crons/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j),
+    fetch('/api/crons/' + id, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
   runCron: (id: string) => post('/api/crons/' + id + '/run').then(j),
   /** Grant/revoke vault secrets, or act on an agent-requested pending grant.
    * Body: {secret_env: {...}} grants (empty object revokes), or
    * {approve_pending: true, expected_secret_env, expected_ts} /
    * {deny_pending: true}. Approval restates the displayed request; the server
    * refuses with 409 stale_request if it was replaced. Operator-only server-side. */
-  cronSecretsGrant: (id: string, body: { secret_env?: Record<string, string>; approve_pending?: boolean; deny_pending?: boolean; expected_secret_env?: Record<string, string> | null; expected_ts?: number; expected_source_sha256?: string }) =>
-    put('/api/crons/' + id + '/secrets', body).then(j),
+  cronSecretsGrant: (
+    id: string,
+    body: {
+      secret_env?: Record<string, string>
+      approve_pending?: boolean
+      deny_pending?: boolean
+      expected_secret_env?: Record<string, string> | null
+      expected_ts?: number
+      expected_source_sha256?: string
+    },
+  ) => put('/api/crons/' + id + '/secrets', body).then(j),
   cancelCron: (id: string) => post('/api/crons/' + id + '/cancel').then(j),
   cronToChat: (id: string) => post('/api/crons/' + id + '/to-chat').then(j),
-  toggleCron: (id: string, enabled: boolean) => post('/api/crons/' + id + '/enable', { enabled }).then(j),
+  toggleCron: (id: string, enabled: boolean) =>
+    post('/api/crons/' + id + '/enable', { enabled }).then(j),
   cronHistory: (jobId: string, offset?: number, limit?: number) => {
     const p = new URLSearchParams()
     if (offset != null) p.set('offset', String(offset))
     if (limit != null) p.set('limit', String(limit))
     const qs = p.toString()
-    return fetch('/api/crons/' + jobId + '/history' + (qs ? '?' + qs : ''), { headers: { ..._sk } }).then(j)
+    return fetch('/api/crons/' + jobId + '/history' + (qs ? '?' + qs : ''), {
+      headers: { ..._sk },
+    }).then(j)
   },
-  cronRunDetail: (jobId: string, runId: string) => fetch('/api/crons/' + jobId + '/history/' + encodeURIComponent(runId), { headers: { ..._sk } }).then(j),
-  cronScript: (jobId: string) => fetch('/api/crons/' + jobId + '/script', { headers: { ..._sk } }).then(j),
+  cronRunDetail: (jobId: string, runId: string) =>
+    fetch('/api/crons/' + jobId + '/history/' + encodeURIComponent(runId), {
+      headers: { ..._sk },
+    }).then(j),
+  cronScript: (jobId: string) =>
+    fetch('/api/crons/' + jobId + '/script', { headers: { ..._sk } }).then(j),
   /** Vault secret NAMES (values are never exposed). Same endpoint the Settings
    * Secrets panel reads. */
   secretsList: () => fetch('/api/secrets').then(j),
-  ackCron: (id: string, summary: string, ts?: string) => post('/api/crons/' + id + '/ack', { summary, ts }).then(j),
+  ackCron: (id: string, summary: string, ts?: string) =>
+    post('/api/crons/' + id + '/ack', { summary, ts }).then(j),
   cronHistoryAll: (opts?: { offset?: number; limit?: number; jobId?: string }) => {
     const p = new URLSearchParams()
     if (opts?.offset != null) p.set('offset', String(opts.offset))
     if (opts?.limit != null) p.set('limit', String(opts.limit))
     if (opts?.jobId) p.set('job_id', opts.jobId)
-    return fetch('/api/crons/history' + (p.toString() ? '?' + p : ''), { headers: { ..._sk } }).then(j)
+    return fetch('/api/crons/history' + (p.toString() ? '?' + p : ''), {
+      headers: { ..._sk },
+    }).then(j)
   },
 
   // Cron Folders
   cronFolders: () => fetch('/api/cron-folders').then(j),
   createCronFolder: (name: string) => post('/api/cron-folders', { name }).then(j),
   updateCronFolder: (id: string, body: { name?: string }) =>
-    fetch('/api/cron-folders/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j),
+    fetch('/api/cron-folders/' + id, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(j),
   deleteCronFolder: (id: string) => del('/api/cron-folders/' + id).then(j),
 
   // Lessons
   lessons: () => fetch('/api/lessons').then(j),
-  createLesson: (rule: string, category: string) => post('/api/lessons', { rule, category }).then(j),
+  createLesson: (rule: string, category: string) =>
+    post('/api/lessons', { rule, category }).then(j),
   deleteLesson: (rule: string) => del('/api/lessons', { rule }).then(j),
   // Hooks
   hooks: () => fetch('/api/hooks').then(j),
@@ -3242,7 +3708,8 @@ export const api = {
   updateHook: (id: string, body: object) => put('/api/hooks/' + id, body).then(j),
   deleteHook: (id: string) => del('/api/hooks/' + id).then(j),
   toggleHook: (id: string) => post('/api/hooks/' + id + '/toggle', {}).then(j),
-  testHook: (id: string, context?: string) => post('/api/hooks/' + id + '/test', { context: context || 'test' }).then(j),
+  testHook: (id: string, context?: string) =>
+    post('/api/hooks/' + id + '/test', { context: context || 'test' }).then(j),
   // Inbound webhooks (POST /api/hooks/agent) — token store, registered
   // contexts, run history. All dashboard-authed; the webhook bearer token is
   // never used from the browser.
@@ -3255,27 +3722,33 @@ export const api = {
       require_signature: requireSignature,
       agent,
     }).then(j),
-  updateWebhookToken: (
-    id: string,
-    patch: { agent?: string; enabled?: boolean; label?: string },
-  ) => fetch('/api/webhooks/tokens/' + encodeURIComponent(id), {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(patch),
-  }).then(j),
+  updateWebhookToken: (id: string, patch: { agent?: string; enabled?: boolean; label?: string }) =>
+    fetch('/api/webhooks/tokens/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    }).then(j),
   deleteWebhookToken: (id: string) => del('/api/webhooks/tokens/' + encodeURIComponent(id)).then(j),
-  deleteWebhookContext: (hookId: string) => del('/api/webhooks/contexts/' + encodeURIComponent(hookId)).then(j),
-  testWebhook: (message?: string, agent?: string) => post('/api/webhooks/test', { message, agent }).then(j),
+  deleteWebhookContext: (hookId: string) =>
+    del('/api/webhooks/contexts/' + encodeURIComponent(hookId)).then(j),
+  testWebhook: (message?: string, agent?: string) =>
+    post('/api/webhooks/test', { message, agent }).then(j),
   setWebhooksEnabled: (enabled: boolean) => post('/api/webhooks/switch', { enabled }).then(j),
   // Prompts (Agent SOPs)
   prompts: () => fetch('/api/prompts').then(j),
   promptDetail: (name: string, scope?: 'global' | 'local') =>
-    fetch('/api/prompts/' + name.split('/').map(encodeURIComponent).join('/')
-      + (scope ? '?scope=' + scope : '')).then(j),
+    fetch(
+      '/api/prompts/' +
+        name.split('/').map(encodeURIComponent).join('/') +
+        (scope ? '?scope=' + scope : ''),
+    ).then(j),
   createPrompt: (name: string, content: string, scope: 'global' | 'local') =>
     post('/api/prompts', { name, content, scope }).then(j),
   updatePrompt: (name: string, scope: 'global' | 'local', content: string, baseHash: string) =>
-    put('/api/prompts/' + encodeURIComponent(name) + '?scope=' + scope, { content, base_hash: baseHash }).then(j),
+    put('/api/prompts/' + encodeURIComponent(name) + '?scope=' + scope, {
+      content,
+      base_hash: baseHash,
+    }).then(j),
   deletePrompt: (name: string, scope: 'global' | 'local') =>
     del('/api/prompts/' + encodeURIComponent(name) + '?scope=' + scope).then(j),
   // Skills
@@ -3293,26 +3766,40 @@ export const api = {
   // Bounded HERE, not per initiator: react-query dedupes on the key, so the
   // weakest initiator would otherwise decide whether the promise is bounded.
   skills: (sessionKey?: string, agent?: string, signal?: AbortSignal) =>
-    withDeadline(SKILLS_TIMEOUT_MS, signal, s =>
-      get('/api/skills' + (agent ? '?agent=' + encodeURIComponent(agent) : ''),
-          sessionKey, s).then(j)),
+    withDeadline(SKILLS_TIMEOUT_MS, signal, (s) =>
+      get('/api/skills' + (agent ? '?agent=' + encodeURIComponent(agent) : ''), sessionKey, s).then(
+        j,
+      ),
+    ),
   /** Project-skills trust: this chat's grant state plus every stored grant. */
   skillTrust: (sessionKey?: string) => get('/api/skills/-/trust', sessionKey).then(j),
   grantSkillTrust: (sessionKey: string | undefined, expectedKey: string) =>
     post('/api/skills/-/trust', { expected_key: expectedKey }, sessionKey).then(j),
   revokeSkillTrust: (path?: string, sessionKey?: string) =>
-    del('/api/skills/-/trust' + (path ? '?path=' + encodeURIComponent(path) : ''), undefined, sessionKey).then(j),
-  skill: (name: string) => fetch('/api/skills/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
+    del(
+      '/api/skills/-/trust' + (path ? '?path=' + encodeURIComponent(path) : ''),
+      undefined,
+      sessionKey,
+    ).then(j),
+  skill: (name: string) =>
+    fetch('/api/skills/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
   /** List the file tree under a skill's directory.  The ``/-/`` separator
    *  disambiguates from a nested skill whose last segment is ``tree``. */
-  skillTree: (name: string) => fetch('/api/skills/' + name.split('/').map(encodeURIComponent).join('/') + '/-/tree').then(j),
+  skillTree: (name: string) =>
+    fetch('/api/skills/' + name.split('/').map(encodeURIComponent).join('/') + '/-/tree').then(j),
   /** Read a single file inside a skill's directory by relative path. */
   skillFile: (name: string, relPath: string) =>
-    fetch('/api/skills/' + name.split('/').map(encodeURIComponent).join('/') +
-          '/-/file?path=' + encodeURIComponent(relPath)).then(j),
+    fetch(
+      '/api/skills/' +
+        name.split('/').map(encodeURIComponent).join('/') +
+        '/-/file?path=' +
+        encodeURIComponent(relPath),
+    ).then(j),
   createSkill: (name: string, content: string) => post('/api/skills', { name, content }).then(j),
-  updateSkill: (name: string, content: string) => put('/api/skills/' + name.split('/').map(encodeURIComponent).join('/'), { content }).then(j),
-  deleteSkill: (name: string) => del('/api/skills/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
+  updateSkill: (name: string, content: string) =>
+    put('/api/skills/' + name.split('/').map(encodeURIComponent).join('/'), { content }).then(j),
+  deleteSkill: (name: string) =>
+    del('/api/skills/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
 
   // Steering (Kiro steering files — ~/.kiro/steering + <project>/.kiro/steering)
   // sessionKey names the CHAT SLOT whose project `workspace/` keys resolve
@@ -3323,7 +3810,9 @@ export const api = {
   // a key created under one project must stay readable, editable and deletable
   // from the same page load.
   steeringFiles: (sessionKey?: string) =>
-    fetch('/api/steering', { headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk } }).then(j),
+    fetch('/api/steering', {
+      headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk },
+    }).then(j),
   steeringFile: (key: string, sessionKey?: string) =>
     fetch('/api/steering/' + key.split('/').map(encodeURIComponent).join('/'), {
       headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk },
@@ -3332,7 +3821,13 @@ export const api = {
   // echoes it so the server can refuse (409) when the chat slot has since been
   // re-pointed at a different project. The session key names the slot, and the
   // slot is precisely what can move, so it cannot close this on its own.
-  createSteering: (name: string, content: string, source?: string, sessionKey?: string, projectKey?: string) =>
+  createSteering: (
+    name: string,
+    content: string,
+    source?: string,
+    sessionKey?: string,
+    projectKey?: string,
+  ) =>
     post('/api/steering', { name, content, source }, sessionKey, projectHeader(projectKey)).then(j),
   /** Save a steering file. `declaration` optionally rewrites its front matter
    *  (mode and pattern) SERVER-side — an empty string on a field removes that
@@ -3346,32 +3841,60 @@ export const api = {
     projectKey?: string,
     declaration?: { inclusion?: string; file_match_pattern?: string },
   ) =>
-    put('/api/steering/' + key.split('/').map(encodeURIComponent).join('/'), { content, ...(declaration ?? {}) }, sessionKey, projectHeader(projectKey)).then(j),
+    put(
+      '/api/steering/' + key.split('/').map(encodeURIComponent).join('/'),
+      { content, ...(declaration ?? {}) },
+      sessionKey,
+      projectHeader(projectKey),
+    ).then(j),
   deleteSteering: (key: string, sessionKey?: string, projectKey?: string) =>
-    del('/api/steering/' + key.split('/').map(encodeURIComponent).join('/'), undefined, sessionKey, projectHeader(projectKey)).then(j),
+    del(
+      '/api/steering/' + key.split('/').map(encodeURIComponent).join('/'),
+      undefined,
+      sessionKey,
+      projectHeader(projectKey),
+    ).then(j),
 
   // Auto-skill pending queue + lifecycle pin
   skillsPending: () => fetch('/api/skills/-/pending').then(j),
-  skillPendingDetail: (slug: string) => fetch('/api/skills/-/pending/' + encodeURIComponent(slug)).then(j),
-  approvePendingSkill: (slug: string) => post('/api/skills/-/pending/' + encodeURIComponent(slug) + '/approve', {}).then(j),
-  dismissPendingSkill: (slug: string) => post('/api/skills/-/pending/' + encodeURIComponent(slug) + '/dismiss', {}).then(j),
-  dismissAllPendingSkills: (slugs: string[]) => post('/api/skills/-/pending/-/dismiss-all', { slugs }).then(j),
+  skillPendingDetail: (slug: string) =>
+    fetch('/api/skills/-/pending/' + encodeURIComponent(slug)).then(j),
+  approvePendingSkill: (slug: string) =>
+    post('/api/skills/-/pending/' + encodeURIComponent(slug) + '/approve', {}).then(j),
+  dismissPendingSkill: (slug: string) =>
+    post('/api/skills/-/pending/' + encodeURIComponent(slug) + '/dismiss', {}).then(j),
+  dismissAllPendingSkills: (slugs: string[]) =>
+    post('/api/skills/-/pending/-/dismiss-all', { slugs }).then(j),
   pinSkill: (name: string, pinned: boolean) => post('/api/skills/-/pin', { name, pinned }).then(j),
   /** Opt a skill in/out of full-body injection when its triggers match.
    *  `inject: false` reduces the skill to a one-line pointer on a match. */
   setSkillInjectOnTrigger: (name: string, inject: boolean) =>
     post('/api/skills/-/inject-on-trigger', { name, inject }).then(j),
   /** Context budget: cost data for the skill control plane. */
-  skillsBudget: () => get('/api/skills/-/budget').then(j) as Promise<import('../types').SkillBudgetResponse>,
+  skillsBudget: () =>
+    get('/api/skills/-/budget').then(j) as Promise<import('../types').SkillBudgetResponse>,
   /** Multi-provider skill discovery (skills.sh, etc.) */
   discoverSkills: (query: string, opts?: { provider?: string; limit?: number }) =>
-    get(`/api/skills/-/discover?q=${encodeURIComponent(query)}${opts?.provider ? `&provider=${opts.provider}` : ''}${opts?.limit ? `&limit=${opts.limit}` : ''}`).then(j) as Promise<import('../types').DiscoverSkillsResponse>,
+    get(
+      `/api/skills/-/discover?q=${encodeURIComponent(query)}${opts?.provider ? `&provider=${opts.provider}` : ''}${opts?.limit ? `&limit=${opts.limit}` : ''}`,
+    ).then(j) as Promise<import('../types').DiscoverSkillsResponse>,
   /** Preview a skill's description, full SKILL.md, and bundle manifest before installing */
   previewDiscoveredSkill: (provider: string, id: string) =>
-    get(`/api/skills/-/discover/preview?provider=${encodeURIComponent(provider)}&id=${encodeURIComponent(id)}`).then(j) as Promise<import('../types').DiscoverSkillPreview>,
+    get(
+      `/api/skills/-/discover/preview?provider=${encodeURIComponent(provider)}&id=${encodeURIComponent(id)}`,
+    ).then(j) as Promise<import('../types').DiscoverSkillPreview>,
   /** Install a skill from a provider by ID. Throws ApiError(409) when already installed and overwrite is not set. */
-  installDiscoveredSkill: (provider: string, skillId: string, opts?: { name?: string; overwrite?: boolean }) =>
-    post('/api/skills/-/discover/install', { provider, skill_id: skillId, name: opts?.name, overwrite: opts?.overwrite }).then(j) as Promise<import('../types').DiscoverInstallResult>,
+  installDiscoveredSkill: (
+    provider: string,
+    skillId: string,
+    opts?: { name?: string; overwrite?: boolean },
+  ) =>
+    post('/api/skills/-/discover/install', {
+      provider,
+      skill_id: skillId,
+      name: opts?.name,
+      overwrite: opts?.overwrite,
+    }).then(j) as Promise<import('../types').DiscoverInstallResult>,
   // MCP
   mcpServers: () => fetch('/api/mcp').then(j),
   mcpGlobalScopes: () => fetch('/api/mcp/scopes').then(j),
@@ -3380,40 +3903,69 @@ export const api = {
    *  shorter than 2 chars returns {results: [], providers: [...]} without
    *  hitting any provider — a cheap availability probe. */
   mcpDiscover: (query: string, opts?: { provider?: string; limit?: number }) =>
-    get(`/api/mcp/discover?q=${encodeURIComponent(query)}${opts?.provider ? `&provider=${opts.provider}` : ''}${opts?.limit ? `&limit=${opts.limit}` : ''}`).then(j) as Promise<import('../types').McpDiscoverResponse>,
+    get(
+      `/api/mcp/discover?q=${encodeURIComponent(query)}${opts?.provider ? `&provider=${opts.provider}` : ''}${opts?.limit ? `&limit=${opts.limit}` : ''}`,
+    ).then(j) as Promise<import('../types').McpDiscoverResponse>,
   /** Full description + install-plan preview for one discovered server. */
   mcpDiscoverDetail: (provider: string, id: string) =>
-    get(`/api/mcp/discover/detail?provider=${encodeURIComponent(provider)}&id=${encodeURIComponent(id)}`).then(j) as Promise<import('../types').McpDiscoverDetail>,
+    get(
+      `/api/mcp/discover/detail?provider=${encodeURIComponent(provider)}&id=${encodeURIComponent(id)}`,
+    ).then(j) as Promise<import('../types').McpDiscoverDetail>,
   /** Install a discovered MCP server. Throws ApiError(409) on name collision. */
   mcpDiscoverInstall: (provider: string, id: string) =>
-    post('/api/mcp/discover/install', { provider, id }).then(j) as Promise<import('../types').McpDiscoverInstallResult>,
+    post('/api/mcp/discover/install', { provider, id }).then(j) as Promise<
+      import('../types').McpDiscoverInstallResult
+    >,
 
   mcpCustomAdd: (servers: Record<string, import('../types').McpCustomSpec>, enable: boolean) =>
-    post('/api/mcp/custom', { servers, enable }).then(j) as Promise<{ ok: boolean; added: string[]; enabled: boolean }>,
+    post('/api/mcp/custom', { servers, enable }).then(j) as Promise<{
+      ok: boolean
+      added: string[]
+      enabled: boolean
+    }>,
 
   mcpCustomGet: (name: string) =>
-    get(`/api/mcp/custom/${encodeURIComponent(name)}`).then(j) as Promise<import('../types').McpCustomSpecResponse>,
+    get(`/api/mcp/custom/${encodeURIComponent(name)}`).then(j) as Promise<
+      import('../types').McpCustomSpecResponse
+    >,
 
   mcpCustomUpdate: (name: string, spec: import('../types').McpCustomSpec) =>
-    put(`/api/mcp/custom/${encodeURIComponent(name)}`, { spec }).then(j) as Promise<{ ok: boolean; name: string }>,
-  mcpActive: (agent?: string) => fetch('/api/mcp/active' + (agent ? `?agent=${encodeURIComponent(agent)}` : '')).then(j),
+    put(`/api/mcp/custom/${encodeURIComponent(name)}`, { spec }).then(j) as Promise<{
+      ok: boolean
+      name: string
+    }>,
+  mcpActive: (agent?: string) =>
+    fetch('/api/mcp/active' + (agent ? `?agent=${encodeURIComponent(agent)}` : '')).then(j),
   mcpProbe: () => post('/api/mcp/probe').then(j),
   mcpResetProbeFailures: (name: string) =>
-    post('/api/mcp/quarantine/clear', { name }).then(j) as Promise<{ ok: boolean; name: string; released: boolean }>,
+    post('/api/mcp/quarantine/clear', { name }).then(j) as Promise<{
+      ok: boolean
+      name: string
+      released: boolean
+    }>,
   mcpSync: () => post('/api/mcp/sync').then(j),
-  mcpApply: (changes: McpApplyChange[]) =>
-    post('/api/mcp/apply', { changes }).then(j),
+  mcpApply: (changes: McpApplyChange[]) => post('/api/mcp/apply', { changes }).then(j),
   mcpToggle: (name: string, enabled: boolean) => post('/api/mcp/toggle', { name, enabled }).then(j),
-  mcpToggleTool: (server: string, tool: string, enabled: boolean) => post('/api/mcp/toggle-tool', { server, tool, enabled }).then(j),
+  mcpToggleTool: (server: string, tool: string, enabled: boolean) =>
+    post('/api/mcp/toggle-tool', { server, tool, enabled }).then(j),
   mcpToggleAll: (enabled: boolean) => post('/api/mcp/toggle-all', { enabled }).then(j),
   mcpRemove: (name: string) => post('/api/mcp/remove', { name }).then(j),
   mcpOAuthRelay: (server: string, redirectUrl: string) =>
-    post('/api/mcp/oauth/relay', { server, redirect_url: redirectUrl }).then(j) as Promise<{ ok: boolean }>,
+    post('/api/mcp/oauth/relay', { server, redirect_url: redirectUrl }).then(j) as Promise<{
+      ok: boolean
+    }>,
   // Connections approval-URL mint. POST starts one; GET is the card's feed for it.
   connectionsMint: (slug: string) =>
-    post('/api/connections/mint', { slug }).then(j) as Promise<{ ok: boolean; slug: string; state: string; token: string }>,
+    post('/api/connections/mint', { slug }).then(j) as Promise<{
+      ok: boolean
+      slug: string
+      state: string
+      token: string
+    }>,
   connectionsMintState: (slug: string) =>
-    fetch(`/api/connections/mint?slug=${encodeURIComponent(slug)}`).then(j) as Promise<ConnectionMintState>,
+    fetch(`/api/connections/mint?slug=${encodeURIComponent(slug)}`).then(
+      j,
+    ) as Promise<ConnectionMintState>,
   // Warm every mintable provider's URL in one activation, so a later Connect
   // serves a URL the warm table already holds instead of paying a cold spawn.
   // Deliberately BODYLESS: what is mintable is a fact about the user's registry
@@ -3428,7 +3980,10 @@ export const api = {
   // Authorization verdict + first-connect time per visible provider. Additive to
   // the mint feed above; never mints.
   connectionsStatus: () =>
-    fetch('/api/connections/status').then(j) as Promise<{ schema_version: number; connections: ConnectionStatus[] }>,
+    fetch('/api/connections/status').then(j) as Promise<{
+      schema_version: number
+      connections: ConnectionStatus[]
+    }>,
   // Promptless authenticated enumeration through kiro-cli. The runtime owns
   // bearer injection and provider tools/list; this receives only a verdict and count.
   connectionsTest: (slug: string) =>
@@ -3436,7 +3991,11 @@ export const api = {
   // Dispose an in-flight mint (process, listener, spec). Does NOT touch the MCP
   // config entry — the card owns that. `token` fences a sibling tab's row.
   connectionsCancel: (slug: string, token?: string) =>
-    post('/api/connections/cancel', token ? { slug, token } : { slug }).then(j) as Promise<{ ok: boolean; slug: string; dropped: boolean }>,
+    post('/api/connections/cancel', token ? { slug, token } : { slug }).then(j) as Promise<{
+      ok: boolean
+      slug: string
+      dropped: boolean
+    }>,
   // Undo a connection on THIS machine: disposes any in-flight mint, deletes the
   // runtime's stored grant artifacts when they are ours alone, and removes the MCP
   // entry. `grantRemoved` and `grantSurviving` are separate answers because the
@@ -3449,14 +4008,89 @@ export const api = {
   // whose URL could not be compared) names no file, and a gateway predating the
   // field sends none.
   connectionsDisconnect: (slug: string) =>
-    post('/api/connections/disconnect', { slug }).then(j) as Promise<{ ok: boolean; grantRemoved: boolean; grantSurviving: string[]; entryRemoved: boolean; grantSharedWith: string[]; grantCensusIncomplete: boolean; grantCensusUnreadable?: string[] }>,
+    post('/api/connections/disconnect', { slug }).then(j) as Promise<{
+      ok: boolean
+      grantRemoved: boolean
+      grantSurviving: string[]
+      entryRemoved: boolean
+      grantSharedWith: string[]
+      grantCensusIncomplete: boolean
+      grantCensusUnreadable?: string[]
+    }>,
+  // Operator-registered OAuth clients for providers that refuse dynamic client
+  // registration (Settings → OAuth Apps). The list is readable by any dashboard
+  // user (it is what the gallery's "needs configuration" card is built from and
+  // carries no secret); save and delete are owner-only.
+  connectionsOAuthClients: () =>
+    fetch('/api/connections/oauth-clients').then(j) as Promise<{
+      schema_version: number
+      clients: ConnectionOAuthClient[]
+    }>,
+  // Omitted fields are left as they are, so the id can be saved without re-entering
+  // a secret the panel never displays; `client_secret_clear` removes the stored one.
+  connectionsOAuthClientSave: (slug: string, body: ConnectionOAuthClientSave) =>
+    put(`/api/connections/oauth-clients/${encodeURIComponent(slug)}`, body).then(j) as Promise<{
+      ok: boolean
+      client: ConnectionOAuthClient | null
+    }>,
+  connectionsOAuthClientDelete: (slug: string) =>
+    del(`/api/connections/oauth-clients/${encodeURIComponent(slug)}`).then(j) as Promise<{
+      ok: boolean
+      client: ConnectionOAuthClient | null
+    }>,
   // MCP Gateway (shared pool)
-  mcpGatewayStatus: () => fetch('/api/mcp-gateway/status').then(j) as Promise<{ enabled: boolean; stub: string[]; stub_count: number; running: boolean; ping_ok: boolean; supported: boolean }>,
-  mcpGatewayEnable: (enabled: boolean) => post('/api/mcp-gateway/enable', { enabled }).then(j) as Promise<{ ok: boolean; enabled: boolean; running: boolean; ping_ok: boolean }>,
-  mcpGatewayMetrics: () => fetch('/api/mcp-gateway/metrics').then(j) as Promise<{ running: boolean; size?: number; max_backends?: number; backends: { server: string; agent: string; pid: number | null; sessions: number; idle_s: number; rss_kb: number }[]; warm_pool_hits?: number; warm_pool_misses?: number; warm_pool_hit_rate_pct?: number }>,
-  mcpGatewayServers: () => fetch('/api/mcp-gateway/servers').then(j) as Promise<{ servers: McpManagedServer[] }>,
-  mcpGatewaySetStub: (name: string, stub: boolean) => post('/api/mcp-gateway/servers/stub', { name, stub }).then(j) as Promise<{ ok: boolean; name: string; stub: boolean; enabled?: boolean; applied?: boolean; restart_required?: boolean; stub_servers?: string[] }>,
-  mcpResolveRefresh: () => post('/api/mcp-gateway/resolve-refresh', {}).then(j) as Promise<{ ok: boolean; reason?: string; resolved: Record<string, 'ready' | 'unresolved' | 'error'>; ready?: string[] }>,
+  mcpGatewayStatus: () =>
+    fetch('/api/mcp-gateway/status').then(j) as Promise<{
+      enabled: boolean
+      stub: string[]
+      stub_count: number
+      running: boolean
+      ping_ok: boolean
+      supported: boolean
+    }>,
+  mcpGatewayEnable: (enabled: boolean) =>
+    post('/api/mcp-gateway/enable', { enabled }).then(j) as Promise<{
+      ok: boolean
+      enabled: boolean
+      running: boolean
+      ping_ok: boolean
+    }>,
+  mcpGatewayMetrics: () =>
+    fetch('/api/mcp-gateway/metrics').then(j) as Promise<{
+      running: boolean
+      size?: number
+      max_backends?: number
+      backends: {
+        server: string
+        agent: string
+        pid: number | null
+        sessions: number
+        idle_s: number
+        rss_kb: number
+      }[]
+      warm_pool_hits?: number
+      warm_pool_misses?: number
+      warm_pool_hit_rate_pct?: number
+    }>,
+  mcpGatewayServers: () =>
+    fetch('/api/mcp-gateway/servers').then(j) as Promise<{ servers: McpManagedServer[] }>,
+  mcpGatewaySetStub: (name: string, stub: boolean) =>
+    post('/api/mcp-gateway/servers/stub', { name, stub }).then(j) as Promise<{
+      ok: boolean
+      name: string
+      stub: boolean
+      enabled?: boolean
+      applied?: boolean
+      restart_required?: boolean
+      stub_servers?: string[]
+    }>,
+  mcpResolveRefresh: () =>
+    post('/api/mcp-gateway/resolve-refresh', {}).then(j) as Promise<{
+      ok: boolean
+      reason?: string
+      resolved: Record<string, 'ready' | 'unresolved' | 'error'>
+      ready?: string[]
+    }>,
   // Starting a measurement pass returns immediately: it spawns two processes per
   // unmeasured server, so the answer arrives through the progress read, not here.
   mcpMeasureStart: () => post('/api/mcp/measure', {}).then(j) as Promise<McpMeasureProgress>,
@@ -3469,15 +4103,39 @@ export const api = {
   // switch and each server's verdict inside the same lock hold that writes them, so
   // the policy and the write cannot disagree. The response then reports `stubbed`
   // and `skipped` rather than echoing the request, because the two differ by design.
-  mcpGatewaySetStubMany: (names: string[], stub: boolean, resolveEligibility?: boolean) => post('/api/mcp-gateway/servers/stub', resolveEligibility ? { names, stub, resolve_eligibility: true } : { names, stub }).then(j) as Promise<{ ok: boolean; names: string[]; stub: boolean; stubbed?: string[]; skipped?: Array<{ name: string; reason: string }>; sharing_on?: boolean; applied?: boolean; restart_required?: boolean; stub_servers?: string[] }>,
+  mcpGatewaySetStubMany: (names: string[], stub: boolean, resolveEligibility?: boolean) =>
+    post(
+      '/api/mcp-gateway/servers/stub',
+      resolveEligibility ? { names, stub, resolve_eligibility: true } : { names, stub },
+    ).then(j) as Promise<{
+      ok: boolean
+      names: string[]
+      stub: boolean
+      stubbed?: string[]
+      skipped?: Array<{ name: string; reason: string }>
+      sharing_on?: boolean
+      applied?: boolean
+      restart_required?: boolean
+      stub_servers?: string[]
+    }>,
   // Agent config
   agentConfig: () => fetch('/api/agent/config').then(j),
   saveAgentConfig: (config: object) => put('/api/agent/config', { config }).then(j),
   defaultAgent: () => fetch('/api/config/default-agent').then(j),
   setDefaultAgent: (agent: string) => put('/api/config/default-agent', { agent }).then(j),
   kirocrewConfig: () => fetch('/api/config/kirocrew').then(j),
-  saveKirocrewConfig: (agent: object) => put('/api/config/kirocrew', { agent }).then(j) as Promise<{ ok?: boolean; restart_required?: boolean; error?: string }>,
-  patchConfig: (path: string, value: unknown) => fetch('/api/config/kirocrew', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, value }) }).then(j),
+  saveKirocrewConfig: (agent: object) =>
+    put('/api/config/kirocrew', { agent }).then(j) as Promise<{
+      ok?: boolean
+      restart_required?: boolean
+      error?: string
+    }>,
+  patchConfig: (path: string, value: unknown) =>
+    fetch('/api/config/kirocrew', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, value }),
+    }).then(j),
   // Owner-only, and absent (404) on an older gateway. Both of those reach the
   // caller as a rejection, which is the intended signal: "no probe information",
   // to be treated as fail-open rather than as a verdict.
@@ -3487,14 +4145,20 @@ export const api = {
   // degrades gracefully (panels render empty when the feature is absent).
   kiroUsage: () => fetch('/api/usage/kiro').then(j),
   capabilityMcpList: () => fetch('/api/capability/mcp').then(j),
-  capabilityMcpInstall: (serverId: string) => post('/api/capability/mcp/install', { server_id: serverId }).then(j),
-  capabilityMcpUninstall: (serverId: string) => post('/api/capability/mcp/uninstall', { server_id: serverId }).then(j),
+  capabilityMcpInstall: (serverId: string) =>
+    post('/api/capability/mcp/install', { server_id: serverId }).then(j),
+  capabilityMcpUninstall: (serverId: string) =>
+    post('/api/capability/mcp/uninstall', { server_id: serverId }).then(j),
   capabilitySkillsList: () => fetch('/api/capability/skills').then(j),
-  capabilitySkillsInstall: (pkg: string) => post('/api/capability/skills/install', { package: pkg }).then(j),
-  capabilitySkillsUninstall: (pkg: string) => post('/api/capability/skills/uninstall', { package: pkg }).then(j),
+  capabilitySkillsInstall: (pkg: string) =>
+    post('/api/capability/skills/install', { package: pkg }).then(j),
+  capabilitySkillsUninstall: (pkg: string) =>
+    post('/api/capability/skills/uninstall', { package: pkg }).then(j),
   capabilityAgentsList: () => fetch('/api/capability/agents').then(j),
-  capabilityAgentsInstall: (pkg: string) => post('/api/capability/agents/install', { package: pkg }).then(j),
-  capabilityAgentsUninstall: (pkg: string) => post('/api/capability/agents/uninstall', { package: pkg }).then(j),
+  capabilityAgentsInstall: (pkg: string) =>
+    post('/api/capability/agents/install', { package: pkg }).then(j),
+  capabilityAgentsUninstall: (pkg: string) =>
+    post('/api/capability/agents/uninstall', { package: pkg }).then(j),
   // Plugin packages (agent-client integrations). The response pairs the installed
   // rows with `out_of_sync` — packages installed as agents but missing their
   // plugin counterpart — so the UI can offer a one-click reconcile.
@@ -3539,33 +4203,75 @@ export const api = {
     return fetch('/api/stt/transcribe', { method: 'POST', body: fd }).then(j)
   },
   // Chat
-  pullRequestSource: (url: string, refresh = false) => post('/api/source/pull-request', { url, refresh }).then(j) as Promise<PullRequestSource>,
-  pullRequestChecks: (url: string) => post('/api/source/pull-request/checks', { url }).then(j) as Promise<{ checks: PullRequestCheck[] }>,
-  pullRequestStatuses: (urls: string[]) => post('/api/source/pull-request/status', { urls }).then(j) as Promise<PullRequestStatusBatch>,
-  resolvePullRequestThread: (url: string, threadId: string) => post('/api/source/pull-request/resolve', { url, threadId }).then(j) as Promise<{ resolved: boolean }>,
-  unresolvePullRequestThread: (url: string, threadId: string) => post('/api/source/pull-request/unresolve', { url, threadId }).then(j) as Promise<{ resolved: boolean }>,
+  pullRequestSource: (url: string, refresh = false) =>
+    post('/api/source/pull-request', { url, refresh }).then(j) as Promise<PullRequestSource>,
+  pullRequestChecks: (url: string) =>
+    post('/api/source/pull-request/checks', { url }).then(j) as Promise<{
+      checks: PullRequestCheck[]
+    }>,
+  pullRequestStatuses: (urls: string[]) =>
+    post('/api/source/pull-request/status', { urls }).then(j) as Promise<PullRequestStatusBatch>,
+  resolvePullRequestThread: (url: string, threadId: string) =>
+    post('/api/source/pull-request/resolve', { url, threadId }).then(j) as Promise<{
+      resolved: boolean
+    }>,
+  unresolvePullRequestThread: (url: string, threadId: string) =>
+    post('/api/source/pull-request/unresolve', { url, threadId }).then(j) as Promise<{
+      resolved: boolean
+    }>,
   /** Reply into an existing review thread. Owner-only on the gateway. */
-  replyToPullRequestThread: (url: string, threadId: string, body: string) => post('/api/source/pull-request/reply', { url, threadId, body }).then(j) as Promise<{ posted: boolean }>,
+  replyToPullRequestThread: (url: string, threadId: string, body: string) =>
+    post('/api/source/pull-request/reply', { url, threadId, body }).then(j) as Promise<{
+      posted: boolean
+    }>,
   /** Top-level comment on the pull request conversation. */
-  commentOnPullRequest: (url: string, body: string) => post('/api/source/pull-request/comment', { url, body }).then(j) as Promise<{ posted: boolean }>,
-  enablePullRequestAutoMerge: (url: string, confirmImmediateMerge = false) => post('/api/source/pull-request/auto-merge', { url, confirmImmediateMerge }).then(j) as Promise<{ autoMerge: boolean; mergeMethod: string }>,
-  markPullRequestReady: (url: string) => post('/api/source/pull-request/ready', { url }).then(j) as Promise<{ ready: boolean }>,
-  pullRequestPendingReview: (url: string) => post('/api/source/pull-request/pending-review', { url }).then(j) as Promise<{ reviewId: string; body: string; comments?: { path: string; line: number | null; body: string }[]; commitId: string; headSha: string; stale: boolean; contentRedacted: boolean; autoMergeArmed: boolean; contentDigest: string; staleDismissalEnabled: boolean }>,
-  submitPullRequestReview: (url: string, reviewId: string, event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT', contentDigest: string) =>
-    post('/api/source/pull-request/submit-review', { url, reviewId, event, contentDigest }).then(j) as Promise<{ submitted: boolean; event: string }>,
+  commentOnPullRequest: (url: string, body: string) =>
+    post('/api/source/pull-request/comment', { url, body }).then(j) as Promise<{ posted: boolean }>,
+  enablePullRequestAutoMerge: (url: string, confirmImmediateMerge = false) =>
+    post('/api/source/pull-request/auto-merge', { url, confirmImmediateMerge }).then(j) as Promise<{
+      autoMerge: boolean
+      mergeMethod: string
+    }>,
+  markPullRequestReady: (url: string) =>
+    post('/api/source/pull-request/ready', { url }).then(j) as Promise<{ ready: boolean }>,
+  pullRequestPendingReview: (url: string) =>
+    post('/api/source/pull-request/pending-review', { url }).then(j) as Promise<{
+      reviewId: string
+      body: string
+      comments?: { path: string; line: number | null; body: string }[]
+      commitId: string
+      headSha: string
+      stale: boolean
+      contentRedacted: boolean
+      autoMergeArmed: boolean
+      contentDigest: string
+      staleDismissalEnabled: boolean
+    }>,
+  submitPullRequestReview: (
+    url: string,
+    reviewId: string,
+    event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT',
+    contentDigest: string,
+  ) =>
+    post('/api/source/pull-request/submit-review', { url, reviewId, event, contentDigest }).then(
+      j,
+    ) as Promise<{ submitted: boolean; event: string }>,
   // Issue sources. `refresh` bypasses the server's cached payload; the panel
   // never polls, so a refresh is always an explicit user action.
-  fetchIssueSource: (url: string, refresh = false) => post('/api/source/issue', { url, refresh }).then(j) as Promise<IssueSource>,
+  fetchIssueSource: (url: string, refresh = false) =>
+    post('/api/source/issue', { url, refresh }).then(j) as Promise<IssueSource>,
   /** Top contributors to an app's source repo (GitHub only). Owner-gated. */
-  appContributors: (url: string, refresh = false) => post('/api/source/contributors', { url, refresh }).then(j) as Promise<{ contributors: AppContributor[] }>,
+  appContributors: (url: string, refresh = false) =>
+    post('/api/source/contributors', { url, refresh }).then(j) as Promise<{
+      contributors: AppContributor[]
+    }>,
   chatSlots: () => fetch('/api/chat/slots').then(j),
   /** All goal loops across sessions — every record the service holds, ACTIVE
    *  OR STOPPED (a stopped loop keeps `active: false` + `stopped_reason`, which
    *  is how a surface can say WHY a patrol went quiet). Returns
    *  `{enabled:false, loops:[]}` when the auto-nudge feature flag is off, so
    *  callers need no flag check. */
-  autonudgeList: (): Promise<AutoNudgeListResponse> =>
-    fetch('/api/autonudge').then(j),
+  autonudgeList: (): Promise<AutoNudgeListResponse> => fetch('/api/autonudge').then(j),
   autonudgeForSlot: (slot: string): Promise<{ enabled: boolean; loop: unknown | null }> =>
     fetch('/api/autonudge/slot/' + encodeURIComponent(slot)).then(j),
   /** Structured monitor records include terminal outcomes for inspection. */
@@ -3587,12 +4293,16 @@ export const api = {
   monitorClear: (id: string): Promise<MonitorResponse> =>
     post('/api/monitors/' + encodeURIComponent(id) + '/clear').then(j) as Promise<MonitorResponse>,
   monitorRestart: (id: string): Promise<MonitorResponse> =>
-    post('/api/monitors/' + encodeURIComponent(id) + '/restart').then(j) as Promise<MonitorResponse>,
+    post('/api/monitors/' + encodeURIComponent(id) + '/restart').then(
+      j,
+    ) as Promise<MonitorResponse>,
   /** Every pull request / issue link a session carries — the unbudgeted read
    *  behind the sidebar's expandable "+N" overflow chip. The slots payload caps
    *  chips per kind, so the links behind that chip are not on the client until
    *  this is called. */
-  chatSlotSourceLinks: (slot: string): Promise<{ links: NonNullable<ChatSlot['source_links']>; total: number }> =>
+  chatSlotSourceLinks: (
+    slot: string,
+  ): Promise<{ links: NonNullable<ChatSlot['source_links']>; total: number }> =>
     fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/source-links').then(j),
   chatSlotDetail: (slot: string, limit?: number, before?: number, signal?: AbortSignal) => {
     const p = new URLSearchParams()
@@ -3613,18 +4323,29 @@ export const api = {
    *  the `remote_already_bound` guard does not fire, and the peer's transcript is
    *  backfilled server-side. Requires `instance_id`; without it the backend
    *  answers `400 adopt_needs_instance`. */
-  createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, instance_id?: string, adopt_remote_slot?: string) => {
+  createChatSlot: async (
+    name?: string,
+    agent?: string,
+    model?: string,
+    mode?: string,
+    memory_mode?: string,
+    title?: string,
+    artifact?: string,
+    folder_id?: string,
+    instance_id?: string,
+    adopt_remote_slot?: string,
+  ) => {
     // ADOPT deliberately resolves NO default memory mode. The adopted slot carries
     // the PEER session's own `memory_mode` — that mode is the privacy boundary and
     // the session it belongs to already chose it — so sending this machine's
     // default would either be ignored or, worse, silently turn an incognito peer
     // session into a persistent local transcript. An explicit `memory_mode`
     // argument still wins, because a caller that names one means it.
-    const resolvedMemoryMode = memory_mode ?? (adopt_remote_slot
-      ? undefined
-      : await resolveDefaultMemoryMode(
-        () => fetch('/api/dashboard/config').then(j),
-      ))
+    const resolvedMemoryMode =
+      memory_mode ??
+      (adopt_remote_slot
+        ? undefined
+        : await resolveDefaultMemoryMode(() => fetch('/api/dashboard/config').then(j)))
     return post('/api/chat/slots', {
       ...(name ? { name } : {}),
       ...(agent ? { agent } : {}),
@@ -3641,89 +4362,264 @@ export const api = {
   /** Inject silent background context into a slot — consumed on the next user
    * message. Used by the artifact companion chat to name the bound artifact so
    * the user's first message needs no slug boilerplate. */
-  chatSlotContext: (slot: string, content: string, opts?: { source?: string; ephemeral?: boolean; maxAge?: number }) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/context', { content, ...(opts?.source ? { source: opts.source } : {}), ...(opts?.ephemeral !== undefined ? { ephemeral: opts.ephemeral } : {}), ...(opts?.maxAge !== undefined ? { maxAge: opts.maxAge } : {}) }).then(j),
+  chatSlotContext: (
+    slot: string,
+    content: string,
+    opts?: { source?: string; ephemeral?: boolean; maxAge?: number },
+  ) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/context', {
+      content,
+      ...(opts?.source ? { source: opts.source } : {}),
+      ...(opts?.ephemeral !== undefined ? { ephemeral: opts.ephemeral } : {}),
+      ...(opts?.maxAge !== undefined ? { maxAge: opts.maxAge } : {}),
+    }).then(j),
   deleteChatSlot: (slot: string) => del('/api/chat/slots/' + encodeURIComponent(slot)).then(j),
-  cleanupSessions: (maxInactiveDays: number, activeSlot?: string, dryRun?: boolean) => post('/api/chat/slots/cleanup', { max_inactive_days: maxInactiveDays, active_slot: activeSlot || '', dry_run: !!dryRun }).then(j) as Promise<{ ok: boolean; archived: number; keys: string[]; failed: string[]; dry_run?: boolean; count?: number; active_is_stale?: boolean }>,
-  stopChatSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/stop').then(j),
-  stopChatSlotForce: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/stop?force=true').then(j),
-  cancelQueuedMessage: (slot: string, queueId: string) => del('/api/chat/slots/' + encodeURIComponent(slot) + '/queue/' + encodeURIComponent(queueId)).then(j),
-  editQueuedMessage: (slot: string, queueId: string, content: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/queue/' + encodeURIComponent(queueId), { content }).then(j),
-  reorderQueuedMessages: (slot: string, order: string[]) => put('/api/chat/slots/' + encodeURIComponent(slot) + '/queue/order', { order }).then(j),
-  interruptSlot: (slot: string, queueId?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/interrupt', queueId ? { queue_id: queueId } : {}).then(j),
+  cleanupSessions: (maxInactiveDays: number, activeSlot?: string, dryRun?: boolean) =>
+    post('/api/chat/slots/cleanup', {
+      max_inactive_days: maxInactiveDays,
+      active_slot: activeSlot || '',
+      dry_run: !!dryRun,
+    }).then(j) as Promise<{
+      ok: boolean
+      archived: number
+      keys: string[]
+      failed: string[]
+      dry_run?: boolean
+      count?: number
+      active_is_stale?: boolean
+    }>,
+  stopChatSlot: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/stop').then(j),
+  stopChatSlotForce: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/stop?force=true').then(j),
+  cancelQueuedMessage: (slot: string, queueId: string) =>
+    del(
+      '/api/chat/slots/' + encodeURIComponent(slot) + '/queue/' + encodeURIComponent(queueId),
+    ).then(j),
+  editQueuedMessage: (slot: string, queueId: string, content: string) =>
+    patch('/api/chat/slots/' + encodeURIComponent(slot) + '/queue/' + encodeURIComponent(queueId), {
+      content,
+    }).then(j),
+  reorderQueuedMessages: (slot: string, order: string[]) =>
+    put('/api/chat/slots/' + encodeURIComponent(slot) + '/queue/order', { order }).then(j),
+  interruptSlot: (slot: string, queueId?: string) =>
+    post(
+      '/api/chat/slots/' + encodeURIComponent(slot) + '/interrupt',
+      queueId ? { queue_id: queueId } : {},
+    ).then(j),
   /** Ask the sleeping `wait` tool to return early. Cooperative, not a stop:
    *  the turn continues with a normal tool result. `waitId` must name the sleep
    *  currently in flight — the backend answers 409 for a stale one, which is how
    *  a click on a leftover countdown is rejected rather than ending a later wait. */
-  endWait: (slot: string, waitId: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/end-wait', { wait_id: waitId }).then(j),
-  approveChatSlot: (slot: string, action: string, extra?: Record<string, string>) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/approve', { action, ...extra }).then(j),
-  planAction: (slot: string, action: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/plan-action', { action }).then(j),
-  resumeChatSlot: (key: string, title?: string) => post('/api/chat/slots/' + encodeURIComponent(key) + '/resume', { name: key, key, title: title || key }).then(j),
-  forkChatSlot: (slot: string, atIndex?: number, prompt?: string, mode?: string, direction?: string, messageId?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/fork', { ...(atIndex !== undefined ? { at_message_index: atIndex } : {}), ...(messageId ? { at_message_id: messageId } : {}), ...(prompt ? { prompt } : {}), ...(mode ? { mode } : {}), ...(direction ? { direction } : {}) }).then(j),
-  sideOpen: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/open', {}).then(j) as Promise<{ ok: boolean; open: boolean; messages: number; last_run_id: string; created_at: string }>,
-  sideTurn: (slot: string, question: string, opts?: { steer?: boolean }) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/turn', { question, ...(opts?.steer ? { steer: true } : {}) }).then(j) as Promise<{ ok: boolean; run_id?: string; messages?: number; steered?: boolean; pending?: boolean; queued?: boolean; demoted?: boolean; queue_id?: string; still_queued?: boolean; depth?: number; steer_id?: string }>,
-  sideQueueCancel: (slot: string, queueId: string) => del('/api/chat/slots/' + encodeURIComponent(slot) + '/side/queue/' + encodeURIComponent(queueId), { client: TAB_ID }).then(j) as Promise<{ ok: boolean; content: string; depth: number }>,
-  sideQueueEdit: (slot: string, queueId: string, content: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/side/queue/' + encodeURIComponent(queueId), { content }).then(j) as Promise<{ ok: boolean; depth: number }>,
-  sideClose: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/close', {}).then(j) as Promise<{ ok: boolean; was_open: boolean }>,
-  chatMode: (mode: string, slot?: string) => post('/api/chat/mode', { mode, slot: slot || '' }).then(j),
-  generateTitle: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/generate-title').then(j),
-  resolveNavLinks: (links: { url: string; context: string }[]) => post('/api/chat/nav/resolve-links', { links }).then(j) as Promise<{ summaries: string[] }>,
-  renameSlot: (slot: string, title: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/title', { title }).then(j),
-  regenerateSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/regenerate').then(j),
+  endWait: (slot: string, waitId: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/end-wait', { wait_id: waitId }).then(j),
+  approveChatSlot: (slot: string, action: string, extra?: Record<string, string>) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/approve', { action, ...extra }).then(j),
+  planAction: (slot: string, action: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/plan-action', { action }).then(j),
+  resumeChatSlot: (key: string, title?: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(key) + '/resume', {
+      name: key,
+      key,
+      title: title || key,
+    }).then(j),
+  forkChatSlot: (
+    slot: string,
+    atIndex?: number,
+    prompt?: string,
+    mode?: string,
+    direction?: string,
+    messageId?: string,
+  ) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/fork', {
+      ...(atIndex !== undefined ? { at_message_index: atIndex } : {}),
+      ...(messageId ? { at_message_id: messageId } : {}),
+      ...(prompt ? { prompt } : {}),
+      ...(mode ? { mode } : {}),
+      ...(direction ? { direction } : {}),
+    }).then(j),
+  sideOpen: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/open', {}).then(j) as Promise<{
+      ok: boolean
+      open: boolean
+      messages: number
+      last_run_id: string
+      created_at: string
+    }>,
+  sideTurn: (slot: string, question: string, opts?: { steer?: boolean }) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/turn', {
+      question,
+      ...(opts?.steer ? { steer: true } : {}),
+    }).then(j) as Promise<{
+      ok: boolean
+      run_id?: string
+      messages?: number
+      steered?: boolean
+      pending?: boolean
+      queued?: boolean
+      demoted?: boolean
+      queue_id?: string
+      still_queued?: boolean
+      depth?: number
+      steer_id?: string
+    }>,
+  sideQueueCancel: (slot: string, queueId: string) =>
+    del(
+      '/api/chat/slots/' + encodeURIComponent(slot) + '/side/queue/' + encodeURIComponent(queueId),
+      { client: TAB_ID },
+    ).then(j) as Promise<{ ok: boolean; content: string; depth: number }>,
+  sideQueueEdit: (slot: string, queueId: string, content: string) =>
+    patch(
+      '/api/chat/slots/' + encodeURIComponent(slot) + '/side/queue/' + encodeURIComponent(queueId),
+      { content },
+    ).then(j) as Promise<{ ok: boolean; depth: number }>,
+  sideClose: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/close', {}).then(j) as Promise<{
+      ok: boolean
+      was_open: boolean
+    }>,
+  chatMode: (mode: string, slot?: string) =>
+    post('/api/chat/mode', { mode, slot: slot || '' }).then(j),
+  generateTitle: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/generate-title').then(j),
+  resolveNavLinks: (links: { url: string; context: string }[]) =>
+    post('/api/chat/nav/resolve-links', { links }).then(j) as Promise<{ summaries: string[] }>,
+  renameSlot: (slot: string, title: string) =>
+    patch('/api/chat/slots/' + encodeURIComponent(slot) + '/title', { title }).then(j),
+  regenerateSlot: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/regenerate').then(j),
   /** Pick an interrupted turn back up. NOT `/resume` — that path opens a history session into a tab. */
-  continueSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/continue').then(j),
-  switchVariant: (slot: string, index: number) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/switch-variant', { index }).then(j),
-  editResend: (slot: string, ts: string, content: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/edit-resend', { ts, content }).then(j),
-  rewind: (slot: string, ts: string, content: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/rewind', { ts, content }).then(j),
-  slackLink: (slot: string, channel?: string, threadTs?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-link', (channel || threadTs) ? { ...(channel ? { channel } : {}), ...(threadTs ? { thread_ts: threadTs } : {}) } : undefined).then(j),
-  unlinkSlack: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-unlink').then(j),
+  continueSlot: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/continue').then(j),
+  switchVariant: (slot: string, index: number) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/switch-variant', { index }).then(j),
+  editResend: (slot: string, ts: string, content: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/edit-resend', { ts, content }).then(j),
+  rewind: (slot: string, ts: string, content: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/rewind', { ts, content }).then(j),
+  slackLink: (slot: string, channel?: string, threadTs?: string) =>
+    post(
+      '/api/chat/slots/' + encodeURIComponent(slot) + '/slack-link',
+      channel || threadTs
+        ? { ...(channel ? { channel } : {}), ...(threadTs ? { thread_ts: threadTs } : {}) }
+        : undefined,
+    ).then(j),
+  unlinkSlack: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-unlink').then(j),
   // Sets whether turns reach the linked Slack thread. One call for both
   // directions: a session born in its thread has no binding to re-establish, so
   // reconnecting cannot go through slack-link.
-  pauseSlack: (slot: string, paused: boolean) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-pause', { paused }).then(j),
+  pauseSlack: (slot: string, paused: boolean) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/slack-pause', { paused }).then(j),
   /** `origin` names WHICH non-Slack delivery to act on: the conversation the
    *  session was born in, or its explicit mirror binding. A session can hold
    *  both, and they mute independently, so the row has to say which it is. */
-  pauseMirror: (slot: string, paused: boolean, origin = false) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-pause', { paused, origin }).then(j),
+  pauseMirror: (slot: string, paused: boolean, origin = false) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-pause', { paused, origin }).then(
+      j,
+    ),
   channelTargets: () => fetch('/api/chat/channel-targets').then(j),
-  linkMirror: (slot: string, channelType: string, targetId: string) => post(
-    '/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-link',
-    { channel_type: channelType, target_id: targetId },
-  ).then(j),
-  remindMirror: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-link').then(j),
-  unlinkMirror: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-unlink').then(j),
+  linkMirror: (slot: string, channelType: string, targetId: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-link', {
+      channel_type: channelType,
+      target_id: targetId,
+    }).then(j),
+  remindMirror: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-link').then(j),
+  unlinkMirror: (slot: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-unlink').then(j),
   slackChannels: () => fetch('/api/slack/channels').then(j),
   // Folders
   chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
   /** `config` carries the folder settings the create modal collects. Each is
    *  omitted when empty so the backend applies its own default. */
-  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; tags?: string[] }) =>
-    post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
-  updateChatFolder: (id: string, body: object) => patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
+  createChatFolder: (
+    name: string,
+    parentId?: string,
+    config?: { project_dir?: string; default_agent?: string; color?: string; tags?: string[] },
+  ) => post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
+  updateChatFolder: (id: string, body: object) =>
+    patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
   deleteChatFolder: (id: string) => del('/api/chat/folders/' + encodeURIComponent(id)).then(j),
-  setSlotFolder: (slot: string, folderId: string | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/folder', { folder_id: folderId || '' }).then(j),
-  setSlotColor: (slot: string, colorIndex: number | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_index: colorIndex }).then(j),
+  setSlotFolder: (slot: string, folderId: string | null) =>
+    patch('/api/chat/slots/' + encodeURIComponent(slot) + '/folder', {
+      folder_id: folderId || '',
+    }).then(j),
+  setSlotColor: (slot: string, colorIndex: number | null) =>
+    patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', {
+      color_index: colorIndex,
+    }).then(j),
   /** Set a custom per-session color (#rrggbb). The backend clears color_index
    *  when a hex is set and vice versa (mutual exclusion), so callers send one
    *  or the other, never both. */
-  setSlotColorHex: (slot: string, colorHex: string | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_hex: colorHex }).then(j),
+  setSlotColorHex: (slot: string, colorHex: string | null) =>
+    patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_hex: colorHex }).then(
+      j,
+    ),
   /** Clear BOTH color fields in one PATCH. The endpoint is in-body-gated, so
    *  an index-only null would leave a custom hex behind. */
-  clearSlotColor: (slot: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_index: null, color_hex: null }).then(j),
-  setSlotPin: (slot: string, pinned: boolean) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/pin', { pinned }).then(j),
-  setSlotMode: (slot: string, mode: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/mode', { mode }).then(j),
+  clearSlotColor: (slot: string) =>
+    patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', {
+      color_index: null,
+      color_hex: null,
+    }).then(j),
+  setSlotPin: (slot: string, pinned: boolean) =>
+    patch('/api/chat/slots/' + encodeURIComponent(slot) + '/pin', { pinned }).then(j),
+  setSlotMode: (slot: string, mode: string) =>
+    patch('/api/chat/slots/' + encodeURIComponent(slot) + '/mode', { mode }).then(j),
   // Tags
   chatTags: () => fetch('/api/chat/tags', { headers: { ..._sk } }).then(j),
-  createChatTag: (name: string, color?: string, status?: boolean) => post('/api/chat/tags', { name, color: color || '', status: !!status }).then(j),
-  updateChatTag: (id: string, body: { name?: string; color?: string; order?: number; status?: boolean }) => patch('/api/chat/tags/' + encodeURIComponent(id), body).then(j),
+  createChatTag: (name: string, color?: string, status?: boolean) =>
+    post('/api/chat/tags', { name, color: color || '', status: !!status }).then(j),
+  updateChatTag: (
+    id: string,
+    body: { name?: string; color?: string; order?: number; status?: boolean },
+  ) => patch('/api/chat/tags/' + encodeURIComponent(id), body).then(j),
   deleteChatTag: (id: string) => del('/api/chat/tags/' + encodeURIComponent(id)).then(j),
-  setSlotTags: (slot: string, tags: string[], baseTagsRevision?: string) => fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/tags', { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify(baseTagsRevision ? { tags, base_tags_revision: baseTagsRevision } : { tags }) }).then(j),
-  dropSlotToColumn: (slot: string, columnId: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/drop', { column_id: columnId }).then(j),
+  setSlotTags: (slot: string, tags: string[], baseTagsRevision?: string) =>
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/tags', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ..._sk },
+      body: JSON.stringify(
+        baseTagsRevision ? { tags, base_tags_revision: baseTagsRevision } : { tags },
+      ),
+    }).then(j),
+  dropSlotToColumn: (slot: string, columnId: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/drop', { column_id: columnId }).then(j),
   tagColumns: () => fetch('/api/chat/tag-columns', { headers: { ..._sk } }).then(j),
-  createTagColumn: (body: { name?: string; tag_ids?: string[]; mode?: 'any' | 'all' | 'none'; include_untagged?: boolean; source?: 'tags' | 'state'; state_key?: SessionLaneKey }) => post('/api/chat/tag-columns', body).then(j),
-  updateTagColumn: (id: string, body: { name?: string; tag_ids?: string[]; mode?: 'any' | 'all' | 'none'; order?: number; include_untagged?: boolean }) => patch('/api/chat/tag-columns/' + encodeURIComponent(id), body).then(j),
+  createTagColumn: (body: {
+    name?: string
+    tag_ids?: string[]
+    mode?: 'any' | 'all' | 'none'
+    include_untagged?: boolean
+    source?: 'tags' | 'state'
+    state_key?: SessionLaneKey
+  }) => post('/api/chat/tag-columns', body).then(j),
+  updateTagColumn: (
+    id: string,
+    body: {
+      name?: string
+      tag_ids?: string[]
+      mode?: 'any' | 'all' | 'none'
+      order?: number
+      include_untagged?: boolean
+    },
+  ) => patch('/api/chat/tag-columns/' + encodeURIComponent(id), body).then(j),
   deleteTagColumn: (id: string) => del('/api/chat/tag-columns/' + encodeURIComponent(id)).then(j),
-  reorderTagColumns: (ids: string[]) => fetch('/api/chat/tag-columns/order', { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ ids }) }).then(j),
-  sendChat: (message: string, slot?: string, colorTheme?: string, signal?: AbortSignal, meta?: Record<string, unknown>, steer?: boolean) => {
+  reorderTagColumns: (ids: string[]) =>
+    fetch('/api/chat/tag-columns/order', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ..._sk },
+      body: JSON.stringify({ ids }),
+    }).then(j),
+  sendChat: (
+    message: string,
+    slot?: string,
+    colorTheme?: string,
+    signal?: AbortSignal,
+    meta?: Record<string, unknown>,
+    steer?: boolean,
+  ) => {
     // theme_consent_sha is the WIRE TOKEN (two-tier consent). The client just
     // TRANSMITS the raw stored grant (see themeConsentSha) — the server verifies
     // content-binding, injecting the persona only when this token equals sha256
@@ -3751,11 +4647,24 @@ export const api = {
     // stale-owner session as a bare "refused" send. The steer helper this
     // replaced went through `j` and had both; the transport must not lose them.
     const themeConsent = themeConsentSha(colorTheme)
-    return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}), ...(steer ? { steer: true } : {}) }), signal }).then(sendResponseAuthRecovery)
+    return fetch('/api/chat?ws=1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ..._sk },
+      body: JSON.stringify({
+        message,
+        slot,
+        ...(colorTheme ? { color_theme: colorTheme } : {}),
+        ...(themeConsent ? { theme_consent_sha: themeConsent } : {}),
+        ...(meta ? { meta } : {}),
+        ...(steer ? { steer: true } : {}),
+      }),
+      signal,
+    }).then(sendResponseAuthRecovery)
   },
   sessionsHealth: () => fetch('/api/sessions/health').then(j),
   // Knowledge
-  knowledgeSearch: (q: string) => get(`/api/knowledge/search-for-context?q=${encodeURIComponent(q)}`).then(j),
+  knowledgeSearch: (q: string) =>
+    get(`/api/knowledge/search-for-context?q=${encodeURIComponent(q)}`).then(j),
   // Notifications
   notifications: () => fetch('/api/notifications').then(j),
   deleteNotification: (ts: string) => del('/api/notifications', { ts }).then(j),
@@ -3764,21 +4673,30 @@ export const api = {
   unackNotification: (ts: string) => post('/api/notifications/unack', { ts }).then(j),
   ackAllNotifications: () => post('/api/notifications/ack-all').then(j),
   notificationChannels: () => fetch('/api/notifications/channels').then(j),
-  updateNotificationChannelSettings: (channel: string, settings: { muted?: boolean; priority?: string | null }) =>
-    put('/api/notifications/channels/settings', { channel, ...settings }).then(j),
-  // Handoff
-  handoffChannels: () => fetch('/api/handoff-channels').then(j) as Promise<Record<string, string> | null>,
-  handoffSlot: (slot: string, channel?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/handoff', channel ? { channel } : undefined).then(j),
+  updateNotificationChannelSettings: (
+    channel: string,
+    settings: { muted?: boolean; priority?: string | null },
+  ) => put('/api/notifications/channels/settings', { channel, ...settings }).then(j),
   // Sessions (history)
   // `excludeOpen` drops sessions already open as a tab — for the sidebar's
   // Older-sessions pane, which is the complement of the tab list above it.
   // Off by default: every other caller wants the full inventory.
-  sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '') + (excludeOpen ? '&exclude_open=1' : '')).then(j),
-  sessionsSearch: (q: string, limit = 50) => fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
+  sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false) =>
+    fetch(
+      '/api/sessions?limit=' +
+        limit +
+        '&offset=' +
+        offset +
+        (preview ? '&preview=1' : '') +
+        (excludeOpen ? '&exclude_open=1' : ''),
+    ).then(j),
+  sessionsSearch: (q: string, limit = 50) =>
+    fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
   // Federated session search across the local gateway + every CONNECTED remote
   // instance (backend rank-interleaves; remote rows carry instance_id/_name).
   // 403 = instances feature disabled — callers fall back to sessionsSearch.
-  instancesSearchSessions: (q: string, limit = 50) => fetch('/api/instances/search-sessions?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
+  instancesSearchSessions: (q: string, limit = 50) =>
+    fetch('/api/instances/search-sessions?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
   /** What a connected crew can do: its version, agent roster, model list, effort
    *  levels and workspaces. The per-instance counterpart to `/api/agents`,
    *  `/api/models`, `/api/effort-levels` and `/api/workspaces`, which are all
@@ -3791,7 +4709,9 @@ export const api = {
    *  `unavailable` names the reads that failed, per field, so one unreachable
    *  roster disables exactly its own control instead of blanking the shelf. */
   instancesCapabilities: (instanceId: string) =>
-    fetch('/api/instances/' + encodeURIComponent(instanceId) + '/capabilities').then(j) as Promise<RemoteCrewCapabilities>,
+    fetch('/api/instances/' + encodeURIComponent(instanceId) + '/capabilities').then(
+      j,
+    ) as Promise<RemoteCrewCapabilities>,
 
   // A CONNECTED remote instance's LIVE sessions, read through an owner-only,
   // GET-only hub route. NOT the generic instance proxy, which this first used: the
@@ -3813,29 +4733,56 @@ export const api = {
   deleteSession: (key: string) => del('/api/sessions/' + encodeURIComponent(key)).then(j),
   clearSessions: () => del('/api/sessions').then(j),
   // Autocomplete
-  autocomplete: (q: string): Promise<{suggestions: string[]}> => fetch('/api/autocomplete?q=' + encodeURIComponent(q)).then(j),
+  autocomplete: (q: string): Promise<{ suggestions: string[] }> =>
+    fetch('/api/autocomplete?q=' + encodeURIComponent(q)).then(j),
   // Spawn
   spawnList: () => fetch('/api/spawn').then(j),
   spawn: (task: string) => post('/api/spawn', { task }).then(j),
-  spawnStatus: (id: string, opts?: { signal?: AbortSignal }) => fetch('/api/spawn/' + encodeURIComponent(id), opts).then(j),
+  spawnStatus: (id: string, opts?: { signal?: AbortSignal }) =>
+    fetch('/api/spawn/' + encodeURIComponent(id), opts).then(j),
   spawnDelete: (id: string) => del('/api/spawn/' + encodeURIComponent(id)).then(j),
   spawnStopAll: (slot: string) => post('/api/spawn/stop-all', { slot }).then(j),
   spawnRetry: (id: string) => post('/api/spawn/' + encodeURIComponent(id) + '/retry', {}).then(j),
-  approvals: (): Promise<{ id: string; source?: string; tool?: string; tool_input?: string; tool_call_id?: string; slot?: string; ts?: number }[]> => fetch('/api/approvals').then(j),
-  resolveApproval: (id: string, action: 'approve' | 'reject' | 'reject_once') => post('/api/approvals/' + encodeURIComponent(id) + '/' + action, {}).then(j),
+  approvals: (): Promise<
+    {
+      id: string
+      source?: string
+      tool?: string
+      tool_input?: string
+      tool_call_id?: string
+      slot?: string
+      ts?: number
+    }[]
+  > => fetch('/api/approvals').then(j),
+  resolveApproval: (id: string, action: 'approve' | 'reject' | 'reject_once') =>
+    post('/api/approvals/' + encodeURIComponent(id) + '/' + action, {}).then(j),
   /** Question cards still awaiting an answer, for rehydration after a reload or
    *  websocket reconnect (`question_card` is a one-shot broadcast). A blocking
    *  ask carries `ask_id`; a stateless card carries `card_id` instead. */
-  pendingQuestions: (): Promise<{ ask_id?: string; card_id?: string; slot: string; questions: { question: string; header?: string; multiSelect?: boolean; options: { label: string; description?: string }[] }[]; ts?: number }[]> =>
-    fetch('/api/ask-question/pending').then(j),
+  pendingQuestions: (): Promise<
+    {
+      ask_id?: string
+      card_id?: string
+      slot: string
+      questions: {
+        question: string
+        header?: string
+        multiSelect?: boolean
+        options: { label: string; description?: string }[]
+      }[]
+      ts?: number
+    }[]
+  > => fetch('/api/ask-question/pending').then(j),
   /** Resolve a pending agent question that carries an `ask_id` — a server-side
    *  wait opened by `POST /api/ask-question`, not the MCP ask_question tool,
    *  which posts a stateless `card_id` card instead. Pass no answers to
    *  dismiss, which unblocks the waiting caller with a timeout-equivalent
    *  result. */
   answerQuestion: (askId: string, answers?: Record<string, string>) =>
-    post('/api/ask-question/' + encodeURIComponent(askId) + '/answer',
-      answers ? { answers } : { dismissed: true }).then(j),
+    post(
+      '/api/ask-question/' + encodeURIComponent(askId) + '/answer',
+      answers ? { answers } : { dismissed: true },
+    ).then(j),
   /** Retire the slot's needs-input status for a STATELESS card (no `ask_id`),
    *  which blocks nothing and is otherwise removed client-side only — leaving
    *  the sidebar and sessions board claiming the agent is still waiting.
@@ -3844,26 +4791,48 @@ export const api = {
    *  it lands, and the server refuses rather than retiring the wrong ask. */
   dismissQuestionCard: (slot: string, cardId: string) =>
     post('/api/ask-question/dismiss', { slot, card_id: cardId }).then(j),
-  /** Silence a buried [OPTIONS:] decision (`pending_decision` on the slot
-   *  payload) without answering it. `ts` is the options row's identity from
-   *  the payload — the sibling of `dismissQuestionCard`'s `cardId`: a newer
-   *  options turn can supersede this one before the request lands, and the
-   *  server silences only the row named. */
-  dismissPendingDecision: (slot: string, ts: string) =>
-    post('/api/pending-decision/dismiss', { slot, ts }).then(j),
   // Logs
   logLevel: () => fetch('/api/logs/level').then(j),
   setLogLevel: (level: string) => post('/api/logs/level', { level }).then(j),
   // Task runner
   taskRunnerStatus: () => fetch('/api/taskrunner').then(j),
-  startTaskRunner: (spec: string, agent?: string, workspaceDir?: string) => post('/api/taskrunner', { spec, agent: agent || '', workspace_dir: workspaceDir || '' }).then(j),
-  cancelTaskRunner: (taskId?: string) => post('/api/taskrunner/cancel', taskId ? { task_id: taskId } : undefined).then(j),
-  pauseTaskRun: (taskId: string) => post('/api/taskrunner/' + encodeURIComponent(taskId) + '/pause').then(j),
+  startTaskRunner: (spec: string, agent?: string, workspaceDir?: string) =>
+    post('/api/taskrunner', { spec, agent: agent || '', workspace_dir: workspaceDir || '' }).then(
+      j,
+    ),
+  cancelTaskRunner: (taskId?: string) =>
+    post('/api/taskrunner/cancel', taskId ? { task_id: taskId } : undefined).then(j),
+  pauseTaskRun: (taskId: string) =>
+    post('/api/taskrunner/' + encodeURIComponent(taskId) + '/pause').then(j),
   deleteTaskRun: (taskId: string) => del('/api/taskrunner/' + encodeURIComponent(taskId)).then(j),
-  retryTaskRun: (taskId: string, fromStep: number) => post('/api/taskrunner/' + encodeURIComponent(taskId) + '/retry', { from_step: fromStep }).then(j),
-  renameTaskRun: (taskId: string, name: string) => fetch('/api/taskrunner/' + encodeURIComponent(taskId) + '/name', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) }).then(j),
-  updateTask: (taskId: string, index: number, updates: { title?: string; description?: string; depends_on?: number[]; requires_approval?: boolean; force_approval?: boolean }) => fetch('/api/taskrunner/' + encodeURIComponent(taskId) + '/tasks/' + index, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates) }).then(j),
-  taskRunToChat: (taskId: string) => post('/api/taskrunner/' + encodeURIComponent(taskId) + '/to-chat').then(j),
+  retryTaskRun: (taskId: string, fromStep: number) =>
+    post('/api/taskrunner/' + encodeURIComponent(taskId) + '/retry', { from_step: fromStep }).then(
+      j,
+    ),
+  renameTaskRun: (taskId: string, name: string) =>
+    fetch('/api/taskrunner/' + encodeURIComponent(taskId) + '/name', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }).then(j),
+  updateTask: (
+    taskId: string,
+    index: number,
+    updates: {
+      title?: string
+      description?: string
+      depends_on?: number[]
+      requires_approval?: boolean
+      force_approval?: boolean
+    },
+  ) =>
+    fetch('/api/taskrunner/' + encodeURIComponent(taskId) + '/tasks/' + index, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    }).then(j),
+  taskRunToChat: (taskId: string) =>
+    post('/api/taskrunner/' + encodeURIComponent(taskId) + '/to-chat').then(j),
   // `action` mirrors the backend's own two modes: 'reveal' selects the path in
   // the OS file manager (the default every existing caller relies on), 'open'
   // hands a regular file to its default application. Headless hosts have
@@ -3898,7 +4867,9 @@ export const api = {
   workflowRuns: () =>
     get('/api/workflows/runs').then(j) as Promise<{ runs?: WorkflowRunSummary[] }>,
   workflowDefinitions: (search = '') =>
-    get('/api/workflows/definitions' + (search ? `?q=${encodeURIComponent(search)}` : '')).then(j) as Promise<{ definitions: WorkflowDefinition[] }>,
+    get('/api/workflows/definitions' + (search ? `?q=${encodeURIComponent(search)}` : '')).then(
+      j,
+    ) as Promise<{ definitions: WorkflowDefinition[] }>,
   authorWorkflow: (intent: string) =>
     post('/api/workflows/author', { intent }).then(j) as Promise<{
       ok: boolean
@@ -3908,7 +4879,10 @@ export const api = {
       errors?: string[]
     }>,
   saveWorkflowDefinition: (body: WorkflowDefinitionWrite) =>
-    post('/api/workflows/definitions', body).then(j) as Promise<{ ok: boolean; definition: WorkflowDefinition }>,
+    post('/api/workflows/definitions', body).then(j) as Promise<{
+      ok: boolean
+      definition: WorkflowDefinition
+    }>,
   promoteWorkflowRun: (
     runId: string,
     body: Omit<WorkflowDefinitionWrite, 'source' | 'derived_from'>,
@@ -3920,21 +4894,39 @@ export const api = {
   updateWorkflowDefinition: (
     workflowRef: string,
     body: Omit<WorkflowDefinitionWrite, 'derived_from'> & { expected_revision: number },
-  ) => patch(`/api/workflows/definitions/${encodeURIComponent(workflowRef)}`, body).then(j) as Promise<{ ok: boolean; definition: WorkflowDefinition }>,
+  ) =>
+    patch(`/api/workflows/definitions/${encodeURIComponent(workflowRef)}`, body).then(
+      j,
+    ) as Promise<{ ok: boolean; definition: WorkflowDefinition }>,
   runWorkflowDefinition: (workflowRef: string, input: string, args: Record<string, unknown> = {}) =>
-    post(`/api/workflows/definitions/${encodeURIComponent(workflowRef)}/run`, { input, args }).then(j) as Promise<{ run_id: string; workflow_id: string; revision: number; slug: string }>,
+    post(`/api/workflows/definitions/${encodeURIComponent(workflowRef)}/run`, { input, args }).then(
+      j,
+    ) as Promise<{ run_id: string; workflow_id: string; revision: number; slug: string }>,
   refineTaskInput: (input: string) => post('/api/taskrunner/refine', { input }).then(j),
   refineStatus: () => fetch('/api/taskrunner/refine').then(j),
   refineCancel: () => post('/api/taskrunner/refine/cancel').then(j),
   planTask: (input: string, source: string, spec?: string, agent?: string, workspaceDir?: string) =>
-    post('/api/taskrunner/plan', { input, source, spec: spec || '', agent: agent || '', workspace_dir: workspaceDir || '' }).then(j),
+    post('/api/taskrunner/plan', {
+      input,
+      source,
+      spec: spec || '',
+      agent: agent || '',
+      workspace_dir: workspaceDir || '',
+    }).then(j),
   cancelPlan: () => post('/api/taskrunner/plan/cancel').then(j),
   updatePlan: (taskId: string, steps: PlanStepInput[]) =>
     put('/api/taskrunner/' + encodeURIComponent(taskId) + '/plan', { steps }).then(j),
   executePlan: (taskId: string, agent?: string, autoApprove?: boolean) =>
-    post('/api/taskrunner/' + encodeURIComponent(taskId) + '/execute', { agent: agent || '', auto_approve: !!autoApprove }).then(j),
+    post('/api/taskrunner/' + encodeURIComponent(taskId) + '/execute', {
+      agent: agent || '',
+      auto_approve: !!autoApprove,
+    }).then(j),
   planFromChat: (steps: PlanStepInput[], taskId?: string, originalInput?: string) =>
-    post('/api/taskrunner/from-chat', { steps, task_id: taskId || '', original_input: originalInput || '' }).then(j),
+    post('/api/taskrunner/from-chat', {
+      steps,
+      task_id: taskId || '',
+      original_input: originalInput || '',
+    }).then(j),
   planContext: (taskId: string) =>
     fetch('/api/taskrunner/' + encodeURIComponent(taskId) + '/plan-context').then(j),
   /** Download the run's plan as a YAML workflow (re-importable via the "From YAML" tab).
@@ -3970,7 +4962,8 @@ export const api = {
    * check compares against; it never installs anything, so the response is the
    * re-run check against the NEW channel.
    */
-  setUpdateChannel: (channel: string) => post('/api/update/channel', { channel }).then(j) as Promise<UpdateCheckResult>,
+  setUpdateChannel: (channel: string) =>
+    post('/api/update/channel', { channel }).then(j) as Promise<UpdateCheckResult>,
   /**
    * Restart the gateway without updating. The connection drops as the process
    * image is replaced, so callers must treat a network failure after a 200 as
@@ -3979,44 +4972,100 @@ export const api = {
   restartGateway: () => post('/api/restart').then(j),
   // In-app wheel update step-up: arming records the request and returns the
   // host command to run; the approval nonce never reaches this client.
-  armUpdate: () => post('/api/update/arm').then(j) as Promise<{ ok?: boolean; armed?: boolean; request_id?: string; version?: string; expires_in?: number; approve_command?: string; error?: string; code?: string }>,
-  armStatus: () => fetch('/api/update/arm').then(j) as Promise<{ armed: boolean; request_id?: string; version?: string; expires_in?: number; approve_command?: string }>,
+  armUpdate: () =>
+    post('/api/update/arm').then(j) as Promise<{
+      ok?: boolean
+      armed?: boolean
+      request_id?: string
+      version?: string
+      expires_in?: number
+      approve_command?: string
+      error?: string
+      code?: string
+    }>,
+  armStatus: () =>
+    fetch('/api/update/arm').then(j) as Promise<{
+      armed: boolean
+      request_id?: string
+      version?: string
+      expires_in?: number
+      approve_command?: string
+    }>,
   cancelUpdate: () => post('/api/update/cancel').then(j),
-  simulateUpdate: (opts?: { delay?: number; fail_at?: string }) => post('/api/update/simulate', opts || {}).then(j),
+  simulateUpdate: (opts?: { delay?: number; fail_at?: string }) =>
+    post('/api/update/simulate', opts || {}).then(j),
   pickFiles: () => post('/api/upload').then(j) as Promise<{ paths: string[] }>,
-  fileDiff: (path: string) => fetch('/api/file-diff?path=' + encodeURIComponent(path)).then(j) as Promise<{ diff: string; original: string; status?: 'clean' | 'modified' | 'untracked' | 'not_git' | 'error' }>,
+  fileDiff: (path: string) =>
+    fetch('/api/file-diff?path=' + encodeURIComponent(path)).then(j) as Promise<{
+      diff: string
+      original: string
+      status?: 'clean' | 'modified' | 'untracked' | 'not_git' | 'error'
+    }>,
   /** Fuzzy file search for @-mention picker. `kind` distinguishes folder hits from files.
    *  `kinds` narrows the result set server-side — 'files' or 'dirs'; omitted returns both.
    *  Filtering server-side rather than dropping unwanted hits here matters because the
    *  backend caps results BEFORE the response, so a client-side filter would silently
    *  shrink an already-capped list. */
-  fileSearch: (q: string, project?: string, signal?: AbortSignal, kinds?: 'files' | 'dirs', limit?: number) => {
+  fileSearch: (
+    q: string,
+    project?: string,
+    signal?: AbortSignal,
+    kinds?: 'files' | 'dirs',
+    limit?: number,
+  ) => {
     const p = new URLSearchParams({ q })
     if (project) p.set('project', project)
     if (kinds) p.set('kinds', kinds)
     if (limit) p.set('limit', String(limit))
-    return fetch(`/api/file-search?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string }>
+    return fetch(`/api/file-search?${p}`, signal ? { signal } : undefined).then(j) as Promise<{
+      results: Array<{
+        path: string
+        name: string
+        size: number
+        mtime: number
+        kind?: 'file' | 'dir'
+      }>
+      root: string
+    }>
   },
   /** Upload files via browser File API (cross-platform) */
   uploadFiles: async (files: File[]) => {
     // Downscale oversized images client-side so they fit the model's image
     // limits before they ever reach the server (see resizeImage.ts).
-    const prepared = await Promise.all(files.map(f => resizeImageForModel(f)))
-    const resized = prepared.map(p => p.info).filter((i): i is ResizeInfo => i !== null)
+    const prepared = await Promise.all(files.map((f) => resizeImageForModel(f)))
+    const resized = prepared.map((p) => p.info).filter((i): i is ResizeInfo => i !== null)
     const fd = new FormData()
-    prepared.forEach(p => fd.append('file', p.file))
+    prepared.forEach((p) => fd.append('file', p.file))
     const res = await fetch('/api/upload/file', { method: 'POST', body: fd })
     checkSessionExpired(res)
     let body: { paths?: unknown; error?: string }
-    try { body = await res.json() } catch { body = {} }
-    if (!res.ok) return { paths: [] as string[], error: body.error || res.statusText, resized, resizedByPath: {} as Record<string, ResizeInfo> }
-    if (!Array.isArray(body.paths)) return { paths: [] as string[], error: i18nT('api.client.unexpected_server_response'), resized, resizedByPath: {} as Record<string, ResizeInfo> }
+    try {
+      body = await res.json()
+    } catch {
+      body = {}
+    }
+    if (!res.ok)
+      return {
+        paths: [] as string[],
+        error: body.error || res.statusText,
+        resized,
+        resizedByPath: {} as Record<string, ResizeInfo>,
+      }
+    if (!Array.isArray(body.paths))
+      return {
+        paths: [] as string[],
+        error: i18nT('api.client.unexpected_server_response'),
+        resized,
+        resizedByPath: {} as Record<string, ResizeInfo>,
+      }
     // The server appends one path per multipart 'file' part in order, so
     // paths[i] is prepared[i]'s stored location — zip them to key resize
     // details by the exact server path the attachment chip renders from.
     const paths = body.paths as string[]
     const resizedByPath: Record<string, ResizeInfo> = {}
-    prepared.forEach((p, i) => { if (p.info && paths[i]) resizedByPath[paths[i]] = p.info })
+    prepared.forEach((p, i) => {
+      if (p.info && paths[i]) resizedByPath[paths[i]] = p.info
+    })
     return { ...(body as { paths: string[]; error?: string }), resized, resizedByPath }
   },
   screenshot: () => post('/api/screenshot').then(j) as Promise<{ path: string }>,
@@ -4041,14 +5090,17 @@ export const api = {
    *  completion or an explicit acknowledgement, `dismissed` retires it on a
    *  close, and the backend never offers that video again after either. */
   featureVideoFeedback: (id: string, status: 'seen' | 'dismissed', sessionKey?: string) =>
-    post('/api/feature-videos/feedback', { id, status }, sessionKey).then(j) as Promise<{ ok: true }>,
+    post('/api/feature-videos/feedback', { id, status }, sessionKey).then(j) as Promise<{
+      ok: true
+    }>,
   /** Is this clip's file actually reachable? Asked of the SERVER, because the
    *  client cannot ask it: a remote clip lives on another origin, where a HEAD
    *  from the page is refused for want of CORS headers and a healthy clip is
    *  indistinguishable from a missing one. */
   featureVideoProbe: (id: string, sessionKey?: string) =>
-    get('/api/feature-videos/probe?id=' + encodeURIComponent(id), sessionKey)
-      .then(j) as Promise<FeatureVideoProbe>,
+    get('/api/feature-videos/probe?id=' + encodeURIComponent(id), sessionKey).then(
+      j,
+    ) as Promise<FeatureVideoProbe>,
   /** Cache readout for the settings panel.
    *
    *  `sessionKey` MUST carry the active slot's key, for the same reason the two
@@ -4074,7 +5126,8 @@ export const api = {
   createTheme: (body: object) => post('/api/themes', body).then(j),
   installTheme: (source: { type: 'local'; path: string } | { type: 'github'; url: string }) =>
     post('/api/themes/install', { source }).then(j),
-  updateTheme: (slug: string, body: object) => put('/api/themes/' + encodeURIComponent(slug), body).then(j),
+  updateTheme: (slug: string, body: object) =>
+    put('/api/themes/' + encodeURIComponent(slug), body).then(j),
   deleteTheme: (slug: string) => del('/api/themes/' + encodeURIComponent(slug)).then(j),
   themeDetail: (slug: string) => fetch('/api/themes/' + encodeURIComponent(slug)).then(j),
   // Workspace theme config (server-authoritative)
@@ -4088,8 +5141,7 @@ export const api = {
     import_onboarded?: boolean
     /** Gates the gateway's first heartbeat; see `beacon.telemetry_permitted`. */
     privacy_acked?: boolean
-  }) =>
-    put('/api/config/theme', body).then(j),
+  }) => put('/api/config/theme', body).then(j),
   // Voice
   voiceConfig: () => fetch('/api/voice/config').then(j),
   updateVoiceConfig: (body: object) => put('/api/voice/config', body).then(j),
@@ -4099,7 +5151,9 @@ export const api = {
   // The GET reports what would be billed AND performs the identity probe, so it
   // is the call that surfaces the account before the operator agrees to it.
   awsConsent: (service: string) =>
-    fetch('/api/aws/consent?service=' + encodeURIComponent(service)).then(j) as Promise<AwsConsentStatus>,
+    fetch('/api/aws/consent?service=' + encodeURIComponent(service)).then(
+      j,
+    ) as Promise<AwsConsentStatus>,
   grantAwsConsent: (service: string, shown: { profile: string; region: string; account: string }) =>
     post('/api/aws/consent', {
       service,
@@ -4110,7 +5164,10 @@ export const api = {
       expectedAccount: shown.account,
     }).then(j) as Promise<{ ok?: boolean; error?: string; code?: string; identityDetail?: string }>,
   revokeAwsConsent: (service: string) =>
-    del('/api/aws/consent?service=' + encodeURIComponent(service)).then(j) as Promise<{ ok?: boolean; removed?: boolean }>,
+    del('/api/aws/consent?service=' + encodeURIComponent(service)).then(j) as Promise<{
+      ok?: boolean
+      removed?: boolean
+    }>,
   // `signal` is carried on the options object rather than as a positional
   // argument so the correlated-request fields and the abort handle travel
   // together; it is stripped before the body is serialised. A caller that
@@ -4119,7 +5176,14 @@ export const api = {
   voiceSynthesize: (
     slot: string,
     text: string,
-    opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; request_id?: string; signal?: AbortSignal },
+    opts?: {
+      voice?: string
+      engine?: string
+      rate?: string
+      pitch?: string
+      request_id?: string
+      signal?: AbortSignal
+    },
   ) => {
     const { signal, ...rest } = opts ?? {}
     const request_id = rest.request_id || createVoiceRequestId()
@@ -4129,12 +5193,18 @@ export const api = {
       headers: { 'Content-Type': 'application/json', ..._sk },
       body: JSON.stringify({ slot, text, ...rest, request_id }),
       ...(signal ? { signal } : {}),
-    }).then(j).catch(error => {
-      if (signal?.aborted) throw error
-      const code = error instanceof ApiError ? parseErrorCode(error.body) : undefined
-      window.dispatchEvent(new CustomEvent('voice-synthesis-failed', { detail: { slot, request_id, code: code || 'voice_synthesis_failed' } }))
-      throw error
     })
+      .then(j)
+      .catch((error) => {
+        if (signal?.aborted) throw error
+        const code = error instanceof ApiError ? parseErrorCode(error.body) : undefined
+        window.dispatchEvent(
+          new CustomEvent('voice-synthesis-failed', {
+            detail: { slot, request_id, code: code || 'voice_synthesis_failed' },
+          }),
+        )
+        throw error
+      })
   },
   voiceCancel: (slot: string, request_id: string) =>
     post('/api/voice/cancel', { slot, request_id }).then(j),
@@ -4143,19 +5213,43 @@ export const api = {
   channelsList: () => fetch('/api/channels').then(j),
   channelPresets: () => fetch('/api/channels/presets').then(j),
   channelGet: (id: string) => fetch('/api/channels/' + encodeURIComponent(id)).then(j),
-  channelCreate: (topic: string, agents: object[], sessionOnly = false) => post(
-    '/api/channels',
-    { topic, agents, ...(sessionOnly ? { session_only: true } : {}) },
-  ).then(j),
+  channelCreate: (topic: string, agents: object[], sessionOnly = false) =>
+    post('/api/channels', { topic, agents, ...(sessionOnly ? { session_only: true } : {}) }).then(
+      j,
+    ),
   channelClose: (id: string) => del('/api/channels/' + encodeURIComponent(id)).then(j),
-  channelPost: (id: string, content: string, mention?: string | string[], thread_id?: string) => post('/api/channels/' + encodeURIComponent(id) + '/messages', { content, mention, thread_id }).then(j),
-  channelAddAgent: (id: string, agent: object) => post('/api/channels/' + encodeURIComponent(id) + '/agents', agent).then(j),
-  channelAttachSession: (id: string, slot: string) => post('/api/channels/' + encodeURIComponent(id) + '/sessions', { slot }).then(j),
-  channelUpdateAgent: (id: string, aid: string, updates: object) => patch('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid), updates).then(j),
-  channelDismissAgent: (id: string, aid: string) => del('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid)).then(j),
-  channelWakeAgent: (id: string, aid: string) => post('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid) + '/wake', {}).then(j),
-  channelApproveAgent: (id: string, aid: string, action: string, pattern?: string) => post('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid) + '/approve', pattern ? { action, pattern } : { action }).then(j),
-  channelClearContext: (id: string, scope: 'all' | 'agent', agentId?: string) => post('/api/channels/' + encodeURIComponent(id) + '/clear-context', scope === 'agent' ? { scope, agent_id: agentId } : { scope }).then(j),
+  channelPost: (id: string, content: string, mention?: string | string[], thread_id?: string) =>
+    post('/api/channels/' + encodeURIComponent(id) + '/messages', {
+      content,
+      mention,
+      thread_id,
+    }).then(j),
+  channelAddAgent: (id: string, agent: object) =>
+    post('/api/channels/' + encodeURIComponent(id) + '/agents', agent).then(j),
+  channelAttachSession: (id: string, slot: string) =>
+    post('/api/channels/' + encodeURIComponent(id) + '/sessions', { slot }).then(j),
+  channelUpdateAgent: (id: string, aid: string, updates: object) =>
+    patch(
+      '/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid),
+      updates,
+    ).then(j),
+  channelDismissAgent: (id: string, aid: string) =>
+    del('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid)).then(j),
+  channelWakeAgent: (id: string, aid: string) =>
+    post(
+      '/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid) + '/wake',
+      {},
+    ).then(j),
+  channelApproveAgent: (id: string, aid: string, action: string, pattern?: string) =>
+    post(
+      '/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid) + '/approve',
+      pattern ? { action, pattern } : { action },
+    ).then(j),
+  channelClearContext: (id: string, scope: 'all' | 'agent', agentId?: string) =>
+    post(
+      '/api/channels/' + encodeURIComponent(id) + '/clear-context',
+      scope === 'agent' ? { scope, agent_id: agentId } : { scope },
+    ).then(j),
 
   // --- Apps ---
   // Installed-app payloads are normalized HERE rather than in a queryFn. The
@@ -4164,13 +5258,22 @@ export const api = {
   // palette, the migration check), and normalizing per consumer is how the
   // fourth one gets forgotten. This is the boundary all four share.
   listApps: () => fetch('/api/apps').then(j).then(normalizeInstalledApps),
-  getApp: (name: string) => fetch('/api/apps/' + encodeURIComponent(name)).then(j).then(normalizeInstalledApp),
-  getAppManifest: (name: string) => fetch('/api/apps/' + encodeURIComponent(name) + '/manifest').then(j),
+  getApp: (name: string) =>
+    fetch('/api/apps/' + encodeURIComponent(name))
+      .then(j)
+      .then(normalizeInstalledApp),
+  getAppManifest: (name: string) =>
+    fetch('/api/apps/' + encodeURIComponent(name) + '/manifest').then(j),
   installApp: (source: string) => post('/api/apps/install', { source }).then(j),
   enableApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/enable').then(j),
   disableApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/disable').then(j),
   openApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/open').then(j),
-  uninstallApp: (name: string, keepData = true, keepDependencies?: boolean, keepSpecific?: string[]) =>
+  uninstallApp: (
+    name: string,
+    keepData = true,
+    keepDependencies?: boolean,
+    keepSpecific?: string[],
+  ) =>
     post('/api/apps/' + encodeURIComponent(name) + '/uninstall', {
       ...(keepData === false ? { purge_data: true } : {}),
       ...(keepDependencies ? { keep_dependencies: true } : {}),
@@ -4186,15 +5289,34 @@ export const api = {
         userInstalled: { id: string; type: string; reason: string }[]
       }
     }>,
-  updateApp: (name: string, source?: string) => post('/api/apps/' + encodeURIComponent(name) + '/update', source ? { source } : {}).then(j),
-  migrateCleanup: (name: string) => del('/api/apps/' + encodeURIComponent(name) + '/migrate-cleanup').then(j),
+  updateApp: (name: string, source?: string) =>
+    post('/api/apps/' + encodeURIComponent(name) + '/update', source ? { source } : {}).then(j),
+  migrateCleanup: (name: string) =>
+    del('/api/apps/' + encodeURIComponent(name) + '/migrate-cleanup').then(j),
   // apps is intentionally `any[]`: each page (AppsPage/MigrationPage/AppDetailPage)
   // narrows it to its own local RegistryApp shape at the call site. Typing it as
   // unknown[] here would break those structural assignments across files.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  listRegistry: () => fetch('/api/apps/registry').then(j) as Promise<{ apps: any[]; serverPlatform: { os: string; arch: string }; categoryOrder?: string[]; editorialSections?: unknown[] }>,
-  listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: { name: string; repo: string; branch: string; trust?: string }[]; pinned?: { name: string; repo: string; branch: string; trust?: string }[] }>,
-  updateRegistries: (registries: { name: string; repo: string; branch: string; trust?: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: { name: string; repo: string; branch: string; trust?: string }[]; newlyTrustedHosts: string[] }>,
+  listRegistry: () =>
+    fetch('/api/apps/registry').then(j) as Promise<{
+      apps: any[]
+      serverPlatform: { os: string; arch: string }
+      categoryOrder?: string[]
+      editorialSections?: unknown[]
+    }>,
+  listRegistries: () =>
+    fetch('/api/apps/registries').then(j) as Promise<{
+      registries: ExternalRegistryRow[]
+      pinned?: ExternalRegistryRow[]
+    }>,
+  updateRegistries: (
+    registries: { name: string; repo: string; branch: string; trust?: string }[],
+  ) =>
+    put('/api/apps/registries', { registries }).then(j) as Promise<{
+      ok: boolean
+      registries: ExternalRegistryRow[]
+      newlyTrustedHosts: string[]
+    }>,
   // Drops the server's on-disk caches of the published documents (catalog /
   // category order / editorial) so the NEXT listRegistry() is rebuilt from
   // fresh fetches instead of waiting out TTLs. A POST because it is a state
@@ -4203,7 +5325,15 @@ export const api = {
   // /api/apps/: that namespace grants an app named `registry` implicit
   // path ownership (token_auth._app_owns_path).
   refreshAppStore: () => post('/api/app-store/refresh').then(j) as Promise<{ ok: boolean }>,
-  refreshRegistries: (repo?: string) => post('/api/apps/registries/refresh', repo ? { repo } : {}).then(j) as Promise<{ ok: boolean; refreshed: string[]; failed: string[]; results: { name: string; ok: boolean }[]; apps: number; lastSyncedAt: string }>,
+  refreshRegistries: (repo?: string) =>
+    post('/api/apps/registries/refresh', repo ? { repo } : {}).then(j) as Promise<{
+      ok: boolean
+      refreshed: string[]
+      failed: string[]
+      results: { name: string; ok: boolean }[]
+      apps: number
+      lastSyncedAt: string
+    }>,
   installFromRegistry: (name: string) => post('/api/apps/registry/install', { name }).then(j),
   /**
    * Stream install logs via SSE.  Calls `onLog` for each line and resolves
@@ -4248,7 +5378,11 @@ export const api = {
           if (eventType === 'log') {
             onLog(data)
           } else if (eventType === 'done') {
-            try { return JSON.parse(data) } catch { return { ok: false, error: data } }
+            try {
+              return JSON.parse(data)
+            } catch {
+              return { ok: false, error: data }
+            }
           }
         }
       }
@@ -4264,7 +5398,17 @@ export const api = {
    *  ORIGINATED; `touchedBy` widens that to every artifact the session was
    *  involved with — created, read, edited, iterated on or reverted — which is
    *  what the in-session Artifacts tab lists. `pinned` filters on the star. */
-  artifacts: (filters?: { tag?: string; kind?: string; q?: string; source_path?: string; snippet?: boolean; contentMatch?: boolean; session?: string; touchedBy?: string; pinned?: boolean }) => {
+  artifacts: (filters?: {
+    tag?: string
+    kind?: string
+    q?: string
+    source_path?: string
+    snippet?: boolean
+    contentMatch?: boolean
+    session?: string
+    touchedBy?: string
+    pinned?: boolean
+  }) => {
     const params = new URLSearchParams()
     if (filters?.tag) params.set('tag', filters.tag)
     if (filters?.kind) params.set('kind', filters.kind)
@@ -4300,14 +5444,29 @@ export const api = {
    *  Rejects on a non-2xx like the other methods (notably 403 for an incognito
    *  slot, which is correct deny-by-default) — callers treat a breadcrumb as
    *  best-effort and swallow the failure rather than failing the user's click. */
-  recordArtifactReference: (slug: string, slot: string, metadata?: { message_ts?: string; widget_index?: number }) =>
+  recordArtifactReference: (
+    slug: string,
+    slot: string,
+    metadata?: { message_ts?: string; widget_index?: number },
+  ) =>
     fetch(`/api/artifacts/${encodeURIComponent(slug)}/events`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Session-Key': `dashboard:${slot}` },
       body: JSON.stringify({ type: 'referenced', ...(metadata ? { metadata } : {}) }),
     }).then(j),
   createArtifact: (
-    body: { name: string; content: string; kind?: string; source?: string; description?: string; tags?: string[]; slug?: string; source_path?: string; origin_session_key?: string; folder?: string },
+    body: {
+      name: string
+      content: string
+      kind?: string
+      source?: string
+      description?: string
+      tags?: string[]
+      slug?: string
+      source_path?: string
+      origin_session_key?: string
+      folder?: string
+    },
     // Pass the owning slot (as `dashboard:<slot>`) when the save is made on
     // behalf of a chat session, so the server's restricted-session gate sees the
     // real session instead of the shared placeholder.
@@ -4323,8 +5482,7 @@ export const api = {
     post(
       '/api/artifacts',
       body,
-      sessionKey
-        ?? (body.origin_session_key ? `dashboard:${body.origin_session_key}` : undefined),
+      sessionKey ?? (body.origin_session_key ? `dashboard:${body.origin_session_key}` : undefined),
     ).then(j),
   /** Atomically resolve a just-created blank document being left: keep it, save
    *  the draft still in the editor, or delete the abandoned shell. The store
@@ -4333,19 +5491,36 @@ export const api = {
     slug: string,
     body: { untitled_name: string; draft: string; allow_delete: boolean },
   ) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/settle`, body).then(j) as
-      Promise<{ outcome: 'kept' | 'saved' | 'deleted' }>,
-  updateArtifact: (slug: string, body: { content?: string; name?: string; kind?: string; description?: string; tags?: string[]; actor?: 'user' | 'agent'; event_type?: 'edited' | 'iterated' | 'reverted'; from_version?: number; snapshot?: boolean }) =>
-    patch(`/api/artifacts/${encodeURIComponent(slug)}`, body).then(j),
+    post(`/api/artifacts/${encodeURIComponent(slug)}/settle`, body).then(j) as Promise<{
+      outcome: 'kept' | 'saved' | 'deleted'
+    }>,
+  updateArtifact: (
+    slug: string,
+    body: {
+      content?: string
+      name?: string
+      kind?: string
+      description?: string
+      tags?: string[]
+      actor?: 'user' | 'agent'
+      event_type?: 'edited' | 'iterated' | 'reverted'
+      from_version?: number
+      snapshot?: boolean
+    },
+  ) => patch(`/api/artifacts/${encodeURIComponent(slug)}`, body).then(j),
   deleteArtifact: (slug: string) => del(`/api/artifacts/${encodeURIComponent(slug)}`).then(j),
   // Artifact library folders
   artifactFolders: () => get('/api/artifact-folders').then(j),
   createArtifactFolder: (body: { name: string; parent_id?: string; color?: string }) =>
     post('/api/artifact-folders', body).then(j),
-  updateArtifactFolder: (id: string, body: { name?: string; parent_id?: string; order?: number; icon?: string; color?: string }) =>
-    patch(`/api/artifact-folders/${encodeURIComponent(id)}`, body).then(j),
+  updateArtifactFolder: (
+    id: string,
+    body: { name?: string; parent_id?: string; order?: number; icon?: string; color?: string },
+  ) => patch(`/api/artifact-folders/${encodeURIComponent(id)}`, body).then(j),
   deleteArtifactFolder: (id: string, deleteContents: boolean) =>
-    del(`/api/artifact-folders/${encodeURIComponent(id)}?delete_contents=${deleteContents ? 'true' : 'false'}`).then(j),
+    del(
+      `/api/artifact-folders/${encodeURIComponent(id)}?delete_contents=${deleteContents ? 'true' : 'false'}`,
+    ).then(j),
   /** Move an artifact into a folder ("" = unfile to root). Metadata-only — no version bump. */
   setArtifactFolder: (slug: string, folderId: string) =>
     patch(`/api/artifacts/${encodeURIComponent(slug)}/folder`, { folder_id: folderId }).then(j),
@@ -4359,28 +5534,48 @@ export const api = {
   /** Virtual list of non-code documents from chat sessions. Pass `session`
    * (a slot key) to scope to a single session. */
   artifactSessionDocs: (session?: string) =>
-    get(`/api/artifacts/session-docs${session ? `?session=${encodeURIComponent(session)}` : ''}`).then(j) as Promise<{ docs: SessionDoc[] }>,
+    get(
+      `/api/artifacts/session-docs${session ? `?session=${encodeURIComponent(session)}` : ''}`,
+    ).then(j) as Promise<{ docs: SessionDoc[] }>,
   /** Turn a session document path into a real, saved (pinned) file-backed artifact.
    * `originSessionKey` records the saving session; `slug_collided_with` names the plain slug, present only when the store had to suffix it. */
   materializeArtifact: (path: string, originSessionKey?: string) =>
-    post('/api/artifacts/materialize', { path, ...(originSessionKey ? { origin_session_key: originSessionKey } : {}) }).then(j) as Promise<{ slug: string; slug_collided_with?: string }>,
+    post('/api/artifacts/materialize', {
+      path,
+      ...(originSessionKey ? { origin_session_key: originSessionKey } : {}),
+    }).then(j) as Promise<{ slug: string; slug_collided_with?: string }>,
   // Artifact publishing / sharing. Local publish/sharing management
   // only — remote-browse / clone / fork surfaces are not part of this edition.
-  publishArtifact: (slug: string, body: { visibility?: 'PRIVATE' | 'SHARED' | 'PUBLIC'; shared_with?: string[]; provider?: string }) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/publish`, body).then(j),
+  publishArtifact: (
+    slug: string,
+    body: {
+      visibility?: 'PRIVATE' | 'SHARED' | 'PUBLIC'
+      shared_with?: string[]
+      provider?: string
+    },
+  ) => post(`/api/artifacts/${encodeURIComponent(slug)}/publish`, body).then(j),
   /** Publishing providers available for an artifact kind, with per-kind support
    *  + sharing/sync/discovery descriptors. Drives the share-panel
    *  picker (selector shown only when >1 capable provider). */
-  getArtifactPublishProviders: (kind: string): Promise<{ providers: PublishProviderDescriptor[]; kind: string }> =>
+  getArtifactPublishProviders: (
+    kind: string,
+  ): Promise<{ providers: PublishProviderDescriptor[]; kind: string }> =>
     get(`/api/artifacts/publish-providers?kind=${encodeURIComponent(kind)}`).then(j),
   /** Provider-routed clone/fork of a remote artifact into the local store.
    *  external_id travels in the body (not the path) — provider-native ids can
    *  contain "/", which a path segment can't carry. */
   cloneRemoteArtifact: (provider: string, externalId: string) =>
-    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/clone`, { external_id: externalId }).then(j),
+    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/clone`, {
+      external_id: externalId,
+    }).then(j),
   forkRemoteArtifact: (provider: string, externalId: string) =>
-    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/fork`, { external_id: externalId }).then(j),
-  browseRemoteArtifacts: (provider: string, opts?: { scope?: string; q?: string; pageToken?: string }) =>
+    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/fork`, {
+      external_id: externalId,
+    }).then(j),
+  browseRemoteArtifacts: (
+    provider: string,
+    opts?: { scope?: string; q?: string; pageToken?: string },
+  ) =>
     get(
       `/api/remote-artifacts/${encodeURIComponent(provider)}/browse` +
         `?scope=${encodeURIComponent(opts?.scope ?? 'mine')}` +
@@ -4391,24 +5586,51 @@ export const api = {
   // powering the remote-artifact detail page's viewer. external_id can contain
   // "/", so it is percent-encoded into the path segment.
   remoteArtifactDetail: (provider: string, externalId: string) =>
-    get(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}`).then(j),
+    get(
+      `/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}`,
+    ).then(j),
   // Remote artifact comments (view-without-fork): these write straight through
   // to the provider (scope=shared) and are TTL-cached server-side. external_id
   // + comment_id travel in the path, percent-encoded (provider-native ids may
   // contain "/").
   remoteArtifactComments: (provider: string, externalId: string) =>
-    get(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments`).then(j),
-  postRemoteArtifactComment: (provider: string, externalId: string, body: { text: string; anchor?: object }) =>
-    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments`, body).then(j),
-  replyRemoteArtifactComment: (provider: string, externalId: string, commentId: string, body: { text: string }) =>
-    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments/${encodeURIComponent(commentId)}/reply`, body).then(j),
+    get(
+      `/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments`,
+    ).then(j),
+  postRemoteArtifactComment: (
+    provider: string,
+    externalId: string,
+    body: { text: string; anchor?: object },
+  ) =>
+    post(
+      `/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments`,
+      body,
+    ).then(j),
+  replyRemoteArtifactComment: (
+    provider: string,
+    externalId: string,
+    commentId: string,
+    body: { text: string },
+  ) =>
+    post(
+      `/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments/${encodeURIComponent(commentId)}/reply`,
+      body,
+    ).then(j),
   markReviewRemoteComment: (provider: string, externalId: string, commentId: string) =>
-    post(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments/${encodeURIComponent(commentId)}/review`, {}).then(j),
+    post(
+      `/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments/${encodeURIComponent(commentId)}/review`,
+      {},
+    ).then(j),
   deleteRemoteComment: (provider: string, externalId: string, commentId: string) =>
-    del(`/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments/${encodeURIComponent(commentId)}`).then(j),
-  updateArtifactSharing: (slug: string, body: { visibility: 'PRIVATE' | 'SHARED' | 'PUBLIC'; shared_with?: string[] }) =>
-    patch(`/api/artifacts/${encodeURIComponent(slug)}/sharing`, body).then(j),
-  unpublishArtifact: (slug: string) => del(`/api/artifacts/${encodeURIComponent(slug)}/publish`).then(j),
+    del(
+      `/api/remote-artifacts/${encodeURIComponent(provider)}/${encodeURIComponent(externalId)}/comments/${encodeURIComponent(commentId)}`,
+    ).then(j),
+  updateArtifactSharing: (
+    slug: string,
+    body: { visibility: 'PRIVATE' | 'SHARED' | 'PUBLIC'; shared_with?: string[] },
+  ) => patch(`/api/artifacts/${encodeURIComponent(slug)}/sharing`, body).then(j),
+  unpublishArtifact: (slug: string) =>
+    del(`/api/artifacts/${encodeURIComponent(slug)}/publish`).then(j),
   /** Re-check a published artifact's destination and clear a notice that no longer holds.
    *
    *  A publish notice ("still rolling out", "delivery network disabled") is recorded once,
@@ -4430,7 +5652,8 @@ export const api = {
    */
   sandboxDocUrl: (html: string) =>
     post('/api/sandbox-doc', { html }).then(j) as Promise<{ url: string }>,
-  refreshArtifactSharing: (slug: string) => post(`/api/artifacts/${encodeURIComponent(slug)}/publish/refresh`, {}).then(j),
+  refreshArtifactSharing: (slug: string) =>
+    post(`/api/artifacts/${encodeURIComponent(slug)}/publish/refresh`, {}).then(j),
   pullLatest: (slug: string) =>
     post(`/api/artifacts/${encodeURIComponent(slug)}/pull-latest`, {}).then(j),
   upstreamStatus: (slug: string) =>
@@ -4440,26 +5663,51 @@ export const api = {
   // Artifact comments (durable, local per-slug store)
   artifactComments: (slug: string) =>
     get(`/api/artifacts/${encodeURIComponent(slug)}/comments`).then(j),
-  postArtifactComment: (slug: string, body: { text: string; scope?: string; anchor?: object; is_agent?: boolean; author?: string }) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/comments`, body).then(j),
-  replyArtifactComment: (slug: string, commentId: string, body: { text: string; is_agent?: boolean; author?: string }) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/reply`, body).then(j),
+  postArtifactComment: (
+    slug: string,
+    body: { text: string; scope?: string; anchor?: object; is_agent?: boolean; author?: string },
+  ) => post(`/api/artifacts/${encodeURIComponent(slug)}/comments`, body).then(j),
+  replyArtifactComment: (
+    slug: string,
+    commentId: string,
+    body: { text: string; is_agent?: boolean; author?: string },
+  ) =>
+    post(
+      `/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/reply`,
+      body,
+    ).then(j),
   markCommentReview: (slug: string, commentId: string) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/review`, {}).then(j),
+    post(
+      `/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/review`,
+      {},
+    ).then(j),
   resolveComment: (slug: string, commentId: string) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/resolve`, {}).then(j),
+    post(
+      `/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/resolve`,
+      {},
+    ).then(j),
   reopenComment: (slug: string, commentId: string) =>
-    post(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/reopen`, {}).then(j),
+    post(
+      `/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}/reopen`,
+      {},
+    ).then(j),
   deleteArtifactComment: (slug: string, commentId: string) =>
-    del(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}`).then(j),
+    del(
+      `/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}`,
+    ).then(j),
   editArtifactComment: (slug: string, commentId: string, body: { text: string }) =>
-    patch(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}`, body).then(j),
+    patch(
+      `/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}`,
+      body,
+    ).then(j),
   // Playwright CLI browser view. GET reports; POST /start is idempotent and
   // returns the SAME shape, so a start needs no follow-up read.
   getBrowserInstall: () => get('/api/browser/install').then(j) as Promise<BrowserInstallData>,
-  setBrowserToken: (token: string) => put('/api/browser/token', { token }).then(j) as Promise<{ok: boolean; token: boolean}>,
+  setBrowserToken: (token: string) =>
+    put('/api/browser/token', { token }).then(j) as Promise<{ ok: boolean; token: boolean }>,
   installBrowserCli: () => post('/api/browser/install', {}).then(j) as Promise<BrowserInstallData>,
-  installBrowserEngine: (engine: string) => post('/api/browser/engine', { engine }).then(j) as Promise<BrowserInstallData>,
+  installBrowserEngine: (engine: string) =>
+    post('/api/browser/engine', { engine }).then(j) as Promise<BrowserInstallData>,
   getBrowserView: () => get('/api/browser/view').then(j) as Promise<BrowserViewData>,
   startBrowserView: () => post('/api/browser/view/start', {}).then(j) as Promise<BrowserViewData>,
   // The address bar's launcher: opens an owner-typed URL in the gateway host's
@@ -4469,68 +5717,144 @@ export const api = {
     post('/api/browser/open', { url, session_key: sessionKey }).then(j) as Promise<BrowserOpenData>,
   // Computer use (desktop automation). The PUT returns the refreshed snapshot so
   // the panel re-renders from server truth rather than its optimistic guess.
-  getComputerUseConfig: () => get('/api/computer-use/config').then(j) as Promise<ComputerUseConfigData>,
+  getComputerUseConfig: () =>
+    get('/api/computer-use/config').then(j) as Promise<ComputerUseConfigData>,
   saveComputerUseConfig: (body: Partial<ComputerUseConfigSave>) =>
     put('/api/computer-use/config', body).then(j) as Promise<ComputerUseConfigData>,
   // Slack integration config
   getSlackConfig: () => get('/api/slack/config').then(j) as Promise<SlackConfigData>,
-  getSlackManifest: () => get('/api/slack/manifest').then(j) as Promise<{ alias: string; manifest: string; create_url: string }>,
-  saveSlackConfig: (body: Partial<SlackConfigSave>) => put('/api/slack/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
+  getSlackManifest: () =>
+    get('/api/slack/manifest').then(j) as Promise<{
+      alias: string
+      manifest: string
+      create_url: string
+    }>,
+  saveSlackConfig: (body: Partial<SlackConfigSave>) =>
+    put('/api/slack/config', body).then(j) as Promise<{
+      ok: boolean
+      restart_required: boolean
+      verify_warning: string
+    }>,
   // Discord integration config
   getDiscordConfig: () => get('/api/discord/config').then(j) as Promise<DiscordConfigData>,
-  saveDiscordConfig: (body: Partial<DiscordConfigSave>) => put('/api/discord/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
+  saveDiscordConfig: (body: Partial<DiscordConfigSave>) =>
+    put('/api/discord/config', body).then(j) as Promise<{
+      ok: boolean
+      restart_required: boolean
+      verify_warning: string
+    }>,
   // Telegram integration config
   getTelegramConfig: () => get('/api/telegram/config').then(j) as Promise<TelegramConfigData>,
-  saveTelegramConfig: (body: Partial<TelegramConfigSave>) => put('/api/telegram/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
+  saveTelegramConfig: (body: Partial<TelegramConfigSave>) =>
+    put('/api/telegram/config', body).then(j) as Promise<{
+      ok: boolean
+      restart_required: boolean
+      verify_warning: string
+    }>,
   getWeComConfig: () => get('/api/wecom/config').then(j) as Promise<WeComConfigData>,
   getFeishuConfig: () => get('/api/feishu/config').then(j) as Promise<FeishuConfigData>,
-  saveFeishuConfig: (body: Partial<FeishuConfigSave>) => put('/api/feishu/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
-  saveWeComConfig: (body: Partial<WeComConfigSave>) => put('/api/wecom/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
+  saveFeishuConfig: (body: Partial<FeishuConfigSave>) =>
+    put('/api/feishu/config', body).then(j) as Promise<{
+      ok: boolean
+      restart_required: boolean
+      verify_warning: string
+    }>,
+  saveWeComConfig: (body: Partial<WeComConfigSave>) =>
+    put('/api/wecom/config', body).then(j) as Promise<{
+      ok: boolean
+      restart_required: boolean
+      verify_warning: string
+    }>,
   // Webex integration config
   getWebexConfig: () => get('/api/webex/config').then(j) as Promise<WebexConfigData>,
-  saveWebexConfig: (body: Partial<WebexConfigSave>) => put('/api/webex/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
+  saveWebexConfig: (body: Partial<WebexConfigSave>) =>
+    put('/api/webex/config', body).then(j) as Promise<{
+      ok: boolean
+      restart_required: boolean
+      verify_warning: string
+    }>,
   // iMessage — no credential to send or mask; the transport is the operator's
   // own Messages.app on this machine.
   getIMessageConfig: () => get('/api/imessage/config').then(j) as Promise<IMessageConfigData>,
-  saveIMessageConfig: (body: Partial<IMessageConfigSave>) => put('/api/imessage/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
+  saveIMessageConfig: (body: Partial<IMessageConfigSave>) =>
+    put('/api/imessage/config', body).then(j) as Promise<{
+      ok: boolean
+      restart_required: boolean
+      verify_warning: string
+    }>,
   // Effective per-channel governance policy decision: { slack: true, discord: false, ... }
   // (true = permitted, false = denied by the `channels` policy, null = governance
   // evaluation transiently failed → shown as "unavailable", NOT "Off by admin").
   // All-true when no policy governs channels (standard build). Drives the Settings
   // channel-tab "Off by admin" greying — the editable panel is replaced by a
   // disabled/unavailable state.
-  getGovernanceChannels: () => get('/api/governance/channels').then(j) as Promise<Record<string, boolean | null>>,
+  getGovernanceChannels: () =>
+    get('/api/governance/channels').then(j) as Promise<Record<string, boolean | null>>,
   getTeamsConfig: () => get('/api/teams/config').then(j) as Promise<TeamsConfigData>,
-  saveTeamsConfig: (body: Partial<TeamsConfigSave>) => put('/api/teams/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
+  saveTeamsConfig: (body: Partial<TeamsConfigSave>) =>
+    put('/api/teams/config', body).then(j) as Promise<{
+      ok: boolean
+      restart_required: boolean
+      verify_warning: string
+    }>,
   // Weixin (iLink personal WeChat) — QR login flow. The bot credential is
   // written server-side; the client only ever sees connection status.
   getWeixinConfig: () => get('/api/weixin/config').then(j) as Promise<WeixinConfigData>,
-  saveWeixinConfig: (body: Partial<WeixinConfigSave>) => put('/api/weixin/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean }>,
-  weixinQrStart: () => post('/api/channels/weixin/qr/start', {}).then(j) as Promise<{ session_id: string; qrcode_img_content: string; error?: string }>,
-  weixinQrStatus: (sessionId: string) => get(`/api/channels/weixin/qr/status?session_id=${encodeURIComponent(sessionId)}`).then(j) as Promise<{ status: string; connected?: boolean; account_id?: string; error?: string }>,
+  saveWeixinConfig: (body: Partial<WeixinConfigSave>) =>
+    put('/api/weixin/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean }>,
+  weixinQrStart: () =>
+    post('/api/channels/weixin/qr/start', {}).then(j) as Promise<{
+      session_id: string
+      qrcode_img_content: string
+      error?: string
+    }>,
+  weixinQrStatus: (sessionId: string) =>
+    get(`/api/channels/weixin/qr/status?session_id=${encodeURIComponent(sessionId)}`).then(
+      j,
+    ) as Promise<{ status: string; connected?: boolean; account_id?: string; error?: string }>,
 
   // WhatsApp (personal account, QR-paired via neonize) — QR pairing flow. The
   // session lives server-side in the neonize SQLite store; the client only ever
   // sees connection status + policy, never a credential.
   getWhatsAppConfig: () => get('/api/whatsapp/config').then(j) as Promise<WhatsAppConfigData>,
-  saveWhatsAppConfig: (body: Partial<WhatsAppConfigSave>) => put('/api/whatsapp/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean }>,
+  saveWhatsAppConfig: (body: Partial<WhatsAppConfigSave>) =>
+    put('/api/whatsapp/config', body).then(j) as Promise<{
+      ok: boolean
+      restart_required: boolean
+    }>,
   // `state` is the live client's pairing state, and it is the only authority on
   // whether a rotating code exists: the endpoint REPORTS pairing rather than
   // starting it (pairing begins inside the channel's own connect()), so a caller
   // that ignores this field renders a wait for a code that will never arrive.
-  whatsAppQrStart: () => post('/api/channels/whatsapp/qr/start', {}).then(j) as Promise<{ ok: boolean; state?: string; error?: string }>,
-  whatsAppQrStatus: () => get('/api/channels/whatsapp/qr/status').then(j) as Promise<{ state: string; qr_data_url: string | null; detail: string }>,
+  whatsAppQrStart: () =>
+    post('/api/channels/whatsapp/qr/start', {}).then(j) as Promise<{
+      ok: boolean
+      state?: string
+      error?: string
+    }>,
+  whatsAppQrStatus: () =>
+    get('/api/channels/whatsapp/qr/status').then(j) as Promise<{
+      state: string
+      qr_data_url: string | null
+      detail: string
+    }>,
   // Two distinguishable successes: a bare `ok` means the device is unlinked and
   // the local session is gone, while `code: 'session_file_kept'` means the device
   // IS unlinked but the store holding its keys survived. A refused logout is an
   // ApiError(502) carrying `code: 'logout_failed'`, the device is still linked
   // there, and the session is kept deliberately so a retry is possible.
-  whatsAppUnlink: () => post('/api/channels/whatsapp/unlink', {}).then(j) as Promise<{ ok: boolean; warning?: string; code?: string }>,
-  getWhatsAppGroups: () => get('/api/whatsapp/groups').then(j) as Promise<{ groups: { jid: string; name: string }[] }>,
+  whatsAppUnlink: () =>
+    post('/api/channels/whatsapp/unlink', {}).then(j) as Promise<{
+      ok: boolean
+      warning?: string
+      code?: string
+    }>,
+  getWhatsAppGroups: () =>
+    get('/api/whatsapp/groups').then(j) as Promise<{ groups: { jid: string; name: string }[] }>,
 
   // Auto-research
-  researchValidate: (body: object) => post("/api/apps/auto-research/validate", body).then(j),
-  researchGrillExpand: (body: object) => post("/api/apps/auto-research/grill/expand", body).then(j),
+  researchValidate: (body: object) => post('/api/apps/auto-research/validate', body).then(j),
+  researchGrillExpand: (body: object) => post('/api/apps/auto-research/grill/expand', body).then(j),
   /**
    * GET an app's declared per-session status route.
    *
@@ -4575,19 +5899,28 @@ export const api = {
       : '/api/apps/' + encodeURIComponent(appName) + '/'
     return get(base + statusPath + (qs ? '?' + qs : '')).then(j)
   },
-  researchCampaigns: () => get("/api/apps/auto-research/campaigns").then(j),
-  researchCampaign: (id: string) => get("/api/apps/auto-research/campaigns/" + id).then(j),
-  researchCreate: (body: object) => post("/api/apps/auto-research/campaigns", body).then(j),
-  researchAction: (id: string, action: string, body?: object) => patch("/api/apps/auto-research/campaigns/" + id, { action, ...body }).then(j),
-  researchGrillTree: (id: string) => get("/api/apps/auto-research/campaigns/" + id + "/grill-tree").then(j),
-  researchNudge: (id: string, text: string) => post("/api/apps/auto-research/campaigns/" + id + "/nudge", { text }).then(j),
-  researchAddQuestion: (id: string, text: string) => post("/api/apps/auto-research/campaigns/" + id + "/questions", { text }).then(j),
-  researchToKnowledge: (id: string) => post("/api/apps/auto-research/campaigns/" + id + "/to-knowledge", {}).then(j),
-  researchKnowledgeStatus: (id: string) => get("/api/apps/auto-research/campaigns/" + id + "/knowledge-status").then(j),
-  researchToArtifact: (id: string) => post("/api/apps/auto-research/campaigns/" + id + "/to-artifact", {}).then(j),
-  researchReportStatus: (id: string) => get("/api/apps/auto-research/campaigns/" + id + "/report-status").then(j),
-  researchReport: (id: string) => get("/api/apps/auto-research/campaigns/" + id + "/report").then(j),
-  researchDelete: (id: string) => del("/api/apps/auto-research/campaigns/" + id).then(j),
+  researchCampaigns: () => get('/api/apps/auto-research/campaigns').then(j),
+  researchCampaign: (id: string) => get('/api/apps/auto-research/campaigns/' + id).then(j),
+  researchCreate: (body: object) => post('/api/apps/auto-research/campaigns', body).then(j),
+  researchAction: (id: string, action: string, body?: object) =>
+    patch('/api/apps/auto-research/campaigns/' + id, { action, ...body }).then(j),
+  researchGrillTree: (id: string) =>
+    get('/api/apps/auto-research/campaigns/' + id + '/grill-tree').then(j),
+  researchNudge: (id: string, text: string) =>
+    post('/api/apps/auto-research/campaigns/' + id + '/nudge', { text }).then(j),
+  researchAddQuestion: (id: string, text: string) =>
+    post('/api/apps/auto-research/campaigns/' + id + '/questions', { text }).then(j),
+  researchToKnowledge: (id: string) =>
+    post('/api/apps/auto-research/campaigns/' + id + '/to-knowledge', {}).then(j),
+  researchKnowledgeStatus: (id: string) =>
+    get('/api/apps/auto-research/campaigns/' + id + '/knowledge-status').then(j),
+  researchToArtifact: (id: string) =>
+    post('/api/apps/auto-research/campaigns/' + id + '/to-artifact', {}).then(j),
+  researchReportStatus: (id: string) =>
+    get('/api/apps/auto-research/campaigns/' + id + '/report-status').then(j),
+  researchReport: (id: string) =>
+    get('/api/apps/auto-research/campaigns/' + id + '/report').then(j),
+  researchDelete: (id: string) => del('/api/apps/auto-research/campaigns/' + id).then(j),
 
   // Activate a file-menu row an installed app contributed. The declarations ride on
   // `GET /api/apps` (see `fileMenuContributions.ts`) rather than an endpoint of their
@@ -4610,15 +5943,26 @@ export const api = {
     ctx: FileMenuContext,
     sessionKey?: string,
   ) => {
-    const r = await post(item.endpoint, { item_id: item.id, ...ctx }, sessionKey, undefined, 'error')
+    const r = await post(
+      item.endpoint,
+      { item_id: item.id, ...ctx },
+      sessionKey,
+      undefined,
+      'error',
+    )
     checkSessionExpired(r)
-    if (r.ok) { removeAuthBanner(); return r.json() }
+    if (r.ok) {
+      removeAuthBanner()
+      return r.json()
+    }
     const errText = await r.text()
     throw new ApiError(r.status, errText || `HTTP ${r.status}`)
   },
 
-  artifactTeardown: (slug: string) => post(`/api/deploy/teardown/${slug}`, { confirm: true }).then(j),
-  publishProviders: () => get('/api/publish-providers').then(j) as Promise<{ providers: AppPublishProvider[] }>,
+  artifactTeardown: (slug: string) =>
+    post(`/api/deploy/teardown/${slug}`, { confirm: true }).then(j),
+  publishProviders: () =>
+    get('/api/publish-providers').then(j) as Promise<{ providers: AppPublishProvider[] }>,
   /** Publish through a CORE-registry destination, resolved by its registry name.
    *  Separate from `publishToProvider` on purpose: that one routes at an app's declared
    *  endpoint and falls back to `/api/deploy/deploy`, which is per-artifact deploy
@@ -4630,8 +5974,13 @@ export const api = {
       provider: providerName,
     })
     checkSessionExpired(r)
-    if (r.ok) { removeAuthBanner(); return r.json() }
-    if (r.status === 409) { return r.json() }
+    if (r.ok) {
+      removeAuthBanner()
+      return r.json()
+    }
+    if (r.status === 409) {
+      return r.json()
+    }
     // Parse before surfacing. The body is JSON, so returning its raw text put
     // `{"error": "No AWS account is registered yet..."}` verbatim in the error line --
     // the provider's carefully worded remedy delivered wrapped in syntax.
@@ -4644,27 +5993,63 @@ export const api = {
       return { error: text }
     }
   },
-  publishToProvider: async (slug: string, providerId: string, provider?: AppPublishProvider, ttlHours?: number) => {
+  publishToProvider: async (
+    slug: string,
+    providerId: string,
+    provider?: AppPublishProvider,
+    ttlHours?: number,
+  ) => {
     // Route to the provider's declared endpoint with the payload shape
     // that _do_deploy expects (site_id + artifact_slug). ttl_hours is sent on
     // BOTH preview and confirm so the previewed TTL matches what is deployed
     // (omitting it here makes preview use the backend 72h default).
     const endpoint = provider?.endpoint || '/api/deploy/deploy'
-    const payload: Record<string, unknown> = { site_id: slug, artifact_slug: slug, provider_id: providerId }
+    const payload: Record<string, unknown> = {
+      site_id: slug,
+      artifact_slug: slug,
+      provider_id: providerId,
+    }
     if (ttlHours !== undefined) payload.ttl_hours = ttlHours
     const r = await post(endpoint, payload)
     checkSessionExpired(r)
-    if (r.ok) { removeAuthBanner(); return r.json() }
+    if (r.ok) {
+      removeAuthBanner()
+      return r.json()
+    }
     // 409 = scan blocked — parse body so PublishHub can render findings panel
-    if (r.status === 409) { return r.json() }
+    if (r.status === 409) {
+      return r.json()
+    }
     const errText = await r.text()
     throw new ApiError(r.status, errText || `HTTP ${r.status}`)
   },
 
   // Tips
-  tipsNext: () => get('/api/tips/next').then(jNullable) as Promise<{ tip: { id: string; feature: string; title: string; body: string; why: string; doc: string; doc_link?: string; cta_prompt: string; action?: { kind: 'route'; label: string; route: string } | null } | null; glow: boolean } | null>,
-  tipsStatus: () => get('/api/tips/status').then(j) as Promise<{ enabled_config: boolean; opted_out: boolean; cadence_hours: number }>,
-  tipsFeedback: (id: string, action: 'shown' | 'ack' | 'dismiss' | 'snooze' | 'helpful' | 'optout' | 'optin') => post('/api/tips/feedback', { id, action }).then(j),
+  tipsNext: () =>
+    get('/api/tips/next').then(jNullable) as Promise<{
+      tip: {
+        id: string
+        feature: string
+        title: string
+        body: string
+        why: string
+        doc: string
+        doc_link?: string
+        cta_prompt: string
+        action?: { kind: 'route'; label: string; route: string } | null
+      } | null
+      glow: boolean
+    } | null>,
+  tipsStatus: () =>
+    get('/api/tips/status').then(j) as Promise<{
+      enabled_config: boolean
+      opted_out: boolean
+      cadence_hours: number
+    }>,
+  tipsFeedback: (
+    id: string,
+    action: 'shown' | 'ack' | 'dismiss' | 'snooze' | 'helpful' | 'optout' | 'optin',
+  ) => post('/api/tips/feedback', { id, action }).then(j),
 }
 
 export interface AppPublishProvider {

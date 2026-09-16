@@ -4,7 +4,7 @@
  * from chat can keep an obsolete visual snapshot indefinitely.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, waitFor } from '@testing-library/react'
+import { act, render, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
@@ -83,4 +83,33 @@ describe('MarkdownPanel live file refresh', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(onRefresh).not.toHaveBeenCalled()
   })
+  it('preserves edits made while the activation read is in flight', async () => {
+    let finishRead!: (response: Response) => void
+    const read = new Promise<Response>(resolve => { finishRead = resolve })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() => read.then(response => response.clone()))
+    const onDiskContent = vi.fn()
+    const props = {
+      embedded: true,
+      filePath: '/workspace/notes.md',
+      content: 'on disk',
+      savedBaseline: 'on disk',
+      onContentChange: vi.fn(),
+      onDiskContent,
+      onSave: async () => {},
+      onClose: () => {},
+      liveWatch: true,
+      isTabActive: true,
+    }
+    try {
+      const { rerender } = render(<MarkdownPanel {...props} />, { wrapper })
+      await waitFor(() => expect(fetchSpy).toHaveBeenCalled())
+      rerender(<MarkdownPanel {...props} content="unsaved edit" />)
+      await act(async () => { finishRead(new Response('new disk content')); await read })
+      expect(onDiskContent).not.toHaveBeenCalled()
+      expect(props.onContentChange).not.toHaveBeenCalled()
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+
 })

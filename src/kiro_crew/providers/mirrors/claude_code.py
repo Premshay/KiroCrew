@@ -266,4 +266,7 @@ class ClaudeCodeMirror(AgentConfigMirror):
                 )
                 continue
             out.append(dict(stub))
-        return SessionProjection(params={"mcpServers": out})
+        return SessionProjection(
+            params={"mcpServers": out},
+            derived_spec_snapshot=projection.derived_spec_snapshot,
+        )

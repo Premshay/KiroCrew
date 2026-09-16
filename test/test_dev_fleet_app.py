@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -1012,6 +1013,94 @@ def _install_step(steps):
     raise AssertionError("no 'pip install' step found in the step list")
 
 
+def _reap_cleanup_paths(cleanup_paths) -> None:
+    """Remove what the sync registered for the run's cleanup, in order.
+
+    Mirrors the real run's cleanup loop: unlink each entry and fall back to
+    rmdir, which only succeeds once the directory is empty -- so the order the
+    sync registered them in (files before their directory) is what makes the
+    directory go too.
+    """
+    for path in cleanup_paths or []:
+        try:
+            os.unlink(path)
+        except OSError:
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
+
+
+def _start_run_stub(rid: str) -> AsyncMock:
+    """A stand-in for ``_start_run`` that still honours ``cleanup_paths``.
+
+    The sync stages its runner snapshot, steps file and preflight snapshot into
+    private mkdtemp directories and hands them to ``_start_run`` for removal
+    when the run ends. A bare ``AsyncMock`` swallows that kwarg, so every sync
+    driven through one leaves those directories behind in the temp root. Use
+    this in any test that does not need to read the staged files afterwards;
+    a test that does must reap them itself once it has read them.
+    """
+
+    def _run(label, cmd, **kw):
+        _reap_cleanup_paths(kw.get("cleanup_paths"))
+        return rid
+
+    return AsyncMock(side_effect=_run)
+
+
+#: Temp-directory prefixes the dev-fleet sync stages and ``_start_run``'s finally owns.
+_STAGED_SYNC_PREFIXES = (
+    "kirocrew-sync-runner-",
+    "kirocrew-npm-preflight-",
+    "kirocrew-dep-sync-",
+)
+
+
+@pytest.fixture(autouse=True)
+def _sweep_staged_sync_tempdirs():
+    """Backstop for sync snapshots left by a test that stubbed ``_start_run`` itself.
+
+    ``_sync_start_locked`` stages three kinds of snapshot into the temp root -- the
+    runner source plus its steps JSON, the npm preflight, and the dependency-only
+    ``dep_sync`` copy -- and registers each one in the ``cleanup_paths`` list that
+    ``runtime._start_run``'s ``finally`` unlinks. Stubbing ``_start_run`` stubs out
+    the ONLY cleanup.
+
+    Two mechanisms cover that, and this is the second. :func:`_start_run_stub` is
+    the exact one and is preferred: it honours ``cleanup_paths``, so it removes
+    precisely what the sync registered. It is only usable where the test does not
+    need the staged files AFTER the call, and several tests here read the steps JSON
+    out of the staged directory, so they must keep it alive across the stubbed run.
+    Those reach the leak through their own inline ``AsyncMock``, and a per-test call
+    they must each remember is how this came back: MEASURED with
+    ``KIROCREW_TMP_PER_TEST=1``, eleven directories outlived one run of this file,
+    named after six tests.
+
+    Sweeping is sound HERE in a way a general temp sweep is not (see the residue
+    rules in testing-conventions): it runs after the test has finished reading, it is
+    confined to THIS run's own redirected temp base, it matches only prefixes this app
+    owns, and it removes only entries absent before the test -- so a concurrent run's
+    directory, which lives under its own base, can never be a candidate.
+    """
+    base = Path(tempfile.gettempdir())
+
+    def staged() -> set[Path]:
+        try:
+            return {
+                p
+                for p in base.iterdir()
+                if p.is_dir() and p.name.startswith(_STAGED_SYNC_PREFIXES)
+            }
+        except OSError:
+            return set()
+
+    before = staged()
+    yield
+    for path in staged() - before:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def _cleanup_sync_tempdirs(mock_start):
     """Delete the snapshot dirs a stubbed _start_run would have cleaned up.
 
@@ -1022,14 +1111,7 @@ def _cleanup_sync_tempdirs(mock_start):
     """
     if not getattr(mock_start, "call_args", None):
         return
-    for path in mock_start.call_args.kwargs.get("cleanup_paths") or []:
-        try:
-            os.unlink(path)
-        except OSError:
-            try:
-                os.rmdir(path)
-            except OSError:
-                pass
+    _reap_cleanup_paths(mock_start.call_args.kwargs.get("cleanup_paths"))
 
 
 #: The main checkout the sync tests run against. Pinned rather than ambient so the
@@ -3409,7 +3491,7 @@ def test_audited_decorator_applied_to_mutations():
         "api_dev_fleet_pod_down", "api_dev_fleet_pod_restart",
         "api_dev_fleet_pod_token", "api_dev_fleet_pod_provision",
         "api_dev_fleet_pod_provision_dismiss",
-        "api_dev_fleet_rebase", "api_dev_fleet_restart_gateway",
+        "api_dev_fleet_rebase",
     ]:
         fn = getattr(mod, name)
         # _audited wraps with __name__ preserved
@@ -3429,7 +3511,10 @@ def test_create_app_returns_aiohttp_application():
     assert "/health" in routes
     assert "/api/fleet" in routes
     assert "/api/sync" in routes
-    assert "/api/restart-gateway" in routes
+    # Served by the GATEWAY process now (gateway_routes.py): the pointer they touch
+    # is masked from this backend and every child it spawns.
+    assert "/api/restart-gateway" not in routes
+    assert "/api/make-live" not in routes
 
 
 def test_main_bootstraps_platform_before_creating_app(monkeypatch):
@@ -3618,9 +3703,14 @@ async def test_restart_gateway_active_detached():
 
 @pytest.mark.asyncio
 async def test_restart_gateway_audited():
-    """The restart-gateway endpoint is wrapped by _audited."""
+    """The restart-gateway endpoint lives in the gateway route module and is a coroutine
+    (the backend does not expose it — see gateway_routes.py)."""
     import inspect
-    fn = mod.api_dev_fleet_restart_gateway
+
+    from kiro_crew.apps.builtins.dev_fleet import gateway_routes
+
+    assert not hasattr(mod, "api_dev_fleet_restart_gateway")
+    fn = gateway_routes.handle_restart_gateway
     assert callable(fn) and inspect.iscoroutinefunction(fn)
 
 
@@ -3870,9 +3960,15 @@ async def test_make_live_real_cutover_writes_pointer(monkeypatch, tmp_path):
     the pointer at all.
     """
     wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    previous = _mk_make_live_wt(tmp_path / "previous", venv=True, dist=True)
     ptr_dir = tmp_path / "ptr"
     dropin = tmp_path / "dropins" / "make-live.conf"
-    _stub_make_live(monkeypatch, wt, pointer_dir=ptr_dir)
+    _stub_make_live(
+        monkeypatch,
+        wt,
+        live=str(previous.resolve()),
+        pointer_dir=ptr_dir,
+    )
     monkeypatch.setattr(live_mod, "_dropin_path", lambda: dropin)
     monkeypatch.setattr(live_mod, "_LIVE_WORKTREE", "sentinel", raising=False)
     monkeypatch.setattr(live_mod, "_LIVE_CHECK_AT", 123.0, raising=False)
@@ -3892,6 +3988,7 @@ async def test_make_live_real_cutover_writes_pointer(monkeypatch, tmp_path):
     import json as _json
     data = _json.loads(ptr_file.read_text())
     assert Path(data["checkout"]).resolve() == wt.resolve()
+    assert Path(data["previous_checkout"]).resolve() == previous.resolve()
     # Service definition restaged at the SAME target, then re-read.
     assert dropin.is_file()
     assert str(wt) in dropin.read_text(encoding="utf-8")
@@ -3903,6 +4000,87 @@ async def test_make_live_real_cutover_writes_pointer(monkeypatch, tmp_path):
     # Live-worktree cache invalidated so the next poll re-resolves.
     assert mod._LIVE_WORKTREE is None
     assert mod._LIVE_CHECK_AT == 0.0
+
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_make_live_omits_unusable_previous_checkout(monkeypatch, tmp_path):
+    """An unprovisioned running checkout is not a safe Undo destination, but
+    it must not make the primary cutover unavailable."""
+    target = _mk_make_live_wt(tmp_path / "target", venv=True, dist=True)
+    previous = tmp_path / "unprovisioned-current"
+    previous.mkdir()
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(
+        monkeypatch,
+        target,
+        live=str(previous.resolve()),
+        pointer_dir=ptr_dir,
+    )
+
+    res = await mod._make_live(str(target))
+
+    assert res["ok"] is True
+    data = json.loads((ptr_dir / "live_target.json").read_text())
+    assert Path(data["checkout"]).resolve() == target.resolve()
+    assert "previous_checkout" not in data
+
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_undo_make_live_clears_one_level_history(monkeypatch, tmp_path):
+    """Undo reuses the cutover transaction but consumes, rather than flips,
+    the previous checkout so the inverse does not become an implicit redo."""
+    current = _mk_make_live_wt(tmp_path / "current", venv=True, dist=True)
+    previous = _mk_make_live_wt(tmp_path / "previous", venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(
+        monkeypatch,
+        previous,
+        live=str(current.resolve()),
+        unit_status="no_user_unit",
+        pointer_dir=ptr_dir,
+    )
+    live_mod.live_target.write_target(
+        current,
+        previous_checkout=previous,
+    )
+
+    res = await mod._make_live(str(previous), undo=True)
+
+    assert res["ok"] is True
+    assert res["staged_only"] is True
+    data = json.loads((ptr_dir / "live_target.json").read_text())
+    assert Path(data["checkout"]).resolve() == previous.resolve()
+    assert "previous_checkout" not in data
+
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_undo_make_live_refuses_stale_banner_target(monkeypatch, tmp_path):
+    """A banner rendered for an older cutover cannot reverse a newer one."""
+    current = _mk_make_live_wt(tmp_path / "current", venv=True, dist=True)
+    previous = _mk_make_live_wt(tmp_path / "previous", venv=True, dist=True)
+    stale = _mk_make_live_wt(tmp_path / "stale", venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(
+        monkeypatch,
+        stale,
+        live=str(current.resolve()),
+        unit_status="no_user_unit",
+        pointer_dir=ptr_dir,
+    )
+    live_mod.live_target.write_target(
+        current,
+        previous_checkout=previous,
+    )
+    before = (ptr_dir / "live_target.json").read_text()
+
+    res = await mod._make_live(str(stale), undo=True)
+
+    assert res["ok"] is False
+    assert res["code"] == "undo_changed"
+    assert (ptr_dir / "live_target.json").read_text() == before
 
 
 @pytest.mark.asyncio
@@ -3980,11 +4158,11 @@ async def test_make_live_write_failure_does_not_latch(monkeypatch, tmp_path):
     original_write = live_mod.live_target.write_target
     call_count = {"n": 0}
 
-    def fail_first_write(checkout):
+    def fail_first_write(checkout, *, previous_checkout=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise OSError("disk full")
-        return original_write(checkout)
+        return original_write(checkout, previous_checkout=previous_checkout)
 
     monkeypatch.setattr(live_mod.live_target, "write_target", fail_first_write)
 
@@ -4072,12 +4250,22 @@ async def test_make_live_already_live_space_path(monkeypatch, tmp_path):
 
 
 def test_make_live_route_registered_and_audited():
-    """/api/make-live is wired in create_app and the handler is a coroutine."""
+    """/make-live is wired in the GATEWAY route module, not the backend's create_app:
+    the pointer it writes is masked from the backend and every child it spawns."""
     import inspect
-    app = mod.create_app()
-    paths = [getattr(r.resource, "canonical", None) for r in app.router.routes()]
-    assert "/api/make-live" in paths
-    fn = mod.api_dev_fleet_make_live
+
+    from aiohttp import web as _web
+
+    from kiro_crew.apps.builtins.dev_fleet import gateway_routes
+
+    backend_paths = [getattr(r.resource, "canonical", None) for r in mod.create_app().router.routes()]
+    assert "/api/make-live" not in backend_paths
+    assert not hasattr(mod, "api_dev_fleet_make_live")
+    gw = _web.Application()
+    gateway_routes.register_routes(gw)
+    gw_paths = [getattr(r.resource, "canonical", None) for r in gw.router.routes()]
+    assert "/api/apps/dev-fleet/make-live" in gw_paths
+    fn = gateway_routes.handle_make_live
     assert callable(fn) and inspect.iscoroutinefunction(fn)
 
 
@@ -4528,9 +4716,11 @@ async def test_make_live_darwin_rolls_back_pointer_on_restart_failure(
     res = await mod._make_live(str(wt), dry_run=False)
     assert res["ok"] is False and res["code"] == "restart_failed"
     assert res["rolled_back"] is True
-    # Pointer rolled back: file should not exist (prior was absent).
+    # Pointer rolled back: prior was absent, so the rollback UNPINS by publishing
+    # the absent-equivalent stub, never an absent name -- the mask cannot cover
+    # a name that does not exist.
     ptr_file = ptr_dir / "live_target.json"
-    assert not ptr_file.exists()
+    assert ptr_file.read_text(encoding="utf-8") == live_mod.live_target.NO_TARGET_DOCUMENT
     assert mod._MAKE_LIVE_COMMITTED is False
 
 
@@ -4565,9 +4755,10 @@ async def test_make_live_refuses_when_prior_pointer_is_unreadable(
 ):
     """An unreadable prior pointer aborts BEFORE anything is staged.
 
-    ``restore(None)`` means "there was nothing here" and DELETES the pointer, so
-    treating a read failure as absent would let a failed cutover destroy a live
-    pointer it merely could not read. The abort must happen before staging.
+    ``restore(None)`` means "there was nothing here" and UNPINS the pointer (the
+    absent-equivalent stub replaces it), so treating a read failure as absent
+    would let a failed cutover destroy a live pointer it merely could not read.
+    The abort must happen before staging.
     """
     wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
     ptr_dir = tmp_path / "ptr"
@@ -4614,8 +4805,10 @@ async def test_make_live_rolls_back_pointer_on_restart_failure(monkeypatch, tmp_
     res = await mod._make_live(str(wt), dry_run=False)
     assert res["ok"] is False and res["code"] == "restart_failed"
     assert res["rolled_back"] is True
-    # Prior was absent -> pointer file deleted on rollback.
-    assert not (ptr_dir / "live_target.json").exists()
+    # Prior was absent -> rollback unpins with the absent-equivalent stub.
+    assert (ptr_dir / "live_target.json").read_text(
+        encoding="utf-8"
+    ) == live_mod.live_target.NO_TARGET_DOCUMENT
     assert mod._MAKE_LIVE_COMMITTED is False
 
 
@@ -4666,8 +4859,11 @@ async def test_make_live_concurrent_second_call_busy(monkeypatch, tmp_path):
     # unlocked lock and let the second call through.
     original_write_target = live_mod.live_target.write_target
 
-    def signalling_write(checkout):
-        result = original_write_target(checkout)
+    def signalling_write(checkout, *, previous_checkout=None):
+        result = original_write_target(
+            checkout,
+            previous_checkout=previous_checkout,
+        )
         entered.set()
         return result
 
@@ -4891,18 +5087,22 @@ def _stage_a_cutover(monkeypatch, tmp_path):
 async def test_cutover_unwind_runs_off_the_event_loop(monkeypatch, tmp_path):
     """The rollback must not block the loop.
 
-    restore() ends in restrict_to_owner, which shells out to icacls on Windows,
-    and svc.rollback() rewrites the service definition. Run inline, an unwind
-    would stall every other gateway request for the duration of a subprocess, so
-    it has to reach the executor like the write it is undoing.
+    restore() ends in restrict_to_owner, whose Windows DACL write can block on
+    a network volume round-trip, and svc.rollback() rewrites the service
+    definition. Run inline, an unwind would stall every other gateway request
+    for the duration of that blocking file IO, so it has to reach the executor
+    like the write it is undoing.
     """
     wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
     ptr_dir = tmp_path / "ptr"
     _stub_make_live(monkeypatch, wt, pointer_dir=ptr_dir, unit_status="no_user_unit")
 
     # Force the cutover write to fail so the unwind path runs.
-    monkeypatch.setattr(live_mod.live_target, "write_target",
-                        lambda _c: (_ for _ in ()).throw(OSError(28, "No space")))
+    monkeypatch.setattr(
+        live_mod.live_target,
+        "write_target",
+        lambda _c, **_kw: (_ for _ in ()).throw(OSError(28, "No space")),
+    )
     loop_thread = threading.get_ident()
     restore_threads: list = []
     monkeypatch.setattr(
@@ -6077,6 +6277,8 @@ async def test_sync_pip_uses_target_repo_venv(monkeypatch, tmp_path):
     async def fake_start_run(label, cmd, **kw):
         captured["cmd"] = cmd
         captured["start_run_kw"] = kw
+        # The real run removes these when it ends; the stub must too.
+        _reap_cleanup_paths(kw.get("cleanup_paths"))
         return "rid-1"
 
     monkeypatch.setattr(runtime_mod, "_start_run", fake_start_run)
@@ -6558,6 +6760,35 @@ async def test_fleet_payload_reports_no_reason_when_pods_work():
     )
     assert fleet["pods_available"] is True
     assert fleet["pods_unavailable_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_fleet_payload_says_live_state_is_known_when_the_pointer_reads():
+    fleet = await _fleet_with(
+        [{"path": "/repo", "branch": "main", "is_main": True}],
+        _load_cfg=lambda: None,
+    )
+    assert fleet["live_state_known"] is True
+
+
+@pytest.mark.asyncio
+async def test_fleet_payload_says_live_state_is_unknown_on_a_pointer_outage():
+    """A broker outage must not render as "nothing is live": the rows still come
+    back (no badge), and one field says the live/staged state is UNKNOWN so the
+    surface can tell the user to check the gateway instead of staging a cutover."""
+
+    async def _down(*, fresh=False):
+        raise live_mod.PointerUnavailable("gateway not answering")
+
+    with patch.object(live_mod, "pointer_state", _down):
+        fleet = await _fleet_with(
+            [{"path": "/repo", "branch": "main", "is_main": True}],
+            _load_cfg=lambda: None,
+        )
+    assert fleet["live_state_known"] is False
+    assert fleet["staged_target"] is None
+    assert fleet["staged_cancel_available"] is False
+    assert len(fleet["worktrees"]) == 1
 
 
 # =============================================================================
@@ -7933,6 +8164,8 @@ async def test_sync_builds_and_stages_under_one_lock_holder(monkeypatch, tmp_pat
     monkeypatch.setattr(runtime_mod, "_run_cmd", fake_run_cmd)
 
     async def fake_start_run(label, cmd, **kw):
+        # The real run removes these when it ends; the stub must too.
+        _reap_cleanup_paths(kw.get("cleanup_paths"))
         return "rid-stage"
 
     monkeypatch.setattr(runtime_mod, "_start_run", fake_start_run)
@@ -9694,7 +9927,7 @@ async def test_make_live_artifact_checks_are_executor_offloaded(
     real_run_in_executor = running_loop.run_in_executor
 
     async def _recording_run_in_executor(executor, fn, *args):
-        submitted_qualnames.append(fn.__qualname__)
+        submitted_qualnames.append(getattr(fn, "__qualname__", repr(fn)))
         return await real_run_in_executor(executor, fn, *args)
 
     monkeypatch.setattr(running_loop, "run_in_executor", _recording_run_in_executor)
@@ -9710,6 +9943,171 @@ async def test_make_live_artifact_checks_are_executor_offloaded(
         f"all submitted callables: {submitted_qualnames!r}.  "
         "Zero entries means the checks are still inline on the event loop."
     )
+
+
+@pytest.mark.asyncio
+async def test_make_live_pointer_and_path_probes_are_executor_offloaded(monkeypatch, tmp_path):
+    """The cutover runs on the GATEWAY's loop, which serves the whole dashboard, so
+    none of its filesystem probes may run inline: the worktree existence check,
+    the pointer reads (`_staged_target`, `snapshot`), the path comparisons
+    (`_same_path`), the pod detection (`_in_pod`), the plan (`validate` stats the
+    target) and the pointer write all go through ``run_in_executor``."""
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(monkeypatch, wt, pointer_dir=ptr_dir)
+    monkeypatch.setattr(live_mod, "_MAKE_LIVE_COMMITTED", False)
+    monkeypatch.setattr(live_mod, "_MAKE_LIVE_LOCK", asyncio.Lock())
+
+    submitted: list[str] = []
+    running_loop = asyncio.get_running_loop()
+    real_run_in_executor = running_loop.run_in_executor
+
+    async def _recording_run_in_executor(executor, fn, *args):
+        submitted.append(getattr(fn, "__qualname__", repr(fn)))
+        return await real_run_in_executor(executor, fn, *args)
+
+    monkeypatch.setattr(running_loop, "run_in_executor", _recording_run_in_executor)
+
+    res = await mod._make_live(str(wt), dry_run=False)
+    assert res["ok"] is True, res
+
+    joined = " ".join(submitted)
+    # `_stub_make_live` replaces `_in_pod` with a lambda and reports no live
+    # checkout (so no `_same_path` comparison runs); the lambda's submission is the
+    # evidence that the pod probe went through the executor.
+    for probe in (
+        "Path.exists",
+        "_plan_sync",
+        "snapshot",
+        "_write_pointer_sync",
+        "stage.<locals>._write",
+    ):
+        assert probe in joined, f"{probe} must be offloaded; submitted: {submitted!r}"
+    assert any(
+        "<lambda>" in name for name in submitted
+    ), f"the (stubbed) _in_pod probe must be offloaded; submitted: {submitted!r}"
+
+
+@pytest.mark.asyncio
+async def test_gateway_pointer_flows_call_no_filesystem_primitive_on_the_loop_thread(
+    monkeypatch, tmp_path
+):
+    """The catch-all the allow-list above cannot be: instead of naming the probes
+    that MUST be offloaded, trap the primitives every probe bottoms out in
+    (``os.stat``/``lstat``, ``readlink``, ``os.path.exists``/``realpath``/
+    ``samefile``, ``shutil.which``) and fail if ANY of them runs on the loop thread
+    while the gateway-side flows run — the live-target read (``pointer_state``), the
+    service-manager resolution behind it and the cutover itself. A primitive nobody
+    enumerated is exactly the one the next review finds."""
+    # Fixture work first: it resolves paths on this very thread, which the traps
+    # below must not count.
+    expected_live = str(tmp_path.resolve())
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+
+    which_threads: list[int] = []
+
+    def _which(_name):
+        which_threads.append(threading.get_ident())
+        return "/usr/bin/systemctl"
+
+    async def fake_run_cmd(cmd, **kw):
+        return (0, f"{tmp_path}\n", "")
+
+    monkeypatch.setattr(live_mod, "sys", MagicMock(platform="linux"))
+    monkeypatch.setattr(live_mod, "shutil", MagicMock(which=_which))
+    monkeypatch.setattr(runtime_mod, "_run_cmd", fake_run_cmd)
+    monkeypatch.setattr(live_mod, "_POINTER_PROVIDER", None, raising=False)
+    monkeypatch.setattr(live_mod, "_LIVE_CHECK_AT", 0.0, raising=False)
+    monkeypatch.setattr(live_mod, "_LIVE_WORKTREE", None, raising=False)
+    monkeypatch.setattr(live_mod.live_target, "read_target", lambda: None)
+
+    loop_thread = threading.get_ident()
+    on_loop: list[str] = []
+
+    def _trap(module, name):
+        real = getattr(module, name)
+
+        def _wrapped(*args, **kwargs):
+            if threading.get_ident() == loop_thread:
+                on_loop.append(f"{module.__name__}.{name}{args[:1]!r}")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, _wrapped)
+
+    for name in ("stat", "lstat", "readlink", "listdir", "scandir"):
+        _trap(os, name)
+    for name in ("exists", "realpath", "samefile", "isdir"):
+        _trap(os.path, name)
+    # ``Path.read_text``/``open()`` bottom out in ``io.open`` (``builtins.open`` is
+    # the same callable bound separately, so both names are trapped).
+    import builtins
+    import io
+
+    _trap(io, "open")
+    _trap(builtins, "open")
+
+    # 1. The service-manager fallthrough of ``_live_worktree_path`` (no pointer).
+    assert await mod._live_worktree_path(fresh=True) == expected_live
+    assert which_threads and all(
+        t != loop_thread for t in which_threads
+    ), "shutil.which walks PATH; it must run off the loop"
+
+    # 2. The read broker the GET live-target route awaits.
+    monkeypatch.setattr(live_mod, "_LIVE_WORKTREE", None, raising=False)
+    await live_mod.pointer_state(fresh=True)
+    assert on_loop == [], f"filesystem primitives ran on the loop thread: {on_loop!r}"
+
+    # 3. The cutover. The stub replaces the live-path resolution the first two steps
+    # exercised, so it goes in only now; its own fixture-time path work is not the
+    # production flow and is discounted.
+    _stub_make_live(monkeypatch, wt, pointer_dir=tmp_path / "ptr")
+    monkeypatch.setattr(live_mod, "_MAKE_LIVE_COMMITTED", False)
+    monkeypatch.setattr(live_mod, "_MAKE_LIVE_LOCK", asyncio.Lock())
+    on_loop.clear()
+    res = await mod._make_live(str(wt), dry_run=False)
+    assert res["ok"] is True, res
+
+    assert on_loop == [], f"filesystem primitives ran on the loop thread: {on_loop!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+async def test_service_backend_availability_probe_runs_off_the_loop_thread(platform, tmp_path):
+    """Both service backends gate every state read on ``which(<manager>)``. The
+    injected ``which`` is ``shutil.which`` in production — a PATH walk of
+    stat/access calls — so it must hop to the executor like the drop-in and
+    plist work already does; the restart route, the status probe and the
+    restart-gateway handshake all sit behind it on the gateway's loop."""
+    loop_thread = threading.get_ident()
+    which_threads: list[int] = []
+
+    def _which(name):
+        which_threads.append(threading.get_ident())
+        return f"/usr/bin/{name}"
+
+    async def _run(cmd, **kw):
+        return (0, "12345\n", "")
+
+    be = live_mod.gateway_service.backend(
+        _run,
+        unit=lambda: "kirocrew.service",
+        label=lambda: "dev.kirocrew.gateway",
+        platform=platform,
+        which=_which,
+        dropin_path=lambda: tmp_path / "override.conf",
+        dropin_content=lambda _wt, _exe: "",
+    )
+    assert be is not None
+    await be.status()
+    await be.active()
+    await be.start_id()
+    if hasattr(be, "reload"):
+        await be.reload()
+
+    assert len(which_threads) >= 3, which_threads
+    assert all(
+        t != loop_thread for t in which_threads
+    ), "the availability probe walked PATH on the loop thread"
 
 
 # --- Pull+Build: preflight, node_modules transaction, operator repair seam ---

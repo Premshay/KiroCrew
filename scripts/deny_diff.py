@@ -120,7 +120,7 @@ _PLATFORMS = frozenset({"any", "posix", "windows"})
 #: would otherwise reach this file, so the differential would keep passing while
 #: quietly covering less of the product than it says.
 _TIERS: tuple[tuple[str, str], ...] = (
-    ("sensitive-path", "is_sensitive_path"),
+    ("sensitive-path", "sensitive_path_refusal"),
     ("sensitive-bash", "is_sensitive_bash_command"),
     ("exfil", "audit_bash_exfiltration"),
     ("deny-rules", "is_denied"),
@@ -152,6 +152,16 @@ _INHERITED_HOME_OVERRIDE_ENV_VARS = (
     # OpenCode's credential home follows the XDG data directory; a relocated token
     # must not reach the classification child any more than a default one does.
     "XDG_DATA_HOME",
+    # pi's whole agent directory, credential store included, follows this one.
+    "PI_CODING_AGENT_DIR",
+    # goose's file-based secret store follows the XDG config directory, which is a
+    # different one from the data directory above: on that harness the config home
+    # is where the secret lives.
+    "XDG_CONFIG_HOME",
+    # DeepSeek Harness relocates its WHOLE home, credential store included, from one
+    # variable. Same reasoning as the entry above, and the source test pins this tuple
+    # against the harness declarations so a new override cannot be forgotten here.
+    "DSH_HOME",
 )
 
 

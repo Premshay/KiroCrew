@@ -148,7 +148,7 @@ describe('TurnBlock — file role visibility', () => {
     expect(container.querySelector('[data-testid="item-2"]')).not.toBeNull()
   })
 
-  it('unmarked mid-turn report folds into the collapse pane (control for #7948)', () => {
+  it('keeps mid-turn assistant reports visible alongside the final reply', () => {
     const report =
       'Fleet synthesis: 44/44 runs banked, all routing gates PASS, medians in the artifact. '.repeat(3)
     const items: TurnItem[] = [
@@ -164,11 +164,9 @@ describe('TurnBlock — file role visibility', () => {
         collapseAll={true}
       />
     )
-    // Without the marker the report is intermediate reasoning: it either does
-    // not render or sits inside a collapsed overflow section. This pins the
-    // user-preference contract the marker deliberately opts OUT of.
     const reportItem = container.querySelector('[data-testid="item-0"]')
-    expect(reportItem === null || reportItem.closest('[style*="overflow"]') !== null).toBe(true)
+    expect(reportItem).not.toBeNull()
+    expect(reportItem?.closest('[style*="overflow"]')).toBeNull()
     // The conclusion is the visible survivor.
     const conclusion = container.querySelector('[data-testid="item-2"]')
     expect(conclusion).not.toBeNull()

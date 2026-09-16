@@ -27,6 +27,17 @@ a mandatory stop at the third round. Local review passes, monitor cycles and wal
 clock measure different costs. The current bounds and escalation rules live only
 in `SKILL.md`; none is a target, and only the user may extend an exhausted budget.
 
+## Why the retrospective decides and continues
+
+In practice the loop stopped at every `--rounds` exit 30: the parent collected the
+retrospective, posted the remove / replace / keep verdicts as a menu, and waited.
+That turned an every-third-round review into a mandatory user gate, which is the
+opposite of what the loop is for. The verdicts are almost always decidable from the
+intent comment and the defect the mechanism was added for, so the skill now names
+the pick order and a default, and lists the only four situations where a human
+supplies something the agent cannot. Recurrence is the trigger for the review, not
+a reason to hand the PR back.
+
 ## Why the two Phase 0 gates come before opening
 
 Measured across the 20 slowest PRs on this repo, rounds spent before the decision
@@ -160,6 +171,20 @@ than presenting its own fix as delegated. The names live once, in the `SKILL.md`
 table; `docs/ci/ci-and-reviews.md` points at it, and
 `test/test_review_repair_routing_skill.py` pins the row order deliberately, so a
 generation change is one table edit plus the test that records the policy.
+
+## Why both body checks are gates
+
+`--check-body` gates completeness (exit 20) and length (exit 21) at once, and
+the two pull in opposite directions on purpose. The accounting check is the leak
+detector, not the prose: a long walkthrough hides a stray file better than a
+short body does, because the reviewer trusts it and skips the diff. The length
+check used to be a WARN, on the theory that a rename or a shared-helper migration
+needs the words and a hard cap cuts true facts. In practice the WARN was never
+read: the hard check rewarded listing, the soft one was ignored, and bodies grew
+round by round into per-file recitals nobody could read. With the ledger
+guaranteed complete, a cap cannot cut a true fact -- only a restated one. The
+code is the evidence; the body says what changed and why. Short prose, complete
+ledger -- paths, tables and pictures never count against the limit.
 
 ## Why the PR body must come from the template file
 

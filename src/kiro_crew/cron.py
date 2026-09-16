@@ -311,6 +311,59 @@ def referenced_skill_names() -> set[str]:
     return out
 
 
+def agent_sequence_dispatches(seq: list[str]) -> bool:
+    """Whether a job's ``agent_sequence`` is what dispatch actually runs.
+
+    A sequence of more than one agent takes precedence over ``agent_id``; a
+    shorter one is dormant and dispatch falls through to ``agent_id``. This is
+    the ONE spelling of that gate -- the Slack dispatch path, session-key
+    stability, and the doctor's disk reader all call it, so a change to the
+    dispatch semantics cannot silently leave a consumer reporting (or keying)
+    against the old rule.
+    """
+    return len(seq) > 1
+
+
+def job_agent_names_from_disk() -> list[tuple[str, str]]:
+    """``(job name, agent name)`` for every agent a stored cron job dispatches.
+
+    Read-only + best-effort like :func:`referenced_skill_names`: reads
+    ``crons.json`` directly (so it needs no running scheduler) and returns an
+    empty list on any error. ``kirocrew doctor`` uses this to warn when a job
+    still names a deprecated agent spec.
+
+    Mirrors dispatch, not storage: a ``script`` or ``command`` job bypasses
+    agent dispatch entirely, so its agent fields are dormant and the record is
+    skipped whole; otherwise, when :func:`agent_sequence_dispatches` the
+    sequence entries are reported and ``agent_id`` is dormant, else
+    ``agent_id`` is reported and the sequence (if any) is dormant. A record
+    whose fields the scheduler's own loader rejects (a non-list sequence, a
+    non-string entry or ``agent_id``) dispatches nothing, so it contributes
+    nothing here rather than failing doctor over a job that never runs.
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        for j in _read_job_records(config_dir() / _CRONS_FILE)[0]:
+            if j.get("script") or j.get("command"):
+                continue  # runs with no LLM; agent fields are dormant
+            label = j.get("name") or j.get("id")
+            holder = label if isinstance(label, str) and label else "<unnamed job>"
+            seq = j.get("agent_sequence", [])
+            if not isinstance(seq, list) or any(not isinstance(s, str) for s in seq):
+                continue  # the scheduler's loader rejects this record whole
+            agent_id = j.get("agent_id", "")
+            if agent_id is not None and not isinstance(agent_id, str):
+                continue  # same rejection class
+            if agent_sequence_dispatches(seq):
+                names = [s for s in seq if s]
+            else:
+                names = [agent_id] if agent_id else []
+            out.extend((holder, name) for name in names)
+    except Exception:
+        return []
+    return out
+
+
 _STORE_VERSION = 2
 _MIN_INTERVAL_SECS = 60
 _JOB_TIMEOUT_SECS = 1800  # 30 min per job
@@ -972,7 +1025,7 @@ def cron_session_key_is_stable(job: CronJob) -> bool:
     record separates them. The sequential path ignores ``persistent_session``
     entirely, which is why it is checked second rather than combined.
     """
-    if len(job.agent_sequence) > 1:
+    if agent_sequence_dispatches(job.agent_sequence):
         return True
     return job.persistent_session
 
@@ -1363,6 +1416,33 @@ def compute_next_run_ts(job: CronJob, now: float | None = None) -> float | None:
     if isinstance(result, float) and not math.isfinite(result):
         return None
     return result
+
+
+def _next_cron_boundary_ts(job: CronJob, now: float) -> float | None:
+    """Return the immediate next cron boundary as a UTC epoch, ignoring skip_dates.
+
+    For TIMER ARMING only. It answers "when is the next minute this expression
+    matches" with a single ``croniter.get_next`` -- O(1), no ``skip_dates``
+    traversal -- so a job with many ``skip_dates`` cannot make the on-loop
+    re-arm walk up to ``_MAX_SKIP_DATE_LOOKAHEAD`` occurrences. ``skip_dates`` is
+    still enforced at fire time by :meth:`CronService._is_due`, so a wake that
+    lands on a skipped boundary is a cheap no-op that re-arms to the following
+    boundary. Returns ``None`` for a non-cron or invalid expression, or when the
+    boundary is non-finite, so the caller falls back to the poll interval.
+    """
+    sched = job.schedule
+    if sched.kind != "cron" or sched.cron_expr is None:
+        return None
+    try:
+        tz = _job_tz(job)
+        base = datetime.fromtimestamp(now, tz=tz)
+        nxt = croniter(sched.cron_expr, base).get_next(float)
+    except Exception:
+        logger.warning("Failed to compute next cron boundary for job %s", job.id, exc_info=True)
+        return None
+    if isinstance(nxt, float) and not math.isfinite(nxt):
+        return None
+    return nxt
 
 
 def _compute_next_run_ts_raw(job: CronJob, now: float | None = None) -> float | None:
@@ -4462,8 +4542,22 @@ class CronService:
             elif job.schedule.kind == "at" and job.schedule.at_ts:
                 delays.append(max(0.0, job.schedule.at_ts - now))
             elif job.schedule.kind == "cron":
-                # Poll every _TIMER_POLL_SECS for cron expressions
-                delays.append(_TIMER_POLL_SECS)
+                # Wake ON the next cron boundary (as `at`/`every` do), not on a
+                # flat poll whose phase is unrelated to the schedule -- a phase
+                # gap can straddle a cron's single matching minute and drop the
+                # occurrence, most visibly on low-frequency crons. Use the
+                # skip-free boundary helper: it is O(1), so a job with many
+                # skip_dates cannot make this on-loop re-arm traverse up to
+                # _MAX_SKIP_DATE_LOOKAHEAD occurrences. skip_dates is enforced at
+                # fire time by _is_due; a wake on a skipped boundary is a no-op
+                # that re-arms to the next one. _effective_delay() still caps the
+                # armed delay at _TIMER_POLL_SECS so an externally-added job is
+                # picked up within one poll.
+                cron_next = _next_cron_boundary_ts(job, now)
+                if cron_next is not None:
+                    delays.append(max(0.0, cron_next - now))
+                else:
+                    delays.append(_TIMER_POLL_SECS)
         return min(delays) if delays else None
 
     def _effective_delay(self) -> float:
@@ -4913,7 +5007,8 @@ class CronService:
         """Return random jitter seconds based on schedule frequency.
 
         - strict_schedule=True or one-shot 'at' jobs: no jitter
-        - Sub-hourly (every < 3600s or cron with /, , or * in minute field): no jitter
+        - Sub-hourly (every < 3600s or cron whose parsed minute field fires
+          more than once per hour): no jitter
         - Hourly (every 3600–86399s or cron firing hourly): 0–5 min
         - Daily (every >= 86400s or cron firing daily): 0–59 min
         - Unrecognized cron patterns (fallback): 0–5 min
@@ -4931,11 +5026,19 @@ class CronService:
             else:
                 return 0.0  # sub-hourly jobs shouldn't be jittered
         if sched.kind == "cron" and sched.cron_expr:
+            # Ask croniter for the normalized minute set. Wildcard collapses
+            # to ["*"]; lists, ranges, steps, and their combinations expand
+            # and deduplicate, so cardinality reflects actual fires per hour.
+            try:
+                expanded, _ = croniter.expand(sched.cron_expr)
+                minute_values = expanded[0]
+            except (KeyError, TypeError, ValueError):
+                minute_values = []
+            if minute_values == ["*"] or len(minute_values) > 1:
+                return 0.0
+
             parts = sched.cron_expr.split()
             if len(parts) == 5:
-                # Sub-hourly cron (minute field has / or , or is wildcard): no jitter
-                if "/" in parts[0] or "," in parts[0] or parts[0] == "*":
-                    return 0.0
                 # Single literal hour (e.g., "0 3 * * *") = truly daily/weekly
                 if parts[1].isdigit():
                     return random.uniform(0, _JITTER_DAILY_MAX)

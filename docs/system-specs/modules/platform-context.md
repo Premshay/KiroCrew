@@ -788,7 +788,13 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   `apps/registry.py::_effective_registries`, which is the single list every
   registry consumer reads (index fetch/refresh, the trusted-host allowlist, row
   lookup, install, the blob-proxy allowlist). Rows are the field shape of
-  `ExternalRegistryConfig` (`{name, repo, branch, trust}`). Unlike
+  `ExternalRegistryConfig` (`{name, repo, branch, label, review, trust}`).
+  `label` (a display name shown instead of the `name` id) and `review` (`""` /
+  `"curated"` / `"community"`, which badge the dashboard renders) are display-only
+  and change no security posture; an unrecognised `review` degrades to `""` (no
+  claim) and is logged, never dropping the row, since a display field must not be
+  able to remove a registry from install and the security gates. `label` never replaces
+  the id: cache paths and installed apps' `_registry` tags are keyed by it. Unlike
   `registry_rows`, the **edition row wins** a `name` collision — and when the two
   rows name DIFFERENT repositories, **neither** is served, because the index cache
   is keyed by name and the displaced row's cache would otherwise be read under the
@@ -999,10 +1005,12 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   > `query` is an optional free-text filter HINT, sent only by MCP discovery
   > search (`mcp_providers/capability.py`); the browse endpoint
   > `GET /api/capability/mcp/registry` omits it and gets the full listing. The
-  > provider consumes at most `_LIST_LIMIT_GUARD` (500) rows, so a manager whose
-  > registry is larger MUST filter server-side or every row past that cap is
-  > unsearchable. Ignoring the hint stays correct — the provider filters again —
-  > it only costs reach. The hint is feature-detected on the signature
+  > provider hands on at most `_LIST_LIMIT_GUARD` (500) entries, and when a query
+  > is present that cap applies to the MATCHES: it bounds the fan-out, never the
+  > searchable window. So a manager whose registry is larger than the cap does NOT
+  > have to filter server-side to stay searchable, and ignoring the hint costs
+  > nothing but the work of returning its own catalog — it is a cost hint, not a
+  > correctness one. The hint is feature-detected on the signature
   > (`mcp_utils.registry_accepts_query`) and forwarded by
   > `BoundedCapabilityManager`, so an edition still on the zero-arg signature
   > keeps working.

@@ -386,6 +386,67 @@ async def _pod_logs(name: str, n: int = 120) -> dict:
     return {"ok": True, "logs": runtime._redact(raw)}
 
 
+async def _pod_status(name: str) -> dict:
+    """One pod's unit state, port and health, as ``kirocrew pod status`` reports it.
+
+    Delegated to the CLI rather than recomposed from ``rt.is_active`` +
+    ``rt.derive_port`` + ``rt.health`` so there is ONE definition of what a pod's
+    status is. A second composition here would drift from the CLI's the first time
+    either side learned a new health verdict (``HEALTH_FOREIGN`` is already one),
+    and an agent comparing the two would be told different things about one pod.
+    """
+    guard = await _pod_checkout_guard(name)
+    if guard:
+        return {"ok": False, "error": guard}
+    await runtime._warm_build_path()
+    rc, stdout, stderr = await runtime._run_cmd(
+        runtime._find_cli() + ["pod", "status", name, "--json"],
+        cwd=repository._repo(),
+        env=_pod_env(),
+        timeout=30,
+    )
+    if rc != 0:
+        return {"ok": False, "error": runtime._redact(stderr or stdout)}
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return {"ok": False, "error": "pod status returned unparseable JSON"}
+    if not isinstance(parsed, dict):
+        return {"ok": False, "error": "pod status returned an unexpected shape"}
+    return {"ok": True, **parsed}
+
+
+async def _pod_ls() -> dict:
+    """Every pod ACTIVE on this host, not only this repo's.
+
+    Deliberately unscoped: the answer's whole use is collision reasoning (which
+    ports are taken, what is already running), and a list filtered to one repo's
+    worktrees would omit exactly the pod that explains a refusal. Read-only and
+    name/port/health only -- it exposes no other checkout's contents.
+
+    ``repository._repo()`` raises when no main checkout is configured. That is NOT
+    caught here: it is raised on every branch of every pod verb (cwd, ``_pod_env``,
+    and inside ``_pod_checkout_guard``'s discovery chain), so the agent surface
+    catches it once at the handler instead of each helper catching its own branch.
+    """
+    await runtime._warm_build_path()
+    rc, stdout, stderr = await runtime._run_cmd(
+        runtime._find_cli() + ["pod", "ls", "--json"],
+        cwd=repository._repo(),
+        env=_pod_env(),
+        timeout=30,
+    )
+    if rc != 0:
+        return {"ok": False, "error": runtime._redact(stderr or stdout)}
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return {"ok": False, "error": "pod ls returned unparseable JSON"}
+    if not isinstance(parsed, list):
+        return {"ok": False, "error": "pod ls returned an unexpected shape"}
+    return {"ok": True, "pods": parsed}
+
+
 async def _pod_provision(name: str) -> dict:
     guard = await _pod_checkout_guard(name)
     if guard:
@@ -509,7 +570,22 @@ async def _worktree_remove_locked(
     path = target["path"]
     branch = target.get("branch")
 
-    live_path = await live._live_worktree_path(fresh=True)
+    # Pointer state comes from the gateway (the pointer file is masked from this
+    # backend). An outage there is NOT "nothing is live": refusing is the only
+    # answer that cannot delete the checkout a cutover is staged on.
+    try:
+        live_path = await live._live_worktree_path(fresh=True)
+    except live.PointerUnavailable as exc:
+        runtime.logger.warning(
+            "worktree remove: live-target state unavailable: %s", runtime._redact(str(exc))
+        )
+        return {
+            "ok": False,
+            "error": (
+                "refusing: cannot verify which checkout is live or staged "
+                "-- retry when the gateway answers"
+            ),
+        }
     if live_path is not None and repository._same_path(path, live_path):
         return {
             "ok": False,
@@ -914,10 +990,46 @@ async def _worktree_remove_locked(
     # A concurrent /make-live can stage this worktree between the
     # eager live-path check above and ``git worktree remove``; every removal
     # caller delegates this ownership to the same internal critical section.
-    async with live._MAKE_LIVE_LOCK:
+    #
+    # ``_MAKE_LIVE_LOCK`` serialises removals against each other in THIS
+    # process, but the cutover (and the gateway restart that tree-kills this
+    # backend) runs in the GATEWAY process, so the gateway-held removal LEASE is
+    # what actually excludes them (live.py). The lease is refused while a
+    # cutover is in flight, and a broker outage is a refusal too: this removal
+    # cannot prove no cutover is staging the very path it is about to delete.
+    async with live._MAKE_LIVE_LOCK, live.removal_lease(path) as _leased:
+        if not _leased:
+            # Two causes with opposite remedies, so one assertive message each.
+            if _leased.refusal == "unavailable":
+                return {
+                    "ok": False,
+                    "error": (
+                        "refusing: can't reach the gateway to check for a staged cutover "
+                        "-- confirm it's running, then retry"
+                    ),
+                }
+            return {
+                "ok": False,
+                "error": (
+                    "refusing: a Make Live cutover is in progress -- retry once it " "has completed"
+                ),
+            }
         # Protection re-check under the lock closes the TOCTOU window between
         # the eager checks at function entry and the actual deletion.
-        _live2 = await live._live_worktree_path(fresh=True)
+        try:
+            _live2 = await live._live_worktree_path(fresh=True)
+            _staged2 = await live._staged_target_resolved()
+        except live.PointerUnavailable as exc:
+            runtime.logger.warning(
+                "worktree remove: live-target state unavailable: %s", runtime._redact(str(exc))
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "refusing: cannot verify which checkout is live or staged "
+                    "-- retry when the gateway answers"
+                ),
+            }
         if _live2 is not None and repository._same_path(path, _live2):
             return {
                 "ok": False,
@@ -926,12 +1038,11 @@ async def _worktree_remove_locked(
                     "switch the gateway to another checkout first"
                 ),
             }
-        _staged2 = live._staged_target()
         if _staged2 is not None and repository._same_path(path, _staged2):
             return {
                 "ok": False,
                 "error": (
-                    "refusing: this worktree is a staged live-gateway cutover "
+                    "refusing: this worktree is a staged Make Live cutover "
                     "target -- cancel the staged cutover before removing"
                 ),
             }
@@ -1119,6 +1230,15 @@ async def _worktree_remove_locked(
         # / `update-ref -d` against the shared MAIN_REPO would race on the worktree
         # admin dir and packed-refs locks, so only one worker mutates at a time.
         async with _GIT_MUTATION_LOCK:
+            # The removal lease excludes a gateway cutover/restart from landing on
+            # this worktree, and it is heartbeated while we queued here. If a
+            # renewal was REFUSED (the gateway restarted and forgot the lease), the
+            # exclusion is gone: stop before the mutation rather than inside it.
+            if live.removal_lease_lost(path):
+                return {
+                    "ok": False,
+                    "error": (f"{_LEASE_REFUSAL_PREFIX} -- nothing was changed; retry the removal"),
+                }
             # TOCTOU recheck: the pod-inactive verification above happened BEFORE
             # this lock was acquired. Under parallel prune a worker can queue here
             # behind other removals — long enough for another session to restart
@@ -1145,9 +1265,13 @@ async def _worktree_remove_locked(
                             "ok": False,
                             "error": f"cannot re-verify pod state before removal: {runtime._redact(str(exc))}",
                         }
-            # Execute the approved untracked-only discard. This is the LAST
-            # point before the removal, so a gate that refused above never got
-            # here and never destroyed anything.
+            # Execute the approved untracked-only discard. Once it runs, work the
+            # user approved for deletion is gone even if the removal itself is later
+            # refused — so when a discard is pending THIS is the point of no return,
+            # and the lease is proven fresh here (a renewal through the gateway, not
+            # the possibly-stale heartbeat view) before anything is destroyed. The
+            # git spawn below re-proves it through the pre-spawn gate; a refusal
+            # THERE, after the discard, is reported as such rather than as "retry".
             #
             # Deletion is per-file `os.unlink`, not `git clean`: it removes only
             # the enumerated names, cannot recurse into a path whose type changed
@@ -1162,7 +1286,17 @@ async def _worktree_remove_locked(
             # --force, so git's own dirty check stays the atomic last line
             # against a tracked edit that landed in the meantime -- the same
             # TOCTOU contract every other path here honours.
+            discard_ran = False
             if pending_discard is not None:
+                if not await live.confirm_removal_lease(path):
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"{_LEASE_REFUSAL_PREFIX}, so the approved untracked files "
+                            "were left in place -- nothing was deleted; retry the removal"
+                        ),
+                    }
+                discard_ran = True
                 if force_use_git_force:  # pragma: no cover - defensive
                     return {
                         "ok": False,
@@ -1180,10 +1314,21 @@ async def _worktree_remove_locked(
                 )
                 post_tracked, post_untracked = await repository._dirty_split(path)
                 if discard_err or post_tracked is not False or post_untracked:
+                    # A per-file helper can fail on the Nth entry after deleting
+                    # N-1, and new dirt can appear after every approved file is
+                    # gone: neither refusal is a no-op, so count what is already
+                    # deleted and say it.
+                    gone = await loop.run_in_executor(
+                        subprocess_executor(),
+                        repository._count_missing,
+                        path,
+                        pending_discard,
+                    )
                     runtime.logger.info(
                         "worktree_removal_audit: worktree=%s branch=%s caller=%s "
                         "approved_discard=%s discard_err=%s tracked_after=%s "
-                        "untracked_after=%s action=refused_discard_incomplete",
+                        "untracked_after=%s already_deleted=%s "
+                        "action=refused_discard_incomplete",
                         name,
                         branch,
                         _caller,
@@ -1191,18 +1336,22 @@ async def _worktree_remove_locked(
                         bool(discard_err),
                         post_tracked,
                         len(post_untracked),
+                        gone,
+                    )
+                    _reason = discard_err or (
+                        "the worktree is not clean after the discard: "
+                        f"{len(post_untracked)} untracked file(s) remain"
+                        + (", and tracked files changed" if post_tracked else "")
+                    )
+                    _already = (
+                        f"{gone} of {len(pending_discard)} approved untracked "
+                        "file(s) were already deleted; "
+                        if gone
+                        else "no approved file was deleted; "
                     )
                     return {
                         "ok": False,
-                        "error": (
-                            discard_err
-                            or (
-                                "could not discard the worktree's untracked files "
-                                "(the tree is not clean afterwards -- a file may "
-                                "have appeared after the discard was approved)"
-                            )
-                        )
-                        + " -- removal aborted",
+                        "error": f"{_reason} -- {_already}removal aborted",
                     }
                 runtime.logger.info(
                     "worktree_removal_audit: worktree=%s branch=%s caller=%s "
@@ -1216,6 +1365,18 @@ async def _worktree_remove_locked(
             cmd = ["git", "-C", repo, "worktree", "remove", path]
             if force_use_git_force:
                 cmd.append("--force")
+
+            # The point of no return is guarded by an explicit lease RENEWAL, run by
+            # ``_run_cmd`` after its sandbox-preparation hop and immediately before
+            # the child is spawned — nothing of unbounded duration sits between the
+            # proof and the mutation. A renewal that succeeds means the gateway
+            # excludes cutovers/restarts from this worktree for a TTL, and for the
+            # grace barrier beyond that should this process die mid-mutation.
+            async def _lease_gate() -> str | None:
+                if await live.confirm_removal_lease(path):
+                    return None
+                return f"{_LEASE_REFUSAL_PREFIX} -- git was not run; retry the removal"
+
             # Run the destructive mutation uninterruptibly. On gateway
             # shutdown dev_fleet_cleanup cancels the prune worker; a naive
             # cancel would either SIGKILL the child (via _run_cmd's handler) or,
@@ -1225,13 +1386,24 @@ async def _worktree_remove_locked(
             # locks -- until the timeout-bounded `git worktree remove` has
             # finished, then lets the cancellation propagate at that safe point.
             rc, stdout, stderr = await runtime._run_uninterruptible(
-                runtime._run_cmd(cmd, timeout=60)
+                runtime._run_cmd(
+                    cmd, timeout=_GIT_WORKTREE_REMOVE_TIMEOUT_SECS, pre_spawn=_lease_gate
+                )
             )
             if rc != 0:
+                # The pre-spawn lease gate refused: git never ran, so this is not
+                # a git failure and must not be read as "dirty at removal". With
+                # no discard pending nothing was destroyed and a plain refusal is
+                # right; after a discard it falls through to the discard-aware
+                # report below, which says what is already gone.
+                if stderr.startswith(_LEASE_REFUSAL_PREFIX) and not discard_ran:
+                    return {"ok": False, "error": stderr}
                 # When the removal runs without --force (TOCTOU guard for
                 # clean-unmerged override), a git refusal means the tree became
-                # dirty in the window — surface it as a specific audit event.
-                if force and not force_use_git_force:
+                # dirty in the window — surface it as a specific audit event. A
+                # lease-gate refusal is not one: git never ran.
+                lease_refused = stderr.startswith(_LEASE_REFUSAL_PREFIX)
+                if force and not force_use_git_force and not lease_refused:
                     runtime.logger.info(
                         "worktree_removal_audit: worktree=%s branch=%s caller=%s "
                         "force=%s dirty_at_removal=True verdict_oid=%s "
@@ -2114,6 +2286,16 @@ _PRUNE_CONCURRENCY = 4
 # here: all acquirers are aiohttp handlers and tasks on the app's single
 # gateway loop — no worker thread runs its own loop against this .git.
 _GIT_MUTATION_LOCK = LoopBoundLock()
+#: Ceiling on ``git worktree remove``. ``live._REMOVAL_LEASE_GRACE_SECS`` must exceed it:
+#: a lapsed removal lease keeps excluding cutovers/restarts for the grace barrier, and the
+#: barrier is only a guarantee while the mutation it shields cannot outlive it. A test
+#: pins the ordering so a bump here cannot silently reopen the overlap window.
+_GIT_WORKTREE_REMOVE_TIMEOUT_SECS = 60
+#: Every refusal that stems from the gateway not vouching for the removal starts with
+#: this consequence-first sentence; the post-spawn interpretation matches on it.
+_LEASE_REFUSAL_PREFIX = (
+    "refusing: the gateway could not confirm that no cutover overlaps this removal"
+)
 
 
 # Prune verdicts an untracked-discard approval is allowed to override. Both are

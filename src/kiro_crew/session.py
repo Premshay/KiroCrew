@@ -64,7 +64,7 @@ Four mechanisms clean up processes. They are complementary — not redundant.
    unless explicitly killed.
 
 2. ``_cleanup_orphaned_mcp_servers()`` — **periodic** (every ~5 min).
-   Reads ``kiro_pids.txt`` (child:parent pairs). Kills children whose parent
+   Reads ``kiro_pids.txt`` (child:parent[:start-id] entries). Kills children whose parent
    is confirmed dead. PPid-based reuse guard prevents killing recycled PIDs.
    Also prunes dead bare PIDs. *Depends on (1)* — children are only orphaned
    after their sandbox root is killed.
@@ -98,6 +98,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 if TYPE_CHECKING:
     from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
+    from kiro_crew.session_capabilities import LoadedCapabilities
 
 from kiro_crew import model_registry, platform_compat, shutdown_event
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
@@ -112,6 +113,7 @@ from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
+from kiro_crew.agent_spec_format import iter_agent_spec_files
 from kiro_crew.config import KiroCrewConfig, live
 from kiro_crew.config.live import ConfigChange
 from kiro_crew.config.loader import (
@@ -916,6 +918,8 @@ class _Session:
     semaphore: asyncio.BoundedSemaphore = field(default_factory=lambda: asyncio.BoundedSemaphore(1))
     approval_policy: str = ""  # "" (interactive) | "auto" (auto-approve all tools)
     agent: str = ""  # kiro agent name used for this session
+    capability_member: str = ""
+    loaded_capabilities: LoadedCapabilities | None = None
     # Slack message queue: FIFO of (msg_ts, text, kwargs) waiting for the semaphore
     queue: deque[tuple[str, str, dict]] = field(default_factory=deque)
     # Set when this session's last turn was cancelled via soft-stop.
@@ -923,10 +927,17 @@ class _Session:
     # must re-inject the cancelled turn (user prompt + partial assistant) as a
     # preamble on the next prompt. One-shot: consumers clear after use.
     prev_turn_cancelled: bool = False
-    # Set when a provider switch is detected (e.g. kiro→CC or CC→kiro).
-    # Consumed one-shot by the next prompt builder to inject history replay
-    # from KiroCrew's conversation_log. Ensures replay fires exactly once
-    # per switch, even if the session is reused across multiple prompts.
+    # Set when a provider switch, failed native resume, or Tool Search
+    # compatibility fallback creates a fresh provider that still needs Kiro Crew
+    # history. Non-destructive slash commands read without clearing; a confirmed
+    # native `/clear` consumes it so replay cannot undo the user's deletion. The
+    # first provider event records acceptance only in the dashboard runner's
+    # turn-local state; the shared lease remains armed until a clean,
+    # non-synthetic, non-empty end_turn atomically promotes the fresh SID and
+    # consumes it. Cancellation, raised streams, empty verdicts, and synthetic
+    # terminals leave it armed because kiro-cli discards or cannot prove those
+    # turns. This preserves replay across empty streams, pre-output failures, and
+    # soft Stops while surviving loss of the separate ``first_turn`` observation.
     provider_switch_replay: bool = False
     # Set of msg_ts values cancelled (message deleted while processing)
     cancelled: set[str] = field(default_factory=set)
@@ -948,6 +959,7 @@ class _Session:
         session's role, not its transcript, so they are kept.
         """
         self.provider = provider
+        self.loaded_capabilities = None
         self.provider_switch_replay = False
         if self.first_turn is FirstTurnState.RESUMED:
             self.first_turn = FirstTurnState.FRESH
@@ -1600,6 +1612,10 @@ class SessionManager:
         """Try to acquire an exact-key idle session."""
         return await self._allocation_boundary().try_acquire(key)
 
+    def capability_runtime_view(self, member: str, saved_revision: str) -> dict[str, Any]:
+        """Return capability adoption without exposing mutable allocation state."""
+        return self._allocation_boundary().capability_runtime_view(member, saved_revision)
+
     def active_providers(self) -> list[LLMProvider]:
         """Return all currently registered providers."""
         return self._allocation_boundary().active_providers()
@@ -2179,10 +2195,11 @@ class SessionManager:
         model = "auto"
         try:
             # Use the SAME directory as the cache stamp and preserve the former
-            # native-order, first-match scan.  This runs on the event-loop
-            # thread, so a match must stop all later spec reads rather than
-            # building a full map on every cache miss / TTL expiry.
-            for agent_file in agents_dir.glob("*.json"):
+            # native-order, first-match scan. The async caller hands this to a
+            # thread (the walk and the reads are filesystem work), and a match
+            # still stops all later spec reads rather than building a full map
+            # on every cache miss / TTL expiry.
+            for agent_file in iter_agent_spec_files(agents_dir, ordered=False):
                 data = _read_agent_spec(
                     agent_file,
                     operation="resolve_agent_model",
@@ -2295,6 +2312,63 @@ class SessionManager:
     def consume_needs_reinjection(self, key: str) -> bool:
         """Consume a live session's reinjection marker."""
         return self._compaction.consume_needs_reinjection(key)
+
+    def provider_switch_replay_pending(self, key: str) -> bool:
+        """Return whether a live session still owes conversation replay.
+
+        The first real claimant can be a native non-destructive slash command,
+        which deliberately bypasses prompt construction. Reading without clearing
+        lets that command finish while preserving replay for the next prompt. A
+        confirmed ``/clear`` is the exception and consumes the marker at its
+        provider event.
+        """
+        session = self._sessions.get(self._fold_key(key))
+        return bool(session is not None and session.provider_switch_replay)
+
+    def mark_provider_switch_replay(self, key: str) -> bool:
+        """Re-arm replay after an accepted turn is discarded by cancellation."""
+        session = self._sessions.get(self._fold_key(key))
+        if session is None:
+            return False
+        session.provider_switch_replay = True
+        return True
+
+    def commit_provider_switch_replay_sid(self, key: str) -> bool:
+        """Settle replay, promoting the live ACP SID when one was deferred.
+
+        Allocation leaves the prior resumable SID in ``SessionMap`` only for an
+        ACP provider that explicitly defers promotion. Other providers publish
+        their own SID during allocation, so a landed replay consumes the lease
+        without another mapping write. This keeps cross-provider history replay
+        one-shot instead of re-arming forever on a non-ACP session.
+        """
+        folded = self._fold_key(key)
+        session = self._sessions.get(folded)
+        if session is None or not session.provider_switch_replay:
+            return False
+        if not _is_acp_provider(session.provider):
+            session.provider_switch_replay = False
+            return True
+        client = getattr(session.provider, "client", None)
+        sid = getattr(client, "_session_id", None)
+        if not isinstance(sid, str) or not sid:
+            return False
+        self._session_map.set(
+            folded,
+            sid,
+            provider=_provider_label(session.provider),
+            cwd=session.provider.cwd,
+        )
+        session.provider_switch_replay = False
+        return True
+
+    def consume_provider_switch_replay(self, key: str) -> bool:
+        """Explicitly retire replay after confirmed native history deletion."""
+        session = self._sessions.get(self._fold_key(key))
+        if session is None or not session.provider_switch_replay:
+            return False
+        session.provider_switch_replay = False
+        return True
 
     def consume_replay_suppression(self, key: str) -> bool:
         """Read and clear whether *key*'s next cold start skips replay once."""
@@ -2876,6 +2950,10 @@ class SessionManager:
             on_soft=on_soft,
             on_hard=on_hard,
         )
+
+    def stop_generation(self, key: str) -> int:
+        """Monotonic count of :meth:`stop_turn` requests recorded for *key*."""
+        return self._lifecycle_boundary().stop_generation(key)
 
     async def _send_abort_for_session(self, key: str, session: Any) -> None:
         """Best-effort abort gateway work before hard session teardown."""

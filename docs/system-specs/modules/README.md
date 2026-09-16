@@ -23,6 +23,8 @@ agent loads only the one it needs.
 | [history.md](history.md) | Conversation persistence, JSONL rotation, and transcript search. |
 | [session-summary.md](session-summary.md) | Intent-level session summaries: the sidecar cache, extraction, and the turn-end pass. |
 | [session-work-ledger.md](session-work-ledger.md) | Per-session durable work state (goal, phase, tried, artifacts) on disk, its MCP tools, and monitor-loop snapshot injection. |
+| [ledger-core.md](ledger-core.md) | Append-only per-crew and per-session ledgers: the wire format, type ownership and guest namespacing, the torn-tail rule, and how the stream relates to `kiro_crew.events`. |
+| [session-ledger-emitter.md](session-ledger-emitter.md) | The flag-gated writer that turns the ACP turn lifecycle into an append-only per-session `ledger.jsonl`: which facts are recorded, from which call site, and which are deliberately not. |
 | [file-search.md](file-search.md) | The `@`-mention file/folder search: index, ranking, `kinds` filter, and the sensitive-path symmetry. |
 | [session-storage.md](session-storage.md) | What sessions cost on disk, and the user-initiated trash that reclaims it. |
 | [session-control.md](session-control.md) | One chat session opening, stopping, and reading another. |
@@ -77,7 +79,7 @@ agent loads only the one it needs.
 | [slack-gateway.md](slack-gateway.md) | The Slack gateway, its event dispatch, Block Kit rendering, and the `action::` inline-action value protocol. |
 | [stt-streaming.md](stt-streaming.md) | Live dictation in the composer: the three providers, the WebSocket frames, the local recognizer's endpointing and partial pipeline, and the model download. |
 | [voice-streaming.md](voice-streaming.md) | Streaming voice replies, and the text normalization applied before synthesis. |
-| [turn-complete-chime.md](turn-complete-chime.md) | The end-of-turn audio cue, and what the policy deliberately does not inspect. |
+| [turn-complete-chime.md](turn-complete-chime.md) | Audio when a conversation stops or requires input, with intermediate work kept quiet. |
 
 ## Apps and UI surfaces
 
@@ -105,7 +107,7 @@ agent loads only the one it needs.
 | Spec | Subsystem |
 |---|---|
 | [papyrus.md](papyrus.md) | The Papyrus writing app. |
-| [aws-control.md](aws-control.md) | The AWS account portal and S3-backed cloud drive app: accounts, Drive/Library/Backup, consent and confirmation guards, sharing. |
+| [aws-control.md](aws-control.md) | The AWS account portal and S3-backed cloud drive app: accounts, Drive/Library/Backup, consent and confirmation guards, sharing, and the crew container runtime a remote crew runs as. |
 | [command-bar.md](command-bar.md) | The opt-in launcher that replaces quick-search: the overlay seam, the request-free root, ranking and scopes. |
 | [pptx-maker.md](pptx-maker.md) | Deck generation. |
 | [meetings.md](meetings.md) | Meeting capture and summarization. |
@@ -120,6 +122,10 @@ agent loads only the one it needs.
 |---|---|
 | [cloud.md](cloud.md) | Cloud connect and remote gateway login. |
 | [connections.md](connections.md) | Third-party account connections: provider registry and tiers, the mint endpoints, grant custody at the kiro-cli boundary, warm-table prewarming, owner-only disconnect, and the L0/L1 launch gates. |
+| [connector-capability-manifest.md](connector-capability-manifest.md) | The connector campaign's manifest field schema (one row per required operation) and the `W00`–`W16` work-stream DAG that sequences its provider rounds. |
+| [connector-github.md](connector-github.md) | The GitHub connector (`W02`): per-operation instance data and the GitHub-specific wire parsing (pagination, rate-limit signals, status/body-to-error-class mapping, capability-signature resolution). |
+| [microsoft-graph-runtime.md](microsoft-graph-runtime.md) | The shared Microsoft Graph runtime base (`W05`): the resource locator (`/me` vs `/users/{id}`, the app-only `/me` refusal, the required Graph resource shapes), request/response payload shaping, and the `@odata.nextLink` pagination variants. Pure logic; defines no vendor-error taxonomy. |
+| [connector-zoom.md](connector-zoom.md) | The Zoom connector's `W11-A` contract-semantics slice: identity/UUID double-encoding, recurrence-occurrence time semantics, per-endpoint pagination, the AI Companion processing tri-state, and error classification plus credential redaction — pure logic, no network/auth/dispatch. |
 | [instances.md](instances.md) | Managing multiple instances over SSH. Sections here are cited by number from `cloud/connect.py`, so do not renumber them. |
 | [dev-fleet.md](dev-fleet.md) | Worktree fleet management and pruning. |
 | [coordinator-work-items.md](coordinator-work-items.md) | Coordinator-owned structured work-item cycles, typed acceptance evidence, bounded fast-recon dispatch, immutable closed-cycle archives, and Goal Conductor legacy import. |

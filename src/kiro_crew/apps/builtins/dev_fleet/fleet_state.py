@@ -1054,9 +1054,58 @@ def _orphan_count_sync(cfg: Any) -> int | None:
         return None
 
 
+def _completed_cutover_undo_target(
+    worktrees: list[dict],
+    rows: list[dict],
+    *,
+    live_path: str | None,
+    staged_path: str | None,
+    previous_path: Path | None,
+) -> dict | None:
+    """Return the discovered previous checkout only after a completed cutover."""
+    if (
+        staged_path is not None
+        or live_path is None
+        or previous_path is None
+        or repository._same_path(live_path, str(previous_path))
+    ):
+        return None
+    return next(
+        (
+            {"name": row["name"], "path": row["path"]}
+            for raw, row in zip(worktrees, rows)
+            if repository._same_path(str(previous_path), raw.get("path", ""))
+        ),
+        None,
+    )
+
+
 async def _build_fleet() -> dict:
-    live_path = await live._live_worktree_path()
-    staged_path = live._staged_target()
+    # Pointer state is answered by the gateway (the pointer file is masked from this
+    # backend). A broker outage must not take the whole fleet view down with it: the
+    # rows still render with no live/staged badge, and the reason goes to the backend
+    # log — the operator-facing surface for a gateway that stopped answering. The
+    # destructive paths (removal, prune override) refuse on the same condition.
+    # ONE snapshot carries all four pointer-derived fields (live, staged, cancel
+    # availability, undo target), so a gateway that goes away while the rest of the
+    # fleet is being built cannot fail a later read.
+    try:
+        pointer = await live.pointer_state()
+        live_state_known = True
+    except live.PointerUnavailable as exc:
+        runtime.logger.warning(
+            "fleet view: live-target state unavailable, no row will be marked live or "
+            "staged: %s",
+            runtime._redact(str(exc)),
+        )
+        pointer = live.PointerState(live=None, staged=None, staged_cancel_available=False)
+        # Carried in the payload so "state unknown" is not rendered as "nothing is
+        # live": the two invite opposite actions (check the gateway vs. stage a
+        # cutover). The badges below stay unset; this one field says why.
+        live_state_known = False
+    live_path = pointer.live
+    staged_path = pointer.staged
+    previous_path = Path(pointer.previous) if pointer.previous is not None else None
     worktrees = await repository._discover_worktrees()
     cfg = runtime._load_cfg()
     loop = asyncio.get_running_loop()
@@ -1266,6 +1315,19 @@ async def _build_fleet() -> dict:
             )
         except Exception:  # noqa: BLE001
             pass
+    # Undo exists only for a COMPLETED cutover: while a pointer is staged the
+    # existing Cancel staged cutover action is the truthful inverse. Bind the
+    # payload to a currently discovered row so a pruned/foreign checkout never
+    # becomes a clickable target; _make_live re-checks the pointer history under
+    # its mutation lock before acting.
+    undo_target = _completed_cutover_undo_target(
+        worktrees,
+        wts,
+        live_path=live_path,
+        staged_path=staged_path,
+        previous_path=previous_path,
+    )
+
     # The run pointers a reloaded page reattaches to -- `sync_run_id` and each
     # row's `provision_run_id` -- are deliberately NOT set here. This snapshot is
     # cached and served stale-while-revalidate, so a pointer written at build
@@ -1284,12 +1346,17 @@ async def _build_fleet() -> dict:
         # persistent pending-restart state from this, so the instruction outlives
         # the toast that announced it.
         "staged_target": runtime._redact(staged_path) if staged_path else None,
+        # One-level post-cutover inverse. Null for legacy pointers, invalid or
+        # pruned previous checkouts, and every still-staged transition.
+        "undo_target": undo_target,
         # Whether the pointer-only cancel of that stage would be accepted (see
-        # _staged_cancel_available). Only probed while a stage exists; false
-        # otherwise so the dashboard's cancel control stays hidden.
-        "staged_cancel_available": (
-            staged_path is not None and await live._staged_cancel_available()
-        ),
+        # _staged_cancel_available). From the same snapshot as the stage itself, so
+        # the two can never disagree; false with no stage so the dashboard's cancel
+        # control stays hidden.
+        "staged_cancel_available": (staged_path is not None and pointer.staged_cancel_available),
+        # False only while the gateway's pointer state could not be read: the
+        # live/staged fields above are then UNKNOWN, not empty.
+        "live_state_known": live_state_known,
         "manual_restart": live._manual_restart_command(),
         # WHY the gateway cannot be restarted/repointed from here, when it
         # cannot. Same lesson as pods_unavailable_reason below: the previous
