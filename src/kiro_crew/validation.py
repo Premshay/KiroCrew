@@ -55,10 +55,7 @@ from kiro_crew.monitoring.models import (
     MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
     MIN_MONITOR_CADENCE_SECS,
 )
-from kiro_crew.monitoring.registry import (
-    publicly_armable_kinds,
-    publicly_armable_objectives,
-)
+from kiro_crew.monitoring.registry import publicly_armable_kinds, publicly_armable_objectives
 from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
 
 # ── Constants ──
@@ -1812,9 +1809,7 @@ def _validate_checkpoint_attention(args: dict[str, Any]) -> None:
             f"exceeds max length {SESSION_CHECKPOINT_ATTENTION_KEY_MAX}",
         )
     if decision_key and kind != "decision":
-        raise ValidationError(
-            "attention.decision_key", "requires attention.kind 'decision'"
-        )
+        raise ValidationError("attention.decision_key", "requires attention.kind 'decision'")
     attention.update({"status": status, "kind": kind, "decision_key": decision_key})
 
 
@@ -1926,6 +1921,8 @@ WORKFLOW_AUTHOR_SCHEMA = ToolSchema(
     tool_name="workflow_author",
     fields=[
         FieldSpec("intent", str, required=True, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("author_agent", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("author_model", str, max_len=MAX_SHORT_STRING),
     ],
 )
 
@@ -1935,6 +1932,8 @@ WORKFLOW_RUN_SCHEMA = ToolSchema(
         # Either an authored Python script (source) or a NL intent to author one.
         FieldSpec("source", str, max_len=MAX_LONG_STRING),
         FieldSpec("intent", str, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("author_agent", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("author_model", str, max_len=MAX_SHORT_STRING),
         FieldSpec("workflow", str, max_len=MAX_SHORT_STRING, pattern=_WF_RUN_ID_RE),
         FieldSpec("input", str, max_len=MAX_MEDIUM_STRING),
         FieldSpec("name", str, max_len=MAX_SHORT_STRING),

@@ -27,12 +27,21 @@ import threading
 from typing import Any, Callable, Optional
 
 from kiro_crew import autonudge
-from kiro_crew.acp.client import AcpError
+from kiro_crew.acp.client import (
+    AcpError,
+    AcpModelUnavailable,
+    model_is_unusable,
+    resolve_pin_spelling,
+)
 from kiro_crew.acp.runtime import AcpRequestTimeout, AcpRuntimeDead
+from kiro_crew.agent_discovery import list_agents
 from kiro_crew.config import live
 from kiro_crew.llm_helpers import (
     ToolApprovalPolicy,
     acp_error_is_transient,
+    provider_active_model,
+    provider_advertised_ids,
+    resolve_substitute_set_model,
     stream_and_collect,
 )
 from kiro_crew.member_memory_auth import private_memory_store_for_session
@@ -90,7 +99,7 @@ agents. Reply with ONLY the Python module (no prose, no code fence). It MUST be:
 Rules (the sandbox REJECTS violations): no imports; no open/eval/exec/__import__;
 no dunder access; no .format/.format_map (use an f-string); no time/random/uuid
 (use ctx.now / ctx.args). Use ONLY the ctx
-surface: await ctx.agent(prompt, schema=?, label=?, phase=?), await ctx.parallel([..]),
+surface: await ctx.agent(prompt, schema=?, label=?, phase=?, agent=?, model=?), await ctx.parallel([..]),
 await ctx.pipeline(items, *stages), ctx.phase(t), ctx.log(m),
 ctx.nudge(idle_secs=?, message=?), ctx.budget, ctx.args. Nothing else exists on
 ctx in this runtime — any other ctx attribute or method fails at runtime, so do
@@ -134,6 +143,16 @@ agent reviews/fact-checks that whole output and returns corrections — not one
 verifier per individual claim. So a research workflow is roughly: one generator
 per top-level facet (a handful), then one critic per facet to challenge it, then a
 single synthesis agent. Prefer few strong agents over many tiny ones.
+
+Choose each worker's agent/model for its task, using installed agent names and
+models advertised by that backend; never invent names or assume the author's
+model is inherited. Follow explicit caller selections. Use local crews for
+bounded extraction, classification, summarization, or routine tool work when
+their verified tools, quality, and input-plus-output context budget fit. Keep
+local concurrency within the serving lane's capacity. Use a stronger available
+model for ambiguous synthesis, difficult debugging, or consequential review.
+When a roster is absent, omit overrides and report that selection is inherited;
+do not claim a particular model ran without runtime evidence.
 
 Available builtins (NOTHING else — any other name is a NameError at runtime, so do
 NOT reference json, math, os, datetime, re, etc.): len, range, enumerate, zip, map,
@@ -715,6 +734,8 @@ class WorkflowService:
         intent: str,
         *,
         author: str = "",
+        author_agent: str = "",
+        author_model: str = "",
         on_progress: Optional[Callable[[str], None]] = None,
     ) -> dict:
         """Turn a NL intent into a validated workflow script (or report errors).
@@ -725,6 +746,14 @@ class WorkflowService:
         refused = await _memory_admission_error(author)
         if refused is not None:
             return refused
+        if author_agent:
+            available = await asyncio.to_thread(list_agents)
+            if author_agent not in {agent.name for agent in available}:
+                return {
+                    "ok": False,
+                    "error": "Unknown author_agent; choose an installed agent.",
+                    "errors": ["Unknown author_agent; choose an installed agent."],
+                }
 
         def _say(msg: str) -> None:
             if on_progress is not None:
@@ -737,13 +766,8 @@ class WorkflowService:
         # _bg session — so a workflow stays fully independent: its authoring context
         # never pollutes (or is polluted by) chat, consolidation, or other runs.
         #
-        # Cost: authoring is pure text generation (intent → Python script), so it
-        # uses the tool-less ``kirocrew-lite`` agent. That is the lever that makes a
-        # fresh session cheap: the dominant cold-start cost was loading the full
-        # MCP toolset + system prompt; lite carries no tools, so the turn is just
-        # the generation. REJECT_ALL is belt-and-suspenders against an alternate
-        # ACP backend injecting tools without set_mode. The session is destroyed
-        # the instant authoring finishes — nothing remains registered or resumable.
+        # Authoring is text generation. Even a caller-selected agent must not
+        # execute tools while drafting a script that has not been validated.
         provider: Any = None
         key = ""
         for startup_attempt in range(1, _AUTHOR_STARTUP_ATTEMPTS + 1):
@@ -752,7 +776,9 @@ class WorkflowService:
             # cleanup when startup fails before registration.
             key = f"wf-author:{self._new_run_id()}:a{startup_attempt}"
             try:
-                provider, *_ = await self._sessions.get_or_create(key, agent="kirocrew-lite")
+                provider, *_ = await self._sessions.get_or_create(
+                    key, agent=author_agent or "kirocrew-lite", model=author_model or None
+                )
             except Exception as exc:
                 try:
                     await self._sessions.destroy(key)
@@ -795,6 +821,22 @@ class WorkflowService:
             break
 
         try:
+            if author_model:
+                advertised = provider_advertised_ids(provider)
+                if model_is_unusable(author_model, advertised):
+                    raise AcpModelUnavailable(author_model, advertised)
+                selected = resolve_pin_spelling(author_model, advertised) or author_model
+                set_model = resolve_substitute_set_model(provider)
+                if set_model is None:
+                    raise RuntimeError(
+                        "Author backend cannot apply author_model; omit it to inherit."
+                    )
+                await set_model(selected)
+                served = provider_active_model(provider)
+                if selected != "auto" and served != selected:
+                    raise RuntimeError(
+                        "Author backend did not confirm the requested model; no prompt sent."
+                    )
             errors: list[str] = []
             source = ""
             attempts = _AUTHOR_RETRIES + 1
@@ -870,6 +912,8 @@ class WorkflowService:
         name: str = "",
         args: Optional[dict] = None,
         author: str = "",
+        author_agent: str = "",
+        author_model: str = "",
         session_key: str = "",
         budget_total: Optional[int] = None,
         timeout_secs: Optional[int] = None,
@@ -896,7 +940,13 @@ class WorkflowService:
         async def _author_fn(
             it: str, *, on_progress: Optional[Callable[[str], None]] = None
         ) -> dict:
-            return await self.author(it, author=author, on_progress=on_progress)
+            return await self.author(
+                it,
+                author=author,
+                author_agent=author_agent,
+                author_model=author_model,
+                on_progress=on_progress,
+            )
 
         await self._runner(run_id, timeout_secs=timeout_secs).run_background(
             "",  # no source — author inside the run

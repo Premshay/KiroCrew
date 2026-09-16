@@ -53,6 +53,14 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": "The goal in plain language, e.g. 'deep research on the origin of pizza'",
                     },
+                    "author_agent": {
+                        "type": "string",
+                        "description": "Agent identity for drafting only; choose from the installed agent roster. Defaults to kirocrew-lite.",
+                    },
+                    "author_model": {
+                        "type": "string",
+                        "description": "Model for drafting only, from the selected agent backend's advertised models. Omit to inherit its default.",
+                    },
                 },
                 "required": ["intent"],
             },
@@ -85,6 +93,14 @@ def schemas() -> list[dict[str, Any]]:
                     "intent": {
                         "type": "string",
                         "description": "If no source: a NL goal to author then run",
+                    },
+                    "author_agent": {
+                        "type": "string",
+                        "description": "Agent identity for intent authoring only; choose from the installed agent roster. Workers choose agent/model separately in ctx.agent().",
+                    },
+                    "author_model": {
+                        "type": "string",
+                        "description": "Model for intent authoring only, from the selected backend's advertised models. Omit to inherit its default.",
                     },
                     "name": {"type": "string", "description": "Optional run name"},
                     "args": {
@@ -211,7 +227,11 @@ def workflow_author(name: str, args: dict[str, Any]) -> str:
     intent = (args.get("intent") or "").strip()
     if not intent:
         return _wf_return("workflow_author", "Error: intent is required", outcome="error")
-    d = mcp_core._post("/api/workflows/author", {"intent": intent})
+    body = {"intent": intent}
+    for field in ("author_agent", "author_model"):
+        if args.get(field):
+            body[field] = args[field]
+    d = mcp_core._post("/api/workflows/author", body)
     if d.get("error"):
         return _wf_return(
             "workflow_author", f"workflow_author failed: {d['error']}", outcome="error"
@@ -275,6 +295,9 @@ def workflow_run(name: str, args: dict[str, Any]) -> str:
         # authored inside the background run as a visible "Authoring" phase, so
         # the slow model call never blocks this tool (no 30s author timeout).
         wf_body["intent"] = intent
+        for field in ("author_agent", "author_model"):
+            if args.get(field):
+                wf_body[field] = args[field]
         d = mcp_core._post("/api/workflows/run_intent", wf_body)
         if d.get("error"):
             return _wf_return("workflow_run", f"workflow_run failed: {d['error']}", outcome="error")

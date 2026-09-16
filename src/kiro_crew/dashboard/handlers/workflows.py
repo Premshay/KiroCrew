@@ -31,6 +31,7 @@ from aiohttp import web
 from kiro_crew.dashboard.handlers._shared import internal_memory_scope, read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.validation import MAX_SHORT_STRING
 
 logger = logging.getLogger(__name__)
 
@@ -389,8 +390,24 @@ async def api_workflow_author(request: web.Request) -> web.Response:
     refusal = await _private_memory_refusal(request, "workflow.author")
     if refusal is not None:
         return refusal
-    out = await svc.author(intent, author=author)
+    selection = _author_selection(body)
+    if selection is None:
+        return web.json_response(
+            {"error": "author_agent and author_model must be strings"}, status=400
+        )
+    out = await svc.author(intent, author=author, **selection)
     return web.json_response(_redact_obj(out))
+
+
+def _author_selection(body: dict) -> Optional[dict[str, str]]:
+    selection = {}
+    for field in ("author_agent", "author_model"):
+        value = body.get(field, "")
+        if not isinstance(value, str) or len(value) > MAX_SHORT_STRING:
+            return None
+        if value.strip():
+            selection[field] = value.strip()
+    return selection
 
 
 def _opt_int(value: Any) -> Optional[int]:
@@ -458,6 +475,11 @@ async def api_workflow_run_intent(request: web.Request) -> web.Response:
     refusal = await _private_memory_refusal(request, "workflow.run_intent")
     if refusal is not None:
         return refusal
+    selection = _author_selection(body)
+    if selection is None:
+        return web.json_response(
+            {"error": "author_agent and author_model must be strings"}, status=400
+        )
     out = await svc.start_from_intent(
         intent,
         name=body.get("name", "") or "",
@@ -466,6 +488,7 @@ async def api_workflow_run_intent(request: web.Request) -> web.Response:
         session_key=request.headers.get("X-Session-Key", ""),
         budget_total=budget_total,
         timeout_secs=_opt_int(body.get("timeout_secs")),
+        **selection,
     )
     status = 200 if "run_id" in out else 400
     return web.json_response(_redact_obj(out), status=status)

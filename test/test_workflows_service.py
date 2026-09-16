@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -42,6 +43,10 @@ class FakeProvider:
     def __init__(self, scripted: list[str]) -> None:
         self._scripted = scripted
         self._i = 0
+        self.served_model = ""
+
+    async def set_model(self, model):
+        self.served_model = model
 
 
 class FakeSessions:
@@ -150,6 +155,47 @@ async def test_author_returns_valid_script(monkeypatch) -> None:
     svc = WorkflowService(sessions=FakeSessions([]))
     out = await svc.author("do a tiny thing")
     assert out["ok"] is True
+
+
+@pytest.mark.parametrize("background", [False, True])
+async def test_author_selection_reaches_isolated_session(monkeypatch, background) -> None:
+    _patch_stream(monkeypatch, [GOOD_SCRIPT])
+    monkeypatch.setattr(
+        "kiro_crew.workflows.service.list_agents", lambda: [SimpleNamespace(name="selected-agent")]
+    )
+    sessions = FakeSessions([])
+    svc = WorkflowService(sessions=sessions, persist=False)
+    selection = {"author_agent": "selected-agent", "author_model": "selected-model"}
+    if background:
+        out = await svc.start_from_intent("draft a workflow", **selection)
+        await _wait_terminal(svc, out["run_id"])
+    else:
+        out = await svc.author("draft a workflow", **selection)
+        assert out["ok"]
+    assert sessions.acquired[0][1] == {"agent": "selected-agent", "model": "selected-model"}
+    assert sessions.destroyed == [sessions.acquired[0][0]]
+
+
+async def test_unknown_author_agent_does_not_allocate(monkeypatch) -> None:
+    monkeypatch.setattr("kiro_crew.workflows.service.list_agents", lambda: [])
+    sessions = FakeSessions([])
+    out = await WorkflowService(sessions=sessions, persist=False).author(
+        "draft", author_agent="missing-agent"
+    )
+    assert not out["ok"]
+    assert not sessions.acquired
+
+
+async def test_author_model_noop_is_rejected_before_prompt(monkeypatch) -> None:
+    calls = _patch_stream(monkeypatch, [GOOD_SCRIPT])
+    monkeypatch.setattr(FakeProvider, "set_model", AsyncMock())
+    sessions = FakeSessions([])
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        await WorkflowService(sessions=sessions, persist=False).author(
+            "draft", author_model="selected-model"
+        )
+    assert calls["i"] == 0
+    assert sessions.destroyed == [sessions.acquired[0][0]]
 
 
 async def test_author_uses_isolated_destroyed_lite_session(monkeypatch) -> None:

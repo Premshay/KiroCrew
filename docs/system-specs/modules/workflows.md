@@ -792,11 +792,14 @@ before retry backoff, and the successfully acquired session is explicitly destro
 when authoring finishes; destruction shuts down the provider, removes the registry
 entry, and deletes any stale SessionMap entry. A workflow's authoring context
 therefore never pollutes (or is polluted by) chat, consolidation, or another run. It
-uses the tool-less `kirocrew-lite` agent with `ToolApprovalPolicy.REJECT_ALL`: the
+defaults to the tool-less `kirocrew-lite` agent with `ToolApprovalPolicy.REJECT_ALL`: the
 dominant cold-start cost is loading the full MCP toolset and system prompt, and
 authoring is pure text generation, so lite is what makes a fresh session cheap.
 `REJECT_ALL` is belt-and-suspenders against an alternate ACP backend injecting tools
-without `set_mode`.
+without `set_mode`, and also applies to caller-selected authors. An unknown named
+author is rejected before allocation. Explicit models are checked against the
+backend's advertised models and applied with a serving-model check before prompting;
+an unavailable model or unconfirmed switch fails rather than silently substituting.
 
 The authoring system prompt (`service._AUTHOR_SYSTEM`) is the model-facing
 statement of this contract: the required module shape, the sandbox rules, the
@@ -810,6 +813,13 @@ immediately, `run_started` is emitted so it appears live, and authoring becomes 
 visible `"Authoring"` phase whose progress streams as `log` events. That is why
 `workflow_run(intent=...)` returns a `run_id` instantly rather than blocking an
 HTTP request on a slow synchronous author.
+
+Both authoring entry points accept optional `author_agent` and `author_model`.
+These choose only the isolated drafting session; worker selections remain in
+`ctx.agent(agent=..., model=...)`. Omitted fields preserve the existing author
+agent and its configured model. The `dynamic-workflows` skill and author prompt
+direct callers to discover available identities, respect explicit selections,
+and assign local work only within verified tools, quality and capacity limits.
 
 ### Agent execution adapters
 
@@ -890,9 +900,9 @@ Owner-browser and verified unbound V1 dispatch retain their existing behavior.
 
 | Route | Body / params | Response |
 |-------|---------------|----------|
-| `POST /api/workflows/author` | `{intent}` | `{ok, source, meta}` or `{ok:false, errors}` |
+| `POST /api/workflows/author` | `{intent, author_agent?, author_model?}` | `{ok, source, meta}` or `{ok:false, errors}` |
 | `POST /api/workflows/run` | `{source, args?, name?, budget_total?, timeout_secs?}` | `{run_id}` or `{error}` (400) |
-| `POST /api/workflows/run_intent` | `{intent, args?, name?, budget_total?, timeout_secs?}` | `{run_id}` immediately |
+| `POST /api/workflows/run_intent` | `{intent, author_agent?, author_model?, args?, name?, budget_total?, timeout_secs?}` | `{run_id}` immediately |
 | `GET /api/workflows/runs` | | `{runs: [...]}` compact, newest first |
 | `GET /api/workflows/runs/{run_id}` | | full snapshot incl. `events` (404 if absent) |
 | `POST /api/workflows/runs/{run_id}/promote` | `{name?, description?, slug?}` | save exact source from a finished run or paused TaskRunner plan; 404 when unknown, 409 when not promotable or only a restored redacted source remains |

@@ -20,6 +20,36 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.mark.parametrize(
+    "handler,method_name",
+    [
+        (api_workflow_author, "author"),
+        (api_workflow_run_intent, "start_from_intent"),
+    ],
+)
+@pytest.mark.parametrize(
+    "selection",
+    [
+        {"author_agent": "chosen-agent", "author_model": "chosen-model"},
+        {"author_agent": ["invalid"]},
+        {"author_model": {"invalid": True}},
+    ],
+)
+async def test_author_selection_http_contract(handler, method_name, selection):
+    method = AsyncMock(return_value={"ok": True, "run_id": "wf_test"})
+    app = web.Application()
+    app["state"] = SimpleNamespace(workflow_service=SimpleNamespace(**{method_name: method}))
+    app.router.add_post("/author", handler)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/author", json={"intent": "draft", **selection})
+    if all(isinstance(value, str) for value in selection.values()):
+        assert response.status == 200
+        assert method.await_args.kwargs.items() >= selection.items()
+    else:
+        assert response.status == 400
+        method.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
     ("route", "path", "handler", "service_method"),
     [
         ("/api/workflows/author", "/api/workflows/author", api_workflow_author, "author"),
@@ -112,10 +142,7 @@ async def test_runs_list_is_compact_and_detail_carries_result() -> None:
     Both read endpoints redact + serialize on a worker thread; the response
     must still be well-formed JSON.
     """
-    from kiro_crew.dashboard.handlers.workflows import (
-        api_workflow_run_get,
-        api_workflow_runs,
-    )
+    from kiro_crew.dashboard.handlers.workflows import api_workflow_run_get, api_workflow_runs
 
     big_result = {"report": "x" * 50_000}
     compact_row = {"run_id": "wf_1", "name": "d", "status": "finished"}

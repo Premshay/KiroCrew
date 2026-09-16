@@ -665,6 +665,17 @@ class TestSpawnSubAgentsValidation:
 
 
 class TestWorkflowAuthor:
+    def test_author_selection_is_forwarded(self):
+        with patch.object(mcp_core, "_post", return_value={"ok": True, "source": "pass"}) as post:
+            _call_tool(
+                "workflow_author",
+                {"intent": "draft", "author_agent": "chosen-agent", "author_model": "chosen-model"},
+            )
+        post.assert_called_once_with(
+            "/api/workflows/author",
+            {"intent": "draft", "author_agent": "chosen-agent", "author_model": "chosen-model"},
+        )
+
     def test_transport_error_is_surfaced(self):
         with patch.object(mcp_core, "_post", return_value={"error": "refused"}):
             out = _call_tool("workflow_author", {"intent": "do a thing"})
@@ -696,6 +707,17 @@ class TestWorkflowAuthor:
 
 
 class TestWorkflowRun:
+    def test_author_selection_is_forwarded_for_intent(self):
+        with patch.object(mcp_core, "_post", return_value={"run_id": "wf_test"}) as post:
+            _call_tool(
+                "workflow_run",
+                {"intent": "draft", "author_agent": "chosen-agent", "author_model": "chosen-model"},
+            )
+        post.assert_called_once_with(
+            "/api/workflows/run_intent",
+            {"intent": "draft", "author_agent": "chosen-agent", "author_model": "chosen-model"},
+        )
+
     def test_refuses_to_start_without_strict_session_identity(self):
         with (
             patch.object(mcp_core, "_resolve_session_key_strict", return_value=""),
