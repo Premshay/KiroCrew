@@ -89,7 +89,9 @@ def _explicit_worker_count(args: list[str]) -> int | None:
             values.append(args[index + 1])
             index += 2
             continue
-        if arg.startswith("-n") and len(arg) > 2:
+        if arg.startswith("-n="):
+            values.append(arg[3:])
+        elif arg.startswith("-n") and len(arg) > 2:
             values.append(arg[2:])
         if arg.startswith("--numprocesses="):
             values.append(arg.split("=", 1)[1])

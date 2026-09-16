@@ -39,6 +39,8 @@ def wrapper(monkeypatch):
         (["-n", "auto"], 6),
         (["--numprocesses=logical"], 6),
         (["-n", "4"], 4),
+        (["-n=1"], 1),
+        (["-n=auto"], 6),
         (["-n", "0"], 1),
     ],
 )
