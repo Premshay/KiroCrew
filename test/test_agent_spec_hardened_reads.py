@@ -893,8 +893,16 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("agent_spec_lookup", "unknown"),
         ("migrate_agent_specs", "unknown"),
     ],
+    "kiro_crew/agent_capabilities.py": [("capability_publish", "dashboard")],
     "kiro_crew/agent_discovery.py": [
         ("forward:operation", "forward:source"),
+        ("forward:operation", "forward:source"),
+        # ``spec_by_declared_name`` scans specs it did not name for whichever
+        # surface resolves an agent id and finds no ``<agent_id>.json``; it
+        # forwards so each such surface attributes its own denials.
+        ("forward:operation", "forward:source"),
+        # ``agent_spec_stems`` reads each ``*.md`` to decide whether it is a
+        # spec at all, for the Slack listings; it forwards for the same reason.
         ("forward:operation", "forward:source"),
         ("list_agents", "unknown"),
         ("list_agents", "unknown"),
@@ -1058,10 +1066,36 @@ _EXPECTED_PARSED_SPECS_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
 # The ratchet's coverage: every attribution-labelled helper in the module, with
 # its exact call-site inventory. Extending attribution to a new helper means
 # adding it here so its callers keep the two vocabularies separate too.
+# The declared-name scan serves the two surfaces that resolve an agent id
+# through it when they find no ``<agent_id>.json``: the KAS projection that
+# starts the session, and the tool-policy read that session's managed MCP
+# servers make. It reads specs it did not name in a user-writable directory, so
+# every caller names the surface whose resolution the denial belongs to.
+_EXPECTED_DECLARED_NAME_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/acp/kas_agents.py": [("kas_agent_projection", "unknown")],
+    "kiro_crew/dashboard/handlers/sessions.py": [("session_tool_policy", "dashboard")],
+}
+
+
+# The strict reader is the direct-filename read for the three surfaces that
+# need the failure CLASS (transient vs deterministic) rather than ``None``: the
+# KAS projection, the overlay rewriter and the tool-policy read. Each names
+# itself so a sensitive-target denial is attributed to the surface that asked.
+_EXPECTED_STRICT_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/acp/kas_agents.py": [("kas_agent_projection", "unknown")],
+    "kiro_crew/dashboard/handlers/sessions.py": [("session_tool_policy", "dashboard")],
+    "kiro_crew/doctor_deadpath.py": [("doctor", "cli")],
+    "kiro_crew/mcp_gateway/rewriter.py": [("mcp_overlay_rewrite", "unknown")],
+    "kiro_crew/slack/handler.py": [("slack_resolve_agent", "slack")],
+}
+
+
 _RATCHET_INVENTORY: dict[str, dict[str, list[tuple[str, str]]]] = {
     "_read_agent_spec": _EXPECTED_CALL_SITE_LABELS,
     "parsed_agent_specs": _EXPECTED_PARSED_SPECS_CALL_SITE_LABELS,
     "project_agent_names": _EXPECTED_PROJECT_NAMES_CALL_SITE_LABELS,
+    "read_agent_spec_strict": _EXPECTED_STRICT_CALL_SITE_LABELS,
+    "spec_by_declared_name": _EXPECTED_DECLARED_NAME_CALL_SITE_LABELS,
     "warm_project_agent_names": _EXPECTED_WARM_CALL_SITE_LABELS,
 }
 

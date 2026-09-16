@@ -1,6 +1,7 @@
 """Tests for ACP client."""
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -635,6 +636,15 @@ class TestAcpClientSessionKey:
                 "kiro_crew.acp.client._resolve_claude_acp_bin",
                 return_value=(["/usr/bin/node", "/x/acp.js"], ""),
             ),
+            # ``_spawn`` fills CLAUDE_CODE_EXECUTABLE from
+            # ``_resolve_claude_code_executable`` when the env does not carry it,
+            # and that resolver shells out to the host's ``mise`` first. This test
+            # is about the env being forwarded, not about where ``claude`` lives,
+            # so pin the answer instead of depending on the developer's toolchain.
+            patch(
+                "kiro_crew.acp.client._resolve_claude_code_executable",
+                return_value="/usr/local/bin/claude",
+            ),
             patch(
                 "kiro_crew.acp.client.wrap_argv",
                 return_value=(["/usr/bin/node", "/x/acp.js"], None),
@@ -1018,6 +1028,12 @@ class TestAcpClientBackendSelection:
                 ),
             ),
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
+            # The claude path also resolves CLAUDE_CODE_EXECUTABLE through the
+            # host's ``mise``; the subject here is the argv, so pin the resolver.
+            patch(
+                "kiro_crew.acp.client._resolve_claude_code_executable",
+                return_value="/usr/local/bin/claude",
+            ),
             patch(
                 "kiro_crew.acp.client.wrap_argv",
                 side_effect=lambda argv, mode, **kwargs: (argv, None),
@@ -7562,19 +7578,37 @@ class TestExtractToolCallUpdate:
         assert event.tool_output == "real output"
         assert "exitCode" not in event.tool_output
 
-    def test_empty_items_envelope_still_returns_none(self):
-        """The gate is the ABSENCE of ``items``, so kiro-cli's space is unchanged."""
+    def test_outputless_terminal_updates_return_status_only_results(self):
         client = self._client()
-        for shape in ({"items": []}, {"items": [{"Text": ""}]}, {}):
-            msg = self._make_msg(
-                {
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": "tc-empty",
-                    "status": "completed",
-                    "rawOutput": shape,
-                }
-            )
-            assert client._extract_tool_call_update(msg) is None, shape
+        for status in ("completed", "failed"):
+            for shape in ({"items": []}, {"items": [{"Text": ""}]}, {}):
+                msg = self._make_msg(
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tc-empty",
+                        "status": status,
+                        "rawOutput": shape,
+                    }
+                )
+                event = client._extract_tool_call_update(msg)
+                assert (
+                    event is not None
+                ), f"terminal status {status} was discarded without a result event"
+                assert event.tool_status == status
+                assert event.tool_final is (status == "completed")
+                assert event.tool_output == "", "a status-only result invented tool output"
+
+    def test_outputless_nonterminal_update_returns_none(self):
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-empty",
+                "status": "in_progress",
+                "rawOutput": {"items": []},
+            }
+        )
+        assert client._extract_tool_call_update(msg) is None
 
     def test_credential_straddling_the_bound_is_still_redacted(self):
         """The 8000-char bound must be applied AFTER redaction, not before.
@@ -7610,6 +7644,57 @@ class TestExtractToolCallUpdate:
         assert event is not None
         assert secret not in event.tool_output
         assert len(event.tool_output) <= 8000
+
+    def test_long_output_metadata_covers_full_redacted_text(self, monkeypatch):
+        monkeypatch.setenv("KIROCREW_SESSION_LEDGER", "1")
+        output = "A" * 8000 + "é-tail"
+        full_redacted = acp_client.redact_text(output)
+        full_bytes = full_redacted.encode("utf-8", "replace")
+        prefix_bytes = full_redacted[:8000].encode("utf-8", "replace")
+
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-long",
+                "status": "completed",
+                "rawOutput": {"items": [{"Text": output}]},
+            }
+        )
+        event = client._extract_tool_call_update(msg)
+        assert event is not None
+        assert event.tool_output == full_redacted[:8000]
+        assert event.tool_output_bytes == len(
+            full_bytes
+        ), f"parser recorded {event.tool_output_bytes} bytes from truncated output"
+        assert event.tool_output_bytes != len(prefix_bytes)
+        assert (
+            event.tool_output_digest == hashlib.sha256(full_bytes).hexdigest()
+        ), "parser digested truncated display prefix instead of full redacted output"
+
+    def test_no_output_metadata_is_measured_while_the_ledger_is_off(self, monkeypatch):
+        """With the ledger off the pair is absent, not a measurement of nothing.
+
+        The digest and byte count have one consumer, the flag-gated emitter, and a
+        tool result is as large as a file the model just printed -- so hashing one
+        while nothing will read it is work the default path must not do. ``-1``
+        distinguishes "not recorded" from a real zero-length output.
+        """
+        monkeypatch.delenv("KIROCREW_SESSION_LEDGER", raising=False)
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-off",
+                "status": "completed",
+                "rawOutput": {"items": [{"Text": "measured-only-when-on"}]},
+            }
+        )
+        event = client._extract_tool_call_update(msg)
+        assert event is not None
+        assert event.tool_output == "measured-only-when-on"
+        assert event.tool_output_bytes == -1, "the parser measured with the ledger off"
+        assert event.tool_output_digest == "", "the parser digested with the ledger off"
 
     def test_raw_output_json_fallback(self):
         client = self._client()
@@ -7731,7 +7816,14 @@ class TestExtractToolCallUpdate:
             }
         )
 
-        assert client._extract_tool_call_update(msg) is None
+        event = client._extract_tool_call_update(msg)
+        assert event is not None
+        assert event.kind == "tool_result"
+        assert event.tool_call_id == "compact-2"
+        assert event.tool_final is True
+        assert event.tool_status == "completed"
+        assert event.tool_output == ""
+        assert event.is_context_compaction is True
         assert client.last_prompt_stats.context_pct == 0.0
         assert client.last_prompt_stats.context_used_tokens == 0
         assert client.last_prompt_stats.context_pct_unknown is True

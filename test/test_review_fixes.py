@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+from conftest import forget_env_at_teardown
 from kiro_crew.security import audit_bash_command
 
 
@@ -148,8 +149,9 @@ class TestEnvPermissions:
 
     def test_env_permission_repair_is_posix_only(self, tmp_path: object, monkeypatch) -> None:
         """On Windows the chmod is a silent no-op for ACLs, and the real
-        lockdown (platform_compat.restrict_to_owner) spawns icacls — a
-        blocking subprocess this loop-reachable reader must never run. The
+        lockdown (platform_compat.restrict_to_owner) is a DACL write that
+        can block on a network volume round-trip — a cost this
+        loop-reachable reader must never pay. The
         repair must not even attempt a chmod there: Windows enforcement lives
         where the file is written (setup wizard, dashboard credential
         writers), all off the loop."""
@@ -309,11 +311,14 @@ class TestObserveModeAuthFilter:
 class TestLoaderChmodWarning:
     """Guard test for loader.py chmod warning on failure (L1219-1222)."""
 
-    def test_chmod_enforced_on_open_permissions(self, tmp_path: object) -> None:
+    def test_chmod_enforced_on_open_permissions(self, tmp_path: object, monkeypatch) -> None:
         from pathlib import Path
 
         from kiro_crew.config.loader import KiroCrewConfig
 
+        # load_credentials() seeds os.environ with every key it reads, so the
+        # fixture key below would otherwise outlive this test.
+        forget_env_at_teardown(monkeypatch, "TEST_KEY")
         tmp = Path(str(tmp_path))
         env_file = tmp / ".env"
         env_file.write_text("TEST_KEY=value\n")

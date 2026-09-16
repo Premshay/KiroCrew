@@ -46,6 +46,7 @@ class _SessionEntry(Protocol):
     provider: Any
     semaphore: asyncio.BoundedSemaphore
     first_turn: object
+    provider_switch_replay: bool
     retire_on_identity_change: bool
     prev_turn_cancelled: bool
 
@@ -215,6 +216,19 @@ class SessionLifecycleState:
     suppress_replay: set[str] = field(default_factory=set)
     origin_links: dict[str, Any] = field(default_factory=dict)
     on_recycled: _RecycleCallback | None = None
+    # Per-session-key count of Stop requests, keyed by folded key. Bumped by
+    # :meth:`SessionLifecycleService.stop_turn` BEFORE the provider cancel is
+    # awaited, so a turn runner that snapshots the count at turn start and
+    # re-reads it at its end-of-turn gates sees a Stop from ANY surface that
+    # reaches this session -- the dashboard, a linked channel command, a
+    # transport's stop verb -- not only the one that owns the runner's slot.
+    # Monotonic across ``reset``: a hard stop resets the session object, so a
+    # flag on the session itself would vanish with the very turn it stopped.
+    # Popped on the teardown paths that end the key's conversation for good
+    # (``remove``, ``remove_if_unclaimed``, ``destroy``, the identity sweep),
+    # beside the sibling per-key dicts, so a long-lived gateway does not keep
+    # one entry per channel thread it ever stopped.
+    stop_requests: dict[str, int] = field(default_factory=dict)
 
 
 class SessionLifecycleService:
@@ -237,6 +251,15 @@ class SessionLifecycleService:
     @_identity_sweep_lock.setter
     def _identity_sweep_lock(self, lock: asyncio.Lock) -> None:
         self.state.identity_sweep_lock = lock
+
+    def stop_generation(self, key: str) -> int:
+        """How many Stop requests :meth:`stop_turn` has recorded for *key*.
+
+        Monotonic per folded key; 0 for a key never stopped. A turn runner
+        snapshots this at turn start and treats any later change as a user
+        Stop, whichever surface issued it.
+        """
+        return self.state.stop_requests.get(self._owner._fold_key(key), 0)
 
     @property
     def _recycling(self) -> dict[str, _SessionEntry]:
@@ -452,6 +475,24 @@ class SessionLifecycleService:
                 # this session's. The pop and the sample happen before this call's
                 # own suspension point, so that ordering still holds; only the
                 # crumb unlink is deferred to a worker.
+                # Append-only session ledger (flag-gated, fail-soft). Reset is
+                # the teardown that ends a ledger's life, since the successor
+                # cold-starts a new ACP session id. Written BEFORE the await
+                # below: the emitter hands the entry to its own thread and
+                # returns, so this adds no suspension point, while writing it
+                # after would let a live turn's entries take a lower seq than the
+                # teardown that already happened. Entries from turns that were
+                # in flight still follow it -- see `on_session_closed` -- but the
+                # teardown's own position stays where the decision was made.
+                # Deferred, not module-scope: this module is reached from the gateway
+                # boot path, and AUTOSDE's no-new-work-on-gateway-boot-path rule asks
+                # for a flag-gated subsystem's IMPORT to be gated, not just its use.
+                from kiro_crew import session_ledger_emit
+
+                session_ledger_emit.on_session_closed(
+                    session_ledger_emit.session_id_of(session.provider),
+                    END_REASON_RESET,
+                )
                 await record_session_ended(key, end_reason=END_REASON_RESET)
         if clear_conversation and session is not None:
             # The registry lock, not an absence of suspension points, is what makes
@@ -568,6 +609,7 @@ class SessionLifecycleService:
             self._suppress_replay.discard(key)
             owner._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
+            self.state.stop_requests.pop(key, None)
             if session is not None:
                 # Same tick as the pop: see reset for why recording after the
                 # teardown awaits would consume a successor's start.
@@ -620,6 +662,7 @@ class SessionLifecycleService:
                         owner._compact_cooldown_until.pop(key, None)
                         self._suppress_replay.discard(key)
                         self._origin_links.pop(key, None)
+                        self.state.stop_requests.pop(key, None)
                         retired_keys.append(key)
                         # Do not clear _compact_pending_verdict: the identity
                         # recycle preserves that deferred verdict.
@@ -759,6 +802,7 @@ class SessionLifecycleService:
             self._suppress_replay.discard(key)
             owner._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
+            self.state.stop_requests.pop(key, None)
             # Same tick as the removal: see reset.
             await record_session_ended(key, end_reason=END_REASON_UNCLAIMED)
         await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
@@ -811,6 +855,7 @@ class SessionLifecycleService:
             owner._compact_cooldown_until.pop(key, None)
             self._suppress_replay.discard(key)
             owner._compact_pending_verdict.pop(key, None)
+            self.state.stop_requests.pop(key, None)
             # Ordinary permanent destroy starts a new conversation on reuse and
             # therefore clears the old threshold. History deletion can race a
             # same-key transcript claim in another process, so its explicit
@@ -1074,17 +1119,13 @@ class SessionLifecycleService:
 
         async with owner._lock:
             for key, sess in owner._sessions.items():
-                # Resumability, not provider identity, decides whether a
-                # mapping is worth saving — so the key test comes first and
-                # ``_store_provider_mapping`` answers the rest through the
-                # provider-native contract (``session_id`` /
-                # ``session_provider_label`` / ``cwd``). The two isinstance
-                # branches this replaces recognised only AcpProvider and
-                # ClaudeCodeProvider, so any third provider silently lost its
-                # resume mapping on every shutdown.
-                if key != constants.background_key and (
-                    not any(key.startswith(prefix) for prefix in constants.stateless_prefixes)
-                    or owner._is_continuable_key(key)
+                if (
+                    not sess.provider_switch_replay
+                    and key != constants.background_key
+                    and (
+                        not any(key.startswith(prefix) for prefix in constants.stateless_prefixes)
+                        or owner._is_continuable_key(key)
+                    )
                 ):
                     owner._store_provider_mapping(key, sess.provider)
 
@@ -1175,6 +1216,11 @@ class SessionLifecycleService:
         if not session:
             return "idle"
 
+        # Record the Stop against the session key before anything is awaited:
+        # the runner's end-of-turn gates may run as soon as the provider's
+        # cancel lands, and `prev_turn_cancelled` (set only after the ack) is
+        # too late for them.
+        self.state.stop_requests[key] = self.state.stop_requests.get(key, 0) + 1
         if not preserve_queue:
             owner.clear_queue(key)
         budget: float = owner._cfg.agent.soft_stop_budget_secs

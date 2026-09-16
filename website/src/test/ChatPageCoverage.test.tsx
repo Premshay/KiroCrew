@@ -264,7 +264,6 @@ globalThis.fetch = vi.fn().mockResolvedValue({
 }) as never
 
 import ChatPage from '../pages/ChatPage'
-import PanelToggles from '../components/PanelToggles'
 
 // --- Fixtures ---------------------------------------------------------------
 
@@ -338,7 +337,6 @@ function renderChatPage(messages: ChatMessage[], opts: RenderOpts = {}) {
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter initialEntries={['/chat/chat-1']}>
-            <PanelToggles showWorkspace />
             <Routes>
               <Route path="/chat/:slug?" element={<ChatPage mode="" />} />
             </Routes>
@@ -918,7 +916,7 @@ describe('ChatPage pinned-messages panel', () => {
    *  contract ChatPage passes it has been recorded. */
   async function openPins(messages: ChatMessage[], opts: RenderOpts = {}) {
     renderChatPage(messages, opts)
-    fireEvent.click(await screen.findByLabelText('Toggle side panel'))
+    fireEvent.click(await screen.findByLabelText('Open activity panel'))
     await waitFor(() => expect(pinsProps).not.toBeNull())
   }
 

@@ -4,7 +4,18 @@
 
 The Slack integration (`kiro_crew/slack/`) connects KiroCrew to Slack via Socket Mode. DMs are routed through ACP to kiro-cli with real-time streaming and interactive tool approval.
 
+Independently scheduled agent runs admit their exact execution key as durable
+work before provider allocation, publishing its privacy mode in the existing
+protected runtime-policy tree. Single and sequential-agent paths share that
+admission, so first-turn child creation does not require a dashboard slot or a
+previous transcript. A damaged committed mode refuses allocation; a key prefix
+alone never grants a mode. Origin-chat injection keeps the chat's own policy.
+
 Startup wires memory objects behind one gateway-lifetime in-process barrier.
+Both dashboard and API-only servers receive the orchestrator's existing context
+builder. Post-bind workflow initialization uses that same object for essentials
+and store-bound context; it does not construct a second memory stack or add
+pre-bind memory reads.
 After the dashboard binds, one tracked worker activates pending V1 and V2 restores before opening any memory database or
 markdown/FTS store. It clears a previous gateway's cached handles, initializes the
 already-wired Global store and rebuilds FTS before releasing memory access.
@@ -384,7 +395,7 @@ Slack `file_share` messages are processed in `_route_message()` after dedup + au
 - Tool calls shown inline as 🔧 _tool name_
 - **Thinking/reasoning content** filtered from the main response — accumulated separately and posted as a 💭 thread reply after the main message. Inline `<thinking>` / `</thinking>` tags are also stripped as a safety net. The thread reply is suppressed when `slack.show_thinking` is `false` (default `true`).
 - Final message split into multiple posts if over 3900 chars (via `split_message()`)
-- **Credential-redaction notice** — when the delivered text (answer or thinking) still carries a `security.CREDENTIAL_REDACTION_TAGS` placeholder, one `messaging.renderer.credential_redaction_notice` message is posted in the thread after the answer is committed, so the reader knows a command they copy will not run as pasted. Redaction is NOT relaxed — Slack is an egress path. Counted from the tag in the sent text rather than the redactor's warnings list, which is empty on the streaming path because each chunk was already redacted upstream. **One notice per turn**: answer and thinking share a single tally. Approving a review-mode draft (`interactions.py`) posts the same notice for the same reason, since that publishes to the whole channel. Both posts are best-effort — a failed notice must never turn a delivered answer into a failed turn
+- **Redaction notice** — when the delivered text (answer or thinking) still carries a `security.CREDENTIAL_REDACTION_TAGS` placeholder or a `security.EXFILTRATION_REDACTION_TAG_PREFIX` (suspicious-URL) placeholder, one `messaging.renderer.redaction_notice` message is posted in the thread after the answer is committed, so the reader knows a command or link they copy will not run as pasted. Worded by kind (credential → re-enter the secret; URL → re-check the link), and byte-identical to the prior `credential_redaction_notice` sentence when only credentials were rewritten. Redaction is NOT relaxed — Slack is an egress path. Counted from the tag in the sent text rather than the redactor's warnings list, which is empty on the streaming path because each chunk was already redacted upstream. **One notice per turn**: answer and thinking share a single tally. Approving a review-mode draft (`interactions.py`) posts the same notice for the same reason, since that publishes to the whole channel. Both posts are best-effort — a failed notice must never turn a delivered answer into a failed turn
 
 ## Message Queue (`session.py` + `events.py`)
 

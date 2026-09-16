@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -32,6 +32,8 @@ from kiro_crew.acp._dispatch import (
     build_permission_event,
     classify_notification,
     error_is_refusal_terminal,
+    identified_mcp_call,
+    is_mcp_tool_approval,
     parse_metadata,
     parse_prompt_token_usage,
     parse_refusal,
@@ -41,13 +43,13 @@ from kiro_crew.acp._dispatch import (
     parse_usage_update,
     redact_text,
     reject_option_id,
+    scoped_tool_cache_key,
     set_mode_params,
     set_model_params,
 )
 from kiro_crew.acp.client import (
-    ACP_EFFORT_CONFIG_IDS,
     _COMPACTION_FAILED_TURN_BUDGET,
-    _JSONRPC_INVALID_PARAMS,
+    ACP_EFFORT_CONFIG_IDS,
     DEFAULT_MODEL,
     AcpClient,
     AcpError,
@@ -56,9 +58,11 @@ from kiro_crew.acp.client import (
     AcpTimeoutError,
     AcpToolGateUnroutable,
     _effective_prompt_timeout_async,
+    _is_config_value_rejection,
     _is_safe_oauth_url,
     _is_tool_interrupted_marker,
     _jsonrpc_error_code,
+    _push_model_via_effort_split,
     _raise_acp_error,
     acp_config_option,
     acp_config_option_values,
@@ -90,6 +94,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_STEER,
     EVENT_AGENT_SWITCHED,
@@ -122,6 +127,9 @@ from kiro_crew.acp.types import (
     OUTCOME_SELECTED,
     STOP_REASON_CANCELLED,
     STOP_REASON_COMPACTION_FAILED,
+    STOP_REASON_CONTENT_FILTERED_WIRE,
+    STOP_REASON_END_TURN,
+    STOP_REASON_REFUSAL,
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
     UPDATE_CURRENT_MODE,
@@ -141,6 +149,24 @@ from kiro_crew.sel import sel
 logger = logging.getLogger(__name__)
 
 # ── Constants ──
+
+# The stopReason values the pre-turn drain may NAME in its warning: the closed
+# protocol values (``types.STOP_REASON_*``) only. A discarded terminal whose
+# stopReason is any other wire string still COUNTS, but its value is logged as
+# a placeholder — an unrecognized string could carry anything, and frame
+# content never belongs in a log (the closed-values discipline of
+# ``chat_runner``'s empty-turn line).
+_DRAIN_CLOSED_STOP_REASONS = frozenset(
+    (
+        STOP_REASON_CANCELLED,
+        STOP_REASON_COMPACTION_FAILED,
+        STOP_REASON_CONTENT_FILTERED_WIRE,
+        STOP_REASON_END_TURN,
+        STOP_REASON_REFUSAL,
+        STOP_REASON_STALE_RECOVER,
+        STOP_REASON_TOOL_STALL,
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -416,6 +442,35 @@ def parse_advertised_models(resp: dict[str, Any]) -> list[dict[str, str]]:
     return []
 
 
+def _select_options(entries: object) -> list[dict[str, Any]]:
+    """Flatten one level of provider GROUPS out of a select's option list.
+
+    ACP lets a select group its options: an entry may carry no ``value`` of its own
+    and hold its real choices in a nested ``options`` list instead. A filter that
+    keeps only entries with a ``value`` therefore empties on a grouped select, and an
+    empty list reads as "this harness advertised no models" -- which for a harness
+    whose advertised list is the ONLY vocabulary its ``set_config_option`` accepts
+    means no model can ever be offered or resolved. ONE level, deliberately: a group
+    holding groups is not a shape any harness here serves, and recursing without
+    bound would let a malformed payload spin. Both levels are narrowed against
+    non-list wire data, so a malformed group is skipped rather than aborting the list.
+    """
+    flattened: list[dict[str, Any]] = []
+    if not isinstance(entries, list):
+        return flattened
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("value"):
+            flattened.append(entry)
+            continue
+        nested = entry.get("options")
+        if not isinstance(nested, list):
+            continue
+        flattened.extend(o for o in nested if isinstance(o, dict) and o.get("value"))
+    return flattened
+
+
 def models_from_config_options(resp: dict[str, Any], backend: str) -> dict[str, Any] | None:
     """A ``models`` envelope synthesized from a ``model`` select, or ``None``.
 
@@ -436,7 +491,7 @@ def models_from_config_options(resp: dict[str, Any], backend: str) -> dict[str, 
     for opt in resp.get("configOptions") or []:
         if not isinstance(opt, dict) or opt.get("id") != "model" or opt.get("type") != "select":
             continue
-        options = [o for o in opt.get("options") or [] if isinstance(o, dict) and o.get("value")]
+        options = _select_options(opt.get("options"))
         if not options:
             return None
         envelope: dict[str, Any] = {
@@ -631,11 +686,19 @@ class AcpSessionHandle:
         crew_agent: str = "",
     ) -> None:
         self._session_id = session_id
+        self.native_context_documents: dict[str, str] = {}
         self._queue = queue
         self._runtime = runtime
         # When True, destroy() skips the transcript unlink (subagent
         # continuability: the transcript is spawn_continue's resume material).
         self.keep_transcript = False
+        # Token carried by THIS session's injected broker-stub entries
+        # (``mcp_gateway.claim.mint_stub_session_token``), set by the runtime
+        # that created the session. It is what a later claim-push names so
+        # gatewayd re-targets this session's stub connections and not every
+        # session's on the shared runtime. Empty when the gateway injected no
+        # stubs. Never logged: it is a bearer name for this session's identity.
+        self.stub_session_token: str = ""
         # Watchdog windows are snapshotted here (construction time) so the
         # dispatch loop never reads config; the liveness oracle carries the
         # per-session evidence state (tracked child, counter samples).
@@ -733,6 +796,7 @@ class AcpSessionHandle:
         # toolCallId -> redacted input string, written by the shared parser so a
         # later tool result can recover its originating input (mirrors AcpClient).
         self._tool_call_inputs: dict[str, str] = {}
+        self._tool_call_input_redacted: dict[str, bool] = {}
         # toolCallId -> is_shell, cached from the tool_call notification so the
         # later permission_request event (which carries no trusted kind) can
         # inherit the canonical shell signal. Mirrors AcpClient's cache and is
@@ -771,6 +835,14 @@ class AcpSessionHandle:
         # per sessionId before this handle's queue exists, so the report is
         # genuinely this session's and not the process's.
         self._mcp_report = McpSessionReport()
+        # (server, tool) pairs this session's agent spec switches off, set by the
+        # runtime from the mirror's session projection. The wire cannot carry the
+        # restriction on a mirrored host -- there is no per-tool deny channel in
+        # ``mcpServers`` -- so it is honoured at the permission request instead.
+        # Empty for every host whose MCP surface needs no projection, which makes
+        # ``_deny_spec_disabled_tool`` a single falsy read on those sessions.
+        # Mirrors ``AcpClient._spec_denied_tools``.
+        self.spec_denied_tools: frozenset[tuple[str, str]] = frozenset()
         # JSON-RPC request id -> {"once","always","reject"} optionId map, so
         # approve_tool / reject_tool echo the exact ids the agent advertised
         # (kiro "allow_once"/"allow_always"; claude-agent-acp "allow"/"reject").
@@ -783,6 +855,7 @@ class AcpSessionHandle:
         self.last_prompt_stats = AcpPromptStats()
         # State tracking (populated from session/new response via store_session_config)
         self._model: str = ""
+        self.active_agent: str = ""
         # Model id kiro-cli RESOLVED the session to (from currentModelId in the
         # session/new|load response), kept separate from _model (the user-picked
         # alias) so it feeds ONLY the context-window backfill — never slot.model
@@ -1018,6 +1091,7 @@ class AcpSessionHandle:
         self._retire_liveness_state()
         self._working_logged_ts = _WORKING_NEVER_LOGGED
         self._tool_call_inputs.clear()
+        self._tool_call_input_redacted.clear()
         self._tool_call_is_shell.clear()
         self._tool_call_raw_params.clear()
         self._tool_call_diff_path.clear()
@@ -1053,9 +1127,13 @@ class AcpSessionHandle:
         # with no attributable cause. Count them and say how many, ONCE. Never
         # what they were: a frame carries model text, tool arguments and tool
         # results, and none of that belongs in a log — nor its size, which leaks
-        # response length. The count is bounded by the queue, and the log line is
-        # one per turn regardless of how many frames drained.
+        # response length. The one exception is a discarded terminal's
+        # stopReason, logged only as a closed protocol value (see
+        # _DRAIN_CLOSED_STOP_REASONS). The count is bounded by the queue, and
+        # the log line is one per turn regardless of how many frames drained.
         _stale_dropped = 0
+        _stale_terminals = 0
+        _stale_reasons: list[str] = []
         while True:
             try:
                 stale = self._queue.get_nowait()
@@ -1128,15 +1206,62 @@ class AcpSessionHandle:
             else:
                 # Everything that is not a permission request is DISCARDED, which
                 # is correct (it belongs to a turn nobody is reading any more) but
-                # was silent. Count it.
+                # was silent. Count it — and CLASSIFY it: a response (``method``
+                # is None, ``id`` set — a request can never have ``method`` None,
+                # so a terminal cannot reach the branch above) whose result
+                # carries a non-empty string ``stopReason`` is by construction
+                # the abandoned turn's terminal, read exactly as the live turn
+                # reads its own; an ERROR response is terminal-shaped too
+                # (_run_turn ends the turn on one), with no stopReason to name —
+                # but it is NOT attributed to the abandoned turn, because a late
+                # error answer to a concurrently timed-out command call
+                # (send_command / compact / set_config_option, re-injected by
+                # _wait_for_response's finally) is indistinguishable here. The
+                # warning below states the shape, never the owner. The isinstance
+                # guard on the leaf mirrors _dispatch.py's wire-stopReason
+                # reader: a truthy non-str here would raise on the set membership
+                # below, and this arm runs OUTSIDE the _turn_done restoration
+                # guard — an escape would wedge the handle permanently.
                 _stale_dropped += 1
+                if stale is not None and stale.method is None and stale.id is not None:
+                    _stale_result = stale.result or {}
+                    _stale_reason = ""
+                    if isinstance(_stale_result, dict):
+                        _stale_reason = _stale_result.get("stopReason", "")
+                    if isinstance(_stale_reason, str) and _stale_reason.strip():
+                        _stale_terminals += 1
+                        _stale_cleaned = _stale_reason.strip()
+                        if _stale_cleaned in _DRAIN_CLOSED_STOP_REASONS:
+                            _stale_reasons.append(_stale_cleaned)
+                        elif _stale_cleaned.upper() == STOP_REASON_CONTENT_FILTERED_WIRE:
+                            # The one spelling _dispatch.py also normalizes
+                            # case-insensitively; log the canonical constant.
+                            _stale_reasons.append(STOP_REASON_CONTENT_FILTERED_WIRE)
+                        else:
+                            _stale_reasons.append("<non-standard>")
+                    elif stale.error is not None:
+                        _stale_terminals += 1
 
         if _stale_dropped:
+            # One line per turn; count + terminal tally only. The stopReason
+            # clause names closed protocol values exclusively (see
+            # _DRAIN_CLOSED_STOP_REASONS), DISTINCT values once each (the queue
+            # is unbounded, so the clause must not grow per frame — the tally
+            # carries multiplicity), and is omitted when there were none — the
+            # explicit "0 of them" is the reassuring reading an operator could
+            # not get from the old hedge.
+            _stale_reason_note = (
+                " (stopReason: %s)" % ", ".join(sorted(set(_stale_reasons)))
+                if _stale_reasons
+                else ""
+            )
             logger.warning(
-                "pre-turn drain discarded %d leftover frame(s) from a prior "
-                "abandoned turn on this session; those frames — possibly "
-                "including that turn's terminal — reached no consumer",
+                "pre-turn drain discarded %d leftover frame(s) on this "
+                "session; %d of them were terminal-shaped responses%s — "
+                "those frames reached no consumer",
                 _stale_dropped,
+                _stale_terminals,
+                _stale_reason_note,
             )
 
         self.last_prompt_stats = self.last_prompt_stats.carry_over()
@@ -1409,14 +1534,160 @@ class AcpSessionHandle:
                 {"outcome": {"outcome": OUTCOME_CANCELLED}},
             )
 
+    async def _deny_spec_disabled_tool(self, event: AcpEvent) -> bool:
+        """Refuse a call the agent spec switched off. True when it was refused.
+
+        The mirrored counterpart of ``AcpClient._deny_spec_disabled_tool``, and the
+        identity read is the SAME function on both drivers
+        (:func:`~kiro_crew.acp._dispatch.identified_mcp_call`) rather than a second
+        copy of it -- a driver that read identity its own way would be a restriction
+        that holds on one transport and not the other.
+
+        Both drivers refuse on the same grounds: the pair is in this session's deny
+        set, proved from a channel the model cannot reach (the preceding
+        ``tool_call`` frame's own ``server``/``tool``, or the ``_meta`` identity the
+        harness published). A False means "not refused BY THIS", nothing more -- an
+        unidentifiable call is left to the consumer's own gate, exactly as it is on
+        the client's event-yielding path.
+
+        Refused HERE rather than after the yield, because a switched-off tool is not
+        a decision to offer anyone: a consumer that auto-approves on hooks or trust
+        would answer it without a human, and a human offered the choice is being
+        asked to re-decide something the spec already settled.
+
+        The reject is sent before the audit, and the audit runs off the loop, so an
+        audit failure cannot undo or delay the refusal.
+        """
+        if not self.spec_denied_tools:
+            return False
+        identity = identified_mcp_call(event)
+        if identity is None or identity not in self.spec_denied_tools:
+            return False
+        server, tool = identity
+        logger.warning(
+            "session MCP: refusing %r on %r -- the agent spec switches it off and this "
+            "transport has no wire channel for that restriction, so it is honoured at "
+            "the permission request [session=%s]",
+            tool,
+            server,
+            self._session_id,
+        )
+        await self.reject_tool(event.request_id)
+        self._audit_handle_reject(
+            event.request_id,
+            f"mcp__{server}__{tool}",
+            "spec_disabled_tool",
+            sub_session_id=event.sub_session_id or "",
+        )
+        return True
+
+    def _tripwire_spec_disabled_tool(self, result: AcpEvent, msg: JsonRpcMessage) -> None:
+        """Make a switched-off tool that RAN loud, whatever let it run.
+
+        The two refusals above fire on a permission REQUEST, and whether codex sends
+        one for a given call is the adapter's behaviour -- read from its source, not
+        measured here. This is the in-band check that does not depend on it: the
+        result frame for a completed call carries the same ``toolCallId`` the
+        ``tool_call`` frame cached its ``rawInput = {server, tool}`` under, so a
+        completed call whose pair is in the deny set is detectable from Crew's own
+        side of the wire -- read under the SAME origin-scoped key the ``tool_call``
+        frame wrote it under, because a bare id would miss on every session and read as
+        "this call carries no identity", which is the silent direction.
+
+        A TRIPWIRE, not enforcement -- the call has already run -- so it logs at
+        WARNING and audits as a security-relevant observation. That turns an adapter
+        release which stopped prompting from a silent drift into a red line in the
+        log and the SEL. Cheap (two dict lookups) and a no-op with an empty deny set,
+        which is every host that needs no projection.
+
+        The same authoring as ``AcpClient._tripwire_spec_disabled_tool``, because the
+        deny set has three readers on that driver and a transport carrying only two
+        of them is a restriction whose failure is invisible on one side.
+        """
+        if not self.spec_denied_tools or not result.tool_final:
+            return
+        scope = str((msg.params or {}).get("sessionId") or self._session_id)
+        params = self._tool_call_raw_params.get(
+            scoped_tool_cache_key(scope, result.tool_call_id or "")
+        )
+        if not isinstance(params, dict):
+            return
+        server, tool = params.get("server"), params.get("tool")
+        if not (isinstance(server, str) and isinstance(tool, str)):
+            return
+        if (server, tool) not in self.spec_denied_tools:
+            return
+        logger.warning(
+            "session MCP: a call to %r on %r COMPLETED although the agent spec switches it "
+            "off; the backend ran it without asking permission, so the per-call refusal "
+            "never saw it -- check the adapter's approval behaviour [session=%s]",
+            tool,
+            server,
+            self._session_id,
+        )
+        self._audit_handle_reject(
+            None,
+            f"mcp__{server}__{tool}",
+            "spec_disabled_tool_completed",
+            outcome="ran_despite_spec_disable",
+        )
+
+    async def _refuse_unidentifiable_mcp_approval(
+        self, msg: JsonRpcMessage, event: AcpEvent
+    ) -> bool:
+        """Refuse an MCP approval this session cannot check against its deny set.
+
+        ``AcpClient`` carries this refusal on ``_handle_permission`` alone, because
+        that is its site with no human. This handle has no second site: the event it
+        yields is what a consumer reads, and a consumer auto-approves by hook glob,
+        by ``auto_approve_tools`` pattern and in trust mode. So "unidentified" cannot
+        fall toward asking here either -- on a session whose spec switched tools off,
+        an MCP tool approval whose call cannot be identified is REFUSED.
+
+        Reachable rather than theoretical: codex marks its STANDALONE approval with
+        ``_meta.is_mcp_tool_approval`` too, and a standalone one has no preceding
+        ``tool_call`` frame, so nothing cached its ``(server, tool)``. Left to the
+        consumer, that is a switched-off tool running on an auto-approve.
+
+        Narrow by construction. It fires only on a session that HAS a deny set, which
+        is a mirrored host whose agent spec switched something off; every other
+        session reads one falsy attribute and returns. The tool name is the one thing
+        this record cannot say, so it is audited as ``mcp__unidentified``.
+        """
+        if not self.spec_denied_tools:
+            return False
+        if not is_mcp_tool_approval(msg, event) or identified_mcp_call(event) is not None:
+            return False
+        logger.warning(
+            "session MCP: refusing an MCP tool approval this session cannot identify -- "
+            "the agent spec switches tools off here and an unidentified call cannot be "
+            "checked against that, while a consumer may auto-approve it [session=%s]",
+            self._session_id,
+        )
+        await self.reject_tool(event.request_id)
+        self._audit_handle_reject(
+            event.request_id,
+            "mcp__unidentified",
+            "spec_disabled_tool_unidentified_call",
+            sub_session_id=event.sub_session_id or "",
+        )
+        return True
+
     def _audit_handle_reject(
         self,
         request_id: str | int | None,
         title: str,
         error: str,
         sub_session_id: str = "",
+        outcome: str = "denied",
     ) -> None:
-        """SEL-audit a permission request this handle rejected ITSELF.
+        """SEL-audit a permission decision this handle made ITSELF.
+
+        ``outcome`` is a parameter because one caller is not a rejection:
+        :meth:`_tripwire_spec_disabled_tool` records that a switched-off call RAN, and
+        writing that down as ``denied`` would put a false record in the SEL -- the one
+        place an operator goes to find out what happened. Every other caller takes the
+        default.
 
         The fail-close fidelity gate and the pre-turn drain answer requests
         that never reach a consumer, so no consumer-side audit fires — every
@@ -1455,7 +1726,7 @@ class AcpSessionHandle:
                     agent="kirocrew",
                     source="acp_session_handle",
                     tool_name=safe_title,
-                    outcome="denied",
+                    outcome=outcome,
                     request_id=rid,
                     error=error,
                 )
@@ -1470,6 +1741,8 @@ class AcpSessionHandle:
 
     async def set_mode(self, agent_name: str) -> None:
         """Activate an agent via session/set_mode."""
+        # send_request only queues the request; it does not await a mode ACK.
+        self.active_agent = ""
         await self._runtime.send_request(
             METHOD_SET_MODE,
             set_mode_params(self._session_id, agent_name),
@@ -1588,11 +1861,7 @@ class AcpSessionHandle:
                         MODEL_CONFIG_ID,
                     )
                     return ""
-                value_rejected = (
-                    f"config option {MODEL_CONFIG_ID}" in lowered
-                    or getattr(exc, "code", None) == _JSONRPC_INVALID_PARAMS
-                )
-                if not value_rejected:
+                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID):
                     raise
                 last_exc = exc
                 continue
@@ -1603,6 +1872,14 @@ class AcpSessionHandle:
                     cand,
                 )
             return cand
+        # Every spelling refused as one value. A ``<model>[<effort>]`` pair --
+        # the shape codex-acp advertises but its ``model`` option does not take --
+        # is applied as its two halves instead (shared seam with AcpClient).
+        split_applied = await _push_model_via_effort_split(
+            self, self._runtime.acp_backend, model_id
+        )
+        if split_applied:
+            return split_applied
         # Redacted through the platform context before the id reaches a log or an
         # exception message: it is caller-supplied text on a path that ends up in
         # front of a user, and this process can compose a companion redactor -- so
@@ -1610,14 +1887,27 @@ class AcpSessionHandle:
         # this file already makes for the unserved-default warning, which is the
         # same shape of value going to the same kind of place.
         _rejected_log = redact_log_via_context(str(model_id))
+        advertised_ids = self._advertised_model_ids()
         if strict:
-            raise AcpModelUnavailable(_rejected_log, self._advertised_model_ids()) from last_exc
+            raise AcpModelUnavailable(
+                _rejected_log,
+                advertised_ids,
+                # Only a pair-id harness earns the adapter-mismatch wording: on
+                # those the advertised list IS the entitlement, so refusing
+                # something on it is the adapter contradicting itself. Elsewhere an
+                # advertised id may simply be out of the account's reach, and the
+                # entitlement wording plus the `whoami` hint is the true answer.
+                advertised_but_refused=(
+                    model_id in advertised_ids
+                    and self._runtime.acp_backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
+                ),
+            ) from last_exc
         logger.warning(
             "ACP model %s rejected by the adapter; staying on the backend default %s "
             "(advertised: %s)",
             _rejected_log,
             self._resolved_model_id or DEFAULT_MODEL,
-            ", ".join(self._advertised_model_ids()) or "none",
+            ", ".join(advertised_ids) or "none",
         )
         return ""
 
@@ -2092,6 +2382,9 @@ class AcpSessionHandle:
 
         Called after create_session() or load() to populate state.
         """
+        modes = resp.get("modes")
+        current_agent = modes.get("currentModeId") if isinstance(modes, dict) else None
+        self.active_agent = current_agent if isinstance(current_agent, str) else ""
         config_options = resp.get("configOptions")
         if isinstance(config_options, list):
             self._config_options = config_options
@@ -2864,6 +3157,7 @@ class AcpSessionHandle:
                                     else ""
                                 )
                                 if name:
+                                    self.active_agent = name
                                     yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=name)
                     reason, _refusal = self.last_prompt_stats.terminal_refusal(reason)
                     self._last_stop_reason = reason
@@ -2902,6 +3196,14 @@ class AcpSessionHandle:
 
                 if action == "permission":
                     _perm_event = self._build_permission_event(msg)
+                    # Before the fidelity gate: a tool the spec switched off is
+                    # refused whether or not this consumer opted into the child
+                    # contract, and naming that reason in the audit is more use
+                    # than naming the fidelity one for the same rejected call.
+                    if await self._deny_spec_disabled_tool(_perm_event):
+                        continue
+                    if await self._refuse_unidentifiable_mcp_approval(msg, _perm_event):
+                        continue
                     if _perm_event.child_low_fidelity and not self.child_fidelity_aware:
                         # This consumer never opted into the child-fidelity
                         # contract: it would run its ordinary hook/trust
@@ -2947,6 +3249,10 @@ class AcpSessionHandle:
                     )
                 elif action == "update":
                     for ev in self._handle_update(msg):
+                        # Before the yield, so the observation is recorded even for a
+                        # consumer that stops pulling: the call already ran, and this
+                        # is the only in-band notice that it did.
+                        self._tripwire_spec_disabled_tool(ev, msg)
                         yield ev
                         # kiro-cli's built-in security filter can abort a turn's
                         # tools and emit ONLY this text marker — never a `complete`
@@ -3041,6 +3347,8 @@ class AcpSessionHandle:
                 elif action == "agent_switched":
                     saw_agent_switch = True
                     params = msg.params or {}
+                    name = params.get("agentName", "")
+                    self.active_agent = name if isinstance(name, str) else ""
                     yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=params.get("agentName", ""))
                 elif action == "subagent_list":
                     params = msg.params or {}
@@ -3718,6 +4026,7 @@ class AcpSessionHandle:
         event, recorded = build_permission_event(
             msg,
             tool_input_cache=self._tool_call_inputs,
+            tool_input_redacted_cache=self._tool_call_input_redacted,
             shell_cache=self._tool_call_is_shell,
             raw_params_cache=self._tool_call_raw_params,
             diff_path_cache=self._tool_call_diff_path,
@@ -4037,6 +4346,7 @@ class AcpSessionHandle:
             child_events = parse_session_update(
                 update,
                 tool_input_cache=self._tool_call_inputs,
+                tool_input_redacted_cache=self._tool_call_input_redacted,
                 shell_cache=self._tool_call_is_shell,
                 raw_params_cache=self._tool_call_raw_params,
                 diff_path_cache=self._tool_call_diff_path,
@@ -4139,6 +4449,7 @@ class AcpSessionHandle:
                     parse_session_update(
                         update,
                         tool_input_cache=self._tool_call_inputs,
+                        tool_input_redacted_cache=self._tool_call_input_redacted,
                         shell_cache=self._tool_call_is_shell,
                         raw_params_cache=self._tool_call_raw_params,
                         diff_path_cache=self._tool_call_diff_path,
@@ -4161,6 +4472,7 @@ class AcpSessionHandle:
         events = parse_session_update(
             update,
             tool_input_cache=self._tool_call_inputs,
+            tool_input_redacted_cache=self._tool_call_input_redacted,
             shell_cache=self._tool_call_is_shell,
             raw_params_cache=self._tool_call_raw_params,
             diff_path_cache=self._tool_call_diff_path,

@@ -2289,6 +2289,225 @@ async def test_dispatch_permission_request():
 
 
 @pytest.mark.asyncio
+async def test_a_spec_disabled_tool_is_refused_before_the_event_is_yielded():
+    """The deny set the mirror's projection returned is enforced in the dispatch loop.
+
+    Unit-testing ``_deny_spec_disabled_tool`` alone would pass on a loop that never
+    called it, and an unwired restriction on a host that approves its own tools is
+    the whole defect. So this drives the real loop: the ``tool_call`` frame seeds the
+    trusted identity cache, the approval arrives, and NOTHING is yielded -- a
+    consumer that auto-approves on hooks or trust must not get the chance, and a
+    human must not be asked to re-decide what the agent spec settled.
+    """
+    from kiro_crew.acp.types import (
+        EVENT_PERMISSION_REQUEST,
+        METHOD_REQUEST_PERMISSION,
+        METHOD_SESSION_UPDATE,
+    )
+
+    rt, reader, proc = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    # What AcpRuntime sets from the projection on a mirrored host.
+    handle.spec_denied_tools = frozenset({("kirocrew-core", "spawn_run")})
+    task = await _start_reader(rt)
+    try:
+        events = []
+
+        async def drive():
+            async for ev in handle.prompt("hi", timeout=3.0):
+                events.append(ev)
+
+        driver = asyncio.ensure_future(drive())
+        req_id = (await _await_routed(rt, "sA"))["sA"]
+        # The adapter's own resolution of what will run -- the one identity channel
+        # the model cannot reach.
+        _feed(
+            reader,
+            {
+                "method": METHOD_SESSION_UPDATE,
+                "params": {
+                    "sessionId": "sA",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tcD",
+                        "title": "mcp.kirocrew-core.spawn_run",
+                        "kind": "execute",
+                        "rawInput": {"server": "kirocrew-core", "tool": "spawn_run"},
+                    },
+                },
+            },
+        )
+        _feed(
+            reader,
+            {
+                "id": 6001,
+                "method": METHOD_REQUEST_PERMISSION,
+                "params": {
+                    "sessionId": "sA",
+                    "toolCall": {"kind": "execute", "toolCallId": "tcD"},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "cancel", "name": "Cancel", "kind": "reject_once"},
+                    ],
+                },
+            },
+        )
+        _feed(reader, {"id": req_id, "result": {"stopReason": "end_turn"}})
+        await asyncio.wait_for(driver, timeout=3.0)
+        assert [e for e in events if e.kind == EVENT_PERMISSION_REQUEST] == []
+        answered = [
+            json.loads(call.args[0].decode())
+            for call in proc.stdin.write.call_args_list
+            if b'"id": 6001' in call.args[0] or b'"id":6001' in call.args[0]
+        ]
+        assert answered, "the request must be ANSWERED, never dropped -- a dropped one hangs"
+        assert answered[-1]["result"]["outcome"] == {
+            "outcome": "selected",
+            "optionId": "cancel",
+        }
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_a_tool_the_deny_set_does_not_name_still_reaches_the_consumer():
+    """The refusal is narrow: a set that names another tool changes nothing."""
+    from kiro_crew.acp.types import (
+        EVENT_PERMISSION_REQUEST,
+        METHOD_REQUEST_PERMISSION,
+        METHOD_SESSION_UPDATE,
+    )
+
+    rt, reader, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.spec_denied_tools = frozenset({("kirocrew-core", "spawn_run")})
+    task = await _start_reader(rt)
+    try:
+        events = []
+
+        async def drive():
+            async for ev in handle.prompt("hi", timeout=3.0):
+                events.append(ev)
+
+        driver = asyncio.ensure_future(drive())
+        req_id = (await _await_routed(rt, "sA"))["sA"]
+        _feed(
+            reader,
+            {
+                "method": METHOD_SESSION_UPDATE,
+                "params": {
+                    "sessionId": "sA",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tcE",
+                        "title": "mcp.kirocrew-core.send_message",
+                        "kind": "execute",
+                        "rawInput": {"server": "kirocrew-core", "tool": "send_message"},
+                    },
+                },
+            },
+        )
+        _feed(
+            reader,
+            {
+                "id": 6002,
+                "method": METHOD_REQUEST_PERMISSION,
+                "params": {
+                    "sessionId": "sA",
+                    "toolCall": {"kind": "execute", "toolCallId": "tcE"},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "cancel", "name": "Cancel", "kind": "reject_once"},
+                    ],
+                },
+            },
+        )
+        _feed(reader, {"id": req_id, "result": {"stopReason": "end_turn"}})
+        await asyncio.wait_for(driver, timeout=3.0)
+        perm = [e for e in events if e.kind == EVENT_PERMISSION_REQUEST]
+        assert len(perm) == 1
+        assert perm[0].request_id == 6002
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_an_unidentifiable_mcp_approval_never_reaches_the_consumer():
+    """The second refusal is wired into the dispatch loop, not merely callable.
+
+    A standalone MCP approval carries no correlated ``tool_call`` frame, so the
+    handle cannot check it against the deny set. It must be ANSWERED here rather than
+    yielded: the consumer auto-approves by hook glob and in trust mode, and this
+    session's spec switched a tool off.
+    """
+    from kiro_crew.acp.types import (
+        EVENT_PERMISSION_REQUEST,
+        METHOD_REQUEST_PERMISSION,
+    )
+
+    rt, reader, proc = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.spec_denied_tools = frozenset({("kirocrew-core", "spawn_run")})
+    task = await _start_reader(rt)
+    try:
+        events = []
+
+        async def drive():
+            async for ev in handle.prompt("hi", timeout=3.0):
+                events.append(ev)
+
+        driver = asyncio.ensure_future(drive())
+        req_id = (await _await_routed(rt, "sA"))["sA"]
+        # No tool_call frame first: this is codex's standalone shape, which still
+        # carries the MCP marker.
+        _feed(
+            reader,
+            {
+                "id": 6003,
+                "method": METHOD_REQUEST_PERMISSION,
+                "params": {
+                    "sessionId": "sA",
+                    "toolCall": {"kind": "execute", "toolCallId": "tcUnknown"},
+                    "_meta": {"is_mcp_tool_approval": True},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "cancel", "name": "Cancel", "kind": "reject_once"},
+                    ],
+                },
+            },
+        )
+        _feed(reader, {"id": req_id, "result": {"stopReason": "end_turn"}})
+        await asyncio.wait_for(driver, timeout=3.0)
+        assert [e for e in events if e.kind == EVENT_PERMISSION_REQUEST] == []
+        answered = [
+            json.loads(call.args[0].decode())
+            for call in proc.stdin.write.call_args_list
+            if b'"id": 6003' in call.args[0] or b'"id":6003' in call.args[0]
+        ]
+        assert answered, "the request must be ANSWERED, never dropped -- a dropped one hangs"
+        assert answered[-1]["result"]["outcome"]["optionId"] == "cancel"
+    finally:
+        await _stop_reader(task)
+
+
+def test_both_deny_set_refusals_run_at_the_handles_one_answering_site():
+    """Structural: ``AcpClient`` splits these across two sites because it HAS two.
+
+    The handle has one, so both belong on it. A refusal that exists but is not called
+    from the loop is a restriction nothing enforces, and the behavioural tests above
+    each cover only their own branch.
+    """
+    import inspect
+
+    body = inspect.getsource(AcpSessionHandle._dispatch_events)
+    assert "self._deny_spec_disabled_tool(" in body
+    assert "self._refuse_unidentifiable_mcp_approval(" in body
+
+
+@pytest.mark.asyncio
 async def test_approve_tool_echoes_recorded_option():
     """approve_tool echoes the advertised optionId recorded from the request."""
     rt, _, proc = _make_runtime()
@@ -4447,7 +4666,9 @@ class TestAcpRuntimeLoadSession:
             return {}
 
         async def _fake_agents(agent, *, member_dispatch=False):
-            return [{"id": agent, "prompt": "p", "tools": []}]
+            from kiro_crew.acp.harness import SessionExtras
+
+            return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
 
         monkeypatch.setattr(rt, "_send_and_await", _fake_send)
         monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
@@ -4489,7 +4710,9 @@ class TestAcpRuntimeLoadSession:
             return {}
 
         async def _fake_agents(agent, *, member_dispatch=False):
-            return [{"id": agent, "prompt": "p", "tools": []}]
+            from kiro_crew.acp.harness import SessionExtras
+
+            return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
 
         monkeypatch.setattr(rt, "_send_and_await", _fake_send)
         monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
@@ -4522,8 +4745,10 @@ class TestAcpRuntimeLoadSession:
             return {}
 
         async def _fake_agents(agent, *, member_dispatch=False):
+            from kiro_crew.acp.harness import SessionExtras
+
             calls.append(agent)
-            return [{"id": agent, "prompt": "p", "tools": []}]
+            return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
 
         monkeypatch.setattr(rt, "_send_and_await", _fake_send)
         monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
@@ -4692,7 +4917,26 @@ class TestAcpRuntimeLoadSession:
         import kiro_crew.acp.runtime as rt_mod
 
         _SEND_FUNCS = {"_send_request", "_send_and_await"}
-        _SESSION_METHODS = {"METHOD_SESSION_NEW", "METHOD_SESSION_LOAD"}
+        # All THREE session-creating verbs. ``session/resume`` is the standard
+        # alternative to ``session/load`` for an agent that keeps sessions without
+        # implementing full loading, and a resumed session re-declares its whole MCP
+        # surface exactly as a loaded one does -- so a builder sending it must consult
+        # the pooled stubs for the same reason, and leaving it out would exempt the
+        # newest restore path from this ratchet.
+        _SESSION_METHODS = {
+            "METHOD_SESSION_NEW",
+            "METHOD_SESSION_LOAD",
+            "METHOD_SESSION_RESUME",
+        }
+
+        # Every session-method constant one expression can evaluate to, so a builder
+        # that CHOOSES its verb is read as naming both.
+        def _method_names(node: ast.AST) -> set:
+            if isinstance(node, ast.Name):
+                return {node.id} & _SESSION_METHODS
+            if isinstance(node, ast.IfExp):
+                return _method_names(node.body) | _method_names(node.orelse)
+            return set()
 
         def _builders(module) -> dict[str, str]:
             src = inspect.getsource(module)
@@ -4700,15 +4944,29 @@ class TestAcpRuntimeLoadSession:
             for node in ast.walk(ast.parse(src)):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
+                # Locals bound to one of those constants, so ``restore_method = A if
+                # ... else B`` followed by a send of ``restore_method`` is still seen.
+                # Without this the scan sees only a constant named AT the call, and one
+                # variable makes a builder invisible -- which is exactly the silent
+                # un-pooling this ratchet exists to catch.
+                aliases = set()
+                for inner in ast.walk(node):
+                    if not isinstance(inner, ast.Assign) or not _method_names(inner.value):
+                        continue
+                    for target in inner.targets:
+                        if isinstance(target, ast.Name):
+                            aliases.add(target.id)
                 for call in ast.walk(node):
-                    if (
+                    if not (
                         isinstance(call, ast.Call)
                         and isinstance(call.func, ast.Attribute)
                         and call.func.attr in _SEND_FUNCS
                         and call.args
-                        and isinstance(call.args[0], ast.Name)
-                        and call.args[0].id in _SESSION_METHODS
                     ):
+                        continue
+                    first = call.args[0]
+                    aliased = isinstance(first, ast.Name) and first.id in aliases
+                    if _method_names(first) or aliased:
                         out[node.name] = ast.get_source_segment(src, node) or ""
                         break
             return out
@@ -4724,19 +4982,22 @@ class TestAcpRuntimeLoadSession:
             assert name in builders, f"{name} no longer issues session/new — remove its exemption"
             builders.pop(name)
         # The four known builders; a new one is included automatically.
-        assert {
+        _EXPECTED = {
             "create_session",
             "load_session",
             "_new_session_following_substitution",
             "_initialize_session",
-        } <= builders.keys(), f"expected builders missing from scan: {sorted(builders)}"
-        # The fork builds AcpClient's array through one deduplicated roster,
-        # ``_session_mcp_servers``; it only counts if EVERY branch of it (the
-        # kiro-cli one and the session-array one) still appends the pooled stubs.
-        roster = inspect.getsource(client_mod.AcpClient._session_mcp_servers)
-        assert roster.count("self._pooled_mcp_servers()") >= 2, (
-            "_session_mcp_servers has a branch that no longer appends the pooled stubs"
+        }
+        # Names what is MISSING first and the found set second, so a reader chasing
+        # this failure looks up the name that is absent rather than one that is
+        # present.
+        assert _EXPECTED <= builders.keys(), (
+            f"expected builders missing from scan: {sorted(_EXPECTED - builders.keys())} "
+            f"(found: {sorted(builders)})"
         )
+        # Both roster branches must preserve broker injection.
+        roster = inspect.getsource(client_mod.AcpClient._session_mcp_servers)
+        assert roster.count("self._pooled_mcp_servers()") >= 2
         pooled = ("pooled_session_servers", "_pooled_mcp_servers", "self._session_mcp_servers")
         for name, body in builders.items():
             assert any(ref in body for ref in pooled), (
@@ -8895,6 +9156,299 @@ async def test_pre_turn_drain_counts_discarded_frames_without_logging_content(ca
     assert "3 leftover frame(s)" in _drain_lines[0]
     for _secret in ("SECRETALPHA", "SECRETBETA", "SECRETGAMMA"):
         assert _secret not in _drain_lines[0], f"{_secret!r} leaked into the drain warning"
+
+
+async def _drain_warning_lines(handle, caplog):
+    """Run one prompt through the pre-turn drain and return its warning lines."""
+    import contextlib
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.acp.session_handle"):
+        gen = handle.prompt("hi", timeout=0.2)
+        with contextlib.suppress(StopAsyncIteration, asyncio.TimeoutError, Exception):
+            await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        await gen.aclose()
+    return [
+        rec.getMessage() for rec in caplog.records if "pre-turn drain discarded" in rec.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_names_a_discarded_terminal(caplog):
+    """A discarded response carrying a non-empty stopReason IS the abandoned
+    turn's terminal, and the warning must SAY so instead of hedging.
+
+    The structural fact: a JSON-RPC response has ``method is None``, so a
+    leftover prompt response can never reach the drain's permission branch —
+    it always lands in the discard arm. Whether the terminal was among the
+    discards is therefore decidable, and "possibly including that turn's
+    terminal" was speculation about data already in hand.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    # A leftover notification plus the abandoned turn's terminal response.
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sA",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "SECRETALPHA"},
+                    },
+                },
+            }
+        )
+    )
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict({"jsonrpc": "2.0", "id": 4, "result": {"stopReason": "cancelled"}})
+    )
+
+    _drain_lines = await _drain_warning_lines(handle, caplog)
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    assert "2 leftover frame(s)" in _drain_lines[0]
+    # The tally states the fact — 1 terminal — and names its closed stopReason.
+    assert "1 of them" in _drain_lines[0], _drain_lines[0]
+    assert "cancelled" in _drain_lines[0]
+    # The hedge is gone.
+    assert "possibly" not in _drain_lines[0]
+    assert "SECRETALPHA" not in _drain_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_states_the_zero_terminal_case(caplog):
+    """When NO discarded frame was a terminal the warning says '0 of them' —
+    the reassuring reading an operator could not get from the old hedge.
+
+    The set here also pins the classification guards: a response with an empty
+    result dict, a response whose result is not a dict, and a REQUEST that
+    (malformed) carries a result with a stopReason must all count as zero —
+    only a response (``method is None``, ``id`` set) with a non-empty
+    ``stopReason`` is a terminal.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    # (a) response, empty result dict — no stopReason, not a terminal
+    q["sA"].put_nowait(JsonRpcMessage.from_dict({"jsonrpc": "2.0", "id": 4, "result": {}}))
+    # (b) response, non-dict result — not a terminal
+    q["sA"].put_nowait(JsonRpcMessage.from_dict({"jsonrpc": "2.0", "id": 5, "result": "done"}))
+    # (c) a REQUEST (method set) that malformedly carries a stopReason result:
+    # kills the mutant that drops the ``method is None`` condition
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "some/other_request",
+                "result": {"stopReason": "end_turn"},
+            }
+        )
+    )
+
+    _drain_lines = await _drain_warning_lines(handle, caplog)
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    assert "3 leftover frame(s)" in _drain_lines[0]
+    assert "0 of them" in _drain_lines[0], _drain_lines[0]
+    # Zero terminals ⇒ no stopReason clause at all.
+    assert "stopReason" not in _drain_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_never_logs_a_non_closed_stop_reason(caplog):
+    """A terminal whose stopReason is NOT a closed protocol value still counts,
+    but its value never reaches the log — an unrecognized wire string could
+    carry anything, and frame content never belongs in a log (the same
+    closed-values discipline as chat_runner's empty-turn line).
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict(
+            {"jsonrpc": "2.0", "id": 4, "result": {"stopReason": "SECRETREASON"}}
+        )
+    )
+
+    _drain_lines = await _drain_warning_lines(handle, caplog)
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    assert "1 of them" in _drain_lines[0]
+    assert "SECRETREASON" not in _drain_lines[0], "raw wire string leaked into the log"
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_classifies_alongside_an_answered_permission_request(caplog):
+    """A mixed leftover set: the permission request is still answered and
+    SEL-audited exactly as today, the terminal is counted, and the request is
+    NOT in the discard count. Discard behaviour itself is unchanged."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+    rt.send_response = AsyncMock()
+
+    audited: list[tuple[object, str, str]] = []
+    handle._audit_handle_reject = (  # type: ignore[method-assign]
+        lambda request_id, title, error, sub_session_id="": audited.append(
+            (request_id, title, error)
+        )
+    )
+
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict(
+            {
+                "jsonrpc": "2.0",
+                "id": 55,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "child-a",
+                    "toolCall": {"toolCallId": "tc-9", "title": "Running: rm -rf x"},
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            }
+        )
+    )
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict({"jsonrpc": "2.0", "id": 4, "result": {"stopReason": "end_turn"}})
+    )
+
+    _drain_lines = await _drain_warning_lines(handle, caplog)
+    assert audited, "stranded permission request was not SEL-audited"
+    assert audited[0][2] == "stranded_request_pre_turn_drain"
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    # The answered request is not discarded: 1 frame, and it is the terminal.
+    assert "1 leftover frame(s)" in _drain_lines[0]
+    assert "1 of them" in _drain_lines[0]
+    assert "end_turn" in _drain_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_survives_a_non_string_stop_reason(caplog):
+    """A JSON-valid response whose stopReason is not a string must neither
+    crash the drain nor count as a terminal.
+
+    The hazard is structural: the drain runs AFTER ``_turn_done.clear()`` and
+    BEFORE the BaseException guard that restores it, so an exception escaping
+    here leaves the handle permanently turn-active — every later prompt on it
+    is rejected. A truthy non-str stopReason (``[]``/``{}``) fed to a frozenset
+    membership test raises ``TypeError: unhashable type``; the classification
+    must type-guard the leaf exactly as ``_dispatch.py``'s wire-stopReason
+    reader does.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict(
+            {"jsonrpc": "2.0", "id": 4, "result": {"stopReason": ["end_turn"]}}
+        )
+    )
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict({"jsonrpc": "2.0", "id": 5, "result": {"stopReason": {"v": 1}}})
+    )
+
+    _drain_lines = await _drain_warning_lines(handle, caplog)
+    # The drain completed: the warning was emitted and the handle is NOT wedged.
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    assert "2 leftover frame(s)" in _drain_lines[0]
+    assert "0 of them" in _drain_lines[0]
+    assert handle.is_turn_active is False, "drain crash left the handle turn-active"
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_counts_an_error_response_terminal(caplog):
+    """An abandoned turn that ended in an ERROR response was still terminated —
+    ``_run_turn`` treats an error response as the turn's terminal — so the
+    tally must count it, or the warning positively asserts none of the
+    discards was terminal-shaped where the old text only hedged. An error
+    terminal has no stopReason to name, the error payload must never leak,
+    and the warning must NOT attribute the frame to "that turn": a late error
+    response to a concurrently timed-out command call (send_command / compact /
+    set_config_option, re-injected by _wait_for_response's finally) is
+    indistinguishable here, so the line states the shape, not the owner."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "error": {"code": -32000, "message": "SECRETBOOM"},
+            }
+        )
+    )
+
+    _drain_lines = await _drain_warning_lines(handle, caplog)
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    assert "1 of them" in _drain_lines[0]
+    assert "stopReason" not in _drain_lines[0]
+    assert "SECRETBOOM" not in _drain_lines[0], "error payload leaked into the drain warning"
+    # No attribution: the drain cannot know which caller owned this response.
+    assert "that turn's" not in _drain_lines[0], _drain_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_normalizes_a_closed_stop_reason_spelling(caplog):
+    """A closed value arriving with stray whitespace still logs as the
+    canonical constant, not as the '<non-standard>' placeholder — the repo's
+    other wire-stopReason reader (``_dispatch.py``) normalizes before
+    comparing, and an operator reading a standard terminal as garbage defeats
+    the classification's purpose."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict(
+            {"jsonrpc": "2.0", "id": 4, "result": {"stopReason": " cancelled "}}
+        )
+    )
+
+    _drain_lines = await _drain_warning_lines(handle, caplog)
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    assert "1 of them" in _drain_lines[0]
+    assert "cancelled" in _drain_lines[0]
+    assert "non-standard" not in _drain_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_dedupes_stop_reasons_in_the_warning(caplog):
+    """The session queue is unbounded, so the stopReason clause must not grow
+    one token per discarded terminal — the count already carries multiplicity;
+    the clause names each DISTINCT closed value once."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    for _rid in (4, 5, 6):
+        q["sA"].put_nowait(
+            JsonRpcMessage.from_dict(
+                {"jsonrpc": "2.0", "id": _rid, "result": {"stopReason": "cancelled"}}
+            )
+        )
+
+    _drain_lines = await _drain_warning_lines(handle, caplog)
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    assert "3 of them" in _drain_lines[0]
+    assert _drain_lines[0].count("cancelled") == 1, _drain_lines[0]
 
 
 @pytest.mark.asyncio

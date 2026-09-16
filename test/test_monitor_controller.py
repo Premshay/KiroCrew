@@ -16,7 +16,10 @@ from kiro_crew.monitoring import models as monitor_models
 from kiro_crew.monitoring.controller import MonitorController, format_monitor_wake
 from kiro_crew.monitoring.github_pull_request import GitHubPullRequestProbeResult
 from kiro_crew.monitoring.models import (
+    DEFAULT_MONITOR_REALERT_SECS,
     MONITOR_STOP_COMPLETION_UNAVAILABLE,
+    MonitorActionCompletion,
+    MonitorActionDisposition,
     MonitorBudgets,
     MonitorCreationSurface,
     MonitorDecision,
@@ -409,7 +412,13 @@ async def test_actionable_probe_claims_once_before_concurrent_dispatch(tmp_path)
         dispatch=dispatch,
     )
     first = asyncio.create_task(controller.tick(loop, now=120.0))
-    await entered.wait()
+    # `entered` is set only inside the dispatch stub, so any regression that makes
+    # tick() return before the transport handoff -- a budget stop, a non-actionable
+    # verdict, a dispatch-not-authorized verdict, or an exception swallowed into the
+    # task -- leaves nobody to set it. Unbounded, that parks the whole run on an
+    # Event instead of failing this test: pytest-timeout's thread method kills the
+    # xdist worker and every test it had not reached goes silently uncollected.
+    await asyncio.wait_for(entered.wait(), timeout=5)
     assert loop.monitor is not None and loop.monitor.wake_in_flight
 
     await controller.tick(loop, now=121.0)
@@ -486,7 +495,11 @@ async def test_terminal_transition_queued_during_claim_persistence_prevents_disp
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", _block_claim_write)
     tick = asyncio.create_task(controller.tick(loop, now=120.0))
-    await write_entered.wait()
+    # Same shape as the claim/dispatch test above: `write_entered` is set only by the
+    # monkeypatched snapshot write, so a tick that stops before persisting the claim,
+    # or a rename of `_write_monitor_snapshot_locked` that leaves this setattr
+    # intercepting nothing, would hang the run rather than fail the test.
+    await asyncio.wait_for(write_entered.wait(), timeout=5)
     terminal = asyncio.create_task(getattr(service, terminal_transition)(loop.id, now=121.0))
     await asyncio.sleep(0)
     release_write.set()
@@ -1630,6 +1643,7 @@ async def test_stop_clears_recovered_dispatched_claim_and_allows_replacement(tmp
 def test_monitor_wake_is_redacted_capped_and_canonical():
     envelope = format_monitor_wake(
         monitor_id="mon-1",
+        kind="github_pull_request",
         target="https://github.com/acme/widgets/pull/7",
         objective="review_ready",
         fingerprint="fp-1",
@@ -1662,6 +1676,7 @@ def test_monitor_wake_reports_check_counts_without_provider_labels():
 
     envelope = format_monitor_wake(
         monitor_id="mon-1",
+        kind="github_pull_request",
         target="https://github.com/acme/widgets/pull/7",
         objective="review_ready",
         fingerprint="fp-1",
@@ -1674,6 +1689,87 @@ def test_monitor_wake_reports_check_counts_without_provider_labels():
     assert "unknown checks: 1" in envelope
     assert "upload secrets" not in envelope
     assert "provider.example" not in envelope
+
+
+def test_monitor_wake_describes_a_workflow_run_by_its_own_facts():
+    canonical = {
+        "conclusion": "failure",
+        "event": "push",
+        "head_revision": "def456",
+        "kind": "github_workflow_run",
+        "status": "completed",
+        "target": "github.com/acme/widgets/actions/runs/42",
+        "workflow_name": "CI",
+    }
+
+    envelope = format_monitor_wake(
+        monitor_id="mon-1",
+        kind="github_workflow_run",
+        target="https://github.com/acme/widgets/actions/runs/42",
+        objective="run_complete",
+        fingerprint="fp-1",
+        reason_code="run_failed",
+        canonical=canonical,
+    )
+
+    assert "workflow run https://github.com/acme/widgets/actions/runs/42" in envelope
+    assert "pull request" not in envelope
+    assert "status=completed" in envelope
+    assert "conclusion=failure" in envelope
+    assert "workflow_name=CI" in envelope
+    assert "event=push" in envelope
+    # A run carries none of the pull-request canonical, so none of it leaks in.
+    for name in ("blocking_review", "mergeability", "review_decision"):
+        assert name not in envelope
+
+
+def test_monitor_wake_fails_closed_on_an_unregistered_kind():
+    """A kind the registry has no entry for gets a neutral envelope, not a review one."""
+    envelope = format_monitor_wake(
+        monitor_id="mon-1",
+        kind="unregistered_kind",
+        target="opaque-subject",
+        objective="some_objective",
+        fingerprint="fp-1",
+        reason_code="changed",
+        canonical={
+            "blocking_review": "changes_requested",
+            "state": "open",
+        },
+    )
+
+    assert "unregistered_kind subject opaque-subject" in envelope
+    assert "pull request" not in envelope
+    assert "canonical fields undeclared for this kind" in envelope
+    # Even pull-request-shaped canonical keys are NOT rendered under an unknown
+    # kind: an unidentifiable subject renders no field, rather than inheriting a
+    # review shape.
+    assert "blocking_review=changes_requested" not in envelope
+    assert "state=open" not in envelope
+
+
+def test_monitor_wake_names_a_known_kind_even_when_the_observation_is_thin():
+    """A registered kind with an empty canonical still knows its noun and fields.
+
+    A thin ``last_observation`` -- empty, or from an older release -- is not an
+    unidentifiable subject: the kind was armed, so its noun comes from the entry
+    and it simply reports its state changed, distinct from the undeclared-fields
+    envelope an unregistered kind gets.
+    """
+    envelope = format_monitor_wake(
+        monitor_id="mon-1",
+        kind="github_workflow_run",
+        target="https://github.com/acme/widgets/actions/runs/42",
+        objective="run_complete",
+        fingerprint="fp-1",
+        reason_code="actionable",
+        canonical={},
+    )
+
+    assert "workflow run https://github.com/acme/widgets/actions/runs/42" in envelope
+    assert "canonical state changed" in envelope
+    assert "fields undeclared" not in envelope
+    assert "pull request" not in envelope
 
 
 @pytest.mark.asyncio
@@ -1919,5 +2015,131 @@ async def test_a_tick_whose_provider_omits_the_subject_does_log(tmp_path, caplog
             await controller.tick(loop, now=120.0)
 
         assert "no usable result" in caplog.text
+    finally:
+        service.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_unresolved_actionable_state_re_asserts_once_per_period(tmp_path):
+    """Re-assertion works through the real writers, once per re-alert period.
+
+    The dedup guard, the wake writer and the completion writer are the real
+    ones, so this drives the composed path the isolated decision tests cannot:
+    apply_monitor_probe records the wake fingerprint, record_monitor_turn_completion
+    clears wake_in_flight while leaving that fingerprint set, and a later probe of
+    the SAME unresolved actionable state re-asserts once its period has passed and
+    stays suppressed before it. Both directions, because a test that only proves
+    the late wake cannot tell re-assertion from a wake on every probe.
+    """
+    service = AutoNudgeService(base_dir=tmp_path, on_monitor_tick=AsyncMock())
+    try:
+        loop = await service.add_monitor(
+            slot_key="chat-1",
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            cadence_secs=60,
+            budgets=MonitorBudgets(max_runtime_secs=10_000_000),
+            now=0.0,
+        )
+        assert loop.monitor is not None
+        gen = loop.monitor.config_generation
+        red = _result(MonitorObservationStatus.ACTIONABLE, fingerprint="red-1")
+
+        async def _probe_and_complete(now: float) -> MonitorDecision:
+            verdict = await service.apply_monitor_probe(
+                loop.id, red, now=now, config_generation=gen
+            )
+            if verdict.decision is MonitorDecision.WAKE_ACTIONABLE:
+                await service.record_monitor_turn_completion(
+                    MonitorActionCompletion(
+                        monitor_id=loop.id,
+                        fingerprint="red-1",
+                        disposition=MonitorActionDisposition.SUCCESS,
+                        completed_ts=now,
+                    )
+                )
+            return verdict.decision
+
+        # First sighting wakes at once, and the turn completes.
+        assert await _probe_and_complete(0.0) is MonitorDecision.WAKE_ACTIONABLE
+
+        # Same unresolved state, well inside the period: suppressed.
+        assert (
+            await _probe_and_complete(DEFAULT_MONITOR_REALERT_SECS * 0.5)
+            is MonitorDecision.NO_CHANGE
+        )
+
+        # A second probe still inside the period: still suppressed, so the late
+        # wake below cannot be a wake on every probe.
+        assert (
+            await _probe_and_complete(DEFAULT_MONITOR_REALERT_SECS * 0.75)
+            is MonitorDecision.NO_CHANGE
+        )
+
+        # Past the period: re-asserted exactly once.
+        assert (
+            await _probe_and_complete(DEFAULT_MONITOR_REALERT_SECS * 1.1)
+            is MonitorDecision.WAKE_ACTIONABLE
+        )
+
+        # Immediately after that re-assertion, inside the new period: suppressed
+        # again, which proves the wake restamped the period rather than leaving it
+        # open to fire on the next probe.
+        assert (
+            await _probe_and_complete(DEFAULT_MONITOR_REALERT_SECS * 1.2)
+            is MonitorDecision.NO_CHANGE
+        )
+    finally:
+        service.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_retarget_clears_the_coalescing_window(tmp_path):
+    """Changing the target resets every per-subject field, the window included.
+
+    A retarget is a new subject, so a window opened on the old subject describes
+    nothing on the new one. The reset block clears the window fingerprint, its
+    open time and the re-alert map alongside the other per-subject state, so a
+    re-assert decision on the new subject reads none of the old subject's alert
+    times.
+    """
+    service = AutoNudgeService(base_dir=tmp_path, on_monitor_tick=AsyncMock())
+    try:
+        loop = await service.add_monitor(
+            slot_key="chat-1",
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            cadence_secs=60,
+            budgets=MonitorBudgets(max_runtime_secs=10_000_000),
+            now=0.0,
+        )
+        assert loop.monitor is not None
+        # Wake on the old subject so the window and re-alert map carry state.
+        await service.apply_monitor_probe(
+            loop.id,
+            _result(MonitorObservationStatus.ACTIONABLE, fingerprint="red-old"),
+            now=10.0,
+            config_generation=loop.monitor.config_generation,
+        )
+        assert loop.monitor.coalesce_fingerprint == "red-old"
+        assert loop.monitor.coalesce_alerted != {}
+
+        await service.record_monitor_turn_completion(
+            MonitorActionCompletion(
+                monitor_id=loop.id,
+                fingerprint="red-old",
+                disposition=MonitorActionDisposition.SUCCESS,
+                completed_ts=10.0,
+            )
+        )
+        updated = await service.update_monitor(
+            loop.id, target="https://github.com/acme/widgets/pull/9"
+        )
+        assert updated is not None and updated.monitor is not None
+        assert updated.monitor.coalesce_fingerprint == ""
+        assert updated.monitor.coalesce_opened_at == 0.0
+        assert updated.monitor.coalesce_alerted == {}
     finally:
         service.stop()

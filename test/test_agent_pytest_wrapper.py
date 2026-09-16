@@ -21,8 +21,15 @@ def _load_wrapper():
 
 
 @pytest.fixture
-def wrapper():
-    return _load_wrapper()
+def wrapper(monkeypatch):
+    module = _load_wrapper()
+    monkeypatch.setattr(module.xdist_budget.os, "cpu_count", lambda: 24)
+    monkeypatch.setattr(module.xdist_budget, "_host_total_gib", lambda: 64)
+    monkeypatch.setattr(module.xdist_budget, "_host_available_mib", lambda: 0)
+    monkeypatch.setattr(module.xdist_budget, "_cgroup_limit_mib", lambda: 0)
+    monkeypatch.delenv(module.xdist_budget._XDIST_ENV_CAP, raising=False)
+    monkeypatch.delenv(module.xdist_budget._MAX_WORKERS_ENV, raising=False)
+    return module
 
 
 @pytest.mark.parametrize(
@@ -164,3 +171,51 @@ def test_launcher_reports_a_scope_that_cannot_start(wrapper, monkeypatch, capsys
 
     assert wrapper.main([]) == 127
     assert "could not start" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("args", [[], ["-n", "auto"], ["--numprocesses=logical"]])
+def test_automatic_request_honors_inherited_cap(wrapper, monkeypatch, args):
+    monkeypatch.setenv(wrapper.xdist_budget._XDIST_ENV_CAP, "2")
+    assert wrapper.requested_workers(args) == 2
+
+
+@pytest.mark.parametrize("args", [["-n", "4"], ["-n4"], ["--numprocesses=4"]])
+def test_explicit_request_is_not_silently_lowered(wrapper, monkeypatch, args):
+    monkeypatch.setenv(wrapper.xdist_budget._XDIST_ENV_CAP, "2")
+    assert wrapper.requested_workers(args) == 4
+
+
+@pytest.mark.parametrize("args", [[], ["-n", "auto"], ["--numprocesses=logical"]])
+def test_contained_automatic_pregrant_rechecks_canonical_limit(wrapper, monkeypatch, args):
+    monkeypatch.setenv(wrapper.xdist_budget._XDIST_ENV_CAP, "2")
+    claims = []
+    monkeypatch.setattr(
+        wrapper.xdist_budget, "claim_exact_worker_slots", lambda n: claims.append(n) or True
+    )
+    monkeypatch.setattr(wrapper.xdist_budget, "release_worker_slots", lambda: None)
+
+    def run(command, **kwargs):
+        assert kwargs["env"]["PREGRANTED_WORKERS"] == "2"
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(wrapper.subprocess, "run", run)
+    assert wrapper.contained_main(["6", *args]) == 0
+    assert claims == [2]
+
+
+def test_automatic_request_reuses_memory_and_configured_bounds(wrapper, monkeypatch):
+    monkeypatch.setenv(wrapper.xdist_budget._MAX_WORKERS_ENV, "3")
+    assert wrapper.requested_workers([]) == 3
+    monkeypatch.setattr(wrapper.xdist_budget, "_live_memory_bounded_cap", lambda cap: 1)
+    assert wrapper.requested_workers([]) == 1
+
+
+@pytest.mark.parametrize("args", [["-n8"], ["-n", "2", "-n", "3"]])
+def test_explicit_invalid_or_conflicting_counts_fail(wrapper, args):
+    with pytest.raises(ValueError):
+        wrapper.requested_workers(args)
+
+
+def test_contained_shim_rejects_mismatched_explicit_grant(wrapper, monkeypatch):
+    monkeypatch.setattr(wrapper.subprocess, "run", lambda *a, **k: pytest.fail("must not run"))
+    assert wrapper.contained_main(["2", "-n4"]) == 64

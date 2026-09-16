@@ -60,7 +60,7 @@ template semantics.
 | `messaging/transport.py` | **Layer 1** — `MessagingTransport` ABC + the `TransportCapabilities`, `InboundMessage`, and `ConfiguredChannelTarget` value objects (stdlib-only) |
 | `messaging/attachments.py` | Channel-neutral attachment classification, bounded streaming download, extraction/redaction, opaque-file preservation, temp ownership, and SEL audit |
 | `messaging/driver.py` | **Layer 2** — `TurnDriver` (channel-neutral turn loop), approval-mode constants, `_redact` helper |
-| `messaging/renderer.py` | **Layer 2b** — `Renderer` ABC, `OutputEvent`, output-kind constants + `OUTPUT_KINDS`, `chunk_text` helper, `session_provenance_tag` (stable callback affinity without exposing session keys), `apply_options_cap`/`cap_choices`/`format_overflow` (`max_buttons` enforcement), `split_options_trailer` (the ONE `[OPTIONS:]` parse — see below), and `render_options_as_text` — the whole-trailer path for a channel with no widget, which reaches the same cap with zero slots so every choice becomes a numbered line. Also `credential_redaction_notice(count)` — the one sentence a channel sends when credential redaction rewrote text it already delivered, so the reader learns a pasted command will not run. Shared so the wording cannot fork per channel and each spelling need its own audit for leaked bytes; it carries only the count, never secret bytes, and is plain text with no markup or emoji because one string ships to platforms that render different dialects (or none) |
+| `messaging/renderer.py` | **Layer 2b** — `Renderer` ABC, `OutputEvent`, output-kind constants + `OUTPUT_KINDS`, `chunk_text` helper, `session_provenance_tag` (stable callback affinity without exposing session keys), `apply_options_cap`/`cap_choices`/`format_overflow` (`max_buttons` enforcement), `split_options_trailer` (the ONE `[OPTIONS:]` parse — see below), and `render_options_as_text` — the whole-trailer path for a channel with no widget, which reaches the same cap with zero slots so every choice becomes a numbered line. Also `credential_redaction_notice(count)` — the one sentence a channel sends when credential redaction rewrote text it already delivered, so the reader learns a pasted command will not run. Shared so the wording cannot fork per channel and each spelling need its own audit for leaked bytes; it carries only the count, never secret bytes, and is plain text with no markup or emoji because one string ships to platforms that render different dialects (or none). `redaction_notice(cred_count, url_count)` is the by-kind superset every channel delivery surface now posts through: it delegates to `credential_redaction_notice` byte-for-byte when `url_count` is zero, and otherwise names the suspicious-URL rewrite (`security.EXFILTRATION_REDACTION_TAG_PREFIX`, counted by prefix because the tag interpolates the domain) with the URL remedy — re-check the link against a trusted source — because telling a reader whose URL was rewritten to "supply the secret" names a remedy that cannot help them. Zero/zero is a `ValueError`, never an empty message |
 | `messaging/approval.py` | Two channel-neutral approval styles behind one INTERACTIVE `decider`, both deny-by-default on timeout and keyed `session_key`+`request_id`. **Typed reply** (`TEXT_APPROVAL_TIMEOUT_S`, the verdict vocabulary, `TextReplyApprovalDecider`) for a `max_buttons=0` channel, with Trust recorded as the session's own approval policy rather than a second trust store. **Widget awaiter** (`PendingApprovals` + `SessionApprovalDecider`) for a press whose correlation id and per-prompt nonce travel a round trip this module cannot see (a Webex Adaptive Card over the device websocket); a typed answer has no nonce, a press has no free text |
 | `messaging/driver.py` `deny_all_tools` | Rejects EVERY permission request ahead of every approve path. The approval ladder cannot express "this sender is not the operator" on its own: the PreToolUse hook may answer `auto_approve` and the Trust/YOLO predicates approve and short-circuit, both BEFORE the ladder is consulted, so setting the mode to `interactive` without a decider is not sufficient. Defaults False |
 | `messaging/display_safety.py` | `strip_ansi` / `canonicalize_display` / `redact_for_display` — credential redaction against the form a platform RENDERS, not the bytes sent. Hoisted out of `slack/format.py` when the shared overflow sink began writing choice text into the parsed body on every widget channel |
@@ -79,7 +79,7 @@ template semantics.
 | `messaging/link.py` | **Layer 3** — session-key namespacing (`session_key`/`canonical_key`/`legacy_key`/`is_legacy_slack_key`) + `ChannelLink` + DM-scope key derivation / `should_rotate_generation`, plus the in-channel `/link` ⇄ `/unlink` pair (`rebind_conversation_location` / `release_conversation_location`) |
 | `messaging/conversation.py` | `ConversationState` — per-conversation rotating *generation* bookkeeping (advanced by `/new` and idle/daily reset), seeded from the persisted session map |
 | `messaging/inbound_spool.py` | The durable spool for an inbound message the SHUTDOWN GATE refused, and its boot-time replay. See [Durable inbound spool](#durable-inbound-spool-inbound_spoolpy) |
-| `messaging/session_resume.py` | **Layer 3** — the channel-neutral half of dashboard-session resume. `SessionResumeController` consumes a bound `ResumeSurface` (including its exact durable expectation identity, which may be narrower than `ChannelLink.channel_id`) and owns the complete SHOW-PICKER flow (eligibility/search, audit, nonce/TTL/owner/message scoping, and registration only after a successful post) plus the CHOOSE/BIND transaction (history existence, conflict checks around the awaited settlement, durable expectation before success, atomic inbound claim, lost-claim/storage outcomes, dashboard push, and audit). `SessionBinder` owns inbound routing, settlement, and release. Discord, Telegram, and Teams retain only address/identity derivation, widgets/cards, exact wording and display redaction, callback parsing, and channel-local replay. |
+| `messaging/session_resume.py` | **Layer 3** — the channel-neutral half of dashboard-session resume. `SessionResumeController` consumes a bound `ResumeSurface` (including its exact durable expectation identity, which may be narrower than `ChannelLink.channel_id`) and owns the complete SHOW-PICKER flow (eligibility/search, audit, nonce/TTL/owner/message scoping, and registration only after a successful post) plus the CHOOSE/BIND transaction (history existence, conflict checks around the awaited settlement, durable expectation before success, atomic inbound claim, lost-claim/storage outcomes, dashboard push, and audit). `SessionBinder` owns inbound routing, settlement, and release. It also owns the two conversation-log reads each adapter used to spell for itself — `persisted_session_agent(conv_log, session_key)` and `session_title_of(conv_log, session_key, channel=)` — both SYNCHRONOUS, because metadata access blocks and the async caller owns the `asyncio.to_thread` offload; `channel` only names the call site in its debug line. Discord, Telegram, and Teams retain only address/identity derivation, widgets/cards, exact wording and display redaction, callback parsing, and channel-local replay. |
 | `messaging/resume_expectation.py` | The durable conversation-keyed shadow of those bindings, ONE file per channel (`store_filename`), because a Discord channel id and a Teams conversation id are unrelated address spaces |
 | `teams/service_urls.py` | `ServiceUrlStore` — durable `conversation_id -> serviceUrl` (plus the authorized identity owning each conversation), because the Bot Framework offers no lookup and a lost reference leaves every proactive path with nowhere to send. `forget` drops a route the Connector permanently refuses |
 | `teams/cards.py` | Adaptive Card construction + `parse_submit` — the strict, total validation of an untrusted card payload. Mints no nonce of its own: every clickable widget's token comes from `messaging.renderer.new_approval_nonce` |
@@ -338,7 +338,7 @@ is the point — a channel-local store would have had to reimplement every one o
 
 ### `OutputEvent`
 
-Channel-neutral output event with a `kind` plus per-kind payload fields (`text`, `tool_call_id`, `title`, `tool_kind`, `tool_purpose`, `options`, `request_id`, `context_usage_pct`, `stop_reason`); `to_dict()` serializes them. Kinds: `TEXT_CHUNK`, `THINKING`, `TOOL_CALL`, `PROMPT_CHOICE`, `COMPACTION`, `DONE` — the full set is `OUTPUT_KINDS` (a `frozenset`). `prompt_choice` is a **first-class** event, not generic "permission text": each renderer maps it to its native interactive widget.
+Channel-neutral output event with a `kind` plus per-kind payload fields (`text`, `tool_call_id`, `title`, `tool_kind`, `tool_name`, `tool_purpose`, `options`, `request_id`, `context_usage_pct`, `stop_reason`); `to_dict()` serializes them. `title` is DISPLAY copy — what a person should read for the call (the backend's own description when it sent one, else the client-derived `List files in src` / `Git status` from `kiro_crew.tool_call_title`, else the raw command) — and is never a tool's identity; `tool_name` is the trusted programmatic identity from `_meta.kiro` (empty when the backend sent none) and is what any behaviour keyed on *which tool ran* reads. `Renderer.dispatch` exposes the current call's identity as `current_tool_name` before `on_tool_call` fires, and the Slack wait-stream rollover keys on it through `slack/format.is_wait_identity` (`wait`, `kirocrew-core___wait`, `mcp__kirocrew-core__wait`; not `wait_for_ci`) with the title equality kept only as the fallback for a transport that sends no identity. Kinds: `TEXT_CHUNK`, `THINKING`, `TOOL_CALL`, `PROMPT_CHOICE`, `COMPACTION`, `DONE` — the full set is `OUTPUT_KINDS` (a `frozenset`). `prompt_choice` is a **first-class** event, not generic "permission text": each renderer maps it to its native interactive widget.
 
 ### `Renderer` ABC
 
@@ -346,7 +346,7 @@ Constructed with a `TransportCapabilities`. `dispatch(event)` routes each kind t
 
 - `on_turn_start()` — default no-op, called once before the stream begins.
 - `on_text_chunk(text)`, `on_thinking(text)` — abstract.
-- `on_tool_call(tool_call_id, title, tool_kind="", tool_purpose="")` — abstract; mirrors native uniform tool-call semantics (each call marks the previous task complete and starts a new in-progress task).
+- `on_tool_call(tool_call_id, title, tool_kind="", tool_purpose="")` — abstract; mirrors native uniform tool-call semantics (each call marks the previous task complete and starts a new in-progress task). `title` is display copy (see `OutputEvent`); a renderer that needs the tool's identity reads `self.current_tool_name`, never the title.
 - `on_prompt_choice(options, request_id, tool_title="", tool_purpose="")` — abstract; renders the interactive approval/choice prompt. The two tool fields ride the `PROMPT_CHOICE` event itself and are REDACTED like every other model-authored string. Both are defaulted, so an implementation that ignores them still satisfies the contract, but a renderer should PREFER them: the alternative is a name remembered from an earlier `TOOL_CALL`, which belongs to whichever call came last, so a permission request not immediately preceded by its own titled call names a different tool. Purpose is paired to title by `tool_call_id` rather than by recency, because the permission payload carries no purpose of its own and pairing by arrival order is what puts tool A's name beside tool B's purpose.
 - `on_compaction(context_usage_pct)`, `on_done(stop_reason="")` — abstract.
 - `on_steer_consumed(summary="")` — default no-op; Discord/Telegram seal the pre-steer segment and open the continuation with a native acknowledgement chip using the parsed summary, without receiving raw protocol text. Webex records the fold and notes it on the final answer instead, because a separate message per fold would bury the answer and it has no spare edit to spend on one.
@@ -1892,11 +1892,13 @@ answer is not permission: a raised evaluation and a `Decision` without
   primitive rather than a usability question (`task run ~/.ssh/id_rsa`). Both
   grammars route through `hooks.validate_file_path`, which applies the Windows UNC
   trusted-root check before resolving (a `realpath` on a UNC path is itself the
-  outbound SMB probe) to the raw and anchored forms, refuses a path with a
-  linked ancestor on Windows (the walk or the resolve would itself be the
-  probe), screens a Windows leaf link's own target (readlink, a local
-  metadata read) so a link aimed at an untrusted UNC share is refused while
-  benign leaf symlinks still resolve, canonicalizes through every symlink on
+  outbound SMB probe) to the raw and anchored forms, screens every Windows
+  link's own target -- a linked ancestor as well as a leaf link -- with
+  `readlink` (a local metadata read, never a traversal): a link aimed at an
+  untrusted UNC share, a device namespace, a drive-relative target or a
+  `..`-climbing suffix is refused before `realpath` can probe it, while a
+  link whose target is another local directory is rewritten to that target
+  so benign junctions still resolve; canonicalizes through every symlink on
   POSIX, and refuses a resolved
   target under a sensitive root, so an innocent-looking path that resolves into a
   blocked root is refused through the link. The **canonical** path is what reaches
@@ -2312,8 +2314,9 @@ like this transaction's own work.
   field when `.env` is empty, so a crash between the two writes would otherwise
   resurrect a revoked credential on the next restart, and the copy sits in
   agent-readable `config.json`. Both writes go through `asyncio.to_thread`:
-  the atomic write fsyncs, and the owner-only lockdown shells out to `icacls`
-  on Windows, neither of which may block the gateway loop.
+  the atomic write fsyncs, and the owner-only lockdown's Windows DACL write
+  can block on a network volume round-trip, neither of which may block the
+  gateway loop.
 
 ## Telegram channel
 
@@ -3401,7 +3404,11 @@ transient set, which is **wider than the usual 429-only rule**: `412`, `429`, `5
 and `504`, honouring `Retry-After` and otherwise backing off exponentially. The
 status badge is bidirectional — a delivered activity clears a stale failure, and
 `_notify_state` dedupes on the transition so a healthy channel does not republish
-per send nor overwrite the first failure reason.
+per send nor overwrite the first failure reason. Before the request is made,
+`_fit_activity` measures the whole serialized activity (text plus JSON envelope,
+`ensure_ascii=False`) against `TEAMS_MAX_ACTIVITY_TEXT_BYTES` and tail-truncates
+the text to fit — mirroring Webex and WeCom's wire-side `truncate_utf8` guards —
+so an over-budget activity delivers its head instead of dying as a Connector 413.
 
 **serviceUrl durability (`service_urls.py`).** The Bot Framework offers no way to
 look up where a conversation can be reached: `serviceUrl` arrives on an inbound

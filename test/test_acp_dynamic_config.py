@@ -176,6 +176,7 @@ class TestSyncEffortLevels:
 class TestUpdateReasoningEffortValues:
     def setup_method(self):
         import kiro_crew.dashboard.chat_persistence as mod
+
         self._mod = mod
         self._orig_values = mod._reasoning_effort_values.copy()
         self._orig_ordered = mod._reasoning_effort_ordered[:]
@@ -253,6 +254,7 @@ async def test_api_effort_levels_global_fallback():
     # No ?slot= → serve the process-global ordered fallback list.
     import kiro_crew.dashboard.chat_persistence as mod
     from kiro_crew.dashboard.handlers.agents import api_effort_levels
+
     orig_ordered = mod._reasoning_effort_ordered[:]
     try:
         mod._reasoning_effort_ordered = ["low", "medium", "high", "max"]
@@ -261,6 +263,7 @@ async def test_api_effort_levels_global_fallback():
         resp = await api_effort_levels(request)
         assert resp.status == 200
         import json
+
         body = json.loads(resp.body)
         assert body == ["low", "medium", "high", "max"]
     finally:
@@ -273,6 +276,7 @@ async def test_api_effort_levels_per_slot():
     # win over the process-global fallback (no cross-slot bleed).
     import kiro_crew.dashboard.chat_persistence as mod
     from kiro_crew.dashboard.handlers.agents import api_effort_levels
+
     orig_ordered = mod._reasoning_effort_ordered[:]
     try:
         mod._reasoning_effort_ordered = ["low", "max"]  # global (other slot)
@@ -288,6 +292,7 @@ async def test_api_effort_levels_per_slot():
         resp = await api_effort_levels(request)
         assert resp.status == 200
         import json
+
         assert json.loads(resp.body) == ["low", "medium", "high", "xhigh"]
     finally:
         mod._reasoning_effort_ordered = orig_ordered
@@ -297,6 +302,7 @@ async def test_api_effort_levels_per_slot():
 async def test_api_effort_levels_slot_without_live_provider_falls_back():
     import kiro_crew.dashboard.chat_persistence as mod
     from kiro_crew.dashboard.handlers.agents import api_effort_levels
+
     orig_ordered = mod._reasoning_effort_ordered[:]
     try:
         mod._reasoning_effort_ordered = ["low", "medium", "high", "max"]
@@ -310,6 +316,7 @@ async def test_api_effort_levels_slot_without_live_provider_falls_back():
         resp = await api_effort_levels(request)
         assert resp.status == 200
         import json
+
         assert json.loads(resp.body) == ["low", "medium", "high", "max"]
     finally:
         mod._reasoning_effort_ordered = orig_ordered
@@ -381,3 +388,21 @@ class TestHandleAvailableCommandsUpdate:
         client = AcpClient()
         client._track_usage_update(self._msg([{"name": "design", "description": "d"}]))
         assert [c["name"] for c in client.available_commands] == ["design"]
+
+
+@pytest.mark.asyncio
+async def test_effort_pair_uses_the_same_advertised_option_as_live_effort():
+    from unittest.mock import AsyncMock
+
+    from kiro_crew.acp.client import _push_model_via_effort_split
+    from kiro_crew.acp.types import ACP_BACKEND_CODEX
+
+    client = AcpClient(acp_backend=ACP_BACKEND_CODEX)
+    client._acp_config_options = [{"id": "effort", "options": [{"value": "high"}]}]
+    client._push_model_config_option = AsyncMock(return_value="example-model")
+    client.set_config_option = AsyncMock()
+
+    result = await _push_model_via_effort_split(client, ACP_BACKEND_CODEX, "example-model[high]")
+
+    assert result == "example-model[high]"
+    client.set_config_option.assert_awaited_once_with("effort", "high")

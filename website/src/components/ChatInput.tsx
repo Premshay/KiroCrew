@@ -10,8 +10,8 @@ import {
   memo,
   lazy,
   Suspense,
-} from "react";
-import { markComposerResize } from '../utils/composerResize';
+} from 'react'
+import { markComposerResize } from '../utils/composerResize'
 import {
   ArrowUpFromLine,
   ArrowUp,
@@ -42,21 +42,20 @@ import {
   ChevronsDownUp,
   ChevronsUpDown,
   MoreHorizontal,
-} from "lucide-react";
-import SketchDialog from './SketchDialog';
-import AppIcon from './AppIcon';
-import CopyBranchButton from './CopyBranchButton';
-import RejectDropdown from './RejectDropdown';
-import { usePointerDrag } from '../hooks/usePointerDrag';
-import { useScrollEdges } from '../hooks/useScrollEdges';
-import VoiceStatusBar from './VoiceStatusBar';
-import VoiceDictationPanel, {
-  useDictationPanelUsable,
-} from "./VoiceDictationPanel";
-import { createPortal } from 'react-dom';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useBranding } from '../hooks/useBranding';
-import { useAppSelector, useAppDispatch } from '../store';
+} from 'lucide-react'
+import SketchDialog from './SketchDialog'
+import AppIcon from './AppIcon'
+import CopyBranchButton from './CopyBranchButton'
+import RejectDropdown from './RejectDropdown'
+import { usePointerDrag } from '../hooks/usePointerDrag'
+import { useAnchorRemeasure } from '../hooks/useAnchorRemeasure'
+import { useScrollEdges } from '../hooks/useScrollEdges'
+import VoiceStatusBar from './VoiceStatusBar'
+import VoiceDictationPanel, { useDictationPanelUsable } from './VoiceDictationPanel'
+import { createPortal } from 'react-dom'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useBranding } from '../hooks/useBranding'
+import { useAppSelector, useAppDispatch } from '../store'
 import {
   resolveByApprovalId,
   openActivityToTool,
@@ -67,51 +66,50 @@ import {
   sseSubagentDone,
   setAgentSwitchNotice,
   switchSlot,
-} from "../store/chatSlice";
-import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback';
-import { useSlotId } from '../providers/SlotContext';
-import { useToolPillVisible } from '../store/toolPillRegistry';
-import { ToolDetails } from '../pages/chat/ToolDetails';
-import { api, ApiError } from '../api/client';
-import { safeSetItem, safeGetItem } from '../utils/safeStorage';
-import { offlineProps } from '../utils/offline';
-import { shallowEqual } from 'react-redux';
-import { motion, AnimatePresence } from 'framer-motion';
-import { sanitizeLlmOutput } from '../utils/sanitize';
-import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames';
-import { useLanguage } from '../i18n/LanguageProvider';
-import { pickToolLabel } from '../utils/toolLabel';
-import { toApiDecision } from '../utils/approvalDecision';
-import TrustDropdown from './TrustDropdown';
-import type { AutomationRecord } from '../monitoring/automation';
-import { useIsMobile } from '../hooks/useIsMobile';
-import { isTouchDevice } from '../utils/isTouchDevice';
-import { useIsTouchDevice } from '../hooks/useIsTouchDevice';
-import { Btn, Slider } from './ui';
-import ErrorNotice from './ErrorNotice';
-import { useTouchPushToTalk } from '../hooks/useTouchPushToTalk';
-import {
-  consumeComposerRelease,
-  COMPOSER_EXPAND_EVENT,
-} from "../pages/chat/composerFocus";
-import BusySendButton, { useBusySendMode } from './BusySendButton';
-import { isScreenSnipSupported } from '../hooks/useScreenSnip';
-import { useImeGuard } from '../hooks/useImeGuard';
+} from '../store/chatSlice'
+import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
+import { useSlotId } from '../providers/SlotContext'
+import { useToolPillVisible } from '../store/toolPillRegistry'
+import { ToolDetails } from '../pages/chat/ToolDetails'
+import { api, ApiError } from '../api/client'
+import { safeSetItem, safeGetItem } from '../utils/safeStorage'
+import { offlineProps } from '../utils/offline'
+import { shallowEqual } from 'react-redux'
+import { motion, AnimatePresence } from 'framer-motion'
+import { sanitizeLlmOutput } from '../utils/sanitize'
+import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
+import { useComposerSpellcheck } from '../hooks/useComposerSpellcheck'
+import { useLanguage } from '../i18n/LanguageProvider'
+import { pickToolLabel } from '../utils/toolLabel'
+import { deriveToolCallTitle } from '../utils/toolCallTitle'
+import { toApiDecision } from '../utils/approvalDecision'
+import TrustDropdown from './TrustDropdown'
+import type { AutomationRecord } from '../monitoring/automation'
+import { useIsMobile } from '../hooks/useIsMobile'
+import { isTouchDevice } from '../utils/isTouchDevice'
+import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
+import { Btn, Slider } from './ui'
+import ErrorNotice from './ErrorNotice'
+import { useTouchPushToTalk } from '../hooks/useTouchPushToTalk'
+import { consumeComposerRelease, COMPOSER_EXPAND_EVENT } from '../pages/chat/composerFocus'
+import BusySendButton, { useBusySendMode } from './BusySendButton'
+import { isScreenSnipSupported } from '../hooks/useScreenSnip'
+import { useImeGuard } from '../hooks/useImeGuard'
 import ContextBar, {
   contextTip,
   contextColor,
   composeContextReadout,
   contextPctClamped,
   fmtTokens,
-} from "./ContextBar";
-import PasteHighlightLayer, { INPUT_TYPO } from './PasteHighlightLayer';
-import PasteHoverLayer, { type PasteHoverHandle } from './PasteHoverLayer';
-import FollowUpBar from './FollowUpBar';
-import { dispatchLightbox } from './MarkdownRenderer';
-import { IMG_EXT, buildFileLabels } from '../utils/fileTokens';
-import type { ResizeInfo } from '../utils/resizeImage';
-import type { SubagentActivity } from '../types';
-import { platformShortcut } from '../utils/platform';
+} from './ContextBar'
+import PasteHighlightLayer, { INPUT_TYPO } from './PasteHighlightLayer'
+import PasteHoverLayer, { type PasteHoverHandle } from './PasteHoverLayer'
+import FollowUpBar from './FollowUpBar'
+import { dispatchLightbox } from './MarkdownRenderer'
+import { IMG_EXT, buildFileLabels } from '../utils/fileTokens'
+import type { ResizeInfo } from '../utils/resizeImage'
+import type { SubagentActivity } from '../types'
+import { platformShortcut } from '../utils/platform'
 import {
   type PasteBlock,
   shouldCollapse as shouldCollapsePaste,
@@ -122,26 +120,26 @@ import {
   pruneBlocks,
   nextSeq,
   findTokenRanges,
-} from "../utils/pasteTokens";
-import type { SendMode } from '../pages/chat/ChatSettings';
-import { useLanguageGeneration } from '../i18n/useLanguageGeneration';
-import type { ComposerControl } from './composerControl';
+} from '../utils/pasteTokens'
+import type { SendMode } from '../pages/chat/ChatSettings'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+import type { ComposerControl } from './composerControl'
 import {
   clipboardFiles,
   hasPlainClipboardText,
   stripTrailingBlankLines,
-} from "./composerPastePolicy";
+} from './composerPastePolicy'
 
-const LexicalComposerInput = lazy(() => import("./LexicalComposerInput"));
+const LexicalComposerInput = lazy(() => import('./LexicalComposerInput'))
 
 class ComposerLoadBoundary extends Component<
   { children: React.ReactNode; onError: () => void },
   { failed: boolean }
 > {
-  state = { failed: false };
+  state = { failed: false }
 
   static getDerivedStateFromError() {
-    return { failed: true };
+    return { failed: true }
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
@@ -152,26 +150,23 @@ class ComposerLoadBoundary extends Component<
     // convention as AppHost's boundary.
     // eslint-disable-next-line no-console -- surface composer chunk failures for debugging
     console.error(
-      "[ChatInput] Lexical composer failed to load; falling back to textarea:",
+      '[ChatInput] Lexical composer failed to load; falling back to textarea:',
       error,
       info.componentStack,
-    );
-    this.props.onError();
+    )
+    this.props.onError()
   }
 
   render() {
-    return this.state.failed ? null : this.props.children;
+    return this.state.failed ? null : this.props.children
   }
 }
 
-const SessionAutomationPopover = lazy(
-  () => import("./SessionAutomationPopover"),
-);
+const SessionAutomationPopover = lazy(() => import('./SessionAutomationPopover'))
 
 // Upload picker accept hints. Client-side ONLY (UX) — the server validates type
 // (magic bytes), size, and runs malware scanning per input-validation guidance.
-const IMAGE_ACCEPT =
-  "image/png,image/jpeg,image/gif,image/webp,image/bmp,image/svg+xml";
+const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/svg+xml'
 // Video containers the server accepts (see `_ALLOWED_VIDEO_EXT`). MIME form, not
 // extensions, because this string is also what the MOBILE photo picker filters
 // the library by: iOS shows videos only when a video/* type is listed, so an
@@ -180,16 +175,14 @@ const IMAGE_ACCEPT =
 // in a picker's filter, so omitting it hides a file the server would accept.
 // test_accept_list_covers_every_accepted_extension pins this set against the
 // server's, from the Python side, since a vitest cannot read the Python constant.
-const VIDEO_ACCEPT = "video/mp4,video/x-m4v,video/quicktime,video/webm";
+const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
 const FILE_ACCEPT =
   IMAGE_ACCEPT +
-  "," +
+  ',' +
   VIDEO_ACCEPT +
-  ",.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz";
+  ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
-import ApprovalModePicker, {
-  APPROVAL_MODE_ADJUSTED_LS_KEY,
-} from "./ApprovalModePicker";
+import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
 // Re-exported here for back-compat with existing `from './ChatInput'` imports.
 export {
@@ -198,48 +191,45 @@ export {
   REASONING_EFFORT_PROVIDERS,
   modelSupportsEffort,
   effortLabel,
-} from "../lib/effort";
+} from '../lib/effort'
 // Re-export above does not create a local binding — import effortLabel for use
 // in this component's own render below.
-import { effortLabel } from '../lib/effort';
-import SlashCommandMenu from './SlashCommandMenu';
-import FilePickerMenu from './FilePickerMenu';
-import type { FileKind } from './FilePickerMenu';
-import { useComposerVoiceSlice, type ComposerVoiceInputProps } from '../chat-core/composer/Composer';
-import SkillPickerMenu from './SkillPickerMenu';
-import { skillsCacheStaleTime } from '../lib/skillsCache';
-import ProjectSkillsTrustDialog from './ProjectSkillsTrustDialog';
-import {
-  matchFileToken,
-  matchSkillToken,
-  replaceTokenAtCaret,
-} from "./composerTokens";
-import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch';
-import { useMeasuredHeight } from '../hooks/useMeasuredHeight';
+import { effortLabel } from '../lib/effort'
+import SlashCommandMenu from './SlashCommandMenu'
+import FilePickerMenu from './FilePickerMenu'
+import type { FileKind } from './FilePickerMenu'
+import { useComposerVoiceSlice, type ComposerVoiceInputProps } from '../chat-core/composer/Composer'
+import SkillPickerMenu from './SkillPickerMenu'
+import { skillsCacheStaleTime } from '../lib/skillsCache'
+import ProjectSkillsTrustDialog from './ProjectSkillsTrustDialog'
+import { matchFileToken, matchSkillToken, replaceTokenAtCaret } from './composerTokens'
+import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
+import { useMeasuredHeight } from '../hooks/useMeasuredHeight'
 
 import {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
-} from "./ui/dropdown-menu";
-import { i18nT } from '../i18n/t';
-import { fmtDateFields, fmtPercent } from '../i18n/format';
-import SessionRefStrip from './SessionRefStrip';
-import type { SessionRef } from '../utils/sessionRefs';
-const INPUT_MIN_H = 44;
-const INPUT_DEFAULT_MAX_H = 140;
-const INPUT_PREFILL_MAX_H = 320;
-const INPUT_DRAG_MIN_H = 93;
-const INPUT_DRAG_MAX_RATIO = 0.5;
-const INPUT_HEIGHT_LS_KEY = "mc-input-height";
+} from './ui/dropdown-menu'
+import { i18nT } from '../i18n/t'
+import { fmtDateFields, fmtPercent } from '../i18n/format'
+import SessionRefStrip from './SessionRefStrip'
+import type { SessionRef } from '../utils/sessionRefs'
+import { activeElementIsEditable, isEditableTarget } from '../utils/editableTarget'
+const INPUT_MIN_H = 44
+const INPUT_DEFAULT_MAX_H = 140
+const INPUT_PREFILL_MAX_H = 320
+const INPUT_DRAG_MIN_H = 93
+const INPUT_DRAG_MAX_RATIO = 0.5
+const INPUT_HEIGHT_LS_KEY = 'mc-input-height'
 /**
  * Whether the composer is in hold-to-talk mode (`'1'`) — the WeChat-style swap
  * where the textarea is replaced by a hold target. Persisted because using voice
  * is a habit rather than a per-message choice: someone who dictates does it all
  * day, and resetting to the keyboard on every mount taxes exactly them.
  */
-const VOICE_MODE_LS_KEY = "mc-voice-mode";
+const VOICE_MODE_LS_KEY = 'mc-voice-mode'
 /**
  * Whether the composer is collapsed for reading (`'1'`). Persisted for the same
  * reason the drag height is: someone reading long output wants the room to stay
@@ -251,36 +241,36 @@ const VOICE_MODE_LS_KEY = "mc-voice-mode";
  * labelled bar standing exactly where the composer was, so it cannot be missed
  * and it is reachable by keyboard.
  */
-const COMPOSER_COLLAPSED_LS_KEY = "mc-composer-collapsed";
+const COMPOSER_COLLAPSED_LS_KEY = 'mc-composer-collapsed'
 
 // Prompt undo/redo tuning. The chat textarea is a controlled component, so any
 // programmatic value reset (send-clear, ↑/↓ history recall, prompt optimize)
 // wipes the browser's native undo stack. We keep an explicit snapshot history
 // so Ctrl/Cmd+Z can always restore prior text — including after an accidental
 // full erase.
-const UNDO_COALESCE_MS = 400; // merge keystrokes within this window into one undo step
-const UNDO_BULK_DELTA = 8; // an insert/delete of >= this many chars is its own boundary
-const UNDO_MAX_HISTORY = 200; // cap snapshots to bound memory
+const UNDO_COALESCE_MS = 400 // merge keystrokes within this window into one undo step
+const UNDO_BULK_DELTA = 8 // an insert/delete of >= this many chars is its own boundary
+const UNDO_MAX_HISTORY = 200 // cap snapshots to bound memory
 
 // `blocks` rides with each snapshot so undo/redo restores the paste content
 // backing any `[ Paste #N ]` token in `value` — deleting or expanding a token
 // drops its PasteBlock, and without this an undo would resurrect the token text
 // as a dead literal with no recoverable content.
 type UndoSnap = {
-  value: string;
-  selStart: number;
-  selEnd: number;
-  blocks: PasteBlock[];
-};
+  value: string
+  selStart: number
+  selEnd: number
+  blocks: PasteBlock[]
+}
 
 /** True when two block lists hold the same blocks by id (order-independent).
  *  Lets undo/redo skip a redundant onPasteBlocksChange when the paste set is
  *  unchanged (e.g. plain-text undo, where both sides are empty). */
 function sameBlocks(a: PasteBlock[], b: PasteBlock[]): boolean {
-  if (a === b) return true;
-  if (a.length !== b.length) return false;
-  const ids = new Set(a.map((x) => x.id));
-  return b.every((x) => ids.has(x.id));
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  const ids = new Set(a.map((x) => x.id))
+  return b.every((x) => ids.has(x.id))
 }
 
 // Decisions resolved through the ONE-SHOT `api.resolveApproval` endpoint are
@@ -296,16 +286,12 @@ function sameBlocks(a: PasteBlock[], b: PasteBlock[]): boolean {
  *  `approvalIsUnattended`), so the Trust controls are withheld and only
  *  Allow once / Reject are offered. Kept in sync with the backend's
  *  `_BACKGROUND_APPROVAL_SOURCES` minus `autonudge`, which does run in-session. */
-export const UNATTENDED_APPROVAL_SOURCES = new Set([
-  "cron",
-  "heartbeat",
-  "taskrunner",
-]);
+export const UNATTENDED_APPROVAL_SOURCES = new Set(['cron', 'heartbeat', 'taskrunner'])
 
 /** B2 nudge: after this many manual one-shot approvals in one slot while the
  *  mode is still `normal`, offer the approval-mode picker once. Three is the
  *  point where repeated prompting reads as friction rather than safety. */
-const APPROVAL_NUDGE_THRESHOLD = 3;
+const APPROVAL_NUDGE_THRESHOLD = 3
 
 // Pending-approval selection is slot-aware — see selectSlotPendingApproval
 // in chatSlice: each grid pane's approval bar reflects ITS slot.
@@ -313,7 +299,7 @@ const APPROVAL_NUDGE_THRESHOLD = 3;
 /** Usable viewport height. Native window zoom already reports zoomed CSS
  *  pixels through innerHeight, so no compensation var is needed. */
 function effectiveVh(): number {
-  return window.innerHeight;
+  return window.innerHeight
 }
 
 /** True when the text on the caret's line, before the caret, is ONLY markdown
@@ -324,17 +310,17 @@ function effectiveVh(): number {
  *  (no `>`) is NOT a quote prefix — the own-line shape stays for those.
  *  Linear scan, no regex. */
 function isBlockquotePrefix(linePrefix: string): boolean {
-  let sawMarker = false;
+  let sawMarker = false
   for (let i = 0; i < linePrefix.length; i++) {
-    const c = linePrefix.charCodeAt(i);
+    const c = linePrefix.charCodeAt(i)
     if (c === 62 /* > */) {
-      sawMarker = true;
-      continue;
+      sawMarker = true
+      continue
     }
-    if (c === 32 /* space */ || c === 9 /* \t */) continue;
-    return false;
+    if (c === 32 /* space */ || c === 9 /* \t */) continue
+    return false
   }
-  return sawMarker;
+  return sawMarker
 }
 
 /** Off-screen twin used to measure the composer's content height.
@@ -354,37 +340,37 @@ function isBlockquotePrefix(linePrefix: string): boolean {
  *  inside the same task never clamps, while WebKit clamps during layout. A
  *  Chromium reproduction of the keystroke case therefore shows nothing at all. */
 /** Far enough off-screen that no scrollable ancestor can reach the twin. */
-const TWIN_OFFSCREEN_PX = "-99999px";
+const TWIN_OFFSCREEN_PX = '-99999px'
 
-let measureTwin: HTMLTextAreaElement | null = null;
+let measureTwin: HTMLTextAreaElement | null = null
 
 /** Content height of `el`'s value, measured without mutating `el`. */
 function measuredContentHeight(el: HTMLTextAreaElement): number {
-  if (typeof document === "undefined") return INPUT_MIN_H;
+  if (typeof document === 'undefined') return INPUT_MIN_H
   if (!measureTwin) {
-    measureTwin = document.createElement("textarea");
-    measureTwin.setAttribute("aria-hidden", "true");
-    measureTwin.tabIndex = -1;
-    measureTwin.readOnly = true;
-    document.body.appendChild(measureTwin);
+    measureTwin = document.createElement('textarea')
+    measureTwin.setAttribute('aria-hidden', 'true')
+    measureTwin.tabIndex = -1
+    measureTwin.readOnly = true
+    document.body.appendChild(measureTwin)
   }
-  const twin = measureTwin;
-  const cs = window.getComputedStyle(el);
+  const twin = measureTwin
+  const cs = window.getComputedStyle(el)
   // `position:fixed` keeps the twin out of every flow, so no ancestor of the live
   // composer — and therefore not the transcript scroller — can see it at all. It
   // also escapes a transformed ancestor, which a `position:absolute` twin would not.
   // Set per property rather than through one `cssText` declaration string: that
   // form reads as user-facing copy to the i18n gate, and this one matches the
   // property-by-property copying below.
-  twin.style.position = "fixed";
-  twin.style.top = TWIN_OFFSCREEN_PX;
-  twin.style.left = TWIN_OFFSCREEN_PX;
-  twin.style.visibility = "hidden";
-  twin.style.pointerEvents = "none";
-  twin.style.height = "0";
-  twin.style.overflow = "hidden";
-  twin.style.resize = "none";
-  twin.style.border = "0";
+  twin.style.position = 'fixed'
+  twin.style.top = TWIN_OFFSCREEN_PX
+  twin.style.left = TWIN_OFFSCREEN_PX
+  twin.style.visibility = 'hidden'
+  twin.style.pointerEvents = 'none'
+  twin.style.height = '0'
+  twin.style.overflow = 'hidden'
+  twin.style.resize = 'none'
+  twin.style.border = '0'
   // Everything that can move where the text wraps or how tall a line is. Width and
   // the horizontal box must match or the twin wraps at a different column and
   // reports a height the live element would never have. The live textarea is
@@ -392,42 +378,42 @@ function measuredContentHeight(el: HTMLTextAreaElement): number {
   // `box-sizing:border-box` a themed border would otherwise give the twin a WIDER
   // content box than the element it stands in for.
   const COPIED = [
-    "width",
-    "boxSizing",
-    "paddingTop",
-    "paddingRight",
-    "paddingBottom",
-    "paddingLeft",
-    "font",
-    "fontFamily",
-    "fontSize",
-    "fontWeight",
-    "fontStyle",
-    "fontStretch",
-    "fontFeatureSettings",
-    "fontVariationSettings",
-    "fontKerning",
-    "lineHeight",
-    "letterSpacing",
-    "wordSpacing",
-    "textIndent",
-    "textTransform",
-    "whiteSpace",
-    "wordBreak",
-    "overflowWrap",
-    "hyphens",
-    "tabSize",
-    "direction",
-    "writingMode",
-    "unicodeBidi",
-  ] as const;
-  const style = twin.style as unknown as Record<string, string>;
-  const computed = cs as unknown as Record<string, string>;
+    'width',
+    'boxSizing',
+    'paddingTop',
+    'paddingRight',
+    'paddingBottom',
+    'paddingLeft',
+    'font',
+    'fontFamily',
+    'fontSize',
+    'fontWeight',
+    'fontStyle',
+    'fontStretch',
+    'fontFeatureSettings',
+    'fontVariationSettings',
+    'fontKerning',
+    'lineHeight',
+    'letterSpacing',
+    'wordSpacing',
+    'textIndent',
+    'textTransform',
+    'whiteSpace',
+    'wordBreak',
+    'overflowWrap',
+    'hyphens',
+    'tabSize',
+    'direction',
+    'writingMode',
+    'unicodeBidi',
+  ] as const
+  const style = twin.style as unknown as Record<string, string>
+  const computed = cs as unknown as Record<string, string>
   for (const prop of COPIED) {
-    const v = computed[prop];
+    const v = computed[prop]
     // Firefox returns '' for the `font` shorthand; the longhands below it cover the
     // same ground, so skip rather than clobber a good value with an empty one.
-    if (v) style[prop] = v;
+    if (v) style[prop] = v
   }
   // An empty composer still renders its PLACEHOLDER in the content box, and that
   // counts toward scrollHeight — several of these placeholders are long translated
@@ -436,8 +422,8 @@ function measuredContentHeight(el: HTMLTextAreaElement): number {
   // rather than as its `placeholder` attribute: the two lay out through the same
   // path at the same width, and an off-screen node carrying a real placeholder
   // attribute would answer accessibility and test queries meant for the live one.
-  twin.value = el.value || el.placeholder || "";
-  return twin.scrollHeight;
+  twin.value = el.value || el.placeholder || ''
+  return twin.scrollHeight
 }
 
 /** The inputs that produced each textarea's current auto-sized height, and the
@@ -452,10 +438,7 @@ function measuredContentHeight(el: HTMLTextAreaElement): number {
  *  corrected. That is what makes the drag handle's double-click reset work
  *  without a measurement — it clears the inline height while the value stays
  *  put, so the cached height is both still correct and no longer applied. */
-const lastMeasured = new WeakMap<
-  HTMLTextAreaElement,
-  { inputs: string; height: string }
->();
+const lastMeasured = new WeakMap<HTMLTextAreaElement, { inputs: string; height: string }>()
 
 /** Auto-size textarea to fit content (only when not manually sized).
  *
@@ -476,6 +459,7 @@ function applyHeight(
   manualHeight: number | null,
   prefillHint?: boolean,
   parked?: boolean,
+  caretFollow?: boolean,
 ) {
   if (parked) {
     // Clipped out of layout — there is nothing valid to measure. Drop the memo
@@ -483,65 +467,70 @@ function applyHeight(
     // height would be re-applied without measuring, and font metrics may have
     // changed across the round-trip. One measurement per unpark is not a cost
     // worth caching against.
-    lastMeasured.delete(el);
-    return;
+    lastMeasured.delete(el)
+    return
   }
-  if (manualHeight !== null) return; // manual height — wrapper controls size
-  const cap = prefillHint ? INPUT_PREFILL_MAX_H : INPUT_DEFAULT_MAX_H;
-  const prev = el.style.height;
+  if (manualHeight !== null) return // manual height — wrapper controls size
+  const cap = prefillHint ? INPUT_PREFILL_MAX_H : INPUT_DEFAULT_MAX_H
+  const prev = el.style.height
   // Everything the twin measures against: its width and box come from the live
   // element, and an EMPTY value is measured as the placeholder (see
   // `measuredContentHeight`), so a placeholder swap changes the height too.
   // `value` last — it is user text and may itself contain the delimiter, so no
   // content can forge a boundary against the fields in front of it.
-  const inputs = [el.clientWidth, cap, el.placeholder, el.value].join("\u0000");
-  const memo = lastMeasured.get(el);
-  let next: string;
+  const inputs = [el.clientWidth, cap, el.placeholder, el.value].join('\u0000')
+  const memo = lastMeasured.get(el)
+  let next: string
   if (memo !== undefined && memo.inputs === inputs) {
-    next = memo.height;
+    next = memo.height
   } else {
-    next =
-      Math.max(INPUT_MIN_H, Math.min(measuredContentHeight(el), cap)) + "px";
-    lastMeasured.set(el, { inputs, height: next });
+    next = Math.max(INPUT_MIN_H, Math.min(measuredContentHeight(el), cap)) + 'px'
+    lastMeasured.set(el, { inputs, height: next })
   }
   if (next !== prev) {
-    el.style.height = next;
+    el.style.height = next
     // Attribute the transcript's resulting viewport change to the composer, so the
     // transcript can hold still instead of chasing it (see composerResize.ts).
-    markComposerResize();
+    markComposerResize()
   }
   // When typing at the end of overflowing content, snap to the bottom so the caret
-  // stays visible.
-  const caretAtEnd =
-    el.selectionStart === el.value.length &&
-    el.selectionEnd === el.value.length;
+  // stays visible. `caretFollow` is false for exactly one caller: the value
+  // effect re-measuring a value the PARENT set -- a hand-off prefill, a slot's
+  // draft restore. Snapping there yanked the view to the LAST line of a seeded
+  // prompt (an error hand-off landed showing only the closing fence of its
+  // report, with the sentence that says what broke scrolled out of sight), and
+  // the caret was not at risk: it only moves when the user edits, and a real
+  // edit comes through the `input` event, which follows it. A re-measure at an
+  // UNCHANGED value -- the cap change when the prefill hint expires, unparking,
+  // a width change -- is a viewport change under a caret the user placed, so it
+  // still follows.
+  const caretAtEnd = el.selectionStart === el.value.length && el.selectionEnd === el.value.length
   if (
+    caretFollow &&
     document.activeElement === el &&
     el.scrollHeight > el.clientHeight &&
     caretAtEnd
   ) {
-    el.scrollTop = el.scrollHeight;
+    el.scrollTop = el.scrollHeight
   }
 }
 
 /** Stable empty result for suppressed spawn-approval reads — a fresh [] per render would churn every dependent memo. */
-const EMPTY_SPAWN_APPROVALS: ReturnType<
-  typeof selectSlotPendingSpawnApprovals
-> = [];
+const EMPTY_SPAWN_APPROVALS: ReturnType<typeof selectSlotPendingSpawnApprovals> = []
 
 /** Busy-composer send affordance — see `ChatInputProps.busyMode`. */
-export type ComposerBusyMode = "split" | "steer-only";
+export type ComposerBusyMode = 'split' | 'steer-only'
 
 interface ChatInputProps {
-  value: string;
-  onChange: (v: string) => void;
-  onSend: () => void;
+  value: string
+  onChange: (v: string) => void
+  onSend: () => void
   /** Rendered inside the composer's own width wrapper, directly above the
    * bordered input box. Children here share the EXACT box geometry of the
    * composer (same padding container, same resolved max-width), so band
    * surfaces like the feature tip can never drift out of alignment the way
    * parallel sibling containers with percentage widths do. */
-  aboveComposer?: React.ReactNode;
+  aboveComposer?: React.ReactNode
   /** When true (composer is busy — a running turn, or background sub-agents
    * still running for the slot), show the split Steer/Queue send button.
    * Steer's meaning follows the state: mid-turn it injects into the live turn;
@@ -549,12 +538,12 @@ interface ChatInputProps {
    * message behind them. If the slot's backend is not steer-capable (e.g.
    * claude), the POST safely falls through to the queue server-side.
    * Plumbing a per-slot capability flag is a follow-up. */
-  canSteer?: boolean;
+  canSteer?: boolean
   /** Act on the composer NOW rather than queueing: a mid-turn steer into the
    * running turn, or a fresh turn when only sub-agents are running. Reads the
    * composer text and pending files itself (ChatPage) and clears them
    * atomically — ChatInput must NOT clear the value around this call. */
-  onSteer?: () => void;
+  onSteer?: () => void
   /** How the BUSY composer offers its send. `'split'` (default): the
    * Steer/Queue split button with its per-slot mode picker — the main chat
    * and split-view panes. `'steer-only'`: the surface has no queue concept —
@@ -565,41 +554,41 @@ interface ChatInputProps {
    * offering one would present a console control inside a chat. Needs
    * `canSteer` + `onSteer` exactly like the split button; without a steer
    * path the busy send still falls back to the queue button. */
-  busyMode?: ComposerBusyMode;
-  disabled?: boolean;
-  placeholder?: string;
-  prefillHint?: boolean;
-  onDismissHint?: () => void;
+  busyMode?: ComposerBusyMode
+  disabled?: boolean
+  placeholder?: string
+  prefillHint?: boolean
+  onDismissHint?: () => void
   /** macOS-only screenshot */
-  onScreenshot?: () => void;
+  onScreenshot?: () => void
   /** Browser-native file upload (cross-platform) */
-  onUploadFiles?: (files: File[]) => void;
+  onUploadFiles?: (files: File[]) => void
   /** Whether file actions are in progress */
-  uploading?: boolean;
+  uploading?: boolean
   /** Pending file paths (images + non-images) for preview strip */
-  pendingFiles?: string[];
+  pendingFiles?: string[]
   /** Pending folder references for the preview strip: RELATIVE paths with trailing slash, derived from `@rel/` composer tokens (a path reference handed to the agent, not an upload) */
-  pendingDirs?: string[];
+  pendingDirs?: string[]
   /** Resize details keyed by pending-file path; renders a badge on the chip */
-  resizedInfo?: Record<string, ResizeInfo>;
+  resizedInfo?: Record<string, ResizeInfo>
   /** Remove a pending file by path */
-  onRemoveFile?: (path: string) => void;
+  onRemoveFile?: (path: string) => void
   /** Remove a pending folder reference by its relative path (strips its composer token) */
-  onRemoveDir?: (path: string) => void;
+  onRemoveDir?: (path: string) => void
   /** Session references staged by dragging a session onto the chat pane.
    *  Rendered as chips above the textarea, the same treatment as attachments.
    *  Serialized as links (never transcripts) when the message is sent. */
-  pendingSessions?: SessionRef[];
+  pendingSessions?: SessionRef[]
   /** Unstage a session reference by its session key */
-  onRemoveSessionRef?: (key: string) => void;
+  onRemoveSessionRef?: (key: string) => void
   /** Show macOS-only buttons (screenshot) */
-  isMac?: boolean;
+  isMac?: boolean
   /** Drag-and-drop handler for the entire input bar */
-  onDrop?: (e: React.DragEvent) => void;
+  onDrop?: (e: React.DragEvent) => void
   /** Drag-over event handler */
-  onDragOver?: (e: React.DragEvent) => void;
+  onDragOver?: (e: React.DragEvent) => void
   /** Drag-leave event handler */
-  onDragLeave?: (e: React.DragEvent) => void;
+  onDragLeave?: (e: React.DragEvent) => void
   /*
    * Voice. There are no voice props any more (chat-core P3-b): dictation is the
    * Voice atom the `<Composer>` root mounts beside this input, read here through
@@ -608,7 +597,7 @@ interface ChatInputProps {
    * hands-free (car-mode) toggle, loop strip and phase arrive the same way.
    */
   /** Chat-level controls in input bar */
-  agentName?: string;
+  agentName?: string
   /**
    * Display label for the agent chip when it must differ from the raw alias.
    * The chip shows this; everything else keyed on the agent (the skills query,
@@ -617,7 +606,7 @@ interface ChatInputProps {
    * agent-less slot that resolves to the current default is distinguishable
    * from one explicitly pinned to that same alias (#8770). Falls back to
    * `agentName` when unset. */
-  agentLabel?: string;
+  agentLabel?: string
   /**
    * True when the agent chip shows an INHERITED default (agent-less slot
    * resolving to the current default), not an explicit pin. Drives an
@@ -625,44 +614,44 @@ interface ChatInputProps {
    * keyboard focus / screen readers (`aria-label`) -- because the ` . default`
    * marker alone reads as opaque (#8770 UX review). Only the inherited case
    * gets it; a pinned chip has nothing to explain. */
-  agentIsInheritedDefault?: boolean;
-  agentSource?: string;
-  modelName?: string;
+  agentIsInheritedDefault?: boolean
+  agentSource?: string
+  modelName?: string
   /**
    * True when `modelName` is the model an INHERITING slot actually runs on (the
    * backend's served default), not a pin. The chip then carries the same
    * ` · default` marker and explanatory tooltip the agent chip uses for its
    * inherited case, so a served model does not read as something the user
    * chose. A pinned chip has nothing to explain. */
-  modelIsInheritedDefault?: boolean;
-  onAgentClick?: (rect: DOMRect) => void;
-  onModelClick?: (rect: DOMRect) => void;
-  onProjectClick?: (rect: DOMRect) => void;
+  modelIsInheritedDefault?: boolean
+  onAgentClick?: (rect: DOMRect) => void
+  onModelClick?: (rect: DOMRect) => void
+  onProjectClick?: (rect: DOMRect) => void
   /** App-contributed session controls (contributes.sessionControls in app.json). */
   sessionControls?: {
-    key: string;
-    label: string;
-    icon?: string;
+    key: string
+    label: string
+    icon?: string
     /** True while this control's popover is open. */
-    active?: boolean;
+    active?: boolean
     /**
      * App-reported per-session state. `ok` tints the chip with --ok so a
      * configured control is visible without opening it; `warn` uses --warn.
      * Absent for apps that declare no status route — the original appearance.
      */
-    state?: "ok" | "warn" | "none";
+    state?: 'ok' | 'warn' | 'none'
     /** Replaces the tooltip when the app explains its state. */
-    statusTooltip?: string;
-  }[];
-  onSessionControlClick?: (key: string, rect: DOMRect) => void;
-  contextPct?: number;
-  contextUsedTokens?: number;
-  contextWindowTokens?: number;
-  showContextPct?: boolean;
+    statusTooltip?: string
+  }[]
+  onSessionControlClick?: (key: string, rect: DOMRect) => void
+  contextPct?: number
+  contextUsedTokens?: number
+  contextWindowTokens?: number
+  showContextPct?: boolean
   /** Show used/window token counts in the inline context readout. */
-  showContextTokens?: boolean;
-  isRunning?: boolean;
-  onStop?: () => void;
+  showContextTokens?: boolean
+  isRunning?: boolean
+  onStop?: () => void
   /**
    * True when an EMPTY composer can hand the thread back to the agent, so the
    * dead send button becomes a Continue control instead. Offered on any idle
@@ -670,7 +659,7 @@ interface ChatInputProps {
    * killed, so restricting this to visibly-broken transcripts would miss exactly
    * the case that needs it most.
    */
-  continuable?: boolean;
+  continuable?: boolean
   /**
    * True when the transcript SHOWS the last turn ending badly (unanswered user
    * row, or a trailing error). Picks between "the last turn was interrupted" and
@@ -680,50 +669,50 @@ interface ChatInputProps {
    * control appears at all. A caller may still pass `continuable` alone — the
    * component keeps working, it just gets the neutral wording.
    */
-  continueIsRecovery?: boolean;
-  onContinue?: () => void;
+  continueIsRecovery?: boolean
+  onContinue?: () => void
   /** True while a continue request is in flight. */
-  continuing?: boolean;
-  isQueued?: boolean;
-  stopState?: "idle" | "soft_pending" | "killing";
-  approvalMode?: string;
-  reasoningEffort?: string;
-  onReasoningEffortClick?: (rect: DOMRect) => void;
-  providerId?: string;
+  continuing?: boolean
+  isQueued?: boolean
+  stopState?: 'idle' | 'soft_pending' | 'killing'
+  approvalMode?: string
+  reasoningEffort?: string
+  onReasoningEffortClick?: (rect: DOMRect) => void
+  providerId?: string
   /** Invoked when an @-mention picks a file or directory. `kind` defaults to
    *  'file'. `token` is the exact composer text the pick inserted (e.g.
    *  "@src/pages/"), computed against the picker's search root — the staging
    *  side records it so a later chip-remove can strip precisely this token. */
-  onFileSelect?: (path: string, kind?: FileKind, token?: string) => void;
-  onFileOpen?: (path: string) => void;
-  project?: string;
+  onFileSelect?: (path: string, kind?: FileKind, token?: string) => void
+  onFileOpen?: (path: string) => void
+  project?: string
   /** Checked-out branch of the active project (or short SHA when detached). */
-  projectBranch?: string;
+  projectBranch?: string
   /** True when the project's HEAD is detached, so the label is a commit. */
-  projectDetached?: boolean;
+  projectDetached?: boolean
   /** Uncommitted file count in the project's working tree (0 = clean). */
-  projectGitDirty?: number;
+  projectGitDirty?: number
   /** Commits ahead of / behind the branch's upstream, when it tracks one. */
-  projectGitAhead?: number;
-  projectGitBehind?: number;
-  memoryMode?: string;
+  projectGitAhead?: number
+  projectGitBehind?: number
+  memoryMode?: string
   /** User-sent messages for ↑/↓ history navigation (oldest → newest). */
-  sentMessages?: string[];
+  sentMessages?: string[]
   /** Authoritative automation record for this slot (if any). */
-  onAutomationClick?: (open: boolean) => void;
-  automation?: AutomationRecord | null;
-  automationOpen?: boolean;
-  onAutomationChange?: (automation: AutomationRecord | null) => void;
-  automationCreationReady?: boolean;
-  automationSnapshotFailed?: boolean;
+  onAutomationClick?: (open: boolean) => void
+  automation?: AutomationRecord | null
+  automationOpen?: boolean
+  onAutomationChange?: (automation: AutomationRecord | null) => void
+  automationCreationReady?: boolean
+  automationSnapshotFailed?: boolean
   /** Session routing mode; crew/member cannot host direct monitor turns. */
-  sessionMode?: string;
+  sessionMode?: string
   /** Send-key mode. Default 'enter'. */
-  sendOnEnter?: SendMode;
+  sendOnEnter?: SendMode
   /** Follow-up options from assistant message */
-  followUpOptions?: string[];
+  followUpOptions?: string[]
   /** Options the user has picked (visual highlight in FollowUpBar) */
-  followUpPicked?: Set<string>;
+  followUpPicked?: Set<string>
   /** Select a follow-up option — handler toggles text in input (see ChatPage wiring).
    *  Third arg is `followUpSourceKey` as it was when the chip was CLICKED (the
    *  chip debounces, and the row can advance inside that window); `undefined`
@@ -732,38 +721,38 @@ interface ChatInputProps {
     option: string,
     event: React.MouseEvent,
     sourceKeyAtClick?: string | null,
-  ) => void;
+  ) => void
   /** Immediate send (double-click / Send-now). Second arg is the click-time
    *  row identity FollowUpBar already snapshots for onSelect. */
-  onFollowUpSend?: (text?: string, sourceKeyAtClick?: string | null) => void;
+  onFollowUpSend?: (text?: string, sourceKeyAtClick?: string | null) => void
   /** Quick Send enabled — clicking sends immediately */
-  quickSend?: boolean;
+  quickSend?: boolean
   /** Layout mode for the follow-up bar: 'multiline' (default) or 'scroll' (original single-line). */
-  followUpLayout?: "multiline" | "scroll";
+  followUpLayout?: 'multiline' | 'scroll'
   /** Identity of the transcript row the follow-up options were derived from.
    *  Forwarded to FollowUpBar so a chip click carries the row it acted on. */
-  followUpSourceKey?: string | null;
+  followUpSourceKey?: string | null
   /** Collapsed paste blocks backing `⌜🗒 Pasted …⌟` tokens in `value`. */
-  pasteBlocks?: PasteBlock[];
+  pasteBlocks?: PasteBlock[]
   /** Replace the current list of paste blocks (add/remove). */
-  onPasteBlocksChange?: (next: PasteBlock[]) => void;
+  onPasteBlocksChange?: (next: PasteBlock[]) => void
   /** Opt into the first Lexical composer migration slice. Defaults off so the
    *  established textarea path remains the production fallback until parity is complete. */
-  lexicalComposer?: boolean;
+  lexicalComposer?: boolean
   /** Optional knowledge chip rendered above the input */
-  knowledgeChip?: React.ReactNode;
+  knowledgeChip?: React.ReactNode
   /** When this key changes, focus the textarea (e.g. on chat session switch). */
   /** Focus-on-switch key. Any new consumer of this prop must honor the
    *  composerFocus one-shot (consumeComposerRelease) or macOS keyboard
    *  switches will autofocus through the release — see composerFocus.ts. */
-  autoFocusKey?: string | null;
+  autoFocusKey?: string | null
   /**
    * Accessible name for the textarea. Defaults to the main chat's "Message
    * input". A host mounting a SECOND composer on the same screen (the side
    * panel) must pass a distinct name, or a screen-reader user tabbing between
    * the two hears the same announcement for both.
    */
-  inputAriaLabel?: string;
+  inputAriaLabel?: string
   /**
    * The typed '/' command and '$' skill triggers, their pickers, and their
    * rows in the plus menu. Defaults on. A host whose sends bypass command
@@ -771,14 +760,14 @@ interface ChatInputProps {
    * turns this off so the menus cannot offer commands that would be sent as
    * plain text.
    */
-  typedCommandMenus?: boolean;
+  typedCommandMenus?: boolean
   /**
    * The slot's approval chrome (tool-approval bar, spawn-approval banner).
    * Defaults on. These are store-driven for the composer's slot, so a second
    * composer on the SAME slot (the side panel) must opt out or the main
    * turn's approvals render twice on one screen.
    */
-  slotApprovalChrome?: boolean;
+  slotApprovalChrome?: boolean
   /**
    * The prompt-optimizer button. Defaults on. Its slot-mismatch completion
    * path routes a late result through `onOptimizeResult`; a host whose
@@ -786,7 +775,7 @@ interface ChatInputProps {
    * (the side panel) must opt out, or an optimize finished after a session
    * switch silently discards the draft it produced.
    */
-  promptOptimizer?: boolean;
+  promptOptimizer?: boolean
   /**
    * The user-driven collapse: the "put the message box away while I read" entry
    * point, the bar that replaces it, and the persisted preference.
@@ -809,31 +798,31 @@ interface ChatInputProps {
    * flag: it needs the key scoped per surface and the event targeted at the
    * pane the intent resolved to. Left as a follow-up, deliberately.
    */
-  collapsible?: boolean;
+  collapsible?: boolean
   /** Gateway WebSocket connection state. When false, send is blocked and a
    *  warning banner appears above the input. Defaults to true so callers that
    *  don't track connectivity (e.g. tests, embedded previews) keep working. */
-  connected?: boolean;
+  connected?: boolean
   /** Deliver an optimize result to the session that initiated it when that
    *  session is no longer the one displayed in this ChatInput (the user
    *  navigated away mid-optimize). The parent routes `optimized` into
    *  `slotId`'s draft so the result is never written to the wrong session and
    *  never silently lost. When the originating session is still on screen,
    *  ChatInput writes the result itself (undoable) and does NOT call this. */
-  onOptimizeResult?: (slotId: string | null, optimized: string) => void;
+  onOptimizeResult?: (slotId: string | null, optimized: string) => void
 }
 
 /** Accent pill under a downscaled attachment chip. Hover (or focus) shows a
  *  styled tooltip with the resize details, portal-rendered above the chip so
  *  the strip's overflow-x-auto can't clip it. */
 function ResizeBadge({ resize }: { resize: ResizeInfo }) {
-  const [tip, setTip] = useState<{ top: number; left: number } | null>(null);
-  const ref = useRef<HTMLButtonElement>(null);
+  const [tip, setTip] = useState<{ top: number; left: number } | null>(null)
+  const ref = useRef<HTMLButtonElement>(null)
   const show = () => {
-    const r = ref.current?.getBoundingClientRect();
-    if (r) setTip({ top: r.top - 8, left: r.left });
-  };
-  const hide = () => setTip(null);
+    const r = ref.current?.getBoundingClientRect()
+    if (r) setTip({ top: r.top - 8, left: r.left })
+  }
+  const hide = () => setTip(null)
   return (
     <>
       {/* In flow under the thumbnail, not overlaid on it. The tile is a fixed
@@ -848,22 +837,19 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
       <button
         type="button"
         ref={ref}
-        aria-label={i18nT(
-          "components.chatInput.resized_to_fit_model_limits_2",
-          {
-            fromW: resize.fromW,
-            fromH: resize.fromH,
-            toW: resize.toW,
-            toH: resize.toH,
-          },
-        )}
+        aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', {
+          fromW: resize.fromW,
+          fromH: resize.fromH,
+          toW: resize.toW,
+          toH: resize.toH,
+        })}
         className="px-1.5 py-[1px] rounded-full border-0 text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default whitespace-nowrap"
         onMouseEnter={show}
         onMouseLeave={hide}
         onFocus={show}
         onBlur={hide}
       >
-        {i18nT("components.chatInput.resized")}
+        {i18nT('components.chatInput.resized')}
       </button>
       {tip &&
         createPortal(
@@ -873,7 +859,7 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
             style={{ top: tip.top, left: tip.left }}
           >
             <div className="text-text">
-              {i18nT("components.chatInput.resized_to_fit_model_limits")}
+              {i18nT('components.chatInput.resized_to_fit_model_limits')}
             </div>
             <div className="text-muted">
               {resize.fromW}×{resize.fromH} → {resize.toW}×{resize.toH}
@@ -882,7 +868,7 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
           document.body,
         )}
     </>
-  );
+  )
 }
 
 /** No Voice atom mounted: every dictation value at its idle default. */
@@ -890,7 +876,7 @@ const NO_VOICE: Partial<ComposerVoiceInputProps> = {}
 
 /** Stable default so an omitted `dirs` prop does not re-run the remeasure
  *  effect on every render (a fresh [] literal changes deps each time). */
-const NO_DIRS: string[] = [];
+const NO_DIRS: string[] = []
 
 function FilePreviewStrip({
   files,
@@ -900,24 +886,24 @@ function FilePreviewStrip({
   onRemoveDir,
   rootRef,
 }: {
-  files: string[];
-  dirs?: string[];
-  resizedInfo?: Record<string, ResizeInfo>;
-  onRemove?: (path: string) => void;
-  onRemoveDir?: (path: string) => void;
-  rootRef?: (node: HTMLDivElement | null) => void;
+  files: string[]
+  dirs?: string[]
+  resizedInfo?: Record<string, ResizeInfo>
+  onRemove?: (path: string) => void
+  onRemoveDir?: (path: string) => void
+  rootRef?: (node: HTMLDivElement | null) => void
 }) {
-  const [attachScroller, edges, remeasure] = useScrollEdges<HTMLDivElement>();
+  const [attachScroller, edges, remeasure] = useScrollEdges<HTMLDivElement>()
   // Chips are added and removed while the strip stays mounted (a paste, a
   // remove), and the scroller keeps its own box through those changes, so the
   // ResizeObserver never fires and no scroll event lands. Without this the cue
   // goes stale: dark over a row that now fits, or absent over one that clips.
   useEffect(() => {
-    remeasure();
-  }, [files, dirs, remeasure]);
-  const imgs = files.filter((p) => IMG_EXT.test(p));
-  const nonImgs = files.filter((p) => !IMG_EXT.test(p));
-  if (!imgs.length && !nonImgs.length && !dirs.length) return null;
+    remeasure()
+  }, [files, dirs, remeasure])
+  const imgs = files.filter((p) => IMG_EXT.test(p))
+  const nonImgs = files.filter((p) => !IMG_EXT.test(p))
+  if (!imgs.length && !nonImgs.length && !dirs.length) return null
   return (
     // The wrapper exists for the edge cues: absolutely-positioned children of
     // the scroller itself would travel with the scrolled content, so the fades
@@ -933,8 +919,8 @@ function FilePreviewStrip({
         data-image-scope=""
       >
         {imgs.map((path, i) => {
-          const src = `/api/file-raw?path=${encodeURIComponent(path)}`;
-          const resize = resizedInfo?.[path];
+          const src = `/api/file-raw?path=${encodeURIComponent(path)}`
+          const resize = resizedInfo?.[path]
           return (
             <div
               key={path}
@@ -952,13 +938,13 @@ function FilePreviewStrip({
                 </span>
                 <button
                   type="button"
-                  aria-label={i18nT("components.chatInput.open_preview_of", {
-                    name: path.split("/").pop(),
+                  aria-label={i18nT('components.chatInput.open_preview_of', {
+                    name: path.split('/').pop(),
                   })}
                   className="block cursor-pointer"
                   onClick={(e) => {
-                    const img = e.currentTarget.querySelector("img");
-                    if (img) dispatchLightbox(img);
+                    const img = e.currentTarget.querySelector('img')
+                    if (img) dispatchLightbox(img)
                   }}
                 >
                   {/* Fixed 64×64 square tile: every image chip is the same size, so
@@ -986,10 +972,10 @@ function FilePreviewStrip({
                 </button>
                 {onRemove && (
                   <button
-                    aria-label={i18nT("components.chatInput.remove")}
+                    aria-label={i18nT('components.chatInput.remove')}
                     className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-danger text-white text-[12px] flex items-center justify-center opacity-0 group-hover/preview:opacity-100 transition-opacity cursor-pointer"
                     onClick={() => onRemove(path)}
-                    title={i18nT("components.chatInput.remove")}
+                    title={i18nT('components.chatInput.remove')}
                   >
                     <X className="lucide-inline" />
                   </button>
@@ -997,20 +983,20 @@ function FilePreviewStrip({
               </div>
               {resize && <ResizeBadge resize={resize} />}
             </div>
-          );
+          )
         })}
         {nonImgs.map((path) => (
           <div
             key={path}
             className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text"
           >
-            <span>{path.split("/").pop()}</span>
+            <span>{path.split('/').pop()}</span>
             {onRemove && (
               <button
                 className="text-muted hover:text-danger cursor-pointer bg-transparent border-none p-0"
                 onClick={() => onRemove(path)}
-                title={i18nT("components.chatInput.remove")}
-                aria-label={i18nT("components.chatInput.remove")}
+                title={i18nT('components.chatInput.remove')}
+                aria-label={i18nT('components.chatInput.remove')}
               >
                 <X size={12} />
               </button>
@@ -1025,9 +1011,8 @@ function FilePreviewStrip({
         {(() => {
           // buildFileLabels splits on `/` only, so normalize Windows separators
           // for label computation; keys and tooltips keep the original rel.
-          const normDir = (d: string) =>
-            d.replace(/\\/g, "/").replace(/\/+$/, "");
-          const dirLabels = buildFileLabels(dirs.map(normDir));
+          const normDir = (d: string) => d.replace(/\\/g, '/').replace(/\/+$/, '')
+          const dirLabels = buildFileLabels(dirs.map(normDir))
           return dirs.map((path) => (
             <div
               key={path}
@@ -1037,22 +1022,22 @@ function FilePreviewStrip({
             >
               <Folder
                 size={12}
-                aria-label={i18nT("components.filePickerMenu.folder")}
+                aria-label={i18nT('components.filePickerMenu.folder')}
                 className="shrink-0 lucide-inline"
               />
-              <span>{(dirLabels.get(normDir(path)) || path) + "/"}</span>
+              <span>{(dirLabels.get(normDir(path)) || path) + '/'}</span>
               {onRemoveDir && (
                 <button
-                  aria-label={i18nT("components.filePickerMenu.remove_folder")}
+                  aria-label={i18nT('components.filePickerMenu.remove_folder')}
                   className="text-muted hover:text-danger cursor-pointer bg-transparent border-none p-0"
                   onClick={() => onRemoveDir(path)}
-                  title={i18nT("components.filePickerMenu.remove_folder")}
+                  title={i18nT('components.filePickerMenu.remove_folder')}
                 >
                   <X size={12} />
                 </button>
               )}
             </div>
-          ));
+          ))
         })()}
       </div>
       {/* Edge cues, same treatment as the sibling strips (SidePanelLayout's
@@ -1076,14 +1061,14 @@ function FilePreviewStrip({
         />
       )}
     </div>
-  );
+  )
 }
 
 /** Stable no-op so an unwired embedder does not remount the picker each render. */
-const noopSelectDevice = () => {};
+const noopSelectDevice = () => {}
 /** Zero-arg stand-in for an absent voice control. Separate from
  *  `noopSelectDevice`, whose one parameter makes it unassignable to `() => void`. */
-const noopVoiceControl = () => {};
+const noopVoiceControl = () => {}
 
 function ChatInput({
   aboveComposer,
@@ -1092,9 +1077,9 @@ function ChatInput({
   onSend,
   canSteer,
   onSteer,
-  busyMode = "split",
+  busyMode = 'split',
   disabled: disabledProp = false,
-  placeholder = "",
+  placeholder = '',
   prefillHint,
   onScreenshot,
   onUploadFiles,
@@ -1155,7 +1140,7 @@ function ChatInput({
   automationCreationReady,
   automationSnapshotFailed,
   sessionMode,
-  sendOnEnter = "enter",
+  sendOnEnter = 'enter',
   followUpOptions,
   followUpPicked,
   onFollowUpSelect,
@@ -1180,7 +1165,7 @@ function ChatInput({
   // root beside this input), not from host-wired props: one hook, the same
   // values the atom computes for every surface, and a host cannot forget to
   // wire it. Null outside a `<Composer>` root — then there is simply no mic.
-  const composerVoice = useComposerVoiceSlice();
+  const composerVoice = useComposerVoiceSlice()
   const {
     voiceRecording = false,
     onSelectVoiceDevice,
@@ -1198,8 +1183,8 @@ function ChatInput({
     voiceCaptureActive,
     voiceError = null,
     voiceLevel = 0,
-    voiceDeviceLabel = "",
-    voiceDeviceId = "",
+    voiceDeviceLabel = '',
+    voiceDeviceId = '',
     voiceDictationPanel = false,
     handsFreeAvailable = false,
     handsFreeOn = false,
@@ -1207,82 +1192,73 @@ function ChatInput({
     handsFreePhase = null,
     voiceStreaming = false,
     voiceSampleRef,
-    voicePartial = "",
+    voicePartial = '',
     voiceDownload = null,
     voiceCaretRef,
     voicePendingCaretRef,
     onClearVoiceError,
-  } = composerVoice?.inputProps ?? NO_VOICE;
-  useLanguageGeneration(); // memo() bails out of the provider-level repaint; subscribe directly
-  const disabled = disabledProp;
-  const dispatch = useAppDispatch();
-  const slotId = useSlotId();
+  } = composerVoice?.inputProps ?? NO_VOICE
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const disabled = disabledProp
+  const dispatch = useAppDispatch()
+  const slotId = useSlotId()
   const pendingApprovalRaw = useAppSelector(
     (s) => selectSlotPendingApproval(s, slotId),
     shallowEqual,
-  );
+  )
   // Suppressed at the READ so every consumer (bar, ghost, pill, rounded-corner
   // class) follows one judgment instead of each render site re-deciding.
-  const pendingApproval = slotApprovalChrome ? pendingApprovalRaw : null;
-  const hasApproval = !!pendingApproval;
-  const [approvalSubmitting, setApprovalSubmitting] = useState(false);
+  const pendingApproval = slotApprovalChrome ? pendingApprovalRaw : null
+  const hasApproval = !!pendingApproval
+  const [approvalSubmitting, setApprovalSubmitting] = useState(false)
   // A2: bumping this opens the footer ApprovalModePicker with a spotlight
   // ring, so the approval bar's hint lands the user on the real control.
-  const [approvalPickerSignal, setApprovalPickerSignal] = useState(0);
+  const [approvalPickerSignal, setApprovalPickerSignal] = useState(0)
   // A1: the hint retires once the user has ever adjusted the mode themselves.
   // Read per approval arrival (cheap), not once per mount, so adjusting the
   // mode hides the hint on the very next approval without a reload.
-  const approvalModeAdjusted =
-    !!pendingApproval && !!safeGetItem(APPROVAL_MODE_ADJUSTED_LS_KEY);
+  const approvalModeAdjusted = !!pendingApproval && !!safeGetItem(APPROVAL_MODE_ADJUSTED_LS_KEY)
   // B2: per-slot manual one-shot approval tally for this dashboard session.
   // In-memory by design — "3 approvals in one sitting" is the annoyance
   // signal; persisting it would fire the nudge on stale history.
-  const approvalCountsRef = useRef<Record<string, number>>({});
-  const [approvalNudgeSlot, setApprovalNudgeSlot] = useState<string | null>(
-    null,
-  );
-  const approvalNudgeActive =
-    !!approvalNudgeSlot && approvalNudgeSlot === slotId;
+  const approvalCountsRef = useRef<Record<string, number>>({})
+  const [approvalNudgeSlot, setApprovalNudgeSlot] = useState<string | null>(null)
+  const approvalNudgeActive = !!approvalNudgeSlot && approvalNudgeSlot === slotId
   // Permanent dismissal (buttons / menu open): the callout has delivered its
   // lesson, so the A1 hint retires with it — otherwise a "Got it" user keeps
   // seeing "Tired of confirming every step?" on every later approval.
   const dismissApprovalNudge = useCallback(() => {
-    setApprovalNudgeSlot(null);
+    setApprovalNudgeSlot(null)
     // One flag carries both retirements: the adjusted/discovery flag already
     // suppresses the hint AND gates the nudge, so a separate dismissed flag
     // would only ever be written alongside it — dead state.
-    safeSetItem(APPROVAL_MODE_ADJUSTED_LS_KEY, "1");
-  }, []);
+    safeSetItem(APPROVAL_MODE_ADJUSTED_LS_KEY, '1')
+  }, [])
   // Session-scoped hide (Escape): a reflexive Escape aimed at the composer
   // must not spend the one-time callout unseen; it may re-fire on a later
   // approval in this sitting.
-  const hideApprovalNudge = useCallback(() => setApprovalNudgeSlot(null), []);
+  const hideApprovalNudge = useCallback(() => setApprovalNudgeSlot(null), [])
   // Non-null while the last approval decision failed. Rendered as a one-line
   // strip under the composer; auto-clears so it cannot become permanent chrome.
-  const [approvalNotice, setApprovalNotice] = useState<string | null>(null);
+  const [approvalNotice, setApprovalNotice] = useState<string | null>(null)
   // The same notice slot carries two different things: STATUS about an
   // approval that expired (nothing failed on our side) and a FAILED decision
   // submit (a rejected request). Only the latter is an error surface.
-  const [approvalNoticeKind, setApprovalNoticeKind] = useState<
-    "status" | "error"
-  >("status");
+  const [approvalNoticeKind, setApprovalNoticeKind] = useState<'status' | 'error'>('status')
 
-  const activeSlot = slotId;
-  const approvalMeta = pendingApproval?.meta as
-    | Record<string, unknown>
-    | undefined;
-  const approvalId = approvalMeta?.approval_id as string | undefined;
-  const approvalToolInput = (approvalMeta?.tool_input as string) || "";
-  const approvalIsReadOnly = !!approvalMeta?.is_read_only;
-  const approvalFullCommand = (approvalMeta?.full_command as string) || "";
-  const approvalBaseCommand = (approvalMeta?.base_command as string) || "";
-  const approvalIsShell = approvalMeta?.is_shell === "1";
+  const activeSlot = slotId
+  const approvalMeta = pendingApproval?.meta as Record<string, unknown> | undefined
+  const approvalId = approvalMeta?.approval_id as string | undefined
+  const approvalToolInput = (approvalMeta?.tool_input as string) || ''
+  const approvalIsReadOnly = !!approvalMeta?.is_read_only
+  const approvalFullCommand = (approvalMeta?.full_command as string) || ''
+  const approvalBaseCommand = (approvalMeta?.base_command as string) || ''
+  const approvalIsShell = approvalMeta?.is_shell === '1'
   // Command-scoped trust is offered only when the gateway proved a canonical,
   // unredacted scope.  The title/input preview are presentation data and must
   // never be promoted into grant authority by a frontend fallback.
-  const approvalTrustCommandGrantable =
-    approvalMeta?.trust_command_grantable === "1";
-  const approvalTrustBaseGrantable = approvalMeta?.trust_base_grantable === "1";
+  const approvalTrustCommandGrantable = approvalMeta?.trust_command_grantable === '1'
+  const approvalTrustBaseGrantable = approvalMeta?.trust_base_grantable === '1'
   /** Server proof that the SESSION-wide grant ("trust all tools") can be
    *  recorded for this card. Read separately from the command-scoped bit above
    *  because the session grant names no command: it auto-approves whatever this
@@ -1290,7 +1266,7 @@ function ChatInput({
    *  whenever the transport redacted or could not canonicalize the command, so
    *  a card that could still take a session grant offered allow-once and reject
    *  alone. */
-  const approvalTrustAllGrantable = approvalMeta?.trust_grantable === "1";
+  const approvalTrustAllGrantable = approvalMeta?.trust_grantable === '1'
   /** Sources that run with no human attached to THIS conversation. Session
    *  trust means "auto-approve tools for this chat session", which is
    *  incoherent for an unattended job: the job is not this session, so the
@@ -1303,9 +1279,9 @@ function ChatInput({
     // reconstruct path carries no `source`), so fall back to the `[source]`
     // prefix the card was written with rather than silently treating a
     // reloaded cron card as an ordinary in-session one.
-    (pendingApproval?.content || "").match(/^(?:🔧\s*)?\[([a-z_]+)\]/)?.[1] ||
-    "";
-  const approvalIsUnattended = UNATTENDED_APPROVAL_SOURCES.has(approvalSource);
+    (pendingApproval?.content || '').match(/^(?:🔧\s*)?\[([a-z_]+)\]/)?.[1] ||
+    ''
+  const approvalIsUnattended = UNATTENDED_APPROVAL_SOURCES.has(approvalSource)
   /** True when a standing Trust grant can actually be RECORDED for this card.
    *  FAIL-CLOSED: the Trust affordances are withheld unless this holds, because
    *  the only other resolve path is the one-shot `api.resolveApproval`, which
@@ -1316,136 +1292,149 @@ function ChatInput({
    *    one-shot endpoint.
    *  - `!approvalIsUnattended`: session trust is incoherent for a job that is
    *    not this session (see `approvalSource` above). */
-  const approvalTrustGrantable = !!activeSlot && !approvalIsUnattended;
-  const simplified = useSimplifiedToolNames();
-  const uiLang = useLanguage().resolved;
-  const approvalLabelRaw = sanitizeLlmOutput(
-    pendingApproval?.content || "",
-  ).replace(/^🔧\s*/, "");
+  const approvalTrustGrantable = !!activeSlot && !approvalIsUnattended
+  const simplified = useSimplifiedToolNames()
+  // Read the composer-spellcheck preference here rather than as a prop, so every
+  // render site of this component honours it and none can forget to pass it.
+  const spellCheck = useComposerSpellcheck()
+  const uiLang = useLanguage().resolved
+  const approvalLabelRaw = sanitizeLlmOutput(pendingApproval?.content || '').replace(/^🔧\s*/, '')
 
-  const approvalToolCallId = (approvalMeta?.tool_call_id as string) || null;
+  const approvalToolCallId = (approvalMeta?.tool_call_id as string) || null
 
   const approvalToolEntry = useAppSelector((s) => {
-    if (!approvalToolCallId) return null;
+    if (!approvalToolCallId) return null
     const log =
       slotId && slotId !== s.chat.activeSlot
         ? (s.chat.slotActivity[slotId]?.toolLog ?? [])
-        : s.chat.toolLog;
-    const entry = log.findLast(
-      (e) => e.type === "tool" && e.tool_call_id === approvalToolCallId,
-    );
-    return entry ? { purpose: entry.purpose || "", ts: entry.ts || 0 } : null;
-  }, shallowEqual);
-  const approvalPurpose = approvalToolEntry?.purpose || "";
-  const approvalTs = approvalToolEntry?.ts || 0;
+        : s.chat.toolLog
+    const entry = log.findLast((e) => e.type === 'tool' && e.tool_call_id === approvalToolCallId)
+    return entry ? { purpose: entry.purpose || '', ts: entry.ts || 0 } : null
+  }, shallowEqual)
+  const approvalPurpose = approvalToolEntry?.purpose || ''
+  const approvalTs = approvalToolEntry?.ts || 0
 
+  // The same label rule as the tool pill (ToolCallLine): simplified mode shows
+  // the purpose, else the argument-derived title; raw mode keeps the verbatim
+  // title unless it is a stub. The permission meta carries `tool_kind` /
+  // `is_shell` / `tool_name` / `mcp_server` for exactly this derivation, and the
+  // verbatim command stays in the ToolDetails payload below — the human vets
+  // the bytes, the title only says what they do.
+  const approvalDerived = deriveToolCallTitle({
+    title: approvalLabelRaw,
+    kind: (approvalMeta?.tool_kind as string) || '',
+    rawInput: approvalMeta?.tool_input,
+    isShell: approvalMeta?.is_shell === '1' || approvalMeta?.is_shell === true,
+    toolName: (approvalMeta?.tool_name as string) || '',
+    mcpServer: (approvalMeta?.mcp_server as string) || '',
+  })
   const approvalLabel = pickToolLabel({
     simplified,
     purpose: approvalPurpose,
     rawLabel: approvalLabelRaw,
+    derivedTitle: approvalDerived.title,
     uiLang,
-  });
+  })
 
   // Subscribe to the inline pill's viewport visibility. While the pill is in
   // view, the bar collapses to just the always-visible button row; the moment
   // the pill scrolls past the top, a "ghost pill" mirror slides into the bar
   // so the user keeps full context (timestamp, purpose, input preview)
   // alongside the action buttons. See src/store/toolPillRegistry.ts.
-  const pillVisible = useToolPillVisible(approvalToolCallId);
+  const pillVisible = useToolPillVisible(approvalToolCallId)
 
   // Settle guard: when a new approval arrives, suppress the ghost for a brief
   // window so the Virtuoso list has time to mount the ToolCallLine and register
   // the pill. Without this, the ghost flashes for 1-2 frames then collapses
   // once the in-chat pill reports itself visible.
-  const [ghostSettled, setGhostSettled] = useState(false);
+  const [ghostSettled, setGhostSettled] = useState(false)
   useEffect(() => {
     if (!approvalToolCallId) {
-      setGhostSettled(false);
-      return;
+      setGhostSettled(false)
+      return
     }
-    setGhostSettled(false);
-    const t = setTimeout(() => setGhostSettled(true), 150);
-    return () => clearTimeout(t);
-  }, [approvalToolCallId]);
+    setGhostSettled(false)
+    const t = setTimeout(() => setGhostSettled(true), 150)
+    return () => clearTimeout(t)
+  }, [approvalToolCallId])
 
-  const showGhost = !!pendingApproval && !pillVisible && ghostSettled;
+  const showGhost = !!pendingApproval && !pillVisible && ghostSettled
 
   // Auto-dismiss the failure notice. Bounded lifetime keeps a transient
   // backend hiccup from leaving a permanent banner over the composer.
   useEffect(() => {
-    if (!approvalNotice) return;
-    const t = setTimeout(() => setApprovalNotice(null), 8000);
-    return () => clearTimeout(t);
-  }, [approvalNotice]);
+    if (!approvalNotice) return
+    const t = setTimeout(() => setApprovalNotice(null), 8000)
+    return () => clearTimeout(t)
+  }, [approvalNotice])
   const showInChat = useCallback(() => {
-    if (approvalToolCallId) dispatch(openActivityToTool(approvalToolCallId));
-  }, [approvalToolCallId, dispatch]);
+    if (approvalToolCallId) dispatch(openActivityToTool(approvalToolCallId))
+  }, [approvalToolCallId, dispatch])
 
   // Stop button: killing-state escape hatch (re-enable after 15s)
-  const { escaped: killingEscaped } = useStopEscapeHatch(stopState);
+  const { escaped: killingEscaped } = useStopEscapeHatch(stopState)
 
   const handleApprovalAction = useCallback(
     (decision: string, pattern?: string) => {
-      if (!approvalId) return;
-      setApprovalSubmitting(true);
-      setApprovalNotice(null);
+      if (!approvalId) return
+      setApprovalSubmitting(true)
+      setApprovalNotice(null)
       const finish = () => {
-        dispatch(resolveByApprovalId({ id: approvalId, decision }));
-        setApprovalSubmitting(false);
+        dispatch(resolveByApprovalId({ id: approvalId, slot: activeSlot || undefined, decision }))
+        setApprovalSubmitting(false)
         // B2: tally manual one-shot approvals per slot. Only 'approved' counts —
         // a trust grant already reduces future prompts, and a rejection is not
         // approval fatigue. Fires once per dashboard install (localStorage
         // guard) and only while the slot still asks about everything (normal).
-        if (decision === "approved" && activeSlot && !approvalIsUnattended) {
-          const n = (approvalCountsRef.current[activeSlot] || 0) + 1;
-          approvalCountsRef.current[activeSlot] = n;
+        if (decision === 'approved' && activeSlot && !approvalIsUnattended) {
+          const n = (approvalCountsRef.current[activeSlot] || 0) + 1
+          approvalCountsRef.current[activeSlot] = n
           if (
             n >= APPROVAL_NUDGE_THRESHOLD &&
-            approvalMode === "normal" &&
+            approvalMode === 'normal' &&
             !safeGetItem(APPROVAL_MODE_ADJUSTED_LS_KEY)
           ) {
-            setApprovalNudgeSlot(activeSlot);
+            setApprovalNudgeSlot(activeSlot)
           }
         }
-      };
+      }
       const fail = (err: unknown) => {
-        setApprovalSubmitting(false);
+        setApprovalSubmitting(false)
         // 404 means the backend no longer holds a future for this id — the turn
         // was stopped, timed out, or the process was replaced. The card is an
         // orphan: leaving it up makes every button look broken, so clear it and
         // say why instead of only logging to the console.
         if (err instanceof ApiError && err.status === 404) {
-          dispatch(resolveByApprovalId({ id: approvalId, decision: "stale" }));
+          dispatch(
+            resolveByApprovalId({
+              id: approvalId,
+              slot: activeSlot || undefined,
+              decision: 'stale',
+            }),
+          )
           // Say WHOSE turn expired. Unattended sources deny-fast on a short
           // window (minutes), so by the time a human reads the card the job has
           // usually already been denied and moved on — "expired" alone reads as
           // a dashboard bug rather than the job's documented timeout.
-          setApprovalNoticeKind("status");
+          setApprovalNoticeKind('status')
           setApprovalNotice(
             approvalIsUnattended
-              ? i18nT(
-                  "components.chatInput.that_request_already_timed_out_and_was_denied",
-                  { source: approvalSource },
-                )
-              : i18nT(
-                  "components.chatInput.that_approval_expired_the_turn_it_belonged_to_is",
-                ),
-          );
-          return;
+              ? i18nT('components.chatInput.that_request_already_timed_out_and_was_denied', {
+                  source: approvalSource,
+                })
+              : i18nT('components.chatInput.that_approval_expired_the_turn_it_belonged_to_is'),
+          )
+          return
         }
         // eslint-disable-next-line no-console -- surface real approval-resolution failures to the dev console
-        console.error("Approval failed:", err);
-        setApprovalNoticeKind("error");
+        console.error('Approval failed:', err)
+        setApprovalNoticeKind('error')
         setApprovalNotice(
-          i18nT(
-            "components.chatInput.could_not_submit_that_decision_see_the_console_f",
-          ),
-        );
-      };
+          i18nT('components.chatInput.could_not_submit_that_decision_see_the_console_f'),
+        )
+      }
       if (
-        ["trust_command", "trust_base", "trust", "trust_reads"].includes(
-          decision,
-        ) &&
+        ['trust_command', 'trust_base', 'trust', 'trust_reads'].includes(decision) &&
         activeSlot
       ) {
         // Defence in depth: the Trust controls are not rendered for unattended
@@ -1454,28 +1443,18 @@ function ChatInput({
         // widening its auto-approval surface for a job that is not this session.
         // Downgrade to a one-shot allow instead of silently over-granting.
         if (approvalIsUnattended) {
-          api.resolveApproval(approvalId, "approve").then(finish).catch(fail);
-          return;
+          api.resolveApproval(approvalId, 'approve').then(finish).catch(fail)
+          return
         }
-        const extra: Record<string, string> = { request_id: approvalId };
-        if (pattern) extra.pattern = pattern;
-        api
-          .approveChatSlot(activeSlot, decision, extra)
-          .then(finish)
-          .catch(fail);
+        const extra: Record<string, string> = { request_id: approvalId }
+        if (pattern) extra.pattern = pattern
+        api.approveChatSlot(activeSlot, decision, extra).then(finish).catch(fail)
       } else {
-        api.resolveApproval(approvalId, toApiDecision(decision)).then(finish).catch(fail);
+        api.resolveApproval(approvalId, toApiDecision(decision)).then(finish).catch(fail)
       }
     },
-    [
-      approvalId,
-      activeSlot,
-      approvalIsUnattended,
-      approvalSource,
-      approvalMode,
-      dispatch,
-    ],
-  );
+    [approvalId, activeSlot, approvalIsUnattended, approvalSource, approvalMode, dispatch],
+  )
 
   // Pending sub-agent SPAWN approvals for this slot (blocked on user approval).
   // Surfaced as a top-level banner with inline Approve/Reject so the user can
@@ -1489,73 +1468,67 @@ function ChatInput({
   const pendingSpawnApprovalsRaw = useAppSelector(
     (s) => selectSlotPendingSpawnApprovals(s, slotId),
     shallowEqual,
-  );
+  )
   const pendingSpawnApprovals = slotApprovalChrome
     ? pendingSpawnApprovalsRaw
-    : EMPTY_SPAWN_APPROVALS;
+    : EMPTY_SPAWN_APPROVALS
   const reviewSpawnApprovals = useCallback(() => {
-    dispatch(openActivityToTab("subagents"));
-  }, [dispatch]);
+    dispatch(openActivityToTab('subagents'))
+  }, [dispatch])
   // True once every pending spawn is mid-resolution — swaps the header buttons
   // for a "Resolving…" note. Cards stay in the pending list (status is still
   // 'pending') until the backend confirms, so the banner remains mounted.
   const spawnApprovalsResolving =
-    pendingSpawnApprovals.length > 0 &&
-    pendingSpawnApprovals.every((a) => a.approving);
+    pendingSpawnApprovals.length > 0 && pendingSpawnApprovals.every((a) => a.approving)
   const resolveOneSpawn = useCallback(
-    (a: SubagentActivity, action: "approve" | "reject") => {
-      if (!a.approval_id || a.approving) return;
-      dispatch(markSubagentApproving({ id: a.id, approving: true }));
+    (a: SubagentActivity, action: 'approve' | 'reject') => {
+      if (!a.approval_id || a.approving) return
+      dispatch(markSubagentApproving({ id: a.id, approving: true }))
       api
         .resolveApproval(a.approval_id, action)
         .then(() => {
-          // Terminate a rejected card here, because nothing else will. The backend's
-          // `approval_resolved` frame carries only {id, approved} — no slot — so the
-          // useWebSocket handler that would dispatch sseSubagentDone is skipped
-          // (it requires data.slot to avoid misattributing cards across sessions).
-          // An APPROVED spawn still converges: it runs and emits its own
-          // spawn/chunk/done stream, each frame carrying a slot. A REJECTED spawn
-          // never runs and emits nothing further, so without this the card stays
-          // pending+approving and the banner sticks on "Resolving…" indefinitely.
-          if (action === "reject" && slotId) {
+          // Terminate a rejected card optimistically so the banner does not depend
+          // on a WebSocket round trip. The slot-scoped `approval_resolved` frame
+          // converges this state idempotently when it arrives. An approved spawn
+          // also converges through its spawn/chunk/done stream, while a rejected
+          // spawn emits no lifecycle events beyond the resolution frame. The card
+          // renders this value verbatim under its error label, so it carries the
+          // same catalog sentence the WS retire path uses, not the raw token.
+          if (action === 'reject' && slotId) {
             dispatch(
               sseSubagentDone({
                 slot: slotId,
                 id: a.id,
                 elapsed: 0,
-                error: "rejected",
+                error: i18nT('hooks.useWebSocket.approval_rejected'),
               }),
-            );
+            )
           }
         })
-        .catch(() =>
-          dispatch(markSubagentApproving({ id: a.id, approving: false })),
-        );
+        .catch(() => dispatch(markSubagentApproving({ id: a.id, approving: false })))
     },
     [dispatch, slotId],
-  );
+  )
   const resolveSpawnApprovals = useCallback(
-    (action: "approve" | "reject") => {
-      for (const a of pendingSpawnApprovals) resolveOneSpawn(a, action);
+    (action: 'approve' | 'reject') => {
+      for (const a of pendingSpawnApprovals) resolveOneSpawn(a, action)
     },
     [pendingSpawnApprovals, resolveOneSpawn],
-  );
+  )
 
   const approvalBtnClass =
-    "inline-flex items-center gap-1 px-2 py-1 rounded-md bg-[color-mix(in_srgb,var(--warn)_12%,transparent)] border border-border text-text text-[12px] cursor-pointer font-body hover:bg-[color-mix(in_srgb,var(--warn)_25%,transparent)] hover:text-text hover:border-border-strong transition-colors disabled:opacity-50";
+    'inline-flex items-center gap-1 px-2 py-1 rounded-md bg-[color-mix(in_srgb,var(--warn)_12%,transparent)] border border-border text-text text-[12px] cursor-pointer font-body hover:bg-[color-mix(in_srgb,var(--warn)_25%,transparent)] hover:text-text hover:border-border-strong transition-colors disabled:opacity-50'
 
-  const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const composerAnchorRef = useRef<HTMLElement | null>(null);
-  const lexicalControlRef = useRef<ComposerControl | null>(null);
-  const [lexicalLoadFailed, setLexicalLoadFailed] = useState(false);
-  const [lexicalFailedNoticeDismissed, setLexicalFailedNoticeDismissed] =
-    useState(false);
-  const [lexicalControlRevision, setLexicalControlRevision] = useState(0);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null)
+  const composerAnchorRef = useRef<HTMLElement | null>(null)
+  const lexicalControlRef = useRef<ComposerControl | null>(null)
+  const [lexicalLoadFailed, setLexicalLoadFailed] = useState(false)
+  const [lexicalFailedNoticeDismissed, setLexicalFailedNoticeDismissed] = useState(false)
+  const [lexicalControlRevision, setLexicalControlRevision] = useState(0)
   const markLexicalReady = useCallback(() => {
-    composerAnchorRef.current =
-      lexicalControlRef.current?.getRootElement() ?? null;
-    setLexicalControlRevision((value) => value + 1);
-  }, []);
+    composerAnchorRef.current = lexicalControlRef.current?.getRootElement() ?? null
+    setLexicalControlRevision((value) => value + 1)
+  }, [])
   // Attribute the Lexical editor's own growth to the composer (see
   // composerResize.ts). The textarea path attributes inside `applyHeight`, which
   // the contenteditable never runs — its box grows through CSS min/max-height as
@@ -1564,81 +1537,77 @@ function ChatInput({
   // Height only: a width change is window- or panel-driven, not composer-driven,
   // and must stay attributable to whatever caused it.
   useEffect(() => {
-    if (!lexicalComposer || lexicalLoadFailed) return;
-    if (typeof ResizeObserver === "undefined") return;
-    const root = lexicalControlRef.current?.getRootElement();
-    if (!root) return;
-    let lastHeight = root.offsetHeight;
+    if (!lexicalComposer || lexicalLoadFailed) return
+    if (typeof ResizeObserver === 'undefined') return
+    const root = lexicalControlRef.current?.getRootElement()
+    if (!root) return
+    let lastHeight = root.offsetHeight
     const ro = new ResizeObserver(() => {
-      const height = root.offsetHeight;
+      const height = root.offsetHeight
       if (height !== lastHeight) {
-        lastHeight = height;
-        markComposerResize();
+        lastHeight = height
+        markComposerResize()
       }
-    });
-    ro.observe(root);
-    return () => ro.disconnect();
-  }, [lexicalComposer, lexicalLoadFailed, lexicalControlRevision]);
+    })
+    ro.observe(root)
+    return () => ro.disconnect()
+  }, [lexicalComposer, lexicalLoadFailed, lexicalControlRevision])
   const publishLexicalSelection = useCallback(
     (selection: { start: number; end: number }) => {
-      if (voiceCaretRef) voiceCaretRef.current = selection;
+      if (voiceCaretRef) voiceCaretRef.current = selection
     },
     [voiceCaretRef],
-  );
+  )
   const textareaControl = useMemo<ComposerControl>(
     () => ({
       focus: () => inputRef.current?.focus(),
       getRootElement: () => inputRef.current,
       getSelection: () => {
-        const textarea = inputRef.current;
-        if (!textarea) return null;
+        const textarea = inputRef.current
+        if (!textarea) return null
         return {
           start: textarea.selectionStart ?? 0,
           end: textarea.selectionEnd ?? textarea.selectionStart ?? 0,
-        };
+        }
       },
       setSelection: (start, end = start, options) => {
-        const textarea = inputRef.current;
-        if (!textarea) return;
-        const boundedStart = Math.min(start, textarea.value.length);
-        const boundedEnd = Math.min(end, textarea.value.length);
-        textarea.setSelectionRange(boundedStart, boundedEnd);
-        if (options?.focus) textarea.focus();
+        const textarea = inputRef.current
+        if (!textarea) return
+        const boundedStart = Math.min(start, textarea.value.length)
+        const boundedEnd = Math.min(end, textarea.value.length)
+        textarea.setSelectionRange(boundedStart, boundedEnd)
+        if (options?.focus) textarea.focus()
       },
     }),
     [],
-  );
+  )
   const composerControl = useCallback(
-    () =>
-      lexicalComposer && !lexicalLoadFailed
-        ? lexicalControlRef.current
-        : textareaControl,
+    () => (lexicalComposer && !lexicalLoadFailed ? lexicalControlRef.current : textareaControl),
     [lexicalComposer, lexicalLoadFailed, textareaControl],
-  );
+  )
   // Publish the live caret so ChatPage's dictation handler can splice a
   // transcript in at the cursor instead of appending. Written on every caret
   // move (typing, click, selection); the value persists through blur (clicking
   // the mic button), which is exactly when a batch transcript needs it.
   const setTextareaRef = useCallback(
     (textarea: HTMLTextAreaElement | null) => {
-      inputRef.current = textarea;
-      if (textarea || !lexicalComposer || lexicalLoadFailed)
-        composerAnchorRef.current = textarea;
+      inputRef.current = textarea
+      if (textarea || !lexicalComposer || lexicalLoadFailed) composerAnchorRef.current = textarea
     },
     [lexicalComposer, lexicalLoadFailed],
-  );
+  )
   const recordCaret = useCallback(() => {
-    const selection = composerControl()?.getSelection();
-    if (selection && voiceCaretRef) voiceCaretRef.current = selection;
-  }, [composerControl, voiceCaretRef]);
+    const selection = composerControl()?.getSelection()
+    if (selection && voiceCaretRef) voiceCaretRef.current = selection
+  }, [composerControl, voiceCaretRef])
   // Restore the caret after a dictation transcript lands in `value`. The update
   // arrives via the parent (onChange → ChatPage setInput → value prop), so the
   // parent can't set the DOM selection itself. rAF mirrors applyPickedToken:
   // wait for the controlled value to commit before moving the caret. Cheap on
   // ordinary edits — it no-ops unless a dictation splice armed a pending caret.
   useLayoutEffect(() => {
-    const pendingRef = voicePendingCaretRef;
-    const pos = pendingRef?.current;
+    const pendingRef = voicePendingCaretRef
+    const pos = pendingRef?.current
     if (!pendingRef || pos == null) {
       // No dictation restore pending: keep voiceCaretRef in sync with the live
       // selection, but ONLY once it has been established by a real interaction.
@@ -1646,115 +1615,102 @@ function ChatInput({
       // existing draft doesn't publish offset 0 here (which would make the next
       // batch transcript prepend at 0 instead of using the append fallback that
       // a null ref provides).
-      const control = composerControl();
-      const selection = control?.getSelection();
-      if (selection && voiceCaretRef && voiceCaretRef.current)
-        voiceCaretRef.current = selection;
-      return;
+      const control = composerControl()
+      const selection = control?.getSelection()
+      if (selection && voiceCaretRef && voiceCaretRef.current) voiceCaretRef.current = selection
+      return
     }
-    pendingRef.current = null;
+    pendingRef.current = null
     const raf = requestAnimationFrame(() => {
-      const control = composerControl();
-      if (!control) return;
-      const p = Math.min(pos, value.length);
-      control.setSelection(p, p);
-      if (voiceCaretRef) voiceCaretRef.current = { start: p, end: p };
-    });
+      const control = composerControl()
+      if (!control) return
+      const p = Math.min(pos, value.length)
+      control.setSelection(p, p)
+      if (voiceCaretRef) voiceCaretRef.current = { start: p, end: p }
+    })
     // Cancel the frame if the slot switches (autoFocusKey) or value changes
     // again before it fires — otherwise the callback would stamp this slot's
     // caret onto whatever composer is mounted next.
-    return () => cancelAnimationFrame(raf);
-  }, [
-    value,
-    voicePendingCaretRef,
-    voiceCaretRef,
-    autoFocusKey,
-    composerControl,
-  ]);
+    return () => cancelAnimationFrame(raf)
+  }, [value, voicePendingCaretRef, voiceCaretRef, autoFocusKey, composerControl])
   // Dictation-panel gate. Three independent conditions must hold: the setting
   // is on, the browser has WebGL2, and the OS is not asking for reduced motion
   // (the hook covers the latter two). A mic error always falls through to
   // VoiceStatusBar, which owns the dismissible error affordance — the panel
   // has no way to surface it. Resolves to the sample ref (not a boolean) so
   // the non-optional prop narrows without a cast.
-  const dictationUsable = useDictationPanelUsable(voiceDictationPanel);
+  const dictationUsable = useDictationPanelUsable(voiceDictationPanel)
   const showDictation =
-    dictationUsable && voiceRecording && !voiceError && voiceSampleRef
-      ? voiceSampleRef
-      : null;
-  const wrapperRef = useRef<HTMLDivElement>(null);
+    dictationUsable && voiceRecording && !voiceError && voiceSampleRef ? voiceSampleRef : null
+  const wrapperRef = useRef<HTMLDivElement>(null)
   // Backdrop mirror that paints chip backgrounds behind paste tokens; its scroll
   // is kept in lockstep with the textarea (see syncMirrorScroll on the textarea).
-  const mirrorRef = useRef<HTMLDivElement>(null);
+  const mirrorRef = useRef<HTMLDivElement>(null)
   // Hover detection layer that shows paste previews on mouseover; scroll-synced
   // identically to the backdrop mirror.
-  const hoverRef = useRef<PasteHoverHandle>(null);
+  const hoverRef = useRef<PasteHoverHandle>(null)
   // Id of the open paste-preview tooltip (or null). Wired to the textarea's
   // aria-describedby so keyboard/screen-reader users get the preview announced
   // when the caret enters a token — the AT half of the paste-preview a11y fix.
-  const [pastePreviewPanelId, setPastePreviewPanelId] = useState<string | null>(
-    null,
-  );
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const fileInputId = useId();
+  const [pastePreviewPanelId, setPastePreviewPanelId] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const fileInputId = useId()
   // "+" drop-up menu (upload file / image + browse toggle).
-  const [plusOpen, setPlusOpen] = useState(false);
-  const [sketchOpen, setSketchOpen] = useState(false);
-  const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false);
+  const [plusOpen, setPlusOpen] = useState(false)
+  const [sketchOpen, setSketchOpen] = useState(false)
+  const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false)
   // Per-session auto-compact threshold (slider in the context popover). The
   // debounce timer collapses a slider drag into one POST; the fetch itself is
   // the React Query below (declared after the shared queryClient), so the
   // value lives in the standard cache rather than hand-rolled state.
-  const autoCompactTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoCompactTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const autoCompactPending = useRef<{
-    slot: string;
-    pct: number | null;
-  } | null>(null);
+    slot: string
+    pct: number | null
+  } | null>(null)
   // Shelf responsiveness: measure the shelf row width and collapse chips to
   // icon-only (agent/project) + drop the model effort label when space is tight.
   // Truncation handles the in-between cases.
-  const [shelfWidth, setShelfWidth] = useState(9999);
-  const shelfRoRef = useRef<ResizeObserver | null>(null);
+  const [shelfWidth, setShelfWidth] = useState(9999)
+  const shelfRoRef = useRef<ResizeObserver | null>(null)
   const shelfRef = useCallback((el: HTMLDivElement | null) => {
-    shelfRoRef.current?.disconnect();
-    if (!el || typeof ResizeObserver === "undefined") return;
+    shelfRoRef.current?.disconnect()
+    if (!el || typeof ResizeObserver === 'undefined') return
     const ro = new ResizeObserver((entries) => {
-      const w = entries[0]?.contentRect.width;
-      if (typeof w === "number") setShelfWidth(w);
-    });
-    ro.observe(el);
-    shelfRoRef.current = ro;
-  }, []);
+      const w = entries[0]?.contentRect.width
+      if (typeof w === 'number') setShelfWidth(w)
+    })
+    ro.observe(el)
+    shelfRoRef.current = ro
+  }, [])
   // Below ~340px the labels no longer fit comfortably alongside the context bar
   // + model chip, so collapse the chips (agent/project) to icon-only.
-  const shelfCompact = shelfWidth < 340;
+  const shelfCompact = shelfWidth < 340
   // Tooltip for the project chip. The chip itself shows the basename (plus the
   // branch when known); the tooltip carries the full path so nothing that was
   // previously discoverable is lost, and names the branch even when the label
   // is truncated or the shelf has collapsed to icon-only.
   const projectChipTitle = useMemo(() => {
-    if (!project) return i18nT("components.chatInput.select_project");
-    const base = i18nT("components.chatInput.project_2", { path: project });
-    if (!projectBranch) return base;
+    if (!project) return i18nT('components.chatInput.select_project')
+    const base = i18nT('components.chatInput.project_2', { path: project })
+    if (!projectBranch) return base
     return projectDetached
-      ? `${base}\n${i18nT("components.chatInput.detached_head_at", { branch: projectBranch })}`
-      : `${base}\n${i18nT("components.chatInput.branch", { branch: projectBranch })}`;
-  }, [project, projectBranch, projectDetached]);
+      ? `${base}\n${i18nT('components.chatInput.detached_head_at', { branch: projectBranch })}`
+      : `${base}\n${i18nT('components.chatInput.branch', { branch: projectBranch })}`
+  }, [project, projectBranch, projectDetached])
   // Tooltip for the working-tree badge. Reuses the Git panel's catalog entry
   // so the badge adds no i18n keys; the arrow segments are glyph+number only
   // (script-neutral, plain concatenation — a template literal here reads as an
   // untranslated string to the i18n gate). Empty when the tree is clean and in
   // sync, which is also what hides the badge.
   const gitBadgeTitle = useMemo(() => {
-    const parts: string[] = [];
+    const parts: string[] = []
     if (projectGitDirty)
-      parts.push(
-        i18nT("components.gitPanel.uncommitted", { count: projectGitDirty }),
-      );
-    if (projectGitAhead) parts.push("\u2191" + String(projectGitAhead));
-    if (projectGitBehind) parts.push("\u2193" + String(projectGitBehind));
-    return parts.join(" \u00b7 ");
-  }, [projectGitDirty, projectGitAhead, projectGitBehind]);
+      parts.push(i18nT('components.gitPanel.uncommitted', { count: projectGitDirty }))
+    if (projectGitAhead) parts.push('\u2191' + String(projectGitAhead))
+    if (projectGitBehind) parts.push('\u2193' + String(projectGitBehind))
+    return parts.join(' \u00b7 ')
+  }, [projectGitDirty, projectGitAhead, projectGitBehind])
   // Focus the composer when the dictation panel is up (as before) OR while a
   // batch transcript is landing (voiceTranscribing), so Enter sends and typing
   // edits the result. Deliberately NOT keyed on bare voiceRecording: focusing
@@ -1762,8 +1718,8 @@ function ChatInput({
   // next partial rebuilds away — the panel (showDictation) already handles the
   // visible streaming case, where the user watches rather than types.
   useEffect(() => {
-    if (showDictation || voiceTranscribing) composerControl()?.focus();
-  }, [showDictation, voiceTranscribing, composerControl]);
+    if (showDictation || voiceTranscribing) composerControl()?.focus()
+  }, [showDictation, voiceTranscribing, composerControl])
 
   // Escape CANCELS dictation (discards the audio), from ANYWHERE. Deliberately a
   // document-level listener rather than the textarea's onKeyDown: starting a
@@ -1795,71 +1751,68 @@ function ChatInput({
   // defaultPrevented, so a snip started during recording would otherwise be
   // cancelled by the same keypress that stopped the recording.
   useEffect(() => {
-    const cancel = onVoiceCancel || onVoiceToggle;
-    if (!voiceRecording || !cancel) return;
+    const cancel = onVoiceCancel || onVoiceToggle
+    if (!voiceRecording || !cancel) return
     const handler = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || e.isComposing || e.defaultPrevented) return;
-      if (
-        slashMenuOpenRef.current ||
-        filePickerOpenRef.current ||
-        skillPickerOpenRef.current
-      )
-        return;
-      if (document.querySelector('[role="dialog"]')) return;
-      e.preventDefault();
-      e.stopPropagation();
-      cancel();
-    };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
-  }, [voiceRecording, onVoiceCancel, onVoiceToggle]);
+      if (e.key !== 'Escape' || e.isComposing || e.defaultPrevented) return
+      if (slashMenuOpenRef.current || filePickerOpenRef.current || skillPickerOpenRef.current)
+        return
+      if (document.querySelector('[role="dialog"]')) return
+      e.preventDefault()
+      e.stopPropagation()
+      cancel()
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [voiceRecording, onVoiceCancel, onVoiceToggle])
 
-  const ctxWrapRef = useRef<HTMLDivElement>(null);
+  const ctxWrapRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    if (!ctxPopoverOpen) return;
+    if (!ctxPopoverOpen) return
     const handler = (e: MouseEvent) => {
       if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node))
-        setCtxPopoverOpen(false);
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [ctxPopoverOpen]);
-  const plusWrapRef = useRef<HTMLDivElement>(null);
-  const plusBtnRef = useRef<HTMLButtonElement>(null);
-  const plusMenuRef = useRef<HTMLDivElement>(null);
-  const [plusRect, setPlusRect] = useState<DOMRect | null>(null);
+        setCtxPopoverOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [ctxPopoverOpen])
+  const plusWrapRef = useRef<HTMLDivElement>(null)
+  const plusBtnRef = useRef<HTMLButtonElement>(null)
+  const plusMenuRef = useRef<HTMLDivElement>(null)
+  const [plusRect, setPlusRect] = useState<DOMRect | null>(null)
   useEffect(() => {
-    if (!plusOpen) return;
+    if (!plusOpen) return
     // Menu is portaled to <body> (escapes the input's overflow-hidden), so the
     // outside-click guard must also exclude the portaled menu, not just the button.
     const h = (e: MouseEvent) => {
-      const t = e.target as Node;
-      if (
-        !plusWrapRef.current?.contains(t) &&
-        !plusMenuRef.current?.contains(t)
-      )
-        setPlusOpen(false);
-    };
-    document.addEventListener("mousedown", h);
-    return () => document.removeEventListener("mousedown", h);
-  }, [plusOpen]);
+      const t = e.target as Node
+      if (!plusWrapRef.current?.contains(t) && !plusMenuRef.current?.contains(t)) setPlusOpen(false)
+    }
+    document.addEventListener('mousedown', h)
+    return () => document.removeEventListener('mousedown', h)
+  }, [plusOpen])
+  const measurePlus = useCallback(() => {
+    if (plusBtnRef.current) setPlusRect(plusBtnRef.current.getBoundingClientRect())
+  }, [])
+  // Keeps the portaled "+" menu anchored while the trigger moves under it --
+  // notably when the mobile keyboard closes (visualViewport-only signal).
+  useAnchorRemeasure(plusOpen, measurePlus)
   const togglePlus = () => {
-    if (!plusOpen && plusBtnRef.current)
-      setPlusRect(plusBtnRef.current.getBoundingClientRect());
-    setPlusOpen((o) => !o);
-  };
+    if (!plusOpen) measurePlus()
+    setPlusOpen((o) => !o)
+  }
   // Client-side `accept` is a UX hint only (input-validation guidance: server enforces type via
   // magic bytes, size, and malware scanning — never trust the extension/MIME here).
   const openPicker = (imageOnly: boolean) => {
-    const el = fileInputRef.current;
-    if (!el) return;
-    el.accept = imageOnly ? IMAGE_ACCEPT : FILE_ACCEPT;
-    el.click();
-    setPlusOpen(false);
-  };
+    const el = fileInputRef.current
+    if (!el) return
+    el.accept = imageOnly ? IMAGE_ACCEPT : FILE_ACCEPT
+    el.click()
+    setPlusOpen(false)
+  }
   // Split send button while the composer is BUSY: 'steer' (default) vs 'queue'.
   // The mode is a persisted PER-SLOT preference — see BusySendButton.
-  const [busySendMode, setBusySendMode] = useBusySendMode(slotId);
+  const [busySendMode, setBusySendMode] = useBusySendMode(slotId)
   // Steer is the active Enter/send action only while the composer is busy and
   // not stopping, on a steer-capable slot, and the user hasn't switched the
   // split button to Queue. Everywhere else the composer falls back to onSend
@@ -1868,14 +1821,10 @@ function ChatInput({
   // `steer-only` has no Queue to switch to, so the persisted per-slot mode is
   // not consulted: a slot that once picked Queue in the main chat must not
   // silently queue from a surface that never shows that choice.
-  const steerOnly = busyMode === "steer-only";
+  const steerOnly = busyMode === 'steer-only'
   const busyChoiceAvailable =
-    isRunning &&
-    (!stopState || stopState === "idle") &&
-    !!canSteer &&
-    !!onSteer;
-  const steerActive =
-    busyChoiceAvailable && (steerOnly || busySendMode === "steer");
+    isRunning && (!stopState || stopState === 'idle') && !!canSteer && !!onSteer
+  const steerActive = busyChoiceAvailable && (steerOnly || busySendMode === 'steer')
   /**
    * Fire the composer. `alternate === true` performs the OTHER busy action for
    * this one send — queue when the split button says steer, steer when it says
@@ -1889,54 +1838,44 @@ function ChatInput({
    */
   const fireComposer = useCallback(
     (alternate?: unknown) => {
-      if (disabled) return;
+      if (disabled) return
       // A batch dictation is still transcribing: block the send so the pending
       // transcript isn't left behind. Otherwise Enter/Send fires the current draft
       // BEFORE the transcript lands, orphaning the dictation into the emptied
       // composer. The transcript appends within ~1-2s, after which a normal Enter
       // sends the complete text. Covers both Enter (handleKeyDown) and the Send
       // button, since both route through here.
-      if (voiceTranscribing) return;
-      const flip = alternate === true && busyChoiceAvailable && !steerOnly;
-      const steerNow = flip ? !steerActive : steerActive;
-      if (steerNow && onSteer) onSteer();
-      else onSend();
+      if (voiceTranscribing) return
+      const flip = alternate === true && busyChoiceAvailable && !steerOnly
+      const steerNow = flip ? !steerActive : steerActive
+      if (steerNow && onSteer) onSteer()
+      else onSend()
     },
-    [
-      disabled,
-      voiceTranscribing,
-      busyChoiceAvailable,
-      steerOnly,
-      steerActive,
-      onSteer,
-      onSend,
-    ],
-  );
+    [disabled, voiceTranscribing, busyChoiceAvailable, steerOnly, steerActive, onSteer, onSend],
+  )
   const sendFollowUp = useCallback(
     (text?: string, sourceKeyAtClick?: string | null) => {
-      if (!disabled) onFollowUpSend?.(text, sourceKeyAtClick);
+      if (!disabled) onFollowUpSend?.(text, sourceKeyAtClick)
     },
     [disabled, onFollowUpSend],
-  );
-  const { botName } = useBranding();
-  const isMobile = useIsMobile();
-  const directFilePicker = isMobile || isTouchDevice();
-  const [attachControlRow, controlRowEdges, remeasureControlRow] =
-    useScrollEdges<HTMLDivElement>();
+  )
+  const { botName } = useBranding()
+  const isMobile = useIsMobile()
+  const directFilePicker = isMobile || isTouchDevice()
+  const [attachControlRow, controlRowEdges, remeasureControlRow] = useScrollEdges<HTMLDivElement>()
   // The control row's chips are prop-driven (the auto-nudge loop chip, the
   // approval-mode picker) and appear or change label while the row keeps its
   // own box, so neither the ResizeObserver nor a scroll event reports the new
   // content width — only this remeasure can refresh the cue. Boolean presence,
   // not the callback itself: the handler's identity may change every render
   // and would re-run the effect for nothing.
-  const hasAutomation = !!onAutomationClick;
+  const hasAutomation = !!onAutomationClick
   useEffect(() => {
-    remeasureControlRow();
-  }, [hasAutomation, automation, approvalMode, isMobile, remeasureControlRow]);
-  const ime = useImeGuard();
+    remeasureControlRow()
+  }, [hasAutomation, automation, approvalMode, isMobile, remeasureControlRow])
+  const ime = useImeGuard()
   const resolvedPlaceholder =
-    placeholder ||
-    i18nT("components.chatInput.message_placeholder", { bot: botName });
+    placeholder || i18nT('components.chatInput.message_placeholder', { bot: botName })
   // An icon swap alone announces nothing, so the empty-state placeholder carries
   // the explanation — and it names typing as the other way out, so the morph
   // never feels like a trap.
@@ -1953,68 +1892,68 @@ function ChatInput({
   // exactly when the loop chip must stop pulsing. Hoisted so the two cannot
   // drift — recomputing it at each site is how the chip silently regresses to
   // claiming active work over a dead session.
-  const resumeOffered = !!(continuable && onContinue && continueIsRecovery);
+  const resumeOffered = !!(continuable && onContinue && continueIsRecovery)
   const continuePlaceholder = resumeOffered
-    ? i18nT("components.chatInput.turn_interrupted_press_resume")
-    : "";
+    ? i18nT('components.chatInput.turn_interrupted_press_resume')
+    : ''
   const continueLabel = i18nT(
     continueIsRecovery
-      ? "components.chatInput.resume_interrupted_turn"
-      : "components.chatInput.continue_thread",
-  );
-  const [slashMenuOpen, setSlashMenuOpen] = useState(false);
-  const [filePickerOpen, setFilePickerOpen] = useState(false);
-  const [fileQuery, setFileQuery] = useState("");
-  const [skillPickerOpen, setSkillPickerOpen] = useState(false);
-  const [skillQuery, setSkillQuery] = useState("");
+      ? 'components.chatInput.resume_interrupted_turn'
+      : 'components.chatInput.continue_thread',
+  )
+  const [slashMenuOpen, setSlashMenuOpen] = useState(false)
+  const [filePickerOpen, setFilePickerOpen] = useState(false)
+  const [fileQuery, setFileQuery] = useState('')
+  const [skillPickerOpen, setSkillPickerOpen] = useState(false)
+  const [skillQuery, setSkillQuery] = useState('')
   // Project skill awaiting consent, together with the exact chat/project/request
   // that initiated it. A grant can outlive this dialog, so completion must not
   // write into a different draft or supersede a newer consent request.
-  const nextTrustRequestIdRef = useRef(0);
-  const activeTrustRequestIdRef = useRef<number | null>(null);
+  const nextTrustRequestIdRef = useRef(0)
+  const activeTrustRequestIdRef = useRef<number | null>(null)
   const [trustPrompt, setTrustPrompt] = useState<{
-    requestId: number;
-    leaf: string;
-    slotKey?: string;
-    project?: string;
-  } | null>(null);
+    requestId: number
+    leaf: string
+    slotKey?: string
+    project?: string
+  } | null>(null)
   // Open an in-input trigger picker from the + menu (mirrors typing the sigil):
   //  '/' slash commands (whole-input), '@' file mention, '$' skill. Appends the
   //  sigil at a word boundary, opens the matching picker, then refocuses the box.
-  const openTrigger = (sigil: "/" | "@" | "$") => {
-    setPlusOpen(false);
-    let nextValue = "/";
-    if (sigil === "/") {
-      onChange(nextValue);
-      setSlashMenuOpen(true);
-      setFilePickerOpen(false);
-      setSkillPickerOpen(false);
+  const openTrigger = (sigil: '/' | '@' | '$') => {
+    setPlusOpen(false)
+    let nextValue = '/'
+    if (sigil === '/') {
+      onChange(nextValue)
+      setSlashMenuOpen(true)
+      setFilePickerOpen(false)
+      setSkillPickerOpen(false)
     } else {
       // Append at the end, exactly as the base textarea path always has —
       // the menu gesture is "start a mention", not "insert at caret", and the
       // default path is this PR's declared rollback target so its observable
       // behavior must not change.
-      const sep = value === "" || /\s$/.test(value) ? "" : " ";
-      nextValue = value + sep + sigil;
-      onChange(nextValue);
-      setSlashMenuOpen(false);
-      if (sigil === "@") {
-        setFilePickerOpen(true);
-        setFileQuery("");
-        setSkillPickerOpen(false);
+      const sep = value === '' || /\s$/.test(value) ? '' : ' '
+      nextValue = value + sep + sigil
+      onChange(nextValue)
+      setSlashMenuOpen(false)
+      if (sigil === '@') {
+        setFilePickerOpen(true)
+        setFileQuery('')
+        setSkillPickerOpen(false)
       } else {
-        setSkillPickerOpen(true);
-        setSkillQuery("");
-        setFilePickerOpen(false);
+        setSkillPickerOpen(true)
+        setSkillQuery('')
+        setFilePickerOpen(false)
       }
     }
     // Engine-neutral twin of the base `el.setSelectionRange(n, n)`: place the
     // caret at the end of the new value in whichever composer is live.
-    const nextCaret = nextValue.length;
+    const nextCaret = nextValue.length
     requestAnimationFrame(() =>
       composerControl()?.setSelection(nextCaret, nextCaret, { focus: true }),
-    );
-  };
+    )
+  }
   // Warm the per-slot-and-project skills cache when the input gains focus so the first
   // `$` trigger renders the picker instantly (the fetch is the only latency).
   // prefetchQuery is a no-op if the cache is already fresh (staleTime), so it's
@@ -2023,190 +1962,177 @@ function ChatInput({
   // prefetch warms a different entry and the menu still pays the fetch on open.
   // The deadline binds HERE too, not only in the menu: react-query dedupes on that
   // shared key, so the menu opening onto this fetch never runs its own queryFn.
-  const queryClient = useQueryClient();
+  const queryClient = useQueryClient()
   // Per-session auto-compact threshold: fetched lazily on popover open (the
   // slots frame stays untouched), cached under the standard query layer. The
   // slider writes optimistically into the cache per step and the debounced
   // mutation collapses a drag into one POST; the response re-syncs the cache.
   const autoCompactQuery = useQuery({
-    queryKey: ["slot-autocompact", activeSlot ?? null],
+    queryKey: ['slot-autocompact', activeSlot ?? null],
     queryFn: () => api.chatSlotAutocompact(activeSlot as string),
     enabled: ctxPopoverOpen && !!activeSlot,
     staleTime: 30_000,
-  });
-  const autoCompact = autoCompactQuery.data ?? null;
+  })
+  const autoCompact = autoCompactQuery.data ?? null
   // In-popover report of an auto-compact threshold write that did not persist.
-  const [autoCompactError, setAutoCompactError] = useState("");
+  const [autoCompactError, setAutoCompactError] = useState('')
   // INVARIANT: every threshold POST is chained onto the previous
   // write for that slot, so writes commit in issue order — a delayed earlier
   // POST can never land after (and overwrite) a newer value on the server.
   // ALL dispatch sites (the debounced mutation, the cross-slot flush, the
   // unmount flush) MUST go through enqueueAutoCompactWrite; never call
   // api.setChatSlotAutocompact directly from this component.
-  const autoCompactChain = useRef<Map<string, Promise<unknown>>>(new Map());
-  const enqueueAutoCompactWrite = useCallback(
-    (slot: string, pct: number | null) => {
-      const prev = autoCompactChain.current.get(slot) ?? Promise.resolve();
-      // Chain through settle (not just success): a failed write must not block
-      // — or reorder — the writes queued behind it.
-      const next = prev.then(
-        () => api.setChatSlotAutocompact(slot, pct),
-        () => api.setChatSlotAutocompact(slot, pct),
-      );
-      autoCompactChain.current.set(
-        slot,
-        next.then(
-          () => undefined,
-          () => undefined,
-        ),
-      );
-      return next;
-    },
-    [],
-  );
+  const autoCompactChain = useRef<Map<string, Promise<unknown>>>(new Map())
+  const enqueueAutoCompactWrite = useCallback((slot: string, pct: number | null) => {
+    const prev = autoCompactChain.current.get(slot) ?? Promise.resolve()
+    // Chain through settle (not just success): a failed write must not block
+    // — or reorder — the writes queued behind it.
+    const next = prev.then(
+      () => api.setChatSlotAutocompact(slot, pct),
+      () => api.setChatSlotAutocompact(slot, pct),
+    )
+    autoCompactChain.current.set(
+      slot,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    )
+    return next
+  }, [])
   const autoCompactMutation = useMutation({
     mutationFn: ({ slot, pct }: { slot: string; pct: number | null }) =>
       enqueueAutoCompactWrite(slot, pct),
     onSuccess: (r, vars) => {
-      setAutoCompactError("");
+      setAutoCompactError('')
       queryClient.setQueryData(
-        ["slot-autocompact", vars.slot],
+        ['slot-autocompact', vars.slot],
         (
           prev:
             | {
-                pct: number | null;
-                global_pct: number;
-                min: number;
-                max: number;
+                pct: number | null
+                global_pct: number
+                min: number
+                max: number
               }
             | undefined,
         ) => (prev ? { ...prev, pct: r.pct, global_pct: r.global_pct } : prev),
-      );
+      )
     },
     onError: (err, vars) => {
       // A rejected write must not leave the optimistic value cached: refetch
       // the server truth so the slider snaps back to the applied threshold.
       queryClient.invalidateQueries({
-        queryKey: ["slot-autocompact", vars.slot],
-      });
+        queryKey: ['slot-autocompact', vars.slot],
+      })
       // Surface the failure the way the sibling per-slot settings do (model,
       // reasoning effort): a silent snap-back leaves the user's compaction
       // intent unapplied with no explanation — and with the popover closed,
       // no visible change at all. The toast is transient feedback only; the
       // in-popover ErrorNotice (autoCompactError) is the error surface.
-      const msg = agentSwitchFailureMessage(err);
-      dispatch(setAgentSwitchNotice(msg));
-      setAutoCompactError(msg);
+      const msg = agentSwitchFailureMessage(err)
+      dispatch(setAgentSwitchNotice(msg))
+      setAutoCompactError(msg)
     },
-  });
+  })
   const pushAutoCompact = useCallback(
     (pct: number | null) => {
-      if (!activeSlot) return;
-      const slot = activeSlot;
+      if (!activeSlot) return
+      const slot = activeSlot
       queryClient.setQueryData(
-        ["slot-autocompact", slot],
+        ['slot-autocompact', slot],
         (
           prev:
             | {
-                pct: number | null;
-                global_pct: number;
-                min: number;
-                max: number;
+                pct: number | null
+                global_pct: number
+                min: number
+                max: number
               }
             | undefined,
         ) => (prev ? { ...prev, pct } : prev),
-      );
-      if (autoCompactTimer.current) clearTimeout(autoCompactTimer.current);
+      )
+      if (autoCompactTimer.current) clearTimeout(autoCompactTimer.current)
       // Debouncing only ever supersedes a write for the SAME slot. A pending
       // write for another slot (drag on A, switch, drag on B within the window)
       // is a different session's change: flush it now instead of discarding it,
       // or A would silently keep its old threshold on the server.
-      const pending = autoCompactPending.current;
+      const pending = autoCompactPending.current
       if (pending && pending.slot !== slot) {
-        autoCompactPending.current = null;
-        autoCompactMutation.mutate({ slot: pending.slot, pct: pending.pct });
+        autoCompactPending.current = null
+        autoCompactMutation.mutate({ slot: pending.slot, pct: pending.pct })
       }
-      autoCompactPending.current = { slot, pct };
+      autoCompactPending.current = { slot, pct }
       autoCompactTimer.current = setTimeout(() => {
-        autoCompactPending.current = null;
-        autoCompactMutation.mutate({ slot, pct });
-      }, 400);
+        autoCompactPending.current = null
+        autoCompactMutation.mutate({ slot, pct })
+      }, 400)
     },
     [activeSlot, queryClient, autoCompactMutation],
-  );
+  )
   // Flush (not discard) a pending debounced write on unmount: cancelling the
   // sole POST would leave the server on the old threshold while the user saw
   // their change accepted. Fire the API call directly -- the component is
   // gone, so the mutation's cache re-sync has nothing left to update.
   useEffect(
     () => () => {
-      if (autoCompactTimer.current) clearTimeout(autoCompactTimer.current);
-      const pending = autoCompactPending.current;
+      if (autoCompactTimer.current) clearTimeout(autoCompactTimer.current)
+      const pending = autoCompactPending.current
       if (pending) {
-        autoCompactPending.current = null;
+        autoCompactPending.current = null
         // On rejection, drop the optimistic value from the cache so a return to
         // this slot refetches server truth instead of showing a threshold the
         // session never applied (mirrors the mutation's onError). Routed through
         // the per-slot chain so the flush cannot overtake an in-flight write.
         void enqueueAutoCompactWrite(pending.slot, pending.pct).catch((err) => {
           queryClient.invalidateQueries({
-            queryKey: ["slot-autocompact", pending.slot],
-          });
+            queryKey: ['slot-autocompact', pending.slot],
+          })
           // The component is gone but the store is not: surface the failure
           // like the sibling settings do, or the user's last change before
           // navigating away silently never applies.
-          dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(err)));
-        });
+          dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(err)))
+        })
       }
     },
     [queryClient, enqueueAutoCompactWrite, dispatch],
-  );
-  const skillSlotKey = slotId ? `dashboard:${slotId}` : undefined;
-  const skillSlotKeyRef = useRef(skillSlotKey);
-  skillSlotKeyRef.current = skillSlotKey;
-  const skillProjectRef = useRef(project);
-  skillProjectRef.current = project;
+  )
+  const skillSlotKey = slotId ? `dashboard:${slotId}` : undefined
+  const skillSlotKeyRef = useRef(skillSlotKey)
+  skillSlotKeyRef.current = skillSlotKey
+  const skillProjectRef = useRef(project)
+  skillProjectRef.current = project
   const prefetchSkills = useCallback(() => {
     queryClient.prefetchQuery({
-      queryKey: [
-        "skills",
-        skillSlotKey ?? null,
-        project ?? null,
-        agentName ?? null,
-      ],
+      queryKey: ['skills', skillSlotKey ?? null, project ?? null, agentName ?? null],
       queryFn: ({ signal }) => api.skills(skillSlotKey, agentName, signal),
       staleTime: skillsCacheStaleTime(project),
-    });
-  }, [queryClient, skillSlotKey, project, agentName]);
+    })
+  }, [queryClient, skillSlotKey, project, agentName])
   // Shared caret-relative token insertion for the @/$ pickers: replace the
   // sigil-token ending at the caret with `token`, commit, and restore the caret
   // just after it. One copy keeps the two onSelect handlers duplication-free.
   const applyPickedToken = useCallback(
     (tokenRe: RegExp, token: string) => {
-      const selection = composerControl()?.getSelection();
-      const next = replaceTokenAtCaret(
-        value,
-        selection?.start ?? value.length,
-        tokenRe,
-        token,
-      );
-      onChange(next.value);
+      const selection = composerControl()?.getSelection()
+      const next = replaceTokenAtCaret(value, selection?.start ?? value.length, tokenRe, token)
+      onChange(next.value)
       requestAnimationFrame(() =>
         composerControl()?.setSelection(next.caret, next.caret, {
           focus: true,
         }),
-      );
+      )
     },
     [value, onChange, composerControl],
-  );
-  const chatMessages = useAppSelector((s) => s.chat.messages);
+  )
+  const chatMessages = useAppSelector((s) => s.chat.messages)
   /** The persisted drag-to-resize preference. Read `manualHeight` below instead —
    *  this is the raw stored value and is not what the composer renders at. */
   const [manualHeightPref, setManualHeight] = useState<number | null>(() => {
-    const saved = localStorage.getItem(INPUT_HEIGHT_LS_KEY);
-    const n = saved ? parseInt(saved, 10) : NaN;
-    return !isNaN(n) && n >= INPUT_MIN_H ? n : null;
-  });
+    const saved = localStorage.getItem(INPUT_HEIGHT_LS_KEY)
+    const n = saved ? parseInt(saved, 10) : NaN
+    return !isNaN(n) && n >= INPUT_MIN_H ? n : null
+  })
   /**
    * Reading-space collapse. The composer is UNMOUNTED, not hidden, and a bar in
    * this component's own wrapper stands in its place.
@@ -2234,13 +2160,12 @@ function ChatInput({
     // MAIN composer wrote and comes up collapsed, which is how "hiding is not
     // collapsing" gets shipped by accident. `collapsible` is host-supplied and
     // constant for a mount, so a lazy initializer is the whole story.
-    () =>
-      collapsible && localStorage.getItem(COMPOSER_COLLAPSED_LS_KEY) === "1",
-  );
-  const collapsedBarRef = useRef<HTMLButtonElement | null>(null);
+    () => collapsible && localStorage.getItem(COMPOSER_COLLAPSED_LS_KEY) === '1',
+  )
+  const collapsedBarRef = useRef<HTMLButtonElement | null>(null)
   /** Latest-value mirror for the window listener below, which is bound once. */
-  const composerCollapsedRef = useRef(composerCollapsed);
-  composerCollapsedRef.current = composerCollapsed;
+  const composerCollapsedRef = useRef(composerCollapsed)
+  composerCollapsedRef.current = composerCollapsed
   /**
    * Two directions rather than one toggle, because each has a different place to
    * put the caret.
@@ -2256,17 +2181,17 @@ function ChatInput({
    * committed the new state. Same reason `focusComposer` defers.
    */
   const collapseComposer = useCallback(() => {
-    setComposerCollapsed(true);
-    safeSetItem(COMPOSER_COLLAPSED_LS_KEY, "1");
-    requestAnimationFrame(() => collapsedBarRef.current?.focus());
-  }, []);
+    setComposerCollapsed(true)
+    safeSetItem(COMPOSER_COLLAPSED_LS_KEY, '1')
+    requestAnimationFrame(() => collapsedBarRef.current?.focus())
+  }, [])
   const expandComposer = useCallback(() => {
-    setComposerCollapsed(false);
-    safeSetItem(COMPOSER_COLLAPSED_LS_KEY, "0");
+    setComposerCollapsed(false)
+    safeSetItem(COMPOSER_COLLAPSED_LS_KEY, '0')
     // Engine-neutral: the live composer may be the textarea or the opt-in
     // Lexical editor, and a collapsed composer re-mounts whichever it was.
-    requestAnimationFrame(() => composerControl()?.focus());
-  }, [composerControl]);
+    requestAnimationFrame(() => composerControl()?.focus())
+  }, [composerControl])
   /**
    * Typing intent is an implicit expand.
    *
@@ -2301,26 +2226,25 @@ function ChatInput({
     // from INHERITING the shared preference, this one stops it from answering for
     // the whole window if some future path sets the state another way. Deleting it
     // would make that future change silently wrong instead of merely wrong.
-    if (!collapsible) return;
+    if (!collapsible) return
     const onExpandRequest = (e: Event) => {
       // Read through a ref, and decide OUTSIDE the state updater: `preventDefault`
       // is a side effect, and a reducer that fires it would run it twice under
       // StrictMode's double-invoke and once for a no-op update.
-      if (!composerCollapsedRef.current) return;
+      if (!composerCollapsedRef.current) return
       // Answering is what licenses the caller's one retry -- see
       // requestComposerExpand. Only a composer that was really collapsed answers,
       // so a lookup that missed for any other reason schedules nothing.
-      e.preventDefault();
-      setComposerCollapsed(false);
-      safeSetItem(COMPOSER_COLLAPSED_LS_KEY, "0");
+      e.preventDefault()
+      setComposerCollapsed(false)
+      safeSetItem(COMPOSER_COLLAPSED_LS_KEY, '0')
       // Deliberately no focus here: the caller does that, and only it knows
       // whether to focus or merely scroll into view -- `revealComposer` scrolls on
       // touch precisely to keep the soft keyboard off the content being read.
-    };
-    window.addEventListener(COMPOSER_EXPAND_EVENT, onExpandRequest);
-    return () =>
-      window.removeEventListener(COMPOSER_EXPAND_EVENT, onExpandRequest);
-  }, [collapsible]);
+    }
+    window.addEventListener(COMPOSER_EXPAND_EVENT, onExpandRequest)
+    return () => window.removeEventListener(COMPOSER_EXPAND_EVENT, onExpandRequest)
+  }, [collapsible])
   /**
    * One line of the waiting draft, shown on the collapsed bar.
    *
@@ -2334,11 +2258,11 @@ function ChatInput({
   const collapsedDraftLine = useMemo(() => {
     const line =
       value
-        .split("\n")
+        .split('\n')
         .find((l) => l.trim().length > 0)
-        ?.trim() ?? "";
-    return line.length > 120 ? `${line.slice(0, 120)}…` : line;
-  }, [value]);
+        ?.trim() ?? ''
+    return line.length > 120 ? `${line.slice(0, 120)}…` : line
+  }, [value])
   /**
    * The collapse entry point, defined once and rendered by whichever menu the
    * layout has.
@@ -2363,26 +2287,23 @@ function ChatInput({
       type="button"
       data-testid="composer-collapse-row"
       onClick={() => {
-        setPlusOpen(false);
-        collapseComposer();
+        setPlusOpen(false)
+        collapseComposer()
       }}
-      title={i18nT("components.chatInput.collapse_composer")}
+      title={i18nT('components.chatInput.collapse_composer')}
       className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
     >
-      <ChevronsDownUp
-        size={14}
-        className="w-4 shrink-0 text-muted lucide-inline"
-      />
+      <ChevronsDownUp size={14} className="w-4 shrink-0 text-muted lucide-inline" />
       <div className="min-w-0">
         <div className="text-[12px] font-medium text-text">
-          {i18nT("components.chatInput.collapse_composer")}
+          {i18nT('components.chatInput.collapse_composer')}
         </div>
         <div className="text-[11px] text-muted leading-snug">
-          {i18nT("components.chatInput.collapse_composer_desc")}
+          {i18nT('components.chatInput.collapse_composer_desc')}
         </div>
       </div>
     </button>
-  ) : null;
+  ) : null
   /**
    * Drag-to-resize is pointer-only, so on a touch device the composer always
    * auto-sizes and the persisted preference is ignored outright.
@@ -2401,64 +2322,63 @@ function ChatInput({
    * `flex-1`, the manual-resize floor, `applyHeight`'s bail — reads this and so
    * follows automatically.
    */
-  const isTouch = useIsTouchDevice();
-  const manualHeight = isTouch ? null : manualHeightPref;
+  const isTouch = useIsTouchDevice()
+  const manualHeight = isTouch ? null : manualHeightPref
 
   // Drag-to-resize refs — resize wrapper div via direct DOM writes, commit on mouseup.
   // Resizing the wrapper (not the textarea) avoids layout thrashing: the textarea
   // fills the wrapper with height:100% so the browser only reflows the wrapper's
   // subtree, not the entire flex column + Virtuoso list above.
-  const dragging = useRef(false);
-  const dragStartY = useRef(0);
-  const dragStartH = useRef(0);
+  const dragging = useRef(false)
+  const dragStartY = useRef(0)
+  const dragStartH = useRef(0)
   /** Mirrors `textareaParked` (defined with the voice-mode derivations, far below)
    *  for the handlers declared above it. Assigned during render, like the other
    *  prop/state mirrors in this file, so it is already current by the time any
    *  effect or event handler reads it. */
-  const parkedRef = useRef(false);
+  const parkedRef = useRef(false)
 
   // Prompt history navigation: -1 = draft (not in history), else index into sentMessages.
   // Refs keep the handler stable across re-renders while preserving state between keystrokes.
-  const historyIdxRef = useRef(-1);
-  const draftRef = useRef("");
+  const historyIdxRef = useRef(-1)
+  const draftRef = useRef('')
   // Refs mirror frequently-changing props/state read from inside the keydown handler
   // so it doesn't re-create on every keystroke.
-  const valueRef = useRef(value);
-  valueRef.current = value;
+  const valueRef = useRef(value)
+  valueRef.current = value
   // Mirror the paste blocks so the undo-recording effect (keyed on
   // [value, autoFocusKey], not pasteBlocks) always snapshots the freshest set.
 
   const handleLexicalChange = useCallback(
     (nextValue: string) => {
-      valueFromUserRef.current = true;
-      onChange(nextValue);
-      const selection = lexicalControlRef.current?.getSelection();
-      const caret = selection?.start ?? nextValue.length;
-      const before = nextValue.slice(0, caret);
-      setSlashMenuOpen(typedCommandMenus && nextValue.startsWith("/"));
-      const fileQueryAtCaret = onFileSelect ? matchFileToken(before) : null;
+      valueFromUserRef.current = true
+      onChange(nextValue)
+      const selection = lexicalControlRef.current?.getSelection()
+      const caret = selection?.start ?? nextValue.length
+      const before = nextValue.slice(0, caret)
+      setSlashMenuOpen(typedCommandMenus && nextValue.startsWith('/'))
+      const fileQueryAtCaret = onFileSelect ? matchFileToken(before) : null
       if (fileQueryAtCaret !== null) {
-        setFilePickerOpen(true);
-        setFileQuery(fileQueryAtCaret);
+        setFilePickerOpen(true)
+        setFileQuery(fileQueryAtCaret)
       } else {
-        setFilePickerOpen(false);
-        setFileQuery("");
+        setFilePickerOpen(false)
+        setFileQuery('')
       }
-      const skillQueryAtCaret =
-        fileQueryAtCaret === null ? matchSkillToken(before) : null;
+      const skillQueryAtCaret = fileQueryAtCaret === null ? matchSkillToken(before) : null
       if (typedCommandMenus && skillQueryAtCaret !== null) {
-        setSkillPickerOpen(true);
-        setSkillQuery(skillQueryAtCaret);
+        setSkillPickerOpen(true)
+        setSkillQuery(skillQueryAtCaret)
       } else {
-        setSkillPickerOpen(false);
-        setSkillQuery("");
+        setSkillPickerOpen(false)
+        setSkillQuery('')
       }
-      if (selection && voiceCaretRef) voiceCaretRef.current = selection;
+      if (selection && voiceCaretRef) voiceCaretRef.current = selection
     },
     [onChange, onFileSelect, typedCommandMenus, voiceCaretRef],
-  );
-  const pasteBlocksRef = useRef(pasteBlocks);
-  pasteBlocksRef.current = pasteBlocks;
+  )
+  const pasteBlocksRef = useRef(pasteBlocks)
+  pasteBlocksRef.current = pasteBlocks
   // --- Prompt undo/redo history (per slot) ---
   // Explicit snapshot stack: undoHistoryRef[undoPointerRef] always mirrors the
   // live value. Rapid keystrokes coalesce into one entry; bulk deletes and
@@ -2471,43 +2391,43 @@ function ChatInput({
       selEnd: value.length,
       blocks: pasteBlocks,
     },
-  ]);
-  const undoPointerRef = useRef(0);
-  const undoLastEditRef = useRef(0);
-  const applyingUndoRef = useRef(false);
+  ])
+  const undoPointerRef = useRef(0)
+  const undoLastEditRef = useRef(0)
+  const applyingUndoRef = useRef(false)
   // True for the next paste only when the user pressed Cmd/Ctrl+Shift+V, so
   // handlePaste inserts the full text inline instead of collapsing it to a
   // `[ Paste #N ]` chip. Set on that keydown, cleared on any other keydown.
-  const rawPasteRef = useRef(false);
-  const prevUndoAfkRef = useRef(autoFocusKey);
-  const slotSettlingRef = useRef(false);
+  const rawPasteRef = useRef(false)
+  const prevUndoAfkRef = useRef(autoFocusKey)
+  const slotSettlingRef = useRef(false)
   // True when the latest `value` change came from a real DOM edit (user typing,
   // IME, execCommand) rather than a parent-driven prop change (slot draft
   // restore). Lets the slot-settling logic tell a keystroke apart from the
   // draft restore regardless of whether ChatPage restores sync or async.
-  const valueFromUserRef = useRef(false);
+  const valueFromUserRef = useRef(false)
   // Tracks the prior render's raw pending state so the completion effect can
   // record a single undo boundary when an optimize actually finishes (as
   // opposed to the scoped `optimizing` flipping off because the user switched
   // sessions mid-flight).
-  const wasOptimizingRef = useRef(false);
+  const wasOptimizingRef = useRef(false)
   // Hoisted here (assigned below, where `optimizing` is defined) so the
   // recording effect above the optimizer block can read it.
-  const optimizingRef = useRef(false);
+  const optimizingRef = useRef(false)
   // The slot that initiated the in-flight optimize. Overlay / readOnly / pending
   // state is scoped to this slot so navigating to another session mid-optimize
   // dismisses the overlay here and only reveals it again when we return to the
   // originating session. Null when no optimize is in flight.
-  const optimizeSlotRef = useRef<string | null>(null);
+  const optimizeSlotRef = useRef<string | null>(null)
   // In-composer report of a rejected optimize request (the restored prompt
   // alone says nothing about why the optimizer did not run).
-  const [optimizeError, setOptimizeError] = useState("");
-  const slashMenuOpenRef = useRef(false);
-  slashMenuOpenRef.current = slashMenuOpen;
-  const filePickerOpenRef = useRef(false);
-  filePickerOpenRef.current = filePickerOpen;
-  const skillPickerOpenRef = useRef(false);
-  skillPickerOpenRef.current = skillPickerOpen;
+  const [optimizeError, setOptimizeError] = useState('')
+  const slashMenuOpenRef = useRef(false)
+  slashMenuOpenRef.current = slashMenuOpen
+  const filePickerOpenRef = useRef(false)
+  filePickerOpenRef.current = filePickerOpen
+  const skillPickerOpenRef = useRef(false)
+  skillPickerOpenRef.current = skillPickerOpen
 
   // Auto-focus textarea when the active session changes (autoFocusKey).
   // Track the previous key in a ref so the effect only acts on real key
@@ -2534,57 +2454,38 @@ function ChatInput({
   // The active-element check IS placed after the ref update — that's a "decline
   // and don't retry" condition (if the user is typing in the agent picker, we
   // shouldn't come back later and steal focus once they switch back).
-  const prevAutoFocusKeyRef = useRef<typeof autoFocusKey>(undefined);
+  const prevAutoFocusKeyRef = useRef<typeof autoFocusKey>(undefined)
   useEffect(() => {
     if (autoFocusKey == null || autoFocusKey === prevAutoFocusKeyRef.current) {
-      prevAutoFocusKeyRef.current = autoFocusKey;
-      return;
+      prevAutoFocusKeyRef.current = autoFocusKey
+      return
     }
     // A keyboard-driven switch released the composer (macOS chord chaining —
     // see releaseComposerForKeyboardSwitch): consume the one-shot and skip
     // this transition's autofocus entirely. The ref advances so the
     // disabled-retry path cannot resurrect the skipped focus later.
     if (consumeComposerRelease()) {
-      prevAutoFocusKeyRef.current = autoFocusKey;
-      return;
+      prevAutoFocusKeyRef.current = autoFocusKey
+      return
     }
-    if (disabled || isMobile || isTouchDevice()) return;
-    const control = composerControl();
-    if (!control) return;
-    prevAutoFocusKeyRef.current = autoFocusKey;
-    const ae = document.activeElement as HTMLElement | null;
-    if (
-      ae &&
-      (ae.tagName === "INPUT" ||
-        ae.tagName === "TEXTAREA" ||
-        ae.isContentEditable)
-    )
-      return;
-    control.focus();
-  }, [
-    autoFocusKey,
-    disabled,
-    isMobile,
-    composerControl,
-    lexicalControlRevision,
-  ]);
+    if (disabled || isMobile || isTouchDevice()) return
+    const control = composerControl()
+    if (!control) return
+    prevAutoFocusKeyRef.current = autoFocusKey
+    if (activeElementIsEditable()) return
+    control.focus()
+  }, [autoFocusKey, disabled, isMobile, composerControl, lexicalControlRevision])
 
   // Global "/" shortcut to focus chat input (like GitHub, YouTube, Slack).
   // Only the primary command composer claims it: with a second instance
   // mounted (the side panel), two document-level listeners would contend and
   // the last-registered one would silently win the focus.
   useEffect(() => {
-    if (!typedCommandMenus) return;
+    if (!typedCommandMenus) return
     const onSlashFocus = (e: KeyboardEvent) => {
-      if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (
-        tag === "INPUT" ||
-        tag === "TEXTAREA" ||
-        (e.target as HTMLElement)?.isContentEditable
-      )
-        return;
-      e.preventDefault();
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
+      if (isEditableTarget(e)) return
+      e.preventDefault()
       // `/` is an explicit "I want to type" gesture, so it outranks the collapse
       // and brings the box back (expandComposer focuses it on the next frame).
       //
@@ -2595,16 +2496,16 @@ function ChatInput({
       // is still covered: it arrives through `focusComposer`, which asks a
       // collapsed composer to return before giving up.
       if (composerCollapsed) {
-        expandComposer();
-        return;
+        expandComposer()
+        return
       }
       // Focus through the engine-neutral control so the gesture lands in
       // whichever composer is live (textarea or the opt-in Lexical editor).
-      composerControl()?.focus();
-    };
-    document.addEventListener("keydown", onSlashFocus);
-    return () => document.removeEventListener("keydown", onSlashFocus);
-  }, [typedCommandMenus, composerCollapsed, expandComposer, composerControl]);
+      composerControl()?.focus()
+    }
+    document.addEventListener('keydown', onSlashFocus)
+    return () => document.removeEventListener('keydown', onSlashFocus)
+  }, [typedCommandMenus, composerCollapsed, expandComposer, composerControl])
 
   // Teardown keyed to the HANDLE's lifecycle, not the component's: the handle
   // leaves the tree on its own mid-drag (the pointer type flipping coarse swaps
@@ -2616,88 +2517,83 @@ function ChatInput({
   // covers every exit. onEnd keeps the normal path; whichever runs first wins,
   // the `dragging` flag makes the loser a no-op.
   const releaseDragSuppression = useCallback(() => {
-    if (!dragging.current) return;
-    dragging.current = false;
-    document.body.style.cursor = "";
-    document.body.style.userSelect = "";
-    if (wrapperRef.current) wrapperRef.current.style.contain = "";
-  }, []);
+    if (!dragging.current) return
+    dragging.current = false
+    document.body.style.cursor = ''
+    document.body.style.userSelect = ''
+    if (wrapperRef.current) wrapperRef.current.style.contain = ''
+  }, [])
   const resizeHandleLifecycleRef = useCallback(
     (node: HTMLDivElement | null) => {
-      if (node === null) releaseDragSuppression();
+      if (node === null) releaseDragSuppression()
     },
     [releaseDragSuppression],
-  );
+  )
 
   const inputResize = usePointerDrag({
     threshold: 0,
     onStart: (e) => {
-      if (!wrapperRef.current) return;
-      const h = wrapperRef.current.offsetHeight;
-      dragging.current = true;
-      dragStartY.current = e.clientY;
-      dragStartH.current = h;
+      if (!wrapperRef.current) return
+      const h = wrapperRef.current.offsetHeight
+      dragging.current = true
+      dragStartY.current = e.clientY
+      dragStartH.current = h
       // Use current natural height as floor so drag never snaps up
-      dragMinHRef.current = Math.min(dragMinHRef.current, h);
+      dragMinHRef.current = Math.min(dragMinHRef.current, h)
       // Lock in current height so auto-resize stops interfering
-      setManualHeight(h);
-      document.body.style.cursor = "row-resize";
-      document.body.style.userSelect = "none";
+      setManualHeight(h)
+      document.body.style.cursor = 'row-resize'
+      document.body.style.userSelect = 'none'
       // Isolate reflow to this subtree during drag
-      wrapperRef.current.style.contain = "strict";
+      wrapperRef.current.style.contain = 'strict'
     },
     onMove: ({ y }) => {
-      if (!dragging.current || !wrapperRef.current) return;
+      if (!dragging.current || !wrapperRef.current) return
       // Account for CSS zoom/scale on #root
-      const scale =
-        parseInt(localStorage.getItem("mc-zoom") || "100", 10) / 100;
-      const maxH = effectiveVh() * INPUT_DRAG_MAX_RATIO;
-      const delta = (dragStartY.current - y) / scale;
-      const h = Math.min(
-        maxH,
-        Math.max(dragMinHRef.current, dragStartH.current + delta),
-      );
+      const scale = parseInt(localStorage.getItem('mc-zoom') || '100', 10) / 100
+      const maxH = effectiveVh() * INPUT_DRAG_MAX_RATIO
+      const delta = (dragStartY.current - y) / scale
+      const h = Math.min(maxH, Math.max(dragMinHRef.current, dragStartH.current + delta))
       // Direct DOM write on wrapper — no React state, no textarea auto-size
-      wrapperRef.current.style.height = h + "px";
+      wrapperRef.current.style.height = h + 'px'
     },
     onEnd: () => {
-      if (!dragging.current) return;
+      if (!dragging.current) return
       // Restore the page-wide suppression BEFORE anything that can bail: the
       // wrapper ref going null must never strand body.cursor/userSelect.
-      releaseDragSuppression();
-      const el = wrapperRef.current;
-      if (!el) return; // suppression released; nothing to measure or commit
+      releaseDragSuppression()
+      const el = wrapperRef.current
+      if (!el) return // suppression released; nothing to measure or commit
       // Commit final height to React state
-      const finalH = el.offsetHeight;
-      setManualHeight(finalH);
-      safeSetItem(INPUT_HEIGHT_LS_KEY, String(Math.round(finalH)));
+      const finalH = el.offsetHeight
+      setManualHeight(finalH)
+      safeSetItem(INPUT_HEIGHT_LS_KEY, String(Math.round(finalH)))
     },
-  });
+  })
   // (Component-unmount teardown is covered by resizeHandleLifecycleRef above:
   // React fires callback refs with null on unmount at every level, so a
   // separate unmount-only effect guard would be a dead duplicate here.)
 
   const resetHeight = useCallback(() => {
-    setManualHeight(null);
-    localStorage.removeItem(INPUT_HEIGHT_LS_KEY);
+    setManualHeight(null)
+    localStorage.removeItem(INPUT_HEIGHT_LS_KEY)
     if (wrapperRef.current) {
-      wrapperRef.current.style.height = "";
-      wrapperRef.current.style.maxHeight = "";
+      wrapperRef.current.style.height = ''
+      wrapperRef.current.style.maxHeight = ''
     }
-  }, []);
+  }, [])
 
   // Sync persisted manual height to DOM (same path as drag writes)
   useEffect(() => {
-    if (!wrapperRef.current) return;
+    if (!wrapperRef.current) return
     if (manualHeight !== null) {
-      wrapperRef.current.style.height =
-        Math.max(manualHeight, INPUT_MIN_H) + "px";
-      wrapperRef.current.style.maxHeight = `${INPUT_DRAG_MAX_RATIO * 100}vh`;
+      wrapperRef.current.style.height = Math.max(manualHeight, INPUT_MIN_H) + 'px'
+      wrapperRef.current.style.maxHeight = `${INPUT_DRAG_MAX_RATIO * 100}vh`
     } else {
-      wrapperRef.current.style.height = "";
-      wrapperRef.current.style.maxHeight = "";
+      wrapperRef.current.style.height = ''
+      wrapperRef.current.style.maxHeight = ''
     }
-  }, [manualHeight, pendingFiles.length, pendingSessions.length]);
+  }, [manualHeight, pendingFiles.length, pendingSessions.length])
 
   // The two effects that MEASURE the textarea (auto-size, and the paste-mirror
   // scroll sync that reads the scrollTop auto-size just wrote) are declared much
@@ -2706,46 +2602,43 @@ function ChatInput({
   // in scope. Do not move them back up here.
 
   // Reset manual height when input is cleared (new message sent)
-  const prevValueRef = useRef(value);
+  const prevValueRef = useRef(value)
   useEffect(() => {
     if (prevValueRef.current && !value) {
-      resetHeight();
+      resetHeight()
       // Picker open state is derived only in the textarea's own onChange, so the
       // parent-driven send-clear would otherwise leave a stale menu open.
-      setSlashMenuOpen(false);
-      setFilePickerOpen(false);
-      setFileQuery("");
-      setSkillPickerOpen(false);
-      setSkillQuery("");
+      setSlashMenuOpen(false)
+      setFilePickerOpen(false)
+      setFileQuery('')
+      setSkillPickerOpen(false)
+      setSkillQuery('')
     }
     // Exit history mode when value diverges from the recalled message
     // (user edited it, or the send pipeline cleared it).
-    if (
-      historyIdxRef.current !== -1 &&
-      value !== sentMessages?.[historyIdxRef.current]
-    ) {
-      historyIdxRef.current = -1;
-      draftRef.current = "";
+    if (historyIdxRef.current !== -1 && value !== sentMessages?.[historyIdxRef.current]) {
+      historyIdxRef.current = -1
+      draftRef.current = ''
     }
-    prevValueRef.current = value;
-  }, [value, resetHeight, sentMessages]);
+    prevValueRef.current = value
+  }, [value, resetHeight, sentMessages])
 
   // ChatInput is one instance shared by every slot, so a switch would carry the
   // previous tab's menu over; an unsent draft never hits the clear above.
   useEffect(() => {
-    setSlashMenuOpen(false);
-    setFilePickerOpen(false);
-    setFileQuery("");
-    setSkillPickerOpen(false);
-    setSkillQuery("");
-  }, [slotId]);
+    setSlashMenuOpen(false)
+    setFilePickerOpen(false)
+    setFileQuery('')
+    setSkillPickerOpen(false)
+    setSkillQuery('')
+  }, [slotId])
 
   // Record undo snapshots as the controlled value changes.
   useEffect(() => {
-    const selection = composerControl()?.getSelection();
+    const selection = composerControl()?.getSelection()
     // Consume the "this change came from a DOM edit" flag exactly once per run.
-    const fromUser = valueFromUserRef.current;
-    valueFromUserRef.current = false;
+    const fromUser = valueFromUserRef.current
+    valueFromUserRef.current = false
     const seed = () => {
       undoHistoryRef.current = [
         {
@@ -2754,17 +2647,17 @@ function ChatInput({
           selEnd: selection?.end ?? value.length,
           blocks: pasteBlocksRef.current,
         },
-      ];
-      undoPointerRef.current = 0;
-      undoLastEditRef.current = 0;
-    };
+      ]
+      undoPointerRef.current = 0
+      undoLastEditRef.current = 0
+    }
     // Skip the change we just made via undo/redo — the pointer is already
     // correct. Keep slot tracking in sync so a coincident switch can't trigger
     // a spurious reset on a later pass.
     if (applyingUndoRef.current) {
-      applyingUndoRef.current = false;
-      prevUndoAfkRef.current = autoFocusKey;
-      return;
+      applyingUndoRef.current = false
+      prevUndoAfkRef.current = autoFocusKey
+      return
     }
     // Slot/session switch. ChatPage restores a slot's draft via the
     // `[activeSlot]` effect in ChatPage.tsx, which calls `setInput` in a
@@ -2774,13 +2667,13 @@ function ChatInput({
     // rather than being recorded as an undoable transition from the prior slot's
     // stale text — otherwise Ctrl+Z in the new slot would restore the old draft.
     if (autoFocusKey !== prevUndoAfkRef.current) {
-      prevUndoAfkRef.current = autoFocusKey;
-      seed();
-      slotSettlingRef.current = true;
-      return;
+      prevUndoAfkRef.current = autoFocusKey
+      seed()
+      slotSettlingRef.current = true
+      return
     }
     if (slotSettlingRef.current) {
-      slotSettlingRef.current = false;
+      slotSettlingRef.current = false
       // The first value change after a switch. A parent-driven prop change is
       // the draft restore (reseed the base at it). A real DOM edit means the
       // user typed before/without a separate restore commit — i.e. ChatPage
@@ -2788,95 +2681,96 @@ function ChatInput({
       // fall through and record the keystroke as a normal edit instead of
       // folding it into the base. Keeps undo correct for sync and async restore.
       if (!fromUser) {
-        if (undoHistoryRef.current[undoPointerRef.current]?.value !== value)
-          seed();
-        return;
+        if (undoHistoryRef.current[undoPointerRef.current]?.value !== value) seed()
+        return
       }
     }
     // While the optimizer owns the textarea, skip per-keystroke recording. A
     // single-shot optimize (one execCommand) lands after `optimizing` clears and
     // records normally; a streaming optimize is captured as one boundary by the
     // completion effect below. Either way one Ctrl+Z reverses a whole optimize.
-    if (optimizingRef.current) return;
-    const hist = undoHistoryRef.current;
-    const ptr = undoPointerRef.current;
-    const prev = hist[ptr]?.value;
-    if (prev === value) return; // selection-only re-render, no text change
+    if (optimizingRef.current) return
+    const hist = undoHistoryRef.current
+    const ptr = undoPointerRef.current
+    const prev = hist[ptr]?.value
+    if (prev === value) return // selection-only re-render, no text change
     const snap: UndoSnap = {
       value,
       selStart: selection?.start ?? value.length,
       selEnd: selection?.end ?? value.length,
       blocks: pasteBlocksRef.current,
-    };
-    const now = Date.now();
+    }
+    const now = Date.now()
     // Coalesce only small, incremental, recent edits at the tip of the history.
     // A bulk change (clear, recall, optimize, select-all-delete) or a pause
     // starts a new boundary so it can be undone on its own. The `prev !== ''`
     // guard also makes the first char typed from empty its own boundary.
     const incremental =
       prev !== undefined &&
-      prev !== "" &&
-      value !== "" &&
-      Math.abs(value.length - prev.length) < UNDO_BULK_DELTA;
-    const recent = now - undoLastEditRef.current < UNDO_COALESCE_MS;
-    const atTip = ptr === hist.length - 1;
+      prev !== '' &&
+      value !== '' &&
+      Math.abs(value.length - prev.length) < UNDO_BULK_DELTA
+    const recent = now - undoLastEditRef.current < UNDO_COALESCE_MS
+    const atTip = ptr === hist.length - 1
     if (atTip && incremental && recent) {
-      hist[ptr] = snap; // merge typing burst into the current entry
+      hist[ptr] = snap // merge typing burst into the current entry
     } else {
-      hist.splice(ptr + 1); // editing discards any redo branch
-      hist.push(snap);
-      if (hist.length > UNDO_MAX_HISTORY) hist.shift();
-      undoPointerRef.current = hist.length - 1;
+      hist.splice(ptr + 1) // editing discards any redo branch
+      hist.push(snap)
+      if (hist.length > UNDO_MAX_HISTORY) hist.shift()
+      undoPointerRef.current = hist.length - 1
     }
-    undoLastEditRef.current = now;
-  }, [value, autoFocusKey, composerControl]);
+    undoLastEditRef.current = now
+  }, [value, autoFocusKey, composerControl])
 
   const handleInput = useCallback(
     (e: React.FormEvent<HTMLTextAreaElement>) => {
+      // This IS the user's edit, so the caret is followed.
       if (!dragging.current)
         applyHeight(
           e.target as HTMLTextAreaElement,
           manualHeight,
           prefillHint,
           parkedRef.current,
-        );
+          true,
+        )
     },
     [manualHeight, prefillHint],
-  );
+  )
 
   const setTextUndoable = useCallback(
     (text: string) => {
       if (lexicalComposer && !lexicalLoadFailed) {
-        valueFromUserRef.current = true;
-        onChange(text);
+        valueFromUserRef.current = true
+        onChange(text)
         requestAnimationFrame(() =>
           composerControl()?.setSelection(text.length, text.length, {
             focus: true,
           }),
-        );
-        return;
+        )
+        return
       }
-      const el = inputRef.current;
+      const el = inputRef.current
       if (!el) {
-        onChange(text);
-        return;
+        onChange(text)
+        return
       }
-      el.readOnly = false;
-      el.focus();
-      el.select();
+      el.readOnly = false
+      el.focus()
+      el.select()
       // Same reconciliation handlePaste does, for the same reason: execCommand's
       // boolean is not evidence. It is absent entirely on some engines, and iOS
       // Safari reports success on a <textarea> while leaving the field untouched.
       // Here the whole field was just select()ed, so an unverified failure leaves
       // the ORIGINAL prompt on screen with the optimizer's result discarded and
       // no error — indistinguishable from "the optimizer changed nothing".
-      let inserted = false;
+      let inserted = false
       try {
         inserted =
-          typeof document.execCommand === "function" &&
-          document.execCommand("insertText", false, text);
+          typeof document.execCommand === 'function' &&
+          document.execCommand('insertText', false, text)
       } catch {
-        inserted = false;
+        inserted = false
       }
       // Reconcile through the controlled value either way, exactly as handlePaste
       // does: after a real insert this is the same string the textarea's own
@@ -2885,43 +2779,42 @@ function ChatInput({
       // silent vanish by a different route. Marked user-driven so the undo
       // recorder treats it as an edit (a new boundary) rather than a
       // parent-driven draft restore, which is what keeps this "undoable".
-      const nativeOk = inserted && el.value === text;
-      valueFromUserRef.current = true;
-      onChange(text);
-      if (nativeOk) return; // the native insert placed the caret itself
+      const nativeOk = inserted && el.value === text
+      valueFromUserRef.current = true
+      onChange(text)
+      if (nativeOk) return // the native insert placed the caret itself
       requestAnimationFrame(() => {
-        if (el && document.activeElement === el)
-          el.setSelectionRange(text.length, text.length);
-      });
+        if (el && document.activeElement === el) el.setSelectionRange(text.length, text.length)
+      })
     },
     [onChange, lexicalComposer, lexicalLoadFailed, composerControl],
-  );
+  )
 
   const optimizeMutation = useMutation({
     onMutate: () => {
-      setOptimizeError("");
+      setOptimizeError('')
     },
     mutationFn: async ({
       prompt,
       context,
       pastes,
     }: {
-      prompt: string;
-      context: string;
-      pastes?: Array<{ seq: number; content: string }>;
-      slotId: string | null;
+      prompt: string
+      context: string
+      pastes?: Array<{ seq: number; content: string }>
+      slotId: string | null
     }) => {
-      const resp = await fetch("/api/optimizer/optimize", {
-        method: "POST",
+      const resp = await fetch('/api/optimizer/optimize', {
+        method: 'POST',
         headers: {
-          "Content-Type": "application/json",
-          "x-session-key": "dashboard:ui",
+          'Content-Type': 'application/json',
+          'x-session-key': 'dashboard:ui',
         },
-        credentials: "same-origin",
+        credentials: 'same-origin',
         body: JSON.stringify({ prompt, context, pastes }),
-      });
-      if (!resp.ok) throw new Error("optimizer failed");
-      return resp.json();
+      })
+      if (!resp.ok) throw new Error('optimizer failed')
+      return resp.json()
     },
     onSuccess: (data, variables) => {
       // Originating session is still the one on screen: write the result here,
@@ -2930,13 +2823,9 @@ function ChatInput({
       // trim-guard defends against a stray whitespace-only mismatch or any
       // unforeseen divergence (drop rather than clobber).
       if (variables.slotId === slotId) {
-        if (valueRef.current.trim() !== variables.prompt.trim()) return;
-        setTextUndoable(
-          data.changed && data.optimized
-            ? data.optimized
-            : valueRef.current.trim(),
-        );
-        return;
+        if (valueRef.current.trim() !== variables.prompt.trim()) return
+        setTextUndoable(data.changed && data.optimized ? data.optimized : valueRef.current.trim())
+        return
       }
       // The user navigated to a different session mid-optimize. Route the
       // result back to the session that started it instead of writing into the
@@ -2945,11 +2834,11 @@ function ChatInput({
       onOptimizeResult?.(
         variables.slotId,
         data.changed && data.optimized ? data.optimized : variables.prompt,
-      );
+      )
     },
     onError: (err, variables) => {
       // eslint-disable-next-line no-console -- surface prompt-optimizer failures to the dev console
-      console.warn("optimizer failed", err);
+      console.warn('optimizer failed', err)
       // The user must learn the optimizer failed: restoring the prompt alone is
       // indistinguishable from "the optimizer changed nothing". Shown on
       // whichever session is on screen — this composer instance is the
@@ -2959,37 +2848,37 @@ function ChatInput({
       // the user is looking at that did not visibly change.
       setOptimizeError(
         variables.slotId === slotId
-          ? i18nT("components.chatInput.optimize_failed")
-          : i18nT("components.chatInput.optimize_failed_elsewhere"),
-      );
+          ? i18nT('components.chatInput.optimize_failed')
+          : i18nT('components.chatInput.optimize_failed_elsewhere'),
+      )
       // Same slot-routing split as onSuccess. On the originating session,
       // restore the original prompt in place; otherwise hand it back to that
       // session's draft so a failed optimize on a backgrounded session doesn't
       // leave stale readOnly text or vanish.
       if (variables.slotId === slotId) {
-        if (valueRef.current.trim() !== variables.prompt.trim()) return;
-        setTextUndoable(valueRef.current.trim());
-        return;
+        if (valueRef.current.trim() !== variables.prompt.trim()) return
+        setTextUndoable(valueRef.current.trim())
+        return
       }
-      onOptimizeResult?.(variables.slotId, variables.prompt);
+      onOptimizeResult?.(variables.slotId, variables.prompt)
     },
-  });
+  })
   // Raw request lifecycle — true whenever a request is in flight, regardless of
   // which session is currently displayed.
-  const optimizePending = optimizeMutation.isPending;
+  const optimizePending = optimizeMutation.isPending
   // Scoped view of that state: only "optimizing" while we're still showing the
   // slot that initiated it. Navigating to a different session dismisses the
   // overlay / readOnly / disabled state here; returning restores it. In grid
   // mode each pane has its own ChatInput + mutation, so slotId always matches
   // and this reduces to the raw pending flag.
-  const optimizing = optimizePending && optimizeSlotRef.current === slotId;
-  optimizingRef.current = optimizing;
+  const optimizing = optimizePending && optimizeSlotRef.current === slotId
+  optimizingRef.current = optimizing
   // Re-entrancy guard reads the RAW lifecycle: only one optimize may be in
   // flight per ChatInput instance. Without this, the button on a *different*
   // session (where scoped `optimizing` is false) could fire a second request
   // that clobbers the single mutation's in-flight state.
-  const optimizePendingRef = useRef(false);
-  optimizePendingRef.current = optimizePending;
+  const optimizePendingRef = useRef(false)
+  optimizePendingRef.current = optimizePending
 
   // When an optimize completes, ensure its result is a single undo boundary.
   // The recording effect skips writes while `optimizing` is true; a single-shot
@@ -3006,54 +2895,54 @@ function ChatInput({
   // request-diverged case is dropped by onSuccess/onError anyway.
   useEffect(() => {
     if (wasOptimizingRef.current && !optimizePending) {
-      const originating = optimizeSlotRef.current;
-      optimizeSlotRef.current = null;
+      const originating = optimizeSlotRef.current
+      optimizeSlotRef.current = null
       if (originating === slotId) {
-        const v = valueRef.current;
-        const hist = undoHistoryRef.current;
-        const ptr = undoPointerRef.current;
+        const v = valueRef.current
+        const hist = undoHistoryRef.current
+        const ptr = undoPointerRef.current
         if (hist[ptr]?.value !== v) {
-          const selection = composerControl()?.getSelection();
-          hist.splice(ptr + 1);
+          const selection = composerControl()?.getSelection()
+          hist.splice(ptr + 1)
           hist.push({
             value: v,
             selStart: selection?.start ?? v.length,
             selEnd: selection?.end ?? v.length,
             blocks: pasteBlocksRef.current,
-          });
-          if (hist.length > UNDO_MAX_HISTORY) hist.shift();
-          undoPointerRef.current = hist.length - 1;
-          undoLastEditRef.current = Date.now();
+          })
+          if (hist.length > UNDO_MAX_HISTORY) hist.shift()
+          undoPointerRef.current = hist.length - 1
+          undoLastEditRef.current = Date.now()
         }
       }
     }
-    wasOptimizingRef.current = optimizePending;
-  }, [optimizePending, slotId, composerControl]);
-  const { mutate: runOptimize } = optimizeMutation;
+    wasOptimizingRef.current = optimizePending
+  }, [optimizePending, slotId, composerControl])
+  const { mutate: runOptimize } = optimizeMutation
 
   const optimizePrompt = useCallback(() => {
-    const txt = valueRef.current.trim();
+    const txt = valueRef.current.trim()
     // Guard on the RAW lifecycle so a second optimize can't start while one is
     // in flight — even from a different session where scoped `optimizing` reads
     // false (a single mutation backs this instance).
-    if (!txt || optimizePendingRef.current) return;
+    if (!txt || optimizePendingRef.current) return
     // Pin the slot that owns this optimize so the overlay and the completion
     // handler stay bound to it across session switches.
-    optimizeSlotRef.current = slotId;
+    optimizeSlotRef.current = slotId
     const context = chatMessages
-      .filter((m) => m.role === "user" || m.role === "assistant")
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
       .slice(-10)
-      .map((m) => (m.content || "").slice(0, 200))
-      .join("\n");
+      .map((m) => (m.content || '').slice(0, 200))
+      .join('\n')
     // Forward the full content behind each paste placeholder still present in
     // the draft, so the optimizer understands the paste without us expanding
     // the "[ Paste #N · M lines ]" token inline. The optimizer preserves the
     // tokens verbatim in its output, so pasteBlocks keeps mapping them back on
     // send. Only referenced blocks are sent (pruneBlocks drops stale ones).
-    const referenced = pruneBlocks(txt, pasteBlocks);
-    const pastes = referenced.map((b) => ({ seq: b.seq, content: b.content }));
-    runOptimize({ prompt: txt, context, pastes, slotId });
-  }, [runOptimize, chatMessages, pasteBlocks, slotId]);
+    const referenced = pruneBlocks(txt, pasteBlocks)
+    const pastes = referenced.map((b) => ({ seq: b.seq, content: b.content }))
+    runOptimize({ prompt: txt, context, pastes, slotId })
+  }, [runOptimize, chatMessages, pasteBlocks, slotId])
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -3062,287 +2951,206 @@ function ChatInput({
       // the paste that immediately follows this exact shortcut. We do NOT
       // preventDefault — the browser still fires the paste event we hook below.
       rawPasteRef.current =
-        (e.metaKey || e.ctrlKey) &&
-        e.shiftKey &&
-        !e.altKey &&
-        e.key.toLowerCase() === "v";
+        (e.metaKey || e.ctrlKey) && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'v'
       // Undo / redo — drive the explicit per-slot history so Ctrl/Cmd+Z restores
       // text even after a programmatic reset (send-clear, ↑/↓ recall, optimize)
       // wiped the browser's native undo stack. We own the gesture and
       // preventDefault native undo so behaviour is deterministic regardless of how
       // `value` changed. Cmd/Ctrl+Z = undo, Cmd/Ctrl+Shift+Z or Ctrl+Y = redo.
-      if (
-        (e.metaKey || e.ctrlKey) &&
-        !e.altKey &&
-        !ime.isComposing(e) &&
-        !optimizingRef.current
-      ) {
-        const k = e.key.toLowerCase();
-        const isUndo = k === "z" && !e.shiftKey;
-        const isRedo = (k === "z" && e.shiftKey) || k === "y";
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && !ime.isComposing(e) && !optimizingRef.current) {
+        const k = e.key.toLowerCase()
+        const isUndo = k === 'z' && !e.shiftKey
+        const isRedo = (k === 'z' && e.shiftKey) || k === 'y'
         if (isUndo || isRedo) {
-          e.preventDefault();
-          const hist = undoHistoryRef.current;
-          let ptr = undoPointerRef.current;
-          if (isUndo && ptr > 0) ptr -= 1;
-          else if (isRedo && ptr < hist.length - 1) ptr += 1;
-          else return; // nothing to undo/redo
-          undoPointerRef.current = ptr;
-          const snap = hist[ptr];
-          applyingUndoRef.current = true;
-          onChange(snap.value);
+          e.preventDefault()
+          const hist = undoHistoryRef.current
+          let ptr = undoPointerRef.current
+          if (isUndo && ptr > 0) ptr -= 1
+          else if (isRedo && ptr < hist.length - 1) ptr += 1
+          else return // nothing to undo/redo
+          undoPointerRef.current = ptr
+          const snap = hist[ptr]
+          applyingUndoRef.current = true
+          onChange(snap.value)
           // Restore the paste blocks captured in this snapshot so a `[ Paste #N ]`
           // token brought back by the undo has its backing content again. Only
           // emit when the set actually differs (identity or membership) to avoid a
           // redundant parent render on plain-text undo. The pruneBlocks effect
           // would otherwise strip a block whose token the undo just restored.
-          if (
-            onPasteBlocksChange &&
-            !sameBlocks(pasteBlocksRef.current, snap.blocks)
-          ) {
-            onPasteBlocksChange(snap.blocks);
+          if (onPasteBlocksChange && !sameBlocks(pasteBlocksRef.current, snap.blocks)) {
+            onPasteBlocksChange(snap.blocks)
           }
           requestAnimationFrame(() => {
-            const el = inputRef.current;
-            if (!el) return;
-            el.focus();
-            el.setSelectionRange(snap.selStart, snap.selEnd);
-          });
-          return;
+            const el = inputRef.current
+            if (!el) return
+            el.focus()
+            el.setSelectionRange(snap.selStart, snap.selEnd)
+          })
+          return
         }
       }
       // Atomic paste-token handling — keep caret out of token interior and
       // treat tokens as single deletable units. Runs before Enter/history so
       // edits on or around a token never reach the default textarea handling.
       if (pasteBlocks.length && !ime.isComposing(e)) {
-        const ta = e.currentTarget;
-        const v = valueRef.current;
-        const ss = ta.selectionStart ?? 0;
-        const se = ta.selectionEnd ?? 0;
-        const isCollapsed = ss === se;
-        const ranges = findTokenRanges(v, pasteBlocks);
+        const ta = e.currentTarget
+        const v = valueRef.current
+        const ss = ta.selectionStart ?? 0
+        const se = ta.selectionEnd ?? 0
+        const isCollapsed = ss === se
+        const ranges = findTokenRanges(v, pasteBlocks)
 
-        const removeBlockAtom = (r: {
-          start: number;
-          end: number;
-          block: PasteBlock;
-        }) => {
-          e.preventDefault();
-          const next = v.slice(0, r.start) + v.slice(r.end);
-          onChange(next);
-          onPasteBlocksChange?.(pasteBlocks.filter((b) => b.id !== r.block.id));
+        const removeBlockAtom = (r: { start: number; end: number; block: PasteBlock }) => {
+          e.preventDefault()
+          const next = v.slice(0, r.start) + v.slice(r.end)
+          onChange(next)
+          onPasteBlocksChange?.(pasteBlocks.filter((b) => b.id !== r.block.id))
           requestAnimationFrame(() => {
-            const el = inputRef.current;
-            if (el) el.setSelectionRange(r.start, r.start);
-          });
-        };
+            const el = inputRef.current
+            if (el) el.setSelectionRange(r.start, r.start)
+          })
+        }
 
         // Backspace with caret just past a token → delete whole token
-        if (
-          e.key === "Backspace" &&
-          isCollapsed &&
-          !e.metaKey &&
-          !e.ctrlKey &&
-          !e.altKey
-        ) {
-          const adj = ranges.find((r) => r.end === ss);
+        if (e.key === 'Backspace' && isCollapsed && !e.metaKey && !e.ctrlKey && !e.altKey) {
+          const adj = ranges.find((r) => r.end === ss)
           if (adj) {
-            removeBlockAtom(adj);
-            return;
+            removeBlockAtom(adj)
+            return
           }
         }
         // Cmd+Backspace (line-back delete on Mac) — extend deletion to cover
         // any token that intersects the caret-to-line-start range, so we never
         // slice a token mid-text. Also drops the associated PasteBlock(s).
-        if (e.key === "Backspace" && isCollapsed && e.metaKey) {
-          const lineStart = v.lastIndexOf("\n", ss - 1) + 1;
-          const intersecting = ranges.filter(
-            (r) => r.start < ss && r.end > lineStart,
-          );
+        if (e.key === 'Backspace' && isCollapsed && e.metaKey) {
+          const lineStart = v.lastIndexOf('\n', ss - 1) + 1
+          const intersecting = ranges.filter((r) => r.start < ss && r.end > lineStart)
           if (intersecting.length) {
-            e.preventDefault();
-            const deleteStart = Math.min(
-              lineStart,
-              ...intersecting.map((r) => r.start),
-            );
+            e.preventDefault()
+            const deleteStart = Math.min(lineStart, ...intersecting.map((r) => r.start))
             const removedIds = new Set(
-              ranges
-                .filter((r) => r.start >= deleteStart && r.end <= ss)
-                .map((r) => r.block.id),
-            );
-            const next = v.slice(0, deleteStart) + v.slice(ss);
-            onChange(next);
-            onPasteBlocksChange?.(
-              pasteBlocks.filter((b) => !removedIds.has(b.id)),
-            );
+              ranges.filter((r) => r.start >= deleteStart && r.end <= ss).map((r) => r.block.id),
+            )
+            const next = v.slice(0, deleteStart) + v.slice(ss)
+            onChange(next)
+            onPasteBlocksChange?.(pasteBlocks.filter((b) => !removedIds.has(b.id)))
             requestAnimationFrame(() => {
-              const el = inputRef.current;
-              if (el) el.setSelectionRange(deleteStart, deleteStart);
-            });
-            return;
+              const el = inputRef.current
+              if (el) el.setSelectionRange(deleteStart, deleteStart)
+            })
+            return
           }
         }
         // Alt/Ctrl+Backspace (word-back delete) — if caret is adjacent to a
         // token, treat as full-token delete (same as plain Backspace). Beyond
         // that, we leave native behavior alone; word boundaries are fuzzy and
         // tokens are on their own line, so the common case is the adjacent one.
-        if (
-          e.key === "Backspace" &&
-          isCollapsed &&
-          (e.altKey || e.ctrlKey) &&
-          !e.metaKey
-        ) {
-          const adj = ranges.find((r) => r.end === ss);
+        if (e.key === 'Backspace' && isCollapsed && (e.altKey || e.ctrlKey) && !e.metaKey) {
+          const adj = ranges.find((r) => r.end === ss)
           if (adj) {
-            removeBlockAtom(adj);
-            return;
+            removeBlockAtom(adj)
+            return
           }
         }
         // Delete with caret just before a token → delete whole token
-        if (
-          e.key === "Delete" &&
-          isCollapsed &&
-          !e.metaKey &&
-          !e.ctrlKey &&
-          !e.altKey
-        ) {
-          const adj = ranges.find((r) => r.start === ss);
+        if (e.key === 'Delete' && isCollapsed && !e.metaKey && !e.ctrlKey && !e.altKey) {
+          const adj = ranges.find((r) => r.start === ss)
           if (adj) {
-            removeBlockAtom(adj);
-            return;
+            removeBlockAtom(adj)
+            return
           }
         }
         // Cmd+Delete (forward line-delete on Mac) — mirror Cmd+Backspace in
         // the forward direction: extend deletion to cover intersecting tokens.
-        if (e.key === "Delete" && isCollapsed && e.metaKey) {
-          const nextNl = v.indexOf("\n", ss);
-          const lineEnd = nextNl === -1 ? v.length : nextNl;
-          const intersecting = ranges.filter(
-            (r) => r.end > ss && r.start < lineEnd,
-          );
+        if (e.key === 'Delete' && isCollapsed && e.metaKey) {
+          const nextNl = v.indexOf('\n', ss)
+          const lineEnd = nextNl === -1 ? v.length : nextNl
+          const intersecting = ranges.filter((r) => r.end > ss && r.start < lineEnd)
           if (intersecting.length) {
-            e.preventDefault();
-            const deleteEnd = Math.max(
-              lineEnd,
-              ...intersecting.map((r) => r.end),
-            );
+            e.preventDefault()
+            const deleteEnd = Math.max(lineEnd, ...intersecting.map((r) => r.end))
             const removedIds = new Set(
-              ranges
-                .filter((r) => r.start >= ss && r.end <= deleteEnd)
-                .map((r) => r.block.id),
-            );
-            const next = v.slice(0, ss) + v.slice(deleteEnd);
-            onChange(next);
-            onPasteBlocksChange?.(
-              pasteBlocks.filter((b) => !removedIds.has(b.id)),
-            );
+              ranges.filter((r) => r.start >= ss && r.end <= deleteEnd).map((r) => r.block.id),
+            )
+            const next = v.slice(0, ss) + v.slice(deleteEnd)
+            onChange(next)
+            onPasteBlocksChange?.(pasteBlocks.filter((b) => !removedIds.has(b.id)))
             requestAnimationFrame(() => {
-              const el = inputRef.current;
-              if (el) el.setSelectionRange(ss, ss);
-            });
-            return;
+              const el = inputRef.current
+              if (el) el.setSelectionRange(ss, ss)
+            })
+            return
           }
         }
         // Alt/Ctrl+Delete (word-forward delete) — adjacent-token atomic delete.
-        if (
-          e.key === "Delete" &&
-          isCollapsed &&
-          (e.altKey || e.ctrlKey) &&
-          !e.metaKey
-        ) {
-          const adj = ranges.find((r) => r.start === ss);
+        if (e.key === 'Delete' && isCollapsed && (e.altKey || e.ctrlKey) && !e.metaKey) {
+          const adj = ranges.find((r) => r.start === ss)
           if (adj) {
-            removeBlockAtom(adj);
-            return;
+            removeBlockAtom(adj)
+            return
           }
         }
         // Arrow left/right — skip over token as if it were a single character
         if (
-          e.key === "ArrowLeft" &&
+          e.key === 'ArrowLeft' &&
           isCollapsed &&
           !e.shiftKey &&
           !e.metaKey &&
           !e.ctrlKey &&
           !e.altKey
         ) {
-          const adj = ranges.find((r) => r.end === ss);
+          const adj = ranges.find((r) => r.end === ss)
           if (adj) {
-            e.preventDefault();
-            requestAnimationFrame(() =>
-              inputRef.current?.setSelectionRange(adj.start, adj.start),
-            );
-            return;
+            e.preventDefault()
+            requestAnimationFrame(() => inputRef.current?.setSelectionRange(adj.start, adj.start))
+            return
           }
         }
         if (
-          e.key === "ArrowRight" &&
+          e.key === 'ArrowRight' &&
           isCollapsed &&
           !e.shiftKey &&
           !e.metaKey &&
           !e.ctrlKey &&
           !e.altKey
         ) {
-          const adj = ranges.find((r) => r.start === ss);
+          const adj = ranges.find((r) => r.start === ss)
           if (adj) {
-            e.preventDefault();
-            requestAnimationFrame(() =>
-              inputRef.current?.setSelectionRange(adj.end, adj.end),
-            );
-            return;
+            e.preventDefault()
+            requestAnimationFrame(() => inputRef.current?.setSelectionRange(adj.end, adj.end))
+            return
           }
         }
         // Shift+Arrow — extend selection past the whole token in one step
-        if (
-          e.key === "ArrowLeft" &&
-          e.shiftKey &&
-          !e.metaKey &&
-          !e.ctrlKey &&
-          !e.altKey
-        ) {
-          const dir = ta.selectionDirection || "forward";
-          const active = dir === "backward" ? ss : se;
-          const adj = ranges.find((r) => r.end === active);
+        if (e.key === 'ArrowLeft' && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+          const dir = ta.selectionDirection || 'forward'
+          const active = dir === 'backward' ? ss : se
+          const adj = ranges.find((r) => r.end === active)
           if (adj) {
-            e.preventDefault();
+            e.preventDefault()
             requestAnimationFrame(() => {
-              const el = inputRef.current;
-              if (!el) return;
-              if (dir === "backward")
-                el.setSelectionRange(adj.start, se, "backward");
-              else
-                el.setSelectionRange(
-                  ss,
-                  adj.start,
-                  ss <= adj.start ? "forward" : "backward",
-                );
-            });
-            return;
+              const el = inputRef.current
+              if (!el) return
+              if (dir === 'backward') el.setSelectionRange(adj.start, se, 'backward')
+              else el.setSelectionRange(ss, adj.start, ss <= adj.start ? 'forward' : 'backward')
+            })
+            return
           }
         }
-        if (
-          e.key === "ArrowRight" &&
-          e.shiftKey &&
-          !e.metaKey &&
-          !e.ctrlKey &&
-          !e.altKey
-        ) {
-          const dir = ta.selectionDirection || "forward";
-          const active = dir === "backward" ? ss : se;
-          const adj = ranges.find((r) => r.start === active);
+        if (e.key === 'ArrowRight' && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+          const dir = ta.selectionDirection || 'forward'
+          const active = dir === 'backward' ? ss : se
+          const adj = ranges.find((r) => r.start === active)
           if (adj) {
-            e.preventDefault();
+            e.preventDefault()
             requestAnimationFrame(() => {
-              const el = inputRef.current;
-              if (!el) return;
-              if (dir === "backward")
-                el.setSelectionRange(
-                  adj.end,
-                  se,
-                  adj.end <= se ? "backward" : "forward",
-                );
-              else el.setSelectionRange(ss, adj.end, "forward");
-            });
-            return;
+              const el = inputRef.current
+              if (!el) return
+              if (dir === 'backward')
+                el.setSelectionRange(adj.end, se, adj.end <= se ? 'backward' : 'forward')
+              else el.setSelectionRange(ss, adj.end, 'forward')
+            })
+            return
           }
         }
 
@@ -3352,41 +3160,34 @@ function ChatInput({
         // selection endpoint landed strictly inside a token and snap it out in
         // the direction of motion.
         const isNavKey =
-          e.key === "ArrowLeft" ||
-          e.key === "ArrowRight" ||
-          e.key === "Home" ||
-          e.key === "End";
+          e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End'
         const hasNavModifier =
-          e.altKey ||
-          e.ctrlKey ||
-          e.metaKey ||
-          e.key === "Home" ||
-          e.key === "End";
+          e.altKey || e.ctrlKey || e.metaKey || e.key === 'Home' || e.key === 'End'
         if (isNavKey && hasNavModifier) {
-          const leftward = e.key === "ArrowLeft" || e.key === "Home";
+          const leftward = e.key === 'ArrowLeft' || e.key === 'Home'
           requestAnimationFrame(() => {
-            const el = inputRef.current;
-            if (!el) return;
-            const freshRanges = findTokenRanges(el.value, pasteBlocks);
-            if (!freshRanges.length) return;
-            const nss = el.selectionStart ?? 0;
-            const nse = el.selectionEnd ?? 0;
+            const el = inputRef.current
+            if (!el) return
+            const freshRanges = findTokenRanges(el.value, pasteBlocks)
+            if (!freshRanges.length) return
+            const nss = el.selectionStart ?? 0
+            const nse = el.selectionEnd ?? 0
             const snapPos = (p: number) => {
               for (const r of freshRanges) {
-                if (p > r.start && p < r.end) return leftward ? r.start : r.end;
+                if (p > r.start && p < r.end) return leftward ? r.start : r.end
               }
-              return p;
-            };
-            const a = snapPos(nss);
-            const b = snapPos(nse);
-            if (a === nss && b === nse) return;
-            const dir = el.selectionDirection || "forward";
+              return p
+            }
+            const a = snapPos(nss)
+            const b = snapPos(nse)
+            if (a === nss && b === nse) return
+            const dir = el.selectionDirection || 'forward'
             el.setSelectionRange(
               Math.min(a, b),
               Math.max(a, b),
-              dir as "forward" | "backward" | "none",
-            );
-          });
+              dir as 'forward' | 'backward' | 'none',
+            )
+          })
         }
       }
 
@@ -3399,37 +3200,28 @@ function ChatInput({
       // default Enter behavior (newline insert) doesn't leak through when the
       // gateway is offline. The action itself is gated on `connected` to match
       // the disabled-state on the Optimize button (line ~1734).
-      if (
-        promptOptimizer &&
-        e.key === "Enter" &&
-        (e.metaKey || e.ctrlKey) &&
-        e.shiftKey
-      ) {
-        e.preventDefault();
-        if (connected) optimizePrompt();
-        return;
+      if (promptOptimizer && e.key === 'Enter' && (e.metaKey || e.ctrlKey) && e.shiftKey) {
+        e.preventDefault()
+        if (connected) optimizePrompt()
+        return
       }
       // Mode: enter-ctrl-newline — Ctrl/Cmd+Enter inserts newline, Enter sends
-      if (
-        sendOnEnter === "enter-ctrl-newline" &&
-        e.key === "Enter" &&
-        (e.metaKey || e.ctrlKey)
-      ) {
-        e.preventDefault();
-        const ta = e.currentTarget;
-        const start = ta.selectionStart;
-        const end = ta.selectionEnd;
-        const val = ta.value;
-        onChange(val.slice(0, start) + "\n" + val.slice(end));
+      if (sendOnEnter === 'enter-ctrl-newline' && e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault()
+        const ta = e.currentTarget
+        const start = ta.selectionStart
+        const end = ta.selectionEnd
+        const val = ta.value
+        onChange(val.slice(0, start) + '\n' + val.slice(end))
         requestAnimationFrame(() => {
-          ta.selectionStart = ta.selectionEnd = start + 1;
-        });
-        return;
+          ta.selectionStart = ta.selectionEnd = start + 1
+        })
+        return
       }
       const sendKey =
-        sendOnEnter === "ctrl-enter"
-          ? e.key === "Enter" && (e.metaKey || e.ctrlKey)
-          : e.key === "Enter" && !e.shiftKey;
+        sendOnEnter === 'ctrl-enter'
+          ? e.key === 'Enter' && (e.metaKey || e.ctrlKey)
+          : e.key === 'Enter' && !e.shiftKey
       if (sendKey && !e.defaultPrevented) {
         // The key is ours as soon as it matches the send binding, so claim it before
         // deciding what to do with it — `claimEnter` suppresses the default and returns
@@ -3440,8 +3232,8 @@ function ChatInput({
         // state, and skipped while a prompt optimization owns the draft.
         // While the composer is busy, Enter follows the split-button mode:
         // steer (default) acts on the text now; queue defers it.
-        if (!ime.claimEnter(e)) return;
-        if (optimizingRef.current) return;
+        if (!ime.claimEnter(e)) return
+        if (optimizingRef.current) return
         // ⌘↩ / Ctrl+Enter while the busy split is showing performs the OTHER
         // action for this send (steer ↔ queue) — the Claude Code / Codex gesture.
         // Only in the `enter` send mode: in `ctrl-enter` the modified Enter IS the
@@ -3449,9 +3241,9 @@ function ChatInput({
         // branch returned above). Idle, the modified Enter is a plain send, as it
         // always was. The flip lands in `fireComposer`, which ignores it whenever
         // the split is not available, so this cannot steer a non-steerable slot.
-        const alternate = sendOnEnter === "enter" && (e.metaKey || e.ctrlKey);
-        if (connected) fireComposer(alternate);
-        return;
+        const alternate = sendOnEnter === 'enter' && (e.metaKey || e.ctrlKey)
+        if (connected) fireComposer(alternate)
+        return
       }
       // Prompt history: ↑/↓ cycles through prior user messages.
       // Ignore when IME composing, no history, modifier keys, or when
@@ -3467,59 +3259,58 @@ function ChatInput({
         e.altKey ||
         e.shiftKey
       )
-        return;
-      const ta = e.currentTarget;
-      const len = sentMessages.length;
-      const cur = valueRef.current;
+        return
+      const ta = e.currentTarget
+      const len = sentMessages.length
+      const cur = valueRef.current
       // After recall, place the caret where the next arrow press will re-engage
       // history immediately (↑ → start, ↓ → end). Deferred to next frame so the
       // controlled textarea has re-rendered with the new value first.
-      const moveCaretAfterRecall = (pos: "start" | "end") => {
+      const moveCaretAfterRecall = (pos: 'start' | 'end') => {
         requestAnimationFrame(() => {
-          const el = inputRef.current;
-          if (!el) return;
-          const p = pos === "start" ? 0 : el.value.length;
-          el.setSelectionRange(p, p);
-        });
-      };
-      if (e.key === "ArrowUp") {
+          const el = inputRef.current
+          if (!el) return
+          const p = pos === 'start' ? 0 : el.value.length
+          el.setSelectionRange(p, p)
+        })
+      }
+      if (e.key === 'ArrowUp') {
         // Only intercept when input is empty OR caret is collapsed at position 0.
-        const atStart = ta.selectionStart === 0 && ta.selectionEnd === 0;
-        if (!atStart && cur !== "") return;
-        const idx = historyIdxRef.current;
+        const atStart = ta.selectionStart === 0 && ta.selectionEnd === 0
+        if (!atStart && cur !== '') return
+        const idx = historyIdxRef.current
         if (idx === -1) {
           // Entering history mode — save current draft (may be empty).
-          draftRef.current = cur;
-          historyIdxRef.current = len - 1;
-          onChange(sentMessages[len - 1]);
-          moveCaretAfterRecall("start");
+          draftRef.current = cur
+          historyIdxRef.current = len - 1
+          onChange(sentMessages[len - 1])
+          moveCaretAfterRecall('start')
         } else if (idx > 0) {
-          historyIdxRef.current = idx - 1;
-          onChange(sentMessages[idx - 1]);
-          moveCaretAfterRecall("start");
+          historyIdxRef.current = idx - 1
+          onChange(sentMessages[idx - 1])
+          moveCaretAfterRecall('start')
         } else {
           // Already at oldest — consume to avoid caret jumping in textarea.
         }
-        e.preventDefault();
-      } else if (e.key === "ArrowDown") {
-        const idx = historyIdxRef.current;
-        if (idx === -1) return; // not in history mode — let textarea handle
+        e.preventDefault()
+      } else if (e.key === 'ArrowDown') {
+        const idx = historyIdxRef.current
+        if (idx === -1) return // not in history mode — let textarea handle
         // Only intercept when caret is at end (so multi-line edits still navigate within).
-        const atEnd =
-          ta.selectionStart === cur.length && ta.selectionEnd === cur.length;
-        if (!atEnd) return;
+        const atEnd = ta.selectionStart === cur.length && ta.selectionEnd === cur.length
+        if (!atEnd) return
         if (idx < len - 1) {
-          historyIdxRef.current = idx + 1;
-          onChange(sentMessages[idx + 1]);
-          moveCaretAfterRecall("end");
+          historyIdxRef.current = idx + 1
+          onChange(sentMessages[idx + 1])
+          moveCaretAfterRecall('end')
         } else {
           // Past newest — restore draft and exit history mode.
-          historyIdxRef.current = -1;
-          onChange(draftRef.current);
-          draftRef.current = "";
-          moveCaretAfterRecall("end");
+          historyIdxRef.current = -1
+          onChange(draftRef.current)
+          draftRef.current = ''
+          moveCaretAfterRecall('end')
         }
-        e.preventDefault();
+        e.preventDefault()
       }
     },
     [
@@ -3534,7 +3325,7 @@ function ChatInput({
       optimizePrompt,
       promptOptimizer,
     ],
-  );
+  )
 
   /** Intercept clipboard paste — files go to upload path, big text gets collapsed into a token. */
   const handlePaste = useCallback(
@@ -3542,8 +3333,8 @@ function ChatInput({
       // Cmd/Ctrl+Shift+V bypass: consume the one-shot flag up front, before any
       // early return below, so it can never leak into a later paste (e.g. a
       // context-menu paste with no intervening keydown to clear it).
-      const forceRaw = rawPasteRef.current;
-      rawPasteRef.current = false;
+      const forceRaw = rawPasteRef.current
+      rawPasteRef.current = false
       // File paste takes precedence — but not when text is also insertable. Only
       // text/plain defers: a <textarea> can only ever insert the text/plain
       // representation, so when the clipboard carries text/html WITHOUT
@@ -3552,12 +3343,12 @@ function ChatInput({
       // macOS Office TEXT copies do include text/plain alongside their junk
       // image rendering of the selection, so real text pastes still win over
       // the image (see ChatInput.paste.test.tsx).
-      const hasText = hasPlainClipboardText(e.clipboardData);
-      const files = clipboardFiles(e.clipboardData);
+      const hasText = hasPlainClipboardText(e.clipboardData)
+      const files = clipboardFiles(e.clipboardData)
       if (files.length && onUploadFiles && !hasText) {
-        e.preventDefault();
-        onUploadFiles(files);
-        return;
+        e.preventDefault()
+        onUploadFiles(files)
+        return
       }
       // Text paste. Sources that serialize rendered HTML (web pages, PDFs, chat
       // bubbles, table cells) routinely tack trailing blank lines onto a copied
@@ -3566,26 +3357,26 @@ function ChatInput({
       // lines up front (only whitespace runs that include a newline; a paste
       // ending in plain spaces and interior blank lines are untouched). Raw paste
       // (Cmd/Ctrl+Shift+V) opts out entirely.
-      const pasted = e.clipboardData.getData("text");
-      const cleaned = forceRaw ? pasted : stripTrailingBlankLines(pasted);
+      const pasted = e.clipboardData.getData('text')
+      const cleaned = forceRaw ? pasted : stripTrailingBlankLines(pasted)
 
-      const ta = e.currentTarget;
-      const start = ta.selectionStart ?? value.length;
-      const end = ta.selectionEnd ?? start;
-      const before = value.slice(0, start);
-      const after = value.slice(end);
+      const ta = e.currentTarget
+      const start = ta.selectionStart ?? value.length
+      const end = ta.selectionEnd ?? start
+      const before = value.slice(0, start)
+      const after = value.slice(end)
 
       // Big paste → collapse into a `[ Paste #N ]` chip. Uses the cleaned text so
       // the chip's line count and stored content exclude the stripped blanks.
       if (onPasteBlocksChange && !forceRaw && shouldCollapsePaste(cleaned)) {
-        e.preventDefault();
+        e.preventDefault()
         const block: PasteBlock = {
           id: makePasteId(),
           seq: nextSeq(pasteBlocks),
           lines: countLines(cleaned),
           content: cleaned,
-        };
-        const token = formatToken(block);
+        }
+        const token = formatToken(block)
         // Surround the token with newlines so the chip lives on its own line —
         // long-form pasted content rarely flows with typed text around it.
         // Skip the leading newline when the caret is at the start of a line,
@@ -3594,43 +3385,41 @@ function ChatInput({
         // a bare blockquote prefix (`> `, `> > `, optionally indented): the
         // user is quoting the paste, and forcing the chip down a line strands
         // the `>` above it.
-        const linePrefix = before.slice(before.lastIndexOf("\n") + 1);
+        const linePrefix = before.slice(before.lastIndexOf('\n') + 1)
         const leadingNewline =
-          before && !before.endsWith("\n") && !isBlockquotePrefix(linePrefix)
-            ? "\n"
-            : "";
-        const trailingNewline = after && !after.startsWith("\n") ? "\n" : "";
-        const insert = leadingNewline + token + trailingNewline;
-        valueFromUserRef.current = true; // a paste is a real user edit, not a draft restore
-        onChange(before + insert + after);
-        onPasteBlocksChange([...pasteBlocks, block]);
+          before && !before.endsWith('\n') && !isBlockquotePrefix(linePrefix) ? '\n' : ''
+        const trailingNewline = after && !after.startsWith('\n') ? '\n' : ''
+        const insert = leadingNewline + token + trailingNewline
+        valueFromUserRef.current = true // a paste is a real user edit, not a draft restore
+        onChange(before + insert + after)
+        onPasteBlocksChange([...pasteBlocks, block])
         // Restore caret right after the inserted token + trailing newline.
         requestAnimationFrame(() => {
           if (ta && document.activeElement === ta) {
-            const pos = before.length + insert.length;
-            ta.setSelectionRange(pos, pos);
+            const pos = before.length + insert.length
+            ta.setSelectionRange(pos, pos)
           }
-        });
-        return;
+        })
+        return
       }
 
       // Small paste. Only intercept when trailing blanks were actually stripped
       // AND something remains — an all-blank clipboard (cleaned === '') is left to
       // the browser so the paste is never a silent no-op.
-      if (cleaned !== pasted && cleaned !== "") {
-        e.preventDefault();
-        const next = before + cleaned + after;
+      if (cleaned !== pasted && cleaned !== '') {
+        e.preventDefault()
+        const next = before + cleaned + after
         // Insert through the native input path so the textarea's own onChange runs:
         // that fires the /, @, $ picker detection, marks the edit user-driven, and
         // keeps native undo. Fall back to a controlled-value splice where
         // execCommand is unavailable (jsdom/tests) or reports failure.
-        let inserted = false;
+        let inserted = false
         try {
           inserted =
-            typeof document.execCommand === "function" &&
-            document.execCommand("insertText", false, cleaned);
+            typeof document.execCommand === 'function' &&
+            document.execCommand('insertText', false, cleaned)
         } catch {
-          inserted = false;
+          inserted = false
         }
         // That boolean is not evidence on its own. iOS Safari's native paste
         // callout reports success on a <textarea> and can leave the field
@@ -3641,42 +3430,39 @@ function ChatInput({
         // onChange already pushed up (React bails), while an insert React never
         // saw would otherwise be reverted to the stale `value` prop on the next
         // render — the same silent vanish by a different route.
-        const nativeOk = inserted && ta.value === next;
-        valueFromUserRef.current = true;
-        onChange(next);
-        if (nativeOk) return; // the native insert placed the caret itself
+        const nativeOk = inserted && ta.value === next
+        valueFromUserRef.current = true
+        onChange(next)
+        if (nativeOk) return // the native insert placed the caret itself
         requestAnimationFrame(() => {
           if (ta && document.activeElement === ta) {
-            const pos = before.length + cleaned.length;
-            ta.setSelectionRange(pos, pos);
+            const pos = before.length + cleaned.length
+            ta.setSelectionRange(pos, pos)
           }
-        });
+        })
       }
     },
     [onUploadFiles, onPasteBlocksChange, pasteBlocks, value, onChange],
-  );
+  )
 
   /** Replace a collapsed-paste token with its full content in the textarea and
    *  drop the backing block. The caret lands just past the inserted content. */
   const expandTokenRange = useCallback(
     (range: { start: number; end: number; block: PasteBlock }) => {
-      const expanded =
-        value.slice(0, range.start) +
-        range.block.content +
-        value.slice(range.end);
-      onChange(expanded);
-      onPasteBlocksChange?.(pasteBlocks.filter((b) => b.id !== range.block.id));
+      const expanded = value.slice(0, range.start) + range.block.content + value.slice(range.end)
+      onChange(expanded)
+      onPasteBlocksChange?.(pasteBlocks.filter((b) => b.id !== range.block.id))
       requestAnimationFrame(() => {
-        const ta = inputRef.current;
+        const ta = inputRef.current
         if (ta) {
-          const pos = range.start + range.block.content.length;
-          ta.setSelectionRange(pos, pos);
-          ta.focus();
+          const pos = range.start + range.block.content.length
+          ta.setSelectionRange(pos, pos)
+          ta.focus()
         }
-      });
+      })
     },
     [value, pasteBlocks, onPasteBlocksChange, onChange],
-  );
+  )
 
   /** Click/tap on a collapsed-paste token expands it to the original full
    *  content in the textarea.
@@ -3695,18 +3481,18 @@ function ChatInput({
    *     PastedChip, which is a real <button> that toggles on one tap. */
   const handleTextareaClick = useCallback(
     (e: React.MouseEvent<HTMLTextAreaElement>) => {
-      if (!onPasteBlocksChange || !pasteBlocks.length) return;
-      const ta = e.currentTarget;
-      const caret = ta.selectionStart ?? 0;
-      const range = tokenRangeAt(value, pasteBlocks, caret);
-      if (!range) return;
+      if (!onPasteBlocksChange || !pasteBlocks.length) return
+      const ta = e.currentTarget
+      const caret = ta.selectionStart ?? 0
+      const range = tokenRangeAt(value, pasteBlocks, caret)
+      if (!range) return
 
       // Touch has no double-click to reach the expand branch below, so the first
       // tap inside a token expands directly — the select-first step is a
       // mouse-only refinement.
       if (isTouchDevice()) {
-        expandTokenRange(range);
-        return;
+        expandTokenRange(range)
+        return
       }
 
       if (e.detail < 2) {
@@ -3714,62 +3500,62 @@ function ChatInput({
         // atomic range. If the user doesn't click again within the browser's
         // double-click window, nothing else happens.
         requestAnimationFrame(() => {
-          const el = inputRef.current;
-          if (el) el.setSelectionRange(range.start, range.end);
-        });
-        return;
+          const el = inputRef.current
+          if (el) el.setSelectionRange(range.start, range.end)
+        })
+        return
       }
 
       // e.detail >= 2 — second (or more) click in a rapid sequence on the
       // same region — expand.
-      expandTokenRange(range);
+      expandTokenRange(range)
     },
     [value, pasteBlocks, onPasteBlocksChange, expandTokenRange],
-  );
+  )
 
   /** Snap selection endpoints that land inside a token range to the nearest edge.
    *  Covers drag-select that ends mid-token, touch/long-press handles on mobile,
    *  and any other non-keyboard way selection could split a token. */
   const handleSelectSnap = useCallback(() => {
-    recordCaret();
-    if (!pasteBlocks.length) return;
-    const ta = inputRef.current;
-    if (!ta) return;
-    const ss = ta.selectionStart ?? 0;
-    const se = ta.selectionEnd ?? 0;
+    recordCaret()
+    if (!pasteBlocks.length) return
+    const ta = inputRef.current
+    if (!ta) return
+    const ss = ta.selectionStart ?? 0
+    const se = ta.selectionEnd ?? 0
     // Keyboard/AT peek: a collapsed caret landing inside a token opens the
     // preview (the handle no-ops for a non-collapsed selection).
-    hoverRef.current?.handleCaret(ss, se);
+    hoverRef.current?.handleCaret(ss, se)
     // Collapsed caret inside a token is handled by the click expander — skip.
-    if (ss === se) return;
-    const ranges = findTokenRanges(ta.value, pasteBlocks);
-    if (!ranges.length) return;
+    if (ss === se) return
+    const ranges = findTokenRanges(ta.value, pasteBlocks)
+    if (!ranges.length) return
     const snap = (pos: number) => {
       for (const r of ranges) {
         if (pos > r.start && pos < r.end) {
           // Snap to the nearer edge (ties go to the start).
-          return pos - r.start <= r.end - pos ? r.start : r.end;
+          return pos - r.start <= r.end - pos ? r.start : r.end
         }
       }
-      return pos;
-    };
-    const newSs = snap(ss);
-    const newSe = snap(se);
-    if (newSs === ss && newSe === se) return;
-    const dir = ta.selectionDirection || "forward";
+      return pos
+    }
+    const newSs = snap(ss)
+    const newSe = snap(se)
+    if (newSs === ss && newSe === se) return
+    const dir = ta.selectionDirection || 'forward'
     ta.setSelectionRange(
       Math.min(newSs, newSe),
       Math.max(newSs, newSe),
-      dir as "forward" | "backward" | "none",
-    );
-  }, [pasteBlocks, recordCaret]);
+      dir as 'forward' | 'backward' | 'none',
+    )
+  }, [pasteBlocks, recordCaret])
 
   /** Prune paste blocks whose token was deleted from the textarea. */
   useEffect(() => {
-    if (!onPasteBlocksChange || !pasteBlocks.length) return;
-    const pruned = pruneBlocks(value, pasteBlocks);
-    if (pruned !== pasteBlocks) onPasteBlocksChange(pruned);
-  }, [value, pasteBlocks, onPasteBlocksChange]);
+    if (!onPasteBlocksChange || !pasteBlocks.length) return
+    const pruned = pruneBlocks(value, pasteBlocks)
+    if (pruned !== pasteBlocks) onPasteBlocksChange(pruned)
+  }, [value, pasteBlocks, onPasteBlocksChange])
 
   /** Copy/cut that spans one or more collapsed-paste tokens writes the
    *  expanded content to the clipboard instead of the literal token text.
@@ -3780,69 +3566,66 @@ function ChatInput({
    *  edges via handleSelectSnap). */
   const expandSelectionForClipboard = useCallback(
     (start: number, end: number): string | null => {
-      if (!pasteBlocks.length || start === end) return null;
-      const ranges = findTokenRanges(value, pasteBlocks);
-      const covered = ranges.filter((r) => r.start >= start && r.end <= end);
-      if (!covered.length) return null;
-      let out = "";
-      let cursor = start;
+      if (!pasteBlocks.length || start === end) return null
+      const ranges = findTokenRanges(value, pasteBlocks)
+      const covered = ranges.filter((r) => r.start >= start && r.end <= end)
+      if (!covered.length) return null
+      let out = ''
+      let cursor = start
       for (const r of covered) {
-        out += value.slice(cursor, r.start);
-        out += r.block.content;
-        cursor = r.end;
+        out += value.slice(cursor, r.start)
+        out += r.block.content
+        cursor = r.end
       }
-      out += value.slice(cursor, end);
-      return out;
+      out += value.slice(cursor, end)
+      return out
     },
     [value, pasteBlocks],
-  );
+  )
 
   const handleCopy = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      const ta = e.currentTarget;
-      const expanded = expandSelectionForClipboard(
-        ta.selectionStart ?? 0,
-        ta.selectionEnd ?? 0,
-      );
-      if (expanded === null) return;
-      e.clipboardData.setData("text/plain", expanded);
-      e.preventDefault();
+      const ta = e.currentTarget
+      const expanded = expandSelectionForClipboard(ta.selectionStart ?? 0, ta.selectionEnd ?? 0)
+      if (expanded === null) return
+      e.clipboardData.setData('text/plain', expanded)
+      e.preventDefault()
     },
     [expandSelectionForClipboard],
-  );
+  )
 
   const handleCut = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      const ta = e.currentTarget;
-      const start = ta.selectionStart ?? 0;
-      const end = ta.selectionEnd ?? 0;
-      const expanded = expandSelectionForClipboard(start, end);
-      if (expanded === null) return;
-      e.clipboardData.setData("text/plain", expanded);
+      const ta = e.currentTarget
+      const start = ta.selectionStart ?? 0
+      const end = ta.selectionEnd ?? 0
+      const expanded = expandSelectionForClipboard(start, end)
+      if (expanded === null) return
+      e.clipboardData.setData('text/plain', expanded)
       // Manually excise the selection from the textarea; the pruneBlocks
       // effect above will drop any blocks whose token text was removed.
-      const nextValue = value.slice(0, start) + value.slice(end);
-      onChange(nextValue);
+      const nextValue = value.slice(0, start) + value.slice(end)
+      onChange(nextValue)
       requestAnimationFrame(() => {
-        if (ta) ta.setSelectionRange(start, start);
-      });
-      e.preventDefault();
+        if (ta) ta.setSelectionRange(start, start)
+      })
+      e.preventDefault()
     },
     [expandSelectionForClipboard, value, onChange],
-  );
+  )
 
   const handleFileInputChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      const files = Array.from(e.target.files || []);
-      if (files.length && onUploadFiles) onUploadFiles(files);
-      e.target.value = ""; // reset so same file can be re-selected
+      const files = Array.from(e.target.files || [])
+      if (files.length && onUploadFiles) onUploadFiles(files)
+      e.target.value = '' // reset so same file can be re-selected
     },
     [onUploadFiles],
-  );
+  )
 
-  const hasSessionRefs = pendingSessions.length > 0;
-  const [fileStripRef, fileStripH] = useMeasuredHeight<HTMLDivElement>();
-  const [sessionStripRef, sessionStripH] = useMeasuredHeight<HTMLDivElement>();
+  const hasSessionRefs = pendingSessions.length > 0
+  const [fileStripRef, fileStripH] = useMeasuredHeight<HTMLDivElement>()
+  const [sessionStripRef, sessionStripH] = useMeasuredHeight<HTMLDivElement>()
   /** True when the composer holds something a send would carry.
    *
    *  Hoisted because the hold-to-talk gate has to agree with the send button, and
@@ -3856,7 +3639,7 @@ function ChatInput({
    *  pending is a normal thing to want and hold mode stays available for it. A
    *  refs-only composer therefore keeps the hold bar while the send button is
    *  live, which is correct for both. */
-  const composerHasDraft = !!value.trim() || pendingFiles.length > 0;
+  const composerHasDraft = !!value.trim() || pendingFiles.length > 0
   /**
    * Hold-to-talk mode: the textarea is swapped for a press-and-hold target and
    * the mic button becomes the switch between the two.
@@ -3873,11 +3656,10 @@ function ChatInput({
    * Resolved inline rather than through a second coarse-pointer subscription: the
    * pointer class does not change under a mounted composer.
    */
-  const voiceModeAvailable =
-    !!onVoiceStart && !!onVoiceStop && !!onVoiceCancel && isTouchDevice();
+  const voiceModeAvailable = !!onVoiceStart && !!onVoiceStop && !!onVoiceCancel && isTouchDevice()
   const [voiceModePref, setVoiceModePref] = useState(
-    () => localStorage.getItem(VOICE_MODE_LS_KEY) === "1",
-  );
+    () => localStorage.getItem(VOICE_MODE_LS_KEY) === '1',
+  )
   /**
    * A draft SUSPENDS hold mode instead of exiting it, so the preference survives.
    *
@@ -3891,7 +3673,7 @@ function ChatInput({
    */
   /** "Is capture in flight at all" — see the `voiceCaptureActive` prop doc. Falls
    *  back to the gated flag so the prop stays optional for other callers. */
-  const captureInFlight = voiceCaptureActive ?? voiceRecording;
+  const captureInFlight = voiceCaptureActive ?? voiceRecording
   /** "Is a transcription in flight at all" — see the `voiceTranscribeActive` prop
    *  doc. Falls back to the gated flag so the prop stays optional. */
   const transcribeInFlight = voiceTranscribeActive ?? voiceTranscribing
@@ -3904,20 +3686,29 @@ function ChatInput({
   // Name the chat that holds the mic when the slot list knows it. In a lone DM
   // thread nothing else on screen shows which chat is capturing, so without a
   // name the user cannot go and end it.
-  const micOwnerTitle = useAppSelector(s =>
-    voiceBusyElsewhereSession ? s.dashboard.slots.find(x => x.key === voiceBusyElsewhereSession)?.title ?? null : null)
+  const micOwnerTitle = useAppSelector((s) =>
+    voiceBusyElsewhereSession
+      ? (s.dashboard.slots.find((x) => x.key === voiceBusyElsewhereSession)?.title ?? null)
+      : null,
+  )
   const micHeldElsewhereLabel = micOwnerTitle
     ? i18nT('components.chatInput.mic_in_use_in', { chat: micOwnerTitle })
     : i18nT('components.chatInput.mic_in_use_elsewhere')
   // The name in the status row is the way there: one click switches to the
   // chat that holds the mic, where the user can end the capture.
-  const micHeldElsewhereAction = micOwnerTitle && voiceBusyElsewhereSession
-    ? { label: micOwnerTitle, onClick: () => { void dispatch(switchSlot({ key: voiceBusyElsewhereSession, announceOnMissing: true })) } }
-    : undefined
+  const micHeldElsewhereAction =
+    micOwnerTitle && voiceBusyElsewhereSession
+      ? {
+          label: micOwnerTitle,
+          onClick: () => {
+            void dispatch(switchSlot({ key: voiceBusyElsewhereSession, announceOnMissing: true }))
+          },
+        }
+      : undefined
   /** State, not a ref: the hold target mounts only once hold mode is on, and the
    *  gesture hook can only bind its listeners when that arrival is observable.
    *  Declared above `touchPtt` because the hook binds to it. */
-  const [holdTarget, setHoldTarget] = useState<HTMLButtonElement | null>(null);
+  const [holdTarget, setHoldTarget] = useState<HTMLButtonElement | null>(null)
   const touchVoice = useMemo(
     () => ({
       recording: captureInFlight,
@@ -3926,7 +3717,7 @@ function ChatInput({
       cancel: onVoiceCancel ?? noopVoiceControl,
     }),
     [captureInFlight, onVoiceStart, onVoiceStop, onVoiceCancel],
-  );
+  )
   /*
    * `disabled` deliberately omits `!voiceHoldMode`, and that omission is what
    * lets `voiceHoldMode` read the hook's ownership below without a cycle. The
@@ -3939,7 +3730,7 @@ function ChatInput({
   const touchPtt = useTouchPushToTalk(touchVoice, {
     target: holdTarget,
     disabled: disabled || micBlocked || optimizing,
-  });
+  })
   /*
    * A draft suspends hold mode, EXCEPT while the touch gesture's own capture is
    * still running — otherwise a transcript landing in the composer would unmount
@@ -3969,9 +3760,7 @@ function ChatInput({
    * the render site.)
    */
   const voiceHoldMode =
-    voiceModeAvailable &&
-    voiceModePref &&
-    (!composerHasDraft || (captureInFlight && touchPtt.owns));
+    voiceModeAvailable && voiceModePref && (!composerHasDraft || (captureInFlight && touchPtt.owns))
   /**
    * True when the mic press changes MODE rather than starting a recording.
    *
@@ -3987,8 +3776,7 @@ function ChatInput({
    * `!composerHasDraft` half covers the other direction — an empty composer with
    * the preference off, where the switch is how voice gets turned on.
    */
-  const micIsModeSwitch =
-    voiceModeAvailable && (voiceHoldMode || !composerHasDraft);
+  const micIsModeSwitch = voiceModeAvailable && (voiceHoldMode || !composerHasDraft)
   /**
    * Capture is winding DOWN: the gesture is over but the transport has not let go.
    *
@@ -4003,7 +3791,7 @@ function ChatInput({
    * would be circular. It does not need to be: a disabled <button> dispatches no
    * pointer events, so the gesture cannot start from a bar that is switched off.
    */
-  const voiceSettling = voiceHoldMode && touchPtt.bar === "settling";
+  const voiceSettling = voiceHoldMode && touchPtt.bar === 'settling'
   /**
    * The textarea is PARKED: still mounted, but clipped out of layout by the
    * `sr-only` box the hold bar and the dictation panel both put it in.
@@ -4014,15 +3802,43 @@ function ChatInput({
    * value that was streamed in while parked is exactly the value whose height was
    * never measurable.
    */
-  const textareaParked = !!showDictation || voiceHoldMode;
-  parkedRef.current = textareaParked;
+  const textareaParked = !!showDictation || voiceHoldMode
+  parkedRef.current = textareaParked
 
   // Auto-resize textarea to fit content. Moved down here from the other composer
   // effects so it can name `textareaParked` — see the note at that site.
+  const lastMeasuredValueRef = useRef(value)
   useEffect(() => {
+    // A changed value here was set by the parent (the user's own edits already
+    // followed the caret in handleInput); an unchanged one means the cap, the
+    // parking or the manual height moved under text the user placed the caret
+    // in. See `applyHeight` for why only the former must not follow the caret.
+    const valueChanged = lastMeasuredValueRef.current !== value
+    lastMeasuredValueRef.current = value
     if (inputRef.current && !dragging.current)
-      applyHeight(inputRef.current, manualHeight, prefillHint, textareaParked);
-  }, [value, prefillHint, manualHeight, textareaParked]);
+      applyHeight(inputRef.current, manualHeight, prefillHint, textareaParked, !valueChanged)
+  }, [value, prefillHint, manualHeight, textareaParked])
+
+  // A pre-filled prompt is read from its first line. When the seed REPLACES what
+  // the box held, a box that was scrolled for the previous text keeps that
+  // offset across the value swap, so the new prompt's first line can start above
+  // the fold: reset once, when the hint arrives with the seed. When the seed was
+  // APPENDED to a draft the user was writing (the widget send path), the new
+  // text is the tail and the offset they had is the right one, so leave it. The
+  // caret stays at the end either way, so typing still appends. The DOM value is
+  // read rather than the prop so the effect keys on the hint alone.
+  const valueBeforeHintRef = useRef(value)
+  useEffect(() => {
+    const el = inputRef.current
+    if (!prefillHint || !el) return
+    // The append path joins on a trimmed draft, so compare against that form.
+    const prev = valueBeforeHintRef.current.trimEnd()
+    const appended = prev.trim().length > 0 && el.value.startsWith(prev)
+    if (!appended) el.scrollTop = 0
+  }, [prefillHint])
+  useEffect(() => {
+    valueBeforeHintRef.current = value
+  }, [value])
 
   // Re-measure when the textarea's WIDTH changes at an unchanged value: a window
   // resize, a sibling column folding, the side panel docking. The wrapped
@@ -4042,7 +3858,7 @@ function ChatInput({
       const width = el.clientWidth
       if (width === lastWidth) return
       lastWidth = width
-      if (!dragging.current) applyHeight(el, manualHeight, prefillHint, parkedRef.current)
+      if (!dragging.current) applyHeight(el, manualHeight, prefillHint, parkedRef.current, true)
     })
     ro.observe(el)
     return () => ro.disconnect()
@@ -4056,17 +3872,17 @@ function ChatInput({
   useEffect(() => {
     const id = requestAnimationFrame(() => {
       if (mirrorRef.current && inputRef.current)
-        mirrorRef.current.scrollTop = inputRef.current.scrollTop;
-    });
-    return () => cancelAnimationFrame(id);
-  }, [value, prefillHint, manualHeight, textareaParked]);
+        mirrorRef.current.scrollTop = inputRef.current.scrollTop
+    })
+    return () => cancelAnimationFrame(id)
+  }, [value, prefillHint, manualHeight, textareaParked])
   const toggleVoiceMode = useCallback(() => {
     setVoiceModePref((prev) => {
-      const next = !prev;
-      safeSetItem(VOICE_MODE_LS_KEY, next ? "1" : "0");
-      return next;
-    });
-  }, []);
+      const next = !prev
+      safeSetItem(VOICE_MODE_LS_KEY, next ? '1' : '0')
+      return next
+    })
+  }, [])
   /**
    * One label for the mic button, which is two different controls depending on
    * the device: a mode SWITCH on touch, the record toggle everywhere else.
@@ -4084,17 +3900,17 @@ function ChatInput({
       ? i18nT('components.chatInput.handsfree_interrupt_hint')
       : i18nT('components.chatInput.handsfree_stop')
     : micIsModeSwitch
-    ? voiceHoldMode
-      ? i18nT('components.chatInput.switch_to_keyboard')
-      : i18nT('components.chatInput.switch_to_voice')
-    : transcribeInFlight
-      ? i18nT('components.chatInput.transcribing')
-      : micHeldElsewhere
-        ? micHeldElsewhereLabel
-      // Not a switch: it records. Same two labels the desktop mic has always had.
-      : voiceRecording
-        ? i18nT('components.chatInput.stop_recording')
-        : i18nT('components.chatInput.voice_input')
+      ? voiceHoldMode
+        ? i18nT('components.chatInput.switch_to_keyboard')
+        : i18nT('components.chatInput.switch_to_voice')
+      : transcribeInFlight
+        ? i18nT('components.chatInput.transcribing')
+        : micHeldElsewhere
+          ? micHeldElsewhereLabel
+          : // Not a switch: it records. Same two labels the desktop mic has always had.
+            voiceRecording
+            ? i18nT('components.chatInput.stop_recording')
+            : i18nT('components.chatInput.voice_input')
   /**
    * What the hold bar says, which must describe what the NEXT press or release
    * ACTUALLY does. Two of these were wrong for the same reason — the WeChat
@@ -4111,19 +3927,19 @@ function ChatInput({
    *   talk", so the dead control explained nothing.
    */
   const holdBarLabel = transcribeInFlight
-    ? i18nT("components.chatInput.transcribing")
-    : touchPtt.bar === "settling"
+    ? i18nT('components.chatInput.transcribing')
+    : touchPtt.bar === 'settling'
       ? // NOT "Transcribing": the drain has not handed anything to the transcriber
         // yet. Saying so would claim work that has not started — the same overclaim
         // this bar has already been corrected for twice.
-        i18nT("components.chatInput.finishing")
-      : touchPtt.bar === "armed-cancel"
-        ? i18nT("components.chatInput.release_to_cancel")
-        : touchPtt.bar === "holding"
-          ? i18nT("components.chatInput.release_to_transcribe")
-          : touchPtt.bar === "tap-too-short"
-            ? i18nT("components.chatInput.keep_holding_to_record")
-            : i18nT("components.chatInput.hold_to_talk");
+        i18nT('components.chatInput.finishing')
+      : touchPtt.bar === 'armed-cancel'
+        ? i18nT('components.chatInput.release_to_cancel')
+        : touchPtt.bar === 'holding'
+          ? i18nT('components.chatInput.release_to_transcribe')
+          : touchPtt.bar === 'tap-too-short'
+            ? i18nT('components.chatInput.keep_holding_to_record')
+            : i18nT('components.chatInput.hold_to_talk')
   /**
    * Discovery hint for the mic switch, shown only where the switch exists and
    * only while it is reachable.
@@ -4146,8 +3962,8 @@ function ChatInput({
    */
   const voiceModePlaceholder =
     voiceModeAvailable && !voiceHoldMode && !composerHasDraft && !placeholder
-      ? i18nT("components.chatInput.send_a_message_or_tap_the_mic_for_voice")
-      : "";
+      ? i18nT('components.chatInput.send_a_message_or_tap_the_mic_for_voice')
+      : ''
   /** Combined height of every strip currently stacked above the textarea,
    *  MEASURED rather than predicted from the strips' Tailwind classes. The
    *  manual-resize floor and the transient height adjustment below both work off
@@ -4160,7 +3976,7 @@ function ChatInput({
    *  is simply taller when measured, instead of needing a second predicted
    *  height, which is how the third constant came to exist in the first place.
    */
-  const stripH = fileStripH + sessionStripH;
+  const stripH = fileStripH + sessionStripH
   /** Whether `stripH` describes what is actually on screen right now.
    *
    *  A measured height arrives one commit AFTER the strip mounts: the ref
@@ -4170,58 +3986,50 @@ function ChatInput({
    *  on every mount that already had something staged. Waiting for a mounted
    *  strip to report a non-zero box makes the first value a BASELINE rather
    *  than a change. */
-  const stripsMounted =
-    pendingFiles.length > 0 || pendingDirs.length > 0 || hasSessionRefs;
-  const stripHSettled = stripsMounted ? stripH > 0 : stripH === 0;
-  const prevStripH = useRef<number | null>(null);
-  const dragMinH = INPUT_DRAG_MIN_H + stripH;
-  const dragMinHRef = useRef(dragMinH);
-  dragMinHRef.current = dragMinH;
+  const stripsMounted = pendingFiles.length > 0 || pendingDirs.length > 0 || hasSessionRefs
+  const stripHSettled = stripsMounted ? stripH > 0 : stripH === 0
+  const prevStripH = useRef<number | null>(null)
+  const dragMinH = INPUT_DRAG_MIN_H + stripH
+  const dragMinHRef = useRef(dragMinH)
+  dragMinHRef.current = dragMinH
   // Adjust height transiently when a strip appears/disappears (not persisted —
   // staged files and session refs are both session-scoped). Diffing the TOTAL
   // rather than a per-strip boolean keeps the arithmetic correct when both
   // strips change in the same commit (e.g. send clears files and refs at once).
   useLayoutEffect(() => {
-    if (!stripHSettled) return;
-    const prev = prevStripH.current;
-    prevStripH.current = stripH;
+    if (!stripHSettled) return
+    const prev = prevStripH.current
+    prevStripH.current = stripH
     // `null` is the first settled reading: there is no previous state to have
     // moved from, so it establishes the baseline instead of adjusting.
-    if (prev === null || prev === stripH) return;
-    setManualHeight((h) =>
-      h !== null ? Math.max(INPUT_DRAG_MIN_H, h + (stripH - prev)) : h,
-    );
-  }, [stripH, stripHSettled]);
+    if (prev === null || prev === stripH) return
+    setManualHeight((h) => (h !== null ? Math.max(INPUT_DRAG_MIN_H, h + (stripH - prev)) : h))
+  }, [stripH, stripHSettled])
 
   return (
     // 'input-area' is a stable theming hook — see website/docs/theming-contract.md
     <div
-      className={`input-area px-4 pb-1 ${hasApproval ? "pt-0" : "pt-1"} mx-auto w-full flex flex-col`}
+      className={`input-area px-4 pb-1 ${hasApproval ? 'pt-0' : 'pt-1'} mx-auto w-full flex flex-col`}
       style={{
-        maxWidth: "var(--mc-input-width, 900px)",
-        ...(manualHeight !== null
-          ? { minHeight: INPUT_DRAG_MIN_H + stripH + "px" }
-          : {}),
+        maxWidth: 'var(--mc-input-width, 900px)',
+        ...(manualHeight !== null ? { minHeight: INPUT_DRAG_MIN_H + stripH + 'px' } : {}),
       }}
     >
       {/* Knowledge context chip */}
       {!showGhost && knowledgeChip}
 
       {/* Ghost follow-up bubbles floating above input */}
-      {!showGhost &&
-        followUpOptions &&
-        followUpOptions.length > 0 &&
-        onFollowUpSelect && (
-          <FollowUpBar
-            options={followUpOptions}
-            picked={followUpPicked ?? new Set()}
-            onSelect={onFollowUpSelect}
-            onSend={sendFollowUp}
-            quickSend={quickSend}
-            layout={followUpLayout}
-            sourceKey={followUpSourceKey}
-          />
-        )}
+      {!showGhost && followUpOptions && followUpOptions.length > 0 && onFollowUpSelect && (
+        <FollowUpBar
+          options={followUpOptions}
+          picked={followUpPicked ?? new Set()}
+          onSelect={onFollowUpSelect}
+          onSend={sendFollowUp}
+          quickSend={quickSend}
+          layout={followUpLayout}
+          sourceKey={followUpSourceKey}
+        />
+      )}
 
       {/* Tip / folder-suggestion band — LAST above the composer so it always
           hugs the input box. Options (FollowUpBar) answer the assistant's
@@ -4256,23 +4064,17 @@ function ChatInput({
           replaces the composer. Keep the box, drop the affordance. */}
       {!showGhost &&
         (isTouch || composerCollapsed ? (
-          <div
-            aria-hidden="true"
-            data-testid="composer-top-gap"
-            className="h-[6px] shrink-0"
-          />
+          <div aria-hidden="true" data-testid="composer-top-gap" className="h-[6px] shrink-0" />
         ) : (
           <div
             ref={resizeHandleLifecycleRef}
             aria-hidden="true"
             data-testid="composer-resize-handle"
             className="flex items-center justify-center h-[6px] cursor-row-resize group/drag"
-            style={{ touchAction: "none" }}
+            style={{ touchAction: 'none' }}
             {...inputResize}
             onDoubleClick={resetHeight}
-            title={i18nT(
-              "components.chatInput.drag_to_resize_double_click_to_reset",
-            )}
+            title={i18nT('components.chatInput.drag_to_resize_double_click_to_reset')}
           >
             <div className="w-12 h-[3px] rounded-full bg-border group-hover/drag:bg-accent group-active/drag:bg-accent-hover transition-all duration-200 opacity-0 group-hover/drag:opacity-100" />
           </div>
@@ -4293,7 +4095,7 @@ function ChatInput({
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 8 }}
             transition={{
-              type: "spring",
+              type: 'spring',
               damping: 25,
               stiffness: 300,
               mass: 0.8,
@@ -4304,36 +4106,36 @@ function ChatInput({
                 <Bot size={13} className="text-warn shrink-0" />
                 <span className="text-[13px] font-body text-muted flex-1 min-w-0">
                   {pendingSpawnApprovals.length === 1
-                    ? "1 sub-agent is awaiting your approval to run"
+                    ? '1 sub-agent is awaiting your approval to run'
                     : `${pendingSpawnApprovals.length} sub-agents are awaiting your approval to run`}
                 </span>
                 {spawnApprovalsResolving ? (
                   <span className="inline-flex items-center gap-1 text-[12px] text-muted/60 shrink-0">
                     <Loader2 size={12} className="animate-spin shrink-0" />
-                    {i18nT("components.chatInput.resolving")}
+                    {i18nT('components.chatInput.resolving')}
                   </span>
                 ) : (
                   <div className="flex items-center gap-1.5 shrink-0">
                     <button
                       key="stop-escape-hatch"
                       type="button"
-                      onClick={() => resolveSpawnApprovals("approve")}
+                      onClick={() => resolveSpawnApprovals('approve')}
                       className={approvalBtnClass}
                     >
                       <CheckCircle size={12} className="shrink-0" />
                       {pendingSpawnApprovals.length === 1
-                        ? i18nT("components.chatInput.approve")
-                        : i18nT("components.chatInput.approve_all")}
+                        ? i18nT('components.chatInput.approve')
+                        : i18nT('components.chatInput.approve_all')}
                     </button>
                     <button
                       type="button"
-                      onClick={() => resolveSpawnApprovals("reject")}
+                      onClick={() => resolveSpawnApprovals('reject')}
                       className={`${approvalBtnClass} hover:!text-danger hover:!border-danger`}
                     >
                       <Ban size={12} className="shrink-0" />
                       {pendingSpawnApprovals.length === 1
-                        ? i18nT("components.chatInput.reject")
-                        : i18nT("components.chatInput.reject_all")}
+                        ? i18nT('components.chatInput.reject')
+                        : i18nT('components.chatInput.reject_all')}
                     </button>
                     <button
                       type="button"
@@ -4341,7 +4143,7 @@ function ChatInput({
                       className="inline-flex items-center gap-1 text-[11px] text-muted hover:text-text shrink-0 cursor-pointer bg-transparent border-none px-1"
                     >
                       <Target size={11} className="shrink-0" />
-                      {i18nT("components.chatInput.review_in_panel")}
+                      {i18nT('components.chatInput.review_in_panel')}
                     </button>
                   </div>
                 )}
@@ -4364,37 +4166,32 @@ function ChatInput({
                       </code>
                       {a.approving ? (
                         <span className="inline-flex items-center gap-1 text-[11px] text-muted/60 shrink-0">
-                          <Loader2
-                            size={11}
-                            className="animate-spin shrink-0"
-                          />
-                          {i18nT("components.chatInput.resolving")}
+                          <Loader2 size={11} className="animate-spin shrink-0" />
+                          {i18nT('components.chatInput.resolving')}
                         </span>
                       ) : (
                         <div className="flex items-center gap-1 shrink-0">
                           <button
                             type="button"
-                            aria-label={i18nT(
-                              "components.chatInput.approve_sub_agent",
-                              { name: a.task || a.agent || a.id },
-                            )}
-                            onClick={() => resolveOneSpawn(a, "approve")}
+                            aria-label={i18nT('components.chatInput.approve_sub_agent', {
+                              name: a.task || a.agent || a.id,
+                            })}
+                            onClick={() => resolveOneSpawn(a, 'approve')}
                             className={approvalBtnClass}
                           >
                             <CheckCircle size={12} className="shrink-0" />
-                            {i18nT("components.chatInput.approve")}
+                            {i18nT('components.chatInput.approve')}
                           </button>
                           <button
                             type="button"
-                            aria-label={i18nT(
-                              "components.chatInput.reject_sub_agent",
-                              { name: a.task || a.agent || a.id },
-                            )}
-                            onClick={() => resolveOneSpawn(a, "reject")}
+                            aria-label={i18nT('components.chatInput.reject_sub_agent', {
+                              name: a.task || a.agent || a.id,
+                            })}
+                            onClick={() => resolveOneSpawn(a, 'reject')}
                             className={`${approvalBtnClass} hover:!text-danger hover:!border-danger`}
                           >
                             <Ban size={12} className="shrink-0" />
-                            {i18nT("components.chatInput.reject")}
+                            {i18nT('components.chatInput.reject')}
                           </button>
                         </div>
                       )}
@@ -4423,36 +4220,36 @@ function ChatInput({
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 8 }}
             transition={{
-              type: "spring",
+              type: 'spring',
               damping: 25,
               stiffness: 300,
               mass: 0.8,
             }}
           >
             <div
-              className={`bg-[color-mix(in_srgb,var(--warn)_12%,transparent)] border border-border ${showGhost ? "rounded-2xl" : "border-b-0 rounded-t-2xl"} approval-glow transition-[border-radius,border-color,border-width] duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]`}
+              className={`bg-[color-mix(in_srgb,var(--warn)_12%,transparent)] border border-border ${showGhost ? 'rounded-2xl' : 'border-b-0 rounded-t-2xl'} approval-glow transition-[border-radius,border-color,border-width] duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]`}
             >
               <AnimatePresence initial={false}>
                 {showGhost && (
                   <motion.div
                     key="ghost"
                     initial={{ height: 0, opacity: 0, y: -6 }}
-                    animate={{ height: "auto", opacity: 1, y: 0 }}
+                    animate={{ height: 'auto', opacity: 1, y: 0 }}
                     exit={{ height: 0, opacity: 0, y: -6 }}
                     transition={{
-                      type: "spring",
+                      type: 'spring',
                       damping: 24,
                       stiffness: 280,
                       mass: 0.7,
                     }}
-                    style={{ overflow: "hidden" }}
+                    style={{ overflow: 'hidden' }}
                   >
                     <div className="px-3.5 pt-2.5 pb-1">
                       <div className="inline-flex items-start gap-1 text-[13px] font-mono px-2 py-0.5">
                         <Lock
                           size={12}
                           className="text-warn shrink-0"
-                          style={{ marginTop: "3px" }}
+                          style={{ marginTop: '3px' }}
                         />
                         <span className="text-muted break-words min-w-0 line-clamp-2">
                           {approvalLabel}
@@ -4471,10 +4268,10 @@ function ChatInput({
                         fmtTime={(t) =>
                           t
                             ? fmtDateFields(t, {
-                                hour: "2-digit",
-                                minute: "2-digit",
+                                hour: '2-digit',
+                                minute: '2-digit',
                               })
-                            : ""
+                            : ''
                         }
                         barColor="color-mix(in srgb, var(--warn) 70%, transparent)"
                         layoutId={`ghost-tool-detail-${approvalToolCallId || approvalId}`}
@@ -4499,33 +4296,26 @@ function ChatInput({
                   <button
                     type="button"
                     onClick={showInChat}
-                    title={i18nT(
-                      "components.chatInput.show_pending_tool_call_in_chat",
-                    )}
-                    aria-label={i18nT(
-                      "components.chatInput.show_pending_tool_call_in_chat",
-                    )}
+                    title={i18nT('components.chatInput.show_pending_tool_call_in_chat')}
+                    aria-label={i18nT('components.chatInput.show_pending_tool_call_in_chat')}
                     className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-transparent border border-border text-muted text-[11px] cursor-pointer hover:text-text hover:border-border-strong hover:bg-bg-hover transition-colors"
                   >
                     <Target size={11} className="shrink-0" />
-                    {i18nT("components.chatInput.show_in_chat")}
+                    {i18nT('components.chatInput.show_in_chat')}
                   </button>
                 )}
                 {/* `data-approval-actions` is the probe `queryPendingApprovalAction`
                       resolves — a keyboard chord lands on this row's first enabled
                       control. A `data-` hook rather than button text because every
                       catalog translates the labels. */}
-                <div
-                  data-approval-actions
-                  className="flex gap-1.5 flex-wrap items-center"
-                >
+                <div data-approval-actions className="flex gap-1.5 flex-wrap items-center">
                   <button
                     disabled={approvalSubmitting}
                     className={approvalBtnClass}
-                    onClick={() => handleApprovalAction("approved")}
+                    onClick={() => handleApprovalAction('approved')}
                   >
                     <CheckCircle size={12} className="shrink-0" />
-                    {i18nT("components.chatInput.allow_once")}
+                    {i18nT('components.chatInput.allow_once')}
                   </button>
                   {/* One dropdown carries every standing grant this card can
                           record. Trust-reads is a tier inside it, not a sibling
@@ -4544,18 +4334,13 @@ function ChatInput({
                         isShell={approvalIsShell && approvalTrustBaseGrantable}
                         hasCommand={approvalTrustCommandGrantable}
                         trustReadsLabelKey={
-                          approvalIsReadOnly
-                            ? "components.chatInput.trust_reads"
-                            : undefined
+                          approvalIsReadOnly ? 'components.chatInput.trust_reads' : undefined
                         }
-                        showTrustAll={
-                          approvalTrustAllGrantable ||
-                          approvalTrustCommandGrantable
-                        }
+                        showTrustAll={approvalTrustAllGrantable || approvalTrustCommandGrantable}
                         disabled={approvalSubmitting}
                         className={approvalBtnClass}
                         onAction={(action, pattern) => {
-                          handleApprovalAction(action, pattern);
+                          handleApprovalAction(action, pattern)
                         }}
                       />
                     )}
@@ -4563,7 +4348,7 @@ function ChatInput({
                     disabled={approvalSubmitting}
                     className={`${approvalBtnClass} hover:!text-danger hover:!bg-[color-mix(in_srgb,var(--danger)_10%,transparent)]`}
                     onAction={(action) => {
-                      handleApprovalAction(action);
+                      handleApprovalAction(action)
                     }}
                   />
                 </div>
@@ -4582,20 +4367,18 @@ function ChatInput({
                 !approvalNudgeActive &&
                 approvalMode && (
                   <div className="flex items-center gap-1.5 flex-wrap px-3.5 pb-2 -mt-1 text-[12px] text-muted select-none">
-                    <span>
-                      {i18nT("components.chatInput.approval_hint_question")}
-                    </span>
+                    <span>{i18nT('components.chatInput.approval_hint_question')}</span>
                     <button
                       type="button"
                       className="inline-flex items-center gap-0.5 p-0 bg-transparent border-none text-accent text-[12px] cursor-pointer hover:underline"
                       onClick={() => {
                         // Discovery achieved: the picker is about to open under a
                         // spotlight, so the hint has done its job for good.
-                        safeSetItem(APPROVAL_MODE_ADJUSTED_LS_KEY, "1");
-                        setApprovalPickerSignal((n) => n + 1);
+                        safeSetItem(APPROVAL_MODE_ADJUSTED_LS_KEY, '1')
+                        setApprovalPickerSignal((n) => n + 1)
                       }}
                     >
-                      {i18nT("components.chatInput.approval_hint_adjust")}
+                      {i18nT('components.chatInput.approval_hint_adjust')}
                     </button>
                   </div>
                 )}
@@ -4611,11 +4394,11 @@ function ChatInput({
             variant="inline"
             testId="optimize-error"
             message={optimizeError}
-            onDismiss={() => setOptimizeError("")}
+            onDismiss={() => setOptimizeError('')}
           />
         </div>
       )}
-      {approvalNotice && approvalNoticeKind === "error" && (
+      {approvalNotice && approvalNoticeKind === 'error' && (
         <div className="px-4 mb-1">
           {/* No hand-off: the composer draft below is unsaved. */}
           <ErrorNotice
@@ -4625,7 +4408,7 @@ function ChatInput({
           />
         </div>
       )}
-      {approvalNotice && approvalNoticeKind === "status" && (
+      {approvalNotice && approvalNoticeKind === 'status' && (
         <div
           role="status"
           className="flex items-center gap-2 px-4 py-2 mb-1 bg-[color-mix(in_srgb,var(--warn)_12%,transparent)] rounded-lg"
@@ -4638,10 +4421,8 @@ function ChatInput({
       {!showGhost && prefillHint && (
         <div className="flex items-center gap-2 px-4 py-2 mb-1 bg-accent/10 rounded-lg">
           <span className="text-accent text-[13px]">
-            <ClipboardList className="lucide-inline" />{" "}
-            {i18nT(
-              "components.chatInput.plan_pre_filled_add_context_then_send",
-            )}
+            <ClipboardList className="lucide-inline" />{' '}
+            {i18nT('components.chatInput.plan_pre_filled_add_context_then_send')}
           </span>
         </div>
       )}
@@ -4650,7 +4431,7 @@ function ChatInput({
         id={fileInputId}
         ref={fileInputRef}
         type="file"
-        aria-label={i18nT("components.chatInput.attach_files")}
+        aria-label={i18nT('components.chatInput.attach_files')}
         multiple
         accept={FILE_ACCEPT}
         className="sr-only"
@@ -4672,8 +4453,8 @@ function ChatInput({
           open={slashMenuOpen}
           sendOnEnter={sendOnEnter}
           onSelect={(cmd) => {
-            onChange(cmd);
-            setSlashMenuOpen(false);
+            onChange(cmd)
+            setSlashMenuOpen(false)
           }}
           onClose={() => setSlashMenuOpen(false)}
         />
@@ -4691,14 +4472,14 @@ function ChatInput({
             // relativePath already carries a trailing slash for directories
             // (see selectionFor in FilePickerMenu), so the inserted token reads
             // as e.g. "@src/pages/ " and is unambiguously a folder.
-            applyPickedToken(/(^|[\s])@\S*$/, `@${relativePath} `);
-            setFilePickerOpen(false);
-            setFileQuery("");
-            onFileSelect(path, kind, `@${relativePath}`);
+            applyPickedToken(/(^|[\s])@\S*$/, `@${relativePath} `)
+            setFilePickerOpen(false)
+            setFileQuery('')
+            onFileSelect(path, kind, `@${relativePath}`)
           }}
           onClose={() => {
-            setFilePickerOpen(false);
-            setFileQuery("");
+            setFilePickerOpen(false)
+            setFileQuery('')
           }}
         />
       )}
@@ -4715,42 +4496,39 @@ function ChatInput({
           onSelect={({ leaf }) => {
             // Token left literal — backend appends the skill body; the user still
             // sees their $token marker. Caret-relative replace via shared helper.
-            applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${leaf} `);
-            setSkillPickerOpen(false);
-            setSkillQuery("");
+            applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${leaf} `)
+            setSkillPickerOpen(false)
+            setSkillQuery('')
           }}
           onTrustRequest={({ leaf }) => {
             // An unconsented project skill: close the menu and ask, rather than
             // inserting a token that would resolve to nothing.
-            setSkillPickerOpen(false);
-            setSkillQuery("");
-            const requestId = nextTrustRequestIdRef.current + 1;
-            nextTrustRequestIdRef.current = requestId;
-            activeTrustRequestIdRef.current = requestId;
-            setTrustPrompt({ requestId, leaf, slotKey: skillSlotKey, project });
+            setSkillPickerOpen(false)
+            setSkillQuery('')
+            const requestId = nextTrustRequestIdRef.current + 1
+            nextTrustRequestIdRef.current = requestId
+            activeTrustRequestIdRef.current = requestId
+            setTrustPrompt({ requestId, leaf, slotKey: skillSlotKey, project })
           }}
           onClose={() => {
-            setSkillPickerOpen(false);
-            setSkillQuery("");
+            setSkillPickerOpen(false)
+            setSkillQuery('')
           }}
         />
       )}
       <ProjectSkillsTrustDialog
         key={trustPrompt?.requestId ?? 0}
         open={trustPrompt !== null}
-        skillLeaf={trustPrompt?.leaf ?? ""}
+        skillLeaf={trustPrompt?.leaf ?? ''}
         slotKey={trustPrompt?.slotKey}
         onClose={() => {
-          activeTrustRequestIdRef.current = null;
-          setTrustPrompt(null);
+          activeTrustRequestIdRef.current = null
+          setTrustPrompt(null)
         }}
         onTrusted={(leaf) => {
-          const completedPrompt = trustPrompt;
-          if (
-            !completedPrompt ||
-            completedPrompt.requestId !== activeTrustRequestIdRef.current
-          )
-            return;
+          const completedPrompt = trustPrompt
+          if (!completedPrompt || completedPrompt.requestId !== activeTrustRequestIdRef.current)
+            return
           if (
             completedPrompt.slotKey !== skillSlotKeyRef.current ||
             completedPrompt.project !== skillProjectRef.current ||
@@ -4758,20 +4536,17 @@ function ChatInput({
           ) {
             // Retire this prompt only if it is still current. A superseding
             // request has a different id and must remain open.
-            activeTrustRequestIdRef.current = null;
+            activeTrustRequestIdRef.current = null
             setTrustPrompt((current) =>
               current?.requestId === completedPrompt.requestId ? null : current,
-            );
-            return;
+            )
+            return
           }
-          activeTrustRequestIdRef.current = null;
-          setTrustPrompt(null);
+          activeTrustRequestIdRef.current = null
+          setTrustPrompt(null)
           // The grant makes the token resolvable, so insert it now — the user
           // asked for this skill and has just consented to its directory.
-          applyPickedToken(
-            /(^|[\s])\$[a-z0-9/_-]*$/,
-            `$${completedPrompt.leaf} `,
-          );
+          applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${completedPrompt.leaf} `)
         }}
       />
 
@@ -4798,16 +4573,16 @@ function ChatInput({
         {!showGhost && !composerCollapsed && (
           <motion.div
             key="input-container"
-            initial={{ opacity: 1, height: "auto" }}
-            animate={{ opacity: 1, height: "auto" }}
+            initial={{ opacity: 1, height: 'auto' }}
+            animate={{ opacity: 1, height: 'auto' }}
             exit={{ opacity: 0, height: 0 }}
             transition={{
-              type: "spring",
+              type: 'spring',
               damping: 26,
               stiffness: 280,
               mass: 0.7,
             }}
-            style={{ overflow: "hidden" }}
+            style={{ overflow: 'hidden' }}
           >
             {/* File drag-and-drop target. Drag-drop is inherently pointer-only; the
            keyboard-accessible path is the "Attach files" button that opens the
@@ -4816,7 +4591,7 @@ function ChatInput({
             <div
               data-testid="input-wrapper"
               ref={wrapperRef}
-              className={`${hasApproval ? "rounded-b-2xl rounded-t-none" : "rounded-2xl"} relative transition-colors overflow-hidden ${manualHeight !== null ? "flex flex-col min-h-0" : ""} ${memoryMode === "incognito" || memoryMode === "temporary" ? "border-2" : "border"} ${memoryMode === "temporary" ? "border-aim bg-bg-elevated" : memoryMode === "incognito" ? "border-warn bg-bg-elevated" : "border-border bg-bg-elevated focus-within:border-accent/50"}`}
+              className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${memoryMode === 'incognito' || memoryMode === 'temporary' ? 'border-2' : 'border'} ${memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
               onDragOver={onDragOver}
               onDragLeave={onDragLeave}
               onDrop={onDrop}
@@ -4841,49 +4616,46 @@ function ChatInput({
                   aria-live="polite"
                   className="flex items-center gap-2 px-3 py-1.5 [@media(hover:none)]:min-h-[44px] text-[12px] border-b border-border bg-accent-subtle text-accent"
                 >
-                  {handsFreePhase === "listening" && (
+                  {handsFreePhase === 'listening' && (
                     <>
-                      <span
-                        className="relative flex h-2 w-2 shrink-0"
-                        aria-hidden="true"
-                      >
+                      <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
                         <span className="absolute inline-flex h-full w-full rounded-full bg-danger opacity-60 animate-ping" />
                         <span className="relative inline-flex h-2 w-2 rounded-full bg-danger" />
                       </span>
                       <span className="font-medium">
-                        {i18nT("components.chatInput.handsfree_listening")}
+                        {i18nT('components.chatInput.handsfree_listening')}
                       </span>
                     </>
                   )}
-                  {handsFreePhase === "processing" && (
+                  {handsFreePhase === 'processing' && (
                     <>
                       <Loader2 className="lucide-inline animate-spin shrink-0" />
                       <span className="font-medium">
-                        {i18nT("components.chatInput.transcribing")}
+                        {i18nT('components.chatInput.transcribing')}
                       </span>
                     </>
                   )}
-                  {handsFreePhase === "sent" && (
+                  {handsFreePhase === 'sent' && (
                     <>
                       <Check className="lucide-inline shrink-0" />
                       <span className="font-medium">
-                        {i18nT("components.chatInput.handsfree_sent")}
+                        {i18nT('components.chatInput.handsfree_sent')}
                       </span>
                     </>
                   )}
-                  {handsFreePhase === "speaking" && (
+                  {handsFreePhase === 'speaking' && (
                     <>
                       <Volume2 className="lucide-inline shrink-0" />
                       <span className="font-medium">
-                        {i18nT("components.chatInput.handsfree_speaking")}
+                        {i18nT('components.chatInput.handsfree_speaking')}
                       </span>
                     </>
                   )}
                   <span className="ml-auto text-muted font-normal">
                     {i18nT(
-                      handsFreePhase === "speaking"
-                        ? "components.chatInput.handsfree_interrupt_hint"
-                        : "components.chatInput.handsfree_stop_hint",
+                      handsFreePhase === 'speaking'
+                        ? 'components.chatInput.handsfree_interrupt_hint'
+                        : 'components.chatInput.handsfree_stop_hint',
                     )}
                   </span>
                 </div>
@@ -4894,25 +4666,25 @@ function ChatInput({
             live — a permanent hint would be noise in a composer used mostly for
             typing. `aria-live` announces the arm/disarm flip, which is the only
             feedback a screen-reader user gets for a gesture with no focus change. */}
-              {voiceHoldMode && touchPtt.phase !== "idle" && (
+              {voiceHoldMode && touchPtt.phase !== 'idle' && (
                 <div
                   data-testid="hold-cancel-cue"
                   aria-live="polite"
                   className={`flex items-center justify-center gap-1.5 py-1.5 text-[11.5px] font-medium transition-colors ${
                     touchPtt.armedCancel
-                      ? "bg-danger text-danger-fg"
-                      : "text-muted border-b border-dashed border-border-strong"
+                      ? 'bg-danger text-danger-fg'
+                      : 'text-muted border-b border-dashed border-border-strong'
                   }`}
                 >
                   {touchPtt.armedCancel ? (
                     <>
                       <X size={12} className="shrink-0" />
-                      {i18nT("components.chatInput.release_to_cancel")}
+                      {i18nT('components.chatInput.release_to_cancel')}
                     </>
                   ) : (
                     <>
                       <ArrowUp size={12} className="shrink-0" />
-                      {i18nT("components.chatInput.slide_up_to_cancel")}
+                      {i18nT('components.chatInput.slide_up_to_cancel')}
                     </>
                   )}
                 </div>
@@ -4927,27 +4699,52 @@ function ChatInput({
              keyboard hint stays suppressed for exactly the drain the finger
              just committed — and stays SHOWN for a keyboard-binding capture,
              where Esc/Enter genuinely work. */
-          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} gestureDriven={voiceHoldMode || touchPtt.bar === 'settling'} download={voiceDownload} />
-        ) : (
-          <VoiceStatusBar
-            recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} download={voiceDownload}
-            /* Visible reasons, not tooltips: why the mic is blocked, or that a
+                <VoiceDictationPanel
+                  sampleRef={showDictation}
+                  value={value}
+                  partial={voicePartial}
+                  deviceLabel={voiceDeviceLabel}
+                  deviceId={voiceDeviceId}
+                  onSelectDevice={onSelectVoiceDevice || noopSelectDevice}
+                  deviceSwitchIsLive={voiceDeviceSwitchIsLive}
+                  streaming={voiceStreaming}
+                  gestureDriven={voiceHoldMode || touchPtt.bar === 'settling'}
+                  download={voiceDownload}
+                />
+              ) : (
+                <VoiceStatusBar
+                  recording={voiceRecording}
+                  level={voiceLevel}
+                  deviceLabel={voiceDeviceLabel}
+                  deviceId={voiceDeviceId}
+                  error={voiceError}
+                  onDismissError={onClearVoiceError}
+                  onSelectDevice={onSelectVoiceDevice || noopSelectDevice}
+                  deviceSwitchIsLive={voiceDeviceSwitchIsLive}
+                  download={voiceDownload}
+                  /* Visible reasons, not tooltips: why the mic is blocked, or that a
                held dictation just arrived. Only while the mic is offered at all.
                Shown in hold mode too: one message, one shape, and the name
                button (the way to the capturing chat) stays reachable there —
                the disabled hold bar keeps its plain label. */
-            notice={onVoiceToggle && micHeldElsewhere
-              ? { text: micHeldElsewhereLabel, tone: 'muted', action: micHeldElsewhereAction }
-              : voiceHeldLanded
-                ? { text: i18nT('components.chatInput.dictation_added'), tone: 'ok' }
-                : null}
-          />
-        )}
+                  notice={
+                    onVoiceToggle && micHeldElsewhere
+                      ? {
+                          text: micHeldElsewhereLabel,
+                          tone: 'muted',
+                          action: micHeldElsewhereAction,
+                        }
+                      : voiceHeldLanded
+                        ? { text: i18nT('components.chatInput.dictation_added'), tone: 'ok' }
+                        : null
+                  }
+                />
+              )}
 
               {optimizing && (
                 <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl">
-                  <Sparkles size={14} className="inline mr-1 text-yellow-400" />{" "}
-                  {i18nT("components.chatInput.optimizing_prompt")}
+                  <Sparkles size={14} className="inline mr-1 text-yellow-400" />{' '}
+                  {i18nT('components.chatInput.optimizing_prompt')}
                 </span>
               )}
               {/* The textarea fallback is seamless for typing (draft intact), but the
@@ -4958,36 +4755,26 @@ function ChatInput({
               {lexicalLoadFailed && !lexicalFailedNoticeDismissed && (
                 <ErrorNotice
                   variant="inline"
-                  message={i18nT(
-                    "components.chatInput.editor_unavailable_standard_input",
-                  )}
+                  message={i18nT('components.chatInput.editor_unavailable_standard_input')}
                   onDismiss={() => setLexicalFailedNoticeDismissed(true)}
                   testId="composer-fallback-notice"
                   className="mb-1 px-1"
                 />
               )}
               <div
-                className={`relative ${showDictation || voiceHoldMode ? "sr-only" : ""} ${manualHeight !== null ? "flex-1 min-h-0 flex flex-col" : ""}`}
+                className={`relative ${showDictation || voiceHoldMode ? 'sr-only' : ''} ${manualHeight !== null ? 'flex-1 min-h-0 flex flex-col' : ''}`}
               >
                 {lexicalComposer && !lexicalLoadFailed ? (
-                  <ComposerLoadBoundary
-                    onError={() => setLexicalLoadFailed(true)}
-                  >
+                  <ComposerLoadBoundary onError={() => setLexicalLoadFailed(true)}>
                     <Suspense
                       fallback={
                         <div
                           role="status"
-                          aria-label={
-                            inputAriaLabel ??
-                            i18nT("components.chatInput.message_input")
-                          }
+                          aria-label={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
                           aria-busy="true"
                           className={`relative flex w-full min-h-[44px] items-center px-4 text-muted ${INPUT_TYPO}`}
                         >
-                          <Loader2
-                            className="lucide-inline animate-spin"
-                            aria-hidden="true"
-                          />
+                          <Loader2 className="lucide-inline animate-spin" aria-hidden="true" />
                         </div>
                       }
                     >
@@ -5002,25 +4789,16 @@ function ChatInput({
                         onReady={markLexicalReady}
                         onSelectionChange={publishLexicalSelection}
                         sentMessages={sentMessages}
-                        ariaLabel={
-                          inputAriaLabel ??
-                          i18nT("components.chatInput.message_input")
-                        }
+                        ariaLabel={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
                         placeholder={
                           !connected
-                            ? i18nT(
-                                "components.chatInput.gateway_offline_message_will_not_send",
-                              )
+                            ? i18nT('components.chatInput.gateway_offline_message_will_not_send')
                             : disabledProp
-                              ? i18nT("components.chatInput.stopping")
+                              ? i18nT('components.chatInput.stopping')
                               : voiceRecording
-                                ? i18nT(
-                                    "components.chatInput.recording_click_mic_to_stop",
-                                  )
+                                ? i18nT('components.chatInput.recording_click_mic_to_stop')
                                 : voiceTranscribing
-                                  ? i18nT(
-                                      "components.chatInput.transcribing_please_wait",
-                                    )
+                                  ? i18nT('components.chatInput.transcribing_please_wait')
                                   : continuePlaceholder ||
                                     voiceModePlaceholder ||
                                     resolvedPlaceholder
@@ -5028,107 +4806,82 @@ function ChatInput({
                         disabled={disabled}
                         readOnly={optimizing}
                         sendOnEnter={sendOnEnter}
-                        className={
-                          manualHeight !== null ? "flex-1 min-h-0" : ""
-                        }
+                        spellCheck={spellCheck}
+                        className={manualHeight !== null ? 'flex-1 min-h-0' : ''}
                       />
                     </Suspense>
                   </ComposerLoadBoundary>
                 ) : (
                   <>
-                    <PasteHighlightLayer
-                      ref={mirrorRef}
-                      value={value}
-                      blocks={pasteBlocks}
-                    />
+                    <PasteHighlightLayer ref={mirrorRef} value={value} blocks={pasteBlocks} />
                     <textarea
                       ref={setTextareaRef}
-                      aria-label={
-                        inputAriaLabel ??
-                        i18nT("components.chatInput.message_input")
-                      }
+                      aria-label={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
                       data-composer-input=""
+                      spellCheck={spellCheck}
                       aria-describedby={pastePreviewPanelId ?? undefined}
                       data-composer-typo
                       className={
-                        /* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? "flex-1" : ""} ${disabled ? "opacity-40 pointer-events-none" : ""} ${optimizing ? "opacity-30" : ""}`
+                        /* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`
                       }
-                      style={
-                        manualHeight !== null ? { height: "100%" } : undefined
-                      }
+                      style={manualHeight !== null ? { height: '100%' } : undefined}
                       placeholder={
                         !connected
-                          ? i18nT(
-                              "components.chatInput.gateway_offline_message_will_not_send",
-                            )
+                          ? i18nT('components.chatInput.gateway_offline_message_will_not_send')
                           : disabledProp
-                            ? i18nT("components.chatInput.stopping")
+                            ? i18nT('components.chatInput.stopping')
                             : voiceRecording
-                              ? i18nT(
-                                  "components.chatInput.recording_click_mic_to_stop",
-                                )
+                              ? i18nT('components.chatInput.recording_click_mic_to_stop')
                               : voiceTranscribing
-                                ? i18nT(
-                                    "components.chatInput.transcribing_please_wait",
-                                  )
-                                : continuePlaceholder ||
-                                  voiceModePlaceholder ||
-                                  resolvedPlaceholder
+                                ? i18nT('components.chatInput.transcribing_please_wait')
+                                : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder
                       }
                       readOnly={optimizing}
                       rows={1}
                       value={value}
                       onDragOver={(e) => {
-                        e.preventDefault();
-                        onDragOver?.(e);
-                        e.stopPropagation();
+                        e.preventDefault()
+                        onDragOver?.(e)
+                        e.stopPropagation()
                       }}
                       onDragLeave={(e) => {
-                        onDragLeave?.(e);
-                        e.stopPropagation();
+                        onDragLeave?.(e)
+                        e.stopPropagation()
                       }}
                       onDrop={(e) => {
-                        e.preventDefault();
-                        onDrop?.(e);
-                        e.stopPropagation();
+                        e.preventDefault()
+                        onDrop?.(e)
+                        e.stopPropagation()
                       }}
                       onChange={(e) => {
-                        valueFromUserRef.current = true; // real DOM edit, not a parent-driven draft restore
-                        const val = e.target.value;
-                        onChange(val);
-                        setSlashMenuOpen(
-                          typedCommandMenus && val.startsWith("/"),
-                        );
+                        valueFromUserRef.current = true // real DOM edit, not a parent-driven draft restore
+                        const val = e.target.value
+                        onChange(val)
+                        setSlashMenuOpen(typedCommandMenus && val.startsWith('/'))
                         // Anchor @/$ detection to the token being edited AT THE CARET, not the
                         // end of the whole input. `before` ends at the caret, so a match means
                         // "the token ends where my cursor is" — which makes both pickers fire
                         // mid-sentence and when trailing text/newlines follow the token.
                         // Matchers live in composerTokens.ts (unit-tested there).
-                        const before = val.slice(
-                          0,
-                          e.target.selectionStart ?? val.length,
-                        );
-                        const fileQ = onFileSelect
-                          ? matchFileToken(before)
-                          : null;
+                        const before = val.slice(0, e.target.selectionStart ?? val.length)
+                        const fileQ = onFileSelect ? matchFileToken(before) : null
                         if (fileQ !== null) {
-                          setFilePickerOpen(true);
-                          setFileQuery(fileQ);
+                          setFilePickerOpen(true)
+                          setFileQuery(fileQ)
                         } else {
-                          setFilePickerOpen(false);
-                          setFileQuery("");
+                          setFilePickerOpen(false)
+                          setFileQuery('')
                         }
                         // $ and @ are mutually exclusive (a token starts with one sigil); @ wins.
-                        const skillQ =
-                          fileQ === null ? matchSkillToken(before) : null;
+                        const skillQ = fileQ === null ? matchSkillToken(before) : null
                         if (typedCommandMenus && skillQ !== null) {
-                          setSkillPickerOpen(true);
-                          setSkillQuery(skillQ);
+                          setSkillPickerOpen(true)
+                          setSkillQuery(skillQ)
                         } else {
-                          setSkillPickerOpen(false);
-                          setSkillQuery("");
+                          setSkillPickerOpen(false)
+                          setSkillQuery('')
                         }
-                        recordCaret();
+                        recordCaret()
                       }}
                       onKeyDown={handleKeyDown}
                       {...ime.bindComposition<HTMLTextAreaElement>({
@@ -5136,8 +4889,7 @@ function ChatInput({
                         // in the binding itself, so these handlers only carry what is local here.
                         onFocus: prefetchSkills,
                         onBlur: () => {
-                          if (hoverRef.current)
-                            hoverRef.current.handleMouseLeave();
+                          if (hoverRef.current) hoverRef.current.handleMouseLeave()
                         },
                       })}
                       onPaste={handlePaste}
@@ -5149,16 +4901,14 @@ function ChatInput({
                       onInput={handleInput}
                       onScroll={(e) => {
                         if (mirrorRef.current)
-                          mirrorRef.current.scrollTop =
-                            e.currentTarget.scrollTop;
+                          mirrorRef.current.scrollTop = e.currentTarget.scrollTop
                       }}
                       onMouseMove={(e) => {
                         if (pasteBlocks.length && hoverRef.current)
-                          hoverRef.current.handleMouseMove(e);
+                          hoverRef.current.handleMouseMove(e)
                       }}
                       onMouseLeave={() => {
-                        if (hoverRef.current)
-                          hoverRef.current.handleMouseLeave();
+                        if (hoverRef.current) hoverRef.current.handleMouseLeave()
                       }}
                     />
                     {pasteBlocks.length > 0 && (
@@ -5181,38 +4931,44 @@ function ChatInput({
             a scroll, and the two -webkit rules stop the long-press callout.
             `flex-1` mirrors the textarea so a manually-resized composer does not
             fight the persisted height. */}
-        {voiceHoldMode && (
-          <div className={`flex px-2.5 pt-2 pb-0.5 ${manualHeight !== null ? 'flex-1 min-h-0' : ''}`}>
-            <Btn
-              type="button"
-              ref={setHoldTarget}
-              data-testid="hold-to-talk"
-              style={{ touchAction: 'none', WebkitUserSelect: 'none', WebkitTouchCallout: 'none' }}
-              // `flex-1` inside a flex row, NOT `flex` on its own: a <button> sizes
-              // to fit-content even as a block-level flex container (UA form-control
-              // sizing), so a bare display swap leaves a small pill where the whole
-              // point is a target a thumb can hit without aiming.
-              // `primary` while holding, not just accent classes: Btn's default
-              // variant carries `hover:bg-bg-hover`, and a finger (or a mouse) on
-              // the bar IS a hover, so the accent fill was overridden the moment
-              // it mattered and a live capture read as a switched-off button
-              // (UX review, light theme). The primary variant's hover stays accent.
-              primary={touchPtt.bar === 'holding'}
-              className={`flex-1 min-h-[44px] justify-center rounded-xl font-semibold select-none ${
-                touchPtt.bar === 'armed-cancel'
-                  ? 'border-dashed border-danger bg-danger-subtle text-danger'
-                  : touchPtt.bar === 'holding'
-                    ? ''
-                    : 'border-border-strong bg-card text-text-strong'
-              }`}
-              disabled={disabled || micBlocked || optimizing || voiceSettling}
-              aria-label={holdBarLabel}
-            >
-              <Mic size={15} className="shrink-0" />
-              {holdBarLabel}
-            </Btn>
-          </div>
-        )}
+              {voiceHoldMode && (
+                <div
+                  className={`flex px-2.5 pt-2 pb-0.5 ${manualHeight !== null ? 'flex-1 min-h-0' : ''}`}
+                >
+                  <Btn
+                    type="button"
+                    ref={setHoldTarget}
+                    data-testid="hold-to-talk"
+                    style={{
+                      touchAction: 'none',
+                      WebkitUserSelect: 'none',
+                      WebkitTouchCallout: 'none',
+                    }}
+                    // `flex-1` inside a flex row, NOT `flex` on its own: a <button> sizes
+                    // to fit-content even as a block-level flex container (UA form-control
+                    // sizing), so a bare display swap leaves a small pill where the whole
+                    // point is a target a thumb can hit without aiming.
+                    // `primary` while holding, not just accent classes: Btn's default
+                    // variant carries `hover:bg-bg-hover`, and a finger (or a mouse) on
+                    // the bar IS a hover, so the accent fill was overridden the moment
+                    // it mattered and a live capture read as a switched-off button
+                    // (UX review, light theme). The primary variant's hover stays accent.
+                    primary={touchPtt.bar === 'holding'}
+                    className={`flex-1 min-h-[44px] justify-center rounded-xl font-semibold select-none ${
+                      touchPtt.bar === 'armed-cancel'
+                        ? 'border-dashed border-danger bg-danger-subtle text-danger'
+                        : touchPtt.bar === 'holding'
+                          ? ''
+                          : 'border-border-strong bg-card text-text-strong'
+                    }`}
+                    disabled={disabled || micBlocked || optimizing || voiceSettling}
+                    aria-label={holdBarLabel}
+                  >
+                    <Mic size={15} className="shrink-0" />
+                    {holdBarLabel}
+                  </Btn>
+                </div>
+              )}
 
               {/* Bottom icon row */}
               <div className="flex items-center justify-between px-2.5 pb-2 pt-0.5">
@@ -5224,11 +4980,9 @@ function ChatInput({
                         <label
                           htmlFor={uploading ? undefined : fileInputId}
                           aria-disabled={uploading || undefined}
-                          className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all bg-transparent ${uploading ? "opacity-30 cursor-default" : "cursor-pointer text-muted hover:text-text hover:bg-bg-hover"}`}
-                          aria-label={i18nT(
-                            "components.chatInput.attach_files",
-                          )}
-                          title={i18nT("components.chatInput.attach_files")}
+                          className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all bg-transparent ${uploading ? 'opacity-30 cursor-default' : 'cursor-pointer text-muted hover:text-text hover:bg-bg-hover'}`}
+                          aria-label={i18nT('components.chatInput.attach_files')}
+                          title={i18nT('components.chatInput.attach_files')}
                         >
                           {uploading ? (
                             <Loader2 size={18} className="animate-spin" />
@@ -5239,24 +4993,20 @@ function ChatInput({
                       ) : (
                         <button
                           ref={plusBtnRef}
-                          className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? "text-text bg-bg-hover" : "text-muted hover:text-text hover:bg-bg-hover"}`}
+                          className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? 'text-text bg-bg-hover' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
                           onClick={togglePlus}
                           disabled={uploading}
                           aria-haspopup="menu"
                           aria-expanded={plusOpen}
-                          aria-label={i18nT(
-                            "components.chatInput.add_files_options",
-                          )}
-                          title={i18nT(
-                            "components.chatInput.add_files_options",
-                          )}
+                          aria-label={i18nT('components.chatInput.add_files_options')}
+                          title={i18nT('components.chatInput.add_files_options')}
                         >
                           {uploading ? (
                             <Loader2 size={18} className="animate-spin" />
                           ) : (
                             <Plus
                               size={18}
-                              className={`transition-transform ${plusOpen ? "rotate-45" : ""}`}
+                              className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`}
                             />
                           )}
                         </button>
@@ -5271,10 +5021,7 @@ function ChatInput({
                             style={{
                               left: Math.max(
                                 8,
-                                Math.min(
-                                  plusRect.left,
-                                  window.innerWidth - 260 - 8,
-                                ),
+                                Math.min(plusRect.left, window.innerWidth - 260 - 8),
                               ),
                               bottom: window.innerHeight - plusRect.top + 8,
                             }}
@@ -5287,26 +5034,24 @@ function ChatInput({
                               >
                                 <FileText size={18} className="text-muted" />
                                 <span className="text-[12px] font-medium text-text">
-                                  {i18nT("components.chatInput.upload_file")}
+                                  {i18nT('components.chatInput.upload_file')}
                                 </span>
                               </button>
-                              {(isScreenSnipSupported() || isMac) &&
-                                !isMobile &&
-                                onScreenshot && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setPlusOpen(false);
-                                      onScreenshot();
-                                    }}
-                                    className="flex-1 flex flex-col items-center gap-1.5 px-2 py-3 rounded-lg border border-border bg-transparent hover:bg-bg-hover hover:border-border-strong transition-all cursor-pointer"
-                                  >
-                                    <Crop size={18} className="text-muted" />
-                                    <span className="text-[12px] font-medium text-text">
-                                      {i18nT("components.chatInput.screenshot")}
-                                    </span>
-                                  </button>
-                                )}
+                              {(isScreenSnipSupported() || isMac) && !isMobile && onScreenshot && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setPlusOpen(false)
+                                    onScreenshot()
+                                  }}
+                                  className="flex-1 flex flex-col items-center gap-1.5 px-2 py-3 rounded-lg border border-border bg-transparent hover:bg-bg-hover hover:border-border-strong transition-all cursor-pointer"
+                                >
+                                  <Crop size={18} className="text-muted" />
+                                  <span className="text-[12px] font-medium text-text">
+                                    {i18nT('components.chatInput.screenshot')}
+                                  </span>
+                                </button>
+                              )}
                             </div>
                             {/* Sketch is a full-width menu ROW, not a third tile: the
                         tile group above is capped at two peer actions by the
@@ -5318,10 +5063,10 @@ function ChatInput({
                               <button
                                 type="button"
                                 onClick={() => {
-                                  setPlusOpen(false);
-                                  setSketchOpen(true);
+                                  setPlusOpen(false)
+                                  setSketchOpen(true)
                                 }}
-                                title={i18nT("components.chatInput.sketch")}
+                                title={i18nT('components.chatInput.sketch')}
                                 className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                               >
                                 <PenLine
@@ -5330,10 +5075,10 @@ function ChatInput({
                                 />
                                 <div className="min-w-0">
                                   <div className="text-[12px] font-medium text-text">
-                                    {i18nT("components.chatInput.sketch")}
+                                    {i18nT('components.chatInput.sketch')}
                                   </div>
                                   <div className="text-[11px] text-muted leading-snug">
-                                    {i18nT("components.chatInput.sketch_desc")}
+                                    {i18nT('components.chatInput.sketch_desc')}
                                   </div>
                                 </div>
                               </button>
@@ -5363,10 +5108,8 @@ function ChatInput({
                               {typedCommandMenus && (
                                 <button
                                   type="button"
-                                  onClick={() => openTrigger("/")}
-                                  title={i18nT(
-                                    "components.chatInput.slash_commands",
-                                  )}
+                                  onClick={() => openTrigger('/')}
+                                  title={i18nT('components.chatInput.slash_commands')}
                                   className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                                 >
                                   <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">
@@ -5374,11 +5117,11 @@ function ChatInput({
                                   </span>
                                   <div className="min-w-0">
                                     <div className="text-[12px] font-medium text-text">
-                                      {i18nT("components.chatInput.command")}
+                                      {i18nT('components.chatInput.command')}
                                     </div>
                                     <div className="text-[11px] text-muted leading-snug">
                                       {i18nT(
-                                        "components.chatInput.quick_actions_like_clearing_the_chat_or_checking",
+                                        'components.chatInput.quick_actions_like_clearing_the_chat_or_checking',
                                       )}
                                     </div>
                                   </div>
@@ -5387,10 +5130,8 @@ function ChatInput({
                               {onFileSelect && (
                                 <button
                                   type="button"
-                                  onClick={() => openTrigger("@")}
-                                  title={i18nT(
-                                    "components.chatInput.reference_a_file",
-                                  )}
+                                  onClick={() => openTrigger('@')}
+                                  title={i18nT('components.chatInput.reference_a_file')}
                                   className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                                 >
                                   <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">
@@ -5398,11 +5139,11 @@ function ChatInput({
                                   </span>
                                   <div className="min-w-0">
                                     <div className="text-[12px] font-medium text-text">
-                                      {i18nT("components.chatInput.file")}
+                                      {i18nT('components.chatInput.file')}
                                     </div>
                                     <div className="text-[11px] text-muted leading-snug">
                                       {i18nT(
-                                        "components.chatInput.let_the_agent_read_one_of_your_files",
+                                        'components.chatInput.let_the_agent_read_one_of_your_files',
                                       )}
                                     </div>
                                   </div>
@@ -5411,10 +5152,8 @@ function ChatInput({
                               {typedCommandMenus && (
                                 <button
                                   type="button"
-                                  onClick={() => openTrigger("$")}
-                                  title={i18nT(
-                                    "components.chatInput.use_a_skill",
-                                  )}
+                                  onClick={() => openTrigger('$')}
+                                  title={i18nT('components.chatInput.use_a_skill')}
                                   className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
                                 >
                                   <span className="w-4 text-center text-[14px] font-mono leading-none text-muted shrink-0">
@@ -5422,11 +5161,11 @@ function ChatInput({
                                   </span>
                                   <div className="min-w-0">
                                     <div className="text-[12px] font-medium text-text">
-                                      {i18nT("components.chatInput.skill")}
+                                      {i18nT('components.chatInput.skill')}
                                     </div>
                                     <div className="text-[11px] text-muted leading-snug">
                                       {i18nT(
-                                        "components.chatInput.apply_a_ready_made_set_of_instructions",
+                                        'components.chatInput.apply_a_ready_made_set_of_instructions',
                                       )}
                                     </div>
                                   </div>
@@ -5460,8 +5199,8 @@ function ChatInput({
                       onClick={() => setSketchOpen(true)}
                       disabled={uploading}
                       aria-haspopup="dialog"
-                      aria-label={i18nT("components.chatInput.sketch")}
-                      title={i18nT("components.chatInput.sketch")}
+                      aria-label={i18nT('components.chatInput.sketch')}
+                      title={i18nT('components.chatInput.sketch')}
                     >
                       <PenLine size={17} />
                     </button>
@@ -5490,19 +5229,13 @@ function ChatInput({
                           type="button"
                           data-testid="composer-more-trigger"
                           className="w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover data-[state=open]:text-text data-[state=open]:bg-bg-hover"
-                          aria-label={i18nT(
-                            "components.chatInput.more_actions",
-                          )}
-                          title={i18nT("components.chatInput.more_actions")}
+                          aria-label={i18nT('components.chatInput.more_actions')}
+                          title={i18nT('components.chatInput.more_actions')}
                         >
                           <MoreHorizontal size={17} />
                         </button>
                       </DropdownMenuTrigger>
-                      <DropdownMenuContent
-                        side="top"
-                        align="start"
-                        className="w-[260px] p-2"
-                      >
+                      <DropdownMenuContent side="top" align="start" className="w-[260px] p-2">
                         {onUploadFiles && (
                           /* `disabled={uploading}` restores a guard the pencil carried and
                        this row lost when Sketch moved in here. Sketch attaches
@@ -5526,29 +5259,24 @@ function ChatInput({
                          blur/focus recursion, which is how the test suite surfaced
                          it here. Past the close commit there is only one trap. */
                             onSelect={() => {
-                              setTimeout(() => setSketchOpen(true), 0);
+                              setTimeout(() => setSketchOpen(true), 0)
                             }}
-                            title={i18nT("components.chatInput.sketch")}
+                            title={i18nT('components.chatInput.sketch')}
                             className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg cursor-pointer text-left"
                           >
-                            <PenLine
-                              size={14}
-                              className="w-4 shrink-0 text-muted lucide-inline"
-                            />
+                            <PenLine size={14} className="w-4 shrink-0 text-muted lucide-inline" />
                             <div className="min-w-0">
                               <div className="text-[12px] font-medium text-text">
-                                {i18nT("components.chatInput.sketch")}
+                                {i18nT('components.chatInput.sketch')}
                               </div>
                               <div className="text-[11px] text-muted leading-snug">
-                                {i18nT("components.chatInput.sketch_desc")}
+                                {i18nT('components.chatInput.sketch_desc')}
                               </div>
                             </div>
                           </DropdownMenuItem>
                         )}
                         {collapseMenuRow && (
-                          <DropdownMenuItem asChild>
-                            {collapseMenuRow}
-                          </DropdownMenuItem>
+                          <DropdownMenuItem asChild>{collapseMenuRow}</DropdownMenuItem>
                         )}
                       </DropdownMenuContent>
                     </DropdownMenu>
@@ -5567,7 +5295,7 @@ function ChatInput({
                       {onAutomationClick && (
                         <Suspense fallback={null}>
                           <SessionAutomationPopover
-                            slotKey={slotId || ""}
+                            slotKey={slotId || ''}
                             automation={automation || null}
                             open={automationOpen || false}
                             onOpenChange={(v) => onAutomationClick(v)}
@@ -5585,7 +5313,7 @@ function ChatInput({
                       {!isMobile && approvalMode && (
                         <ApprovalModePicker
                           mode={approvalMode}
-                          slotKey={activeSlot || ""}
+                          slotKey={activeSlot || ''}
                           openSignal={approvalPickerSignal}
                           nudge={approvalNudgeActive}
                           onNudgeDismiss={dismissApprovalNudge}
@@ -5603,105 +5331,142 @@ function ChatInput({
                   win the tree-order tiebreak against the optimizing dim
                   overlay (also z-10, earlier in the tree), punching an
                   undimmed wedge through it. */}
-              {controlRowEdges.left && (
-                <div aria-hidden="true" data-testid="control-row-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 bg-gradient-to-r from-bg-elevated to-transparent" />
-              )}
-              {controlRowEdges.right && (
-                <div aria-hidden="true" data-testid="control-row-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 bg-gradient-to-l from-bg-elevated to-transparent" />
-              )}
-            </div>
-            {isMobile && approvalMode && (
-              <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
-            )}
-          </div>
-          <div className="flex items-center gap-1 shrink-0">
-            {onHandsFreeToggle && handsFreeAvailable && (
-              <button
-                type="button"
-                className={`w-8 h-8 [@media(hover:none)]:w-10 [@media(hover:none)]:h-10 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none text-[18px] ${handsFreePhase ? "bg-accent text-accent-fg" : handsFreeOn ? "bg-accent-subtle text-accent" : "text-muted hover:text-text hover:bg-bg-hover bg-transparent"} disabled:opacity-30`}
-                onClick={onHandsFreeToggle}
-                disabled={disabled || optimizing}
-                aria-pressed={handsFreeOn}
-                aria-label={i18nT("components.chatInput.handsfree_voice")}
-                title={
-                  handsFreeOn
-                    ? i18nT("components.chatInput.handsfree_on")
-                    : i18nT("components.chatInput.handsfree_off")
-                }
-                data-testid="handsfree-toggle"
-              >
-                <Headset className="lucide-inline" />
-              </button>
-            )}
-            {onVoiceToggle && (
-              <button
-                type="button"
-                // In hold mode the switch carries a visible label: its `title` is
-                // hover-only and hold mode is a touch surface, so a bare icon read
-                // as "no idea what it toggles".
-                className={`${voiceHoldMode ? 'px-2.5 gap-1.5 text-[12px] font-medium' : 'w-8'} h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none ${
-                  // The recording tint belongs to the RECORD button. As a mode
-                  // switch (hold mode) this button hands the keyboard back; a red
-                  // pulse on it read as an alarm on an unexplained control.
-                  voiceRecording && !micIsModeSwitch ? 'bg-danger-subtle text-danger animate-pulse' : (!micIsModeSwitch && transcribeInFlight) ? 'bg-accent-subtle text-accent' : voiceHoldMode ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'
-                } disabled:opacity-30`}
-                // The mic does whichever voice thing is AVAILABLE right now, which is
-                // what keeps it from becoming a dead control. On an empty composer
-                // that is the mode switch. With a draft, hold mode is suspended
-                // anyway (a hold bar cannot show text you need to read and edit),
-                // so the mic reverts to the job it had before this feature: tap to
-                // dictate, transcript spliced in at the caret.
-                //
-                // Without that second branch the switch was disabled on every draft,
-                // on every coarse-pointer device — including for someone who never
-                // opened hold mode — and since the mic is the only voice entry point
-                // on touch, dictating onto existing text became impossible. Speak,
-                // glance, speak again is how a long message actually gets composed
-                // on a phone, so losing it is not a cost of the new mode; it would
-                // have been an unconditional regression in the old one.
-                onClick={micIsModeSwitch ? toggleVoiceMode : onVoiceToggle}
-                // Prewarm only when the press will actually record. On the switch it
-                // would acquire the mic for a press that changes layout, and in hold
-                // mode the gesture's own pointerdown opens capture earlier anyway.
-                onPointerDown={micIsModeSwitch ? undefined : onVoicePrewarm}
-                /* A foreign transcription blocks STARTING a capture, so it gates the
+                    {controlRowEdges.left && (
+                      <div
+                        aria-hidden="true"
+                        data-testid="control-row-cue-left"
+                        className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 bg-gradient-to-r from-bg-elevated to-transparent"
+                      />
+                    )}
+                    {controlRowEdges.right && (
+                      <div
+                        aria-hidden="true"
+                        data-testid="control-row-cue-right"
+                        className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 bg-gradient-to-l from-bg-elevated to-transparent"
+                      />
+                    )}
+                  </div>
+                  {isMobile && approvalMode && (
+                    <ApprovalModePicker
+                      mode={approvalMode}
+                      slotKey={activeSlot || ''}
+                      compact
+                      openSignal={approvalPickerSignal}
+                      nudge={approvalNudgeActive}
+                      onNudgeDismiss={dismissApprovalNudge}
+                      onNudgeHide={hideApprovalNudge}
+                    />
+                  )}
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  {onHandsFreeToggle && handsFreeAvailable && (
+                    <button
+                      type="button"
+                      className={`w-8 h-8 [@media(hover:none)]:w-10 [@media(hover:none)]:h-10 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none text-[18px] ${handsFreePhase ? 'bg-accent text-accent-fg' : handsFreeOn ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'} disabled:opacity-30`}
+                      onClick={onHandsFreeToggle}
+                      disabled={disabled || optimizing}
+                      aria-pressed={handsFreeOn}
+                      aria-label={i18nT('components.chatInput.handsfree_voice')}
+                      title={
+                        handsFreeOn
+                          ? i18nT('components.chatInput.handsfree_on')
+                          : i18nT('components.chatInput.handsfree_off')
+                      }
+                      data-testid="handsfree-toggle"
+                    >
+                      <Headset className="lucide-inline" />
+                    </button>
+                  )}
+                  {onVoiceToggle && (
+                    <button
+                      type="button"
+                      // In hold mode the switch carries a visible label: its `title` is
+                      // hover-only and hold mode is a touch surface, so a bare icon read
+                      // as "no idea what it toggles".
+                      className={`${voiceHoldMode ? 'px-2.5 gap-1.5 text-[12px] font-medium' : 'w-8'} h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none ${
+                        // The recording tint belongs to the RECORD button. As a mode
+                        // switch (hold mode) this button hands the keyboard back; a red
+                        // pulse on it read as an alarm on an unexplained control.
+                        voiceRecording && !micIsModeSwitch
+                          ? 'bg-danger-subtle text-danger animate-pulse'
+                          : !micIsModeSwitch && transcribeInFlight
+                            ? 'bg-accent-subtle text-accent'
+                            : voiceHoldMode
+                              ? 'bg-accent-subtle text-accent'
+                              : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'
+                      } disabled:opacity-30`}
+                      // The mic does whichever voice thing is AVAILABLE right now, which is
+                      // what keeps it from becoming a dead control. On an empty composer
+                      // that is the mode switch. With a draft, hold mode is suspended
+                      // anyway (a hold bar cannot show text you need to read and edit),
+                      // so the mic reverts to the job it had before this feature: tap to
+                      // dictate, transcript spliced in at the caret.
+                      //
+                      // Without that second branch the switch was disabled on every draft,
+                      // on every coarse-pointer device — including for someone who never
+                      // opened hold mode — and since the mic is the only voice entry point
+                      // on touch, dictating onto existing text became impossible. Speak,
+                      // glance, speak again is how a long message actually gets composed
+                      // on a phone, so losing it is not a cost of the new mode; it would
+                      // have been an unconditional regression in the old one.
+                      onClick={micIsModeSwitch ? toggleVoiceMode : onVoiceToggle}
+                      // Prewarm only when the press will actually record. On the switch it
+                      // would acquire the mic for a press that changes layout, and in hold
+                      // mode the gesture's own pointerdown opens capture earlier anyway.
+                      onPointerDown={micIsModeSwitch ? undefined : onVoicePrewarm}
+                      /* A foreign transcription blocks STARTING a capture, so it gates the
                    mic only while the mic is the record button. As a MODE SWITCH the
                    click starts nothing — it hands the keyboard back — and disabling
                    it there strands the user in voice mode, unable to type or send
                    until unrelated work in another session finishes. */
-                /* Enabled mid-capture too. A press the hold bar owns is discarded
+                      /* Enabled mid-capture too. A press the hold bar owns is discarded
                    when its target unmounts (`useTouchPushToTalk.abandon`), so the
                    switch cancels the capture and hands the keyboard back — the
                    greyed control beside an identical enabled one in a sibling pane
                    read as "no idea why it's off" (UX review on #9787). */
-                /* The mic is the hands-free loop's stop (and barge-in) control, so it
+                      /* The mic is the hands-free loop's stop (and barge-in) control, so it
                    stays tappable while the loop is transcribing. */
-                disabled={disabled || optimizing || (!handsFreePhase && (micIsModeSwitch ? false : micBlocked))}
-                aria-label={micLabel}
-                title={micLabel}
-              >
-                {!handsFreePhase && !micIsModeSwitch && transcribeInFlight ? <Loader2 size={18} className="animate-spin" /> : !micIsModeSwitch && micHeldElsewhere ? <MicOff size={18} /> : voiceHoldMode ? <><Keyboard size={18} /><span className="leading-none">{i18nT('components.chatInput.type_label')}</span></> : <Mic size={18} />}
-              </button>
-            )}
-            {/* The busy branch is reachable with EITHER a stop affordance or a
+                      disabled={
+                        disabled ||
+                        optimizing ||
+                        (!handsFreePhase && (micIsModeSwitch ? false : micBlocked))
+                      }
+                      aria-label={micLabel}
+                      title={micLabel}
+                    >
+                      {!handsFreePhase && !micIsModeSwitch && transcribeInFlight ? (
+                        <Loader2 size={18} className="animate-spin" />
+                      ) : !micIsModeSwitch && micHeldElsewhere ? (
+                        <MicOff size={18} />
+                      ) : voiceHoldMode ? (
+                        <>
+                          <Keyboard size={18} />
+                          <span className="leading-none">
+                            {i18nT('components.chatInput.type_label')}
+                          </span>
+                        </>
+                      ) : (
+                        <Mic size={18} />
+                      )}
+                    </button>
+                  )}
+                  {/* The busy branch is reachable with EITHER a stop affordance or a
                 steer path: a host without onStop (the side panel — stopping the
                 main turn from there would be misdirected) still needs the
                 split steer/queue button while a turn runs. */}
-                  {(isRunning ||
-                    stopState === "soft_pending" ||
-                    stopState === "killing") &&
+                  {(isRunning || stopState === 'soft_pending' || stopState === 'killing') &&
                   (onStop || (canSteer && onSteer)) ? (
-                    stopState === "killing" ? (
+                    stopState === 'killing' ? (
                       killingEscaped ? (
                         <div className="flex items-center gap-1.5">
                           <button
                             className="w-8 h-8 rounded-lg bg-danger text-danger-fg border-none flex items-center justify-center cursor-pointer hover:bg-danger/80 transition-all"
                             onClick={onStop}
                             title={i18nT(
-                              "components.chatInput.force_reset_taking_longer_than_expected",
+                              'components.chatInput.force_reset_taking_longer_than_expected',
                             )}
                             aria-label={i18nT(
-                              "components.chatInput.force_reset_session_taking_longer_than_expected",
+                              'components.chatInput.force_reset_session_taking_longer_than_expected',
                             )}
                             data-testid="stop-button-escape-hatch"
                           >
@@ -5711,9 +5476,7 @@ function ChatInput({
                             className="text-xs text-muted whitespace-nowrap"
                             data-testid="stop-escape-hint"
                           >
-                            {i18nT(
-                              "components.chatInput.taking_longer_than_expected",
-                            )}
+                            {i18nT('components.chatInput.taking_longer_than_expected')}
                           </span>
                         </div>
                       ) : (
@@ -5722,16 +5485,14 @@ function ChatInput({
                           type="button"
                           className="w-8 h-8 rounded-lg bg-danger text-danger-fg border-none flex items-center justify-center cursor-not-allowed transition-all"
                           disabled
-                          title={i18nT("components.chatInput.killing")}
-                          aria-label={i18nT(
-                            "components.chatInput.killing_session",
-                          )}
+                          title={i18nT('components.chatInput.killing')}
+                          aria-label={i18nT('components.chatInput.killing_session')}
                           data-testid="stop-button-killing"
                         >
                           <Loader2 size={18} className="animate-spin" />
                         </button>
                       )
-                    ) : stopState === "soft_pending" ? (
+                    ) : stopState === 'soft_pending' ? (
                       <div className="flex items-center gap-1.5">
                         {/* Pulse floor 0.8 with a faint danger fill: at 0.6 on a
                       transparent background the light-theme button bottomed
@@ -5743,10 +5504,10 @@ function ChatInput({
                           className="w-8 h-8 rounded-lg bg-danger/10 border-none text-danger hover:bg-danger/20 flex items-center justify-center cursor-pointer transition-all"
                           onClick={onStop}
                           title={i18nT(
-                            "components.chatInput.force_kill_discards_in_progress_work_and_queued",
+                            'components.chatInput.force_kill_discards_in_progress_work_and_queued',
                           )}
                           aria-label={i18nT(
-                            "components.chatInput.force_kill_session_discards_in_progress_work_and",
+                            'components.chatInput.force_kill_session_discards_in_progress_work_and',
                           )}
                           animate={{ opacity: [0.8, 1, 0.8] }}
                           transition={{ duration: 1.2, repeat: Infinity }}
@@ -5758,9 +5519,7 @@ function ChatInput({
                           className="text-xs text-muted whitespace-nowrap"
                           data-testid="stop-force-hint"
                         >
-                          {i18nT(
-                            "components.chatInput.click_again_to_force_stop",
-                          )}
+                          {i18nT('components.chatInput.click_again_to_force_stop')}
                         </span>
                       </div>
                     ) : isQueued ? (
@@ -5769,8 +5528,8 @@ function ChatInput({
                         type="button"
                         className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 transition-all"
                         onClick={onStop}
-                        title={i18nT("components.chatInput.stopping")}
-                        aria-label={i18nT("components.chatInput.stopping_2")}
+                        title={i18nT('components.chatInput.stopping')}
+                        aria-label={i18nT('components.chatInput.stopping_2')}
                       >
                         <Loader2 size={18} className="animate-spin" />
                       </button>
@@ -5793,13 +5552,9 @@ function ChatInput({
                             className="primary w-8 h-8 rounded-full bg-accent text-accent-fg border-none flex items-center justify-center cursor-pointer hover:bg-accent-hover disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                             onClick={fireComposer}
                             disabled={disabled || !connected}
-                            aria-label={i18nT("components.chatInput.send")}
+                            aria-label={i18nT('components.chatInput.send')}
                             data-testid="steer-only-send"
-                            {...offlineProps(
-                              connected,
-                              "send",
-                              i18nT("components.chatInput.send"),
-                            )}
+                            {...offlineProps(connected, 'send', i18nT('components.chatInput.send'))}
                           >
                             <ArrowUp size={18} />
                           </button>
@@ -5809,7 +5564,7 @@ function ChatInput({
                             onModeChange={setBusySendMode}
                             onFire={fireComposer}
                             disabled={disabled}
-                            altChordAvailable={sendOnEnter === "enter"}
+                            altChordAvailable={sendOnEnter === 'enter'}
                           />
                         )
                       ) : (
@@ -5819,10 +5574,8 @@ function ChatInput({
                           className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                           onClick={fireComposer}
                           disabled={disabled}
-                          title={i18nT("components.chatInput.queue_message")}
-                          aria-label={i18nT(
-                            "components.chatInput.queue_message",
-                          )}
+                          title={i18nT('components.chatInput.queue_message')}
+                          aria-label={i18nT('components.chatInput.queue_message')}
                         >
                           <ArrowUpFromLine size={18} />
                         </button>
@@ -5833,10 +5586,8 @@ function ChatInput({
                         type="button"
                         className="w-8 h-8 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all"
                         onClick={onStop}
-                        title={i18nT("components.chatInput.stop_generation")}
-                        aria-label={i18nT(
-                          "components.chatInput.stop_generation",
-                        )}
+                        title={i18nT('components.chatInput.stop_generation')}
+                        aria-label={i18nT('components.chatInput.stop_generation')}
                         data-testid="stop-button-armed"
                       >
                         <Square size={18} fill="currentColor" />
@@ -5847,7 +5598,7 @@ function ChatInput({
                       <button
                         className="primary w-8 h-8 rounded-full bg-accent text-accent-fg border-none flex items-center justify-center cursor-not-allowed disabled:opacity-30 transition-all"
                         disabled
-                        aria-label={i18nT("components.chatInput.send")}
+                        aria-label={i18nT('components.chatInput.send')}
                         data-testid="steer-only-send"
                       >
                         <ArrowUp size={18} />
@@ -5861,18 +5612,18 @@ function ChatInput({
                         onModeChange={setBusySendMode}
                         onFire={fireComposer}
                         disabled
-                        altChordAvailable={sendOnEnter === "enter"}
+                        altChordAvailable={sendOnEnter === 'enter'}
                       />
                     )
                   ) : (
                     <>
                       {promptOptimizer && (
                         <button
-                          className={`w-8 h-8 rounded-lg border-none flex items-center justify-center cursor-pointer transition-all disabled:cursor-not-allowed ${optimizing ? "bg-accent/20 text-accent animate-pulse" : "bg-transparent text-muted hover:text-accent hover:bg-accent/10 disabled:opacity-40 disabled:hover:text-muted disabled:hover:bg-transparent"}`}
+                          className={`w-8 h-8 rounded-lg border-none flex items-center justify-center cursor-pointer transition-all disabled:cursor-not-allowed ${optimizing ? 'bg-accent/20 text-accent animate-pulse' : 'bg-transparent text-muted hover:text-accent hover:bg-accent/10 disabled:opacity-40 disabled:hover:text-muted disabled:hover:bg-transparent'}`}
                           onClick={(e) => {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            optimizePrompt();
+                            e.stopPropagation()
+                            e.preventDefault()
+                            optimizePrompt()
                           }}
                           // A single mutation backs this instance, so only one optimize can
                           // run at a time. Disable on the RAW pending flag (not the
@@ -5881,30 +5632,22 @@ function ChatInput({
                           // still in flight — matching the re-entrancy guard in
                           // optimizePrompt(). optimizing ⊂ optimizePending, so this stays
                           // disabled on the originating session too.
-                          disabled={
-                            !value.trim() || optimizePending || !connected
-                          }
+                          disabled={!value.trim() || optimizePending || !connected}
                           aria-label={
                             optimizePending && !optimizing
                               ? i18nT(
-                                  "components.chatInput.optimize_prompt_busy_optimizing_another_chat",
+                                  'components.chatInput.optimize_prompt_busy_optimizing_another_chat',
                                 )
-                              : i18nT("components.chatInput.optimize_prompt")
+                              : i18nT('components.chatInput.optimize_prompt')
                           }
                           title={
                             optimizePending && !optimizing
-                              ? i18nT(
-                                  "components.chatInput.optimizing_another_chat_please_wait",
-                                )
-                              : i18nT(
-                                  "components.chatInput.optimize_prompt_2",
-                                  {
-                                    shortcut:
-                                      platformShortcut("Cmd+Shift+Enter"),
-                                  },
-                                )
+                              ? i18nT('components.chatInput.optimizing_another_chat_please_wait')
+                              : i18nT('components.chatInput.optimize_prompt_2', {
+                                  shortcut: platformShortcut('Cmd+Shift+Enter'),
+                                })
                           }
-                          {...offlineProps(connected, "optimize", "Optimize")}
+                          {...offlineProps(connected, 'optimize', 'Optimize')}
                         >
                           {optimizing ? (
                             <Loader2 size={16} className="animate-spin" />
@@ -5949,23 +5692,17 @@ function ChatInput({
                           type="button"
                           className="primary h-8 px-3 rounded-full bg-accent text-accent-fg border-none inline-flex items-center gap-1.5 text-[12px] font-medium leading-none cursor-pointer hover:bg-accent-hover disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                           onClick={onContinue}
-                          disabled={
-                            continuing || disabled || optimizing || !connected
-                          }
+                          disabled={continuing || disabled || optimizing || !connected}
                           title={continueLabel}
                           data-testid="composer-continue"
-                          {...offlineProps(
-                            connected,
-                            "continue",
-                            continueLabel,
-                          )}
+                          {...offlineProps(connected, 'continue', continueLabel)}
                         >
                           {continuing ? (
                             <Loader2 size={14} className="animate-spin" />
                           ) : (
                             <RotateCw size={14} />
                           )}
-                          {i18nT("components.chatInput.resume")}
+                          {i18nT('components.chatInput.resume')}
                         </button>
                       ) : (
                         <button
@@ -5974,15 +5711,13 @@ function ChatInput({
                           className="primary w-8 h-8 rounded-full bg-accent text-accent-fg border-none flex items-center justify-center cursor-pointer hover:bg-accent-hover disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                           onClick={fireComposer}
                           disabled={
-                            (!value.trim() &&
-                              !pendingFiles.length &&
-                              !hasSessionRefs) ||
+                            (!value.trim() && !pendingFiles.length && !hasSessionRefs) ||
                             disabled ||
                             optimizing ||
                             !connected
                           }
-                          aria-label={i18nT("components.chatInput.send")}
-                          {...offlineProps(connected, "send", "Send")}
+                          aria-label={i18nT('components.chatInput.send')}
+                          {...offlineProps(connected, 'send', 'Send')}
                         >
                           <ArrowUp size={18} />
                         </button>
@@ -6023,8 +5758,8 @@ function ChatInput({
           data-testid="composer-collapsed-bar"
           onClick={expandComposer}
           aria-expanded={false}
-          aria-label={i18nT("components.chatInput.expand_composer")}
-          title={i18nT("components.chatInput.expand_composer")}
+          aria-label={i18nT('components.chatInput.expand_composer')}
+          title={i18nT('components.chatInput.expand_composer')}
           className="w-full flex items-center gap-2 px-3.5 py-2 rounded-2xl border border-border bg-bg-elevated text-muted hover:text-text transition-colors cursor-pointer text-left"
         >
           <ChevronsUpDown size={16} className="shrink-0" />
@@ -6043,7 +5778,7 @@ function ChatInput({
               Both spans are aria-hidden: the button's explicit aria-label already
               names it, and exposing this as content would only duplicate it. */}
           <span aria-hidden="true" className="shrink-0 text-[13px] font-body">
-            {i18nT("components.chatInput.expand_composer")}
+            {i18nT('components.chatInput.expand_composer')}
           </span>
           {collapsedDraftLine && (
             <span
@@ -6091,20 +5826,18 @@ function ChatInput({
                the label is what identifies the control, so it has to survive
                whatever the app reports about it. */
                   const stateWord =
-                    sc.state === "warn"
-                      ? i18nT(
-                          "components.chatInput.session_control_needs_attention",
-                        )
-                      : sc.state === "ok"
-                        ? i18nT("components.chatInput.session_control_ready")
-                        : "";
-                  const detail = sc.statusTooltip || stateWord;
+                    sc.state === 'warn'
+                      ? i18nT('components.chatInput.session_control_needs_attention')
+                      : sc.state === 'ok'
+                        ? i18nT('components.chatInput.session_control_ready')
+                        : ''
+                  const detail = sc.statusTooltip || stateWord
                   const chipName = detail
-                    ? i18nT("components.chatInput.session_control_chip_label", {
+                    ? i18nT('components.chatInput.session_control_chip_label', {
                         label: sc.label,
                         detail,
                       })
-                    : sc.label;
+                    : sc.label
                   return (
                     <button
                       key={sc.key}
@@ -6115,18 +5848,15 @@ function ChatInput({
                         /* Open wins, so the chip you are pointing at always reads as
                    the active one; otherwise the app's own state colours it. */
                         sc.active
-                          ? "text-accent"
-                          : sc.state === "ok"
-                            ? "text-ok"
-                            : sc.state === "warn"
-                              ? "text-warn"
-                              : "text-muted hover:text-text"
+                          ? 'text-accent'
+                          : sc.state === 'ok'
+                            ? 'text-ok'
+                            : sc.state === 'warn'
+                              ? 'text-warn'
+                              : 'text-muted hover:text-text'
                       }`}
                       onClick={(e) =>
-                        onSessionControlClick?.(
-                          sc.key,
-                          e.currentTarget.getBoundingClientRect(),
-                        )
+                        onSessionControlClick?.(sc.key, e.currentTarget.getBoundingClientRect())
                       }
                       // Marks the chip as part of its own popover for dismissal
                       // purposes: mousedown fires before click, so without this the
@@ -6137,13 +5867,9 @@ function ChatInput({
                       aria-label={chipName}
                     >
                       <AppIcon icon={sc.icon} size={13} />
-                      {!shelfCompact && (
-                        <span className="truncate max-w-[140px]">
-                          {sc.label}
-                        </span>
-                      )}
+                      {!shelfCompact && <span className="truncate max-w-[140px]">{sc.label}</span>}
                     </button>
-                  );
+                  )
                 })}
               </div>
             )}
@@ -6153,10 +5879,8 @@ function ChatInput({
                pin `var(--mono)`, which Settings → Display → Font Family never
                writes, so it would make the shelf ignore the user's typeface. */
                 <button
-                  className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === "package" ? "text-[var(--aim)] hover:text-[var(--aim)]" : "text-muted hover:text-text disabled:hover:text-muted"}`}
-                  onClick={(e) =>
-                    onAgentClick(e.currentTarget.getBoundingClientRect())
-                  }
+                  className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
+                  onClick={(e) => onAgentClick(e.currentTarget.getBoundingClientRect())}
                   disabled={isRunning}
                   // Inherited default: explain what the ` . default` marker means, on
                   // hover (title) AND keyboard focus / screen readers (aria-label),
@@ -6165,38 +5889,26 @@ function ChatInput({
                   // switch hint; it has nothing to explain.
                   title={
                     isRunning
-                      ? i18nT(
-                          "components.chatInput.stop_the_current_response_to_switch_agents",
-                        )
+                      ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
                       : agentIsInheritedDefault
-                        ? i18nT(
-                            "components.chatInput.agent_inherited_default",
-                            { name: agentName },
-                          )
-                        : i18nT("components.chatInput.agent", {
+                        ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
+                        : i18nT('components.chatInput.agent', {
                             name: agentName,
                           })
                   }
                   aria-label={
                     isRunning
-                      ? i18nT(
-                          "components.chatInput.stop_the_current_response_to_switch_agents",
-                        )
+                      ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
                       : agentIsInheritedDefault
-                        ? i18nT(
-                            "components.chatInput.agent_inherited_default",
-                            { name: agentName },
-                          )
-                        : i18nT("components.chatInput.agent", {
+                        ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
+                        : i18nT('components.chatInput.agent', {
                             name: agentName,
                           })
                   }
                 >
                   <Bot size={13} className="shrink-0 opacity-70" />
                   {!shelfCompact && (
-                    <span className="truncate max-w-[160px]">
-                      {agentLabel ?? agentName}
-                    </span>
+                    <span className="truncate max-w-[160px]">{agentLabel ?? agentName}</span>
                   )}
                 </button>
               )}
@@ -6209,22 +5921,16 @@ function ChatInput({
                 <div className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted">
                   <button
                     className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
-                    onClick={(e) =>
-                      onProjectClick(e.currentTarget.getBoundingClientRect())
-                    }
+                    onClick={(e) => onProjectClick(e.currentTarget.getBoundingClientRect())}
                     disabled={isRunning}
                     title={
                       isRunning
-                        ? i18nT(
-                            "components.chatInput.stop_the_current_response_to_switch_project",
-                          )
+                        ? i18nT('components.chatInput.stop_the_current_response_to_switch_project')
                         : projectChipTitle
                     }
                     aria-label={
                       isRunning
-                        ? i18nT(
-                            "components.chatInput.stop_the_current_response_to_switch_project",
-                          )
+                        ? i18nT('components.chatInput.stop_the_current_response_to_switch_project')
                         : projectChipTitle
                     }
                   >
@@ -6237,8 +5943,8 @@ function ChatInput({
                     {!shelfCompact && (
                       <span className="truncate max-w-[160px]">
                         {project
-                          ? project.split("/").filter(Boolean).pop() || project
-                          : i18nT("components.chatInput.project")}
+                          ? project.split('/').filter(Boolean).pop() || project
+                          : i18nT('components.chatInput.project')}
                       </span>
                     )}
                   </button>
@@ -6253,7 +5959,7 @@ function ChatInput({
                   does not supply it). */}
                       <CopyBranchButton
                         branch={projectBranch}
-                        label={projectDetached ? "commit" : "branch name"}
+                        label={projectDetached ? 'commit' : 'branch name'}
                         className="max-w-[220px] font-mono opacity-70 hover:opacity-100 hover:text-text"
                       />
                     </>
@@ -6292,7 +5998,7 @@ function ChatInput({
                       {!!projectGitAhead && <>&#x2191;{projectGitAhead}</>}
                       {!!projectGitBehind && (
                         <>
-                          {projectGitAhead ? " " : ""}&#x2193;{projectGitBehind}
+                          {projectGitAhead ? ' ' : ''}&#x2193;{projectGitBehind}
                         </>
                       )}
                     </span>
@@ -6303,28 +6009,24 @@ function ChatInput({
             <div className="flex items-center shrink-0">
               {contextPct != null &&
                 (() => {
-                  const pct = Math.round(contextPct);
-                  const win = contextWindowTokens || 0;
+                  const pct = Math.round(contextPct)
+                  const win = contextWindowTokens || 0
                   const used =
                     contextUsedTokens != null
                       ? contextUsedTokens
                       : win
                         ? Math.round((pct / 100) * win)
-                        : 0;
-                  const remaining = win ? Math.max(win - used, 0) : 0;
-                  const approx = contextUsedTokens == null;
-                  const hasKnownWindow = win > 0;
-                  const hasMeasuredUsed =
-                    contextUsedTokens != null && contextUsedTokens > 0;
+                        : 0
+                  const remaining = win ? Math.max(win - used, 0) : 0
+                  const approx = contextUsedTokens == null
+                  const hasKnownWindow = win > 0
+                  const hasMeasuredUsed = contextUsedTokens != null && contextUsedTokens > 0
                   // With no window there is no percentage to colour or plot; the
                   // readout degrades to a bare token count rather than asserting
                   // a 0% that was never measured.
-                  const pctColor = hasKnownWindow
-                    ? contextColor(contextPct)
-                    : "var(--text)";
-                  const showPct = !!showContextPct && hasKnownWindow;
-                  const showTokens =
-                    !!showContextTokens && (hasKnownWindow || hasMeasuredUsed);
+                  const pctColor = hasKnownWindow ? contextColor(contextPct) : 'var(--text)'
+                  const showPct = !!showContextPct && hasKnownWindow
+                  const showTokens = !!showContextTokens && (hasKnownWindow || hasMeasuredUsed)
                   // Graceful degrade: on a narrow shelf, collapse to the percentage
                   // alone (or tokens, if that's the only segment enabled) so the
                   // readout never crowds out the agent/model controls.
@@ -6338,21 +6040,18 @@ function ChatInput({
                         approx,
                         showPct,
                         showTokens,
-                      });
+                      })
                   return (
-                    <div
-                      ref={ctxWrapRef}
-                      className="relative flex items-center"
-                    >
+                    <div ref={ctxWrapRef} className="relative flex items-center">
                       <button
-                        className={`inline-flex items-center h-7 px-2.5 rounded-md transition-colors border-none cursor-pointer ${ctxPopoverOpen ? "bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]" : "bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]"}`}
+                        className={`inline-flex items-center h-7 px-2.5 rounded-md transition-colors border-none cursor-pointer ${ctxPopoverOpen ? 'bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]' : 'bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]'}`}
                         onClick={() => setCtxPopoverOpen((o) => !o)}
                         title={
                           hasKnownWindow
                             ? contextTip(contextPct)
-                            : i18nT("components.chatInput.context_usage")
+                            : i18nT('components.chatInput.context_usage')
                         }
-                        aria-label={i18nT("components.chatInput.context_usage")}
+                        aria-label={i18nT('components.chatInput.context_usage')}
                       >
                         <ContextBar
                           pct={hasKnownWindow ? contextPct : 0}
@@ -6374,37 +6073,35 @@ function ChatInput({
                           <div className="flex items-center justify-between mb-2">
                             <span className="text-[11px] font-semibold text-text">
                               {hasKnownWindow
-                                ? i18nT("components.chatInput.context_window")
-                                : i18nT("components.chatInput.context_usage")}
+                                ? i18nT('components.chatInput.context_window')
+                                : i18nT('components.chatInput.context_usage')}
                             </span>
                             <span
                               className="text-[12px] font-mono font-bold"
                               style={{ color: pctColor }}
                             >
                               {hasKnownWindow
-                                ? fmtPercent(
-                                    contextPctClamped(contextPct) / 100,
-                                  )
+                                ? fmtPercent(contextPctClamped(contextPct) / 100)
                                 : fmtTokens(used)}
                             </span>
                           </div>
                           <div className="flex flex-col gap-1 text-[11px] font-mono">
                             <div className="flex justify-between">
                               <span className="text-muted">
-                                {i18nT("components.chatInput.used")}
+                                {i18nT('components.chatInput.used')}
                               </span>
                               <span className="text-text">
-                                {approx ? "~" : ""}
+                                {approx ? '~' : ''}
                                 {fmtTokens(used)}
                               </span>
                             </div>
                             {hasKnownWindow && (
                               <div className="flex justify-between">
                                 <span className="text-muted">
-                                  {i18nT("components.chatInput.remaining")}
+                                  {i18nT('components.chatInput.remaining')}
                                 </span>
                                 <span className="text-text">
-                                  {approx ? "~" : ""}
+                                  {approx ? '~' : ''}
                                   {fmtTokens(remaining)}
                                 </span>
                               </div>
@@ -6412,32 +6109,24 @@ function ChatInput({
                             {hasKnownWindow && (
                               <div className="flex justify-between">
                                 <span className="text-muted">
-                                  {i18nT("components.chatInput.total")}
+                                  {i18nT('components.chatInput.total')}
                                 </span>
-                                <span className="text-text">
-                                  {fmtTokens(win)}
-                                </span>
+                                <span className="text-text">{fmtTokens(win)}</span>
                               </div>
                             )}
                           </div>
                           {modelName && (
                             <div className="mt-2 pt-2 border-t border-border flex justify-between text-[11px] font-mono">
                               <span className="text-muted">
-                                {i18nT("components.chatInput.model")}
+                                {i18nT('components.chatInput.model')}
                               </span>
-                              <span
-                                className="text-text truncate max-w-[120px]"
-                                title={modelName}
-                              >
+                              <span className="text-text truncate max-w-[120px]" title={modelName}>
                                 {modelName}
                               </span>
                             </div>
                           )}
                           {autoCompactQuery.isLoading && (
-                            <div
-                              className="mt-2 pt-2 border-t border-border"
-                              aria-hidden="true"
-                            >
+                            <div className="mt-2 pt-2 border-t border-border" aria-hidden="true">
                               <div className="h-4 mb-1 rounded bg-bg-hover animate-pulse" />
                               <div className="h-5 rounded bg-bg-hover animate-pulse" />
                             </div>
@@ -6448,9 +6137,7 @@ function ChatInput({
                               <ErrorNotice
                                 variant="inline"
                                 testId="auto-compact-load-error"
-                                message={i18nT(
-                                  "components.chatInput.auto_compact_load_failed",
-                                )}
+                                message={i18nT('components.chatInput.auto_compact_load_failed')}
                               />
                             </div>
                           )}
@@ -6463,7 +6150,7 @@ function ChatInput({
                                 variant="inline"
                                 testId="auto-compact-write-error"
                                 message={autoCompactError}
-                                onDismiss={() => setAutoCompactError("")}
+                                onDismiss={() => setAutoCompactError('')}
                               />
                             </div>
                           )}
@@ -6471,47 +6158,37 @@ function ChatInput({
                             <div className="mt-2 pt-2 border-t border-border">
                               <div className="flex items-center justify-between mb-1">
                                 <span className="text-[11px] text-muted">
-                                  {i18nT(
-                                    "components.chatInput.auto_compact_at",
-                                  )}
+                                  {i18nT('components.chatInput.auto_compact_at')}
                                 </span>
                                 <span className="text-[12px] font-mono font-bold text-accent">
                                   {fmtPercent(
-                                    Math.round(
-                                      autoCompact.pct ?? autoCompact.global_pct,
-                                    ) / 100,
+                                    Math.round(autoCompact.pct ?? autoCompact.global_pct) / 100,
                                   )}
                                 </span>
                               </div>
                               <Slider
-                                value={
-                                  autoCompact.pct ?? autoCompact.global_pct
-                                }
+                                value={autoCompact.pct ?? autoCompact.global_pct}
                                 onChange={(v) => pushAutoCompact(v)}
                                 min={autoCompact.min}
                                 max={autoCompact.max}
                                 step={1}
                                 formatValue={(v) => fmtPercent(v / 100)}
-                                aria-label={i18nT(
-                                  "components.chatInput.auto_compact_threshold",
-                                )}
+                                aria-label={i18nT('components.chatInput.auto_compact_threshold')}
                               />
                               {autoCompact.pct != null ? (
                                 <Btn
                                   className="mt-1 px-0 py-0 border-none text-[10px] text-muted underline hover:text-text hover:bg-transparent"
                                   onClick={() => pushAutoCompact(null)}
                                 >
-                                  {i18nT(
-                                    "components.chatInput.reset_to_global",
-                                    { pct: Math.round(autoCompact.global_pct) },
-                                  )}
+                                  {i18nT('components.chatInput.reset_to_global', {
+                                    pct: Math.round(autoCompact.global_pct),
+                                  })}
                                 </Btn>
                               ) : (
                                 <div className="mt-1 text-[10px] text-muted">
-                                  {i18nT(
-                                    "components.chatInput.following_global",
-                                    { pct: Math.round(autoCompact.global_pct) },
-                                  )}
+                                  {i18nT('components.chatInput.following_global', {
+                                    pct: Math.round(autoCompact.global_pct),
+                                  })}
                                 </div>
                               )}
                             </div>
@@ -6519,14 +6196,12 @@ function ChatInput({
                         </div>
                       )}
                     </div>
-                  );
+                  )
                 })()}
               {onModelClick && modelName && (
                 <button
                   className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
-                  onClick={(e) =>
-                    onModelClick(e.currentTarget.getBoundingClientRect())
-                  }
+                  onClick={(e) => onModelClick(e.currentTarget.getBoundingClientRect())}
                   disabled={isRunning}
                   data-testid="composer-model-chip"
                   // Inherited default: mirror the agent chip -- ` · default` marker on
@@ -6535,29 +6210,19 @@ function ChatInput({
                   // reads exactly like a pin. A pinned chip keeps the plain hint.
                   title={
                     isRunning
-                      ? i18nT(
-                          "components.chatInput.stop_the_current_response_to_switch_model",
-                        )
+                      ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
                       : modelIsInheritedDefault
-                        ? i18nT(
-                            "components.chatInput.model_inherited_default",
-                            { name: modelName },
-                          )
-                        : i18nT("components.chatInput.model_2", {
+                        ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+                        : i18nT('components.chatInput.model_2', {
                             name: modelName,
                           })
                   }
                   aria-label={
                     isRunning
-                      ? i18nT(
-                          "components.chatInput.stop_the_current_response_to_switch_model",
-                        )
+                      ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
                       : modelIsInheritedDefault
-                        ? i18nT(
-                            "components.chatInput.model_inherited_default",
-                            { name: modelName },
-                          )
-                        : i18nT("components.chatInput.model_2", {
+                        ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+                        : i18nT('components.chatInput.model_2', {
                             name: modelName,
                           })
                   }
@@ -6568,27 +6233,21 @@ function ChatInput({
                     // ellipsize its own tail, never the marker that tells a served
                     // default apart from a pin.
                     <>
-                      <span
-                        className="opacity-30 select-none shrink-0"
-                        aria-hidden="true"
-                      >
+                      <span className="opacity-30 select-none shrink-0" aria-hidden="true">
                         ·
                       </span>
                       <span className="opacity-60 shrink-0">
-                        {i18nT("components.agentSelector.default")}
+                        {i18nT('components.agentSelector.default')}
                       </span>
                     </>
                   )}
                   {onReasoningEffortClick && !shelfCompact && (
                     <>
-                      <span
-                        className="opacity-30 select-none shrink-0"
-                        aria-hidden="true"
-                      >
+                      <span className="opacity-30 select-none shrink-0" aria-hidden="true">
                         ·
                       </span>
                       <span className="opacity-60 shrink-0">
-                        {effortLabel(reasoningEffort || "")}
+                        {effortLabel(reasoningEffort || '')}
                       </span>
                     </>
                   )}
@@ -6598,7 +6257,7 @@ function ChatInput({
           </div>
         )}
     </div>
-  );
+  )
 }
 
-export default memo(ChatInput);
+export default memo(ChatInput)

@@ -1,9 +1,8 @@
-import { panelTabClassName, PANEL_TAB_ICON_CLASS, PANEL_TAB_LIST_CLASS } from './panelTabStyles'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { motion, AnimatePresence, Reorder } from 'framer-motion'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import { useLongPressReorder } from '../hooks/useLongPressReorder'
-import { TerminalSquare, Plus, X, PictureInPicture2, MoreHorizontal, PanelRight, PanelBottom, Loader2 } from 'lucide-react'
+import { TerminalSquare, Plus, X, ChevronDown, ChevronRight, PictureInPicture2, MoreHorizontal, PanelRight, PanelBottom, Loader2 } from 'lucide-react'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from './ui/dropdown-menu'
@@ -14,7 +13,7 @@ import { useAppSelector } from '../store'
 import { selectActiveSlotProject } from '../store/chatSlice'
 import { openPopout as openTerminalPopout, isPopoutOpen as isTerminalPopoutOpen, focusPopout as focusTerminalPopout, bringBack as bringBackTerminalPopout, returnSelfToMain } from '../utils/terminalPopout'
 import {
-  useBottomTerminal, addTab, removeTab, setActiveTab, setTabsOrder,
+  useBottomTerminal, useTerminalHydratePending, addTab, removeTab, setActiveTab, setTabsOrder,
   closeBottomTerminal, setBottomTerminalHeight, setBottomTerminalWidth,
   toggleTerminalPosition, MAX_TERMINALS, MIN_WIDTH, MAX_VH, MAX_VW,
   setTerminalCloseFailed, useTerminalCloseFailed,
@@ -30,7 +29,7 @@ function TerminalTitle({ sessionId }: { sessionId: string }) {
   return <>{live || i18nT('components.bottomTerminalPanel.terminal')}</>
 }
 
-/** A terminal tab chip sharing its appearance with workspace tabs. */
+/** A terminal tab chip — mirrors the activity-bar SidePanel TabChip design */
 function TabChip({ tab, active, closing = false, onSelect, onClose }: {
   tab: TermTab; active: boolean; closing?: boolean; onSelect: () => void; onClose: () => void
 }) {
@@ -45,9 +44,11 @@ function TabChip({ tab, active, closing = false, onSelect, onClose }: {
       // activates it natively instead of also selecting the tab.
       onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onSelect() } }}
       onAuxClick={(e) => { if (e.button === 1 && !closing) { e.preventDefault(); onClose() } }}
-      className={`${panelTabClassName(active)} ${closing ? 'opacity-60' : ''}`}
+      className={`group relative flex items-center gap-1.5 h-8 pl-3 pr-1.5 rounded-full cursor-pointer shrink-0 max-w-[240px] select-none border transition-colors ${
+        active ? 'bg-bg-elevated border-border text-text-strong shadow-sm' : 'bg-transparent border-transparent text-muted hover:text-text hover:bg-bg-hover'
+      } ${closing ? 'opacity-60' : ''}`}
     >
-      <span className={`${PANEL_TAB_ICON_CLASS} opacity-80`}><TerminalSquare className="lucide-inline" /></span>
+      <span className="shrink-0 opacity-80"><TerminalSquare size={13} /></span>
       <span className="min-w-0 text-[12.5px] truncate text-left">
         <TerminalTitle sessionId={tab.id} />
       </span>
@@ -124,6 +125,12 @@ function TerminalCloseErrorNotice() {
 
 export function TerminalTabsView({ variant }: { variant: 'dock' | 'popout' }) {
   const { tabs, activeId, position } = useBottomTerminal()
+  // Tabs restored from storage are unverified until the backend has said which
+  // shells still exist. Nothing is drawn for them before that ruling — a
+  // mounted CliPanel would reconnect and spawn a shell for a tab the probe is
+  // about to drop, and a strip chip would offer to close a tab that may be
+  // gone already. One probe round-trip, then the kept tabs mount as usual.
+  const hydratePending = useTerminalHydratePending()
   // A rejected PTY delete lands in the close-failed flag (set by the hook), which
   // the always-mounted panel root renders (see BottomTerminalPanel below) —
   // closing the LAST tab unmounts this strip before a delayed rejection arrives.
@@ -177,6 +184,8 @@ export function TerminalTabsView({ variant }: { variant: 'dock' | 'popout' }) {
 
   const atCap = tabs.length >= MAX_TERMINALS
 
+  if (hydratePending) return null
+
   return (
     <div className="flex flex-col h-full min-h-0">
       {/* The popout window has no BottomTerminalPanel root, so the strip hosts
@@ -186,13 +195,13 @@ export function TerminalTabsView({ variant }: { variant: 'dock' | 'popout' }) {
       {variant === 'popout' && <TerminalCloseErrorNotice />}
       {/* Tab strip — same aesthetics as the activity-bar strip; drag chips
           horizontally to reorder (framer Reorder). */}
-      <div className="panel-toolbar flex items-center gap-1.5 shrink-0 px-2">
+      <div className="flex items-center gap-1.5 h-9 shrink-0 pl-2 pr-1.5">
         <Reorder.Group
           axis="x"
           values={tabs}
           onReorder={setTabsOrder}
           role="tablist"
-          className={PANEL_TAB_LIST_CLASS}
+          className="flex items-center gap-2 min-w-0 overflow-x-auto scrollbar-none list-none m-0 p-0"
         >
           {tabs.map((t, i) => (
             <DraggableTermTab
@@ -210,7 +219,7 @@ export function TerminalTabsView({ variant }: { variant: 'dock' | 'popout' }) {
         </Reorder.Group>
         {/* + opens a new terminal tab instantly (no menu). */}
         <button
-          className="panel-toolbar-action flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+          className="flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={() => addTab(activeSlotProject)}
           disabled={atCap}
           title={atCap ? i18nT('components.bottomTerminalPanel.maximum_terminals', { n: MAX_TERMINALS }) : i18nT('components.bottomTerminalPanel.new_terminal')}
@@ -219,7 +228,7 @@ export function TerminalTabsView({ variant }: { variant: 'dock' | 'popout' }) {
           <Plus size={15} />
         </button>
         {variant === 'dock' ? (
-          <div data-panel-controls-host="terminal" className="panel-toolbar-actions flex items-center gap-0.5 ml-auto shrink-0">
+          <div className="flex items-center gap-0.5 ml-auto shrink-0">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
@@ -241,13 +250,13 @@ export function TerminalTabsView({ variant }: { variant: 'dock' | 'popout' }) {
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-            <button data-panel-controls-local-close="terminal"
+            <button
               className="flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
               onClick={() => closeBottomTerminal()}
               title={i18nT('components.bottomTerminalPanel.hide_terminal_panel')}
               aria-label={i18nT('components.bottomTerminalPanel.hide_terminal_panel')}
             >
-              <X className="lucide-inline w-4 h-4" />
+              {position === 'bottom' ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
             </button>
           </div>
         ) : (
@@ -392,17 +401,17 @@ export default function BottomTerminalPanel() {
       {open && (
         <motion.div
           key={motionKey}
-          className="shrink-0 overflow-hidden bg-bg"
+          className={`shrink-0 overflow-hidden bg-bg ${isRight ? 'border-l border-border' : 'border-t border-border'}`}
           initial={isRight ? { width: 0 } : { height: 0 }}
           animate={motionProp}
           exit={isRight ? { width: 0 } : { height: 0 }}
           transition={{ duration: dragging ? 0 : 0.22, ease: 'easeOut' }}
           style={{ willChange: isRight ? 'width' : 'height' }}
         >
-          <div className={`relative box-border flex border-border ${isRight ? 'flex-row h-full border-l' : 'flex-col border-t'}`} style={motionProp}>
+          <div className={isRight ? 'flex flex-row h-full' : 'flex flex-col'} style={motionProp}>
             <div
               {...grip}
-              className={`absolute z-30 group/drag ${isRight ? 'inset-y-0 left-0 w-[6px] cursor-col-resize' : 'inset-x-0 top-0 h-[6px] cursor-row-resize'}`}
+              className={`relative shrink-0 group/drag ${isRight ? 'w-[6px] cursor-col-resize' : 'h-[6px] cursor-row-resize'}`}
               style={{ touchAction: 'none' }}
               role="separator"
               aria-orientation={isRight ? 'vertical' : 'horizontal'}

@@ -66,9 +66,15 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.dashboard.origin import check_host, is_direct_local_request
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.stt_stream import _STREAMING_PROVIDERS, PROVIDER_LOCAL
-from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token, parse_duration
+from kiro_crew.dashboard.token_auth import (
+    MAX_SESSION_TTL_SECS,
+    _unix_request_socket,
+    generate_token,
+    parse_duration,
+)
 from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.executors import discovery_executor
+from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self
 from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
 from kiro_crew.session_workspace import is_valid_id
@@ -1670,15 +1676,6 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
                 agent["subagent_max_per_parent"] = val
                 applied.append("subagent_max_per_parent")
 
-            for key in ("conductor_skill",):
-                if key in agent_settings:
-                    val = agent_settings[key]
-                    if not isinstance(val, bool):
-                        _validation_error.append((f"{key} must be a boolean", 400))
-                        return None
-                    agent[key] = val
-                    applied.append(key)
-
             if not applied:
                 _validation_error.append(("no recognized settings provided", 400))
                 return None
@@ -1693,11 +1690,7 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
         try:
             async with _get_config_lock():
                 try:
-                    # update_config_locked returns the final config dict (after
-                    # mutation); use it directly rather than re-reading from disk
-                    # (a blocking read on the loop, and it writes the callback's
-                    # output verbatim — there is no concurrent merge to observe).
-                    final = await asyncio.to_thread(
+                    await asyncio.to_thread(
                         update_config_locked, cfg_path, mutate=_mutate_config_put
                     )
                 except ConfigReadError:
@@ -1717,34 +1710,12 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
                     return _deny(msg, status)
 
                 applied: list[str] = _result["applied"]  # type: ignore[assignment]
-                agent = final.get("agent") or {}
                 _sel().log_api_access(
                     caller=caller,
                     operation="config.update",
                     outcome="ok",
                     resources=",".join(applied),
                 )
-                # Regenerate or clean up conductor skill on toggle. Held INSIDE
-                # the lock so a concurrent enable/disable cannot interleave and
-                # leave the persisted flag disagreeing with the skill file on
-                # disk (config says enabled while SKILL.md is absent, or vice
-                # versa).
-                if "conductor_skill" in applied:
-                    if agent.get("conductor_skill"):
-                        from kiro_crew.dashboard.handlers.agents import (  # noqa: F811
-                            _regen_conductor,
-                        )
-
-                        _regen_conductor()
-                    else:
-                        try:
-                            from kiro_crew.skills import SkillsLoader  # noqa: F811
-
-                            p = SkillsLoader()._dir / "conductor" / "SKILL.md"
-                            if p.exists():
-                                p.unlink()
-                        except Exception:
-                            logger.exception("Failed to clean up conductor skill")
         except OSError:
             _sel().log_api_access(
                 caller=caller,
@@ -2476,6 +2447,12 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 # ── Local token bootstrap (Electron / local apps) ─────────────────────
 
 
+def _unix_peer_is_self(request: web.Request) -> bool:
+    """True iff the request's Unix peer is this process's own principal."""
+    sock = _unix_request_socket(request)
+    return sock is not None and check_peer_is_self(sock) is PeerCredResult.MATCH
+
+
 async def api_token_local(request: web.Request) -> web.Response:
     """GET /api/token/local — issue a token for local apps.
 
@@ -2483,10 +2460,15 @@ async def api_token_local(request: web.Request) -> web.Response:
     gateway startup. Only processes on the same machine can read the file.
     Secret passed via ``X-Local-Secret`` header (not query string, to avoid
     leaking in logs).
+
+    Reachable over loopback TCP or the dashboard's ``AF_UNIX`` socket; unix
+    peers are admitted only on a positive kernel same-principal check
+    (``_unix_peer_is_self``), which is stronger locality evidence than a
+    loopback address. The secret is required on both transports.
     """
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
-    if not _h.is_loopback(request.remote or ""):
+    if not _h.is_loopback(request.remote or "") and not _unix_peer_is_self(request):
         _sel().log_api_access(
             caller=request.remote or "unknown",
             operation="token.local",

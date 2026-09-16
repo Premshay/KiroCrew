@@ -30,9 +30,9 @@ this spec states the target and that one states the present.
 | Layer | Status | Where it lives today |
 |---|---|---|
 | Subject and registry | `partial` | `monitoring/registry.py` owns kind/objective/capability data for four public pull-request kinds plus internal `gh-pr` and `github_workflow_run`; `probes/__init__.py` still has its separate dispatch branch |
-| Probe | `partial` | `monitoring.models.MonitorProbe` and `MonitorProbeResult` are provider-neutral and plural; the `irq.Probe` path remains separate |
+| Probe | `partial` | `monitoring.models.MonitorProbe` and `MonitorProbeResult` are provider-neutral and plural, and `monitoring/github_pull_request.py` batches its subjects into one GraphQL document per evidence kind; the other adapters loop internally and no driver assembles a batch, and the `irq.Probe` path remains separate |
 | Observation | `partial` | the `Observation` type and the `Severity` vocabulary live in `irq.py`; `PrWatchProbe` in `probes/gh_pr.py` emits the keys; `monitoring/` reduces a subject to one fingerprint |
-| Decision | `partial` | `decide_monitor` returns a `MonitorVerdict` carrying its entries and remains pure, but is edge-triggered and has no coalescing; `irq.py` already level-triggers with a re-alert window and a coalescing floor |
+| Decision | `partial` | `decide_monitor` is IO-free but state-mutating: it coalesces successive changes to one subject over time through a window on `MonitorState` (a floor and a head-change reset) and derives its dedup comparison so an unresolved change re-asserts on a re-alert interval. It writes the window fields on the staged state and READS the alert map; the caller stamps the alert map on a wake and persists the same staged state, so decide-and-persist is a required pairing. `irq.py` keeps its own multi-signal coalescing for the cron path |
 | Persistence | `partial` | versioned in `monitoring/`; unversioned in `irq.py`, which also holds decision logic |
 | Driver | `implemented` | in-session timer in `autonudge.py`; out-of-session script cron in `babysit/scripts/pr_watch.py` |
 | Delivery | `implemented` | session directive keyed by the call's input digest, shared by both arming paths |
@@ -51,12 +51,18 @@ remains the seven-value effect selector, but `decide_monitor` returns a
 that wrapper. The entries tuple is provider-neutral and plural, so adding more
 evidence no longer requires changing the return type.
 
-The live decision still places exactly one `MonitorObservation` in that tuple,
-reduces the subject to one fingerprint, and lets `format_monitor_wake` compose
-operator text from `MonitorState.last_observation` and `wake_instructions`. The
-return-type prerequisite is therefore complete; per-condition entries,
-coalescing, and delivery from those entries remain target work in layers 3, 4,
-and 7.
+The live decision places exactly one `MonitorObservation` in that tuple, reduces
+the subject to one fingerprint, and lets `format_monitor_wake` compose operator
+text from `MonitorState.last_observation` and `wake_instructions`. That text is
+kind-dispatched: `format_monitor_wake` takes the subject's `kind` from
+`MonitorState.kind` -- the authoritative armed record, not the provider-supplied
+canonical -- reads that kind's registry entry for its subject noun and field
+list, and renders those fields, so a non-pull-request kind reads as what it is.
+The return-type prerequisite is complete; the engine coalesces successive changes
+to that one subject over time and re-asserts an unresolved change on a re-alert
+interval, both through a window on `MonitorState`. Per-condition entries and the
+multi-signal fold across simultaneous conditions remain target work in layers 3
+and 4, since one fingerprint per subject has no second condition to fold.
 
 ### A probe boundary not typed to one implementation
 
@@ -75,10 +81,14 @@ make those two drivers consume one extension point.
 ### A kind and objective vocabulary that is not one shared list
 
 **Status: implemented for structured monitors.** `monitoring/registry.py` owns
-one `MonitorKind` data row per kind. Each row declares its own objectives and
-capabilities; `kind_supports_objective` enforces the pairing. The MCP schema,
-validation schema, REST handler, arming path, and shadow path derive their
-answers from that registry instead of maintaining independent allowlists.
+one `MonitorKind` data row per kind. Each row declares its own objectives, its
+capabilities, and how it describes itself when it wakes a session -- a subject
+noun and an ordered `wake_fields` list, held as strings; `kind_supports_objective`
+enforces the objective pairing and delivery reads the entry's noun and fields
+through `monitor_kind`. The MCP schema, validation schema, REST handler, arming
+path, and shadow path derive their answers from that registry instead of
+maintaining independent allowlists, and delivery reads the same table for the
+noun and fields rather than hardcoding one kind's shape.
 
 Four pull-request kinds are publicly armable with `review_ready`. The internal
 `gh-pr` kind and the `github_workflow_run` acceptance kind are registered but
@@ -106,6 +116,24 @@ That is progress, not consolidation: a kind intended for both drivers still has
 to integrate with two contracts. The remaining target is one plugin shape that
 both drivers consume; the acceptance fixture below proves the structured half
 is provider-neutral, not that the two stacks are already one.
+
+### Retiring `irq.Probe` is gated on layer 3
+
+Retirement is downstream of layer 3, not of the coalescing window the pure
+decision engine gained. That window folds successive changes to one subject over
+time, which is not the mechanism the cron path depends on. What that path uses,
+and the shared engine cannot yet express, is already named in layers 3 and 4
+below: the urgency claim layer 3 calls `IMMEDIATE` and the kernel implements as
+`Severity.NMI`, for a condition where waiting observes nothing further; and the
+per-entry `resets_on` distinction, which decides whether a new revision clears an
+entry or the entry outlives it. One fingerprint per subject can express neither.
+It has no per-entry identity to scope and no severity to raise, so an entry that
+must fire now cannot say so, and an entry that survives a force-push cannot be
+told from one the force-push resolved.
+
+Deleting the old extension point before layer 3 lands would therefore delete
+those two behaviours rather than move them. Until then the two drivers keep two
+contracts, and an author adding a cron-path kind still subclasses `irq.Probe`.
 
 ## A monitor is a field, not a system
 
@@ -168,9 +196,22 @@ the read was complete, and a classified error or `None`.
 This is the single most consequential contract in this spec. A per-subject probe
 interface cannot be batched later without changing every implementation and
 every caller, and batching is not a micro-optimization here: fifty subjects read
-one at a time is roughly 150 process invocations against one query. Today
-batching is reachable only from the single out-of-session poller, for no reason
-other than the interface shape.
+one at a time is roughly 150 process invocations against one query.
+
+**Status: the GitHub pull-request probe batches; no caller passes more than one
+subject yet.** `GitHubPullRequestProvider.probe` spends one GraphQL document per
+evidence kind per chunk of at most 25 subjects, so a tick of any size up to that
+bound costs three requests instead of three per subject, and each further chunk
+adds three. It carries the (host, credential) rule as a check rather than as a
+grouping pass: the credential is the call's own argument, and a chunk is refused
+if it names two hosts. The
+other four adapters still loop internally and declare so in their own docstrings.
+What is missing is above the probe, not inside it: the in-session driver arms one
+`asyncio` task per loop in `autonudge.py`, so a tick structurally sees one
+monitor, and the out-of-session poller runs one subject per cron job through
+`irq.Probe.observe`, which is singular. A batch therefore has no assembler; that
+is a driver change, and it belongs with the consolidation rather than with the
+probe.
 
 Rules:
 
@@ -178,7 +219,14 @@ Rules:
   plural signature and loops internally, so the caller never encodes the
   difference.
 - One query per (host, credential) per tick. Subjects sharing a credential share
-  the query.
+  the query. An adapter satisfies this with a CHECK, not with a grouping pass: a
+  pass that sorts subjects into per-host queries is machinery for a case its own
+  target gate cannot construct, so it would ship unexercised, while a check is
+  exercised on every call and fails closed the day a second host is accepted. A
+  read whose failures are separate is a separate query: the GitHub
+  adapter keeps its load-bearing primary read apart from its two supplemental
+  ones, because a document that selects the check rollup hands its lifecycle
+  facts to a missing Checks permission.
 - A partial failure degrades only the subjects it covers. One unreadable subject
   must not fail the batch.
 - Every error is classified before it leaves this layer. An unclassified failure
@@ -254,15 +302,16 @@ fail safe:
 4. **Coalescing window**.
 5. **Floor**.
 
-The engine is **level-triggered**, not edge-triggered, and one of the two already
-is. `irq.py` level-triggers on the live cron path today: per-key `alerted`
-timestamps in its loaded state, `_dedupe_key` distinguishing epoch-scoped from
-sticky entries, a re-alert window defaulting to six hours through
-`DEFAULT_REALERT_SECS`, a coalescing window through `coalesce_secs`, and
-`Severity.NMI` documented as bypassing the delay but not the mask. So
-re-assertion-after-a-window is **not** a behaviour the system lacks; it is a
-behaviour `monitoring/decision.py` lacks, and consolidation is where it stops
-being available on only one path.
+The engine is **level-triggered**, not edge-triggered, on both paths. `irq.py`
+level-triggers on the live cron path: per-key `alerted` timestamps in its loaded
+state, `_dedupe_key` distinguishing epoch-scoped from sticky entries, a re-alert
+window defaulting to six hours through `DEFAULT_REALERT_SECS`, a coalescing
+window through `coalesce_secs`, and `Severity.NMI` documented as bypassing the
+delay but not the mask. `monitoring/decision.py` now level-triggers too: it
+re-asserts an unresolved actionable change once its re-alert interval has elapsed
+and coalesces a burst of successive changes to one subject, through a window on
+`MonitorState`. So re-assertion-after-a-window is available on both paths rather
+than only the cron one.
 
 Each key carries its own alert timestamp, and a key that is still true re-asserts
 once its window has elapsed. Edge triggering loses any condition that stayed true
@@ -335,7 +384,7 @@ Required contents:
 |---|---|
 | `version` | every bump ships a migration; an unrecognized version is quarantined, never guessed at |
 | `revision` | what `resets_on: REVISION` is measured against |
-| `alerted` | per-key alert timestamps -- the level-triggered state |
+| `alerted` | per-key alert timestamps -- the level-triggered state. Records that a wake was DECIDED, not that one was delivered: the persistence-only shadow path stamps a wake it deliberately refuses to deliver, so this is not delivery history and a report must not read it as such. The structured engine's `MonitorState.coalesce_alerted` mirrors it |
 | `coalescing` | the open window: when it opened, which keys joined |
 | `errors` | per-kind counts, so a retryable class stays bounded |
 | `budgets_spent` | turns, tokens and provider errors already charged |
@@ -411,13 +460,24 @@ leaves it enforced nowhere:
   it does group, by context -- and maps `CANCELLED` to failed in `_normalize_check`.
   Since the state fold prefers `failed`, a superseded cancelled attempt reads as a
   live failure and can wake on a phantom.
-- A published aggregate verdict is authoritative over the individual rows. A
-  reader that only enumerates rows can report green while the aggregate is
-  pending, which is not a hypothetical: a subject has been observed with every
-  individual check complete and green while the aggregate context still read
-  pending. Enforced today only in the status tool, which resolves the aggregate
-  through `resolve_readiness_context`; the structured provider has no aggregate
-  notion at all (`target`).
+- A published aggregate is one signal in the worst-wins fold, never an override
+  of the rows. It is read like any other row: a `PR Readiness` StatusContext with
+  state FAILURE is a failing row and makes the verdict red, and one with state
+  PENDING keeps the monitor waiting instead of concluding early. What it cannot
+  do is subtract information -- a green aggregate does not clear an observed
+  failing row, because the aggregate is identified by its context name, a display
+  string any status publisher on the pull request can set, and a name anyone can
+  write must not be able to remove a failure. The fold keeps the aggregate's
+  failure and its pending while granting its green no authority over the rows.
+  The problem aggregate authority was reaching for is real and still answered:
+  green rows sitting under a still-pending aggregate must not conclude the round
+  early. Worst-wins pending already answers it -- a pending aggregate is a
+  pending row, so the monitor waits -- without letting a green one subtract a
+  failure. Both current implementations now follow this rule: the structured
+  provider reads the aggregate as an ordinary worst-wins row, and the skill's
+  status tool was brought onto the same rule by
+  [PR #10731](https://github.com/kirodotdev/KiroCrew/pull/10731), merged
+  2026-09-14.
 - A stale reviewer stamp is an entry (`stale:<name>`), not a paragraph.
 - An un-dispositioned finding is an entry, so readiness cannot be declared over
   one.
@@ -501,7 +561,7 @@ of a subject, and a substrate whose subject is optional has no subject.
 
 | Pattern | Why it fails |
 |---|---|
-| One fingerprint per subject | cannot say what changed, cannot coalesce siblings, cannot re-assert a condition |
+| One fingerprint per subject | cannot say which of several simultaneous conditions changed, and cannot coalesce sibling conditions into one wake; it does carry temporal coalescing and re-assertion of the single fingerprint over time |
 | Per-subject probe signature | cannot be batched later without changing every caller |
 | Subject knowledge in the decision layer | every new kind then needs a branch there, and the layer stops being testable in isolation |
 | Subject state in the state document | the document is a snapshot of delivery bookkeeping; a reader looking for subject state finds timestamps |
@@ -518,3 +578,52 @@ an anti-pattern outright. Both current implementations share this deviation, and
 it is not resolved here: the change is larger than this consolidation and belongs
 in its own proposal. It is recorded so a reader does not mistake the omission for
 an argument that same-session wakes are correct.
+
+## The two arming tools read in the wrong order, and the names stay
+
+`monitor_start` arms the in-session timer. `monitor_watch` arms the observation-gated
+probe. Read cold, that is backwards: `start` is the generic primary verb, so the older
+timer reads as the default way to arm a monitor and the newer, cheaper, zero-token
+probe reads as a variant of it. A reader picking by name picks the expensive one.
+`patrol` would say what the timer actually does -- a watch waits and reports when a
+fact changes, a patrol walks the route every interval whether or not anything did --
+and the shipped conductor prompts already use that word for it.
+
+The names stay anyway, and the reason is worth more than the fix would have been.
+
+**A published tool name is a key that other people's persisted records were written
+against, and every one of those records is a decision that silently changes meaning
+when the key changes.** Restrictions are the dangerous half: a persisted rule naming
+a tool that no longer exists does not fail loudly, it stops matching. The capability
+the operator switched off comes back on, and nothing at the call site says so.
+
+Kiro Crew resolves tool restrictions at several name-keyed surfaces, at different
+lifecycle stages, in different shapes:
+
+| Site | Lifecycle stage | Shape | Reachable from code |
+|---|---|---|---|
+| `mcp_shared._resolve_excluded_tools` | per call, cached per session | flat name set from `managedToolPolicy.exclude` | yes |
+| the same function's fail-open returns | before the exclude list is parsed | returns an empty set | nothing to migrate; withholds every exclusion equally |
+| `acp/kas_agents.to_client_custom_agent` | startup projection, before the session exists | `excludedTools` list relayed to the agent host | yes |
+| `acp/session_mcp.session_mcp_disabled_tools` | session projection: Claude `permissions.deny`, codex `rawInput.server`/`tool` | `(server, tool)` pairs, unioned from the agent spec AND the dashboard-written global `mcp.json` | yes |
+| `agent._WORKER_MIRRORED_SHAPES` | derive-time copy | copies the persisted key | copies rather than resolves, so a rewrite here would alter a user's stored value |
+| `GET /api/session-tool-policy` | on request | the raw persisted rule | deliberately raw, so an operator can see a stale spelling and re-key it |
+| a hand-written block in an on-disk profile | the backend reads the file itself | unknown to this repo | **no** |
+
+The last row is what settles it. `acp/kas_agents.py` states the boundary: a
+hand-written block "is not ignored, just not Crew's to relay: it lives in the profile
+on disk, which the backend reads itself when Crew is not injecting an agent over the
+wire." No code here composes that file, so no migration can expand a retired name in
+it and nothing can warn the operator holding one.
+
+So the best achievable end state for renaming a published tool is a known silent
+fail-open that cannot be closed -- not a step on the way to a complete job, but the
+complete job's residue. A rename of a published name is therefore a policy migration
+with a permanent remainder, not a legibility change, and it should be priced that way
+before it is approved rather than discovered one surface at a time.
+
+Weighed against that: the mispick this rename would prevent has not been observed.
+
+What remains available, because none of it is name-keyed: the tool descriptions, this
+spec, and the prompts that choose between the two. A caller reading `monitor_start`'s
+description learns it is the timer without the name having to carry it.

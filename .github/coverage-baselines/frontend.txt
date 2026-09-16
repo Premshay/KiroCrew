@@ -71,7 +71,6 @@ src/components/MarkdownToc.tsx 55.0   # 77/140
 src/components/Strands.tsx 52.2   # 71/136
 src/components/folderColorPaint.ts 0.0   # 0/4
 src/components/notifications/NotificationDetailPanel.tsx 43.2   # 16/37
-src/hooks/useBottomTerminal.ts 66.3   # 65/98
 src/hooks/useCronActions.ts 31.0   # 9/29
 src/hooks/usePopoutSync.ts 0.0   # 0/51
 src/hooks/useQuickSearchShortcut.ts 40.5   # 17/42
@@ -83,7 +82,6 @@ src/pages/MigrationPage.tsx 0.0   # 0/38
 src/pages/chat/KnowledgePicker.tsx 0.0   # 0/23
 src/pages/chat/PinnedPrompt.tsx 3.5   # 2/57
 src/pages/chat/SidePanel.tsx 69.3   # 124/179
-src/pages/overview/EmbeddingModelCard.tsx 58.7   # 64/109
 src/pages/overview/MemoryGraphTab.tsx 68.3   # 97/142
 src/pages/overview/PortabilityTab.tsx 0.0   # 0/60
 src/pages/overview/UsageTab.tsx 0.0   # 0/21

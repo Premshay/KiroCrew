@@ -28,13 +28,14 @@ from kiro_crew.acp.kas_transport import (
     build_kas_argv,
 )
 from kiro_crew.acp.types import ACP_BACKEND_KAS
-from kiro_crew.agent import AGENT_FILENAME
+from kiro_crew.agent import AGENT_FILENAME, agent_spec_path
 from kiro_crew.agent_discovery import (
     _read_agent_spec,
     project_agent_files,
     project_agent_name,
 )
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_spec_format import is_agent_spec_name
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cli_perf import _read_gateway_pid
@@ -255,8 +256,20 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
 
     bound_model = ""
     bound_spec: Path | None = None
+    bound_spec_missing = False
     if bound != "kirocrew":
-        bound_spec = agents_dir / f"{bound}.json"
+        # Display only, through the same resolver the writers use, so the path
+        # shown is the file that holds the agent -- whichever form (``.json``
+        # or ``.md``) and whichever filename declares the name -- rather than a
+        # ``.json`` join that names a file a markdown agent does not have.
+        try:
+            bound_spec = agent_spec_path(bound, agents_dir=agents_dir)
+        except ValueError:
+            # Two safe specs declare the name, so no single file IS the bound
+            # spec; the model resolver below refuses for the same reason and
+            # its tier shows as deferring.
+            bound_spec = None
+        bound_spec_missing = bound_spec is None
         # Read through the resolver's own accessor: it matches on the spec's
         # ``name`` field as well as the filename, which a bare path join misses.
         try:
@@ -292,6 +305,10 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
     print(f"  spec file:   {_safe_display(str(default_spec))}")
     if bound_spec is not None:
         print(f"  bound spec:  {_safe_display(str(bound_spec))}")
+    elif bound_spec_missing:
+        print(
+            f"  bound spec:  ⚠️  no spec for {_safe_display(bound)} under {_safe_display(str(agents_dir))}"
+        )
 
     # Self-check: the marked tier must be what the resolver actually returned.
     if decided_value != effective:
@@ -434,7 +451,7 @@ def _strict_agent_json_specs(directory: Path) -> list[Path]:
                 (
                     Path(entry.path)
                     for entry in entries
-                    if entry.name.endswith(".json") and not entry.name.startswith("._")
+                    if is_agent_spec_name(entry.name) and not entry.name.startswith("._")
                 ),
                 key=lambda path: path.stem,
             )
@@ -1091,6 +1108,127 @@ def _doctor_cron_script_sources(issues: list[str]) -> None:
             "A diverged copy may be a stale deploy OR an intentional local edit "
             "-- doctor cannot tell which, so it does not overwrite either one."
         )
+
+
+def _open_slot_agent_names() -> list[tuple[str, str]]:
+    """``(slot key, agent name)`` for every open dashboard tab persisting one.
+
+    Read-only + best-effort: reads ``open_slots.json`` and each open slot's
+    transcript metadata line off disk (no running gateway needed), returning an
+    empty list on any error. Slot keys pass through the restore path's own
+    sanitizer before they reach path construction -- the file is
+    attacker-writable, and doctor must not accept a key the restore path would
+    reject.
+    """
+    try:
+        from kiro_crew.dashboard.chat_persistence import (
+            _read_open_slots_keys,
+            _sanitize_open_slot_key,
+        )
+        from kiro_crew.dashboard.chat_utils import slot_transcript_key
+        from kiro_crew.history import ConversationLog
+
+        log = ConversationLog()
+        out: list[tuple[str, str]] = []
+        for raw in _read_open_slots_keys():
+            key = _sanitize_open_slot_key(raw)
+            if not key:
+                continue
+            # slot_transcript_key, not _history_key_for: a channel-born tab's
+            # slot key (e.g. slack_<ts>) already addresses its transcript, and
+            # an unconditional dashboard: prefix would read a nonexistent file
+            # and silently skip that tab.
+            agent = log.get_metadata(slot_transcript_key(key)).get("agent")
+            if isinstance(agent, str) and agent:
+                out.append((key, agent))
+        return out
+    except Exception:
+        logger.debug("doctor: open-slot agent scan failed", exc_info=True)
+        return []
+
+
+def _doctor_deprecated_agent_specs(cfg: KiroCrewConfig, issues: list[str]) -> None:
+    """Report configs that still name a deprecated agent spec.
+
+    A deprecated spec (``DEPRECATED_AGENT_SPECS`` in ``agent.py``) still
+    resolves for one release, so a config surface naming it -- a cron job, a
+    crew binding, an open chat slot, or one of the config's own agent
+    selectors -- keeps working today and breaks with ``Mode not found`` at
+    dispatch time once the alias is deleted. Each finding names the replacement so the owner
+    can migrate inside the window.
+
+    Silent when nothing names one: the installed alias spec by itself is
+    expected (the gateway installs it every boot), not a finding.
+    """
+    from kiro_crew.agent import DEPRECATED_AGENT_SPECS
+    from kiro_crew.cron import job_agent_names_from_disk
+
+    # (holder description, deprecated name, replacement). Holder text is
+    # user/LLM-writeable (crew names, job names, slot keys) so it goes through
+    # _safe_display; the matched name and its replacement are keys and values
+    # of our own table, so they print as-is.
+    findings: list[tuple[str, str, str]] = []
+
+    # A cron job, chat slot, or config selector may name a CREW rather than a
+    # kiro agent spec; the crew row owns that report, so those names are
+    # skipped on the leaf surfaces rather than double-flagged through the
+    # crew's binding.
+    crew_names = set(cfg.agents)
+
+    def _add(holder: str, name: object) -> None:
+        # config.json is hand-editable and agent-writable, and the loader
+        # preserves some of these values verbatim (e.g. kiro_agent), so a
+        # non-string can arrive here. dict.get on an unhashable value raises
+        # TypeError, and doctor must diagnose a malformed config, not crash
+        # on it -- a non-string never names a deprecated spec, so skip it.
+        if not isinstance(name, str) or not name or name in crew_names:
+            return
+        replacement = DEPRECATED_AGENT_SPECS.get(name)
+        if replacement:
+            findings.append((holder, name, replacement))
+
+    # Crew bindings: config.json agents.<name>.kiro_agent. A crew name is not
+    # skipped here -- crew_names shields only the LEAF surfaces that resolve
+    # through a crew, and a kiro_agent that happens to equal a crew name is
+    # not resolved again.
+    for crew_name, crew in cfg.agents.items():
+        name = crew.kiro_agent
+        if not isinstance(name, str) or not name:
+            continue
+        replacement = DEPRECATED_AGENT_SPECS.get(name)
+        if replacement:
+            findings.append((f"crew {_safe_display(crew_name)}", name, replacement))
+
+    # The config's own persisted agent selectors.
+    _add("agent.default_agent", cfg.agent.default_agent)
+    _add("session.pool_agent", cfg.session.pool_agent)
+    for channel_id, channel in cfg.slack_channels.items():
+        _add(f"slack channel {_safe_display(channel_id)}", channel.agent)
+
+    # Cron jobs: the agent names dispatch actually runs, read off crons.json
+    # (agent_id, or the agent_sequence entries when the sequence dispatches).
+    for holder, name in job_agent_names_from_disk():
+        _add(f"cron job {_safe_display(holder)}", name)
+
+    # Chat slots: each open tab's persisted agent from its transcript metadata.
+    for slot_key, name in _open_slot_agent_names():
+        _add(f"chat slot {_safe_display(slot_key)}", name)
+
+    if not findings:
+        return
+
+    print("\nDeprecated Agent Specs")
+    for holder, name, replacement in findings:
+        print(
+            f"  {holder}:  \u26a0\ufe0f  names deprecated agent spec "
+            f"'{name}' -- rename it to '{replacement}'"
+        )
+    print(
+        "               A deprecated spec still resolves this release and is "
+        "deleted next release; a config still naming it then fails with "
+        "'Mode not found' at dispatch time."
+    )
+    issues.append("a config names a deprecated agent spec")
 
 
 def _doctor_managed_service_policy(issues: list[str]) -> None:
@@ -3597,6 +3735,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Data Home (+ leftover legacy home) ──
     _doctor_data_home()
     _doctor_cron_script_sources(issues)
+    _doctor_deprecated_agent_specs(cfg, issues)
     _doctor_path_launcher()
     _doctor_trust_root()
     _doctor_strict_identity(cfg)

@@ -131,7 +131,7 @@ export default function NamespaceScopePanel({
                     value={repository}
                     aria-label={i18nT('apps.codeReviewSage.components.namespaceScopePanel.repository_for', { name })}
                     onChange={(value) => chooseRepository(name, value)}
-                    triggerFallback={i18nT('components.postureDisclosure.unavailable')}
+                    triggerFallback={i18nT('pages.settings.postureDisclosure.unavailable')}
                     disabled={saving || repositoryOptions.length === 0}
                     className={SELECT_CLASS}
                   />

@@ -6,6 +6,14 @@ The ACP layer spans **five** modules: the legacy per-session client (`acp/client
 
 ## Backend Selection
 
+`AcpSessionHandle.active_agent` records the mode named by session configuration,
+a completed mode handshake or an observed agent-switch event. A queued mode
+request clears that observation until confirmation. `AcpSessionProvider` exposes
+`loaded_capability_template` only for a live dedicated Kiro runtime whose active
+mode matches its launch template; shared handles provide no full-spec loading
+claim. Member generation and MCP-readiness checks belong to
+[session](session.md#member-capability-generations).
+
 The trusted `private_memory` constructor flag is preserved from provider creation
 through client/runtime spawn and recovery. Only private member processes pass it
 to the sandbox; the default `False` keeps existing V1 spawn arguments. The OS
@@ -125,9 +133,16 @@ MCP-identified call) and app-own-server grant, reported as
 `ToolHookResult.identity_grant`, and the TrustDropdown's `approval_command`
 key — so the user's narrow allowance covers the child's call to that tool
 without a session-wide trust grant (`security.md` § Child-fidelity split).
-A miss keeps reading as an absent classification, and a frame reporting
-`kind: "execute"` caches `True` whatever its `_meta` says — the transport
-identity never waives a shell check.
+A miss keeps reading as an absent classification. Classification reads the
+whole frame through `_dispatch.classify_tool_call`, not the `kind` alone: a
+kiro-cli frame reporting `kind: "execute"` caches `True` whatever its
+`_meta.kiro` says — that identity never waives a shell check — while a
+codex-acp frame carrying the adapter-authored `_meta.is_mcp_tool_call` marker
+is an MCP call the adapter happened to build with its shell builder, so it
+caches `False` and takes its trusted identity from the adapter-resolved
+`rawInput.server`/`rawInput.tool` pair. A marker with an unreadable pair
+resolves nothing (the shell cache stays unwritten), so the permission event
+stays low-fidelity rather than earning a minted non-shell verdict.
 
 For a CHILD event, the identity lane only helps a consumer the handle actually
 delivers to: the session handle fail-closes every low-fidelity child permission
@@ -453,7 +468,7 @@ HTTP response.
 | Notification | Event Kind | Fields |
 |-------------|-----------|--------|
 | `_kiro.dev/compaction/status` | `compaction_status` | `text` = started/completed/failed, `title` = summary |
-| `_kiro.dev/clear/status` | `clear_status` | (none) |
+| `_kiro.dev/clear/status` | `clear_status` | (none); also invalidates the essential-context receipt (`providers.md`) |
 | `_kiro.dev/agent/switched` | `agent_switched` | `text` = new agent name |
 | `_kiro.dev/mcp/oauth_request` | `mcp_oauth_request` | `server_name`, `oauth_url` |
 | `_kiro.dev/mcp/server_initialized` | `mcp_server_initialized` | `server_name` |
@@ -732,8 +747,20 @@ response length.
   which synthesize a terminal and return while the real kiro-cli turn keeps
   emitting). Permission REQUESTS are answered rather than dropped; everything else
   is discarded, which used to happen with no count and no log. It now counts the
-  discarded frames and emits **one** WARNING per turn carrying that count — one
+  discarded frames, classifies each one, and emits **one** WARNING per turn — one
   line regardless of how many frames drained, so a burst cannot flood the log.
+  The classification is structural: a JSON-RPC response (`method` is `None`, `id`
+  set) whose result carries a non-empty string `stopReason` is by construction
+  the abandoned turn's terminal — a response can never reach the permission
+  branch, which requires `method` — and an error response is terminal-shaped
+  too (a failed turn was still terminated). The warning states the total AND how
+  many of the discards were terminal-shaped (explicitly including zero), plus
+  their distinct `stopReason` values — closed protocol values (`STOP_REASON_*`)
+  only, whitespace-normalized before matching; any other wire string (including
+  a non-string) is never logged verbatim. It deliberately does NOT attribute a
+  counted response to the abandoned turn: a late error answer to a concurrently
+  timed-out command call (re-injected by `_wait_for_response`'s `finally`) is
+  indistinguishable in the drain, so the line states the shape, not the owner.
   This matters downstream: a turn whose terminal was destroyed here reaches the
   dashboard as an empty response with no attributable cause. The count is NOT
   bridged into `chat_runner` — see the note below.

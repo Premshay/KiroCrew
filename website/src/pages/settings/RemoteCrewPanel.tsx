@@ -37,6 +37,8 @@ import {
   MoreHorizontal,
   Pencil,
   Play,
+  Cloud,
+  X,
 } from 'lucide-react'
 import {
   api,
@@ -48,6 +50,7 @@ import {
   type CloudCoords,
   type RemoteProvisioner,
 } from '../../api/client'
+import { BUILTIN_PROVISIONER_ID, WARM_SET_CAP_AUTO_CEILING } from '../../utils/remoteCrew'
 import { Card, Btn, Badge, IconButton } from '../../components/ui'
 import { SettingsToggle } from '../../components/settings'
 import {
@@ -85,6 +88,18 @@ import {
 /** A launch job the user is still waiting on (not yet a switchable crew). */
 const IN_PROGRESS: LaunchJob['status'][] = ['pending', 'running', 'awaiting_signin']
 const isInProgress = (j: LaunchJob) => IN_PROGRESS.includes(j.status)
+
+const connectionTypeLabel = (inst: InstanceView): string =>
+  inst.connection_method === 'ssm'
+    ? i18nT('pages.settings.remoteCrewPanel.type_ssm')
+    : i18nT('pages.settings.remoteCrewPanel.type_ssh')
+
+// The badges compress to acronyms (EC2 / SSM / SSH) a first-time reader may
+// not know; the hover title spells out what each one means.
+const connectionTypeHint = (inst: InstanceView): string =>
+  inst.connection_method === 'ssm'
+    ? i18nT('pages.settings.remoteCrewPanel.transport_hint_ssm')
+    : i18nT('pages.settings.remoteCrewPanel.transport_hint_ssh')
 
 /** Remembered across navigation — see the state declarations for why. */
 const CLOUD_PROFILE_KEY = 'mc-cloud-profile'
@@ -322,14 +337,17 @@ function CrewRow({
 }) {
   const connected = inst.status.state === 'connected'
   const isCloud = cloudTag !== null
-  // An SSM machine with no matching launch job is NOT necessarily hand-added: the CLI
-  // launcher registers real cloud crews the same way, and those never produce a launch
-  // job in this gateway's store. Calling them "added by you" and offering the plain
-  // one-click Remove would unregister a live, billing instance and take away the only
-  // place the dashboard could still delete it. We cannot prove which it is, so treat it
-  // as possibly-cloud: same confirm step, and copy that says what Remove does and does
-  // not do.
-  const unverifiedCloud = !isCloud && inst.connection_method === 'ssm' && !!inst.ssm_target
+  // Two persisted signals mark a row possibly-cloud when no launch job matches: an
+  // EC2 stamp (`provisioner_id`), and an SSM target — the CLI launcher registers real
+  // cloud crews the same way, and those never produce a launch job in this gateway's
+  // store. Calling either "added by you" would invite a Remove that unregisters a
+  // live, billing instance and takes away the only place the dashboard could still
+  // delete it. We cannot prove which it is, so treat it as possibly-cloud: same
+  // confirm step, and copy that says what Remove does and does not do.
+  const unverifiedCloud =
+    !isCloud &&
+    (inst.provisioner_id === BUILTIN_PROVISIONER_ID ||
+      (inst.connection_method === 'ssm' && !!inst.ssm_target))
   // A stop/start this row asked for is still in flight.
   const lifecycleBusy = busy === `stop:${cloudTag}` || busy === `start:${cloudTag}`
   // States that occupy the row's second control slot with an inline button.
@@ -346,7 +364,20 @@ function CrewRow({
         <div className="min-w-0">
           <div className="text-text-strong text-sm font-medium truncate">{inst.name}</div>
           <div className="text-[12px] text-muted truncate">
-            <span className="uppercase tracking-wide text-muted-strong">{inst.connection_method === 'ssm' ? 'SSM' : 'SSH'}</span>{' '}
+            {(inst.provisioner_id === BUILTIN_PROVISIONER_ID || isCloud) && (
+              <Badge
+                variant="aim"
+                className="mr-1"
+                title={i18nT('pages.settings.remoteCrewPanel.source_ec2_hint')}
+                aria-label={i18nT('pages.settings.remoteCrewPanel.source_ec2_hint')}
+              >
+                <Cloud className="lucide-inline" />
+                {i18nT('pages.settings.remoteCrewPanel.source_ec2')}
+              </Badge>
+            )}
+            <Badge variant="muted" className="mr-1" title={connectionTypeHint(inst)} aria-label={connectionTypeHint(inst)}>
+              {connectionTypeLabel(inst)}
+            </Badge>
             {target}
             {inst.connection_method === 'ssm' && inst.aws_region ? ` (${inst.aws_region})` : ''} {i18nT('pages.settings.instancesPanel.port_2')} {inst.remote_port}
           </div>
@@ -354,9 +385,14 @@ function CrewRow({
           <div className="text-[11px] text-muted-strong mt-1">
             {isCloud
               ? i18nT('pages.settings.remoteCrewPanel.launched_by_kiro_crew')
-              : unverifiedCloud
-                ? i18nT('pages.settings.remoteCrewPanel.unverified_cloud_note')
-                : `${i18nT('pages.settings.remoteCrewPanel.added_by_you')} · ${i18nT('pages.settings.remoteCrewPanel.doesnt_manage')}`}
+              : inst.provisioner_id === BUILTIN_PROVISIONER_ID
+                // An EC2-stamped row wears the EC2 badge, whose hint says it WAS
+                // launched by the EC2 launcher — the caption must agree with the
+                // badge, not hedge about whether AWS resources exist.
+                ? i18nT('pages.settings.remoteCrewPanel.stamped_ec2_note')
+                : unverifiedCloud
+                  ? i18nT('pages.settings.remoteCrewPanel.unverified_cloud_note')
+                  : `${i18nT('pages.settings.remoteCrewPanel.added_by_you')} · ${i18nT('pages.settings.remoteCrewPanel.doesnt_manage')}`}
           </div>
         </div>
       </div>
@@ -759,7 +795,6 @@ export function RemoteCrewPanel() {
   // `seq` counts REBASES, and is used as the form's React key: adopting the current
   // record rewrites the draft's values, and a mounted form cannot re-seed itself.
   const editDraft = useAppSelector(s => s.instances.crewForms?.edit ?? null)
-  const editDirty = editDraft !== null
   // Which row's Edit was refused, not a bare flag: the refusal has to render at
   // the row the user actually clicked. Shown once at the bottom of the Card it
   // could sit off-screen in a long crew list, so the click looked like a no-op.
@@ -774,7 +809,12 @@ export function RemoteCrewPanel() {
   // row disappears on its own when the teardown finishes.
   const [deletingTags, setDeletingTags] = useState<Set<string>>(new Set())
   const [actionErr, setActionErr] = useState<string | null>(null)
-  const [diagNote, setDiagNote] = useState<string | null>(null)
+  // `kind` decides the surface: only `warn` (a negative ladder verdict, or the
+  // tunnel's own `status.error`) is an error. `ok` / `info` describe a state that
+  // has not gone wrong — healthy, or simply not connected yet — and render as a
+  // status note, never as a red ErrorNotice with an agent hand-off. Mirrors
+  // InstancesPanel's classification.
+  const [diagNote, setDiagNote] = useState<{ kind: 'ok' | 'info' | 'warn'; text: string } | null>(null)
   // The diagnosis note's own report, so the hand-off carries the ladder's verdict
   // code and probe chain rather than the `id: reason` string on screen. Held as an
   // object because message text is not an identity: two crews unreachable the same
@@ -939,7 +979,7 @@ export function RemoteCrewPanel() {
   })
 
   const instances = useMemo(() => instancesQuery.data?.instances ?? [], [instancesQuery.data])
-  const warmCap = instancesQuery.data?.warm_set_cap || 5
+  const warmCap = instancesQuery.data?.warm_set_cap || WARM_SET_CAP_AUTO_CEILING
 
   // A draft outlives its form ON PURPOSE, which means it can also outlive the CREW
   // it belongs to: Remove a crew mid-edit and the draft stays keyed by that id, so
@@ -1001,7 +1041,7 @@ export function RemoteCrewPanel() {
   const cloudTagByInstanceId = useMemo(() => {
     const m = new Map<string, string>()
     for (const j of launches) {
-      if (j.instance_id && (j.provider_id ?? 'aws_ec2') === 'aws_ec2') m.set(j.instance_id, j.tag)
+      if (j.instance_id && (j.provider_id ?? BUILTIN_PROVISIONER_ID) === BUILTIN_PROVISIONER_ID) m.set(j.instance_id, j.tag)
     }
     return m
   }, [launches])
@@ -1038,20 +1078,40 @@ export function RemoteCrewPanel() {
     mutationFn: (id: string) => api.instanceStatus(id, true),
     onMutate: () => { setActionErr(null); setDiagNote(null); setDiagReport(null) },
     onSuccess: (st, id) => {
-      const reason = st.diagnosis?.reason || st.error
-      if (reason) setDiagNote(`${id}: ${reason}`)
+      const code = st.diagnosis?.code
+      // Two verdicts are BENIGN: `ok`, and `not_connected` — which is `ok: false`
+      // on the wire but whose reason is guidance ("click Connect"), not a failure.
+      // Neither may label an error surface or reach the failure report.
+      const benign = code === 'ok' || code === 'not_connected'
+      const failing = st.diagnosis && !benign ? st.diagnosis : undefined
+      // Displayed text, most specific first: a FAILING ladder verdict names the
+      // broken link, so it wins; otherwise the tunnel's live `status.error`; and
+      // only then a benign verdict's own reason. The ladder result is the last
+      // RUN, so a stale "All checks passed" / "click Connect" must never label a
+      // red notice whose real cause is the live error.
+      const reason = failing?.reason || st.error || st.diagnosis?.reason
+      // A benign verdict is only benign while the tunnel has no error of its own.
+      const kind: 'ok' | 'info' | 'warn' =
+        st.error || failing ? 'warn' : code === 'ok' ? 'ok' : code === 'not_connected' ? 'info' : 'warn'
+      if (reason) setDiagNote({ kind, text: `${id}: ${reason}` })
       // Journal unconditionally, healthy verdict included: the recorder's
       // no-failure path is what clears its de-dup signature, so skipping the call
       // on a healthy diagnose would leave the signature standing and suppress the
       // next identical failure. It returns null when there is nothing to describe.
+      // A benign verdict is stripped from the status handed over: the recorder
+      // treats any not-ok verdict as a failure, so `not_connected` would otherwise
+      // be journaled as a system error (the #11110 defect by another path), and a
+      // stale benign verdict beside a live error would decorate that error's
+      // report with a probe chain that says nothing is wrong.
       const inst = instances.find(i => i.id === id)
+      const { diagnosis: _omitted, ...withoutDiagnosis } = st
       setDiagReport(reportInstanceFailure({
         id,
         name: inst?.name || id,
         transport: inst?.connection_method === 'ssm' ? 'ssm' : 'ssh',
-        status: st,
+        status: benign ? withoutDiagnosis : st,
         stage: 'connect',
-        fallbackMessage: reason || '',
+        fallbackMessage: kind === 'warn' ? reason || '' : '',
       }))
     },
     onError: (e, id) => setActionErr(i18nT('pages.settings.instancesPanel.diagnose_failed', { id, error: errMsg(e, i18nT('pages.settings.instancesPanel.unknown_error')) })),
@@ -1276,19 +1336,44 @@ export function RemoteCrewPanel() {
           message here (a refused connect, a failed diagnose, a rejected launch)
           is a gateway-side failure the agent can look into. */}
       {actionErr && <ErrorNotice message={actionErr} onDismiss={() => setActionErr(null)} className="mb-3" askAgent />}
-      {/* A diagnosis names the broken link (`diagnosis.reason`, or the tunnel's
-          own `status.error`), so it is an error surface, not a status line. The
-          structured `report` is passed when the journal produced one, so the
-          hand-off carries the transport and stage rather than a message match. */}
-      {diagNote && (
+      {/* A `warn` diagnosis names the broken link (`diagnosis.reason`, or the
+          tunnel's own `status.error`), so it is an error surface. The structured
+          `report` is passed when the journal produced one, so the hand-off carries
+          the transport and stage rather than a message match. `ok` / `info`
+          describe a state that has not gone wrong and stay a status note — a
+          healthy "All checks passed" must not paint red or offer an agent hand-off. */}
+      {diagNote?.kind === 'warn' && (
         <ErrorNotice
-          message={diagNote}
+          message={diagNote.text}
           report={diagReport ?? undefined}
           askAgent
           onDismiss={() => { setDiagNote(null); setDiagReport(null) }}
           className="mb-3"
           testId="remote-crew-diagnosis"
         />
+      )}
+      {diagNote && diagNote.kind !== 'warn' && (
+        <div
+          role="status"
+          data-testid="remote-crew-diagnosis-status"
+          className={
+            'mb-3 flex items-start gap-2 px-3 py-2 text-[13px] rounded-md border ' +
+            (diagNote.kind === 'ok'
+              ? 'bg-ok/10 text-ok border-ok/30'
+              : 'bg-accent/10 text-accent border-accent/30')
+          }
+        >
+          <Stethoscope size={14} className="lucide-inline mt-0.5 shrink-0" />
+          <span className="flex-1 break-words">{diagNote.text}</span>
+          <button
+            type="button"
+            aria-label={i18nT('pages.settings.instancesPanel.dismiss_diagnosis')}
+            className="shrink-0 opacity-70 hover:opacity-100"
+            onClick={() => { setDiagNote(null); setDiagReport(null) }}
+          >
+            <X size={12} />
+          </button>
+        </div>
       )}
     </>
   )
@@ -1370,7 +1455,12 @@ export function RemoteCrewPanel() {
                     editing={editingId === inst.id}
                     blocked={editBlockedId === inst.id}
                     onEdit={id => {
-                      if (id !== null && editingId !== null && id !== editingId && editDirty) {
+                      // Switching rows would unmount another crew's draft.
+                      if (
+                        id !== null
+                        && editDraft !== null
+                        && id !== editDraft.id
+                      ) {
                         setEditBlockedId(id)
                         return
                       }
@@ -1409,10 +1499,14 @@ export function RemoteCrewPanel() {
                       const next =
                         draft === null
                           ? null
-                          : { id: inst.id, draft, seq: editDraft?.id === inst.id ? editDraft.seq : 0 }
+                          : {
+                              id: inst.id, draft,
+                              seq: editDraft?.id === inst.id ? editDraft.seq : 0,
+                            }
                       // Same values, same action: the report fires on every keystroke,
                       // and dispatching an equal-but-new object re-renders for nothing.
                       if (JSON.stringify(editDraft) === JSON.stringify(next)) return
+                      if (next === null) setEditBlockedId(null)
                       dispatch(setCrewEditForm(next))
                     }}
                     // Clearing editingId without clearing the refusal left the UI

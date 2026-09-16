@@ -24,6 +24,53 @@ store field. An absent protected record for a V2 run returns
 legacy absence. A readable legacy run with no memory binding keeps V1. Retry and
 continuation preserve the store even when the parent uses different memory.
 
+The protected run record also carries the admitted `memory_mode`. Recreating an
+existing record can only retain or tighten that mode; replacing the editable
+`state.json` or changing its parent cannot change the protected value. Mode
+restoration refuses missing, malformed and legacy records without a mode rather
+than interpreting unknown admission as persistent. Store-only legacy lookup keeps
+its separate compatibility contract. The creation caller must supply the mode
+captured at admission, not re-read a replacement parent when queued work starts.
+`SubagentManager` accepts a trusted `memory_mode_for_session` resolver and freezes
+its answer before queueing or waiting for approval. The queue carries that value
+to the started `SubagentInfo`, and `_log_spawned` publishes it with the binding.
+An invalid answer refuses admission; failure to publish the binding blocks provider
+allocation for Global runs as well as named stores. Standalone embedders without
+a resolver use persistent mode; the gateway must wire its own session-policy resolver.
+Before allocating a continuation's provider, the shared run path restores the
+original conversation's protected mode off-loop and combines it with the new
+caller's admitted mode. It tightens both protected records without rewriting the
+original `state.json`; later continuations, including after restart, cannot undo
+that restriction. Memory calls refuse while this recovery is pending. Failure
+prevents provider allocation, and repeated cancellation drains an in-flight mode
+publication before returning. The same allocation boundary covers direct manager
+calls and automatic follow-ups, not only the HTTP continuation route.
+
+Dedicated subagents call `messaging.identity.publish_turn_identity` with their
+own session key before every stream attempt, including continuation and
+transient retries. The publisher resolves the currently registered provider's
+host PID through `SessionManager.get_pid`, so a replaced process receives its
+own process-start-bound record before its next prompt. Cleanup identity and the
+protected dispatch binding do not substitute for this publication. Shared
+sessions skip this writer: they do not own the runtime's PID mapping.
+
+Memory-route session recognition checks the full dedicated child key in
+`SessionManager`, including the original conversation key reused on continuation.
+Shared children are not entries in that manager: `has_live_shared_session` checks
+an active, unreaped run and the exact handle queue in the live runtime registry.
+A completed run, retained transcript, parent PID, or destroyed/replaced handle
+cannot provide this recognition. The existing handle destruction and dedicated
+reset paths revoke it without an extra registry or persistence lifecycle.
+Private member sessions still require dedicated runtimes and their own proof;
+recognition does not bypass store ownership or incognito/temporary policy.
+
+The private-workflow E2E attaches an authenticated owner WebSocket before nested
+spawn dispatch, waits for registration, and approves only the returned spawn's
+matching request through the existing one-shot HTTP approval route. It grants
+no session trust or global auto-approval. Result polling reads the complete
+unchanged JSON stream, stops on a failed terminal child, and reports only fixed
+state/reason labels plus missing-file and non-JSON poll counts.
+
 ## Constants
 
 | Constant | Value | Purpose |
@@ -316,6 +363,7 @@ An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_c
 
 - `_reaper_loop`: sweeps every 60s, calls `_force_reap` on expired agents
 - `_force_reap`: reset with 30s timeout → SIGKILL fallback → mark done → fire `subagent_done` WS event
+- **Startup-stall admission ends when the first provider stream begins.** A provider may create its child process lazily from `stream()`, so a missing PID before the first response is not proof that execution never started. The marker resets for every recovery execution; the startup watchdog may reap only a subagent with no first stream, no runtime PID, and no completed turn. The ordinary wall-clock deadline remains unchanged.
 - **Terminal completion is arbitrated by FOUR separate guards, not by `reaped` alone.** Two paths can finish a subagent — `_force_reap` and `_run`'s `finally` — and between them there are four distinct one-time concerns. Earlier revisions tried to arbitrate them with `reaped` plus `done` and every attempt satisfied two while breaking a third (duplicate delivery when the marker was set late; a lost outcome when it was set early and the reaper was cancelled; a lost outcome when the claim was handed back to a run that had already exited; and finally **no reporter at all plus a leaked concurrency slot** when the report claim was gated on `not info.done`). The guards are now:
   1. **`info.reaped` — classification.** Was this a deliberate reap? The cancel-recovery scheduler reads it, and the marker MUST precede the intentional cancel (see the intentional-cancel rule above) or an unexpected-cancel respawn fires on the run being killed. Unchanged.
   2. **`if not info.done` — the terminal RECORD.** Error synthesis, failure stat, tombstone, cost. First-arrival-wins, so it is never written twice (pinned by `test_subagent.py::TestOnDoneTimeout::test_force_reap_skips_tombstone_when_already_done`).

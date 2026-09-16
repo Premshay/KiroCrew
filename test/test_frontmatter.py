@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from source_corpus import repo_files_named, repo_root
 from yaml_helpers import load_with
 
 from kiro_crew import history
@@ -136,13 +137,17 @@ SKILL_LOADER_EXPECTED: dict[str, dict[str, str]] = {
     "four_dash_fences": {},
     "indented_shadow_before": {"k": "real"},
     "leading_ws_before_opener": {},
-    "mismatched_quotes": {"k": "a"},
+    # Deliberate accepted-input surface, not drift: unwrapping removes one
+    # MATCHED level, so a mismatched pair is content and stays byte-identical.
+    "mismatched_quotes": {"k": "\"a'"},
     "no_closer": {},
     "no_colon_line": {"name": "x"},
     "opener_junk_with_colon": {},
     "opener_trailing_junk": {},
     "plain_prose": {},
-    "quoted_values": {"desc": "single", "multi": "double", "name": "quoted"},
+    # Deliberate accepted-input surface: a doubled wrapper loses exactly one
+    # level per read.
+    "quoted_values": {"desc": "single", "multi": '"double"', "name": "quoted"},
     "simple": {"description": "hello", "name": "x"},
     "space_indented_key": {"name": "x"},
     "tab_indented_key": {"name": "x"},
@@ -179,13 +184,17 @@ ONBOARDING_EXPECTED: dict[str, tuple[dict[str, str], str]] = {
     "four_dash_fences": ({}, "----\nkey: v\n----\nbody\n"),
     "indented_shadow_before": ({"k": "real"}, ""),
     "leading_ws_before_opener": ({}, "\n  ---\nname: x\n---\n"),
-    "mismatched_quotes": ({"k": "a"}, ""),
+    # Deliberate accepted-input surface, matching SKILL_LOADER: one matched
+    # level of quotes comes off, a mismatched pair is content.
+    "mismatched_quotes": ({"k": "\"a'"}, ""),
     "no_closer": ({}, "---\nname: x\n"),
     "no_colon_line": ({"name": "x"}, ""),
     "opener_junk_with_colon": ({"name": "x"}, ""),
     "opener_trailing_junk": ({"name": "x"}, ""),
     "plain_prose": ({}, "no frontmatter here\nkey: value\n"),
-    "quoted_values": ({"desc": "single", "multi": "double", "name": "quoted"}, ""),
+    # Deliberate accepted-input surface, matching SKILL_LOADER: a doubled
+    # wrapper loses exactly one level.
+    "quoted_values": ({"desc": "single", "multi": '"double"', "name": "quoted"}, ""),
     "simple": ({"description": "hello", "name": "x"}, "body"),
     "space_indented_key": ({"name": "x", "steps": "do x"}, ""),
     "tab_indented_key": ({"name": "x", "steps": "tabbed"}, ""),
@@ -329,6 +338,78 @@ class TestSkillUpdateDialect:
     def test_none_and_empty(self) -> None:
         assert history._frontmatter_value(None, "description") == ""
         assert history._frontmatter_value("", "description") == ""
+
+
+class TestQuoteUnwrapping:
+    """One MATCHED level of wrapping quotes comes off; content quotes stay.
+
+    The distinction is what a run-strip of quote characters cannot make: it
+    eats a quote the author wrote as content, so the file on disk looks right
+    while the agent is handed a different description than the author wrote.
+    These cases lock the matched-pair semantics in.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            # A quote that is content stays content, byte-identical.
+            ('say "hi"', 'say "hi"'),
+            ('ends with "', 'ends with "'),
+            ('"starts and runs', '"starts and runs'),
+            ("it's a mess'", "it's a mess'"),
+            # A matched wrapping pair comes off — exactly one level.
+            ("'quoted'", "quoted"),
+            ('"quoted"', "quoted"),
+            ('""quoted""', '"quoted"'),
+            # The single-quoted grammar's one escape collapses.
+            ("'it''s'", "it's"),
+            ("''''", "'"),
+            # Mismatched edges are not a wrapper.
+            ("\"a'", "\"a'"),
+            ("'a\"", "'a\""),
+            # Degenerate shapes: a lone quote, an empty pair.
+            ('"', '"'),
+            ("'", "'"),
+            ('""', ""),
+            ("''", ""),
+        ],
+    )
+    def test_one_matched_level_comes_off(self, raw: str, expected: str) -> None:
+        text = f"---\nk: {raw}\n---\n"
+        for dialect in (SKILL_LOADER, STEERING_LOADER, ONBOARDING_IMPORT):
+            got = parse_frontmatter(text, dialect)["k"]
+            assert got == expected, f"{dialect.extraction}: {raw!r} -> {got!r}"
+
+    def test_matches_the_yaml_oracle_on_well_formed_quoting(self) -> None:
+        # On values a real YAML parser accepts, unwrapping agrees with it —
+        # the run-strip did not (it collapsed every level and ate escapes).
+        for raw in ('"quoted"', "'quoted'", "'it''s'", "''''", 'say "hi"'):
+            text = f"k: {raw}\n"
+            want = load_with(_StringScalarLoader, text)["k"]
+            got = parse_frontmatter(f"---\n{text}---\n", SKILL_LOADER)["k"]
+            assert got == want, f"{raw!r}: yaml={want!r} reader={got!r}"
+
+    def test_an_escaped_apostrophe_does_not_expose_a_quoted_hash(self) -> None:
+        # GPT review, head 11b06f861. The comment splitter located a
+        # single-quoted scalar's closing delimiter at the FIRST quote after the
+        # opener — the first half of an ``''`` escape — so everything after it
+        # was scanned for a comment and an in-scalar ``#`` truncated the value:
+        # ``'Bob''s # drafts/*.md'`` read back as ``'Bob''s`` where a YAML
+        # reader (kiro-cli, this document's other consumer) reads the whole
+        # pattern and no comment. The closing delimiter is the first UNPAIRED
+        # quote, exactly as YAML scans it.
+        text = "---\nfileMatchPattern: 'Bob''s # drafts/*.md'\n---\n"
+        want = load_with(_StringScalarLoader, text.split("---")[1])["fileMatchPattern"]
+        assert want == "Bob's # drafts/*.md"  # the oracle reads it whole
+        got = parse_frontmatter(text, STEERING_LOADER)["fileMatchPattern"]
+        assert got == want, f"reader={got!r}"
+
+    def test_a_real_comment_after_an_escaped_apostrophe_still_splits(self) -> None:
+        # The pair-skip must not swallow a genuine trailing comment.
+        assert split_inline_comment(" 'it''s' # note") == (" 'it''s'", " # note")
+        assert parse_frontmatter(
+            "---\nk: 'it''s' # note\n---\n", STEERING_LOADER
+        )["k"] == "it's"
 
 
 class TestTheLiteralFoldTheSkillEditorSimulates:
@@ -791,19 +872,22 @@ class TestTheRepoSkillFileCorpus:
         }
     )
 
-    @staticmethod
-    def _repo_root() -> Path:
-        return Path(__file__).resolve().parent.parent
-
     @classmethod
     def _skill_files(cls) -> list[tuple[str, str]]:
-        root = cls._repo_root()
+        """Every ``SKILL.md`` the checkout holds, generated trees excluded.
+
+        Enumerated through ``source_corpus.repo_files_named`` rather than
+        ``rglob``, which also reaches into a nested worktree and reported ITS copy
+        of a shipped skill as the offender below. The generated-tree filter stays
+        here because that scope is this gate's contract, not the enumerator's.
+        """
+        root = repo_root()
         out: list[tuple[str, str]] = []
-        for path in sorted(root.rglob("SKILL.md")):
-            rel = path.relative_to(root).as_posix()
-            if any(part in ("node_modules", ".git", "dist", "build") for part in path.parts):
+        for path in repo_files_named("SKILL.md"):
+            rel = path.relative_to(root)
+            if any(part in ("node_modules", "dist", "build") for part in rel.parts):
                 continue
-            out.append((rel, path.read_text(encoding="utf-8")))
+            out.append((rel.as_posix(), path.read_text(encoding="utf-8")))
         return out
 
     @staticmethod
@@ -1481,6 +1565,10 @@ class TestWrittenValuesStayLoadableYaml:
         "src # old/*.ts",
         # Ordinary, and deliberately boring: these must not regress.
         "src/**/*.ts", "?.ts", "-x.ts", "a: b", "  padded  ", "", "it's ok", "日本語/*.ts",
+        # Single-quote-edged values: the writer's double-quoted form carries
+        # them, and the reader removes exactly the one wrapping level the
+        # writer added, so each survives both readers byte-identically.
+        "'quoted'", "trailing'", "'leading", "'",
     ]
 
     @pytest.mark.parametrize("value", ROUND_TRIP)
@@ -1541,10 +1629,13 @@ class TestWrittenValuesStayLoadableYaml:
         assert yaml.safe_load(doc.split("---")[1])["fileMatchPattern"] == value
         assert parse_frontmatter(doc, STEERING_LOADER)["fileMatchPattern"] == value
 
-    @pytest.mark.parametrize("value", ['a"b', "a\\b", "'quoted'", "trailing'"])
+    @pytest.mark.parametrize("value", ['a"b', "a\\b"])
     def test_unspellable_values_are_refused_not_mangled(self, value: str) -> None:
-        # This writer emits no escape sequences and its reader understands none,
-        # so there is no spelling both agree on. Refusing beats writing a document
-        # that loads as something else.
+        # This writer emits no escape sequences and its reader processes none,
+        # so a value carrying a double quote or a backslash has no spelling both
+        # agree on. Refusing beats writing a document that loads as something
+        # else. (Single-quote-edged values are spellable — see ROUND_TRIP: the
+        # reader removes exactly one wrapping level, so the writer's
+        # double-quoted form survives.)
         with pytest.raises(ValueError):
             set_frontmatter_fields("---\na: b\n---\n", {"fileMatchPattern": value}, STEERING_LOADER)

@@ -1,4 +1,7 @@
 [
+  "pages.overview.vectorMemoryCard.repair_deferred",
+  "pages.overview.vectorMemoryCard.repair_invalidation",
+  "pages.overview.vectorMemoryCard.repair_vectors",
   "app.n_more",
   "app.notification_count",
   "app.show_more_apps",
@@ -116,6 +119,7 @@
   "components.skillBrowserModal.file",
   "components.webPreviewPanel.annotate_clear_confirm",
   "components.webPreviewPanel.annotations_count",
+  "crewCapabilities.memberChanged",
   "pages.aidlc.taskDetailPanel.task_2",
   "pages.appsPage.agent",
   "pages.appsPage.app",
@@ -193,5 +197,6 @@
   "pages.webhooksPage.enabled_credentials",
   "pages.webhooksPage.switched_off_credentials_kept",
   "pages.worldsPage.agent",
-  "pages.worldsPage.slot"
+  "pages.worldsPage.slot",
+  "utils.toolCallTitle.and_more"
 ]

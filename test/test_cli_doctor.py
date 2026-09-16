@@ -20,6 +20,7 @@ import pytest
 
 from conftest import requires_symlinks
 from kiro_crew import cli_doctor, cron
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_PI
 
 
 class TestManagedServicePolicyDoctor:
@@ -633,16 +634,19 @@ class TestSelectedBackendProjectionRow:
         out = capsys.readouterr().out
         assert "withholds the whole server" in out
 
-    def test_the_shipped_tables_hold_no_unaddressed_no_channel_backend(self):
+    def test_the_shipped_tables_hold_exactly_the_declared_no_channel_backends(self):
         """The row's own subject, read off the SHIPPED tables rather than a stub.
 
-        Silence on every shipped backend is the correct state, and it is worth
-        pinning rather than leaving implicit: the case above supplies its
-        declaration, so nothing else in this class touches the real one. A
-        ``no-channel`` entry appearing here is not a failure of the row -- it must
-        simply be addressable, which ``McpProjection`` enforces and
-        ``test_provider_mirrors`` asserts -- but it IS the state an operator gets
-        told about, so a new one should be a deliberate change to this assertion.
+        A ``no-channel`` entry here is not a failure of the row -- it must simply be
+        addressable, which ``McpProjection`` enforces and ``test_provider_mirrors``
+        asserts -- but it IS the state an operator gets told about, so the set is
+        pinned by name and a new one is a deliberate change to this assertion.
+
+        ``pi`` is the one member, on evidence rather than absence: pi-acp accepts the
+        ``session/new`` MCP array and never hands it to the pi process (a stdio server
+        placed in it produced no error and no tool, verified live on pi-acp 0.0.33),
+        so the row below is what tells the operator a pi session carries none of
+        Kiro Crew's own tools. The case that follows pins that the row is rendered.
         """
         from kiro_crew.providers.mirrors import PROJECTIONS, ProjectionKind
 
@@ -651,7 +655,13 @@ class TestSelectedBackendProjectionRow:
             for backend, declared in PROJECTIONS.items()
             if declared.kind is ProjectionKind.NO_CHANNEL
         }
-        assert not gaps, f"a no-channel backend ships: {sorted(gaps)}"
+        assert gaps == {ACP_BACKEND_PI}, f"no-channel backends shipping: {sorted(gaps)}"
+
+    def test_the_real_pi_declaration_drives_the_no_channel_row(self, capsys):
+        """Read off the SHIPPED declaration: the operator is told, not left to find out."""
+        cli_doctor._doctor_selected_backend_projection(self._cfg("pi"))
+        out = capsys.readouterr().out
+        assert "carries none of Kiro Crew's own tools" in out
 
     def test_a_backend_that_does_receive_its_servers_prints_nothing(self, capsys):
         """Silence is the whole point on a stock install.
@@ -2015,6 +2025,38 @@ class TestEffectiveModelSection:
         assert "bound agent pin ('custom-agent'):" in out
         assert "out of date" not in out, "report must agree with the resolver"
         assert issues == []
+
+    def test_a_bound_markdown_agent_shows_the_file_that_holds_it(self, capsys) -> None:
+        """The "bound spec" line is the file the resolver read, so for a markdown
+        agent it names ``<name>.md``; a ``.json`` join would point the operator
+        at a file that does not exist."""
+        self._install_spec(None)
+        agents_dir = self._agents_dir()
+        md = agents_dir / "custom-agent.md"
+        md.write_text(
+            "---\nname: custom-agent\nmodel: claude-opus-4.8\n---\nprompt\n", encoding="utf-8"
+        )
+        cfg = self._bind_custom_agent(self._cfg("auto"), "custom-agent")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(cfg, "", issues)
+
+        out = capsys.readouterr().out
+        assert "decided by:  bound agent pin ('custom-agent')" in out
+        assert f"bound spec:  {str(md)!r}" in out
+        assert "custom-agent.json" not in out
+        assert issues == []
+
+    def test_a_bound_agent_with_no_spec_is_reported_as_missing(self, capsys) -> None:
+        self._install_spec(None)
+        cfg = self._bind_custom_agent(self._cfg("auto"), "custom-agent")
+        issues: list[str] = []
+
+        cli_doctor._doctor_effective_model(cfg, "", issues)
+
+        out = capsys.readouterr().out
+        assert "bound spec:  \u26a0\ufe0f  no spec for 'custom-agent' under" in out
+        assert "custom-agent.json" not in out
 
     def test_the_builtin_agent_shows_no_bound_tier(self, capsys) -> None:
         """Tier 2 is skipped for the built-in agent, so the list must not show

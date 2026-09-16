@@ -41,7 +41,14 @@ from kiro_crew.acp.types import (
     STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_END_TURN,
 )
-from kiro_crew.agent_discovery import project_agent_files, project_agent_name
+from kiro_crew.agent_discovery import (
+    SensitiveAgentSpecPathError,
+    agent_spec_stems,
+    project_agent_files,
+    project_agent_name,
+    read_agent_spec_strict,
+)
+from kiro_crew.agent_spec_format import is_markdown_spec, iter_agent_spec_files
 from kiro_crew.config.loader import (
     ACTIVATION_REVIEW,
     ConfigReadError,
@@ -74,8 +81,8 @@ from kiro_crew.hooks import (
     TOOL_AUTO_APPROVE,
     TOOL_DENY,
     event_is_spawn_run,
+    hook_gate_kwargs,
     safe_read_file_bytes,
-    validate_file_path,
 )
 from kiro_crew.llm_helpers import (
     record_interaction_event,
@@ -94,7 +101,7 @@ from kiro_crew.messaging.dispatch import admit_inbound_callback
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import canonical_key
-from kiro_crew.messaging.renderer import credential_redaction_notice
+from kiro_crew.messaging.renderer import redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
@@ -119,6 +126,7 @@ from kiro_crew.safety_override import (
 )
 from kiro_crew.security import (
     CREDENTIAL_REDACTION_TAGS,
+    EXFILTRATION_REDACTION_TAG_PREFIX,
     StreamRedactor,
     is_sensitive_path,
     redact,
@@ -136,6 +144,7 @@ from kiro_crew.slack.format import (
     TRUNCATION_NOTICE,
     _convert_tables,
     extract_options,
+    is_wait_identity,
     render_one_for_slack,
     split_message,
     strip_thinking_tags,
@@ -1024,10 +1033,10 @@ def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None
     """
     # Project-local agents take priority — kiro-cli resolves --agent against its
     # cwd before the user-level dir, so a project agent is the one that would run.
-    # Prefilter on the FILENAME first: this runs on the event loop, and reading
-    # every spec to compare its declared name stalls Slack and the gateway on a
-    # checkout with many agents or slow storage. At most the one matching file is
-    # read, to return the name it declares.
+    # Prefilter on the FILENAME first: the async callers hand this to a thread,
+    # but reading every spec to compare its declared name would still make a
+    # checkout with many agents or slow storage slow to answer. At most the one
+    # matching file is read, to return the name it declares.
     for spec in _discover_project_agents(project_dir):
         stem = spec.stem.removesuffix(".agent-spec")
         if stem != name and spec.stem != name:
@@ -1035,26 +1044,38 @@ def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None
         return project_agent_name(spec)
 
     agents_dir = kiro_agents_dir()
-    jsons = (
-        sorted(agents_dir.glob("*.json"), key=lambda f: (len(f.stem), f.stem))
+    specs = (
+        sorted(iter_agent_spec_files(agents_dir), key=lambda f: (len(f.stem), f.stem))
         if agents_dir.is_dir()
         else []
     )
     match = next(
-        (f for f in jsons if f.stem == name or f.stem.endswith(f"-{name}")),
+        (f for f in specs if f.stem == name or f.stem.endswith(f"-{name}")),
         None,
     )
     if not match:
         # Fallback: search companion-backend cc-plugins agents
         cc_match = _resolve_cc_agent_name(name)
         return cc_match
-    safe = validate_file_path(str(match))
-    if not safe:
-        return None
     try:
-        return json.loads(Path(safe).read_text(encoding="utf-8")).get("name", match.stem)
-    except (json.JSONDecodeError, OSError):
-        return match.stem
+        # The hardened reader resolves the path, vets the target and opens it
+        # with no reparse in ONE step, so a symlink swapped in between a check
+        # and the read is refused rather than followed.
+        data = read_agent_spec_strict(match, operation="slack_resolve_agent", source="slack")
+    except SensitiveAgentSpecPathError:
+        # A file whose target the path gate refuses is no agent at all, as it
+        # was when the path check ran here.
+        return None
+    except (ValueError, OSError):
+        # ValueError covers bad JSON, bad frontmatter and a non-UTF-8 read. A
+        # broken JSON spec still occupies its name, as it always has; a
+        # markdown file that does not parse is not a spec at all (a README,
+        # notes), the same rule the listing applies, so it does not resolve.
+        return None if is_markdown_spec(match) else match.stem
+    if not isinstance(data, dict):
+        return None if is_markdown_spec(match) else match.stem
+    declared = data.get("name")
+    return declared if isinstance(declared, str) and declared else match.stem
 
 
 # Frontmatter ``name:`` matcher for cc-plugins agent specs. Pre-compiled at
@@ -1104,9 +1125,12 @@ def _resolve_cc_agent_name(name: str, cc_plugins_dir: Path | None = None) -> str
 def _list_all_agent_names(cc_plugins_dir: Path | None = None) -> str:
     """Return a comma-separated list of all available agent names.
 
-    Merges ``~/.kiro/agents/*.json`` (by stem) with the cc-plugins agents from
-    :func:`_iter_cc_agent_names`. The internal ``kirocrew-lite`` variant is
-    hidden. Returns ``"(none found)"`` when empty.
+    Merges the ``~/.kiro/agents`` spec stems (see
+    :func:`kiro_crew.agent_discovery.agent_spec_stems`) with the cc-plugins
+    agents from :func:`_iter_cc_agent_names`. The internal ``kirocrew-lite``
+    variant is hidden. Returns ``"(none found)"`` when empty. Reads every
+    markdown candidate to decide whether it is a spec, so the async callers
+    run it in a thread rather than on the event loop.
 
     Note: this listing is unioned across both agent sources, but *activation*
     is not. cc-plugins (companion-backend) agents only actually load when
@@ -1120,7 +1144,11 @@ def _list_all_agent_names(cc_plugins_dir: Path | None = None) -> str:
     if agents_dir.is_dir():
         # Hide the internal kirocrew-lite variant from BOTH sources — a
         # ~/.kiro/agents/kirocrew-lite.json would otherwise leak into the list.
-        names.extend(f.stem for f in sorted(agents_dir.glob("*.json")) if f.stem != "kirocrew-lite")
+        names.extend(
+            stem
+            for stem in agent_spec_stems(agents_dir, operation="slack_list_agents", source="slack")
+            if stem != "kirocrew-lite"
+        )
     seen = set(names)
     for agent_name in _iter_cc_agent_names(cc_plugins_dir):
         if agent_name not in seen and agent_name != "kirocrew-lite":
@@ -1912,9 +1940,11 @@ async def _handle_slash_command(
             await slack.post_message(channel, "🔄 Reset to default agent.", reply_ts)
             await _add_phase_reaction(slack, channel, msg_ts, "done")
             return ""
-        resolved = _resolve_agent_name(agent_name, _thread_projects.get(session_key))
+        resolved = await asyncio.to_thread(
+            _resolve_agent_name, agent_name, _thread_projects.get(session_key)
+        )
         if not resolved:
-            names = _list_all_agent_names()
+            names = await asyncio.to_thread(_list_all_agent_names)
             await slack.post_message(
                 channel, f"❌ Unknown agent `{agent_name}`. Available: {names}", reply_ts
             )
@@ -2079,9 +2109,11 @@ async def _handle_slash_command(
             await slack.post_message(channel, "🔄 Thread agent reset.", reply_ts)
             await _add_phase_reaction(slack, channel, msg_ts, "done")
             return ""
-        resolved = _resolve_agent_name(agent_name, _thread_projects.get(session_key))
+        resolved = await asyncio.to_thread(
+            _resolve_agent_name, agent_name, _thread_projects.get(session_key)
+        )
         if not resolved:
-            names = _list_all_agent_names()
+            names = await asyncio.to_thread(_list_all_agent_names)
             await slack.post_message(
                 channel, f"❌ Unknown agent `{agent_name}`. Available: {names}", reply_ts
             )
@@ -2187,8 +2219,9 @@ async def _handle_slash_command(
             metadata={"user": user_id, "channel": channel, "project": resolved},
         )
         await sessions.remove(session_key)
-        # Discover project-local agents
-        project_agents = _discover_project_agents(resolved)
+        # Discover project-local agents: a directory listing of the checkout,
+        # so off the loop like the metadata write above.
+        project_agents = await asyncio.to_thread(_discover_project_agents, resolved)
         agent_info = ""
         if project_agents:
             names = ", ".join(
@@ -2254,9 +2287,11 @@ async def _handle_slash_command(
             if agent_name.lower() == "off":
                 agent_name = ""
             else:
-                resolved = _resolve_agent_name(agent_name, _thread_projects.get(session_key))
+                resolved = await asyncio.to_thread(
+                    _resolve_agent_name, agent_name, _thread_projects.get(session_key)
+                )
                 if not resolved:
-                    names = _list_all_agent_names()
+                    names = await asyncio.to_thread(_list_all_agent_names)
                     await slack.post_message(
                         channel,
                         f"Unknown agent `{agent_name}`. Available: {names}",
@@ -2586,6 +2621,19 @@ async def _handle_compact_command(
         sessions.release(session_key)
 
 
+def _is_sessions_keyword(text: str) -> bool:
+    """True when the whole stripped, lower-cased message is the bare
+    ``sessions`` keyword.
+
+    The ONE predicate shared by the native ``handle_message`` branch, the
+    transport ``maybe_handle_keyword_command`` branch, and the linked-thread
+    fall-through in ``maybe_route_linked_thread`` — keeping all three sites on
+    one helper guarantees the intercept matches exactly what the keyword
+    branches match, so the keyword cannot be swallowed by a linked thread.
+    """
+    return text.strip().lower() == "sessions"
+
+
 async def maybe_handle_keyword_command(
     text: str,
     slack: SlackClientOps,
@@ -2631,7 +2679,7 @@ async def maybe_handle_keyword_command(
     # global default), matching handle_message's main path.
     _agent = _thread_agents.get(session_key) or channel_agent or _get_default_agent() or None
     # ── Sessions keyword: list recent sessions (owner/allowed only) ──
-    if handle_sessions and text.strip().lower() == "sessions":
+    if handle_sessions and _is_sessions_keyword(text):
         if is_owner(user_id) or is_allowed_user(user_id):
             sel().log_api_access(
                 caller=user_id,
@@ -2744,8 +2792,9 @@ async def maybe_route_linked_thread(
     Returns ``True`` when the caller MUST return without further handling —
     either the message was routed into the linked dashboard slot, or an
     unauthorized user was denied. Returns ``False`` when normal routing should
-    continue: no dashboard state, no linked slot, or a ``!``-bang command
-    (which is intentionally allowed to fall through to normal handling).
+    continue: no dashboard state, no linked slot, a ``!``-bang command, or the
+    bare ``sessions`` keyword (both intentionally allowed to fall through to
+    normal handling, so control commands stay reachable in a linked thread).
 
     *route_pinned* makes *target_slot* authoritative instead of resolving the
     thread's CURRENT owner. An OPTIONS answer is accepted against the
@@ -2784,9 +2833,17 @@ async def maybe_route_linked_thread(
         await slack.post_message(channel, "Not authorized.", reply_ts)
         return True
 
-    # Let bang commands fall through to normal handling.
+    # Let bang commands and the bare ``sessions`` keyword fall through to
+    # normal handling. The predicate matches the keyword branches exactly
+    # (whole stripped, lower-cased message), so "sessions please" still routes
+    # to the linked slot. Other keywords (status, spawn, cron, ...) remain
+    # link-routed on purpose. A pinned OPTIONS answer is exempt: its text is a
+    # selected label being DELIVERED to the conversation that asked, and
+    # dropping it into the picker would strand that conversation forever.
     _first_word = text.strip().split(maxsplit=1)[0] if text.strip() else ""
     if _first_word in _BANG_TO_SLASH:
+        return False
+    if not route_pinned and _is_sessions_keyword(text):
         return False
 
     _linked_slot_key = _linked_slot.key
@@ -2985,7 +3042,7 @@ async def handle_message(
         return
 
     # ── Sessions keyword: list recent sessions ──
-    if text.strip().lower() == "sessions":
+    if _is_sessions_keyword(text):
         if is_owner(user_id) or is_allowed_user(user_id):
             sel().log_api_access(
                 caller=user_id,
@@ -3681,6 +3738,7 @@ async def handle_message(
                 blocks_reads=_slack_blocks_reads,
                 model_window=_model_window,
                 runtime_source="slack",
+                context_provider=client,
             )
         else:
             full_message = text
@@ -3803,8 +3861,15 @@ async def handle_message(
                 # NOT arm deny-by-default here (is_shell omitted): a shell tool
                 # with an unrecoverable command would otherwise render a
                 # misleading "blocked" message while the tool actually runs.
-                # A genuine deny-list / sensitive-path match still surfaces a
-                # (best-effort, non-enforcing) warning + audit.
+                # For the same reason this site deliberately does NOT use
+                # ``hook_gate_kwargs`` (the shared extraction every enforcing
+                # permission-request site threads): the params/diff-path tiers
+                # it would arm can also deny a call that is already executing,
+                # and this warning must never claim to have blocked one. The
+                # structural test in test_hooks.py names this site as the one
+                # informational exception. A genuine deny-list / sensitive-path
+                # match still surfaces a (best-effort, non-enforcing) warning +
+                # audit.
                 if context_builder:
                     tool_result = context_builder.hooks.on_tool_call(
                         event.title,
@@ -3906,7 +3971,13 @@ async def handle_message(
                 # streaming message now so Slack doesn't show an error.
                 # _ensure_stream_started() will open a new message when
                 # the next text chunk arrives after wait returns.
-                if tool_name == "wait" and use_slack_stream and stream_ts:
+                # Keyed on the tool's programmatic identity when the transport
+                # sent one (same rule as SlackRenderer); the title compare is the
+                # fallback for a frame without ``_meta.kiro``.
+                _is_wait = (
+                    is_wait_identity(event.tool_name) if event.tool_name else tool_name == "wait"
+                )
+                if _is_wait and use_slack_stream and stream_ts:
                     if _active_task_id:
                         _elapsed = _tool_elapsed_str()
                         _cancel_tool_timer()
@@ -3938,14 +4009,7 @@ async def handle_message(
                         event.title,
                         session_key=session_key,
                         agent=_agent or "",
-                        tool_kind=event.tool_kind,
-                        raw_params=event.raw_tool_params,
-                        diff_path=event.diff_path,
-                        command=event.shell_command,
-                        is_shell=event.is_shell,
-                        mcp_server_name=event.mcp_server_name,
-                        mcp_tool_name=event.tool_name,
-                        mcp_identity_trusted=event.mcp_identity_trusted,
+                        **hook_gate_kwargs(event),
                     )
                     if tool_result.action == TOOL_AUTO_APPROVE:
                         # The hook granted this by NAME (its `auto_approve_tools`
@@ -4348,12 +4412,17 @@ async def handle_message(
     # substitution happened (per-chunk, the StreamRedactor wire pass, the final
     # render, or the post-decorator scan). Sum every tag the redactor can emit
     # (`CREDENTIAL_REDACTION_TAGS`) so an encoded-credential-only reply is not
-    # missed.
+    # missed. The exfiltration-URL rewriter runs over this same text, so its tag
+    # is tallied too -- counted by `EXFILTRATION_REDACTION_TAG_PREFIX` prefix,
+    # because that tag interpolates the redacted domain and has no constant form
+    # to equality-compare. Kept as a separate count because the notice is worded
+    # by kind: the remedies differ (re-enter the secret vs re-check the URL).
     #
     # The thinking block (redacted separately below) adds to this SAME tally so a
     # single warning covers the turn if either the answer or the thinking was
     # rewritten -- one turn, one notice, never two identical warnings.
     _cred_redactions = sum(clean_text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
+    _url_redactions = clean_text.count(EXFILTRATION_REDACTION_TAG_PREFIX)
 
     # ── Review mode: ephemeral draft instead of public post ──
     if channel_activation == ACTIVATION_REVIEW:
@@ -4456,6 +4525,7 @@ async def handle_message(
         # condensed -- condensing can truncate, which would drop a placeholder
         # from the count even though the credential was still rewritten.
         _cred_redactions += sum(thinking_mrkdwn.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
+        _url_redactions += thinking_mrkdwn.count(EXFILTRATION_REDACTION_TAG_PREFIX)
         thinking_block = _condense_thinking(thinking_mrkdwn)
         if thinking_ts:
             try:
@@ -4482,13 +4552,13 @@ async def handle_message(
     # answer via stop_stream/chat_update above and the answer text must stay
     # exactly as redacted (never relaxed, never annotated inline). Best-effort --
     # a failed notice must not turn a delivered answer into a failed turn.
-    if _cred_redactions > 0:
+    if _cred_redactions > 0 or _url_redactions > 0:
         try:
             await slack.post_message(
-                channel, credential_redaction_notice(_cred_redactions), reply_ts
+                channel, redaction_notice(_cred_redactions, _url_redactions), reply_ts
             )
         except Exception:
-            logger.warning("Failed to post credential redaction notice", exc_info=True)
+            logger.warning("Failed to post redaction notice", exc_info=True)
 
     # Persist the turn BEFORE posting anything that invites an answer to it.
     # The control below carries a staleness token derived from this session's last

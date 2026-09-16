@@ -44,12 +44,12 @@ Node is only needed to *build* the dashboard. The prebuilt wheel, the DMG, the
 AppImage, and the Linux `.deb` / `.rpm` packages all ship the dashboard already
 bundled, so end users of those artifacts need neither Node nor a compiler.
 
-### Agent backend: `kiro-cli` (required)
+### Default agent backend: `kiro-cli`
 
-Kiro Crew drives an LLM through the **`kiro-cli`** agent over the
+Kiro Crew drives the default agent through **`kiro-cli`** over the
 [Agent Client Protocol](https://github.com/zed-industries/agent-client-protocol)
-(ACP). It is the only provider: `agent.provider` is fixed to `acp`, and the
-gateway spawns `kiro-cli acp --agent <name>`.
+(ACP). Other ACP backends can be selected with `agent.acp_backend`, but a fresh
+configuration uses Kiro and the gateway spawns `kiro-cli acp --agent <name>`.
 
 Install `kiro-cli` per its own docs, put it on your `PATH`, and log in:
 
@@ -59,8 +59,10 @@ kiro-cli login
 
 If `kiro-cli` is not on `PATH`, spawning a session fails with
 `kiro-cli not found in PATH`. On the first dashboard launch the **Set up Kiro**
-page walks through installing the CLI and completing device-code sign-in.
-`kirocrew doctor` reports both the binary and the login state.
+page detects the missing prerequisite, links to the official Kiro CLI setup
+guide, and shows the login commands to run yourself. Kiro Crew does not download
+the CLI or start its login flow. `kirocrew doctor` reports both the binary and
+the login state.
 
 ### Embeddings: nothing to install
 
@@ -365,7 +367,9 @@ on Linux, and an assisted NSIS Setup.exe on Windows, under
 drag-to-Applications layout carrying the opening animation's artwork. The
 Windows wizard keeps native controls and its
 per-user default while carrying matching Kiro Crew artwork through its sidebar
-and header. On macOS the default is ONE universal DMG: the Electron shell is
+and header. Its Finish page links to the external Kiro CLI setup guide and names
+the login command required by the default agent before offering to launch Kiro
+Crew. On macOS the default is ONE universal DMG: the Electron shell is
 lipo-merged, and the backend, which cannot be lipo-merged, ships as two complete
 PBS trees selected at launch by `process.arch`. The x86_64 backend is built
 under Rosetta 2, so a universal build needs an Apple-Silicon host;
@@ -450,6 +454,14 @@ app" interstitial.
 ## First run
 
 After installing by any path:
+
+Install Kiro CLI from <https://kiro.dev/cli/> and sign in for the default agent:
+
+```bash
+kiro-cli login
+```
+
+Then start Kiro Crew:
 
 ```bash
 kirocrew setup            # interactive wizard
@@ -904,6 +916,7 @@ sandbox probe names the failing step so you can tell them apart:
 | `unshare` fails and `kernel.unprivileged_userns_clone=0` | Debian-family legacy knob (defaults to 1 since Debian 11) | Set it to 1 |
 | `unshare` fails `EINVAL` / `ENOSYS` | Kernel built without `CONFIG_USER_NS` | None short of a different kernel |
 | Fails inside Docker/Podman | The container's seccomp filter denies `unshare` | Container run flags, **not** host config |
+| Both `unshare` steps pass, `mount(MS_REC\|MS_PRIVATE)` on `/` fails `EACCES` (or `EPERM`) | The container runtime's default AppArmor profile (`deny mount`), or a seccomp filter without `mount`; the Kubernetes default on AppArmor nodes | `--security-opt apparmor=unconfined` / Pod `appArmorProfile: Unconfined` plus a seccomp profile permitting `unshare` and `mount`, or `agent.sandbox_allow_unsandboxed_exec=true` — see [Kubernetes and AppArmor](docker.md#kubernetes-and-apparmor) |
 | RHEL/Fedora/Rocky/AL2023 | SELinux, not AppArmor | userns is enabled there; the profile is inert |
 
 To see which step is failing on your host:
@@ -917,8 +930,8 @@ sb.reset_backend(); print(sb.detect_backend(), sb._last_unshare_failure)"
 `kirocrew doctor` reports the same verdict without the one-liner, and the
 dashboard's **Sandbox unavailable** screen names the mechanism and the command
 for it directly — the probe classifies the failing step into one of
-`apparmor_userns`, `max_user_namespaces`, `userns_denied` or `no_user_ns`, which
-is the row of the table above that applies to you.
+`apparmor_userns`, `max_user_namespaces`, `userns_denied`, `no_user_ns` or
+`mount_denied`, which is the row of the table above that applies to you.
 
 ## Troubleshooting
 

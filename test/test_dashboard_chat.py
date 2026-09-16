@@ -50,6 +50,30 @@ def _arm_inner_client_handlers(inner):
     return inner
 
 
+def _provider_mock() -> AsyncMock:
+    """A stand-in for the ACP session provider a chat turn drives.
+
+    The turn surface (``stream``, ``shutdown``, ``approve_tool`` ...) is async,
+    so the double is an ``AsyncMock``. The telemetry accessors the runner reads
+    after every turn -- ``context_usage_pct``, ``context_window_tokens``,
+    ``context_used_tokens``, ``mcp_session_report``, ``available_models``, and the
+    inner client's ``pop_pending_oauth_requests`` -- are SYNCHRONOUS on the real
+    provider and are called without ``await``. Left as
+    ``AsyncMock`` children each call would hand back a coroutine nobody awaits,
+    which the interpreter reports at garbage collection against whichever later
+    test happens to trigger it. Tests override any accessor they assert on.
+    """
+    client = AsyncMock()
+    client.context_usage_pct = MagicMock(return_value=0.0)
+    client.context_window_tokens = MagicMock(return_value=0)
+    client.context_used_tokens = MagicMock(return_value=0)
+    client.mcp_session_report = MagicMock(return_value=None)
+    client.available_models = MagicMock(return_value=[])
+    client.client.pop_pending_oauth_requests = MagicMock(return_value=[])
+    _arm_inner_client_handlers(client.client)
+    return client
+
+
 def test_tool_call_ws_payload_preserves_shell_capability_signal():
     """The dashboard receives an explicit shell signal for indeterminate UX.
 
@@ -3831,6 +3855,7 @@ class TestKiroReadinessQueueHandoff:
             yield LLMEvent(kind=EVENT_COMPLETE)
 
         client = MagicMock()
+        _arm_inner_client_handlers(client.client)
         client.stream = stream
         client.stream_command = stream
         client.context_usage_pct = MagicMock(return_value=1.0)
@@ -5359,6 +5384,22 @@ class TestFlushSegment:
 
         assert slot.messages[-1]["meta"]["between_turn"] is True
 
+    def test_flush_segment_keeps_peer_metadata_and_ledger_interruption(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import chat_runner
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("peer-ledger")
+        sent = MagicMock()
+        monkeypatch.setattr(chat_runner.session_ledger_emit, "session_id_of", lambda _: "sid")
+        monkeypatch.setattr(chat_runner.session_ledger_emit, "live_turn", lambda _: 7)
+        monkeypatch.setattr(chat_runner.session_ledger_emit, "on_message_sent", sent)
+        chat_runner._flush_segment(
+            state, slot, "partial reply", broadcast=False,
+            message_meta={"between_turn": True}, interrupted=True,
+        )
+        assert slot.messages[-1]["meta"]["between_turn"] is True
+        sent.assert_called_once_with("sid", 7, text="partial reply", interrupted=True)
+
     def test_flush_segment_schedules_widget_registration(self, tmp_path, monkeypatch):
         """A segment containing an <mcwidget> auto-registers it as an artifact.
 
@@ -5515,7 +5556,7 @@ class TestRunChatSegmentFlush:
     @staticmethod
     def _make_mock_client(events):
         """Create a mock ACP client that yields the given LLMEvent list."""
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
 
         async def _stream(msg):
@@ -5681,6 +5722,46 @@ class TestRunChatSegmentFlush:
 
         rows = state.conversation_log.read_messages_chained("dashboard:s1")
         assert any(row.get("content") == "durable result" for row in rows)
+
+    @pytest.mark.asyncio
+    async def test_tool_turn_progress_claim_surfaces_idle_notice(self, tmp_path, monkeypatch):
+        """A mixed turn must not replay tools, but it must not claim it keeps running."""
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            EVENT_TOOL_CALL,
+            LLMEvent,
+        )
+
+        claim = (
+            "I'm continuing with the full local gate run; the new screenshot is "
+            "the lower frame above."
+        )
+        events = [
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="Prepared the gate script."),
+            LLMEvent(kind=EVENT_TOOL_CALL, title="write_file", tool_kind="write"),
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text=claim),
+            LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+        ]
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        state.refresh_slot_source_status = MagicMock()
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+        client = self._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "run the full gate")
+
+        notices = [m["content"] for m in slot.messages if m.get("role") == "notice"]
+        assert any("No further main-agent steps run" in text for text in notices)
+        assert any(
+            "Stop hook explicitly requests a bounded continuation" in text for text in notices
+        )
+        assert claim in [m["content"] for m in slot.messages if m.get("role") == "assistant"]
+        assert slot._queue == []
 
     @pytest.mark.asyncio
     async def test_idle_turn_boundary_refreshes_source_status(self, tmp_path, monkeypatch):
@@ -6010,7 +6091,7 @@ class TestRunChatNativeSubagentAttribution:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
 
         async def _stream(msg):
@@ -6181,7 +6262,7 @@ class TestRunChatCompactDeferredWait:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.context_window_tokens = MagicMock(return_value=0)
         client.context_used_tokens = MagicMock(return_value=0)
@@ -6548,7 +6629,7 @@ class TestTokenPersistenceBackfill:
         """Mock provider that exposes a nested client._model attribute,
         mirroring AcpClient/CcClient layout (provider.client._model).
         """
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         # Expose `client.client._model` like the real provider wrappers
         inner = MagicMock()
@@ -6850,7 +6931,7 @@ class TestTokenPersistenceBackfill:
         # branch (chat_runner.py:471-476) finds nothing and leaves slot.model
         # blank. Then mutate inner._model mid-stream — just before yielding
         # EVENT_COMPLETE — so only the late backfill branch can populate it.
-        client = AsyncMock()
+        client = _provider_mock()
         client.capabilities = capabilities_for(ACP_BACKEND_CLAUDE)
         client.context_usage_pct = MagicMock(return_value=10.0)
         inner = MagicMock()
@@ -7187,7 +7268,7 @@ class TestKiroBackfillProfileGuard:
         slot.model = ""  # user picked nothing explicit on this turn
 
         # Default test config provider is acp/kiro — exercise that path.
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         inner = MagicMock()
         inner._model = ""  # empty at create; kiro learns the profile mid-turn
@@ -7534,7 +7615,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = "claude-opus-5"  # pinned before the plan downgrade
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # The live session advertises the free tier only.
@@ -7617,7 +7698,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = ""  # inheriting: no pin
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.is_claude_backend = False
         client.available_models = MagicMock(
@@ -7676,7 +7757,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = "claude-opus-4.6-1m"  # deprecated spelling: absent from GET /api/models
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # The session serves the replacement the pin normalizes to.
@@ -7685,7 +7766,7 @@ class TestPinnedModelWithheld:
         )
         inner = MagicMock()
         inner._model = ""
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
 
         async def _stream(msg):
             del msg
@@ -7734,13 +7815,13 @@ class TestPinnedModelWithheld:
         slot.model = "claude-opus-5"
         slot.record_model_withheld(True)  # the PREVIOUS session withheld this pin
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[])  # advertises nothing
         inner = MagicMock()
         inner._model = ""
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
 
         async def _stream(msg):
             del msg
@@ -7807,7 +7888,7 @@ class TestPinnedModelWithheld:
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", load_then_break)
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-5"}])
@@ -7851,7 +7932,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = "claude-opus-5"
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         # This account CAN run the pin, so nothing is withheld.
@@ -7906,7 +7987,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = "claude-opus-5"
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-5"}])
@@ -7963,7 +8044,7 @@ class TestPinnedModelWithheld:
         slot = state.get_or_create_slot("s1")
         slot.model = "claude-sonnet-5"
 
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.capabilities = capabilities_for(ACP_BACKEND_KIRO)
         client.available_models = MagicMock(
@@ -9064,6 +9145,7 @@ class TestRuntimeWiring:
         slot._rewind_context_once = True
 
         client = MagicMock()
+        _arm_inner_client_handlers(client.client)
         client.stream_command = MagicMock(return_value=AsyncIterator([]))
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
 
@@ -9071,6 +9153,326 @@ class TestRuntimeWiring:
 
         client.stream_command.assert_called_once_with("/help")
         assert slot._rewind_context_once is False
+
+    @pytest.mark.parametrize(
+        ("accepts_inbound", "expected_channel"),
+        [(True, "chat-42"), (False, None)],
+    )
+    @pytest.mark.asyncio
+    async def test_run_chat_passes_only_resumable_mirror_channel_to_provider(
+        self, tmp_path, monkeypatch, accepts_inbound, expected_channel
+    ):
+        """Only an inbound-capable persisted mirror identifies a dispatcher.
+
+        Telegram/Discord mirrors can reuse a ``dashboard:*`` key while their
+        identity exists only in ``SessionMap.mirror``. Two-way links must retain
+        native resume; outbound-only mirrors still run as direct dashboard turns
+        and need the Tool Search resume workaround.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+
+        from kiro_crew.messaging.link import ChannelLink
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        state = _make_state(tmp_path)
+        state.context_builder = None
+        state.broadcast_ws = MagicMock()
+        state.push_slots_update = MagicMock()
+        slot = state.get_or_create_slot("linked-provider")
+        slot._slack_channel = ""
+        state.sessions.get_mirror_link = MagicMock(
+            return_value=ChannelLink("telegram", channel_id="chat-42", thread_id="thread-7")
+        )
+        state.sessions.mirror_accepts_inbound = MagicMock(return_value=accepts_inbound)
+
+        async def stream(_message):
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok")
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")
+
+        mock_client = MagicMock()
+        _arm_inner_client_handlers(mock_client.client)
+        mock_client.stream = stream
+        mock_client.stream_command = stream
+        mock_client.context_usage_pct = MagicMock(return_value=10.0)
+        state.sessions.get_or_create = AsyncMock(return_value=(mock_client, True, False))
+        state.sessions.get_pid = MagicMock(return_value=None)
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "linked dashboard turn")
+
+        assert state.sessions.get_or_create.await_args.kwargs["channel_id"] == expected_channel
+
+    @pytest.mark.asyncio
+    async def test_first_slash_preserves_pending_replay_for_next_prompt(
+        self, tmp_path, monkeypatch
+    ):
+        """A fresh session's slash command bypasses ContextBuilder entirely.
+
+        The command may consume SessionManager's one-shot ``is_new`` observation,
+        but it must not consume the conversation replay debt. Pre-dispatch Stop
+        leaves it armed; an accepted turn consumes it on the first provider event;
+        and a cancelled terminal re-arms it because the provider discards that
+        turn. The next accepted ordinary prompt finally clears the lease.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+
+        build_message_calls: list[dict] = []
+        build_behavior = {"stop_during_build": False}
+
+        def mock_build_message(text, context_is_new, session_key=None, **kwargs):
+            build_message_calls.append(
+                {
+                    "text": text,
+                    "context_is_new": context_is_new,
+                    "session_key": session_key,
+                    "kwargs": kwargs,
+                }
+            )
+            if build_behavior["stop_during_build"]:
+                slot._stop_generation += 1
+                build_behavior["stop_during_build"] = False
+            return text, MagicMock(action=None, text="")
+
+        from kiro_crew.acp.types import STOP_REASON_CANCELLED
+        from kiro_crew.context import ContextBuilder
+        from kiro_crew.hooks import HOOK_EVENT_AGENT_SPAWN
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+        from kiro_crew.skills import SkillsLoader
+
+        ctx_builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        ctx_builder.conversation_log = MagicMock()
+        monkeypatch.setattr(ctx_builder, "build_message", mock_build_message)
+        monkeypatch.setattr(
+            "kiro_crew.context.build_session_replay",
+            lambda *args, **kwargs: "retained conversation replay",
+        )
+
+        state = _make_state(tmp_path, context_builder=ctx_builder)
+        hook_store = MagicMock()
+        hook_store.fire = AsyncMock(return_value=[])
+        state._hook_store = hook_store
+        slot = state.get_or_create_slot("slash-replay")
+        monkeypatch.setattr(_ChatSlot, "checkpoint_reminder_due", lambda self: False)
+        slot.folder_id = "folder-1"
+        state.folder_breadcrumb = MagicMock(return_value="Workspace / Demo")
+        persona_first_turn: list[bool] = []
+
+        def inject_persona(message, _theme, context_is_new, **_kwargs):
+            persona_first_turn.append(context_is_new)
+            return message
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._maybe_inject_persona",
+            inject_persona,
+        )
+
+        dispatched: list[str] = []
+        stream_behavior = {
+            "cancel_after_accept": False,
+            "raise_after_accept": False,
+            "synthetic_end_turn": False,
+            "empty_end_turn": False,
+        }
+
+        async def stream(stream_message):
+            dispatched.append(stream_message)
+            if stream_message != "/tools":
+                assert replay["pending"] is True
+            if stream_behavior["cancel_after_accept"]:
+                stream_behavior["cancel_after_accept"] = False
+                yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_CANCELLED)
+                return
+            if stream_behavior["synthetic_end_turn"]:
+                stream_behavior["synthetic_end_turn"] = False
+                yield LLMEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason="end_turn",
+                    synthetic_completion=True,
+                )
+                return
+            if stream_behavior["empty_end_turn"]:
+                stream_behavior["empty_end_turn"] = False
+                yield LLMEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")
+                return
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok")
+            if stream_message != "/tools":
+                assert replay["pending"] is True
+            if stream_behavior["raise_after_accept"]:
+                stream_behavior["raise_after_accept"] = False
+                raise RuntimeError("stream failed after accepting replay")
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")
+
+        mock_client = MagicMock()
+        _arm_inner_client_handlers(mock_client.client)
+        mock_client.stream = stream
+        mock_client.stream_command = stream
+        mock_client.context_usage_pct = MagicMock(return_value=10.0)
+        state.sessions.get_or_create = AsyncMock(
+            side_effect=[
+                (mock_client, True, False),
+                (mock_client, False, False),
+                (mock_client, False, False),
+                (mock_client, False, False),
+                (mock_client, False, False),
+                (mock_client, False, False),
+                (mock_client, False, False),
+                (mock_client, False, False),
+            ]
+        )
+        state.sessions.get_pid = MagicMock(return_value=None)
+        state.sessions.record_failure = AsyncMock()
+        state.sessions.consume_replay_suppression = MagicMock(return_value=False)
+
+        replay = {"pending": True}
+        durable = {"sid": "old-full-history-sid"}
+
+        def replay_pending(_key):
+            return replay["pending"]
+
+        def consume_replay(_key):
+            was_pending = replay["pending"]
+            replay["pending"] = False
+            return was_pending
+
+        def mark_replay(_key):
+            replay["pending"] = True
+            return True
+
+        def commit_replay(_key):
+            durable["sid"] = "fresh-replayed-sid"
+            replay["pending"] = False
+            return True
+
+        state.sessions.provider_switch_replay_pending = MagicMock(side_effect=replay_pending)
+        state.sessions.consume_provider_switch_replay = MagicMock(side_effect=consume_replay)
+        state.sessions.mark_provider_switch_replay = MagicMock(side_effect=mark_replay)
+        state.sessions.commit_provider_switch_replay_sid = MagicMock(side_effect=commit_replay)
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "/tools")
+
+        assert build_message_calls == []
+        assert replay["pending"] is True
+        assert durable["sid"] == "old-full-history-sid"
+        assert dispatched == ["/tools"]
+        state.sessions.consume_provider_switch_replay.assert_not_called()
+        state.sessions.commit_provider_switch_replay_sid.assert_not_called()
+
+        build_behavior["stop_during_build"] = True
+        await _run_chat(state, slot, "stop during replay prep")
+
+        assert len(build_message_calls) == 1
+        assert build_message_calls[0]["context_is_new"] is True
+        assert build_message_calls[0]["kwargs"]["folder_path"] == "Workspace / Demo"
+        assert (
+            build_message_calls[0]["kwargs"]["compressed_history"] == "retained conversation replay"
+        )
+        assert persona_first_turn == [True]
+        assert replay["pending"] is True
+        assert durable["sid"] == "old-full-history-sid"
+        assert dispatched == ["/tools"]
+        state.sessions.consume_provider_switch_replay.assert_not_called()
+        state.sessions.commit_provider_switch_replay_sid.assert_not_called()
+
+        stream_behavior["cancel_after_accept"] = True
+        await _run_chat(state, slot, "cancel accepted replay")
+
+        assert len(build_message_calls) == 2
+        cancelled_call = build_message_calls[1]
+        assert cancelled_call["context_is_new"] is True
+        assert cancelled_call["kwargs"]["folder_path"] == "Workspace / Demo"
+        assert cancelled_call["kwargs"]["compressed_history"] == "retained conversation replay"
+        assert persona_first_turn == [True, True]
+        assert dispatched == ["/tools", "cancel accepted replay"]
+        assert replay["pending"] is True
+        assert durable["sid"] == "old-full-history-sid"
+        state.sessions.consume_provider_switch_replay.assert_not_called()
+        state.sessions.mark_provider_switch_replay.assert_called_once_with("dashboard:slash-replay")
+        state.sessions.commit_provider_switch_replay_sid.assert_not_called()
+
+        stream_behavior["raise_after_accept"] = True
+        await _run_chat(state, slot, "raise after accepted replay")
+
+        assert len(build_message_calls) == 3
+        assert replay["pending"] is True
+        assert durable["sid"] == "old-full-history-sid"
+        state.sessions.consume_provider_switch_replay.assert_not_called()
+        assert state.sessions.mark_provider_switch_replay.call_count == 2
+        state.sessions.commit_provider_switch_replay_sid.assert_not_called()
+
+        stream_behavior["synthetic_end_turn"] = True
+        slot._empty_response_retries = 2
+        await _run_chat(state, slot, "synthetic replay completion")
+
+        assert len(build_message_calls) == 4
+        assert replay["pending"] is True
+        assert durable["sid"] == "old-full-history-sid"
+        state.sessions.consume_provider_switch_replay.assert_not_called()
+        assert state.sessions.mark_provider_switch_replay.call_count == 3
+        state.sessions.commit_provider_switch_replay_sid.assert_not_called()
+
+        stream_behavior["empty_end_turn"] = True
+        slot._empty_response_retries = 2
+        await _run_chat(state, slot, "real empty replay with exhausted budget")
+
+        assert len(build_message_calls) == 5
+        assert replay["pending"] is True
+        assert durable["sid"] == "old-full-history-sid"
+        state.sessions.consume_provider_switch_replay.assert_not_called()
+        assert state.sessions.mark_provider_switch_replay.call_count == 4
+        state.sessions.commit_provider_switch_replay_sid.assert_not_called()
+
+        stream_behavior["empty_end_turn"] = True
+        slot._empty_response_retries = 1
+        with patch(
+            "kiro_crew.dashboard.chat_runner._empty_auto_continue_enabled",
+            return_value=False,
+        ):
+            await _run_chat(state, slot, "real empty replay with continuation off")
+
+        assert len(build_message_calls) == 6
+        assert replay["pending"] is True
+        assert durable["sid"] == "old-full-history-sid"
+        state.sessions.consume_provider_switch_replay.assert_not_called()
+        assert state.sessions.mark_provider_switch_replay.call_count == 5
+        state.sessions.commit_provider_switch_replay_sid.assert_not_called()
+
+        await _run_chat(state, slot, "continue after uncommitted replay turns")
+
+        assert len(build_message_calls) == 7
+        call = build_message_calls[6]
+        assert call["context_is_new"] is True
+        assert call["kwargs"]["folder_path"] == "Workspace / Demo"
+        assert call["kwargs"]["compressed_history"] == "retained conversation replay"
+        assert persona_first_turn == [True, True, True, True, True, True, True]
+        assert dispatched == [
+            "/tools",
+            "cancel accepted replay",
+            "raise after accepted replay",
+            "synthetic replay completion",
+            "real empty replay with exhausted budget",
+            "real empty replay with continuation off",
+            "continue after uncommitted replay turns",
+        ]
+        assert replay["pending"] is False
+        assert durable["sid"] == "fresh-replayed-sid"
+        state.sessions.consume_provider_switch_replay.assert_not_called()
+        assert state.sessions.mark_provider_switch_replay.call_count == 5
+        state.sessions.commit_provider_switch_replay_sid.assert_called_once_with(
+            "dashboard:slash-replay"
+        )
+        agent_spawn_calls = [
+            call
+            for call in hook_store.fire.await_args_list
+            if call.args and call.args[0] == HOOK_EVENT_AGENT_SPAWN
+        ]
+        assert len(agent_spawn_calls) == 1
 
     @pytest.mark.asyncio
     async def test_run_chat_forwards_and_clears_the_reinjection_flag(self, tmp_path, monkeypatch):
@@ -9105,6 +9507,7 @@ class TestRuntimeWiring:
         slot = state.get_or_create_slot("reinject-test")
 
         mock_client = MagicMock()
+        _arm_inner_client_handlers(mock_client.client)
         mock_client.client = None
         mock_client.stream = MagicMock(return_value=AsyncIterator([]))
         state.sessions.get_or_create = AsyncMock(return_value=(mock_client, True, False))
@@ -9148,6 +9551,7 @@ class TestRuntimeWiring:
         assert build_message_calls[0]["kwargs"].get("post_compaction_checkpoint") == (
             slot.session_checkpoint_payload()
         )
+        assert build_message_calls[0]["kwargs"]["context_provider"] is mock_client
         assert state.sessions.mark_needs_reinjection.called, (
             "a turn that consumed the flag but did not land must restore it, "
             "or the skills index is lost for the rest of the session"
@@ -9236,7 +9640,7 @@ class TestRunChatToolBoundarySegments:
             LLMEvent(kind="complete"),
         ]
 
-        fake_client = AsyncMock()
+        fake_client = _provider_mock()
 
         async def _stream(msg):
             for e in events:
@@ -9282,7 +9686,7 @@ class TestRunChatToolBoundarySegments:
             LLMEvent(kind="complete"),
         ]
 
-        fake_client = AsyncMock()
+        fake_client = _provider_mock()
 
         async def _stream(msg):
             for e in events:
@@ -9314,7 +9718,7 @@ class TestRunChatToolCallUpdate:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
 
         async def _stream(msg):
@@ -9935,7 +10339,7 @@ class TestRunChatModelRefusal:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
 
         async def _stream(msg):
@@ -10975,7 +11379,7 @@ class TestOrchestratorPlanGateArming:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.context_window_tokens = MagicMock(return_value=0)
         client.context_used_tokens = MagicMock(return_value=0)
@@ -12145,7 +12549,7 @@ class TestPromptBusyRecovery:
         from kiro_crew.dashboard.chat import _run_chat
 
         state = _make_state(tmp_path)
-        state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
+        state.sessions.get_or_create = AsyncMock(return_value=(_provider_mock(), False, False))
         state.sessions.release = MagicMock()
         state.sessions.reset = AsyncMock()
         state.sessions.set_approval_policy = MagicMock()
@@ -12189,7 +12593,7 @@ class TestPromptBusyRecovery:
         from kiro_crew.dashboard.chat import _run_chat
 
         state = _make_state(tmp_path)
-        state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
+        state.sessions.get_or_create = AsyncMock(return_value=(_provider_mock(), False, False))
         state.sessions.release = MagicMock()
         state.sessions.reset = AsyncMock()
         state.sessions.set_approval_policy = MagicMock()
@@ -13397,6 +13801,55 @@ class TestFolderCRUD:
             assert resp.status == 404
 
     @pytest.mark.asyncio
+    async def test_expected_created_matching_the_live_slot_files_it(self, tmp_path, monkeypatch):
+        """The generation token is optional; when it matches the slot's own
+        ``created_at`` the write lands exactly as an untokened one does."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("myslot")
+        state._folders = [{"id": "f1", "name": "Test", "order": 0, "collapsed": False}]
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.patch(
+                "/api/chat/slots/myslot/folder",
+                json={"folder_id": "f1", "expected_created": slot.created_at},
+            )
+            assert resp.status == 200
+            assert slot.folder_id == "f1"
+
+    @pytest.mark.asyncio
+    async def test_expected_created_from_a_replaced_slot_is_refused_409(
+        self, tmp_path, monkeypatch
+    ):
+        """A caller that resolved a slot in an earlier request, then saw its
+        tab close and the same key recreated for another conversation, carries
+        the OLD slot's ``created_at``. The recreated slot has the same key and
+        the same ``dashboard:<key>`` transcript key, so only the token can tell
+        them apart — and it must, or the stale write files someone else's
+        session."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        first = state.get_or_create_slot("myslot")
+        stale_token = first.created_at
+        # Close the tab and recreate the key: a different slot object, a
+        # different birth stamp, the same key.
+        del state._slots["myslot"]
+        replacement = state.get_or_create_slot("myslot")
+        replacement.created_at = stale_token + "-later"
+        state._folders = [{"id": "f1", "name": "Test", "order": 0, "collapsed": False}]
+        app = _make_folder_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.patch(
+                "/api/chat/slots/myslot/folder",
+                json={"folder_id": "f1", "expected_created": stale_token},
+            )
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "session_gone"
+            # The replacement conversation was not filed.
+            assert replacement.folder_id == ""
+            assert replacement._folder_changed is False
+
+    @pytest.mark.asyncio
     async def test_assign_nonexistent_folder_rejected(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -13747,7 +14200,7 @@ class TestGenerateEmojiForName:
         monkeypatch.setattr("kiro_crew.providers.base.EVENT_COMPLETE", "complete")
         monkeypatch.setattr("kiro_crew.providers.base.EVENT_PERMISSION_REQUEST", "permission")
 
-        mock_client = AsyncMock()
+        mock_client = _provider_mock()
         mock_client.prompt = MagicMock(return_value=AsyncIterator([mock_event, done_event]))
         state.sessions.get_bg_session = AsyncMock(return_value=mock_client)
         state.push_slots_update = MagicMock()
@@ -13786,7 +14239,7 @@ class TestGenerateEmojiForName:
         monkeypatch.setattr("kiro_crew.providers.base.EVENT_COMPLETE", "complete")
         monkeypatch.setattr("kiro_crew.providers.base.EVENT_PERMISSION_REQUEST", "permission")
 
-        mock_client = AsyncMock()
+        mock_client = _provider_mock()
         mock_client.prompt = MagicMock(return_value=AsyncIterator([mock_event, done_event]))
         state.sessions.get_bg_session = AsyncMock(return_value=mock_client)
 
@@ -15846,7 +16299,7 @@ class TestStopReasonCancelled:
 
     @staticmethod
     def _make_mock_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
 
         async def _stream(msg):
@@ -15960,6 +16413,7 @@ class TestStopReasonCancelled:
         slot = state.get_or_create_slot("s1")
 
         client = MagicMock()
+        _arm_inner_client_handlers(client.client)
 
         def _boom(_msg):
             raise RuntimeError("provider exploded mid-turn")
@@ -16549,6 +17003,7 @@ class TestStopDuringSessionPrep:
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
 
         client = MagicMock()
+        _arm_inner_client_handlers(client.client)
         client.shutdown = AsyncMock()
         # The fork's `_run_chat` registers an ASYNC autonomous-turn handler on the
         # inner client; a bare MagicMock child is not awaitable. Modelled here so
@@ -16669,7 +17124,7 @@ class TestAcpProcessDiedRecovery:
         from kiro_crew.dashboard.chat_runner import _run_chat
 
         state = _make_state(tmp_path)
-        state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
+        state.sessions.get_or_create = AsyncMock(return_value=(_provider_mock(), False, False))
         state.sessions.release = MagicMock()
         state.sessions.reset = AsyncMock()
         state.sessions.set_approval_policy = MagicMock()
@@ -16694,6 +17149,27 @@ class TestAcpProcessDiedRecovery:
 
         mock_client.stream = _raise
         mock_client.stream_command = _raise
+
+    @pytest.mark.asyncio
+    async def test_provider_interruption_records_partial_reply_in_ledger(self, tmp_path, monkeypatch):
+        from kiro_crew.acp.client import AcpProviderStreamInterrupted
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.providers.base import EVENT_TEXT_CHUNK, LLMEvent
+
+        state, slot, client, run_chat = self._make_state_and_slot(tmp_path)
+        sent = MagicMock()
+        monkeypatch.setattr(chat_runner.session_ledger_emit, "on_message_sent", sent)
+
+        async def stream(message):
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="partial provider reply")
+            raise AcpProviderStreamInterrupted("interrupted")
+
+        client.stream = stream
+        await run_chat(state, slot, "hello")
+        assert any(m.get("content") == "partial provider reply" for m in slot.messages)
+        sent.assert_called_once()
+        assert sent.call_args.kwargs["text"] == "partial provider reply"
+        assert sent.call_args.kwargs["interrupted"] is True
 
     @pytest.mark.asyncio
     async def test_retry_at_depth_0_requeues_message(self, tmp_path: Path) -> None:
@@ -17245,7 +17721,7 @@ class TestEmptyResponseRetry:
         from kiro_crew.dashboard.chat_runner import _run_chat
 
         state = _make_state(tmp_path)
-        state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
+        state.sessions.get_or_create = AsyncMock(return_value=(_provider_mock(), False, False))
         state.sessions.release = MagicMock()
         state.sessions.reset = AsyncMock()
         state.sessions.set_approval_policy = MagicMock()
@@ -17678,6 +18154,10 @@ class TestEmptyResponseRetry:
         from kiro_crew.providers.base import EVENT_CLEAR_STATUS, EVENT_COMPLETE, LLMEvent
 
         state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        state.sessions.provider_switch_replay_pending = MagicMock(return_value=True)
+        state.sessions.consume_provider_switch_replay = MagicMock(return_value=True)
+        state.sessions.mark_provider_switch_replay = MagicMock(return_value=True)
+        state.sessions.commit_provider_switch_replay_sid = MagicMock(return_value=True)
 
         async def _stream(msg):
             yield LLMEvent(kind=EVENT_CLEAR_STATUS)
@@ -17690,6 +18170,13 @@ class TestEmptyResponseRetry:
 
         notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
         assert not any("returned nothing this turn" in m.get("content", "") for m in notice_msgs)
+        state.sessions.consume_provider_switch_replay.assert_called_once_with(
+            f"dashboard:{slot.key}"
+        )
+        state.sessions.commit_provider_switch_replay_sid.assert_called_once_with(
+            f"dashboard:{slot.key}"
+        )
+        state.sessions.mark_provider_switch_replay.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_agent_switch_turn_no_empty_response_error(self, tmp_path: Path) -> None:
@@ -18360,7 +18847,7 @@ class TestRunChatTransientRetry:
 
     @staticmethod
     def _client(stream):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=0.0)
         # These are sync accessors on the real provider client; _run_chat
         # calls them without awaiting, so a bare AsyncMock attribute here

@@ -13,7 +13,11 @@ Only stub entries are injected. A non-poolable server is left entirely to the
 agent spec, so its ``env`` — which routinely holds tokens and API keys — never
 leaves the file it was declared in. Stub entries carry ``env: {}`` by
 construction (``rewriter._build_stub_entry``): the pooled backend is spawned by
-gatewayd, not by kiro-cli, so no credential is transmitted here either.
+gatewayd, not by kiro-cli, so no credential is transmitted here either. The one
+value a stub entry's ``env`` does carry is this session's stub token
+(:func:`attach_stub_session_token`), which names the SESSION the entry was
+injected for and is what stops a subagent sharing its parent's process from
+inheriting the parent's identity.
 
 Precedence caveat: same-name override is verified against the shipped binary
 (``test_mcp_gateway_session_inject.py`` pins it, including a live check when
@@ -31,9 +35,42 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
+from kiro_crew.mcp_gateway.hashing import STUB_FLAGS_FLAG, encode_target_args, expand_stub_flags
 from kiro_crew.mcp_gateway.rewriter import _WRAPPER_MARKER, _WRAPPER_MARKER_LEGACY
 
 logger = logging.getLogger(__name__)
+
+
+def attach_stub_session_token(
+    entries: list[dict[str, Any]], token: str
+) -> list[dict[str, Any]]:
+    """Return *entries* with *token* added to each element's ACP ``env`` array.
+
+    Applied to the stub entries of ONE ACP session, after
+    :func:`pooled_session_servers` has shaped them. Kept separate from that
+    function rather than folded into it because the token is per SESSION while
+    the overlay lookup is per agent — and because the shaping call is
+    monkeypatched by callers that know nothing about tokens.
+
+    An empty *token* returns the input unchanged, so a caller that cannot mint
+    one (or a build with the gateway off, where ``entries`` is empty anyway)
+    stays byte-identical to the pre-token wire shape. Copies each element: the
+    caller's list may be a cached array shared with another session.
+    """
+    if not token:
+        return entries
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        shaped = dict(entry)
+        raw_env = shaped.get("env")
+        env = [e for e in raw_env if isinstance(e, dict)] if isinstance(raw_env, list) else []
+        env = [e for e in env if e.get("name") != STUB_SESSION_TOKEN_ENV]
+        env.append({"name": STUB_SESSION_TOKEN_ENV, "value": token})
+        shaped["env"] = env
+        out.append(shaped)
+    return out
+
 
 # Keys that are positional in the ACP element shape (``name``) or that we
 # always re-derive (``env``), so they must not be copied verbatim.
@@ -62,11 +99,13 @@ def _acp_server_entry(
     session-injected element, and dropping ``autoApprove`` in particular would
     re-prompt for tools the agent spec had already auto-approved.
 
-    ``channel_id`` is APPENDED as ``--channel-id <value>`` rather than
-    prepended: the overlay entry runs the interpreter, so ``args`` opens with
-    ``-m kiro_crew.mcp_gateway.stub`` and anything inserted ahead of that would
-    be eaten by the interpreter instead of the stub. argparse does not care
-    about order. The channel value is known here, at the one place that runs
+    ``channel_id`` is APPENDED as an encoded ``--channel-id <value>`` pair
+    rather than prepended: the overlay entry runs the interpreter, so ``args``
+    opens with ``-m kiro_crew.mcp_gateway.stub`` and anything inserted ahead of
+    that would be eaten by the interpreter instead of the stub. argparse does
+    not care about order. It rides its own ``--stub-flags-b64`` envelope for
+    the same reason the rewriter's flags do: a channel identifier is external
+    text, and a plain token crossing cmd.exe has its ``%NAME%`` spans expanded. The channel value is known here, at the one place that runs
     per session, so the stub does not need to recover it by walking its
     ancestors' ``/proc/<pid>/environ`` from a bash launcher.
     """
@@ -78,8 +117,18 @@ def _acp_server_entry(
         return None
     args = [a if isinstance(a, str) else json.dumps(a, sort_keys=True, default=str)
             for a in (entry.get("args") or [])]
-    if channel_id and "--channel-id" not in args:
-        args.extend(["--channel-id", channel_id])
+    try:
+        flags = expand_stub_flags(args)
+    except ValueError:
+        # A stub whose envelope cannot be read cannot be launched against the
+        # metadata the rewriter hashed; injecting it would shadow the agent's
+        # working entry with one that dies at parse time. Skip it, like the
+        # command-less case above, so one unreadable overlay entry degrades
+        # this server to unpooled operation instead of failing the session.
+        logger.warning("mcp-gateway: skipping stub %r with an unreadable flag envelope", name)
+        return None
+    if channel_id and "--channel-id" not in flags:
+        args.append(f"{STUB_FLAGS_FLAG}={encode_target_args(['--channel-id', channel_id])}")
     shaped: dict[str, Any] = {
         k: v for k, v in entry.items() if k not in _ACP_RESERVED and k != "command"
     }

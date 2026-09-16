@@ -287,9 +287,15 @@ class TestKnowledgeStore:
         migration runs on EVERY store open, so an uncaught one would abort every
         construction rather than skipping the row.
         """
-        deep = '{"sync_status": "active"}'
-        for _ in range(60000):
-            deep = '{"a": ' + deep + '}'
+        # Built by multiplication, not by wrapping in a loop: the accumulator
+        # would sit on the RIGHT of the concat, so CPython cannot append in
+        # place and every iteration recopies the whole string -- ~25 GB of
+        # transient memcpy, 10 s of CPU on a loaded worker, to produce the same
+        # 420 KB blob this builds in 0.3 ms. Same idiom as
+        # test_cron_count_from_disk.py's `"[" * depth + "]" * depth`. The depth
+        # is load-bearing, not padding: python3.12 decodes ~10,000 levels
+        # before RecursionError, so a small number would assert nothing.
+        deep = '{"a": ' * 60000 + '{"sync_status": "active"}' + '}' * 60000
         with pytest.raises(RecursionError):
             json.loads(deep)
 
@@ -2647,6 +2653,52 @@ class TestChunkMarkdown:
         chunker = HeadingAwareChunker(target_size=50)
         chunks = chunker.chunk_markdown(text)
         assert len(chunks) > 1
+
+    def test_merged_sections_line_end_stays_within_the_file(self):
+        # Three small heading sections that all merge into a single chunk. The
+        # merge joins section bodies with a synthetic "\n" the source never had,
+        # so counting newlines in the reconstructed body reported a line_end that
+        # ran (merged_sections - 1) lines past the end of the file -- a citation
+        # pointing past EOF. line_end must track the last real SOURCE line.
+        text = (
+            "## Alpha\n"      # line 1
+            "body a\n"        # line 2
+            "## Bravo\n"      # line 3
+            "body b\n"        # line 4
+            "## Charlie\n"    # line 5
+            "body c\n"        # line 6
+        )
+        total_lines = text.count("\n")  # 6 source lines
+        chunker = HeadingAwareChunker(target_size=500)
+        chunks = chunker.chunk_markdown(text)
+        # Small sections collapse into one chunk.
+        assert len(chunks) == 1
+        chunk = chunks[0]
+        assert chunk["line_start"] == 1
+        # The body's last real content line is line 6; before the fix this was
+        # reported as 8 (6 + 2 injected newlines), citing two lines past EOF.
+        assert chunk["line_end"] == 6
+        assert chunk["line_end"] <= total_lines
+
+    def test_merged_section_ending_in_whitespace_only_line(self):
+        # The last section's body trails a whitespace-only line, which strip()
+        # drops from the emitted content. A blank tail is not a content line, so
+        # line_end must stay on the last line carrying real text (4) instead of
+        # counting the blank tail line (5) that the content does not hold.
+        text = (
+            "## Alpha\n"      # line 1
+            "body a\n"        # line 2
+            "## Bravo\n"      # line 3
+            "body b\n"        # line 4
+            "   \n"           # line 5 -- whitespace only
+        )
+        chunker = HeadingAwareChunker(target_size=500)
+        chunks = chunker.chunk_markdown(text)
+        assert len(chunks) == 1
+        chunk = chunks[0]
+        assert chunk["line_start"] == 1
+        assert chunk["content"].endswith("body b")
+        assert chunk["line_end"] == 4
 
 
 # ---------------------------------------------------------------------------
