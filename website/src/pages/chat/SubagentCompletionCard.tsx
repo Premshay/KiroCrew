@@ -309,8 +309,8 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
           <AlertCircle size={12} className="shrink-0 mt-0.5" aria-hidden />
           <span className="min-w-0 break-words">
             {i18nT('pages.chat.activityViewer.model_downgraded', {
-              requested: requestedModel,
-              resolved: resolvedModel,
+              requested: modelLabel(requestedModel),
+              resolved: modelLabel(resolvedModel),
             })}
           </span>
         </div>
