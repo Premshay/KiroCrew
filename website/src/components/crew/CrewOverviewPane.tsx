@@ -11,6 +11,7 @@ import { Boxes, Clock, Cpu, Database, FolderOpen, Users, Waypoints, Webhook } fr
 import { useTranslation } from 'react-i18next'
 import CrewOverviewDiagram, { type CrewWireNode } from './CrewOverviewDiagram'
 import type { CrewPaneKey } from './crewEditorSections'
+import { modelLabel as formatModelLabel } from '../../lib/model'
 
 /** Every node the diagram draws. A new node must join this union, and the
  *  union forces a `NODE_PANE` entry — so an unmapped node is a compile error
@@ -181,7 +182,7 @@ export default function CrewOverviewPane({
           label={t('components.crewEditor.stat_crews_sharing')}
         />
         <Stat
-          value={resolvedModel || unknown}
+          value={formatModelLabel(resolvedModel) || unknown}
           label={t('components.crewEditor.stat_resolved_model')}
         />
       </div>

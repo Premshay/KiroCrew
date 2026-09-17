@@ -27,7 +27,7 @@ import {
   type SubagentOutcome,
 } from './subagentCompletion'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
-import { normalizeModelKey } from '../../lib/model'
+import { modelLabel, normalizeModelKey } from '../../lib/model'
 
 function outcomeLabel(outcome: SubagentOutcome): string {
   if (outcome === 'failed') return i18nT('pages.chat.subagentCompletionCard.failed')
@@ -233,11 +233,11 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
               title={
                 modelDowngraded
                   ? i18nT('pages.chat.activityViewer.model_downgraded', {
-                      requested: requestedModel,
-                      resolved: resolvedModel,
+                      requested: modelLabel(requestedModel),
+                      resolved: modelLabel(resolvedModel),
                     })
                   : resolvedKnown
-                    ? i18nT('pages.chat.activityViewer.model_label', { model: resolvedModel })
+                    ? i18nT('pages.chat.activityViewer.model_label', { model: modelLabel(resolvedModel) })
                     : i18nT('pages.chat.activityViewer.model_effective', { model: displayModel })
               }
             >

@@ -368,10 +368,10 @@ import ChatDropOverlay from '../components/ChatDropOverlay'
 import SessionGridView from '../components/SessionGridView'
 import SessionTabStrip from '../components/SessionTabStrip'
 import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutStore'
-import { effortSupportedForCrew, modelSupportsEffort } from '../lib/effort'
+import { effortSupportedForCrew } from '../lib/effort'
 import { mcpAppTabTitle } from '../lib/mcpAppSrcdoc'
 import { countCompletedTurns } from '../lib/completedTurns'
-import { displayModel, pinIsWithheld } from '../lib/model'
+import { displayModel, modelLabel, pinIsWithheld } from '../lib/model'
 import FollowUpCard from '../components/FollowUpCard'
 import FolderSuggestionCard from './chat/FolderSuggestionCard'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
@@ -4525,6 +4525,10 @@ export default function ChatPage({
     ? remoteCrew.capabilities?.effort_levels
     : localModelCatalog.effortLevels
   const effortSupported = effortSupportedForCrew(crewEffortLevels, shownEffortModel)
+  // What the chip READS. `shownModel` stays the value every control selects on,
+  // so only the rendered text changes -- a composite-id harness (dsh spells its
+  // model `["deepseek-official","deepseek-v4-pro"]`) must never show that raw.
+  const shownModelLabel = modelLabel(shownModel, availableModels)
   // Warn while the image is still pending, not after the harness rejects the
   // whole prompt. `undefined` is "no crew runtime answered", which never warns.
   const showImageHint =
@@ -9355,7 +9359,7 @@ export default function ChatPage({
               agentLabel={agentOrDefaultLabel(currentSlot?.agent, effectiveDefaultAgent)}
               agentIsInheritedDefault={!currentSlot?.agent && !!effectiveDefaultAgent}
               agentSource={effectiveAgents.find(a => a.name === activeAgentName)?.source}
-              modelName={shownModel}
+              modelName={shownModelLabel}
               // The served default is shown exactly when the pin alone would
               // have read `auto`; that is the inherited case the marker names.
               modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
@@ -9673,7 +9677,13 @@ export default function ChatPage({
                 onClose={() => setModelDropdown(false)}
                 modelVisibilityError={hiddenModelsQ.isError}
                 onRetryModelVisibility={() => hiddenModelsQ.refetch()}
-                hasEffort={!!(activeSlot && provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel))}
+                hasEffort={
+                  !!(
+                    activeSlot &&
+                    provider.capabilities.reasoningEffort &&
+                    effortSupported
+                  )
+                }
                 slot={activeSlot}
                 currentEffort={currentSlot?.reasoning_effort || ''}
                 defaultEffort={defaultEffort}

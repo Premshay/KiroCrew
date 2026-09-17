@@ -21,6 +21,7 @@ import type { PlanStepInput } from '../../api/client'
 import { extractSteeringAcks, parseOptions, stripPartialOptionMarker } from '../../app-sdk/protocol'
 import { i18nT } from '../../i18n/t'
 import { ROUTING_PREFIX_RE } from '../../providers/modelRegistry'
+import { modelLabel } from '../../lib/model'
 import { fmtCurrency, fmtDuration, fmtNumber, fmtUnit } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
@@ -559,7 +560,7 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
           return <>
             {/* Model leads (what served), then cost (what it took), then time.
                 Trimmed for width; the untrimmed id is in the footer tooltip. */}
-            {turnStats.model && <span className="font-mono" data-testid="turn-model">{fmtTurnModel(turnStats.model)} ·</span>}
+            {turnStats.model && <span className="font-mono" data-testid="turn-model">{modelLabel(fmtTurnModel(turnStats.model))} ·</span>}
             {billed && <span>{billed} ·</span>}
             <Clock size={11} aria-hidden="true" />
             <span>{fmtTurnElapsed(turnStats.elapsed_ms)}</span>

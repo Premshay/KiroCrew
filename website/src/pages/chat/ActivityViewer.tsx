@@ -30,7 +30,7 @@ import { i18nT } from '../../i18n/t'
 import GitPanel from '../../components/GitPanel'
 import { fmtDateFields } from '../../i18n/format'
 import { isModelDowngrade } from './subagentCompletion'
-import { normalizeModelKey } from '../../lib/model'
+import { modelLabel, normalizeModelKey } from '../../lib/model'
 const STATUS = {
   pending: <Lock size={12} className="text-muted" />,
   running: <LoaderIcon size={12} className="text-accent animate-spin" />,
@@ -249,14 +249,14 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
               // the exact fact this chip exists to surface. Parallels the sibling
               // SubagentCompletionCard's role="status" downgrade banner.
               aria-label={liveDowngrade
-                ? i18nT('pages.chat.activityViewer.model_downgraded', { requested: a.requestedModel, resolved: a.model })
+                ? i18nT('pages.chat.activityViewer.model_downgraded', { requested: modelLabel(a.requestedModel ?? ''), resolved: modelLabel(a.model ?? '') })
                 : resolvedKnown
-                  ? i18nT('pages.chat.activityViewer.model_label', { model: a.model })
+                  ? i18nT('pages.chat.activityViewer.model_label', { model: modelLabel(a.model ?? '') })
                   : i18nT('pages.chat.activityViewer.model_effective', { model: display })}
               title={liveDowngrade
-                ? i18nT('pages.chat.activityViewer.model_downgraded', { requested: a.requestedModel, resolved: a.model })
+                ? i18nT('pages.chat.activityViewer.model_downgraded', { requested: modelLabel(a.requestedModel ?? ''), resolved: modelLabel(a.model ?? '') })
                 : resolvedKnown
-                  ? i18nT('pages.chat.activityViewer.model_label', { model: a.model })
+                  ? i18nT('pages.chat.activityViewer.model_label', { model: modelLabel(a.model ?? '') })
                   : i18nT('pages.chat.activityViewer.model_effective', { model: display })}
             >
               {liveDowngrade && <AlertCircle size={10} aria-hidden className="inline-block mr-0.5 align-middle" />}
