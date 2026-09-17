@@ -328,35 +328,6 @@ def effective_max_concurrent() -> int:
 REVIEW_EFFORT = _DEFAULT_EFFORT
 
 
-def is_known_review_agent(name: str) -> bool:
-    """Whether *name* is an agent Sage may run reviews on.
-
-    Two populations qualify: agents with an installed spec in the agents dir
-    (``<name>.json`` / ``<name>.md``) and configured crews from the KiroCrew
-    config's ``agents`` section -- which is what admits engine-mapped crews
-    (e.g. ``crew-deepseek-pro``) that carry no spec file of their own. The
-    token rules match the model validator's, because the value becomes a spawn
-    argument and a settings key, never free text.
-    """
-    if not isinstance(name, str) or not name or len(name) > 64:
-        return False
-    if not all(c.isalnum() or c in "._-" for c in name):
-        return False
-    if kiro_agents_dir is not None:
-        try:
-            agents_dir = kiro_agents_dir()
-            if (agents_dir / f"{name}.json").is_file() or (agents_dir / f"{name}.md").is_file():
-                return True
-        except Exception:
-            pass
-    try:
-        from kiro_crew.config.loader import KiroCrewConfig
-
-        return name in getattr(KiroCrewConfig.load(), "agents", {})
-    except Exception:
-        return False
-
-
 def known_review_agents() -> list[str]:
     """Every agent Sage may be pointed at, for the settings picker.
 
@@ -382,6 +353,25 @@ def known_review_agents() -> list[str]:
     except Exception:
         pass
     return sorted(names)
+
+
+def is_known_review_agent(name: str) -> bool:
+    """Whether *name* is an agent Sage may run reviews on.
+
+    The one roster :func:`known_review_agents` builds -- installed specs plus
+    configured crews (the latter admits engine-mapped crews like
+    ``crew-deepseek-pro`` that carry no spec file) -- after the token rules,
+    which match the model validator's because the value becomes a spawn
+    argument and a settings key, never free text.
+    """
+    if not isinstance(name, str) or not name or len(name) > 64:
+        return False
+    if not all(c.isalnum() or c in "._-" for c in name):
+        return False
+    try:
+        return name in known_review_agents()
+    except Exception:
+        return False
 
 
 def _resolve_review_agent(preferred: str | None = None) -> str:
