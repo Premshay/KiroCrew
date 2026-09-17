@@ -1010,3 +1010,35 @@ def test_korean_refusal_yields_no_title(reply):
 )
 def test_legitimate_titles_survive_the_new_checks(reply, expected):
     assert _validate_title_reply(reply) == expected
+
+
+@pytest.mark.asyncio
+async def test_plan_rephrase_timeout_releases_the_turn(monkeypatch):
+    """A stalled rephrase must return None rather than hold the answer.
+
+    The rephrase is a cosmetic second LLM round-trip. Without a bound, a slow
+    or flaky backend stalled it indefinitely, and because the caller awaits it
+    before flushing the answer, the turn never finalized and the UI sat on
+    "streaming" with nothing. On timeout the original text must fall through.
+    """
+    import asyncio
+
+    class _Bg:
+        async def __aenter__(self):
+            return SimpleNamespace()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def _never_returns(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(chat_title, "background_turn", lambda sessions, task: _Bg())
+    monkeypatch.setattr(chat_title, "rephrase_plan", _never_returns)
+    monkeypatch.setattr(chat_title, "_PLAN_REPHRASE_TIMEOUT", 0.05)
+
+    state = SimpleNamespace(sessions=SimpleNamespace())
+    out = await chat_title._rephrase_plan_lite(
+        state, "plan-like text", ["issue"], might_not_be_plan=True
+    )
+    assert out is None

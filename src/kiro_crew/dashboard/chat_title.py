@@ -754,6 +754,13 @@ def _extract_and_redact_plan_metadata(text: str) -> tuple[list[str], str, list[l
     return titles, goal, descriptions
 
 
+#: Bound on the plan-reformat round-trip. The rephrase is cosmetic: when it
+#: does not return inside this window the turn keeps the model's original text
+#: rather than holding the answer -- and the turn's own finalize -- behind a
+#: second LLM call that a slow or flaky backend can stall indefinitely.
+_PLAN_REPHRASE_TIMEOUT = 20.0
+
+
 async def _rephrase_plan_lite(
     state: DashboardState,
     text: str,
@@ -771,7 +778,17 @@ async def _rephrase_plan_lite(
         except Exception:
             logger.warning("Failed to get background session for plan rephrase", exc_info=True)
             return None
-        result = await rephrase_plan(text, issues, bg, might_not_be_plan=might_not_be_plan)
+        try:
+            result = await asyncio.wait_for(
+                rephrase_plan(text, issues, bg, might_not_be_plan=might_not_be_plan),
+                timeout=_PLAN_REPHRASE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Plan rephrase timed out after %.0fs; keeping the original text",
+                _PLAN_REPHRASE_TIMEOUT,
+            )
+            return None
     if result:
         result, _ = redact_exfiltration_urls(result)
         result, _ = redact_credentials(result)
