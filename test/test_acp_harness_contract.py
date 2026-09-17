@@ -592,8 +592,10 @@ def test_every_host_accepts_the_standard_session_update_spelling(backend):
     assert METHOD_SESSION_UPDATE in harness_for(backend).notification_aliases.session_update
 
 
-def test_a_host_outside_the_family_declares_its_own_vocabulary(backend=ACP_BACKEND_CODEX):
-    """codex is not reached through kiro-cli, so it must not inherit ``_kiro.dev/*``.
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CODEX, ACP_BACKEND_DEEPSEEK])
+def test_a_host_outside_the_family_declares_its_own_vocabulary(backend):
+    """codex and deepseek are not reached through kiro-cli, so neither may
+    inherit ``_kiro.dev/*``.
 
     Inheriting it would make the demux accept methods the host never sends, which
     costs nothing -- and would hide the real question, which is whether anyone

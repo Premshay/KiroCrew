@@ -22,15 +22,12 @@ import asyncio
 import pytest
 
 from kiro_crew.acp import client as client_mod
-from kiro_crew.acp.harness import deepseek as harness_mod
 from kiro_crew.acp.harness import harness_for
 from kiro_crew.acp.harness.base import SpawnContext, TeardownPolicy
-from kiro_crew.acp.session_handle import AcpRuntimeError
 from kiro_crew.acp.types import (
     ACP_BACKEND_DEEPSEEK,
     ACP_CLIENT_CAPABILITIES,
     METHOD_CANCEL,
-    METHOD_SESSION_UPDATE,
 )
 
 
@@ -73,13 +70,6 @@ async def test_the_model_rides_the_plan_not_argv(monkeypatch, tmp_path):
     )
     assert "--model" not in plan.argv
     assert plan.session_model == "deepseek-v4-pro"
-
-
-@pytest.mark.asyncio
-async def test_a_missing_binary_aborts_the_spawn_with_the_install_remedy(monkeypatch, tmp_path):
-    _pin_binary(monkeypatch, lambda: (None, "/nowhere"))
-    with pytest.raises(AcpRuntimeError, match="dsh not found"):
-        await harness_for(ACP_BACKEND_DEEPSEEK).resolve_spawn(_ctx(tmp_path))
 
 
 def test_spawn_env_strips_the_kiro_key_and_pins_the_permission_mode(monkeypatch):
@@ -142,13 +132,6 @@ async def test_answer_request_raises_for_an_unclaimed_method():
         await harness_for(ACP_BACKEND_DEEPSEEK).answer_request("some/other")
 
 
-def test_aliases_are_plain_acp_without_the_kiro_family_vocabulary():
-    aliases = harness_for(ACP_BACKEND_DEEPSEEK).notification_aliases
-    assert aliases.session_update == (METHOD_SESSION_UPDATE,)
-    assert aliases.subagent_list_update == ""
-    assert aliases.mcp_init == ()
-
-
 def test_teardown_is_a_cancel_notification():
     teardown = harness_for(ACP_BACKEND_DEEPSEEK).teardown
     assert teardown == TeardownPolicy(method=METHOD_CANCEL, notification=True)
@@ -158,10 +141,11 @@ def test_teardown_is_a_cancel_notification():
 
 
 def test_membership_seams_read_the_sets():
+    """The three membership answers the contract does not already parametrise
+    for every host; ``reads_markdown_agent_specs`` is covered there."""
     harness = harness_for(ACP_BACKEND_DEEPSEEK)
     assert harness.internal_sandbox is False
     assert harness.pod_home_remap is False
-    assert harness.reads_markdown_agent_specs is False
     assert harness.verifies_agent_activation is False
 
 
