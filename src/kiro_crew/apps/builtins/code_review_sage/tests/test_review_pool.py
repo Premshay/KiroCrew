@@ -206,6 +206,21 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FakeRuntime.instances[0].kw["model"], "gpt-5.3-codex")
         await pool.end_batch()
 
+    async def test_placeholder_models_are_not_forwarded_to_the_seat(self):
+        """auto/"default" mean "inherit the agent/seat default" and must never
+        reach the runtime's model channel: a seat-pinned engine (deepseek's
+        KIROCREW_DSH_MODEL) picks its own model, and pushing a placeholder
+        through session/set_config_option draws -32602 from any harness whose
+        advertised ids do not include it."""
+        for placeholder in ("auto", "default"):
+            _install_fake_runtime(self)
+            with unittest.mock.patch.object(rp, "reviewer_info", return_value={
+                    "model": placeholder, "effort": "", "agent": "reviewer"}):
+                pool = ReviewPool(work_dir="/tmp/x")
+                await pool.begin_batch()
+            self.assertIsNone(FakeRuntime.instances[0].kw["model"], placeholder)
+            await pool.end_batch()
+
     async def test_records_the_backend_reported_session_model(self):
         _install_fake_runtime(self)
         resolved: list[dict] = []

@@ -639,10 +639,19 @@ class _BatchRuntimeHolder:
         # OS sandbox scrubs credential paths/env for this LLM-directed subprocess
         # (GitHub fetch/post run via the `gh` CLI's own auth; the worker only
         # writes data/results and runs `python3 sage_lib/pipeline.py`).
+        # Placeholder model ids ("auto", the legacy "default") mean "inherit the
+        # agent/seat default" and are NOT forwarded: a seat-pinned engine
+        # (deepseek's KIROCREW_DSH_MODEL) decides its own model, and pushing a
+        # placeholder through session/set_config_option draws a -32602 from any
+        # harness whose advertised ids do not include it.
         runtime_kwargs: dict = {
             "work_dir": self._work_dir,
             "sandbox_mode": "auto",
-            "model": model_registry.to_acp_id(model) if model and model != "auto" else None,
+            "model": (
+                model_registry.to_acp_id(model)
+                if model and model not in ("auto", "default")
+                else None
+            ),
         }
         apply_runtime_client_binding(runtime_kwargs, runtime_client_binding(self._agent))
         rt = AcpRuntime(agent=self._agent, **runtime_kwargs)
