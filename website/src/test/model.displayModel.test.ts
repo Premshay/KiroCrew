@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { displayModel, normalizeModelKey, pinIsWithheld } from '../lib/model'
+import { displayModel, modelLabel, normalizeModelKey, pinIsWithheld } from '../lib/model'
 
 /** The picker's list is narrowed to what the live session says the account can
  *  run, while the slot keeps whatever model was pinned before. After a plan
@@ -243,5 +243,37 @@ describe('normalizeModelKey', () => {
     expect(normalizeModelKey('GPT-5.6')).toBe('gpt-5-6')
     expect(normalizeModelKey('deepseek-3.2')).toBe('deepseek-3-2')
     expect(normalizeModelKey('claude-opus-5')).toBe('claude-opus-5')
+  })
+})
+
+/** A composite-id harness (DeepSeek Harness) advertises its models as
+ *  `["provider","model"]` route pairs. The pair is the VALUE a picker selects
+ *  and `session/set_config_option` takes, so it must stay on `name`; the text a
+ *  person reads is this helper's answer. The composer chip, the crew editor's
+ *  model field and Settings' model lists all route through it. */
+describe('modelLabel', () => {
+  const list = [
+    { name: 'auto' },
+    { name: '["deepseek-official","deepseek-flash"]', label: 'DeepSeek-V41-Flash' },
+    { name: '["deepseek-official","deepseek-v4-pro"]', label: 'DeepSeek-V4-Pro' },
+  ]
+
+  it('writes the advertised name for a row that carries one', () => {
+    expect(modelLabel('["deepseek-official","deepseek-v4-pro"]', list)).toBe('DeepSeek-V4-Pro')
+  })
+
+  it('unwraps a route pair that has no row to read', () => {
+    // A served default the picker's list has not caught up with must still not
+    // render the provider envelope.
+    expect(modelLabel('["deepseek-official","deepseek-v4-flash-vision-exp"]')).toBe(
+      'deepseek-v4-flash-vision-exp',
+    )
+    expect(modelLabel('["deepseek-official","deepseek-v4-pro"]')).toBe('deepseek-v4-pro')
+  })
+
+  it('leaves an id that is already a name alone', () => {
+    expect(modelLabel('auto', list)).toBe('auto')
+    expect(modelLabel('claude-sonnet-5', list)).toBe('claude-sonnet-5')
+    expect(modelLabel('', list)).toBe('')
   })
 })

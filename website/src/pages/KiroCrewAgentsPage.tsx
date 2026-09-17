@@ -21,6 +21,7 @@ import { createSlot } from '../store/chatSlice'
 import { api, type WebhookTokenEntry } from '../api/client'
 import { useProvider } from '../providers'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { modelLabel } from '../lib/model'
 import { FOLDER_COLOR_PALETTE } from '../components/folderColorCatalog'
 import { Btn, SendBtn, Input, Badge, SearchInput, PageHeader, EmptyState } from '../components/ui'
 import {
@@ -698,7 +699,7 @@ export function ModelField({
         // inherit the next tier" — which can resolve to a concrete model. Label
         // it as the card does so the round trip stays honest.
         optionLabels={withCurrent(options, value).map((m) =>
-          m === INHERIT_MODEL ? i18nT('pages.kiroCrewAgentsPage.inherited') : m,
+          m === INHERIT_MODEL ? i18nT('pages.kiroCrewAgentsPage.inherited') : modelLabel(m),
         )}
         value={value}
         onChange={onChange}

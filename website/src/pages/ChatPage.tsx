@@ -369,7 +369,7 @@ import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutSto
 import { modelSupportsEffort } from '../lib/effort'
 import { mcpAppTabTitle } from '../lib/mcpAppSrcdoc'
 import { countCompletedTurns } from '../lib/completedTurns'
-import { displayModel, pinIsWithheld } from '../lib/model'
+import { displayModel, modelLabel, pinIsWithheld } from '../lib/model'
 import FollowUpCard from '../components/FollowUpCard'
 import FolderSuggestionCard from './chat/FolderSuggestionCard'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
@@ -4525,6 +4525,9 @@ export default function ChatPage({
     _modelsDegraded,
     currentSlot?.model_withheld,
   )
+  // What the chip WRITES. `shownModel` stays the value the picker selects on,
+  // so the raw id keeps its job and only the rendered text changes.
+  const shownModelLabel = modelLabel(shownModel, availableModels)
   // Context-window fallback for a peer-bound session BEFORE its first turn. Once a
   // turn has run the real number arrives with the relayed `context_usage` frame and
   // wins; until then `provider.getContextWindow` would answer from THIS machine's
@@ -9310,7 +9313,7 @@ export default function ChatPage({
                               agentSource={
                                 effectiveAgents.find((a) => a.name === activeAgentName)?.source
                               }
-                              modelName={shownModel}
+                              modelName={shownModelLabel}
                               // The served default is shown exactly when the pin alone would
                               // have read `auto`; that is the inherited case the marker names.
                               modelIsInheritedDefault={

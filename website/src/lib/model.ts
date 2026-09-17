@@ -102,6 +102,37 @@ export function displayModel(
   return row ? row.name : shown
 }
 
+/** An ACP harness that spells a model as a `["provider","model"]` route pair.
+ *
+ *  DeepSeek Harness advertises its models that way, and the pair IS the value
+ *  `session/set_config_option` takes. Nothing user-facing should render it.
+ */
+const ACP_ROUTE_PAIR_RE = /^\[\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\]$/
+
+/** The text to WRITE for a model id, for every surface that names one.
+ *
+ *  `displayModel` answers which model to name; this answers how to write it.
+ *  They are deliberately separate because a picker SELECTS on the value.
+ *
+ *  An advertised row's `label` is the backend's own name for the model
+ *  ("DeepSeek-V4-Pro") and wins whenever `models` carries that row. Without one
+ *  — a served default the list has not caught up with, a surface that only has
+ *  ids — a `["provider","model"]` pair is unwrapped to its model half, so the
+ *  provider envelope never reaches a human. Anything else is returned
+ *  unchanged: a kiro or Claude id is already the name.
+ */
+export function modelLabel(
+  value: string,
+  models: { name: string; label?: string }[] = [],
+): string {
+  if (!value) return value
+  const key = normalizeModelKey(value)
+  const row = models.find(m => normalizeModelKey(m.name) === key)
+  if (row?.label) return row.label
+  const route = ACP_ROUTE_PAIR_RE.exec(value)
+  return route ? route[2] : value
+}
+
 /** The pin-only half of `displayModel`: what the PIN alone says to display.
  *
  *  Split out so the inherited-model substitution above is a single post-step on

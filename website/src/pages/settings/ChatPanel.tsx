@@ -17,6 +17,7 @@ import { useAppSelector } from '../../store'
 import { serializeDefaultMemoryModeUpdate } from '../../api/queryClient'
 import { useOptimisticConfigPaths, setConfigPathValue } from './useOptimisticConfigPaths'
 import { useAvailableModelsQuery } from '../../hooks/useAvailableModels'
+import { modelLabel } from '../../lib/model'
 import { usePlainDiff } from '../../hooks/usePlainDiff'
 import { useDiffSplit } from '../../hooks/useDiffSplit'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
@@ -1018,7 +1019,7 @@ export function ChatPanel() {
             hint={i18nT('pages.settings.chatPanel.default_defers_to_your_agent_config_and_then_to')}
             value={shownDefaultModel}
             options={modelOptions}
-            optionLabels={modelOptions.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.default_auto') : m))}
+            optionLabels={modelOptions.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.default_auto') : modelLabel(m, availableModels)))}
             onChange={v => defaultModelMut.mutate(v)}
             disabled={!mcQ.isSuccess}
           />
@@ -1027,7 +1028,7 @@ export function ChatPanel() {
             description={i18nT('pages.settings.chatPanel.selectable_models_description')}
             options={availableModels.map(model => ({
               value: model.name,
-              label: model.name,
+              label: model.label ?? model.name,
               description: model.name === 'auto'
                 ? i18nT('pages.settings.chatPanel.auto_always_visible')
                 : model.description,

@@ -103,7 +103,7 @@ import {
   type ComposerHandle,
   type ComposerVoiceOptions,
 } from '../chat-core/composer/Composer'
-import { displayModel } from '../lib/model'
+import { displayModel, modelLabel } from '../lib/model'
 
 import { i18nT } from '../i18n/t'
 
@@ -615,6 +615,8 @@ export default function ChatPane({
     _modelsDegraded,
     paneSlot?.model_withheld,
   )
+  // See ChatPage: the chip writes the label, the picker still selects the value.
+  const shownModelLabel = modelLabel(shownModel, availableModels)
 
   // One-time hydrate of this slot's message history via React Query + the api
   // client (caching + cross-pane dedup; staleTime Infinity keeps it one-shot —
@@ -1823,7 +1825,7 @@ export default function ChatPane({
                 agentLabel={agentOrDefaultLabel(paneSlot?.agent, paneEffectiveDefaultAgent)}
                 agentIsInheritedDefault={!paneSlot?.agent && !!paneEffectiveDefaultAgent}
                 agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
-                modelName={shownModel}
+                modelName={shownModelLabel}
                 modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
                 contextPct={contextPct}
                 contextUsedTokens={contextTokens?.used}
