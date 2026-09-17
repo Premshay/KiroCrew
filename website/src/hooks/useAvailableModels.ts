@@ -24,7 +24,7 @@ const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
  * back to the model-family allowlist". An empty ARRAY is different and
  * meaningful: discovery ran and the runtime offered no effort selector.
  */
-type ModelCatalog = { models: ModelInfo[]; effortLevels?: string[] }
+type ModelCatalog = { models: ModelInfo[]; effortLevels?: string[]; supportsImages?: boolean }
 
 /**
  * THE model list. Every picker reads it through here.
@@ -104,6 +104,10 @@ export function useAvailableModelsQuery({
           effortLevels: Array.isArray(discovered.effort_levels)
             ? discovered.effort_levels
             : undefined,
+          supportsImages:
+            typeof discovered.supports_images === 'boolean'
+              ? discovered.supports_images
+              : undefined,
         }
       }
       return { models: withAutoFirst(await provider.fetchAvailableModels()) }
@@ -118,6 +122,9 @@ export function useAvailableModelsQuery({
     // means the catalog is generic (no crew runtime answered), which callers
     // read as "unknown -- fall back", never as "unsupported".
     effortLevels: query.data?.effortLevels,
+    /** Same contract as effortLevels: undefined means the generic catalog
+     *  answered, so callers fall back rather than assume unsupported. */
+    supportsImages: query.data?.supportsImages,
     isDegraded: selectableAgent ? query.isError : isDegraded,
   }
 }

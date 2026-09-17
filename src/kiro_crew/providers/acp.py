@@ -630,6 +630,16 @@ class AcpProvider(LLMProvider):
         return self._client.available_commands
 
     @property
+    def supports_image_prompt(self) -> bool:
+        """True when the live backend advertised image input at initialize.
+
+        Fails closed: an un-handshaked or silent backend reports False, which the
+        dashboard reads as "this crew cannot take images" and warns about, rather
+        than letting the whole prompt be rejected by the harness.
+        """
+        return bool(getattr(self._client, "supports_image_prompt", False))
+
+    @property
     def is_session_sharing_eligible(self) -> bool:
         """True when this provider can host multiplexed subagent sessions.
 

@@ -169,6 +169,7 @@ import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
 import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import {
+  IMG_EXT,
   addPendingFile,
   prepareSendPayload,
   buildRelMap,
@@ -4541,6 +4542,11 @@ export default function ChatPage({
     ? remoteCrew.capabilities?.effort_levels
     : localModelCatalog.effortLevels
   const effortSupported = effortSupportedForCrew(crewEffortLevels, shownEffortModel)
+  // Warn while the image is still pending, not after the harness rejects the
+  // whole prompt. `undefined` is "no crew runtime answered", which never warns.
+  const showImageHint =
+    localModelCatalog.supportsImages === false &&
+    pendingFiles.some((path) => IMG_EXT.test(path))
   // Context-window fallback for a peer-bound session BEFORE its first turn. Once a
   // turn has run the real number arrives with the relayed `context_usage` frame and
   // wins; until then `provider.getContextWindow` would answer from THIS machine's
@@ -9149,6 +9155,14 @@ export default function ChatPage({
                       actually existing, though: with no chips on screen a folder
                       failure is not a session-control problem, and calling it one
                       would put an unexplained notice on every composer. */}
+                                  {showImageHint && (
+                                    <div
+                                      className="pt-1.5 text-xs text-text-muted"
+                                      key="image-unsupported-hint"
+                                    >
+                                      {i18nT('pages.chatPage.image_unsupported_hint')}
+                                    </div>
+                                  )}
                                   {(sessionControlsError ||
                                     sessionControlStatusError ||
                                     (chatFoldersError && sessionControls.length > 0)) && (

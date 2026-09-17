@@ -6447,6 +6447,7 @@
     },
     "chatPage": {
       "agent_list": "Agent list",
+      "image_unsupported_hint": "This model can't accept images, so the file path is sent as text — ask the agent to open it, or switch to a seat whose model has vision.",
       "agent_selector": "Agent selector",
       "chat_messages": "Chat messages",
       "continue_a_previous_chat": "Continue a previous chat?",

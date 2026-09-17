@@ -141,6 +141,28 @@ describe('useAvailableModels — selectable crew', () => {
     await waitFor(() => expect(result.current.effortLevels).toEqual(['off', 'low', 'high', 'max']))
   })
 
+  it('surfaces the crew runtime image capability for the composer to warn on', async () => {
+    mocks.discover.mockResolvedValue({
+      models: [{ modelId: '["deepseek-official","deepseek-v4-pro"]', name: 'DeepSeek-V4-Pro', description: '' }],
+      effort_levels: ['off', 'low', 'high', 'max'],
+      supports_images: false,
+    })
+
+    const { result } = renderHook(
+      () => useAvailableModelsQuery({ agent: { name: 'crew-deepseek-pro', runtime_policy: { model: 'selectable' } } }),
+      { wrapper: queryWrapper },
+    )
+
+    await waitFor(() => expect(result.current.supportsImages).toBe(false))
+  })
+
+  it('leaves the image capability unknown for the generic catalog', async () => {
+    mocks.generic.mockResolvedValue([{ modelId: 'claude-sonnet-5', name: 'Claude Sonnet 5', description: '' }])
+    const { result } = renderHook(() => useAvailableModelsQuery(), { wrapper: queryWrapper })
+    await waitFor(() => expect(result.current.data.length).toBeGreaterThan(0))
+    expect(result.current.supportsImages).toBeUndefined()
+  })
+
   it('leaves the effort selector unknown for the generic catalog', async () => {
     mocks.generic.mockResolvedValue([{ modelId: 'claude-sonnet-5', name: 'Claude Sonnet 5', description: '' }])
     const { result } = renderHook(() => useAvailableModelsQuery(), { wrapper: queryWrapper })

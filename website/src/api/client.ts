@@ -3408,6 +3408,7 @@ export const api = {
     fetch('/api/agents/' + encodeURIComponent(agent) + '/models').then(j) as Promise<{
       models: { modelId: string; name: string; description: string }[]
       effort_levels: string[]
+      supports_images: boolean
     }>,
   syncKirocrewAgents: () => post('/api/agents/sync', {}).then(j),
   createKirocrewAgent: (body: object) => post('/api/agents', body).then(j),

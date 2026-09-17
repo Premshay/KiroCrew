@@ -4160,6 +4160,7 @@ async def _discover_agent_models(state: DashboardState, name: str) -> dict[str, 
         )
         available = await provider.discover_models()
         efforts = getattr(provider, "get_valid_effort_levels", lambda: [])()
+        supports_images = bool(getattr(provider, "supports_image_prompt", False))
         configured_models = acp_model_config_options(getattr(provider, "acp_config_options", []))
         if configured_models:
             available = configured_models
@@ -4175,6 +4176,9 @@ async def _discover_agent_models(state: DashboardState, name: str) -> dict[str, 
         return {
             "models": models,
             "effort_levels": [level for level in efforts if isinstance(level, str)],
+            # What the crew's OWN runtime advertised for prompt image input. The
+            # composer warns on a false rather than letting the send fail whole.
+            "supports_images": supports_images,
         }
     finally:
         if state.sessions.has_session(key):
