@@ -22,7 +22,11 @@ from kiro_crew import agent as agent_mod
 from kiro_crew.acp import client as client_mod
 from kiro_crew.acp import session_mcp
 from kiro_crew.acp.client import AcpClient
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX
+from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
+)
 from kiro_crew.providers.mirrors import claude_code as claude_mirror
 from kiro_crew.providers.mirrors import registry as mirrors_registry
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
@@ -650,28 +654,57 @@ class TestClientSeam:
 
         The capability set decides WHETHER the array is consulted (a property of the
         transport, not the vendor -- harness-parity H6), and the mirror registry
-        decides WHAT fills it. Widening the set alone must NOT populate: a backend
-        with no registered mirror has nothing to contribute and fails closed. Add
-        both and it works with no edit at either call site, which is what proves no
-        identity branch has crept back in.
+        decides WHAT the array carries from the agent spec. Widening the set alone
+        must not project the spec: a backend with no registered mirror contributes
+        no translation. It does NOT withhold Crew's own servers, which are not
+        spec-derived -- "no mirror" is a missing projection, not a refusal. Add both
+        and the spec arrives too, which is what proves no identity branch has
+        crept back in.
         """
         _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
         client = self._seeded(tmp_path, agent="kirocrew")
         assert client._session_mcp_servers() == []
 
-        # Set widened, no mirror registered -> still nothing. Fail-closed.
+        # Set widened, no mirror registered -> no spec translation, but Crew's own
+        # servers still arrive: the array is now the channel, and the withhold
+        # verdict belongs to a mirror that REFUSED, not to a mirror that is absent.
         monkeypatch.setattr(
             client_mod, "ACP_BACKENDS_SESSION_MCP_ARRAY", frozenset({client.backend})
         )
         client._reset_state()
         client._write_claude_local_settings()  # reset ends the session's ownership
-        assert client._session_mcp_servers() == []
+        names = set(_by_name(client._session_mcp_servers()))
+        assert "foo" not in names
+        assert names
 
         # Register a mirror for that backend too, and the array populates.
         monkeypatch.setitem(mirrors_registry.MIRRORS, client.backend, ClaudeCodeMirror)
         client._reset_state()
         client._write_claude_local_settings()
         assert "foo" in _by_name(client._session_mcp_servers())
+
+    def test_a_broker_only_backend_is_not_withheld(
+        self, tmp_path, agents_dir, monkeypatch
+    ):
+        """``no mirror`` is not ``refused``: a BROKER_ONLY backend still gets Crew's servers.
+
+        deepseek declares a real channel and no spec translation, so the withheld
+        verdict must not drop the shared broker append. Dropping it left every
+        deepseek session with none of Crew's tools, observed live 2026-09-17: no
+        broker stub process under the harness and no Crew tool on the session.
+        """
+        _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
+        client = AcpClient(
+            work_dir=tmp_path, agent="crew-deepseek", acp_backend=ACP_BACKEND_DEEPSEEK
+        )
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [{"name": "kirocrew-core"}])
+        monkeypatch.setattr(
+            client, "_session_capability_mcp_servers", lambda: [{"name": "kirocrew-cron"}]
+        )
+        names = _by_name(client._session_mcp_servers())
+        assert {"kirocrew-core", "kirocrew-cron"} <= set(names)
+        # BROKER_ONLY: the spec's own server is not translated onto this array.
+        assert "foo" not in names
 
     def test_the_seam_hands_down_the_pooled_stub_names(self, tmp_path, agents_dir, monkeypatch):
         # The client owns the overlay, so it is the only layer that can answer

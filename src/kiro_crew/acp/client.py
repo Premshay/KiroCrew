@@ -218,7 +218,12 @@ from kiro_crew.mcp_gateway.session_servers import (
 )
 from kiro_crew.metrics.tool_calls import note_tool_call_started, record_tool_call_finished
 from kiro_crew.platform.context import redact_log_via_context
-from kiro_crew.providers.mirrors import MIRRORS, mirror_for
+from kiro_crew.providers.mirrors import (
+    MIRRORS,
+    ProjectionKind,
+    mirror_for,
+    projection_for,
+)
 from kiro_crew.providers.mirrors.codex import drop_unadvertised_transports
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
@@ -5014,7 +5019,18 @@ class AcpClient:
             stubbed = frozenset()
         mirror = mirror_for(self.backend)
         if mirror is None:
-            self._session_mcp_withheld = True
+            # "No mirror in THIS folder" and "a mirror refused" are different
+            # verdicts, and only the second withholds the array. A BROKER_ONLY
+            # backend (deepseek) declares a real channel and no spec translation:
+            # the shared broker append and the session capability servers still
+            # have to reach it, and the flag set below is what drops both. Only a
+            # projection with NO channel withholds everything. ``projection_for``
+            # still raises for a backend declared in neither table, so an
+            # undeclared harness stays loud rather than silently toolless.
+            if projection_for(self.backend).kind is ProjectionKind.NO_CHANNEL:
+                self._session_mcp_withheld = True
+                return []
+            self._session_mcp_withheld = False
             return []
         owned = _permission_surface_owned(self)
         # Recorded HERE, beside the call that decides it, because the caller cannot
