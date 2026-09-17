@@ -333,7 +333,7 @@ import {
 import WelcomeView from '../components/WelcomeView'
 import { openPanelView, claimAppAutoOpen } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
-import { useAvailableModels } from '../hooks/useAvailableModels'
+import { useAvailableModelsQuery } from '../hooks/useAvailableModels'
 import {
   filterInteractiveModels,
   useModelPickerConfigured,
@@ -366,7 +366,7 @@ import ChatDropOverlay from '../components/ChatDropOverlay'
 import SessionGridView from '../components/SessionGridView'
 import SessionTabStrip from '../components/SessionTabStrip'
 import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutStore'
-import { modelSupportsEffort } from '../lib/effort'
+import { effortSupportedForCrew } from '../lib/effort'
 import { mcpAppTabTitle } from '../lib/mcpAppSrcdoc'
 import { countCompletedTurns } from '../lib/completedTurns'
 import { displayModel, modelLabel, pinIsWithheld } from '../lib/model'
@@ -1192,7 +1192,8 @@ export default function ChatPage({
   const modelPickerAgentName =
     slots.find((s) => s.key === activeSlot)?.agent || pendingAgent || defaultAgent
   const modelPickerAgent = installedAgents.find((agent) => agent.name === modelPickerAgentName)
-  const localModels = useAvailableModels({ agent: modelPickerAgent })
+  const localModelCatalog = useAvailableModelsQuery({ agent: modelPickerAgent })
+  const localModels = localModelCatalog.data
   // A peer-bound session's shelf must offer the PEER's rosters. Both hooks above
   // read THIS machine same-origin, so a remote session left on them would list
   // crews and models that do not exist over there — accepted by the picker, then
@@ -4528,6 +4529,18 @@ export default function ChatPage({
   // What the chip WRITES. `shownModel` stays the value the picker selects on,
   // so the raw id keeps its job and only the rendered text changes.
   const shownModelLabel = modelLabel(shownModel, availableModels)
+  // Authoritative effort capability for the crew this composer is bound to: the
+  // levels its own runtime advertised at discovery (dsh reports a
+  // `reasoning_effort` selector there, which the model-family allowlist below
+  // cannot be expected to know). `undefined` means the catalog is generic -- no
+  // crew runtime answered -- so the allowlist is the only signal left and is
+  // consulted ONLY in that case. An empty array is authoritative and closes the
+  // gate: discovery ran and offered no effort selector.
+  const shownEffortModel = shownModel === 'auto' ? '' : shownModel
+  const crewEffortLevels = remoteCrew.isRemote
+    ? remoteCrew.capabilities?.effort_levels
+    : localModelCatalog.effortLevels
+  const effortSupported = effortSupportedForCrew(crewEffortLevels, shownEffortModel)
   // Context-window fallback for a peer-bound session BEFORE its first turn. Once a
   // turn has run the real number arrives with the relayed `context_usage` frame and
   // wins; until then `provider.getContextWindow` would answer from THIS machine's
@@ -9439,7 +9452,7 @@ export default function ChatPage({
                               reasoningEffort={effectiveEffort}
                               onReasoningEffortClick={
                                 provider.capabilities.reasoningEffort &&
-                                modelSupportsEffort(shownModel === 'auto' ? '' : shownModel)
+                                effortSupported
                                   ? (rect) => {
                                       setReasoningEffortBtnRect(rect)
                                       setReasoningEffortDropdown(!reasoningEffortDropdown)
@@ -9669,7 +9682,7 @@ export default function ChatPage({
                                 !!(
                                   activeSlot &&
                                   provider.capabilities.reasoningEffort &&
-                                  modelSupportsEffort(shownModel === 'auto' ? '' : shownModel)
+                                  effortSupported
                                 )
                               }
                               slot={activeSlot}
@@ -9774,7 +9787,7 @@ export default function ChatPage({
                           reasoningEffortBtnRect &&
                           activeSlot &&
                           provider.capabilities.reasoningEffort &&
-                          modelSupportsEffort(shownModel === 'auto' ? '' : shownModel) &&
+                          effortSupported &&
                           createPortal(
                             <div
                               ref={reasoningEffortDropdownRef}

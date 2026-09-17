@@ -14,6 +14,19 @@ import type { ModelInfo } from '../providers/types'
 const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
 
 /**
+ * What one catalog fetch carries.
+ *
+ * `effortLevels` is the reasoning-effort selector the crew's OWN runtime
+ * advertised at discovery -- the authoritative capability for that crew, and
+ * the reason callers no longer have to guess from the model id. It is
+ * `undefined` when the catalog did not come from a crew's runtime (the generic
+ * catalog advertises no per-crew selector), which callers read as "unknown, fall
+ * back to the model-family allowlist". An empty ARRAY is different and
+ * meaningful: discovery ran and the runtime offered no effort selector.
+ */
+type ModelCatalog = { models: ModelInfo[]; effortLevels?: string[] }
+
+/**
  * THE model list. Every picker reads it through here.
  *
  * ## Why a hook and not six `useQuery` calls
@@ -72,28 +85,41 @@ export function useAvailableModelsQuery({
       : fallback === 'global'
         ? ['available-models', provider.id]
         : ['available-models', provider.id, 'none'],
-    queryFn: async () => {
+    queryFn: async (): Promise<ModelCatalog> => {
       if (selectableAgent) {
         const discovered = await api.kirocrewAgentModels(selectableAgent.name)
-        return withAutoFirst(
-          discovered.models.map((model) => ({
-            // `name` is the wire VALUE — dsh spells its ids as
-            // `["provider","model"]` pairs — so the readable name the agent
-            // catalog advertises rides a separate field. It used to be demoted
-            // to the description, which left the picker showing only the id.
-            name: model.modelId,
-            ...(model.name && model.name !== model.modelId ? { label: model.name } : {}),
-            description: model.description,
-            contextWindow: provider.getContextWindow(model.modelId),
-          })),
-        )
+        return {
+          models: withAutoFirst(
+            discovered.models.map((model) => ({
+              // `name` is the wire VALUE — dsh spells its ids as
+              // `["provider","model"]` pairs — so the readable name the agent
+              // catalog advertises rides a separate field. It used to be demoted
+              // to the description, which left the picker showing only the id.
+              name: model.modelId,
+              ...(model.name && model.name !== model.modelId ? { label: model.name } : {}),
+              description: model.description,
+              contextWindow: provider.getContextWindow(model.modelId),
+            })),
+          ),
+          effortLevels: Array.isArray(discovered.effort_levels)
+            ? discovered.effort_levels
+            : undefined,
+        }
       }
-      return withAutoFirst(await provider.fetchAvailableModels())
+      return { models: withAutoFirst(await provider.fetchAvailableModels()) }
     },
     refetchInterval: selectableAgent ? false : modelListRefetchInterval,
     enabled: (enabled ?? true) && canDiscover,
   })
-  return { ...query, data: query.data ?? (fallback === 'none' ? [] : PLACEHOLDER), isDegraded: selectableAgent ? query.isError : isDegraded }
+  return {
+    ...query,
+    data: query.data?.models ?? (fallback === 'none' ? [] : PLACEHOLDER),
+    // Authoritative capability for the crew this catalog belongs to. `undefined`
+    // means the catalog is generic (no crew runtime answered), which callers
+    // read as "unknown -- fall back", never as "unsupported".
+    effortLevels: query.data?.effortLevels,
+    isDegraded: selectableAgent ? query.isError : isDegraded,
+  }
 }
 
 export function useAvailableModels(options: Parameters<typeof useAvailableModelsQuery>[0] = {}): ModelInfo[] {

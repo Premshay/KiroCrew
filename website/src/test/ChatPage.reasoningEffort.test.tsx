@@ -17,6 +17,7 @@ vi.mock('../hooks/useVoiceInput', () => ({ useVoiceInput: () => ({ recording: fa
 import ChatInput, { REASONING_EFFORT_PROVIDERS, EFFORT_LABEL_KEY, modelSupportsEffort } from '../components/ChatInput'
 import ReasoningEffortDropdown from '../components/ReasoningEffortDropdown'
 import { pendingSlotSwitchTarget, performSlotSwitch, SWITCH_CONFIRM_TIMEOUT_MS } from '../lib/slotSwitch'
+import { effortSupportedForCrew } from '../lib/effort'
 
 beforeEach(() => { vi.clearAllMocks() })
 
@@ -96,6 +97,31 @@ describe('ChatInput reasoning effort button', () => {
     expect(modelSupportsEffort('deepseek-3.2')).toBe(false)
     expect(modelSupportsEffort('minimax-m2.5')).toBe(false)
     expect(modelSupportsEffort('glm-5')).toBe(false)
+  })
+})
+
+describe('effortSupportedForCrew — the crew runtime outranks the family allowlist', () => {
+  it('opens the control for a DeepSeek route pair when the crew advertises levels', () => {
+    // The regression: the family allowlist cannot parse dsh's composite ids, so
+    // before the crew catalog answered, the effort control never rendered.
+    expect(
+      effortSupportedForCrew(
+        ['off', 'low', 'high', 'max'],
+        '["deepseek-official","deepseek-flash"]',
+      ),
+    ).toBe(true)
+  })
+
+  it('treats an advertised empty list as authoritative and closes the control', () => {
+    expect(effortSupportedForCrew([], 'claude-opus-4.7')).toBe(false)
+  })
+
+  it('falls back to the family allowlist only when no crew runtime answered', () => {
+    expect(effortSupportedForCrew(undefined, 'claude-opus-4.7')).toBe(true)
+    expect(effortSupportedForCrew(undefined, 'claude-haiku-4.5')).toBe(false)
+    expect(
+      effortSupportedForCrew(undefined, '["deepseek-official","deepseek-flash"]'),
+    ).toBe(false)
   })
 })
 

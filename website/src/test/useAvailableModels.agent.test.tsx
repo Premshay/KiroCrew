@@ -124,4 +124,28 @@ describe('useAvailableModels — selectable crew', () => {
     expect(mocks.generic).not.toHaveBeenCalled()
   })
 
+  it('surfaces the crew runtime effort selector for the composer to gate on', async () => {
+    // The effort control is gated on this: a harness whose ids the frontend
+    // family allowlist cannot parse (dsh's route pairs) still reports its own
+    // selector, and dropping it here is what blanked the control.
+    mocks.discover.mockResolvedValue({
+      models: [{ modelId: '["deepseek-official","deepseek-flash"]', name: 'DeepSeek-V41-Flash', description: '' }],
+      effort_levels: ['off', 'low', 'high', 'max'],
+    })
+
+    const { result } = renderHook(
+      () => useAvailableModelsQuery({ agent: { name: 'crew-deepseek', runtime_policy: { model: 'selectable' } } }),
+      { wrapper: queryWrapper },
+    )
+
+    await waitFor(() => expect(result.current.effortLevels).toEqual(['off', 'low', 'high', 'max']))
+  })
+
+  it('leaves the effort selector unknown for the generic catalog', async () => {
+    mocks.generic.mockResolvedValue([{ modelId: 'claude-sonnet-5', name: 'Claude Sonnet 5', description: '' }])
+    const { result } = renderHook(() => useAvailableModelsQuery(), { wrapper: queryWrapper })
+    await waitFor(() => expect(result.current.data.length).toBeGreaterThan(0))
+    expect(result.current.effortLevels).toBeUndefined()
+  })
+
 })
