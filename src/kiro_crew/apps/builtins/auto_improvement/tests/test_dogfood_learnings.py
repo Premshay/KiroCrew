@@ -2760,29 +2760,64 @@ class TestTheWatcherRefusesToRunWithoutEgressAcknowledgement:
 class TestTheLoopRunnerRefusesWithoutCredentialConfinement:
     """The loop's authoring agent must not run with the operator's credential stores visible.
 
-    The SUBPROCESS path spawns through `sandboxed_spawn_argv(mode="strict")` +
-    `strip_credential_env`, which hides `~/.aws`, `~/.gnupg`, `gh`/`gcloud`/`kube` config and
-    scrubs the token env. The PROVIDER path (`SessionAgentRunner`) drives a Kiro Crew session
-    instead, so isolation is whatever the gateway's `sandbox` setting provides — and that field
-    DEFAULTS TO "auto" (engages OS-level isolation and defers to kiro-cli's internal agent sandbox
-    on macOS when enabled). On a gateway with mode='off' set, a repository instruction reaching
-    the agent's auto-approved Bash (`python helper.py`) could read those stores and exfiltrate
-    over an unrestricted network.
-
-    `_build_runner` therefore runs OFFLINE (returns None — the same fail-closed answer it
-    already gives when the tool-restricted agent cannot be registered) unless the sandbox is
-    'auto' OR the operator has acknowledged the residual risk with
-    `acceptUnsandboxedAgentRisk`. Raised by the GPT review.
+    The provider inherits agent.sandbox and its governance floor. Only an effective
+    cc/strict profile or an explicit operator acknowledgement permits this path.
     """
 
-    def test_an_unconfined_sandbox_without_acknowledgement_refuses(self, monkeypatch) -> None:
+    @pytest.mark.parametrize("mode", ["off", "auto", "standard", ""])
+    def test_an_unconfined_sandbox_without_acknowledgement_refuses(self, monkeypatch, mode) -> None:
+        from kiro_crew import sandbox
         from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
+        from kiro_crew.config import KiroCrewConfig
 
         monkeypatch.setattr(R, "_unsandboxed_agent_accepted", lambda: False)
-        monkeypatch.setattr(R.store, "read_json", lambda *_a, **_k: {})
+        monkeypatch.setattr(
+            KiroCrewConfig, "load", lambda: SimpleNamespace(agent=SimpleNamespace(sandbox=mode))
+        )
+        monkeypatch.setattr(sandbox, "effective_sandbox_mode", lambda value: value)
         reason = R._credentials_are_unconfined()
-        assert reason, "an 'off'/unset sandbox with no acknowledgement must report unconfined"
-        assert "auto" in reason
+        assert "requires 'cc' or 'strict'" in reason
+
+    @pytest.mark.parametrize(
+        "configured,effective",
+        [("cc", "cc"), ("strict", "strict"), ("standard", "cc"), ("off", "strict")],
+    )
+    def test_nested_setting_and_governance_floor_are_honored(
+        self, monkeypatch, configured, effective
+    ):
+        from kiro_crew import sandbox
+        from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
+        from kiro_crew.config import KiroCrewConfig
+
+        monkeypatch.setattr(R, "_unsandboxed_agent_accepted", lambda: False)
+        monkeypatch.setattr(
+            KiroCrewConfig,
+            "load",
+            lambda: SimpleNamespace(agent=SimpleNamespace(sandbox=configured)),
+        )
+
+        def resolve(value):
+            assert value == configured
+            return effective
+
+        monkeypatch.setattr(sandbox, "effective_sandbox_mode", resolve)
+        assert R._credentials_are_unconfined() == ""
+
+    def test_unresolvable_governance_fails_closed(self, monkeypatch):
+        from kiro_crew import sandbox
+        from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
+        from kiro_crew.config import KiroCrewConfig
+
+        monkeypatch.setattr(R, "_unsandboxed_agent_accepted", lambda: False)
+        monkeypatch.setattr(
+            KiroCrewConfig, "load", lambda: SimpleNamespace(agent=SimpleNamespace(sandbox="strict"))
+        )
+
+        def resolve(value):
+            raise RuntimeError("policy unavailable")
+
+        monkeypatch.setattr(sandbox, "effective_sandbox_mode", resolve)
+        assert "could not be resolved (RuntimeError)" in R._credentials_are_unconfined()
 
     def test_the_acknowledgement_opts_in(self, monkeypatch) -> None:
         from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
@@ -2834,9 +2869,9 @@ class TestTheLoopRunnerRefusesWithoutCredentialConfinement:
             "the loop's runner does not check credential confinement, so a provider-driven "
             "agent can run with the operator's credential stores visible"
         )
-        assert src.index("_credentials_are_unconfined()") < src.index("SessionAgentRunner("), (
-            "the confinement check runs AFTER the runner is constructed — it must refuse first"
-        )
+        assert src.index("_credentials_are_unconfined()") < src.index(
+            "SessionAgentRunner("
+        ), "the confinement check runs AFTER the runner is constructed — it must refuse first"
 
     def test_the_config_key_is_writable(self) -> None:
         from kiro_crew.apps.builtins.auto_improvement.backend.routes import _CONFIG_WRITABLE

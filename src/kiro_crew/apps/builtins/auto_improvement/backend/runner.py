@@ -178,7 +178,7 @@ def _credentials_are_unconfined() -> str:
 
     Empty string means "confined, safe to run". The app's subprocess path forces
     ``sandboxed_spawn_argv(mode="strict")`` + ``strip_credential_env``; the provider path
-    inherits the gateway's ``sandbox`` setting instead. Only ``"cc"`` and ``"strict"``
+    inherits ``agent.sandbox`` plus its governance floor. Only ``"cc"`` and ``"strict"``
     profiles hide credential stores (``~/.aws``, ``~/.ssh``, ``~/.config/gh``, ``~/.kube``);
     the default ``"auto"``/``"standard"`` intentionally exposes ``.aws/.ssh`` for
     interactive workflow use — safe for human-driven chat, but NOT for unattended
@@ -198,10 +198,12 @@ def _credentials_are_unconfined() -> str:
         return ""
     try:
         from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.sandbox import effective_sandbox_mode
 
-        mode = str(getattr(KiroCrewConfig.load(), "sandbox", "") or "").strip().lower()
+        configured = KiroCrewConfig.load().agent.sandbox
+        mode = effective_sandbox_mode(configured)
     except Exception as exc:  # noqa: BLE001 — an unverifiable sandbox is an unconfined one
-        return f"the gateway sandbox setting could not be read ({type(exc).__name__})"
+        return f"the effective provider sandbox could not be resolved ({type(exc).__name__})"
     # The provider path runs repository-controlled text through an agent with
     # auto-approved shell, so it requires a sandbox level that HIDES credential
     # stores (~/.aws, ~/.ssh, ~/.config/gh, ~/.kube). Only 'cc' and 'strict'
@@ -211,7 +213,7 @@ def _credentials_are_unconfined() -> str:
     _CREDENTIAL_HIDING_MODES = {"cc", "strict"}
     if mode not in _CREDENTIAL_HIDING_MODES:
         return (
-            f"the gateway sandbox is {mode or 'unset'!r} — the auto-improvement "
+            f"the effective provider sandbox is {mode or 'unset'!r} — the auto-improvement "
             f"provider path requires 'cc' or 'strict' (credential-hiding profiles) "
             f"or the explicit acceptUnsandboxedAgentRisk opt-in"
         )
@@ -453,26 +455,14 @@ class RunSupervisor:
         from ..spine.agent_runner import SessionAgentRunner
 
         if SessionAgentRunner.available():
-            # CREDENTIAL CONFINEMENT PRECONDITION. The subprocess path spawns through
-            # `sandboxed_spawn_argv(mode="strict")` + `strip_credential_env`, which hides
-            # `~/.aws`, `~/.gnupg`, `gh`/`gcloud`/`kube` config and scrubs the token env. The
-            # PROVIDER path does not: it drives a Kiro Crew session, so isolation is whatever
-            # `cfg.sandbox` says — and that field DEFAULTS TO "off" ("defers isolation to
-            # kiro-cli's internal agent sandbox"). On a gateway where kiro-cli provides no
-            # sandbox, an injected repository instruction reaching the agent's auto-approved
-            # Bash (`python helper.py`) could read those credential stores and exfiltrate over
-            # an unrestricted network. Refuse rather than run unconfined: `None` means OFFLINE
-            # (no fabricated fixes), which is the same fail-closed answer this method already
-            # gives when the tool-restricted agent cannot be registered. Raised by the GPT
-            # review. The watcher path is gated separately and explicitly
-            # (`pr_watchers._watcher_egress_accepted`, D-118) because it genuinely needs `gh`
-            # network access; the loop's authoring agent does not.
+            # Repository-controlled prompts run unattended, so the provider's
+            # effective sandbox must hide credentials before any agent is started.
             unconfined = _credentials_are_unconfined()
             if unconfined:
                 logger.warning(
                     "%s: refusing the provider-backed agent runner — %s, so an agent-run "
                     "command could read credential stores and exfiltrate. Running OFFLINE. "
-                    "Set the gateway's `sandbox` to 'auto' to re-enable the OS-level sandbox, "
+                    "The provider requires an effective 'cc' or 'strict' credential-hiding sandbox, "
                     "or set `acceptUnsandboxedAgentRisk` to acknowledge the residual risk.",
                     store.APP_NAME,
                     unconfined,

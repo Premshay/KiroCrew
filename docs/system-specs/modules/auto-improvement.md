@@ -25,6 +25,12 @@ throughout.
 
 ## Routes
 
+The provider-runner credential check reads `agent.sandbox` and resolves it through
+`sandbox.effective_sandbox_mode`, the same governance-floor calculation used by
+the launcher. An effective `cc` or `strict` mode passes; other modes still require
+the explicit risk acknowledgement. Configuration or policy-resolution failures
+refuse the runner rather than assuming credentials are isolated.
+
 All routes live under `/api/apps/auto-improvement/` and are registered by
 `apps/builtins/auto_improvement/backend/routes.py:register_routes`, mounted
 in-process on the gateway's own aiohttp app. Every handler is wrapped in
