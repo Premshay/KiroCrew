@@ -111,7 +111,16 @@ export interface ProviderLabels {
 }
 
 export interface ModelInfo {
+  /** The value the backend takes for this model, and what a picker sends on
+   *  select. On a companion-owned catalog it is the provider's own id, and a
+   *  composite-id harness spells that structurally — dsh sends
+   *  `["deepseek-official","deepseek-v4-pro"]`. Never render it raw; use
+   *  `label` when the row carries one. */
   name: string
+  /** Human label for a picker row: the name the backend advertised for the
+   *  model. Set only when that name differs from `name`, so rows render
+   *  `label ?? name` and an id-only catalog is unchanged. */
+  label?: string
   description: string
   contextWindow?: number
   supportsExtendedContext?: boolean

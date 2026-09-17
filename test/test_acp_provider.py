@@ -16,7 +16,12 @@ import pytest
 from kiro_crew.acp.client import AcpAuthRequired
 from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_provider import AcpSessionProvider
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, AcpEvent, TurnUsage
+from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_DEEPSEEK,
+    AcpEvent,
+    TurnUsage,
+)
 from kiro_crew.providers.acp import AcpProvider
 
 
@@ -720,6 +725,39 @@ class TestEffortControl:
         assert not self._effort_provider(backend="", model="auto").supports_effort()
         assert not self._effort_provider(backend="", model="claude-haiku-4.5").supports_effort()
         assert not self._effort_provider(backend="", model="deepseek-3.2").supports_effort()
+
+    # ── Composite-id harness (DeepSeek Harness) ──────────────────────────
+    # dsh advertises its models as JSON route pairs, so no id reaching these
+    # methods is a name the kiro/claude allowlist can classify. The session's
+    # own advertised selector is the only evidence there is, and these three
+    # pin that it is what decides.
+
+    _DSH_MODEL = '["deepseek-official","deepseek-flash"]'
+
+    def test_deepseek_supports_effort_follows_the_advertised_option(self):
+        provider = self._effort_provider(backend=ACP_BACKEND_DEEPSEEK, model=self._DSH_MODEL)
+        provider._client.effort_config_option_id.return_value = "reasoning_effort"
+        assert provider.supports_effort() is True
+        # An older adapter build that advertises no selector must not claim it.
+        provider._client.effort_config_option_id.return_value = None
+        assert provider.supports_effort() is False
+
+    @pytest.mark.asyncio
+    async def test_deepseek_change_effort_uses_the_advertised_option(self):
+        provider = self._effort_provider(backend=ACP_BACKEND_DEEPSEEK, model=self._DSH_MODEL)
+        provider._client.effort_config_option_id.return_value = "reasoning_effort"
+        assert await provider.change_effort("low") is True
+        provider._client.set_config_option.assert_awaited_once_with("reasoning_effort", "low")
+        provider._client.send_command.assert_not_awaited()
+        assert provider._effort_per_model[self._DSH_MODEL] == "low"
+
+    @pytest.mark.asyncio
+    async def test_deepseek_initial_effort_applies_a_slot_override(self):
+        provider = self._effort_provider(backend=ACP_BACKEND_DEEPSEEK, model=self._DSH_MODEL)
+        provider._client.effort_config_option_id.return_value = "reasoning_effort"
+        provider._effort_per_model = {self._DSH_MODEL: "low"}
+        await provider._apply_initial_effort()
+        provider._client.set_config_option.assert_awaited_once_with("reasoning_effort", "low")
 
 
 class TestStartKiroRuntimeResume:

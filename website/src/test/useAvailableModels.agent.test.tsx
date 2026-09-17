@@ -81,6 +81,34 @@ describe('useAvailableModels — selectable crew', () => {
     expect(mocks.discover).not.toHaveBeenCalled()
     expect(mocks.generic).not.toHaveBeenCalled()
   })
+  it('labels a composite-id agent catalog with the advertised model names', async () => {
+    // dsh advertises its models as `["provider","model"]` route pairs. The id
+    // is the wire value and stays `name`; the readable name the catalog sends
+    // rides `label`, which is what a picker row renders.
+    mocks.discover.mockResolvedValue({
+      models: [
+        { modelId: '["deepseek-official","deepseek-flash"]', name: 'DeepSeek-V41-Flash', description: '' },
+        { modelId: '["deepseek-official","deepseek-v4-pro"]', name: 'DeepSeek-V4-Pro', description: 'Harder tasks.' },
+      ],
+      effort_levels: ['off', 'low', 'high', 'max'],
+    })
+
+    const { result } = renderHook(
+      () => useAvailableModels({
+        agent: { name: 'crew-deepseek-atlas', runtime_policy: { model: 'selectable' } },
+      }),
+      { wrapper: queryWrapper },
+    )
+
+    await waitFor(() =>
+      expect(result.current.map(m => [m.name, m.label])).toEqual([
+        ['auto', undefined],
+        ['["deepseek-official","deepseek-flash"]', 'DeepSeek-V41-Flash'],
+        ['["deepseek-official","deepseek-v4-pro"]', 'DeepSeek-V4-Pro'],
+      ]),
+    )
+  })
+
   it('exposes a crew discovery failure without consulting another runtime catalog', async () => {
     mocks.discover.mockRejectedValue(new Error('Crew discovery unavailable'))
     const { result } = renderHook(

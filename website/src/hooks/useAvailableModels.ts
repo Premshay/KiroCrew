@@ -77,8 +77,13 @@ export function useAvailableModelsQuery({
         const discovered = await api.kirocrewAgentModels(selectableAgent.name)
         return withAutoFirst(
           discovered.models.map((model) => ({
+            // `name` is the wire VALUE — dsh spells its ids as
+            // `["provider","model"]` pairs — so the readable name the agent
+            // catalog advertises rides a separate field. It used to be demoted
+            // to the description, which left the picker showing only the id.
             name: model.modelId,
-            description: model.description || model.name,
+            ...(model.name && model.name !== model.modelId ? { label: model.name } : {}),
+            description: model.description,
             contextWindow: provider.getContextWindow(model.modelId),
           })),
         )

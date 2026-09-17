@@ -5205,6 +5205,27 @@ class KiroCrewConfig:
             # kiro cold start (or the handler's reset-then-respawn) would only
             # pick up effort already recovered from a pre-existing overlay,
             # never the freshly-set slot value. Mirrors the _claude_code path.
+            # Which harness this session runs on decides whether an effort
+            # override can be carried at all, so the backend is resolved HERE,
+            # before the effort gate below. ONE call to the selection gate's
+            # per-session half (members.select_provider_backend: member-DM
+            # auto-route > configured default); resolve_selected_backend inside
+            # the helper applies the same governance/selectability gate as the
+            # persisted field, so a denied or unknown value degrades to kiro --
+            # the member thread then runs as plain chat and the mount step logs
+            # why.
+            # circular import: members sits above config in the layering.
+            from kiro_crew.agent_sdk.backends import ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
+            from kiro_crew.members import select_provider_backend
+
+            _backend = select_provider_backend(
+                session_key,
+                self.agent.member_acp_backend,
+                self.agent.acp_backend,
+            )
+            _effort_via_config_option = (
+                _backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
+            )
             _eff_per_model: dict[str, str] = {}
             # Role-aware effort default: background worker agents (lite /
             # heartbeat) resolve the "background" role effort; everything else
@@ -5215,7 +5236,12 @@ class KiroCrewConfig:
             else:
                 base_effort = default_effort
             _eff = reasoning_effort_override or base_effort
-            if m and _eff and is_valid_effort(_eff) and model_supports_effort(m):
+            if (
+                m
+                and _eff
+                and is_valid_effort(_eff)
+                and (model_supports_effort(m) or _effort_via_config_option)
+            ):
                 _eff_per_model[m] = _eff
             elif _eff and is_valid_effort(_eff):
                 # Single-authority drop warning: a valid requested effort is
@@ -5249,23 +5275,6 @@ class KiroCrewConfig:
                         session_key or "?",
                         m or "auto",
                     )
-            # Per-session backend selection — ONE call to the selection gate's
-            # per-session half (members.select_provider_backend: member-DM
-            # auto-route > configured default). The factory body carries no
-            # branching of its own, so the kiro construction path gains no
-            # second check (harness-parity H3/H13); resolve_selected_backend
-            # inside the helper applies the same governance/selectability gate
-            # as the persisted field, so a denied or unknown value degrades to
-            # kiro — the member thread then runs as plain chat and the mount
-            # step logs why.
-            # circular import: members sits above config in the layering.
-            from kiro_crew.members import select_provider_backend
-
-            _backend = select_provider_backend(
-                session_key,
-                self.agent.member_acp_backend,
-                self.agent.acp_backend,
-            )
             return AcpProvider(
                 work_dir=wdir,
                 model=m,

@@ -1286,12 +1286,27 @@ class AcpProvider(LLMProvider):
 
     # ── Reasoning-effort control ─────────────────────────────────────
 
-    def supports_effort(self) -> bool:
-        """True when the current model accepts a reasoning-effort level.
+    def _advertised_effort(self) -> bool:
+        """Whether this session advertises a reasoning-effort selector.
 
-        Drives the dashboard effort dropdown: shown only when the active
-        model is effort-capable (Opus/Sonnet), for both ACP backends.
+        The config-option channel's own evidence, and stronger than the static
+        kiro/claude model allowlist: a harness that advertises the option
+        accepts a level whatever its model ids are called, which is the only
+        evidence there is for a composite-id harness the allowlist has never
+        seen (dsh spells its models ``["deepseek-official","deepseek-flash"]``).
         """
+        return bool(self._client.effort_config_option_id())
+
+    def supports_effort(self) -> bool:
+        """True when the current session accepts a reasoning-effort level.
+
+        Drives the dashboard effort dropdown. On the config-option channel the
+        session's own selector decides, so a harness the model allowlist cannot
+        classify still gets the control. The kiro family advertises no selector
+        and keeps the model allowlist.
+        """
+        if self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION:
+            return self._advertised_effort()
         return model_supports_effort(self._client._model)
 
     def _resolve_effort(self) -> str | None:
@@ -1311,6 +1326,10 @@ class AcpProvider(LLMProvider):
             self._client._model,
             slot_overrides=self._effort_per_model,
             defaults=self._effort_defaults,
+            advertised_supported=(
+                self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
+                and self._advertised_effort()
+            ),
         )
 
     def _apply_effort_overlay(self) -> None:
@@ -1455,9 +1474,6 @@ class AcpProvider(LLMProvider):
         so has no effort channel at all.
         """
         model = self._client._model
-        if not model_supports_effort(model):
-            logger.info("change_effort skipped — model %s does not support effort", model)
-            return False
         via_config_option = self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
         via_slash_command = self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS
         if not (via_config_option or via_slash_command):
@@ -1469,11 +1485,19 @@ class AcpProvider(LLMProvider):
                 self._client.backend,
             )
             return False
-        # An adapter build may advertise no 'effort' config option; attempting to
-        # push would fail with 'Unknown config option' and reset the session.
-        # Report unsupported so the dashboard leaves the UI as-is.
-        if via_config_option and not self._client.effort_config_option_id():
-            logger.info("change_effort skipped — ACP backend exposes no effort option")
+        if via_config_option:
+            # The advertised selector is the authority on this channel, and it
+            # outranks the static model allowlist: dsh accepts effort on ids
+            # that allowlist has never seen. An adapter build may also advertise
+            # none at all; pushing then answers 'Unknown config option' and
+            # resets the session, so report unsupported and leave the UI as-is.
+            if not self._advertised_effort():
+                logger.info("change_effort skipped — ACP backend exposes no effort option")
+                return False
+        elif not model_supports_effort(model):
+            # The slash-command channel advertises no selector to read, so the
+            # model allowlist is the only evidence there is.
+            logger.info("change_effort skipped — model %s does not support effort", model)
             return False
         # Accept any level the dynamic validation set knows about — ACP backends
         # can report levels beyond the canonical five (effort.py), and those are
@@ -1541,7 +1565,7 @@ class AcpProvider(LLMProvider):
         while the UI shows "default".
         """
         model = self._client._model
-        if not model_supports_effort(model):
+        if not self.supports_effort():
             return False
         self._effort_per_model.pop(model, None)
         if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:

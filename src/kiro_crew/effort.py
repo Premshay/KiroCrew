@@ -142,14 +142,22 @@ def resolve_effort_for_model(
     model: str | None,
     slot_overrides: dict[str, str] | None = None,
     defaults: object = None,
+    *,
+    advertised_supported: bool = False,
 ) -> str | None:
     """Resolve the effort level for *model* using the priority chain.
 
     Priority: ``slot_overrides[model]`` → ``defaults[model]`` → ``None``.
     Returns ``None`` when the model does not support effort or no level
     resolves (caller should then leave the provider on its own default).
+
+    *advertised_supported* is the caller's own evidence that the live session
+    advertises an effort selector. That outranks this module's static
+    kiro/claude allowlist, and it is the only evidence available for a harness
+    whose ids the allowlist has never seen (dsh spells its models as
+    ``["deepseek-official","deepseek-flash"]``).
     """
-    if not model_supports_effort(model):
+    if not (advertised_supported or model_supports_effort(model)):
         return None
     assert model is not None  # narrowed by model_supports_effort
     if slot_overrides:
