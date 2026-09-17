@@ -768,8 +768,34 @@ async def _rephrase_plan_lite(
     *,
     might_not_be_plan: bool = False,
 ) -> str | None:
-    """Rephrase a plan using the cheap background session (kirocrew-lite)."""
+    """Rephrase a plan using the cheap background session (kirocrew-lite).
 
+    Bounded END TO END. Acquiring the shared background session can itself
+    block behind another background turn, so a bound around only the prompt
+    left the caller held at the acquire: the rephrase logged "asking LLM to
+    reformat" and then produced nothing until a manual Stop, and the
+    prompt-level timeout never fired.
+    """
+    try:
+        return await asyncio.wait_for(
+            _rephrase_plan_turn(state, text, issues, might_not_be_plan=might_not_be_plan),
+            timeout=_PLAN_REPHRASE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Plan rephrase timed out after %.0fs; keeping the original text",
+            _PLAN_REPHRASE_TIMEOUT,
+        )
+        return None
+
+
+async def _rephrase_plan_turn(
+    state: DashboardState,
+    text: str,
+    issues: list[str],
+    *,
+    might_not_be_plan: bool,
+) -> str | None:
     async with contextlib.AsyncExitStack() as stack:
         try:
             bg = await stack.enter_async_context(
@@ -778,17 +804,7 @@ async def _rephrase_plan_lite(
         except Exception:
             logger.warning("Failed to get background session for plan rephrase", exc_info=True)
             return None
-        try:
-            result = await asyncio.wait_for(
-                rephrase_plan(text, issues, bg, might_not_be_plan=might_not_be_plan),
-                timeout=_PLAN_REPHRASE_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Plan rephrase timed out after %.0fs; keeping the original text",
-                _PLAN_REPHRASE_TIMEOUT,
-            )
-            return None
+        result = await rephrase_plan(text, issues, bg, might_not_be_plan=might_not_be_plan)
     if result:
         result, _ = redact_exfiltration_urls(result)
         result, _ = redact_credentials(result)

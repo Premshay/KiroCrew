@@ -1042,3 +1042,31 @@ async def test_plan_rephrase_timeout_releases_the_turn(monkeypatch):
         state, "plan-like text", ["issue"], might_not_be_plan=True
     )
     assert out is None
+
+
+@pytest.mark.asyncio
+async def test_plan_rephrase_acquisition_hang_releases_the_turn(monkeypatch):
+    """The bound must cover acquiring the background session, not just the prompt.
+
+    The shared background session can be held by another background turn, so
+    the acquire is where the turn was actually held: the prompt-level timeout
+    never fired and the dashboard sat on "streaming" until a manual Stop. A
+    hang in ``background_turn.__aenter__`` must release the turn too.
+    """
+    import asyncio
+
+    class _HangingBg:
+        async def __aenter__(self):
+            await asyncio.sleep(3600)
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(chat_title, "background_turn", lambda sessions, task: _HangingBg())
+    monkeypatch.setattr(chat_title, "_PLAN_REPHRASE_TIMEOUT", 0.05)
+
+    state = SimpleNamespace(sessions=SimpleNamespace())
+    out = await chat_title._rephrase_plan_lite(
+        state, "plan-like text", ["issue"], might_not_be_plan=True
+    )
+    assert out is None
