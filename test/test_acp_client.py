@@ -13590,3 +13590,68 @@ class TestCompactionFailureIsTransient:
         }
         assert compaction_failure_detail(frame) == "High traffic — try another model."
         assert compaction_failure_is_transient(frame) is True
+
+
+class TestImagePromptCapability:
+    """The direct prompt path gates on the capability the harness advertised.
+
+    Ungated it sent an image block to a harness that advertised none, and the
+    harness rejected the WHOLE prompt (-32602) instead of the documented
+    fallback: leave the path in the text so a tool-capable agent can open it.
+    """
+
+    def _client(self, tmp_path, advertised):
+        client = acp_client.AcpClient(work_dir=tmp_path)
+        client._prompt_capabilities = advertised
+        return client
+
+    def test_the_property_fails_closed_before_the_handshake(self, tmp_path):
+        client = acp_client.AcpClient(work_dir=tmp_path)
+        assert client.supports_image_prompt is False
+
+    def test_initialize_session_captures_the_advertised_capabilities(self):
+        import inspect
+
+        source = inspect.getsource(acp_client.AcpClient._initialize_session)
+        assert "promptCapabilities" in source
+        assert "self._prompt_capabilities" in source
+
+    @pytest.mark.asyncio
+    async def test_send_prompt_withholds_images_when_not_advertised(
+        self, tmp_path, monkeypatch
+    ):
+        seen = {}
+
+        def _fake_build(message, *, allow_image=True, **kwargs):
+            seen["allow_image"] = allow_image
+            return [{"type": "text", "text": message}]
+
+        monkeypatch.setattr(acp_client, "build_prompt_blocks", _fake_build)
+        client = self._client(tmp_path, {"image": False})
+
+        async def _fake_send(method, params, **kwargs):
+            seen["params"] = params
+            return 1
+
+        monkeypatch.setattr(client, "_send_request", _fake_send)
+        await client._send_prompt("look at /tmp/shot.png")
+        assert seen["allow_image"] is False
+        assert all(block["type"] != "image" for block in seen["params"]["prompt"])
+
+    @pytest.mark.asyncio
+    async def test_send_prompt_inlines_images_when_advertised(self, tmp_path, monkeypatch):
+        seen = {}
+
+        def _fake_build(message, *, allow_image=True, **kwargs):
+            seen["allow_image"] = allow_image
+            return [{"type": "text", "text": message}]
+
+        monkeypatch.setattr(acp_client, "build_prompt_blocks", _fake_build)
+        client = self._client(tmp_path, {"image": True})
+
+        async def _fake_send(method, params, **kwargs):
+            return 1
+
+        monkeypatch.setattr(client, "_send_request", _fake_send)
+        await client._send_prompt("look at /tmp/shot.png")
+        assert seen["allow_image"] is True

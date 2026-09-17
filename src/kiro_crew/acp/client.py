@@ -4512,6 +4512,12 @@ class AcpClient:
         # silently wrong on the next. Empty until the handshake, and cleared on
         # reset so a re-spawned session re-reads it.
         self._agent_mcp_capabilities: dict[str, Any] = {}
+        # What this connection can carry in a PROMPT, from initialize's
+        # ``agentCapabilities.promptCapabilities``. Only ``image`` is read: a
+        # harness that did not advertise it rejects the whole prompt rather than
+        # just the image, so the prompt path reads this instead of assuming.
+        # Empty until the handshake, cleared on reset so a respawn re-reads it.
+        self._prompt_capabilities: dict[str, Any] = {}
         # The mirror's CLIENT OBLIGATION from the same spec parse as the array
         # (``SessionProjection.denied_tools``): ``(server, tool)`` pairs the spec
         # switched off that the backend cannot refuse on the wire, so this client
@@ -4865,6 +4871,17 @@ class AcpClient:
         `commands_changed` push replaces wholesale.
         """
         return list(self._available_commands)
+
+    @property
+    def supports_image_prompt(self) -> bool:
+        """True when the harness advertised ``promptCapabilities.image``.
+
+        Fails closed: an un-handshaked or silent backend reports False, so the
+        prompt path sends text only instead of an image block the agent rejects
+        whole. ``AcpRuntime`` answers the same question from the same field; the
+        two transports must not disagree about what a session can carry.
+        """
+        return bool(self._prompt_capabilities.get("image", False))
 
     @property
     def agent_version(self) -> str:
@@ -8829,6 +8846,7 @@ class AcpClient:
         # what the next session's guard judges, not this one's.
         self._mcp_ref_spec = None
         self._agent_mcp_capabilities = {}
+        self._prompt_capabilities = {}
         self._spec_denied_tools = frozenset()
         # Save PIDs before clearing state — needed for untracking
         saved_pid = self._pid
@@ -9075,6 +9093,10 @@ class AcpClient:
         # alike, so its hook applies no filter (see _opencode_session_mcp_servers).
         advertised = (init_resp.get("agentCapabilities") or {}).get("mcpCapabilities")
         self._agent_mcp_capabilities = dict(advertised) if isinstance(advertised, dict) else {}
+        _prompt_caps = capabilities.get("promptCapabilities")
+        self._prompt_capabilities = (
+            dict(_prompt_caps) if isinstance(_prompt_caps, dict) else {}
+        )
         self._agent_version = agent_version_from_init(init_resp)
         self._note_pi_adapter_version()
         self._note_goose_version()
@@ -11586,14 +11608,18 @@ class AcpClient:
 
     async def _send_prompt(self, message: str) -> int:
         # Shared with AcpSessionHandle.prompt via prompt_blocks so the two paths
-        # cannot drift.
+        # cannot drift -- which means gating on the SAME advertised capability:
+        # an image block sent to a harness that never advertised image input is
+        # rejected whole, so the path stays in the text for a tool to open.
         return await self._send_request(
             METHOD_PROMPT,
             {
                 "sessionId": self._session_id,
                 # Offloaded: see the note in session_handle.prompt -- image
                 # reads and base64 encoding must not block the event loop.
-                "prompt": await asyncio.to_thread(build_prompt_blocks, message),
+                "prompt": await asyncio.to_thread(
+                    build_prompt_blocks, message, allow_image=self.supports_image_prompt
+                ),
             },
         )
 
