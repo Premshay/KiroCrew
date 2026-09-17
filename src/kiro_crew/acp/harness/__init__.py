@@ -24,11 +24,13 @@ from kiro_crew.acp.harness.base import (
 )
 from kiro_crew.acp.harness.claude import ClaudeHarness
 from kiro_crew.acp.harness.codex import CodexHarness
+from kiro_crew.acp.harness.deepseek import DeepseekHarness
 from kiro_crew.acp.harness.kas import KasHarness
 from kiro_crew.acp.harness.kiro import KiroHarness
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
 )
@@ -36,6 +38,7 @@ from kiro_crew.acp.types import (
 __all__ = [
     "ClaudeHarness",
     "CodexHarness",
+    "DeepseekHarness",
     "HarnessAdapter",
     "KasHarness",
     "KiroHarness",
@@ -65,6 +68,14 @@ _HARNESSES: dict[str, type[HarnessAdapter]] = {
     # ``AcpRuntime`` to a claude engine (``platform.acp_binding``), which the
     # registry would otherwise refuse at spawn. See ``harness/claude.py``.
     ACP_BACKEND_CLAUDE: ClaudeHarness,
+    # Same class of registration as claude above: providers keep deepseek on
+    # AcpClient (its routing is UNVERIFIED, so it is absent from the selectable
+    # switch), and the engine map is what reaches it. Registered here for the
+    # direct runtime consumers -- Sage's review pool -- that bind an
+    # ``AcpRuntime`` to a deepseek engine through ``platform.acp_binding``. The
+    # UNVERIFIED posture (no credential mask, host-decided tool calls) is the
+    # engine map's accepted state, not something this registration changes.
+    ACP_BACKEND_DEEPSEEK: DeepseekHarness,
 }
 
 

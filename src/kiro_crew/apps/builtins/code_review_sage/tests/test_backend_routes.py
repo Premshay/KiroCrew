@@ -642,6 +642,70 @@ class TestSettingsModelValidation(unittest.TestCase):
         self.assertEqual(review["effort"], "low")
 
 
+class TestSettingsAgentValidation(unittest.TestCase):
+    """The review agent written to config.json becomes the review worker's spawn
+    identity, so it is validated against the known-agent roster exactly like the
+    model is validated against the runtime snapshot (security-controls)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+        store.ensure_layout()
+
+    def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_known_agent_accepted(self):
+        with unittest.mock.patch.object(
+            self.mod.review_pool, "is_known_review_agent", return_value=True
+        ):
+            review = self.mod._write_review_section({"agent": "crew-deepseek-pro"})
+        self.assertEqual(review["agent"], "crew-deepseek-pro")
+        loaded = self.mod._load_review_section()
+        self.assertEqual(loaded["agent"], "crew-deepseek-pro")
+
+    def test_unknown_agent_rejected(self):
+        with unittest.mock.patch.object(
+            self.mod.review_pool, "is_known_review_agent", return_value=False
+        ):
+            with self.assertRaises(ValueError):
+                self.mod._write_review_section({"agent": "evil-agent-9000"})
+
+    def test_empty_agent_clears_override(self):
+        with unittest.mock.patch.object(
+            self.mod.review_pool, "is_known_review_agent", return_value=True
+        ):
+            self.mod._write_review_section({"agent": "crew-deepseek-pro"})
+            review = self.mod._write_review_section({"agent": None})
+        self.assertIsNone(review["agent"])
+
+    def test_settings_get_exposes_the_agent_and_the_roster(self):
+        async def _run():
+            with unittest.mock.patch.object(
+                self.mod.review_pool, "reviewer_info", return_value=None
+            ), unittest.mock.patch.object(
+                self.mod.review_pool, "known_review_agents",
+                return_value=["crew-deepseek-pro", "code-review-sage-reviewer"],
+            ), unittest.mock.patch.object(
+                self.mod.review_pool, "is_known_review_agent", return_value=True
+            ):
+                self.mod._write_review_section({"agent": "crew-deepseek-pro"})
+                resp = await self.mod._handle_settings(
+                    type("Req", (), {"method": "GET"})()
+                )
+            return json.loads(resp.text)
+
+        body = asyncio.run(_run())
+        self.assertEqual(body["settings"]["agent"], "crew-deepseek-pro")
+        self.assertIn("crew-deepseek-pro", body["agents"])
+
+
 class TestConsolidationWorkerFailures(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

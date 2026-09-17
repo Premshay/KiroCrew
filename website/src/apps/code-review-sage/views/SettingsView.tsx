@@ -89,6 +89,19 @@ export default function SettingsView() {
               </Field>
             )}
             <Field
+              label={i18nT('apps.codeReviewSage.views.settingsView.review_agent')}
+              hint={i18nT('apps.codeReviewSage.views.settingsView.which_agent_runs_the_review_default_dedicated_reviewer')}
+            >
+              <SimpleSelect
+                aria-label={i18nT('apps.codeReviewSage.views.settingsView.review_agent')}
+                options={data.agents ?? []}
+                value={s.agent ?? ''}
+                onChange={(v) => saveMut.mutate({ agent: v || null })}
+                clearLabel={i18nT('apps.codeReviewSage.views.settingsView.default_agent_config')}
+                className={SELECT_CLASS}
+              />
+            </Field>
+            <Field
               label={i18nT('apps.codeReviewSage.views.settingsView.model')}
               hint={i18nT('apps.codeReviewSage.views.settingsView.which_model_performs_the_review_default_inherits')}
             >

@@ -936,6 +936,8 @@
           "model": "Model",
           "reasoning_effort": "Reasoning effort",
           "review_model": "Review model",
+          "review_agent": "Review agent",
+          "which_agent_runs_the_review_default_dedicated_reviewer": "Which crew agent runs the review workers (and the sessions\n                    they spawn). Default uses the dedicated reviewer agent; pick a\n                    crew like crew-deepseek-pro to run reviews on its engine.",
           "reviews_at_once": "Reviews at once",
           "settings": "Settings",
           "these_apply_to_every_review_started_from_here": "These apply to every review started from here.",

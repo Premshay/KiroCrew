@@ -291,9 +291,10 @@ except Exception:  # pragma: no cover - defensive
 
 
 def _get_review_settings() -> dict:
-    """Read user-configured model and effort from config.json → review section.
-    Returns {"model": str|None, "effort": str}. None model = use agent default;
-    "" effort = inherit the model/provider default."""
+    """Read user-configured model, effort, and agent from config.json → review
+    section. Returns {"model": str|None, "effort": str, "agent": str|None}.
+    None model = use agent default; "" effort = inherit the model/provider
+    default; None agent = the dedicated reviewer agent."""
     try:
         cfg = store.load_config()
         review = cfg.get("review", {})
@@ -301,9 +302,10 @@ def _get_review_settings() -> dict:
         effort = review.get("effort", _DEFAULT_EFFORT)
         if effort and effort not in VALID_EFFORTS:  # "" is valid (= inherit)
             effort = _DEFAULT_EFFORT
-        return {"model": model, "effort": effort}
+        agent = review.get("agent") or None  # None/"" → dedicated reviewer
+        return {"model": model, "effort": effort, "agent": agent}
     except Exception:
-        return {"model": None, "effort": _DEFAULT_EFFORT}
+        return {"model": None, "effort": _DEFAULT_EFFORT, "agent": None}
 
 
 def effective_max_concurrent() -> int:
@@ -326,15 +328,85 @@ def effective_max_concurrent() -> int:
 REVIEW_EFFORT = _DEFAULT_EFFORT
 
 
-def _resolve_review_agent(preferred: str = REVIEW_AGENT) -> str:
-    """Use the dedicated reviewer agent if it's installed, else fall back to the
-    `kirocrew` agent. GitHub posting runs the `gh` CLI, so the chosen agent needs
-    shell access; review reasoning still runs on the fallback so a missing
-    reviewer agent degrades gracefully rather than failing."""
+def is_known_review_agent(name: str) -> bool:
+    """Whether *name* is an agent Sage may run reviews on.
+
+    Two populations qualify: agents with an installed spec in the agents dir
+    (``<name>.json`` / ``<name>.md``) and configured crews from the KiroCrew
+    config's ``agents`` section -- which is what admits engine-mapped crews
+    (e.g. ``crew-deepseek-pro``) that carry no spec file of their own. The
+    token rules match the model validator's, because the value becomes a spawn
+    argument and a settings key, never free text.
+    """
+    if not isinstance(name, str) or not name or len(name) > 64:
+        return False
+    if not all(c.isalnum() or c in "._-" for c in name):
+        return False
+    if kiro_agents_dir is not None:
+        try:
+            agents_dir = kiro_agents_dir()
+            if (agents_dir / f"{name}.json").is_file() or (agents_dir / f"{name}.md").is_file():
+                return True
+        except Exception:
+            pass
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return name in getattr(KiroCrewConfig.load(), "agents", {})
+    except Exception:
+        return False
+
+
+def known_review_agents() -> list[str]:
+    """Every agent Sage may be pointed at, for the settings picker.
+
+    Sorted, deduplicated union of installed agent specs and configured crews.
+    A filesystem read; call off the event loop (the settings route already
+    runs in a thread)."""
+    names: set[str] = set()
+    if kiro_agents_dir is not None:
+        try:
+            agents_dir = kiro_agents_dir()
+            for suffix in (".json", ".md"):
+                try:
+                    for path in agents_dir.glob(f"*{suffix}"):
+                        names.add(path.name[: -len(suffix)])
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        names.update(str(n) for n in KiroCrewConfig.load().agents.keys())
+    except Exception:
+        pass
+    return sorted(names)
+
+
+def _resolve_review_agent(preferred: str | None = None) -> str:
+    """The agent review workers run as. Resolution order:
+
+    1. An explicit ``preferred`` argument (the pool constructor's caller wins).
+    2. The user-configured agent in the app config (``review.agent``) when it
+       names a known agent.
+    3. The dedicated reviewer agent if its spec is installed, else the
+       ``kirocrew`` fallback.
+
+    GitHub posting runs the `gh` CLI, so the chosen agent needs shell access;
+    review reasoning still runs on the fallback so a missing reviewer agent
+    degrades gracefully rather than failing."""
+    if not preferred:
+        settings_agent = _get_review_settings().get("agent")
+        if isinstance(settings_agent, str) and settings_agent and is_known_review_agent(settings_agent):
+            return settings_agent
+        preferred = REVIEW_AGENT
     if kiro_agents_dir is None:  # pragma: no cover - standalone fallback
         return _FALLBACK_AGENT
     try:
-        if (kiro_agents_dir() / f"{preferred}.json").is_file():
+        if (kiro_agents_dir() / f"{preferred}.json").is_file() or (
+            kiro_agents_dir() / f"{preferred}.md"
+        ).is_file():
             return preferred
     except Exception:
         pass
@@ -380,6 +452,23 @@ def _reviewer_model(agent: str) -> str:
     return _DEFAULT_REVIEW_MODEL
 
 
+def _review_engine_label(agent: str) -> str:
+    """The backend id that will actually serve *agent*'s review runtime.
+
+    Reads the same platform binding the spawn applies (engine map), so the
+    settings line cannot claim "kiro-cli" for a crew the engine map routes to
+    deepseek or codex. Best-effort: outside the gateway process there is no
+    platform provider context, and the answer is then the kiro default."""
+    try:
+        binding = runtime_client_binding(agent)
+        backend = str(binding.get("acp_backend") or "")
+        if backend:
+            return backend
+    except Exception:
+        pass
+    return "kiro-cli"
+
+
 def reviewer_info() -> dict:
     """Resolved reviewer identity for display in the dashboard: the agent in use,
     the model it actually runs (user override → agent default → fallback), and the
@@ -390,11 +479,12 @@ def reviewer_info() -> dict:
     models = _runtime_model_snapshot(agent)
     return {
         "agent": agent,
-        "engine": "kiro-cli",
+        "engine": _review_engine_label(agent),
         "provider": "acp",
         "model": model,
         "effort": settings.get("effort", _DEFAULT_EFFORT),
         "model_source": "config" if settings.get("model") else "agent-default",
+        "agent_source": "config" if settings.get("agent") else "default",
         "model_override_supported": bool(models),
         "effort_override_supported": bool(model_supports_effort(model)),
         "models": models,
@@ -619,7 +709,9 @@ class ReviewPool:
         max_starting: Optional[int] = None,
         worker_factory: Optional[object] = None,
     ) -> None:
-        self._agent = _resolve_review_agent(agent or REVIEW_AGENT)
+        # None -> config review.agent (when set) -> the dedicated reviewer ->
+        # fallback; an explicit agent is honored verbatim.
+        self._agent = _resolve_review_agent(agent)
         self._work_dir = work_dir if work_dir is not None else _review_work_dir()
         # Auto mode = no explicit max_workers -> the semaphore tracks the live
         # review.max_concurrent config (resized per batch). An explicit value
@@ -680,7 +772,8 @@ class ReviewPool:
                 if on_resolution is not None:
                     served = str(getattr(handle, "served_model", "") or "").strip()
                     on_resolution({
-                        "engine": "kiro-cli", "provider": "acp", "agent": self._agent,
+                        "engine": _review_engine_label(self._agent),
+                        "provider": "acp", "agent": self._agent,
                         "resolved_model": served or None,
                         "model_resolution": "reported" if served else "unavailable",
                     })

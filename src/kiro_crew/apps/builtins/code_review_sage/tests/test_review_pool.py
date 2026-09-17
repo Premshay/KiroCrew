@@ -499,6 +499,99 @@ class TestReviewAgentResolution(unittest.TestCase):
         self.assertTrue(wd.replace("\\", "/").endswith("apps/code-review-sage"))
 
 
+class TestReviewAgentSelection(unittest.TestCase):
+    """``review.agent`` picks the worker agent: settings win over the default
+    chain, an explicit constructor argument wins over settings, and the token
+    rules match the model validator's (the value becomes a spawn identity)."""
+
+    def _agents_dir(self, names):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        agents_dir = Path(tmp.name)
+        for name in names:
+            (agents_dir / f"{name}.json").write_text("{}", encoding="utf-8")
+        return agents_dir
+
+    def test_settings_agent_wins_when_known(self):
+        with unittest.mock.patch.object(
+            rp, "_get_review_settings", return_value={"agent": "crew-deepseek-pro"}
+        ), unittest.mock.patch.object(rp, "is_known_review_agent", return_value=True):
+            self.assertEqual(_resolve_review_agent(), "crew-deepseek-pro")
+
+    def test_unknown_settings_agent_falls_back_to_the_dedicated_reviewer(self):
+        agents_dir = self._agents_dir([rp.REVIEW_AGENT])
+        with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir), \
+                unittest.mock.patch.object(
+                    rp, "_get_review_settings", return_value={"agent": "not-an-agent"}
+                ), \
+                unittest.mock.patch.object(rp, "is_known_review_agent", return_value=False):
+            self.assertEqual(_resolve_review_agent(), rp.REVIEW_AGENT)
+
+    def test_explicit_preferred_beats_the_settings_agent(self):
+        agents_dir = self._agents_dir(["explicit-reviewer"])
+        with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir), \
+                unittest.mock.patch.object(
+                    rp, "_get_review_settings", return_value={"agent": "crew-deepseek-pro"}
+                ), \
+                unittest.mock.patch.object(rp, "is_known_review_agent", return_value=True):
+            self.assertEqual(_resolve_review_agent("explicit-reviewer"), "explicit-reviewer")
+
+    def test_settings_agent_without_a_spec_resolves_via_the_configured_crews(self):
+        # crew-deepseek-pro has no spec file; it is admitted through the config
+        # crews list, exactly like the engine-mapped crews the picker offers.
+        agents_dir = self._agents_dir([])
+        fake_cfg = type("FakeCfg", (), {
+            "load": classmethod(lambda cls: type("C", (), {
+                "agents": {"crew-deepseek-pro": {}, "default": {}}
+            })())
+        })
+        with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir), \
+                unittest.mock.patch("kiro_crew.config.loader.KiroCrewConfig", fake_cfg):
+            self.assertTrue(rp.is_known_review_agent("crew-deepseek-pro"))
+            self.assertFalse(rp.is_known_review_agent("crew-codex"))
+
+    def test_agent_token_rules_reject_injection_shapes(self):
+        for bad in ("", "a" * 65, "../etc", "crew deepseek", "crew@x"):
+            with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=self._agents_dir([])):
+                self.assertFalse(rp.is_known_review_agent(bad), bad)
+
+    def test_known_review_agents_merges_specs_and_crews(self):
+        agents_dir = self._agents_dir(["spec-a", "spec-b"])
+        fake_cfg = type("FakeCfg", (), {
+            "load": classmethod(lambda cls: type("C", (), {
+                "agents": {"crew-deepseek-pro": {}, "default": {}}
+            })())
+        })
+        with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir), \
+                unittest.mock.patch("kiro_crew.config.loader.KiroCrewConfig", fake_cfg):
+            names = rp.known_review_agents()
+        for expected in ("spec-a", "spec-b", "crew-deepseek-pro", "default"):
+            self.assertIn(expected, names)
+        self.assertEqual(names, sorted(names))
+
+    def test_reviewer_info_reports_the_bound_engine_and_agent_source(self):
+        with unittest.mock.patch.object(
+            rp, "_resolve_review_agent", return_value="crew-deepseek-pro"
+        ), unittest.mock.patch.object(
+            rp, "_get_review_settings",
+            return_value={"agent": "crew-deepseek-pro", "model": None, "effort": ""},
+        ), unittest.mock.patch.object(
+            rp, "runtime_client_binding", return_value={"acp_backend": "deepseek"}
+        ), unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True):
+            info = reviewer_info()
+        self.assertEqual(info["engine"], "deepseek")
+        self.assertEqual(info["agent_source"], "config")
+        self.assertEqual(info["agent"], "crew-deepseek-pro")
+
+    def test_reviewer_info_default_engine_is_kiro_cli(self):
+        with unittest.mock.patch.object(
+            rp, "runtime_client_binding", return_value={}
+        ), unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True):
+            info = reviewer_info()
+        self.assertEqual(info["engine"], "kiro-cli")
+        self.assertEqual(info["agent_source"], "default")
+
+
 class TestReviewEffort(unittest.TestCase):
     """Effort is applied via a per-model workspace cli.json overlay written
     before spawn. The default is "" (inherit the model/provider default)."""

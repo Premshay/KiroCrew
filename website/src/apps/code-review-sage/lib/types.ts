@@ -342,6 +342,8 @@ export interface RuleResolution {
 // --- Settings + learning -----------------------------------------------------
 
 export interface Settings {
+  /** The agent review workers run as; null = the dedicated reviewer agent. */
+  agent: string | null
   model: string | null
   effort: string
   active_namespaces: string[]
@@ -353,6 +355,7 @@ export interface Settings {
 export interface SettingsResponse {
   settings: Settings
   models: string[]
+  agents: string[]
   efforts: string[]
   namespaces: string[]
   pinned_repos: PinnedRepo[]

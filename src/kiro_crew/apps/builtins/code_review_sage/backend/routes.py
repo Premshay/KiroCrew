@@ -1708,7 +1708,7 @@ def _valid_model(m: str) -> bool:
 
 
 def _load_review_section() -> dict:
-    """Read persisted model, effort, and namespace-resolution settings."""
+    """Read persisted agent, model, effort, and namespace-resolution settings."""
     try:
         cfg = store.load_config()
     except Exception:
@@ -1717,6 +1717,7 @@ def _load_review_section() -> dict:
     if not isinstance(review, dict):
         review = {}
     return {
+        "agent": review.get("agent") or None,
         "model": review.get("model") or None,
         "effort": review.get("effort", ""),
         "active_namespaces": review.get("active_namespaces") or ["default"],
@@ -1727,8 +1728,8 @@ def _load_review_section() -> dict:
 
 def _write_review_section(patch: dict) -> dict:
     """Merge a partial review-settings patch into config.json atomically. Only
-    the model/effort/active_namespaces/namespace_bindings keys are writable; everything else in the
-    config is preserved. Returns the resulting review section."""
+    the agent/model/effort/active_namespaces/namespace_bindings keys are writable; everything
+    else in the config is preserved. Returns the resulting review section."""
     with _review_settings_lock():
         cfg_path = store.data_dir() / "config.json"
         try:
@@ -1741,6 +1742,18 @@ def _write_review_section(patch: dict) -> dict:
         review = cfg.get("review")
         if not isinstance(review, dict):
             review = {}
+
+        if "agent" in patch:
+            a = patch["agent"]
+            # Empty/None clears the override (back to the dedicated reviewer).
+            # A non-empty value must name a known agent: it becomes the review
+            # worker's spawn identity, so raw request input must not reach it.
+            if not a:
+                review["agent"] = None
+            elif review_pool.is_known_review_agent(str(a)):
+                review["agent"] = str(a)
+            else:
+                raise ValueError(f"unknown agent {str(a)!r}")
 
         if "model" in patch:
             m = patch["model"]
@@ -1811,8 +1824,8 @@ def _write_review_section(patch: dict) -> dict:
 
 
 async def _handle_settings(request: web.Request) -> web.Response:
-    """GET  -> {settings, models, efforts, namespaces}
-    PUT  body {model?, effort?, active_namespaces?, namespace_bindings?} -> {ok, settings}."""
+    """GET  -> {settings, models, agents, efforts, namespaces}
+    PUT  body {agent?, model?, effort?, active_namespaces?, namespace_bindings?} -> {ok, settings}."""
     if request.method == "GET":
         # All of this is synchronous file IO (config read + namespaces dir walk +
         # reviewer_info file read) — offload to a thread so it never blocks the
@@ -1828,9 +1841,14 @@ async def _handle_settings(request: web.Request) -> web.Response:
                     reviewer = review_pool.reviewer_info()
                 except Exception:
                     reviewer = None
+            try:
+                agents = review_pool.known_review_agents()
+            except Exception:
+                agents = []
             return {
                 "settings": _load_review_section(),
                 "models": list(reviewer.get("models") or []) if reviewer else [],
+                "agents": agents,
                 "efforts": (
                     list(review_pool.VALID_EFFORTS)
                     if reviewer and reviewer.get("effort_override_supported")
@@ -1880,6 +1898,7 @@ async def _handle_settings(request: web.Request) -> web.Response:
             {
                 "ok": True,
                 "settings": {
+                    "agent": review.get("agent") or None,
                     "model": review.get("model") or None,
                     "effort": review.get("effort", ""),
                     "active_namespaces": review.get("active_namespaces") or ["default"],

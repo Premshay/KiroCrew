@@ -100,8 +100,9 @@ DEFAULT_CONFIG: dict[str, object] = {
         "common_max_patterns": 60,
         "repo_max_patterns": 120,
     },
-    # Review settings — model, effort, and active namespaces.
+    # Review settings — agent, model, effort, and active namespaces.
     "review": {
+        "agent": None,         # None = the dedicated reviewer agent (or its fallback)
         "model": None,         # None = inherit the system/agent default model
         "effort": "",          # "" = inherit the model/provider default effort
         "active_namespaces": ["default"],  # which namespaces to load during review

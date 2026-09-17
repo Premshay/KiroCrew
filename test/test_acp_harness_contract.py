@@ -31,6 +31,7 @@ from kiro_crew.acp import kas_agents as kas_agents_mod
 from kiro_crew.acp.harness import (
     ClaudeHarness,
     CodexHarness,
+    DeepseekHarness,
     HarnessAdapter,
     KasHarness,
     KiroHarness,
@@ -45,6 +46,7 @@ from kiro_crew.acp.kas_transport import METHOD_KAS_AUTH_GET_ACCESS_TOKEN
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_CLIENT_CAPABILITIES,
@@ -56,7 +58,19 @@ from kiro_crew.acp.types import (
 from kiro_crew.config import paths as paths_mod
 from kiro_crew.mcp_gateway import session_servers as session_servers_mod
 
-ALL_BACKENDS = [ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX, ACP_BACKEND_CLAUDE]
+ALL_BACKENDS = [
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_CLAUDE,
+    # The operator-owned exception: deepseek's routing is UNVERIFIED, so it is
+    # absent from the selectable switch and reachable only through an engine map
+    # entry the operator owns. Registered on the shared runtime for the direct
+    # consumers (Sage's review pool) that bind such an entry; the runtime harness
+    # carries the same no-mask, host-decided-tools posture as the client
+    # transport already serves for the same seat. See harness/deepseek.py.
+    ACP_BACKEND_DEEPSEEK,
+]
 
 #: The hosts reached through kiro-cli's own binary and ACP relay. They share a
 #: notification vocabulary, an agent-spec permission routing and a spawn-time effort
@@ -117,6 +131,7 @@ def kas_projection_stubbed(monkeypatch, tmp_path):
         (ACP_BACKEND_KAS, KasHarness),
         (ACP_BACKEND_CODEX, CodexHarness),
         (ACP_BACKEND_CLAUDE, ClaudeHarness),
+        (ACP_BACKEND_DEEPSEEK, DeepseekHarness),
     ],
 )
 def test_harness_for_resolves_each_served_backend(backend, expected):
@@ -320,6 +335,7 @@ async def test_a_missing_binary_aborts_the_spawn(monkeypatch, tmp_path, backend)
     # it to one family would leave the next host's spawn unasserted.
     monkeypatch.setattr(client_mod, "_resolve_codex_acp_bin", lambda: (None, "/nowhere"))
     monkeypatch.setattr(client_mod, "_resolve_claude_acp_bin", lambda: (None, "/nowhere"))
+    monkeypatch.setattr(client_mod, "_resolve_deepseek_bin", lambda: (None, "/nowhere"))
     with pytest.raises(AcpRuntimeError, match="not found"):
         await harness_for(backend).resolve_spawn(_ctx(tmp_path))
 
@@ -683,9 +699,22 @@ def test_codex_is_made_to_ask_by_a_session_write():
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_no_host_is_left_unverified(backend):
-    """``UNVERIFIED`` refuses, so a host resolving to it cannot start a session."""
+    """``UNVERIFIED`` refuses, so a host resolving to it cannot start a session --
+    with one operator-owned exception.
+
+    Every host on the SELECTABLE switch must be routed. DeepSeek is not on the
+    switch: its routing is UNVERIFIED, its seat is reachable only through an
+    engine map entry the operator owns, and both transports (client and runtime
+    harness) start it with the same documented posture -- no credential mask, and
+    the harness's own workspace-write sandbox deciding its tool calls. Registering
+    it on the shared runtime does not change that: the exception is the engine
+    map's accepted state, not something this registration grants.
+    """
     from kiro_crew import acp_tool_gate
 
+    if backend == ACP_BACKEND_DEEPSEEK:
+        assert acp_tool_gate.routing_for(backend) is acp_tool_gate.Routing.UNVERIFIED
+        return
     assert acp_tool_gate.routing_for(backend) is not acp_tool_gate.Routing.UNVERIFIED
 
 
@@ -780,7 +809,9 @@ def test_a_projection_only_bare_runtime_still_resolves_its_host():
 # ── Structural: no runtime coupling ──
 
 
-@pytest.mark.parametrize("module", ["base", "_common", "kiro", "kas", "codex", "__init__"])
+@pytest.mark.parametrize(
+    "module", ["base", "_common", "kiro", "kas", "codex", "deepseek", "__init__"]
+)
 def test_no_harness_module_imports_the_runtime(module):
     """The harness layer never reaches back into ``AcpRuntime``.
 
@@ -1006,12 +1037,20 @@ def test_the_spawn_mask_reaches_the_sandbox():
 def test_an_enforced_host_may_not_spawn_without_a_mask():
     """A host this core's tool gate ENFORCES must carry a credential mask.
 
-    Vacuous while every host the shared-process runtime serves asks by
-    construction, and that is the point: it arms itself the moment an enforced
-    host joins. For such a host the mask is the ONLY thing between a third-party
-    binary and the operator's credential homes, because ACP cannot make it ask
-    about a passive read -- so an empty mask there is a missing control, not a
+    For such a host the mask is the ONLY thing between a third-party binary and
+    the operator's credential homes, because ACP cannot make it ask about a
+    passive read -- so an empty mask there is a missing control, not a
     simplification.
+
+    Three classes, read off the routing table rather than a host list:
+
+    * ``AGENT_SPEC`` -- asks by construction: no mask needed, and none claimed.
+    * enforced (``SESSION_CONFIG`` / seeded / verified) -- must resolve a mask
+      onto the plan.
+    * ``UNVERIFIED`` (deepseek) -- the operator-owned exception: the seat runs
+      with no mask on the client transport too, its documented posture is the
+      harness's own workspace-write sandbox deciding tool calls, and a mask the
+      gate cannot enforce would read as a control nothing performs.
 
     Read off the class rather than by spawning: resolving a real mask touches the
     filesystem, and this asks a question about the harness's contract.
@@ -1024,12 +1063,13 @@ def test_an_enforced_host_may_not_spawn_without_a_mask():
     for backend, harness_cls in _HARNESSES.items():
         routing = acp_tool_gate.routing_for(backend)
         source = _inspect.getsource(harness_cls.resolve_spawn)
-        if routing is acp_tool_gate.Routing.AGENT_SPEC:
-            # Asks by construction: no mask needed, and none claimed.
+        if routing in (acp_tool_gate.Routing.AGENT_SPEC, acp_tool_gate.Routing.UNVERIFIED):
+            # Asks by construction, or the operator-owned no-mask seat: no mask
+            # needed, and none claimed.
             assert "extra_hidden_dirs" not in source, backend
             continue
         assert "extra_hidden_dirs=" in source, (
-            f"{backend} is not AGENT_SPEC-routed, so its harness must resolve an "
+            f"{backend} is enforced, so its harness must resolve an "
             f"OS credential mask and put it on the plan"
         )
 
@@ -1115,15 +1155,18 @@ def test_an_enforced_host_must_consult_the_sandbox_tier():
     harness that only resolved one would spawn a third-party binary with the
     operator's credential homes readable and nothing compensating.
 
-    Vacuous while every host here asks by construction, and armed the moment one
-    does not. Read off the class because the property is that the source consults
-    the tier, which a passing spawn on this machine cannot show.
+    The two mask-less classes are exempt: ``AGENT_SPEC`` hosts ask by
+    construction, and the ``UNVERIFIED`` deepseek seat resolves no mask on either
+    transport, so there is no tier whose answer would drop one. Read off the
+    class because the property is that the source consults the tier, which a
+    passing spawn on this machine cannot show.
     """
     from kiro_crew import acp_tool_gate
     from kiro_crew.acp.harness import _HARNESSES
 
     for backend, harness_cls in _HARNESSES.items():
-        if acp_tool_gate.routing_for(backend) is acp_tool_gate.Routing.AGENT_SPEC:
+        routing = acp_tool_gate.routing_for(backend)
+        if routing in (acp_tool_gate.Routing.AGENT_SPEC, acp_tool_gate.Routing.UNVERIFIED):
             continue
         source = inspect.getsource(harness_cls.resolve_spawn)
         assert "sandbox_mode" in source, (
