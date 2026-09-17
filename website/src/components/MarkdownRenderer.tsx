@@ -1,8 +1,11 @@
+import { mermaidFontCss } from './mermaidFontCss'
+import { downloadBlob } from '../utils/download'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from './ui/dropdown-menu'
 import React, { createContext, useContext, memo, useEffect, useMemo, useRef, useId, useCallback, useState } from 'react'
 import Clickable from './Clickable'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { X, Download, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, FileSpreadsheet, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
+import { X, Download, Loader2, MoreHorizontal, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, FileSpreadsheet, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
 import { copyCode, copyToClipboard } from '../utils/clipboard'
 import { capWhitespaceRuns, remarkBoundDepth, rehypeBoundRawDepth } from '../utils/markdownDepthBound'
 import { hastTableToCsv, hastTableToMarkdown } from '../utils/tableClipboard'
@@ -11,6 +14,8 @@ import ReactMarkdown from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkAutolinkRules from '../utils/remarkAutolinkRules'
+import { remarkLatexDelimiters } from '../utils/remarkLatexDelimiters'
+import { pairedCloseIndices, singleTagName } from '../utils/htmlTagGrammar'
 import remarkCjkFriendly from 'remark-cjk-friendly'
 import remarkCjkFriendlyGfmStrikethrough from 'remark-cjk-friendly-gfm-strikethrough'
 import remarkMath from 'remark-math'
@@ -565,8 +570,59 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
   // Rendered SVG markup, kept for the enlarge viewer. Empty until a successful
   // render and reset on failure, so the enlarge affordance only ever exists
   // for (and targets) the diagram currently on screen.
-  const [svg, setSvg] = useState('')
+  const [{ svg, code: renderedCode }, setRendered] = useState({ svg: '', code: '' })
   const [enlarged, setEnlarged] = useState(false)
+  const moreRef = useRef<HTMLButtonElement>(null)
+  const enlargeAfterMenu = useRef(false)
+  const [downloadFailed, setDownloadFailed] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const downloadDiagram = async (format: 'svg' | 'png') => {
+    if (!svg || renderedCode !== code) return
+    setDownloading(true)
+    let snapshotHost: HTMLDivElement | undefined
+    try {
+      let basename = ref.current?.querySelector(':scope > svg > title')?.textContent?.normalize('NFKC')
+        .replace(/[^\p{L}\p{N}_-]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 80)
+      if (!basename || /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i.test(basename)) basename = 'mermaid-diagram'
+      let blob: Blob
+      if (format === 'svg') {
+        blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' })
+      } else {
+        const node = ref.current
+        if (!node) throw new Error('diagram not mounted')
+        // Freeze pixels' inputs before any await; a rerender may replace the live SVG.
+        const snapshot = node.cloneNode(true) as HTMLDivElement
+        const originals = [node, ...node.querySelectorAll<HTMLElement | SVGElement>('*')]
+        const copies = [snapshot, ...snapshot.querySelectorAll<HTMLElement | SVGElement>('*')]
+        originals.forEach((element, index) => {
+          const style = getComputedStyle(element)
+          for (const property of Array.from(style)) copies[index].style.setProperty(property, style.getPropertyValue(property))
+        })
+        const backgroundColor = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()
+        snapshotHost = document.createElement('div')
+        Object.assign(snapshotHost.style, { position: 'absolute', left: '-100000px', top: '0', pointerEvents: 'none' })
+        snapshotHost.setAttribute('aria-hidden', 'true')
+        // Isolate SVG IDs/styles from Mermaid's next render, while retaining layout.
+        snapshotHost.attachShadow({ mode: 'closed' }).appendChild(snapshot)
+        document.body.appendChild(snapshotHost)
+        const { toBlob } = await import('html-to-image')
+        const image = await toBlob(snapshot, {
+          pixelRatio: 2,
+          fontEmbedCSS: await mermaidFontCss(snapshot),
+          backgroundColor,
+        })
+        if (!image) throw new Error('canvas encoder returned null')
+        blob = image
+      }
+      downloadBlob(blob, `${basename}.${format}`)
+      setDownloadFailed(false)
+    } catch {
+      setDownloadFailed(true)
+    } finally {
+      snapshotHost?.remove()
+      setDownloading(false)
+    }
+  }
   // Which of the two views is on screen. The diagram host below stays MOUNTED
   // either way and is hidden with the `hidden` ATTRIBUTE rather than unmounted:
   // the render effect is guarded on `renderedRef.current === code`, so a
@@ -704,7 +760,7 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
         range.selectNodeContents(ref.current)
         range.deleteContents()
         ref.current.appendChild(range.createContextualFragment(result.svg))
-        setSvg(result.svg)
+        setRendered({ svg: result.svg, code })
       })
       .catch(() => {
         if (!live || !ref.current) return
@@ -716,7 +772,7 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
         // one here left two spellings of the same thing, kept in sync by hand,
         // which diverges the first time either is retouched.
         ref.current.textContent = ''
-        setSvg('')
+        setRendered({ svg: '', code: '' })
         setEnlarged(false)
         // Reset so the failed state has ONE shape. Not to prevent stranding: the
         // source below now lives OUTSIDE the hidden host, so neither value of
@@ -788,13 +844,13 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
           that left the default state is still reachable without hovering.
 
           AT MOST TWO BUTTONS IN EVERY REACHABLE STATE, by construction rather
-          than by counting: the diagram view is toggle + enlarge, the source view
+          than by counting: the diagram view is toggle + actions, the source view
           is toggle + copy (enlarge would open a viewer for the view just left),
           and a failed render is copy alone, there being no rendered diagram to
           toggle to. Copy rides with the SOURCE for a second reason: on the
           rendered diagram the object of "copy" is ambiguous -- the picture or the
           text behind it -- and beside the source text it is not. */}
-      <div className={`absolute top-1.5 right-1.5 flex items-center gap-1 transition-opacity ${showSource ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'} ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
+      <div className={`absolute top-1.5 right-1.5 flex items-center gap-1 transition-opacity ${showSource || downloading ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'} ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
         {svg && (
           <button
             data-testid="mermaid-source-toggle"
@@ -810,12 +866,7 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
             <FileCode className="lucide-inline" aria-hidden="true" />
           </button>
         )}
-        {/* Copies the SOURCE, never the rendered image, and only where the source
-            is on screen: the source view, and a failed render, where it is what a
-            reader most wants to take away. Copying the image is not offered at
-            all -- this surface leaves mermaid's `htmlLabels` at its default, so
-            labels live in `<foreignObject>`, which browsers refuse to paint in an
-            image context; see `DiagramLightbox`'s note on the same constraint. */}
+        {/* Copy remains source-only; rendered-image downloads live in the menu. */}
         {(showSource || failed) && (
           <button
             data-testid="mermaid-copy-source"
@@ -829,15 +880,50 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
           </button>
         )}
         {svg && !showSource && (
-          <button
-            data-testid="mermaid-enlarge"
-            aria-label={i18nT('components.diagramLightbox.enlarge_diagram')}
-            title={i18nT('components.diagramLightbox.enlarge_diagram')}
-            className={MERMAID_ACTION_BTN_CLS}
-            onClick={() => setEnlarged(true)}
-          >
-            <Maximize2 className="lucide-inline" aria-hidden="true" />
-          </button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                ref={moreRef}
+                aria-busy={downloading}
+                aria-disabled={downloading}
+                onPointerDown={event => { if (downloading) event.preventDefault() }}
+                onKeyDown={event => {
+                  if (downloading && ['Enter', ' ', 'ArrowDown'].includes(event.key)) event.preventDefault()
+                }}
+                data-testid="mermaid-more-actions"
+                aria-label={i18nT('components.markdownRenderer.diagram_actions')}
+                title={i18nT('components.markdownRenderer.diagram_actions')}
+                className={MERMAID_ACTION_BTN_CLS}
+              >
+                {downloading
+                  ? <Loader2 className="lucide-inline animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                  : <MoreHorizontal className="lucide-inline" aria-hidden="true" />}
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" onCloseAutoFocus={event => {
+              if (!enlargeAfterMenu.current) return
+              event.preventDefault()
+              enlargeAfterMenu.current = false
+              // Seat focus on the lasting trigger before the viewer captures it.
+              // Opening during onSelect would let the menu steal focus back.
+              moreRef.current?.focus({ preventScroll: true })
+              setEnlarged(true)
+            }}>
+              <DropdownMenuItem data-testid="mermaid-enlarge" onSelect={() => { enlargeAfterMenu.current = true }}>
+                <Maximize2 className="lucide-inline" aria-hidden="true" />
+                {i18nT('components.diagramLightbox.enlarge_diagram')}
+              </DropdownMenuItem>
+              <DropdownMenuItem data-testid="mermaid-download-svg" disabled={downloading || renderedCode !== code} onSelect={() => { void downloadDiagram('svg') }}>
+                <Download className="lucide-inline" aria-hidden="true" />
+                {i18nT('components.markdownRenderer.download_svg')}
+              </DropdownMenuItem>
+              <DropdownMenuItem data-testid="mermaid-download-png" disabled={downloading || renderedCode !== code} onSelect={() => { void downloadDiagram('png') }}>
+                <Download className="lucide-inline" aria-hidden="true" />
+                {i18nT('components.markdownRenderer.download_png')}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
       </div>
       {/* A SEPARATED REGION below the action row, deliberately NOT a third
@@ -851,6 +937,16 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
           No hand-off, for exactly the reason given at the render notice above --
           this renderer is embedded in hosts holding unsaved drafts it cannot
           identify, so navigating away could discard what the user typed. */}
+      {/* No hand-off: the containing file editor or composer may hold unsaved drafts. */}
+      {downloadFailed && (
+        <ErrorNotice
+          variant="inline"
+          className="mt-2"
+          message={i18nT('components.markdownRenderer.download_failed')}
+          onDismiss={() => setDownloadFailed(false)}
+          testId="mermaid-download-error"
+        />
+      )}
       {copyState === 'failed' && (
         <ErrorNotice
           variant="inline"
@@ -2470,40 +2566,10 @@ export function rehypeSanitize() {
   }
 }
 
-/** A whole mdast `html` node that is exactly ONE tag: `<x>`, `</x>`, `<x a b>`,
- * `<x/>`. Attribute values are quote-aware, so a value may itself contain `>`
- * (`<x a="b>c">`); without that, such a tag misses this test and falls to the
- * lossy escapedNodeTree() path. A bare attribute may hold `/` (`<x a/b>`) so
- * this accepts everything the previous blanket `[^>]*` did. The leading
- * `[a-zA-Z]` excludes comments (`<!-- -->`) and doctypes, which keep their
- * existing handling. */
-const SINGLE_TAG_RE =
-  /^<\/?([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[^\s=>]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*))?)*)\s*\/?>$/
-
-/** Tag name of a single-tag html node, or undefined when it is not one. */
-function singleTagName(value: string): string | undefined {
-  return SINGLE_TAG_RE.exec(value)?.[1]?.toLowerCase()
-}
-
 /** Showable verbatim. Executable tags keep their `[unsupported: x]` marker; every
  * other unknown tag diverts, because a text node is inert wherever it lands. */
 function divertibleTag(tag: string): boolean {
   return !UNSAFE_RECONSTRUCT_TAGS.has(tag)
-}
-
-/** Index of the sibling that closes `tag`, tracking same-tag nesting; -1 if unclosed. */
-function matchingCloseIndex(kids: MdastNode[], start: number, tag: string): number {
-  let depth = 0
-  for (let j = start + 1; j < kids.length; j++) {
-    const k = kids[j]
-    if (k.type !== 'html' || typeof k.value !== 'string') continue
-    if (singleTagName(k.value) !== tag) continue
-    if (k.value.startsWith('</')) {
-      if (depth === 0) return j
-      depth--
-    } else if (!k.value.endsWith('/>')) depth++
-  }
-  return -1
 }
 
 /** Render non-allowlisted single tags VERBATIM instead of reconstructing them.
@@ -2525,19 +2591,27 @@ function matchingCloseIndex(kids: MdastNode[], start: number, tag: string): numb
  * parser — it ends up a text node, which React escapes on render, so the React
  * #290 guard still holds.
  */
+/** Allowlisted tags whose text content is verbatim, never prose (see remarkLatexDelimiters). */
+const VERBATIM_CONTENT_TAGS = new Set(['code', 'pre', 'kbd', 'samp', 'var', 'tt', 'textarea', 'svg', 'math'])
+
 export function remarkVerbatimUnknownTags() {
   return (tree: MdastNode) => {
     const walk = (node: MdastNode) => {
       const kids = node.children
       if (!kids) return
+      // Pairing is computed ONCE per sibling list (linear), never per opener:
+      // a run of unclosed unknown openers must not cost a suffix scan each.
+      let pairs: Map<number, number> | null = null
       for (let i = 0; i < kids.length; i++) {
         const child = kids[i]
         if (child.type === 'html' && typeof child.value === 'string') {
           const tag = singleTagName(child.value)
           if (tag && !ALLOWED_TAGS.has(tag) && divertibleTag(tag)) {
-            const paired = child.value.startsWith('</') || child.value.endsWith('/>')
-              ? -1
-              : matchingCloseIndex(kids, i, tag)
+            let paired = -1
+            if (!child.value.startsWith('</') && !child.value.endsWith('/>')) {
+              pairs ??= pairedCloseIndices(kids)
+              paired = pairs.get(i) ?? -1
+            }
             if (paired > i) {
               // A closed container: divert the whole span, so allowlisted tags
               // inside it stay literal instead of rendering as live elements.
@@ -2580,6 +2654,14 @@ const REMARK_PLUGINS: PluggableList = [
   remarkGfm,
   remarkCjkFriendlyGfmStrikethrough,
   [remarkMath, { singleDollarTextMath: false }],
+  // LaTeX-native `\( … \)` / `\[ … \]` → the same math nodes remark-math emits,
+  // from ELIGIBLE TEXT NODES only (code, html, link destinations and reference
+  // definitions are other node types and are never touched). After remark-math
+  // so `$$` math is already tokenized; before the verbatim pass -- and told
+  // which paired tags that pass will show as literal source, so text inside
+  // them is never converted (a `<customBlock>` shown verbatim must not carry
+  // a rendered KaTeX span in the middle of its source).
+  [remarkLatexDelimiters, { verbatimTag: (tag: string) => VERBATIM_CONTENT_TAGS.has(tag) || !ALLOWED_TAGS.has(tag) }],
   // After gfm so an autolink literal is already a `link` node, but BEFORE the
   // verbatim pass, which retypes an unknown tag to text and hides it.
   remarkAutolinkRules,
@@ -4486,14 +4568,7 @@ async function downloadLightboxImage(image: LightboxImage): Promise<void> {
     const res = await fetch(image.src)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const blob = await res.blob()
-    const objUrl = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = objUrl
-    a.download = name
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    setTimeout(() => URL.revokeObjectURL(objUrl), 1000)
+    downloadBlob(blob, name)
   } catch {
     window.open(image.src, '_blank', 'noopener,noreferrer')
   }

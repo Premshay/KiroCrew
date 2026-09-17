@@ -27,6 +27,7 @@ import json
 import os
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -43,6 +44,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
 )
+from kiro_crew.config.sections import ResolvedBindings
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.history import ConversationLog
@@ -2930,7 +2932,7 @@ class TestFinishQueueCycle:
         state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
 
         with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()):
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         assert slot._synthesis_inflight is True
@@ -2955,7 +2957,7 @@ class TestFinishQueueCycle:
             patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush,
             patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()),
         ):
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         assert slot._synthesis_inflight is True
@@ -2979,7 +2981,7 @@ class TestFinishQueueCycle:
         state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
 
         with patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush:
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
         flush.assert_not_called()
         if slot.task is not None:
@@ -2992,7 +2994,7 @@ class TestFinishQueueCycle:
         state2.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
 
         with patch.object(type(slot2), "flush_deferred_notes", return_value=0) as flush2:
-            chat_runner._finish_queue_cycle(state2, slot2)
+            await chat_runner._finish_queue_cycle(state2, slot2)
             await asyncio.sleep(0)
         flush2.assert_called_once()
         if slot2.task is not None:
@@ -3014,7 +3016,7 @@ class TestFinishQueueCycle:
         assert state._slots.get(slot.key) is None
 
         with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()):
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         assert slot._deferred_notes == [], "the held note was discarded on close"
@@ -3035,7 +3037,7 @@ class TestFinishQueueCycle:
             patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush,
             patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()),
         ):
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         flush.assert_called_once()
@@ -3045,7 +3047,7 @@ class TestFinishQueueCycle:
         state, slot = _state(tmp_path), _slot()
 
         with patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()):
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         assert slot.messages[-1]["role"] == "done"
@@ -4430,17 +4432,16 @@ class TestRunChatPlanGate:
 
 
 def _bindings(*, kiro_agent, resolved_alias, requested_resolved):
-    """A minimal ResolvedBindings stand-in for the app-agent dispatch guard.
-
-    Only the fields ``_run_chat`` reads off the resolve result are populated;
-    ``model`` is a real ``str`` so ``normalize_agent_model`` stays happy.
-    """
-    return SimpleNamespace(
+    """Real bindings for a materialized app template or its cold fallback."""
+    return ResolvedBindings(
+        workspace_dir=Path("workspace"),
         kiro_agent=kiro_agent,
         resolved_alias=resolved_alias,
         memory_store_name="default",
+        effective_memory_config={},
         model="",
         requested_resolved=requested_resolved,
+        selection_kind="template" if requested_resolved else "member",
     )
 
 

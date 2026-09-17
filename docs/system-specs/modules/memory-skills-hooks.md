@@ -39,6 +39,13 @@ Unverifiable calls return `403 member_session_unverified`; they never access
 global memory instead. See [security](security.md#overview) for the filesystem
 and caller-proof boundary.
 
+Subagent memory calls require the full `subagent:<run-id>` key's live allocation,
+including the original key reused by a continuation. Dashboard slots, restriction
+markers and retained transcripts cannot answer for a stopped child. The admitted
+protected memory mode must permit the operation. Recognition does not select a
+private store: the protected process/session proof above still supplies that
+authority.
+
 The hidden proof-signing key is staged as 32 owner-only bytes and fsynced before
 atomic publication without replacement. Concurrent creators adopt the first
 valid key. A crash before publication leaves the final name absent; corrupt
@@ -114,8 +121,13 @@ channel transcript cannot mint one; metadata downgrade or reassignment fails
 after restart.
 Session-control creation resolves the effective agent's memory and workspace
 binding off the event loop. Resolution failures return `agent_unverifiable`
-before allocation; the final live-caller authorization still follows all awaited
-preparation.
+before allocation. Creation applies `require_memory_delegation` to the caller's
+canonical history key and the selected store before allocating a slot or pinning
+its identity. Private callers may create only same-store workers; Global callers
+retain member assignment. Unreadable identities and cross-store requests return
+`403 memory_delegation_denied`, without exposing filesystem diagnostics. After
+awaited preparation, creation rechecks the live caller object, history key, agent
+and memory store before allocation; a changed selection refuses the request.
 Async turn admission, vector-store preparation and member consolidation perform
 protected binding reads, store validation, initial SQLite/FAISS construction and
 profile reads in worker threads. Store cache generation and retirement checks
@@ -1388,6 +1400,14 @@ No row is selected automatically. This is selective copying, not V1 migration.
 V1 retains its existing fresh-session context: bounded preferences/projects,
 decayed daily history, semantic and query-ranked episodic memory, plus
 query-ranked project-scoped lessons. Warm follow-ups do not repeat that recall.
+One five-second prompt-build deadline covers V1 semantic, episodic and lesson
+query embeddings in the shared model queue. Expiry removes queued work; each
+retrieval path falls back to its existing lexical score and stable ordering, so
+saved context is still injected. A native inference already claimed by the
+single model worker is not interruptible and may finish before the build
+returns. Sharing one budget bounds queue amplification from concurrent
+first-turn builds; the whole synchronous `ContextBuilder.build_message` call
+remains off the event loop in the bounded `mc-embed` pool.
 V2 context includes essential preference/project anchors and query-free,
 project-scoped lessons. V2 prompt construction performs no embedding search or
 episodic/semantic retrieval. Its runtime tells the agent to call `memory_recall`
@@ -1915,8 +1935,10 @@ no new restore intent and leaves any existing journal and live memory intact.
 
 Memory is the only data here that cannot be rebuilt from another source: config can be
 retyped and sessions replayed, but a superseded preference nobody remembers stating is
-gone. Active member V2 stores get a daily rotating hot copy. Global and named V1
-stores are copied only when the owner requests a manual backup. The heartbeat schedules its
+gone. Every active store gets a daily rotating hot copy: the default store first, then
+declared named V1 stores and actively owned member V2 stores. The default store is
+never left to a manual copy, because it is the one every install has and typically
+the largest. The heartbeat schedules its
 first pass at the first eligible tick after memory readiness, then uses its
 existing daily tick cadence and per-store freshness checks. One tracked task
 runs the serial copy pass in `maintenance_executor`; a tick never waits for a
@@ -1944,12 +1966,13 @@ self-contained file with no WAL to pair.
 - **Retention**: `memory.backup_keep` (default 7), clamped to at least 1. A retention
   policy that can empty the directory is a scheduled deletion, not retention.
   The loader preserves this value and `memory.backup_enabled` (default true)
-  across reload/save, so disabling automatic V2 backups or extending recovery
-  retention survives a gateway restart. Automatic retention never visits V1.
+  across reload/save, so disabling automatic backups or extending recovery
+  retention survives a gateway restart. Automatic retention prunes only the
+  backup directory of the store it just copied and never touches archived stores.
   Manual dashboard backups use the same configured retention in their worker.
-- **Enumeration**: the heartbeat passes `private_only=True` and visits only
-  actively owned V2 stores. The explicit all-store backup helper retains Global,
-  declared named V1 stores and active V2 stores. Neither uses a glob of `memory_stores/`: a glob
+- **Enumeration**: the heartbeat and the `kirocrew memory backup` command share one
+  helper that visits the default store, declared named V1 stores and actively owned
+  V2 stores. Neither uses a glob of `memory_stores/`: a glob
   would adopt an abandoned or restored directory the operator never declared and then
   copy it forever. Each resolved path is confirmed to belong to the store that asked for
   it, independently of strict binding resolution.
@@ -3190,7 +3213,11 @@ consolidator's constructor:
   the resolved binding is not the default store.** ABSENCE means global, so a default
   user's metadata line stays byte-identical and a session carrying no such key is
   unambiguously global rather than "global as of whenever it was saved". The birth dict is
-  the only record for a session that is created and then sits idle.
+  the only transcript record for a session that is created and then sits idle.
+  For a private V2 member, authorized creation also pins the protected session
+  assignment before writing that dict. This keeps an empty newborn transcript
+  from being mistaken for unverified V1 history on its first turn or after restart.
+  A pre-existing unverified transcript or native session still refuses creation.
 - `memory_store` is in `history.SLOT_OWNED_META_KEYS`, so current slot metadata
   owns its presence or absence instead of carrying a stale historical value
   forward. Private member bindings themselves are immutable.
@@ -3806,6 +3833,15 @@ the message against each skill's `triggers` (negative `!`-prefixed triggers
 exclude). To keep it off the per-message filesystem/config hot path:
 - the discovered skill-file list is TTL-cached (`_iter`, `_ITER_CACHE_TTL_SECS`),
   invalidated by `create_auto_skill`;
+- the walk that rebuilds it (`_iter_skill_files`, on a worker thread) asks the
+  sensitive-path fence through `is_sensitive_resolved_path` against the
+  `realpath` it has already computed for loop detection and containment, with
+  the fence's anchors resolved on that same thread, so the ~1.4k per-scan
+  checks on an install with a few provider packages submit nothing to the
+  two-worker `mc-pathres` pool. That pool is FIFO and sized for
+  the event loop; a scan flooding it from worker threads queued the loop's own
+  resolutions behind the backlog until the loop-stall watchdog fired
+  (see [security.md](security.md));
 - the `max_triggered` cap is read from the config watcher's snapshot
   (`_max_triggered_now`) — a plain attribute read, so still no
   `KiroCrewConfig.load()` per message, and `kirocrew config set
@@ -4280,7 +4316,7 @@ and exfiltration URLs; clean assets are copied byte-for-byte, including leading
 and trailing whitespace. No per-asset preview truncation is used for either the
 security decision or the copied content.
 
-**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
+**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The mutating verbs (POST, PUT, DELETE) are owner-only and SEL-audited — app tokens and non-owner subjects get a 403 before any write — and the same owner gate fronts pending approve/dismiss/dismiss-all, pin, and inject-on-trigger, so every mutating skill endpoint in `prompts.py` refuses non-owner callers (the discover-module install endpoint carries its own internal-secret refusal instead; see learn-cron-dashboard.md's Skills CRUD entry). The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
 
 **LLM tool mechanisms:**
 - MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**
@@ -4738,6 +4774,12 @@ and Kiro Crew resets its context-usage accounting at that chokepoint. Separately
 `SessionManager` trips a circuit breaker after `_CIRCUIT_BREAKER_THRESHOLD` = 5
 consecutive turn FAILURES for a session key and resets the session; that counter
 tracks failures, not compactions.
+
+On the dashboard, confirmed provider-native and manual `/compact` completion
+arms `SessionManager.mark_needs_reinjection` for the effective session key.
+The next dashboard turn consumes that one-shot flag to restore the skills
+context. Failed deferred compaction does not arm it. This completion hook does
+not add skills reinjection to messaging surfaces or the task runner.
 
 #### Dynamic budget scaling (per active model context window)
 

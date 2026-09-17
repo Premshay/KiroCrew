@@ -131,6 +131,12 @@ from the live `kirocrew` binary, strips stale remote-transport fields (`url`,
 gateway is actually running under while preserving the user's own env keys.
 User customizations such as `autoApprove` are preserved.
 
+For KAS native managed servers, session projection supplies the actual gateway
+listener port and the allocation-time caller session key. These values come
+from the gateway rather than the editable agent environment. Native tools keep
+their own session identity and reach the serving instance on a non-default port;
+third-party servers receive neither value.
+
 An entry may also carry a **`spec_gate`** — a predicate consulted at spec
 EMISSION time. `kirocrew-computer` is the one row that has one, and the
 distinction it draws is the difference between a capability that advertises no
@@ -590,10 +596,146 @@ env pin `KIROCREW_MCP_SPILL_THRESHOLD` → config key → built-in 256 KiB), mar
 for a second reason as well: it is handed to asyncio readers as `limit=` when they
 are CONSTRUCTED and cannot be changed afterwards. `socket_path`, `overlay_dir`,
 `idle_timeout_secs`, `max_backends`, `prewarm_count`, `stub_servers`,
-`poolable_servers`, `stub_overrides`, `pool_identity_env` and
-`forward_declared_env` ride the daemon's command line or size structures built
-once at spawn, so they too are marked `restart=True` in the config schema and
-apply to a broker started after the change.
+`poolable_servers`, `stub_overrides`, `pool_identity_env`,
+`forward_declared_env`, `spawn_concurrency_initial`, `spawn_concurrency_min`,
+`spawn_concurrency_max`, `spawn_queue_wait_secs`, `initialize_timeout_secs`,
+`host_budget_max_procs`, `host_budget_max_rss_mb` and `host_budget_max_fds` ride
+the daemon's command line or size structures built once at spawn, so they too
+are marked `restart=True` in the config schema and apply to a broker started
+after the change.
+
+### Admission before allocation
+
+The daemon bounds how many backend processes it FORKS AND INITIALISES at once,
+and how many it is answerable for in total, before anything is allocated. Two
+objects, built once in `run_gatewayd` beside the pool (`mcp_gateway/admission.py`,
+`mcp_gateway/host_budget.py`) and threaded into every spawn path -- pooled,
+connection-private, mid-call respawn and prewarm -- through `_acquire_backend`:
+
+- **`HostBudget`** charges a fixed per-backend estimate (`procs`, `rss_mb`,
+  `fds`) BEFORE the fork and releases it only when `process.wait()` returns, so a
+  backend that survives SIGKILL stays charged until it is really gone. Pooled,
+  private and fallback backends are charged identically: exclusivity is a
+  topology property, not a budget exemption, and a stub's per-session exec after
+  a `compat`/`isolation` rejection is one more process on the host, charged by
+  the daemon when it sends the rejection and released when that connection
+  reaches EOF (a new stub keeps the socket inheritable across its exec so EOF is
+  the backend exiting). Ceilings come from `mcp_gateway.host_budget_max_*`; `0`
+  derives processes from the available-memory sample the supervising gateway
+  passes on argv (never below `max_backends`) and descriptors from the daemon's
+  own `RLIMIT_NOFILE`, and leaves memory unbounded.
+- **`SpawnGate`** is one daemon-wide count of spawn+initialize windows in
+  flight, FIFO past that. Fixed capacity from `spawn_concurrency_initial`
+  (default 4), clamped to `[spawn_concurrency_min, spawn_concurrency_max]`
+  (1/8); `set_capacity(n)` is the seam the adaptive controller plugs into. A
+  `Permit` covers the fork and the backend's first `initialize`: `ready` is sent
+  to the stub before the handshake arrives (the stub forwards kiro-cli's first
+  frame), so the spawn path never awaits it inline -- a detached watcher on
+  `_init_done_event`, bounded by `Backend.initialize_timeout_secs` (a
+  constructor field fed from `mcp_gateway.initialize_timeout_secs`, not a module
+  setter), settles the permit `success` (ready), `failure` (handshake failed;
+  the permit is then held until the process is reaped) or `neutral` (no
+  handshake ever arrived -- an unused prewarm or a client that never
+  initialised is not congestion). `settle` is exactly-once and separate from
+  `release`, which is idempotent and settles `neutral` on its own; cancellation
+  at any boundary is neutral. Prewarm settles neutral the moment the fork
+  returns; it also re-reads the queue depth BEFORE EACH KEY and stands that key
+  down while any stub is queued (`_PrewarmStoodDown`, logged and skipped like any
+  other prewarm failure), and takes its wait with a `_PREWARM_SPAWN_WAIT_SECS`
+  deadline. Both because a pass lasts as long as its spawns: a once-per-pass
+  check leaves a stub that arrives during one queued behind the rest of it, and
+  the gate has no priority lane, so what bounds a stub sitting behind a prewarm
+  that already enqueued is that deadline. An unbounded prewarm wait would also
+  park under `_prewarm_lock`, which the credential-rotation re-warm has to take.
+- **`BackendPool.reserve_resident_slot`** moves the `max_backends` check in
+  front of the fork: a slot is claimed (or `PoolAtCapacity` raised with nothing
+  to reap) before `spawn_backend`, and `add` consumes it. Private backends take
+  none, as before.
+
+Acquisition order inside `_acquire_backend`'s spawn closure -- after the per-key
+`_spawn_locks` dedup and after `CircuitBreaker.allow`, so a permit is never held
+during a breaker cooldown and no pool lock is held while queued -- is
+**SpawnGate → HostBudget → resident slot → fork**, released in reverse on any
+failure before the fork. Deadlock argument: the budget and the slot never wait
+(they succeed or raise), so the only wait is the gate's FIFO, and a gate waiter
+holds nothing another waiter needs; a holder of resource k only ever waits for
+resource k+1, so the wait-for graph is acyclic. **That is why the gate is first
+and not last.** A charge taken before the wait prices a process that does not
+exist for as long as the wait lasts -- up to `spawn_queue_wait_secs`, 600 s by
+default -- so a queue of ten reaches the ceiling with nothing running and the
+eleventh stub is refused `capacity` on an idle host, a refusal that deliberately
+authorises no fallback. Taken after the permit, the budget and the slot are read
+against the host as it is at the moment of the fork. The daemon's drain closes
+admission FIRST -- queued waiters fail with `SpawnGateClosed`, watchers are
+cancelled (releasing their permits neutral), charges are dropped -- then
+proceeds with the existing teardown.
+
+**Wire.** `REGISTERED_CAPABILITIES` carries `spawn_queue`. A stub that saw it
+sends `{"type": "ensure_backend", "wait_budget_secs": N}` and the daemon queues
+the spawn for `min(N, spawn_queue_wait_secs)` LESS
+`_QUEUE_REFUSAL_MARGIN_SECS` (capped at half, so the subtraction is strict for
+any N), writing
+`{"type": "queued", "position": p, "capacity": c, "in_flight": i, "waited_secs": w}`
+every 5 s; a stub that did not negotiate it sends the bare frame, never sees
+`queued`, and its gate wait is bounded at 20 s so its own 25 s pre-flight timer
+still governs. The margin is the same property as that 20 s: **the daemon has to
+give up first.** The stub starts its timer before it writes the frame and the
+daemon starts its own only after reading it, so equal budgets -- which is what
+the shipped defaults are, 600 s on each side -- expire on the stub first, and a
+stub whose budget expires runs the per-session `fallback_exec` that a `capacity`
+refusal exists to withhold, charged to nothing. Raising `spawn_queue_wait_secs`
+above the stub's constant is harmless for the same reason: what the stub asked
+for caps the answer before the margin is taken off it. While any acquire or respawn waits, the connection handler keeps
+reading (`_await_answering_pings`): bridge pings get their `pong` at once and
+any other frame is parked and processed in order afterwards, so the stub's
+liveness monitor never declares a queued daemon dead -- bounded in both
+dimensions by `_MAX_PENDING_FRAMES` / `_MAX_PENDING_BYTES`, the same guard class
+as `backend._STUB_INBOX_MAXSIZE` in the reverse direction, because only the main
+loop drains the park and it cannot run until the wait returns; past either bound
+the pending acquire is cancelled and that ONE connection is dropped so
+co-pooled sessions survive. `rejected` frames carry
+`class`: `capacity` (resident pool full, host budget exhausted, wait budget
+spent, breaker OPEN, a fork refused for memory/descriptors) with
+`retry_after_secs`; `compat` (a pooled target this daemon cannot run or map);
+`isolation` (a private target it cannot launch). `fallback: true` rides
+`compat`/`isolation` and NOTHING else, on every wire shape: it authorises the
+stub's own per-session exec, and a stub that never negotiated `spawn_queue`
+closes its socket before exec'ing, so the charge `_reply_rejected` takes is
+released at that EOF -- before the process it pays for exists -- and N
+simultaneous `capacity` refusals would leave N backends the host budget never
+sees, which is the unbounded fan-out admission exists to end.
+**The compatibility cost is deliberate and falls on the pre-`spawn_queue` stub
+alone.** It cannot read `class`, so it reads the untagged refusal as terminal and
+exits 1 with `initialize` unanswered: kiro-cli reports that server as failed and
+that ONE session loses its tools until the retry, where before it would have run
+an unaccounted copy. **The bound is on the refusal ARRIVING inside that stub's own
+pre-flight window**, which is 25 s in the pre-upgrade binary: a refusal later than
+that reaches a stub which has already given up waiting and exec'd on a path that
+reads no frame, so the exec is unaccounted however the frame is tagged. What keeps
+the daemon inside the window is `_LEGACY_SPAWN_WAIT_SECS`, pinned strictly under
+25 s. It bounds the GATE wait only, so a refusal raised after the permit — a full
+pool or an open breaker, past up to `_MAX_SPAWN_DRAIN_RETRIES` spawn-and-initialize
+rounds — can still exceed it; that residual is the reason the pin exists rather
+than a claim it removes. The refusal is recorded on both sides -- `_audit_pool_rejected`
+on the daemon, a `terminal:` line in `stub_fallback.jsonl` that
+`fallback_counts()` keeps separate from real fallbacks in the `stats` reply -- so
+the degradation is observable rather than silent. A stub that DID negotiate
+`spawn_queue` pays nothing: it keeps its transport and answers `-32001` below.
+`compat` is not refused with it, because there the host is fine and the exec is
+the topology the connection asked for; refusing it would strand every session
+behind a daemon whose target map drifted. The stub (`stub.py`) negotiates
+`spawn_queue` on all three of its paths -- cold-start `ensure_backend`, the
+`_reconnect` replay (which now pre-flights before replaying `initialize`, and
+retries a `capacity` answer within its remaining budget) and the bridge (where
+a `queued` frame during a respawn counts as proof of life like a `pong`) -- and
+renews a 25 s SILENCE timer on `queued`/`keepalive`/`pong` rather than running a
+fixed deadline, bounded by its 600 s reconnect budget -- inside which the
+daemon's own wait always ends, per the margin above. The `capacity` rejection
+that ends the wait is answered to kiro-cli as JSON-RPC error `-32001` with
+`data.class` and `data.retry_after_secs` on every request, the stdio transport
+left open (`_serve_capacity_refusal`): the session is told the gateway is full,
+not that the server crashed, and no exec is run. The `stats` frame carries an
+`admission` snapshot (gate capacity/in-flight/queued/outcomes, budget counters).
 
 ### Windows target command spelling
 
@@ -737,7 +879,7 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger` |
 | `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
-| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `session_create`, `session_send`, `session_read_message`, `session_stop`, `session_close` |
+| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `session_create`, `session_send`, `session_read_message`, `session_stop`, `session_close` |
 
 `kirocrew-dashboard` is one transport carrying **two** authorization models, which is
 what makes its assignment decision larger than its name suggests. The
@@ -833,7 +975,7 @@ answers `tools/list` from):
 - **Session-bound directives** (`session_directive.DIRECTIVE_TOOLS`):
   `ask_question`, `suggest_followup`, `monitor_start`, `monitor_watch`,
   `monitor_update`, `monitor_stop`, `autonudge_stop`, `set_project`,
-  `reset_conversation`
+  `reset_conversation`, `chat_tag`
 - **Memory recall (V1 and V2):** `memory_recall` resolves authenticated session identity
   once through `require_strict_session_key` and passes that same identity to the gateway.
   Missing identity returns the shared gate's refusal and installation diagnosis.
@@ -1189,6 +1331,34 @@ stays per-route rather than in the middleware on purpose: a popped slot no longe
 says whose tab it was, so refusing centrally would also refuse the person's own
 in-flight calls on every internal route at once.
 
+**Tags ride the same server, with the same shape.** `chat_tag_list` reads the
+vocabulary (`GET /api/chat/tags`), `chat_tag_create` adds to it
+(`POST /api/chat/tags`, which dedups on the lowered name so a repeat call is a
+no-op), `chat_tag_update` renames, recolors or flips the status flag of one
+(`PATCH /api/chat/tags/<id>`, metadata only — every session keeps the tag), and
+`chat_tag_assign` labels a live session (`PUT /api/chat/slots/<slot>/tags`). No
+delete: removing a tag from the vocabulary strips it from every session and
+column at once, which is the one operation in the set with real blast radius.
+Two differences from the folder verbs follow from tags having no owner. First,
+`POST` and `PATCH /api/chat/tags` refuse an app-scoped caller outright (403
+`app_forbidden`, which the tools surface): a folder an app makes is the app's
+own, but a tag lands in the person's one shared list with nothing to tell it
+apart, so
+there is no boundary to bound that write to. The rule sits in the endpoint, on
+the middleware's validated claim, for the same reason the folder policy does —
+a tool-layer copy could only drift. `POST /api/chat/tags` also draws on the same
+per-caller create budget as `api_chat_folder_create` (`create_rate_limit`,
+`TAG_CREATE`), keyed by the validated `X-Internal-Caller` component, so a
+granted agent loop cannot grow `tags.json` without bound; the browser is exempt.
+Second, `chat_tag_assign` takes `add` / `remove` DELTAS rather than a list to
+replace, and sends the slot's `tags_revision` as `base_tags_revision` so the
+endpoint applies the write compare-and-set: a tag the person toggles between the
+tool's read and its PUT is not silently dropped by a wholesale replace — the call
+fails 409 `stale_base` and re-reads. The session is resolved through the same
+scoped `_visible_chat_slots` as `chat_folder_move_session`, and the PUT route
+applies the same App Kit ownership check `api_chat_slot_folder` does, so an app
+agent cannot reach a foreign session's tags from either side.
+
 **Assignment is still not authorization.** Being unreferenced by default keeps a
 capability cheap and deliberate; it does not prove the user consented to reach the
 agent does not otherwise have. For that, `config.json` is the WRONG home —
@@ -1431,7 +1601,7 @@ and let a sub-agent's card land in its parent's slot.
 **Return a session directive and let the session-aware consumer apply it.** This
 is what the `ask_question` MCP tool itself now does, along with `monitor_start`,
 `monitor_watch`, `monitor_update`, `monitor_stop`, `autonudge_stop`, `set_project`
-and `suggest_followup`, and `reset_conversation`
+and `suggest_followup`, `reset_conversation` and `chat_tag`
 (`session_directive.DIRECTIVE_TOOLS`). The tool validates its arguments and
 returns a human-readable confirmation plus a marker line carrying the validated
 payload and **no session key**. `dashboard/chat_runner`'s tool-result handler
@@ -1477,6 +1647,26 @@ measured 7,999 chars in and 8,755 out), so `preserve_tail_marker` re-attaches a
 marker the cut removed — the same re-injection the MCP App render marker already
 gets at that seam, for the same reason: a control token that decides how a frame is
 interpreted must not be a casualty of a length cut applied to the frame's prose.
+
+A marker is honoured at that gate ONLY if the emitter vouched for it on the same
+dispatch: `_emit_directive` is the one producer of a real marker, so it records a
+digest of what it built, `_call_tool` clears that record before every dispatch, and
+`refuse_if_markerless` defangs any marker nobody vouched for. "Does this look like a
+directive?" is not a safe question — a rejection echoing a model-chosen argument
+name can imitate one, which is how a rejected call came to apply the very arguments
+validation had refused. Every place `mcp_shared` builds an `"Error: …"` result also
+passes the interpolated text through `session_directive.neutralize_markers`, kept as
+defense in depth because those strings reach the audit row and the four other
+servers' outputs, where no vouch gate runs. That defanging is applied only where the
+caller KNOWS the string is not a directive: doing it centrally over every tool
+result would defang the real marker too.
+
+`_emit_directive` classifies its OWN output the same way — by the marker's presence,
+not by content. Testing `is_refusal(out)` there matched any payload that merely
+CONTAINED the refusal token, so a stop whose reason quoted that token was filed as a
+refusal, skipped both the publish and the vouch, and had its genuine marker defanged
+downstream: the stop was lost. A gate against imitable content cannot itself be
+built on imitable content.
 
 **A directive tool's result either carries the marker, or it is a tagged
 refusal — nothing in between.** The consumer cannot otherwise tell a decline from

@@ -823,10 +823,12 @@ def _apply_document_migrations(
     #   the one failure that can override a value the operator restored. A failing
     #   record therefore propagates and aborts the whole migration write;
     # * every key it records is reported back through *recorded_adoptions*, because
-    #   writing the ledger first creates the mirror hazard: if the config write then
+    #   writing the ledger first leaves a known residual: if the config write then
     #   fails, the key is marked adopted while the stale value is still stored, and
-    #   the one-shot filter would never revisit it. The caller rolls those entries
-    #   back when the write does not land, which restores the pre-load state exactly;
+    #   the one-shot filter never revisits it. Nothing rolls the ledger back -- see
+    #   ``record_adoptions`` for why that residual is the one chosen -- so the caller
+    #   uses the list only to decide which keys the IN-MEMORY half may apply: those
+    #   whose removal it saw land, and no others;
     # * ``drop_drifted_keys`` REMOVES the key rather than writing the new number, so
     #   the field resolves through ``data.get(key, DEFAULT)`` until the next full
     #   rewrite of the document re-materializes it.
@@ -963,10 +965,11 @@ def _persist_config_migration(
     # ``applied`` means the delta was computed and the backup taken; ``wrote`` means
     # the ATOMIC WRITE returned. They are separate because the write happens AFTER
     # ``_mutate`` returns -- ``update_config_locked`` performs it -- so a flag set
-    # inside the callback would report a write that had not happened yet, and a
-    # failing write would then skip the ledger rollback below and strand the key as
-    # adopted-but-stale. Neither call site guards ``write_config_atomically``, so a
-    # failed write propagates and ``wrote`` correctly stays False.
+    # inside the callback would report a write that had not happened yet, and the
+    # ``finally`` below would then confirm an adoption whose removal never reached
+    # disk, letting the in-memory half run ahead of the stored document. Neither
+    # call site guards ``write_config_atomically``, so a failed write propagates and
+    # ``wrote`` correctly stays False.
     applied = False
 
     def _mutate(current: dict) -> dict | None:
@@ -2510,6 +2513,9 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         role_models=coerce_role_models(agent_data.get("role_models")),
         role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
         fallback_model=coerce_fallback_model(agent_data.get("fallback_model", "auto")),
+        refusal_fallback_model=_sections.coerce_refusal_fallback_model(
+            agent_data.get("refusal_fallback_model", "")
+        ),
         reasoning_effort=agent_data.get("reasoning_effort", ""),
         provider=agent_data.get("provider", "acp"),
         mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
@@ -2604,6 +2610,68 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
         resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
         admission_gate=_safe_bool(agent_data.get("admission_gate"), True),
+        # Durable task queue keys, adjacent to admission_gate because a
+        # gated spawn is what the queue defers instead of refusing.
+        task_queue_enabled=_safe_bool(agent_data.get("task_queue_enabled"), True),
+        task_dispatch_window=_safe_int(agent_data.get("task_dispatch_window", 64), 64, 1, 4096),
+        task_store_journal_mode=(
+            str(agent_data.get("task_store_journal_mode") or "auto").lower()
+            if str(agent_data.get("task_store_journal_mode") or "auto").lower()
+            in ("auto", "wal", "delete")
+            else "auto"
+        ),
+        admit_wait_secs=_safe_int(agent_data.get("admit_wait_secs", 30), 30, 1, 3600),
+        start_collect_timeout_secs=_safe_int(
+            agent_data.get("start_collect_timeout_secs", 300), 300, 10, 3600
+        ),
+        # Fairness lanes (taskq/lanes.py): weights shape the share of
+        # picks; the reserve keeps children startable under full parents.
+        lane_weights=(
+            {
+                lane: _safe_int(weight, 1, 1, 64)
+                for lane, weight in _lane_weights.items()
+                if isinstance(lane, str) and lane
+            }
+            if isinstance(_lane_weights := agent_data.get("lane_weights"), dict)
+            else {}
+        ),
+        child_reserve=_safe_int(agent_data.get("child_reserve", 1), 1, 0, 8),
+        # Shared recovery ladder schedule (recovery/policy.py bounds).
+        recovery_backoff_base_secs=_safe_float(
+            agent_data.get("recovery_backoff_base_secs", 2.0), 2.0, 0.1, 60.0
+        ),
+        recovery_backoff_max_secs=_safe_float(
+            agent_data.get("recovery_backoff_max_secs", 120.0), 120.0, 1.0, 3600.0
+        ),
+        # Session-start gate (acp/runtime.py SessionStartGate).
+        session_start_concurrency=_safe_int(
+            agent_data.get("session_start_concurrency", 2), 2, 1, 64
+        ),
+        # Adaptive controller (adaptive/policy.py params_from_config).
+        adaptive_concurrency=_safe_bool(agent_data.get("adaptive_concurrency"), True),
+        adaptive_concurrency_mode=(
+            "fixed" if agent_data.get("adaptive_concurrency_mode") == "fixed" else "aimd"
+        ),
+        adaptive_floor=_safe_int(agent_data.get("adaptive_floor", 1), 1, 1, 64),
+        adaptive_initial=_safe_int(agent_data.get("adaptive_initial", 4), 4, 1, 64),
+        controller_sample_secs=_safe_int(agent_data.get("controller_sample_secs", 5), 5, 1, 300),
+        # Dependency coordinator (taskq/dependency.py coordinator_from_config).
+        dependency_max_attempts=_safe_int(
+            agent_data.get("dependency_max_attempts", 20), 20, 1, 1000
+        ),
+        dependency_wait_deadline_secs=_safe_int(
+            agent_data.get("dependency_wait_deadline_secs", 3600), 3600, 0, 86400
+        ),
+        dependency_wake_per_tick=_safe_int(
+            agent_data.get("dependency_wake_per_tick", 0), 0, 0, 4096
+        ),
+        dependency_wake_spacing_secs=_safe_float(
+            agent_data.get("dependency_wake_spacing_secs", 1.0), 1.0, 0.0, 60.0
+        ),
+        # Tool-stall watchdog (acp/session_handle.py WatchdogSettings).
+        interactive_command_policy=(
+            "wait" if agent_data.get("interactive_command_policy") == "wait" else "cancel"
+        ),
         subagent_max_turns=_safe_int(
             agent_data.get("subagent_max_turns", 100), 100, 1, SUBAGENT_MAX_TURNS_CEILING
         ),
@@ -2619,8 +2687,10 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
             COMPLETION_KEEP_CHARS_MAX,
         ),
         subagent_result_ttl_secs=_safe_int(agent_data.get("subagent_result_ttl_secs", 3600), 3600),
+        # Same band workflows/service.py clamp_run_timeout enforces, so a
+        # hand-edited file and the live-bound setter agree.
         workflow_run_timeout_secs=_safe_int(
-            agent_data.get("workflow_run_timeout_secs", 3600), 3600
+            agent_data.get("workflow_run_timeout_secs", 3600), 3600, 60, 21600
         ),
         subagent_cwd_allowed_roots=(
             [r for r in _roots if isinstance(r, str)]
@@ -3366,6 +3436,8 @@ def _build_computer_use_config(computer_use_data: dict) -> ComputerUseConfig:
 
 
 def _build_mcp_gateway_config(mcp_gateway_data: dict) -> McpGatewayConfig:
+    _spawn_min = max(1, _safe_int(mcp_gateway_data.get("spawn_concurrency_min", 1), 1))
+    _spawn_max = max(_spawn_min, _safe_int(mcp_gateway_data.get("spawn_concurrency_max", 8), 8))
     return McpGatewayConfig(
         shared_readonly_servers=[
             s.strip()
@@ -3415,6 +3487,31 @@ def _build_mcp_gateway_config(mcp_gateway_data: dict) -> McpGatewayConfig:
             0, _safe_int(mcp_gateway_data.get("resolve_once_refresh_hours", 24), 24)
         ),
         max_backends=max(1, _safe_int(mcp_gateway_data.get("max_backends", 64), 64)),
+        # Admission keys. Clamps mirror the dataclass defaults: floor
+        # >= 1, ceiling >= floor, initial inside the band; 0 keeps the
+        # "auto" meaning on the host-budget ceilings.
+        spawn_concurrency_min=_spawn_min,
+        spawn_concurrency_max=_spawn_max,
+        spawn_concurrency_initial=min(
+            _spawn_max,
+            max(
+                _spawn_min,
+                _safe_int(mcp_gateway_data.get("spawn_concurrency_initial", 4), 4),
+            ),
+        ),
+        spawn_queue_wait_secs=max(
+            1, _safe_int(mcp_gateway_data.get("spawn_queue_wait_secs", 600), 600)
+        ),
+        initialize_timeout_secs=max(
+            1, _safe_int(mcp_gateway_data.get("initialize_timeout_secs", 10), 10)
+        ),
+        host_budget_max_procs=max(
+            0, _safe_int(mcp_gateway_data.get("host_budget_max_procs", 0), 0)
+        ),
+        host_budget_max_rss_mb=max(
+            0, _safe_int(mcp_gateway_data.get("host_budget_max_rss_mb", 0), 0)
+        ),
+        host_budget_max_fds=max(0, _safe_int(mcp_gateway_data.get("host_budget_max_fds", 0), 0)),
         poolable_servers=[
             s for s in mcp_gateway_data.get("poolable_servers", []) if isinstance(s, str)
         ],
@@ -4678,10 +4775,20 @@ class KiroCrewConfig:
             # so a read-and-skip that left its document cached would have every
             # later load serve the stale value and never retry -- the ceiling the
             # operator upgraded to fix would come back and stay. In a ``finally``
-            # rather than beside the write, because the write is skipped by three
-            # different paths (a contended lock, a degraded load, an exception) and
-            # all three leave the same stale cache entry.
-            if adopt_keys and not adoption_landed:
+            # rather than beside the write, because the write is skipped by more
+            # than one path (a contended lock, an exception) and each leaves the
+            # same stale cache entry.
+            #
+            # The degraded-sections branch is the exception, and it is excluded on
+            # purpose. Its retry condition is not "the next load" but "the operator
+            # fixes the file and restarts the gateway" -- degradation observations
+            # are sticky for the life of a process (``_OBSERVED_DEGRADED_SECTIONS``),
+            # so until then the write is refused every time, and dropping the cache
+            # buys nothing except a full re-read and re-parse of config.json on
+            # EVERY load for as long as the two conditions coexist. After the
+            # restart the fixed file's fingerprint misses the (empty) cache and the
+            # adoption retries on that first load -- no invalidation needed.
+            if adopt_keys and not adoption_landed and not cfg._degraded_sections:
                 _invalidate_config_cache()
 
         return cfg, ticket
@@ -5064,14 +5171,45 @@ class KiroCrewConfig:
         ``model`` slot only; ``""`` when the agent declares none, so the caller
         falls back to the global. ``agents_dir`` overrides the lookup directory
         (a dependency-injection seam for tests); defaults to ``kiro_agents_dir()``.
+
+        Reads the ``agent_discovery.parsed_agent_specs`` snapshot -- the same
+        stat-signature-revalidated cache behind ``agent_skill_globs`` -- rather
+        than re-parsing every spec per call. This runs SYNCHRONOUSLY on the event
+        loop from the provider factory (every session start, every background
+        recycle), and a per-call scan of a ~125-file agents directory is ~125
+        ``realpath`` calls plus twice as many ``is_sensitive_path`` round trips
+        through the two-worker ``mc-pathres`` pool; when that pool is also
+        serving the skill scanner's bulk traffic, those waits queue and their
+        sum crosses the loop-stall watchdog. A warm call now costs one
+        ``scandir``. On the loop, cold or changed snapshots refresh in the
+        ``mc-discovery`` pool while this lookup serves previous rows (or no
+        pin until the first refresh lands). Off-loop callers parse inline.
+
+        JSON-first precedence is kept: with two live specs of DIFFERENT stems
+        both declaring this name, the ``.json`` one wins, as the unordered
+        first-match scan this replaces guaranteed (``iter_agent_spec_files``
+        lists JSON entries first). Never raises -- a failure to import, walk or
+        parse is "no pin here", never an exception into model resolution.
         """
         if not agent:
             return ""
         base = agents_dir if agents_dir is not None else kiro_agents_dir()
-        for af in iter_agent_spec_files(base, ordered=False):
-            ad = _read_hardened_agent_spec(af)
-            if ad is None:
-                continue
+        try:
+            # Deferred import: agent_discovery imports kiro_crew.hooks, whose
+            # closure reaches back into this module (see _project_declares_agent).
+            from kiro_crew.agent_discovery import cached_agent_specs, parsed_agent_specs
+
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                rows = parsed_agent_specs(base, operation="load_config", source="unknown")
+            else:
+                rows = cached_agent_specs(base, operation="load_config", source="unknown")
+        except Exception:
+            return ""
+        # Stable sort: JSON rows first, filename order preserved within each group.
+        rows.sort(key=lambda row: row[1].suffix.lower() != ".json")
+        for ad, af in rows:
             # Skip stray non-object JSON a user may have dropped in the dir.
             if isinstance(ad, dict) and (ad.get("name") == agent or af.stem == agent):
                 return ad.get("model") or ""
@@ -5421,11 +5559,14 @@ _MATERIALIZED_AGENTS_LOCK = threading.Lock()
 def _scan_materialized_agents(agents_dir: Path) -> frozenset[str]:
     """Every agent name declared by the kiro agent configs in *agents_dir*.
 
-    Both spellings are emitted: the config's ``name`` field and the filename stem
-    (mirroring :meth:`_resolve_named_agent_model`), since an app's agent is
-    registered under a namespaced filename while its config keeps the app's bare
-    name. Unreadable or non-object entries are skipped. Performs the glob and the
-    per-file reads, so callers must invoke it OFF the event loop.
+    Each config contributes its DECLARED ``name`` field; the filename stem is
+    used only as a fallback when a config declares no name, since it is then the
+    only identifier available. An app's agent is registered under a namespaced
+    filename (``<app>--<agent>.json``) while its config keeps the app's bare
+    name, so the stem of a named config is deliberately NOT emitted — kiro-cli
+    enumerates agents by declared name and would not resolve it (see the inline
+    comment below). Unreadable or non-object entries are skipped. Performs the
+    glob and the per-file reads, so callers must invoke it OFF the event loop.
     """
     names: set[str] = set()
     # Deferred import: `hooks` reaches back into this module for config paths, so
@@ -6044,10 +6185,14 @@ def resolve_crew_identity(
     return ""
 
 
-def _resolve_agent_selection(config, agent_name=None, project_dir=None):
+def _resolve_agent_selection(config, agent_name=None, project_dir=None, *, selection_kind=""):
     """Select a config record/template without accessing any memory files."""
-    alias_hit = bool(agent_name) and agent_name in config.agents
-    passthrough = "" if alias_hit else _materialized_kiro_agent(agent_name, project_dir)
+    alias_hit = selection_kind != "template" and bool(agent_name) and agent_name in config.agents
+    passthrough = (
+        ""
+        if alias_hit or selection_kind == "member"
+        else _materialized_kiro_agent(agent_name, project_dir)
+    )
     requested_resolved = (not agent_name) or alias_hit or bool(passthrough)
     if alias_hit:
         alias = agent_name
@@ -6061,13 +6206,15 @@ def _resolve_agent_selection(config, agent_name=None, project_dir=None):
     return config.agents.get(alias), alias, passthrough, requested_resolved
 
 
-def resolve_agent_identity(config, agent_name=None) -> tuple[str, str, str]:
+def resolve_agent_identity(config, agent_name=None, *, selection_kind="") -> tuple[str, str, str]:
     """Alias, provider template and model pin for display/configuration only.
 
     This does not authorize memory access. Runtime callers must resolve the full
     bindings; a model chip remains inspectable while private memory is unavailable.
     """
-    record, alias, passthrough, _ = _resolve_agent_selection(config, agent_name)
+    record, alias, passthrough, _ = _resolve_agent_selection(
+        config, agent_name, selection_kind=selection_kind
+    )
     return (
         alias,
         passthrough or (record.kiro_agent if record else config.agent.default_agent),
@@ -6081,6 +6228,7 @@ def resolve_agent_bindings(
     project_dir: str | None = None,
     *,
     validate_memory_files: bool = True,
+    selection_kind: str = "",
 ) -> ResolvedBindings:
     """Resolve workspace, memory store, and kiro agent for a session.
 
@@ -6102,7 +6250,7 @@ def resolve_agent_bindings(
     import dataclasses as _dc
 
     agent_cfg, resolved_alias, passthrough, requested_resolved = _resolve_agent_selection(
-        config, agent_name, project_dir
+        config, agent_name, project_dir, selection_kind=selection_kind
     )
     if agent_cfg is None:
         logger.warning("No agents configured, using bare defaults")
@@ -6112,6 +6260,7 @@ def resolve_agent_bindings(
             effective_memory_config=_dc.asdict(config.memory),
             kiro_agent=passthrough or config.agent.default_agent,
             requested_resolved=requested_resolved,
+            selection_kind="template" if passthrough else "",
         )
 
     # Resolve workspace
@@ -6158,12 +6307,15 @@ def resolve_agent_bindings(
         ),
         requested_resolved=requested_resolved,
         resolved_alias=resolved_alias,
+        selection_kind="template" if passthrough else "member",
     )
 
 
 def resolve_effective_model(
     config: KiroCrewConfig,
     agent_name: str | None = None,
+    *,
+    selection_kind: str = "",
 ) -> str:
     """Return the model a new session on *agent_name* would start with.
 
@@ -6181,7 +6333,9 @@ def resolve_effective_model(
     caller holds it. Returns ``""`` when every tier defers, meaning the backend
     picks (kiro-cli's own ``chat.defaultModel``).
     """
-    _, kiro_agent, model_pin = resolve_agent_identity(config, agent_name)
+    _, kiro_agent, model_pin = resolve_agent_identity(
+        config, agent_name, selection_kind=selection_kind
+    )
     if model_pin:
         return model_pin
     if kiro_agent and kiro_agent != "kirocrew":

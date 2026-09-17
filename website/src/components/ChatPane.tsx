@@ -38,6 +38,7 @@ import { useProvider } from '../providers'
 import type { ModelInfo } from '../providers/types'
 import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
+import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import {
@@ -103,7 +104,7 @@ import {
   type ComposerHandle,
   type ComposerVoiceOptions,
 } from '../chat-core/composer/Composer'
-import { displayModel, modelLabel } from '../lib/model'
+import { displayModel } from '../lib/model'
 
 import { i18nT } from '../i18n/t'
 
@@ -321,8 +322,6 @@ export default function ChatPane({
   // In-pane report of a title rename / regenerate that did not land (#9727):
   // the main header routes the same failure into its action banner.
   const [titleError, setTitleError] = useState<{ title: string; message: string } | null>(null)
-  const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
-  const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
   // The transcript is virtualized (chat-core P5-e): ChatMessageList owns the
   // scroller and the stick-to-bottom follow through VirtualTranscript. The pane
   // keeps the element ref for the pinned-prompt hook, a handle for the jump
@@ -593,6 +592,10 @@ export default function ChatPane({
     [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model],
   )
   const modelDD = useFilteredDropdown(modelPickerModels)
+  // Picker anchors: keep each portaled menu glued to the ChatInput chip that
+  // opened it while the menu is open (#10616, same class as #10580).
+  const { rect: agentBtnRect, anchorTo: anchorAgentBtn } = useAnchoredTriggerRect(agentDD.open)
+  const { rect: modelBtnRect, anchorTo: anchorModelBtn } = useAnchoredTriggerRect(modelDD.open)
   // See ChatPage: display what will actually run, not a pin the account lost
   // access to. The slot's own `model_withheld` verdict answers that when the
   // backend has one; the degraded flag gates only the list-membership fallback —
@@ -615,8 +618,6 @@ export default function ChatPane({
     _modelsDegraded,
     paneSlot?.model_withheld,
   )
-  // See ChatPage: the chip writes the label, the picker still selects the value.
-  const shownModelLabel = modelLabel(shownModel, availableModels)
 
   // One-time hydrate of this slot's message history via React Query + the api
   // client (caching + cross-pane dedup; staleTime Infinity keeps it one-shot —
@@ -1785,149 +1786,116 @@ export default function ChatPane({
           {/* Quote transit: the selection flies from where it was taken into this
             pane's composer (the wrapper below is the landing target — same
             shape as ChatPage's inputAreaRef). */}
-          {quoteFlight && (
-            <FlyingQuote
-              text={quoteFlight.text}
-              from={quoteFlight.from}
-              targetRef={inputAreaRef}
-              onComplete={endQuoteFlight}
-            />
-          )}
-          <div ref={inputAreaRef} className="relative z-10">
-            <Composer
-              ref={composerRef}
-              slotKey={slotKey}
-              value={input}
-              onChange={setInput}
-              voice={composerVoiceOptions}
-            >
-              <ChatInput
-                value={input}
-                onChange={setInput}
-                onSend={doSend}
-                isRunning={busy}
-                onStop={onStop}
-                isQueued={streamState === 'stopping' || !!paneSlot?.stopping}
-                stopState={paneStopState}
-                // Steer path on the pane too (it was queue-only before): busy panes
-                // get the same mid-turn choice as the main chat, and a
-                // `steer-only` host gets a plain send that steers.
-                canSteer={busy}
-                onSteer={doSteer}
-                busyMode={busyMode}
-                autoFocusKey={slotKey}
-                agentName={paneAgentName}
-                // The chip shows the inherited-default marker; `agentName` stays the
-                // raw resolved alias for the skills query and switch title. Uses the
-                // SLOT's stored agent (not `paneAgentName`, which has already
-                // collapsed empty->default) so an agent-less slot reads
-                // `<default> · default` and a pinned one reads the bare alias (#8770).
-                agentLabel={agentOrDefaultLabel(paneSlot?.agent, paneEffectiveDefaultAgent)}
-                agentIsInheritedDefault={!paneSlot?.agent && !!paneEffectiveDefaultAgent}
-                agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
-                modelName={shownModelLabel}
-                modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
-                contextPct={contextPct}
-                contextUsedTokens={contextTokens?.used}
-                contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
-                onAgentClick={
-                  !agentLocked && provider.capabilities.agentTemplates
-                    ? (rect) => {
-                        setAgentBtnRect(rect)
-                        agentDD.setOpen(!agentDD.open)
-                      }
-                    : undefined
-                }
-                onModelClick={(rect) => {
-                  setModelBtnRect(rect)
-                  modelDD.setOpen(!modelDD.open)
-                }}
-                approvalMode={displayMode}
-                followUpOptions={followUpOptions}
-                followUpPicked={followUpPicked}
-                followUpLayout={chatConfig.followUpLayout}
-                quickSend={dashCfg?.quick_send}
-                followUpSourceKey={followUpSourceKey}
-                onFollowUpSelect={(
-                  o: string,
-                  e: React.MouseEvent,
-                  sourceKeyAtClick?: string | null,
-                ) => {
-                  // Mirrors ChatPage's wiring, plan branch included (#5893). Plan
-                  // options (Go / Go All / Cancel — the only labels the plan
-                  // pipeline emits and the only actions the endpoint accepts)
-                  // dispatch directly against THIS pane's slot — no input fill:
-                  // the same chip must mean the same thing here as in the main
-                  // chat. A plan-SHAPED message carrying non-protocol labels keeps
-                  // the composer path — dispatching those would 400 server-side
-                  // while also skipping the append, leaving a dead chip.
-                  // Slot record not yet delivered: dispatchPlanFollowUp no-ops
-                  // rather than appending an approval label (the reported bug).
-                  if (dispatchPlanFollowUp(o, sourceKeyAtClick)) return
-                  // One-click Quick Send takes the same gate as ChatPage: enabled +
-                  // no shift + not busy + not already in multi-select.
-                  if (
-                    tryQuickSend(
-                      o,
-                      dashCfg?.quick_send,
-                      e.shiftKey,
-                      busy,
-                      followUpPickedRef.current.size,
-                      (t: string) => doSend(t),
-                    )
-                  )
-                    return
-                  // Regular options: toggle. Click unpicked → append + mark; click
-                  // picked → try to remove the text + unmark (if the user edited the
-                  // text so it no longer matches, leave the text alone — the chip
-                  // still un-highlights for consistency).
-                  if (followUpPickedRef.current.has(o)) {
-                    const next = new Set(followUpPickedRef.current)
-                    next.delete(o)
-                    followUpPickedRef.current = next
-                    setInput((prev) => {
-                      // Order matters: try leading ", o" first so "opt, opt" + remove
-                      // last "opt" doesn't match "opt, " and splice the wrong one.
-                      // lastIndexOf, not indexOf: the handler appends options at the
-                      // END, so the last occurrence is the one it created — a draft
-                      // merely containing ", o" as a substring (draft "Please, Google"
-                      // + option "Go") must not be spliced mid-word.
-                      const leading = ', ' + o
-                      let idx = prev.lastIndexOf(leading)
-                      if (idx >= 0) return prev.slice(0, idx) + prev.slice(idx + leading.length)
-                      const trailing = o + ', '
-                      idx = prev.indexOf(trailing)
-                      if (idx >= 0) return prev.slice(0, idx) + prev.slice(idx + trailing.length)
-                      if (prev === o) return ''
-                      return prev // user edited — leave text, still unmark below
-                    })
-                    setFollowUpPicked(next)
-                  } else {
-                    const next = new Set(followUpPickedRef.current)
-                    next.add(o)
-                    followUpPickedRef.current = next
-                    setInput((prev) => (prev.trim() ? prev.trimEnd() + ', ' + o : o))
-                    setFollowUpPicked(next)
-                  }
-                }}
-                onFollowUpSend={(text?: string, sourceKeyAtClick?: string | null) => {
-                  // Double-click and Send-now share dispatchPlanFollowUp with
-                  // single-click (#6240). `sourceKeyAtClick` is the first-click
-                  // row — a straddled double-click on a replaced footer is refused.
-                  if (text && dispatchPlanFollowUp(text, sourceKeyAtClick)) return
-                  doSend(text)
-                }}
-                project={paneSlot?.project ?? ''}
-                onUploadFiles={uploadFiles}
-                pendingFiles={pendingFiles}
-                onRemoveFile={(p) => setPendingFiles((prev) => prev.filter((x) => x !== p))}
-                uploading={uploadMutation.isPending}
-                onDrop={dropTargetProps.onDrop}
-                onDragOver={dropTargetProps.onDragOver}
-                onDragLeave={dropTargetProps.onDragLeave}
-              />
-            </Composer>
-          </div>
+        {quoteFlight && <FlyingQuote text={quoteFlight.text} from={quoteFlight.from} targetRef={inputAreaRef} onComplete={endQuoteFlight} />}
+        <div ref={inputAreaRef} className="relative z-10">
+        <Composer
+          ref={composerRef}
+          slotKey={slotKey}
+          value={input}
+          onChange={setInput}
+          voice={composerVoiceOptions}
+        >
+        <ChatInput
+          value={input}
+          onChange={setInput}
+          onSend={doSend}
+          isRunning={busy}
+          onStop={onStop}
+          isQueued={streamState === 'stopping' || !!paneSlot?.stopping}
+          stopState={paneStopState}
+          // Steer path on the pane too (it was queue-only before): busy panes
+          // get the same mid-turn choice as the main chat, and a
+          // `steer-only` host gets a plain send that steers.
+          canSteer={busy}
+          onSteer={doSteer}
+          busyMode={busyMode}
+          autoFocusKey={slotKey}
+          agentName={paneAgentName}
+          // The chip shows the inherited-default marker; `agentName` stays the
+          // raw resolved alias for the skills query and switch title. Uses the
+          // SLOT's stored agent (not `paneAgentName`, which has already
+          // collapsed empty->default) so an agent-less slot reads
+          // `<default> · default` and a pinned one reads the bare alias (#8770).
+          agentLabel={agentOrDefaultLabel(paneSlot?.agent, paneEffectiveDefaultAgent)}
+          agentIsInheritedDefault={!paneSlot?.agent && !!paneEffectiveDefaultAgent}
+          agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
+          modelName={shownModel}
+          modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
+          contextPct={contextPct}
+          contextUsedTokens={contextTokens?.used}
+          contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
+          onAgentClick={!agentLocked && provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); agentDD.setOpen(!agentDD.open) } : undefined}
+          onModelClick={(rect, trigger) => { anchorModelBtn(rect, trigger); modelDD.setOpen(!modelDD.open) }}
+          approvalMode={displayMode}
+          followUpOptions={followUpOptions}
+          followUpPicked={followUpPicked}
+          followUpLayout={chatConfig.followUpLayout}
+          quickSend={dashCfg?.quick_send}
+          followUpSourceKey={followUpSourceKey}
+          onFollowUpSelect={(o: string, e: React.MouseEvent, sourceKeyAtClick?: string | null) => {
+            // Mirrors ChatPage's wiring, plan branch included (#5893). Plan
+            // options (Go / Go All / Cancel — the only labels the plan
+            // pipeline emits and the only actions the endpoint accepts)
+            // dispatch directly against THIS pane's slot — no input fill:
+            // the same chip must mean the same thing here as in the main
+            // chat. A plan-SHAPED message carrying non-protocol labels keeps
+            // the composer path — dispatching those would 400 server-side
+            // while also skipping the append, leaving a dead chip.
+            // Slot record not yet delivered: dispatchPlanFollowUp no-ops
+            // rather than appending an approval label (the reported bug).
+            if (dispatchPlanFollowUp(o, sourceKeyAtClick)) return
+            // One-click Quick Send takes the same gate as ChatPage: enabled +
+            // no shift + not busy + not already in multi-select.
+            if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, busy, followUpPickedRef.current.size, (t: string) => doSend(t))) return
+            // Regular options: toggle. Click unpicked → append + mark; click
+            // picked → try to remove the text + unmark (if the user edited the
+            // text so it no longer matches, leave the text alone — the chip
+            // still un-highlights for consistency).
+            if (followUpPickedRef.current.has(o)) {
+              const next = new Set(followUpPickedRef.current); next.delete(o)
+              followUpPickedRef.current = next
+              setInput(prev => {
+                // Order matters: try leading ", o" first so "opt, opt" + remove
+                // last "opt" doesn't match "opt, " and splice the wrong one.
+                // lastIndexOf, not indexOf: the handler appends options at the
+                // END, so the last occurrence is the one it created — a draft
+                // merely containing ", o" as a substring (draft "Please, Google"
+                // + option "Go") must not be spliced mid-word.
+                const leading = ', ' + o
+                let idx = prev.lastIndexOf(leading)
+                if (idx >= 0) return prev.slice(0, idx) + prev.slice(idx + leading.length)
+                const trailing = o + ', '
+                idx = prev.indexOf(trailing)
+                if (idx >= 0) return prev.slice(0, idx) + prev.slice(idx + trailing.length)
+                if (prev === o) return ''
+                return prev  // user edited — leave text, still unmark below
+              })
+              setFollowUpPicked(next)
+            } else {
+              const next = new Set(followUpPickedRef.current); next.add(o)
+              followUpPickedRef.current = next
+              setInput(prev => prev.trim() ? prev.trimEnd() + ', ' + o : o)
+              setFollowUpPicked(next)
+            }
+          }}
+          onFollowUpSend={(text?: string, sourceKeyAtClick?: string | null) => {
+            // Double-click and Send-now share dispatchPlanFollowUp with
+            // single-click (#6240). `sourceKeyAtClick` is the first-click
+            // row — a straddled double-click on a replaced footer is refused.
+            if (text && dispatchPlanFollowUp(text, sourceKeyAtClick)) return
+            doSend(text)
+          }}
+          project={paneSlot?.project ?? ''}
+          onUploadFiles={uploadFiles}
+          pendingFiles={pendingFiles}
+          onRemoveFile={(p) => setPendingFiles((prev) => prev.filter((x) => x !== p))}
+          uploading={uploadMutation.isPending}
+          onDrop={dropTargetProps.onDrop}
+          onDragOver={dropTargetProps.onDragOver}
+          onDragLeave={dropTargetProps.onDragLeave}
+        />
+        </Composer>
+        </div>
         </div>
 
         {/* Agent picker portal — anchored to the input-bar agent button. */}

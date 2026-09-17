@@ -45,7 +45,8 @@ import { emitThemeSound } from './themeSound'
 import { streamingFlushHoldMs } from '../lib/streamHold'
 import { registerPendingChunkDrain } from '../lib/pendingChunkDrain'
 import { bindSlotReadSender, emitSlotRead, flushSlotRead } from '../lib/slotReadRelay'
-import { VoicePcmPlayer, createVoiceRequestId, voiceBoundary } from '../lib/voicePlayback'
+import { getViewedThreadSlot } from '../lib/viewedThread'
+import { VoicePcmPlayer, voiceBoundary, createVoiceRequestId } from '../lib/voicePlayback'
 import { reportVoiceFailure } from '../lib/voiceFailure'
 import {
   fetchHistory,
@@ -163,6 +164,25 @@ const isChatSurfaceVisible = (): boolean => {
     path.startsWith('/embed/chat')
   )
 }
+/** True when *slot* is the thread this window is displaying: the chat
+ *  surfaces' `chat.activeSlot`, or the thread a non-chat surface (the Crew
+ *  Members page) registered in `viewedThread`. The unread-marker's gate: a
+ *  message landing in a thread the user is watching is not unread. Without
+ *  the second source every message in an open member thread was flagged and
+ *  then cleared by the page's read effect one render later -- a badge that
+ *  lit and vanished on the parent dashboard's crew tab for each message. */
+const isSlotOnScreen = (slot: string): boolean =>
+  slot === store.getState().chat.activeSlot || slot === getViewedThreadSlot()
+/** The read-relay twin of `isSlotOnScreen`: true when THIS window is rendering
+ *  *slot* on a surface the user can see -- a chat route showing the active
+ *  slot, or the registered viewed thread (registration already implies a
+ *  visible, focused window). Used by the passive relays beside the focus
+ *  gate: a message the marker declined to flag because the user was watching
+ *  it arrive must still be relayed as read, or a sibling window's badge for
+ *  it stays lit -- and `chat_done` moves no `last_ts`, so nothing else on the
+ *  Members page would ever relay that completion. */
+const isSlotRenderedVisibly = (slot: string): boolean =>
+  isChatSurfaceVisible() || slot === getViewedThreadSlot()
 const WORKFLOW_HEAL_MS = 15000
 const LEGACY_AUTOMATION_SEED_QUERY_KEY = ['automation-seed', 'legacy'] as const
 const STRUCTURED_AUTOMATION_SEED_QUERY_KEY = ['automation-seed', 'structured'] as const
@@ -2028,10 +2048,7 @@ export function useWebSocket() {
               // Notification; an uncaught throw here kills the whole message
               // handler, so the native toast is best-effort.
               try {
-                new Notification(i18nT('hooks.useWebSocket.approval_required'), {
-                  body: data.tool || i18nT('hooks.useWebSocket.a_task_needs_your_decision'),
-                  tag: 'kirocrew-approval',
-                })
+                new Notification(i18nT('hooks.useWebSocket.approval_required'), { body: data.tool || i18nT('hooks.useWebSocket.a_task_needs_your_decision'), silent: true, tag: 'kirocrew-approval' })
               } catch {
                 /* unsupported platform */
               }
@@ -2166,12 +2183,7 @@ export function useWebSocket() {
                 data.role === 'user' || data.role === 'inject',
               )
             }
-            if (
-              data.slot &&
-              data.slot !== store.getState().chat.activeSlot &&
-              !reconnectingRef.current
-            )
-              dispatch(markSlotUnread({ slot: data.slot, ts: data.ts || undefined }))
+            if (data.slot && !isSlotOnScreen(data.slot) && !reconnectingRef.current) dispatch(markSlotUnread({ slot: data.slot, ts: data.ts || undefined }))
             // The message landed in THIS window's active slot while the tab is
             // visible: the user is watching it arrive, so the fresh bubble the
             // other windows just lit for it is already read — relay that, with
@@ -2183,13 +2195,7 @@ export function useWebSocket() {
             // is kept, so a later timestamp-less frame cannot regress the
             // reveal watermark. Reconnect catch-up replays aren't reads either
             // (mirrors the markSlotUnread suppression above).
-            else if (
-              data.slot &&
-              !reconnectingRef.current &&
-              !document.hidden &&
-              document.hasFocus() &&
-              isChatSurfaceVisible()
-            ) {
+            else if (data.slot && !reconnectingRef.current && !document.hidden && document.hasFocus() && isSlotRenderedVisibly(data.slot)) {
               // Watermark = this message's own server ts, else the slot's
               // last_ts (also server-minted); never client time — windows
               // minting their own clocks disagree about the same message.
@@ -3119,17 +3125,8 @@ export function useWebSocket() {
                 /* unsupported platform */
               }
             }
-            if (
-              data.slot &&
-              data.slot !== store.getState().chat.activeSlot &&
-              !reconnectingRef.current
-            ) {
-              dispatch(
-                markSlotUnread({
-                  slot: data.slot,
-                  ts: (data as { ts?: string }).ts || undefined,
-                }),
-              )
+            if (data.slot && !isSlotOnScreen(data.slot) && !reconnectingRef.current) {
+              dispatch(markSlotUnread({ slot: data.slot, ts: (data as { ts?: string }).ts || undefined }))
               // #2: warm the per-slot cache so switching to this background
               // session renders the finished answer instantly (no on-switch fetch).
               dispatch(warmSlotCache(data.slot))
@@ -3137,13 +3134,7 @@ export function useWebSocket() {
             // Turn finished in this window's active slot: same visible-only
             // read-relay as the chat_message arrival branch above (a hidden
             // window relays on reveal instead).
-            else if (
-              data.slot &&
-              !reconnectingRef.current &&
-              !document.hidden &&
-              document.hasFocus() &&
-              isChatSurfaceVisible()
-            ) {
+            else if (data.slot && !reconnectingRef.current && !document.hidden && document.hasFocus() && isSlotRenderedVisibly(data.slot)) {
               // Same actual-timestamp rule as the chat_message branch above.
               const doneTs =
                 (data as { ts?: string }).ts ||

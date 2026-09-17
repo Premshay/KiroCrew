@@ -6135,6 +6135,14 @@ handle immediately.
 #:   same-workspace session, losing filing the user did by hand.
 #: * ``chat_folder_move`` — WITHHELD. Reparents an existing folder tree, and no
 #:   conductor step needs it.
+#: * ``chat_tag_list`` / ``chat_tag_create`` / ``chat_tag_update`` — WITHHELD,
+#:   not because any fails the invariant (a read, a create that dedups on name,
+#:   and a metadata edit that loses no assignment) but because no conductor step
+#:   needs them; a verb is granted for a step, not for being harmless.
+#: * ``chat_tag_assign`` — WITHHELD. Writes another session's ``tags``: the PUT
+#:   goes to ``/api/chat/slots/<target>/tags`` where the target is the session
+#:   named in the ARGUMENTS — the same shape as ``chat_folder_move_session``.
+#:   Ingested content could re-label any persistent same-workspace session.
 #: * ``session_send`` — WITHHELD. Runs text as another session's user-role turn
 #:   under that target's own grants. The server-side gates bound WHICH target is
 #:   reachable; nothing bounds WHAT is sent.
@@ -7037,6 +7045,28 @@ pipeline's folder, patrol the fleet, verify claimed results independently,
 intervene when a worker loops or stalls, adjudicate blocked items, govern host
 resources and per-item credit budgets, and report verified greens to the
 person as plain-language digests.
+
+**You track exactly TWO columns per work item: is this session still working,
+and is this PR / this item solved.** That is the whole state, so the failure you
+chase is one shape — an item with no owner, or an owner that is not working.
+Everything a red PR is ABOUT belongs to the worker that owns it: which lane is
+red, whether a cancellation was fail-fast or teardown, which head a verdict was
+bound to, whether a rebase is curative. You send INTENT — *you own this item end
+to end, the deliverable is a green board, diagnose and decide it yourself* — and
+you do NOT read PR boards, item bodies or full worker reports to re-derive a
+worker's reasoning. Verifying a CLAIMED GREEN against the bar is measurement and
+stays yours; re-deriving a diagnosis is duplication, and the worker is closer to
+the code than you are. When a worker is stuck and its status line does not say
+what it needs, ask it in one line rather than reading its history.
+
+**Decide; do not escalate.** Scope calls, design judgements inside one item and
+dispositions on reviewer findings are yours. Four classes go to the person, and
+only these four: dismissing a human's recorded review, overriding a fenced or
+security-class finding, a disagreement between two maintainers about the same
+code, and content you cannot verify yourself. Append every decision as ONE LINE
+to the pipeline's `decisions.md`, and append a lesson to the run's retrospective
+in the cycle it happens — never saved for the end of the run, because by then the
+reasoning is precisely what has been lost.
 
 **You never do a work item's work yourself.** A file to write, a build to run,
 a fix to make — each one belongs to a worker session you dispatch, verify and

@@ -5,6 +5,7 @@ import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/rea
 import { useModelsDegraded } from '../providers/modelListHealth'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { useVisualViewport } from '../hooks/useVisualViewport'
+import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useRailWidth } from '../hooks/useRailWidth'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
 import { settingsPath } from '../components/settingsPath'
@@ -367,10 +368,10 @@ import ChatDropOverlay from '../components/ChatDropOverlay'
 import SessionGridView from '../components/SessionGridView'
 import SessionTabStrip from '../components/SessionTabStrip'
 import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutStore'
-import { effortSupportedForCrew } from '../lib/effort'
+import { effortSupportedForCrew, modelSupportsEffort } from '../lib/effort'
 import { mcpAppTabTitle } from '../lib/mcpAppSrcdoc'
 import { countCompletedTurns } from '../lib/completedTurns'
-import { displayModel, modelLabel, pinIsWithheld } from '../lib/model'
+import { displayModel, pinIsWithheld } from '../lib/model'
 import FollowUpCard from '../components/FollowUpCard'
 import FolderSuggestionCard from './chat/FolderSuggestionCard'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
@@ -414,12 +415,8 @@ import SubagentProgressBar from './chat/SubagentProgressBar'
 import TaskProgressBar from './chat/TaskProgressBar'
 import SidePanel, { CHAT_PANE_MIN_W, sidePanelFillWidth } from './chat/SidePanel'
 import { useSidePanelDock } from '../hooks/useSidePanelDock'
-import { createTurnGrouper, applyRunningState, REASONING_ROLES } from './chat/groupDisplayItems'
-import {
-  setSessionPreviewPending,
-  normalizeUrl,
-  PREVIEW_EXPAND_EVENT,
-} from '../components/WebPreviewPanel'
+import { createTurnGrouper, applyRunningState, isTurnEnd, REASONING_ROLES, TURN_OPENER_ROLES } from './chat/groupDisplayItems'
+import { setSessionPreviewPending, normalizeUrl, PREVIEW_EXPAND_EVENT } from '../components/WebPreviewPanel'
 import { detectPreviewUrl, previewFeedDecision } from '../utils/detectPreviewUrl'
 import ChatSidebar from './ChatSidebar'
 import { SIDEBAR_MIN, SIDEBAR_MAX, clampSidebarWidth } from './chat/sidebarWidth'
@@ -464,7 +461,7 @@ import { isNoteRow } from '../lib/noteContract'
 import OverlayDrawer from '../components/OverlayDrawer'
 import { loadChatConfig, CONTENT_WIDTH, type ChatConfig } from './chat/ChatSettings'
 import SessionFlyout, { TOGGLE_RECT } from './chat/SessionFlyout'
-import { focusComposerAfter, revealComposer } from './chat/composerFocus'
+import { focusComposer, focusComposerAfter, revealComposer } from './chat/composerFocus'
 import { useHoverIntent } from '../hooks/useHoverIntent'
 import {
   useKnowledgeFetch,
@@ -1216,22 +1213,25 @@ export default function ChatPage({
   const hiddenModelIds = hiddenModelsQ.data
   const modelPickerConfigured = useModelPickerConfigured()
   const availableModels = effectiveModels
-  const modelPickerModels = useMemo(() => {
-    const pickerSlot = slots.find((slot) => slot.key === activeSlot)
-    return filterInteractiveModels(effectiveModels, hiddenModelIds, [
-      pickerSlot?.model || '',
-      pickerSlot?.served_model || '',
-    ])
-  }, [effectiveModels, hiddenModelIds, slots, activeSlot])
-  const {
-    open: modelDropdown,
-    setOpen: setModelDropdown,
-    filter: modelFilter,
-    setFilter: setModelFilter,
-    dropdownRef: modelDropdownRef,
-    inputRef: modelInputRef,
-    filtered: filteredModels,
-  } = useFilteredDropdown(modelPickerModels)
+  const modelPickerModels = useMemo(
+    () => {
+      const pickerSlot = slots.find(slot => slot.key === activeSlot)
+      return filterInteractiveModels(effectiveModels, hiddenModelIds, [
+        pickerSlot?.model || '',
+        pickerSlot?.served_model || '',
+      ])
+    },
+    [effectiveModels, hiddenModelIds, slots, activeSlot],
+  )
+  const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(modelPickerModels)
+  // Whether the composer held focus when the picker was opened from its chip
+  // (ChatInput reads this before the press moves focus). A pick closes the
+  // picker, which unmounts the focused row and would otherwise drop focus on
+  // <body>; when the user was typing, the pick hands focus back to the
+  // composer so they can carry on. A user who was not typing is left alone —
+  // focusing the composer under them would be a surprise, and on touch it
+  // would raise the keyboard (`focusComposer` already skips touch).
+  const modelPickerReturnsFocusRef = useRef(false)
   // Roving-focus keyboard nav for the agent + model dropdowns (shared with StyledSelect/AgentSelector).
   const { onListKeyDown: onAgentListKeyDown } = useListboxKeyboard({
     open: agentDropdown,
@@ -1254,10 +1254,7 @@ export default function ChatPage({
     inputRef: modelInputRef,
     hasFilterInput: true,
     filteredCount: filteredModels.length,
-    onEnterSingleMatch: () => {
-      switchModel(filteredModels[0].name)
-      setModelDropdown(false)
-    },
+    onEnterSingleMatch: () => { pickModel(filteredModels[0].name) },
     closeToTrigger: () => setModelDropdown(false),
   })
   // pendingModel is the model for the NEXT new slot, and it is deliberately
@@ -1283,7 +1280,9 @@ export default function ChatPage({
   // Sending the literal 'auto' would NOT be equivalent: it is truthy, so it
   // short-circuits `slot.model or agent_model` and would override a template or
   // global pin the user did configure.
-  const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
+  // Composer-toolbar picker anchors: each hook keeps its portaled menu glued
+  // to the ChatInput chip that opened it while the menu is open (#10616).
+  const { rect: modelBtnRect, anchorTo: anchorModelBtn } = useAnchoredTriggerRect(modelDropdown)
   // One in-page slot for every failed action whose only report used to be a
   // notification-centre toast, a native alert() or a swallowed catch (fork,
   // plan-from-here, apply-plan, steer, rename, title generation, the agent
@@ -2167,9 +2166,9 @@ export default function ChatPage({
     window.addEventListener('beforeunload', h)
     return () => window.removeEventListener('beforeunload', h)
   }, [flushDrafts])
-  const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
+  const { rect: agentBtnRect, anchorTo: anchorAgentBtn } = useAnchoredTriggerRect(agentDropdown)
   const [projectPickerOpen, setProjectPickerOpen] = useState(false)
-  const [projectBtnRect, setProjectBtnRect] = useState<DOMRect | null>(null)
+  const { rect: projectBtnRect, anchorTo: anchorProjectBtn } = useAnchoredTriggerRect(projectPickerOpen)
 
   // Prevent Chrome from navigating to dropped files.
   // Must be on document to catch drops anywhere on the page.
@@ -3573,119 +3572,106 @@ export default function ChatPage({
   // `toApiDecision` (utils/approvalDecision.ts) is fail-closed and is the only
   // place that mapping is spelled — a Trust affordance on this path would claim
   // a standing grant the backend never records (#5400, #5434).
-  const dismissApproval = useCallback(
-    (aid: string, decision?: string) => {
-      dispatch(resolveByApprovalId({ id: aid, slot: activeSlot || undefined, decision }))
-      const n = store.getState().notifications.items.find((x) => x.approval_id === aid)
-      if (n) dispatch(removeNotificationByTs(n.ts))
-    },
-    [activeSlot, dispatch],
-  )
-  const switchAgent = useCallback(
-    async (agentName: string) => {
-      if (!activeSlot) {
-        setPendingAgent(agentName)
-        // Clear any explicit pick made for the PREVIOUS agent rather than
-        // re-seeding a resolved model: an empty pendingModel makes createSlot omit
-        // `model`, which lets the backend resolve the new agent's own chain at
-        // create time. Seeding the resolved id here pinned it instead (#2035).
-        setPendingModel('')
-        return
-      }
-      dispatch(setAgentSwitchNotice(null))
-      try {
-        // Same protocol as switchModel below (#4523): the acting tab must not
-        // depend on the coalesced slots rebroadcast to see its own pick.
-        // performAgentSlotSwitch mirrors exactly what the response names.
-        await performAgentSlotSwitch(activeSlot, agentName, dispatch)
-      } catch (error) {
-        // Closing the picker is the call sites' job and already happens
-        // synchronously alongside this call, so a failure surfaces as the shared
-        // notice rather than by holding the dropdown open.
-        dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(error)))
-      }
-      // The setPending* setters are useState setters, so they are stable and cost
-      // nothing to list. `installedAgents`, `provider` and `queryClient` are
-      // deliberately absent: this body reads none of them, and `installedAgents` is
-      // a fresh array on every agents refetch, so naming it would rebuild the
-      // callback — and every picker holding it — for no behavioral gain.
-    },
-    [activeSlot, dispatch, setPendingAgent, setPendingModel],
-  )
-  const switchModel = useCallback(
-    async (modelName: string) => {
-      // 'auto' is stored VERBATIM, not collapsed to ''. Both resolve to the same
-      // provider behaviour server-side, but '' is also the "never chosen" state,
-      // and every reader of an empty model re-resolves it to the agent template's
-      // model (the `resolvedModel` / `_initResolvedModel` queries below, and the
-      // backend's slot.model backfill). Writing '' therefore made an explicit Auto
-      // pick snap straight back to e.g. claude-opus-5 — Auto was unselectable.
-      // kiro-cli advertises `auto` as a real model id (and its default_model), and
-      // the ChatPane + Alt+Shift model-cycle paths already send it verbatim.
-      if (!activeSlot) {
-        setPendingModel(modelName)
-        return
-      }
-      try {
-        // performSlotSwitch owns the whole protocol: per-slot+field serialized
-        // dispatch, latest-request-wins adjudication, hung-request timeout, and
-        // exactly-one store write on the authoritative value (#4523). The store
-        // write is deliberately NOT awaited on the server's slots rebroadcast:
-        // that push is coalesced and never arrives with the websocket down.
-        await performSlotSwitch(
-          'model',
-          activeSlot,
-          modelName,
-          async () => {
-            // The response's `model` is the stored value (deprecated ids are
-            // remapped server-side), so prefer it over the requested name.
-            const r = await api.chatSlotModel(activeSlot, modelName)
-            return r?.model ?? modelName
-          },
-          (value) => dispatch(updateSlot({ key: activeSlot, model: value })),
-        )
-      } catch (e) {
-        // Same failure surface as the agent switch beside this: the shared
-        // notice toast, preferring the server's own message. The chip keeps
-        // showing what is actually running either way.
-        dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
-        // eslint-disable-next-line no-console -- surface switchModel failures for debugging
-        console.error('switchModel failed', e)
-      }
-      // Keep the dropdown open after selecting — the user may switch models again
-      // or drill into the reasoning-effort panel. Dismiss is via outside-click/Escape.
-      // setPendingModel is a stable useState setter.
-    },
-    [activeSlot, dispatch, setPendingModel],
-  )
-  const setProject = useCallback(
-    async (path: string) => {
-      if (!activeSlot) {
-        setPendingProject(path)
-        return
-      }
-      try {
-        // Same protocol as switchModel above; the server realpath-normalizes
-        // the directory, so the response's spelling is what gets written.
-        await performSlotSwitch(
-          'project',
-          activeSlot,
-          path,
-          async () => {
-            const r = await api.chatSlotProject(activeSlot, path)
-            return r?.project ?? path
-          },
-          (value) => dispatch(updateSlot({ key: activeSlot, project: value })),
-        )
-      } catch (e) {
-        dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
-        // eslint-disable-next-line no-console -- surface setProject failures for debugging
-        console.error('setProject failed', e)
-      }
-      // setPendingProject is a stable ref-backed setter.
-    },
-    [activeSlot, dispatch, setPendingProject],
-  )
+  const dismissApproval = useCallback((aid: string, decision?: string) => {
+    dispatch(resolveByApprovalId({ id: aid, slot: activeSlot || undefined, decision }))
+    const n = store.getState().notifications.items.find(x => x.approval_id === aid)
+    if (n) dispatch(removeNotificationByTs(n.ts))
+  }, [activeSlot, dispatch])
+  const switchAgent = useCallback(async (agentName: string) => {
+    if (!activeSlot) {
+      setPendingAgent(agentName)
+      // Clear any explicit pick made for the PREVIOUS agent rather than
+      // re-seeding a resolved model: an empty pendingModel makes createSlot omit
+      // `model`, which lets the backend resolve the new agent's own chain at
+      // create time. Seeding the resolved id here pinned it instead (#2035).
+      setPendingModel('')
+      return
+    }
+    dispatch(setAgentSwitchNotice(null))
+    try {
+      // Same protocol as switchModel below (#4523): the acting tab must not
+      // depend on the coalesced slots rebroadcast to see its own pick.
+      // performAgentSlotSwitch mirrors exactly what the response names.
+      await performAgentSlotSwitch(activeSlot, agentName, dispatch)
+    } catch (error) {
+      // Closing the picker is the call sites' job and already happens
+      // synchronously alongside this call, so a failure surfaces as the shared
+      // notice rather than by holding the dropdown open.
+      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(error)))
+    }
+    // The setPending* setters are useState setters, so they are stable and cost
+    // nothing to list. `installedAgents`, `provider` and `queryClient` are
+    // deliberately absent: this body reads none of them, and `installedAgents` is
+    // a fresh array on every agents refetch, so naming it would rebuild the
+    // callback — and every picker holding it — for no behavioral gain.
+  }, [activeSlot, dispatch, setPendingAgent, setPendingModel])
+  const switchModel = useCallback(async (modelName: string) => {
+    // 'auto' is stored VERBATIM, not collapsed to ''. Both resolve to the same
+    // provider behaviour server-side, but '' is also the "never chosen" state,
+    // and every reader of an empty model re-resolves it to the agent template's
+    // model (the `resolvedModel` / `_initResolvedModel` queries below, and the
+    // backend's slot.model backfill). Writing '' therefore made an explicit Auto
+    // pick snap straight back to e.g. claude-opus-5 — Auto was unselectable.
+    // kiro-cli advertises `auto` as a real model id (and its default_model), and
+    // the ChatPane + Alt+Shift model-cycle paths already send it verbatim.
+    if (!activeSlot) { setPendingModel(modelName); return }
+    try {
+      // performSlotSwitch owns the whole protocol: per-slot+field serialized
+      // dispatch, latest-request-wins adjudication, hung-request timeout, and
+      // exactly-one store write on the authoritative value (#4523). The store
+      // write is deliberately NOT awaited on the server's slots rebroadcast:
+      // that push is coalesced and never arrives with the websocket down.
+      await performSlotSwitch('model', activeSlot, modelName,
+        async () => {
+          // The response's `model` is the stored value (deprecated ids are
+          // remapped server-side), so prefer it over the requested name.
+          const r = await api.chatSlotModel(activeSlot, modelName)
+          return r?.model ?? modelName
+        },
+        (value) => dispatch(updateSlot({ key: activeSlot, model: value })))
+    } catch (e) {
+      // Same failure surface as the agent switch beside this: the shared
+      // notice toast, preferring the server's own message. The chip keeps
+      // showing what is actually running either way.
+      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+      // eslint-disable-next-line no-console -- surface switchModel failures for debugging
+      console.error('switchModel failed', e)
+    }
+    // Dismissal is the picker's job, not this callback's: a row click closes
+    // the menu at the call site (the same shape as the agent picker and the
+    // split-pane ChatPane picker), so a rejected switch is reported by the
+    // notice toast above, never by a menu left open. Reasoning-effort edits
+    // live on the drill-in page and keep the menu open on their own.
+    // setPendingModel is a stable useState setter.
+  }, [activeSlot, dispatch, setPendingModel])
+  // A pick from the picker: a row click or Enter on the sole filtered match.
+  // Closes the menu and, when the composer held focus at open time, hands
+  // focus back to it (see `modelPickerReturnsFocusRef`). The picker's other
+  // exits — Escape, outside click, the drill-in page's own links — are not
+  // picks and keep their existing focus behaviour.
+  const pickModel = useCallback((modelName: string) => {
+    switchModel(modelName)
+    setModelDropdown(false)
+    if (modelPickerReturnsFocusRef.current) focusComposer()
+  }, [switchModel, setModelDropdown])
+  const setProject = useCallback(async (path: string) => {
+    if (!activeSlot) { setPendingProject(path); return }
+    try {
+      // Same protocol as switchModel above; the server realpath-normalizes
+      // the directory, so the response's spelling is what gets written.
+      await performSlotSwitch('project', activeSlot, path,
+        async () => {
+          const r = await api.chatSlotProject(activeSlot, path)
+          return r?.project ?? path
+        },
+        (value) => dispatch(updateSlot({ key: activeSlot, project: value })))
+    } catch (e) {
+      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+      // eslint-disable-next-line no-console -- surface setProject failures for debugging
+      console.error('setProject failed', e)
+    }
+    // setPendingProject is a stable ref-backed setter.
+  }, [activeSlot, dispatch, setPendingProject])
 
   const currentSlot = slots.find((s) => s.key === activeSlot)
   // App-contributed session controls (contributes.sessionControls). Discovered once;
@@ -3693,11 +3679,11 @@ export default function ChatPage({
   // plus the slot it was opened in, so at most one control popover is mounted
   // at a time, and only against the chat it was opened for.
   const { controls: sessionControls, error: sessionControlsError } = useSessionControls()
-  const [openSessionControl, setOpenSessionControl] = useState<{
-    key: string
-    slot: string
-  } | null>(null)
-  const [sessionControlRect, setSessionControlRect] = useState<DOMRect | null>(null)
+  const [openSessionControl, setOpenSessionControl] =
+    useState<{ key: string; slot: string } | null>(null)
+  const { rect: sessionControlRect, anchorTo: anchorSessionControl } = useAnchoredTriggerRect(
+    !!openSessionControl && openSessionControl.slot === activeSlot,
+  )
   // Re-poll a control's status when its popover closes: that is when the user
   // has most likely just changed the thing the chip reports. React Query owns
   // the cache, so this is an invalidation rather than a token the hook watches.
@@ -4527,9 +4513,6 @@ export default function ChatPage({
     _modelsDegraded,
     currentSlot?.model_withheld,
   )
-  // What the chip WRITES. `shownModel` stays the value the picker selects on,
-  // so the raw id keeps its job and only the rendered text changes.
-  const shownModelLabel = modelLabel(shownModel, availableModels)
   // Authoritative effort capability for the crew this composer is bound to: the
   // levels its own runtime advertised at discovery (dsh reports a
   // `reasoning_effort` selector there, which the model-family allowlist below
@@ -4907,12 +4890,13 @@ export default function ChatPage({
   // collapsed composer) the picker still opens, anchored to the composer edge.
   const openModelPickerFromError = useCallback(() => {
     const chip = document.querySelector<HTMLElement>('[data-testid="composer-model-chip"]')
-    const rect =
-      chip?.getBoundingClientRect() ??
-      new DOMRect(16, Math.max(0, window.innerHeight - 96), 160, 28)
-    setModelBtnRect(rect)
+    const rect = chip?.getBoundingClientRect()
+      ?? new DOMRect(16, Math.max(0, window.innerHeight - 96), 160, 28)
+    anchorModelBtn(rect, chip)
+    // Opened from a transcript row, not from the composer: nothing to return to.
+    modelPickerReturnsFocusRef.current = false
     setModelDropdown(true)
-  }, [setModelDropdown])
+  }, [anchorModelBtn, setModelDropdown])
   // The Default Model setting lives only on the full dashboard's Settings →
   // Chat tab. /embed/settings is a different page (Display), and a popout has
   // no settings route at all, so on both surfaces the affordance is omitted
@@ -5311,7 +5295,58 @@ export default function ChatPage({
   // turn minimap, the Navigation tab) sees the same snapshot by construction.
   const liveTranscript = useMemo(() => ({ messages, displayItems }), [messages, displayItems])
   const renderedTranscript = useSlotDeferredValue(activeSlot, liveTranscript)
-  const renderedDisplayItems = renderedTranscript.displayItems
+  // MCP App payloads live outside the message list, so promote after the
+  // transcript defer: the FIRST render that can draw an iframe must already use
+  // the same TurnBlock subtree that later grouping will keep. Short turns are
+  // emitted as loose siblings, so promote the WHOLE loose turn region rather
+  // than each app row separately; otherwise a later merge reparents every app
+  // after the first and reloads its iframe. The boundaries mirror the grouper:
+  // opener rows start a turn, persisted assistant-final rows end one, and an
+  // already-grouped turn is its own region. The app-anchor latch below gives
+  // the synthetic turn the same key as its first rendered app row.
+  const renderedDisplayItems = useMemo<DisplayItem[]>(() => {
+    const items = renderedTranscript.displayItems
+    if (appToolCallIds.size === 0) return items
+
+    const next: DisplayItem[] = []
+    let looseItems: TurnItem[] = []
+    let looseHasApp = false
+    let promoted = false
+
+    const flushLooseTurn = () => {
+      if (looseItems.length === 0) return
+      if (looseHasApp) {
+        next.push({ kind: 'turn', items: looseItems, complete: !runningLatched })
+        promoted = true
+      } else {
+        next.push(...looseItems)
+      }
+      looseItems = []
+      looseHasApp = false
+    }
+
+    for (const item of items) {
+      if (item.kind === 'turn') {
+        flushLooseTurn()
+        next.push(item)
+        continue
+      }
+      if (item.kind === 'single' && TURN_OPENER_ROLES.has(item.msg.role)) {
+        flushLooseTurn()
+        next.push(item)
+        continue
+      }
+
+      looseItems.push(item)
+      if (item.kind === 'single' && item.msg.role === 'tool') {
+        const toolCallId = item.msg.meta?.tool_call_id
+        if (typeof toolCallId === 'string' && appToolCallIds.has(toolCallId)) looseHasApp = true
+      }
+      if (item.kind === 'single' && isTurnEnd(item.msg)) flushLooseTurn()
+    }
+    flushLooseTurn()
+    return promoted ? next : items
+  }, [renderedTranscript.displayItems, appToolCallIds, runningLatched])
 
   // Keep the ref in sync so handleRangeChanged / updatePinnedPrompt
   // read the latest displayItems. useLayoutEffect (not useEffect): the DOM's
@@ -5417,10 +5452,64 @@ export default function ChatPage({
     }
     return undefined
   }, [renderedDisplayItems])
-  const rowKeys = useMemo(
-    () => uniqueRowKeys(renderedDisplayItems, stableMsgKey),
-    [renderedDisplayItems, stableMsgKey],
-  )
+  // An inline MCP App makes one row stateful: remounting its iframe discards
+  // in-canvas work. A running turn normally keys on its lead, but a later
+  // reasoning burst can become that lead. Once an app payload exists, anchor
+  // the turn to the first app payload observed in that turn. `appToolCallIds`
+  // preserves the insertion order of chat.mcpApps, so an earlier transcript
+  // row whose slower payload arrives later cannot steal the anchor and remount
+  // an app already on screen. The session-scoped tool-call id selected here
+  // becomes the turn's latch id: its transcript row outlives the bounded render
+  // payload, so retention eviction cannot promote a later app and re-key the
+  // turn. The latched value uses an `mcp-app:` namespace followed by that
+  // session-scoped id. Ordinary row keys use other prefixes, so a history
+  // prepend cannot collide with this key and make `uniqueRowKeys` suffix it.
+  // Rebuilding the map from the rendered turns drops a latch as soon as its
+  // turn disappears.
+  const appAnchorByTurnId = useRef(new Map<string, string>())
+  const rowKeys = useMemo(() => {
+    // Preserve the ordinary transcript's original O(display rows) path. The
+    // deeper turn-item scan is needed only while selecting or retaining an app
+    // anchor.
+    if (appAnchorByTurnId.current.size === 0 && appToolCallIds.size === 0) {
+      return uniqueRowKeys(renderedDisplayItems, stableMsgKey)
+    }
+    const previousAnchors = appAnchorByTurnId.current
+    const retainedAnchors = new Map<string, string>()
+    const keys = uniqueRowKeys(renderedDisplayItems, stableMsgKey, (it) => {
+      if (it.kind !== 'turn' || !activeSlot) return undefined
+
+      // Retention can remove the payload that selected this anchor. Find the
+      // turn's latch from its still-rendered tool row before consulting the
+      // bounded live-payload set.
+      for (const row of it.items) {
+        if (row.kind !== 'single') continue
+        const toolCallId = row.msg.meta?.tool_call_id
+        if (typeof toolCallId !== 'string' || !toolCallId) continue
+        const turnId = mcpAppKey(activeSlot, toolCallId)
+        const anchor = previousAnchors.get(turnId)
+        if (anchor) {
+          retainedAnchors.set(turnId, anchor)
+          return anchor
+        }
+      }
+
+      for (const appToolCallId of appToolCallIds) {
+        for (const row of it.items) {
+          if (row.kind !== 'single') continue
+          if (row.msg.meta?.tool_call_id === appToolCallId) {
+            const turnId = mcpAppKey(activeSlot, appToolCallId)
+            const anchor = `mcp-app:${turnId}`
+            retainedAnchors.set(turnId, anchor)
+            return anchor
+          }
+        }
+      }
+      return undefined
+    })
+    appAnchorByTurnId.current = retainedAnchors
+    return keys
+  }, [renderedDisplayItems, stableMsgKey, appToolCallIds, activeSlot])
   // Index lookup into the deduped list, so this getKey prices an item
   // correctly ONLY against the displayItems of its own render. Live consumers
   // pair getKeyRef with itemsRef from the same tick; the one stale-ITEMS
@@ -5609,7 +5698,7 @@ export default function ChatPage({
     // virtualizer track that one row's growth every RO tick instead of
     // debouncing it into a stale-then-jump spacer (see the `streamingIndex`
     // option's doc and useVirtualChat.spacerLurch.test.tsx).
-    streamingIndex: isStreaming && displayItems.length > 0 ? displayItems.length - 1 : undefined,
+    streamingIndex: isStreaming && renderedDisplayItems.length > 0 ? renderedDisplayItems.length - 1 : undefined,
     // `slotRunning`, not `isStreaming`: a turn spends much of its life in tool
     // calls with no streaming row named, and follow has to keep working there.
     runActive: !!slotRunning,
@@ -6082,8 +6171,13 @@ export default function ChatPage({
     restoreDraft: restoreQueuedDraft,
   })
 
-  // Search: map message index → displayItems index for scroll-to-match
-  const messageToDisplayIdx = useMemo(() => buildMessageToDisplayIdx(displayItems), [displayItems])
+
+  // Search, pins, tool focus, and deep links navigate the rows the virtualizer
+  // actually renders, including post-defer MCP App coalescing.
+  const messageToDisplayIdx = useMemo(
+    () => buildMessageToDisplayIdx(renderedDisplayItems),
+    [renderedDisplayItems],
+  )
 
   const navigateToTurn = useCallback(
     (displayIndex: number) => {
@@ -6098,17 +6192,13 @@ export default function ChatPage({
 
   // The transcript renders the deferred `renderedTranscript` snapshot; while a
   // history page lands, live indexes lead the rows on screen. The minimap's
-  // items and index map come from that same frame, so a marker's display index
-  // always names the row the virtualizer is actually showing.
-  const renderedMessageToDisplayIdx = useMemo(
-    () => buildMessageToDisplayIdx(renderedTranscript.displayItems),
-    [renderedTranscript.displayItems],
-  )
+  // messages and `messageToDisplayIdx` map come from that same rendered frame,
+  // so a marker's display index always names the virtualizer row on screen.
   // One per-turn derivation: `sections` feeds the turn minimap; `links` feeds the
   // Navigation tab. Both read the deferred snapshot, so the link list trails a
   // landing history page by one deferred commit -- deliberate, and harmless for
   // a side panel.
-  const chatNav = useChatNavigation(renderedTranscript.messages, renderedMessageToDisplayIdx)
+  const chatNav = useChatNavigation(renderedTranscript.messages, messageToDisplayIdx)
 
   // ── Chat Pins ──────────────────────────────────────────────────────────────
   const {
@@ -8717,125 +8807,71 @@ export default function ChatPage({
                           >
                             {/* Message items — only the mounted window renders; everything
                   else is represented by the top/bottom spacers. */}
-                            {visibleDisplayItems.map((vi) => {
-                              if (!vi.mounted) return null
-                              const item = vi.data
-                              const displayIdx = vi.index
-                              // A hidden invisible-only assistant row grouped as a loose
-                              // single (short quiet-cycle batches never wrap into a turn)
-                              // draws nothing in renderMessage; skip its measured py-1
-                              // wrapper too, or each quiet cycle leaves an empty spacer row.
-                              if (item.kind === 'single' && isHiddenInvisibleAssistantRow(item.msg))
-                                return null
-                              if (item.kind === 'turn') {
-                                return (
-                                  <div
-                                    key={vi.key}
-                                    ref={virt.measureRef(vi.index)}
-                                    data-display-index={displayIdx}
-                                  >
-                                    <TurnBlock
-                                      turn={item}
-                                      renderItem={renderTurnItem}
-                                      collapseAll={chatConfig.collapseAllSteps}
-                                      appToolCallIds={appToolCallIds}
-                                      disclosure={turnDisclosure[vi.key]}
-                                      disclosureKey={vi.key}
-                                      onDisclosureChange={setTurnDisclosureFor}
-                                    />
-                                  </div>
-                                )
-                              }
-                              return (
-                                <div
-                                  key={vi.key}
-                                  ref={virt.measureRef(vi.index)}
-                                  data-display-index={displayIdx}
-                                  className={`px-4 mx-auto w-full py-1`}
-                                  style={{
-                                    maxWidth: 'var(--mc-content-width, 900px)',
-                                    // The pinned banner is styled as this row's own bubble and sits
-                                    // at the exact position and width the bubble had when its bottom
-                                    // edge reached the band's bottom, so leaving both visible is what
-                                    // betrays them as two containers. Hide the real one (visibility,
-                                    // NOT display — the virtualizer must keep measuring its height or
-                                    // the transcript would reflow under the reader) and the bubble
-                                    // appears to simply stop travelling and stick. A row is only ever
-                                    // hidden once it is entirely behind the band, so a tall prompt
-                                    // never leaves a visible hole above the response.
-                                    //
-                                    // Match by message IDENTITY (ts), not display index. `pinned.idx`
-                                    // is computed in a scroll rAF against `displayItemsRef`, which is
-                                    // refreshed in a layout effect — but a streaming append or a turn
-                                    // regroup can still shift the list between that read and this
-                                    // render, leaving `pinned.idx` pointing one row off. When it did,
-                                    // the WRONG row was hidden and the real pinned bubble painted
-                                    // alongside the banner — the "two stacked boxes" bug. The ts is
-                                    // stable across any index shift, so it hides the right row every
-                                    // frame; fall back to the index only for a message with no ts.
-                                    visibility:
-                                      pinned &&
-                                      (pinned.ts != null
-                                        ? item.kind === 'single' && item.msg.ts === pinned.ts
-                                        : pinned.idx === displayIdx)
-                                        ? 'hidden'
-                                        : undefined,
-                                  }}
-                                >
-                                  {item.kind === 'group'
-                                    ? (() => {
-                                        const unresolvedGroupPerms = item.msgs.filter(
-                                          (m) => m.role === 'permission' && !m.meta?.resolved,
-                                        )
-                                        if (item.msgs.every((m) => m.role === 'permission'))
-                                          return null
-                                        return (
-                                          <CollapsibleToolGroup
-                                            count={
-                                              item.msgs.filter((m) => m.role !== 'permission')
-                                                .length
-                                            }
-                                            disclosureKey={`ctg-${vi.key}`}
-                                            hasPermission={false}
-                                            isRunning={
-                                              slotRunning && displayIdx === displayItems.length - 1
-                                            }
-                                            permissionMeta={
-                                              unresolvedGroupPerms.at(-1)?.meta as
-                                                Record<string, unknown> | undefined
-                                            }
-                                            pendingPermCount={unresolvedGroupPerms.length}
-                                            onApprove={(() => {
-                                              const aid = unresolvedGroupPerms.at(-1)?.meta
-                                                ?.approval_id as string | undefined
-                                              if (!aid) return approve
-                                              return async (action: string) => {
-                                                await api.resolveApproval(
-                                                  aid,
-                                                  toApiDecision(action),
-                                                )
-                                                dismissApproval(aid)
-                                              }
-                                            })()}
-                                            onViewActivity={toggleAct}
-                                            activityOpen={activityOpen}
-                                          >
-                                            {item.msgs.map((m, j) => (
-                                              <div key={msgIdentityKey(m, stableMsgKey)}>
-                                                {renderMessage(item.startIdx + j, m)}
-                                              </div>
-                                            ))}
-                                          </CollapsibleToolGroup>
-                                        )
-                                      })()
-                                    : renderMessage(item.idx, item.msg)}
-                                </div>
-                              )
-                            })}
-                          </TranscriptScrollShell>
-                        </>
-                      )}
-                      {/* Restore cover. A session left mid-history reopens on a transcript
+              {visibleDisplayItems.map((vi) => {
+                if (!vi.mounted) return null
+                const item = vi.data
+                const displayIdx = vi.index
+                // A hidden invisible-only assistant row grouped as a loose
+                // single (short quiet-cycle batches never wrap into a turn)
+                // draws nothing in renderMessage; skip its measured py-1
+                // wrapper too, or each quiet cycle leaves an empty spacer row.
+                if (item.kind === 'single' && isHiddenInvisibleAssistantRow(item.msg)) return null
+                if (item.kind === 'turn') {
+                  return <div key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx}><TurnBlock turn={item} renderItem={renderTurnItem} collapseAll={chatConfig.collapseAllSteps} appToolCallIds={appToolCallIds} disclosure={turnDisclosure[vi.key]} disclosureKey={vi.key} onDisclosureChange={setTurnDisclosureFor} /></div>
+                }
+                return <div key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx} className={`px-4 mx-auto w-full py-1`} style={{
+                  maxWidth: 'var(--mc-content-width, 900px)',
+                  // The pinned banner is styled as this row's own bubble and sits
+                  // at the exact position and width the bubble had when its bottom
+                  // edge reached the band's bottom, so leaving both visible is what
+                  // betrays them as two containers. Hide the real one (visibility,
+                  // NOT display — the virtualizer must keep measuring its height or
+                  // the transcript would reflow under the reader) and the bubble
+                  // appears to simply stop travelling and stick. A row is only ever
+                  // hidden once it is entirely behind the band, so a tall prompt
+                  // never leaves a visible hole above the response.
+                  //
+                  // Match by message IDENTITY (ts), not display index. `pinned.idx`
+                  // is computed in a scroll rAF against `displayItemsRef`, which is
+                  // refreshed in a layout effect — but a streaming append or a turn
+                  // regroup can still shift the list between that read and this
+                  // render, leaving `pinned.idx` pointing one row off. When it did,
+                  // the WRONG row was hidden and the real pinned bubble painted
+                  // alongside the banner — the "two stacked boxes" bug. The ts is
+                  // stable across any index shift, so it hides the right row every
+                  // frame; fall back to the index only for a message with no ts.
+                  visibility: (pinned && (pinned.ts != null
+                    ? (item.kind === 'single' && item.msg.ts === pinned.ts)
+                    : pinned.idx === displayIdx)) ? 'hidden' : undefined,
+                }}>{item.kind === 'group' ? (() => {
+                const unresolvedGroupPerms = item.msgs.filter(m => m.role === 'permission' && !m.meta?.resolved)
+                if (item.msgs.every(m => m.role === 'permission')) return null
+                return (
+                <CollapsibleToolGroup
+                  count={item.msgs.filter(m => m.role !== 'permission').length}
+                  disclosureKey={`ctg-${vi.key}`}
+                  hasPermission={false}
+                  isRunning={slotRunning && displayIdx === renderedDisplayItems.length - 1}
+                  permissionMeta={unresolvedGroupPerms.at(-1)?.meta as Record<string, unknown> | undefined}
+                  pendingPermCount={unresolvedGroupPerms.length}
+                  onApprove={(() => {
+                    const aid = unresolvedGroupPerms.at(-1)?.meta?.approval_id as string | undefined
+                    if (!aid) return approve
+                    return async (action: string) => {
+                      await api.resolveApproval(aid, toApiDecision(action))
+                      dismissApproval(aid)
+                    }
+                  })()}
+                  onViewActivity={toggleAct}
+                  activityOpen={activityOpen}
+                >{item.msgs.map((m, j) => <div key={msgIdentityKey(m, stableMsgKey)}>{renderMessage(item.startIdx + j, m)}</div>)}</CollapsibleToolGroup>)
+              })() : renderMessage(item.idx, item.msg)}</div>
+              })}
+              
+            </TranscriptScrollShell>
+            </>
+            )}
+            {/* Restore cover. A session left mid-history reopens on a transcript
                 that hydrates in chunks and is only positioned once its anchored
                 row lands, so the rows underneath are briefly partial and in the
                 wrong place. Showing them means the reader watches the transcript
@@ -9249,159 +9285,120 @@ export default function ChatPage({
                               /* The one collapsible composer. Opt-in rather than default so the
                  shared preference key and the window-level expand event stay
                  correct by construction -- see ChatInput's `collapsible` prop. */
-                              collapsible
-                              uploading={uploading}
-                              pendingFiles={pendingFiles}
-                              pendingDirs={pendingDirs}
-                              resizedInfo={resizedInfo}
-                              onRemoveFile={(p) => {
-                                setPendingFiles((prev) => prev.filter((x) => x !== p))
-                                // A picker-picked file also inserted an `@rel` token into the
-                                // composer, so its remove strips that token too — the same
-                                // contract folder chips have, so the two chip kinds cannot
-                                // disagree about what "remove" means. The exact token is
-                                // recorded at pick time, but the ref is in-memory only: a
-                                // restored draft or a failed-send restore re-stages the file
-                                // without it. Fall back to deriving the token from the path —
-                                // the shortest boundary-checked `@suffix` present in the text
-                                // (the same walk buildRelMap uses), which is exactly the form
-                                // the picker inserts. Uploaded/dropped files have no token in
-                                // the text, so the derivation finds nothing and their remove
-                                // stays state-only. On no match the text is left alone —
-                                // visible and editable is the safe fallback.
-                                const token =
-                                  pickedFileTokens.current[p] ??
-                                  [...buildRelMap([p], inputRef.current).keys()].map(
-                                    (s) => `@${s}`,
-                                  )[0]
-                                delete pickedFileTokens.current[p]
-                                if (!token) return
-                                const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-                                setInput((prev) =>
-                                  prev.replace(
-                                    new RegExp(`(^|\\s)${esc}(?: |(?=\\s)|$)`, 'g'),
-                                    '$1',
-                                  ),
-                                )
-                              }}
-                              onRemoveDir={(rel) => {
-                                // The chip derives from the `@rel/` token, so removing the
-                                // reference IS removing the token. Boundary-checked so
-                                // "@src/pages/" never eats a longer "@src/pages/sub/" token.
-                                const esc = `@${rel}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-                                setInput((prev) =>
-                                  prev.replace(
-                                    new RegExp(`(^|\\s)${esc}(?: |(?=\\s)|$)`, 'g'),
-                                    '$1',
-                                  ),
-                                )
-                              }}
-                              pendingSessions={pendingSessions}
-                              onRemoveSessionRef={unstageSessionRef}
-                              // A folder pick is complete once ChatInput inserts its `@rel/`
-                              // token — the chip derives from the text, so there is no state
-                              // to stage here. Files stay list-backed (uploads have no token)
-                              // and additionally record their inserted token for remove.
-                              onFileSelect={(path, kind, token) => {
-                                if (kind === 'dir') return
-                                // Stage under the canonical (forward-slash Windows) identity —
-                                // the same form the tree context menu stages — so the SAME file
-                                // picked through both entry points dedupes instead of sending
-                                // twice. Token bookkeeping keys on the staged form so remove
-                                // finds it.
-                                const canon = normalizeWindowsPath(path)
-                                if (token) pickedFileTokens.current[canon] = token
-                                setPendingFiles((prev) => addPendingFile(prev, canon))
-                              }}
-                              onFileOpen={handleFileOpen}
-                              project={currentSlot?.project || ''}
-                              projectBranch={projectBranch}
-                              projectDetached={!projectGitError && !!projectGit?.detached}
-                              projectGitDirty={gitBadge?.dirty ?? 0}
-                              projectGitAhead={gitBadge?.ahead ?? 0}
-                              projectGitBehind={gitBadge?.behind ?? 0}
-                              isMac={isMac}
-                              onDrop={dropTargetProps.onDrop}
-                              onDragOver={dropTargetProps.onDragOver}
-                              onDragLeave={dropTargetProps.onDragLeave}
-                              agentName={activeAgentName}
-                              // The chip shows the inherited-default marker; `agentName` stays
-                              // the raw resolved alias for the skills query and switch title.
-                              // Uses the SLOT's stored agent (not `activeAgentName`, which has
-                              // already collapsed empty->default) so an agent-less slot reads
-                              // `<default> · default` and a pinned one reads the bare alias (#8770).
-                              agentLabel={agentOrDefaultLabel(
-                                currentSlot?.agent,
-                                effectiveDefaultAgent,
-                              )}
-                              agentIsInheritedDefault={
-                                !currentSlot?.agent && !!effectiveDefaultAgent
-                              }
-                              agentSource={
-                                effectiveAgents.find((a) => a.name === activeAgentName)?.source
-                              }
-                              modelName={shownModelLabel}
-                              // The served default is shown exactly when the pin alone would
-                              // have read `auto`; that is the inherited case the marker names.
-                              modelIsInheritedDefault={
-                                shownModel !== 'auto' && shownModel !== _pinShownModel
-                              }
-                              onAgentClick={
-                                provider.capabilities.agentTemplates
-                                  ? (rect) => {
-                                      setAgentBtnRect(rect)
-                                      setAgentDropdown(!agentDropdown)
-                                    }
-                                  : undefined
-                              }
-                              onModelClick={(rect) => {
-                                setModelBtnRect(rect)
-                                setModelDropdown(!modelDropdown)
-                              }}
-                              onProjectClick={(rect) => {
-                                setProjectBtnRect(rect)
-                                setProjectPickerOpen((o) => !o)
-                              }}
-                              sessionControls={sessionControls.map((sc) => ({
-                                key: sc.key,
-                                label: sc.label,
-                                icon: sc.icon,
-                                active:
-                                  openSessionControl?.key === sc.key &&
-                                  openSessionControl.slot === activeSlot,
-                                state: sessionControlStatuses[sc.key]?.state,
-                                statusTooltip: sessionControlStatuses[sc.key]?.tooltip,
-                              }))}
-                              onSessionControlClick={(key, rect) => {
-                                setSessionControlRect(rect)
-                                // Two independent setState calls, not one updater with a side
-                                // effect: React may run an updater twice (StrictMode does in
-                                // dev), which would bump the refresh token twice per toggle and
-                                // fire a redundant status poll.
-                                if (openSessionControl?.key === key) {
-                                  setOpenSessionControl(null)
-                                  refreshSessionControlStatuses()
-                                } else {
-                                  // Capture the slot the control is opened in: the host render
-                                  // is gated on it still matching activeSlot, so a chat switch
-                                  // can never mount the control against the next session.
-                                  setOpenSessionControl({
-                                    key,
-                                    slot: activeSlot,
-                                  })
-                                }
-                              }}
-                              contextPct={contextPct}
-                              contextUsedTokens={contextTokens?.used}
-                              contextWindowTokens={
-                                contextTokens?.window ||
-                                remoteContextWindow ||
-                                provider.getContextWindow(shownModel)
-                              }
-                              showContextPct={chatConfig.showContextPct}
-                              showContextTokens={chatConfig.showContextTokens}
-                              isRunning={composerBusy}
-                              /* Composed with `interrupted`, matching the ErrorCard gate above.
+              collapsible
+              uploading={uploading}
+              pendingFiles={pendingFiles}
+              pendingDirs={pendingDirs}
+              resizedInfo={resizedInfo}
+              onRemoveFile={p => {
+                setPendingFiles(prev => prev.filter(x => x !== p))
+                // A picker-picked file also inserted an `@rel` token into the
+                // composer, so its remove strips that token too — the same
+                // contract folder chips have, so the two chip kinds cannot
+                // disagree about what "remove" means. The exact token is
+                // recorded at pick time, but the ref is in-memory only: a
+                // restored draft or a failed-send restore re-stages the file
+                // without it. Fall back to deriving the token from the path —
+                // the shortest boundary-checked `@suffix` present in the text
+                // (the same walk buildRelMap uses), which is exactly the form
+                // the picker inserts. Uploaded/dropped files have no token in
+                // the text, so the derivation finds nothing and their remove
+                // stays state-only. On no match the text is left alone —
+                // visible and editable is the safe fallback.
+                const token = pickedFileTokens.current[p] ?? [...buildRelMap([p], inputRef.current).keys()].map(s => `@${s}`)[0]
+                delete pickedFileTokens.current[p]
+                if (!token) return
+                const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                setInput(prev => prev.replace(new RegExp(`(^|\\s)${esc}(?: |(?=\\s)|$)`, 'g'), '$1'))
+              }}
+              onRemoveDir={rel => {
+                // The chip derives from the `@rel/` token, so removing the
+                // reference IS removing the token. Boundary-checked so
+                // "@src/pages/" never eats a longer "@src/pages/sub/" token.
+                const esc = `@${rel}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                setInput(prev => prev.replace(new RegExp(`(^|\\s)${esc}(?: |(?=\\s)|$)`, 'g'), '$1'))
+              }}
+              pendingSessions={pendingSessions}
+              onRemoveSessionRef={unstageSessionRef}
+              // A folder pick is complete once ChatInput inserts its `@rel/`
+              // token — the chip derives from the text, so there is no state
+              // to stage here. Files stay list-backed (uploads have no token)
+              // and additionally record their inserted token for remove.
+              onFileSelect={(path, kind, token) => {
+                if (kind === 'dir') return
+                // Stage under the canonical (forward-slash Windows) identity —
+                // the same form the tree context menu stages — so the SAME file
+                // picked through both entry points dedupes instead of sending
+                // twice. Token bookkeeping keys on the staged form so remove
+                // finds it.
+                const canon = normalizeWindowsPath(path)
+                if (token) pickedFileTokens.current[canon] = token
+                setPendingFiles(prev => addPendingFile(prev, canon))
+              }}
+              onFileOpen={handleFileOpen}
+              project={currentSlot?.project || ''}
+              projectBranch={projectBranch}
+              projectDetached={!projectGitError && !!projectGit?.detached}
+              projectGitDirty={gitBadge?.dirty ?? 0}
+              projectGitAhead={gitBadge?.ahead ?? 0}
+              projectGitBehind={gitBadge?.behind ?? 0}
+              isMac={isMac}
+              onDrop={dropTargetProps.onDrop}
+              onDragOver={dropTargetProps.onDragOver}
+              onDragLeave={dropTargetProps.onDragLeave}
+              agentName={activeAgentName}
+              // The chip shows the inherited-default marker; `agentName` stays
+              // the raw resolved alias for the skills query and switch title.
+              // Uses the SLOT's stored agent (not `activeAgentName`, which has
+              // already collapsed empty->default) so an agent-less slot reads
+              // `<default> · default` and a pinned one reads the bare alias (#8770).
+              agentLabel={agentOrDefaultLabel(currentSlot?.agent, effectiveDefaultAgent)}
+              agentIsInheritedDefault={!currentSlot?.agent && !!effectiveDefaultAgent}
+              agentSource={effectiveAgents.find(a => a.name === activeAgentName)?.source}
+              modelName={shownModel}
+              // The served default is shown exactly when the pin alone would
+              // have read `auto`; that is the inherited case the marker names.
+              modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
+              onAgentClick={provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); setAgentDropdown(!agentDropdown) } : undefined}
+              onModelClick={(rect, trigger, composerHadFocus) => {
+                modelPickerReturnsFocusRef.current = !!composerHadFocus
+                anchorModelBtn(rect, trigger); setModelDropdown(!modelDropdown)
+              }}
+              onProjectClick={(rect, trigger) => {
+                anchorProjectBtn(rect, trigger)
+                setProjectPickerOpen(o => !o)
+              }}
+              sessionControls={sessionControls.map(sc => ({
+                key: sc.key,
+                label: sc.label,
+                icon: sc.icon,
+                active: openSessionControl?.key === sc.key && openSessionControl.slot === activeSlot,
+                state: sessionControlStatuses[sc.key]?.state,
+                statusTooltip: sessionControlStatuses[sc.key]?.tooltip,
+              }))}
+              onSessionControlClick={(key, rect, trigger) => {
+                anchorSessionControl(rect, trigger)
+                // Two independent setState calls, not one updater with a side
+                // effect: React may run an updater twice (StrictMode does in
+                // dev), which would bump the refresh token twice per toggle and
+                // fire a redundant status poll.
+                if (openSessionControl?.key === key) {
+                  setOpenSessionControl(null)
+                  refreshSessionControlStatuses()
+                } else {
+                  // Capture the slot the control is opened in: the host render
+                  // is gated on it still matching activeSlot, so a chat switch
+                  // can never mount the control against the next session.
+                  setOpenSessionControl({ key, slot: activeSlot })
+                }
+              }}
+              contextPct={contextPct}
+              contextUsedTokens={contextTokens?.used}
+              contextWindowTokens={contextTokens?.window || remoteContextWindow || provider.getContextWindow(shownModel)}
+              showContextPct={chatConfig.showContextPct}
+              showContextTokens={chatConfig.showContextTokens}
+              isRunning={composerBusy}
+              /* Composed with `interrupted`, matching the ErrorCard gate above.
                  Availability alone would put a filled primary button on the
                  composer of every idle chat that holds a conversation — an
                  accent-filled control reads as "this is your next move", so on
@@ -9652,111 +9649,68 @@ export default function ChatPage({
                     no /capabilities route for the footer, and the footer is what carries the
                     failed-write alert — offering the write without its error path would make
                     a rejected request indistinguishable from a successful one. */}
-                              {!embedded && (
-                                <DefaultAgentRow
-                                  agentName={activeAgentName}
-                                  isDefault={activeAgentName === defaultAgent}
-                                  onSetDefault={() => toggleDefaultAgent(activeAgentName)}
-                                />
-                              )}
-                              {!embedded && (
-                                <ManageAgentsFooter
-                                  error={defaultAgentFailed}
-                                  onManage={() => {
-                                    setAgentDropdown(false)
-                                    navigate('/capabilities?tab=crews')
-                                  }}
-                                />
-                              )}
-                            </div>,
-                            document.body,
-                          )}
-                        {/* Model dropdown portal — triggered from input bar */}
-                        {modelDropdown &&
-                          modelBtnRect &&
-                          createPortal(
-                            <ModelEffortDropdown
-                              anchorRect={modelBtnRect}
-                              dropdownRef={modelDropdownRef}
-                              inputRef={modelInputRef}
-                              onListKeyDown={onModelListKeyDown}
-                              models={filteredModels}
-                              activeModel={shownModel}
-                              onSelectModel={(name) => switchModel(name)}
-                              modelsLoading={remoteCrew.modelsPending}
-                              modelsFailed={remoteCrew.failed}
-                              retryingModels={remoteCrew.retrying}
-                              onRetryModels={() => remoteCrew.refetch()}
-                              filter={modelFilter}
-                              setFilter={setModelFilter}
-                              onClose={() => setModelDropdown(false)}
-                              modelVisibilityError={hiddenModelsQ.isError}
-                              onRetryModelVisibility={() => hiddenModelsQ.refetch()}
-                              hasEffort={
-                                !!(
-                                  activeSlot &&
-                                  provider.capabilities.reasoningEffort &&
-                                  effortSupported
-                                )
-                              }
-                              slot={activeSlot}
-                              currentEffort={currentSlot?.reasoning_effort || ''}
-                              defaultEffort={defaultEffort}
-                              effortLevelsOverride={
-                                remoteCrew.isRemote
-                                  ? (remoteCrew.capabilities?.effort_levels ?? [])
-                                  : undefined
-                              }
-                              onManageModels={
-                                modelPickerConfigured
-                                  ? undefined
-                                  : () => {
-                                      setModelDropdown(false)
-                                      navigate(
-                                        settingsPath({
-                                          tab: 'chat',
-                                          highlight: 'key:dashboard.model_picker_hidden_models',
-                                        }),
-                                      )
-                                    }
-                              }
-                              onSetDefault={() => {
-                                setModelDropdown(false)
-                                navigate(
-                                  settingsPath({
-                                    tab: 'chat',
-                                    highlight: SETTINGS_DEFAULT_MODEL_ID,
-                                  }),
-                                )
-                              }}
-                              agentName={_modelPinAgent}
-                              pinModelName={_modelPinActive || 'auto'}
-                              pinModelUnavailable={pinIsWithheld(_modelPinActive, _pinShownModel)}
-                              pinnedToAgent={_modelPinPinned}
-                              onPinToAgent={() => {
-                                setModelDropdown(false)
-                                pinModelToAgentMut.mutate({
-                                  agent: _modelPinAgent,
-                                  // The slot's REAL model, never the display fallback: a
-                                  // stale/degraded list must not be able to persist 'auto'
-                                  // over a pin the account actually has.
-                                  model: _modelPinActive === 'auto' ? '' : _modelPinActive,
-                                })
-                              }}
-                            />,
-                            document.body,
-                          )}
-                        {/* Project picker — triggered from input bar */}
-                        <ProjectPicker
-                          open={projectPickerOpen}
-                          onOpenChange={setProjectPickerOpen}
-                          anchorRect={projectBtnRect}
-                          onSelect={(path) => {
-                            setProject(path)
-                            setProjectPickerOpen(false)
-                          }}
-                        />
-                        {/* App-contributed session control popover — triggered from input bar.
+                {!embedded && <DefaultAgentRow agentName={activeAgentName} isDefault={activeAgentName === defaultAgent} onSetDefault={() => toggleDefaultAgent(activeAgentName)} />}
+                {!embedded && <ManageAgentsFooter error={defaultAgentFailed} onManage={() => { setAgentDropdown(false); navigate('/capabilities?tab=crews') }} />}
+              </div>,
+              document.body
+            )}
+            {/* Model dropdown portal — triggered from input bar */}
+            {modelDropdown && modelBtnRect && createPortal(
+              <ModelEffortDropdown
+                anchorRect={modelBtnRect}
+                dropdownRef={modelDropdownRef}
+                inputRef={modelInputRef}
+                onListKeyDown={onModelListKeyDown}
+                models={filteredModels}
+                activeModel={shownModel}
+                onSelectModel={pickModel}
+                modelsLoading={remoteCrew.modelsPending}
+                modelsFailed={remoteCrew.failed}
+                retryingModels={remoteCrew.retrying}
+                onRetryModels={() => remoteCrew.refetch()}
+                filter={modelFilter}
+                setFilter={setModelFilter}
+                onClose={() => setModelDropdown(false)}
+                modelVisibilityError={hiddenModelsQ.isError}
+                onRetryModelVisibility={() => hiddenModelsQ.refetch()}
+                hasEffort={!!(activeSlot && provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel))}
+                slot={activeSlot}
+                currentEffort={currentSlot?.reasoning_effort || ''}
+                defaultEffort={defaultEffort}
+                effortLevelsOverride={remoteCrew.isRemote ? (remoteCrew.capabilities?.effort_levels ?? []) : undefined}
+                onManageModels={modelPickerConfigured ? undefined : () => {
+                  setModelDropdown(false)
+                  navigate(settingsPath({ tab: 'chat', highlight: 'key:dashboard.model_picker_hidden_models' }))
+                }}
+                onSetDefault={() => {
+                  setModelDropdown(false)
+                  navigate(settingsPath({ tab: 'chat', highlight: SETTINGS_DEFAULT_MODEL_ID }))
+                }}
+                agentName={_modelPinAgent}
+                pinModelName={_modelPinActive || 'auto'}
+                pinModelUnavailable={pinIsWithheld(_modelPinActive, _pinShownModel)}
+                pinnedToAgent={_modelPinPinned}
+                onPinToAgent={() => {
+                  setModelDropdown(false)
+                  pinModelToAgentMut.mutate({
+                    agent: _modelPinAgent,
+                    // The slot's REAL model, never the display fallback: a
+                    // stale/degraded list must not be able to persist 'auto'
+                    // over a pin the account actually has.
+                    model: _modelPinActive === 'auto' ? '' : _modelPinActive,
+                  })
+                }}
+              />,
+              document.body
+            )}
+            {/* Project picker — triggered from input bar */}
+            <ProjectPicker
+              open={projectPickerOpen}
+              onOpenChange={setProjectPickerOpen}
+              anchorRect={projectBtnRect}
+              onSelect={path => { setProject(path); setProjectPickerOpen(false) }}
+            />
+            {/* App-contributed session control popover — triggered from input bar.
                 Only the open one is mounted, so an app's control costs nothing
                 while closed. Render is gated on the slot the control was opened
                 in: on a chat switch the committed render where activeSlot has

@@ -729,16 +729,16 @@ def _model_fallback(per_agent_model: str, global_default: str) -> "str | None":
     return global_default if global_default and global_default not in _SENTINEL_MODELS else None
 
 
-def _session_model(cfg: "KiroCrewConfig", agent: str | None) -> "str | None":
+def _session_model(
+    cfg: "KiroCrewConfig", agent: str | None, *, crew_agent: str | None = None
+) -> "str | None":
     """Resolve the model for a new session on *agent*, for EVERY surface.
 
-    ``agent`` is whatever the caller passed, and callers are not consistent: the
-    dashboard passes a resolved kiro template name, while Slack threads, cron
-    jobs and spawned agents pass a KiroCrew agent (crew) name. Both are handled
-    by trying the crew namespace first, so a crew's own ``model`` applies no
-    matter which surface starts the turn. Without this, a crew pinned to one
-    model in the Crews table still ran the template/global model from Slack or
-    cron — the same per-surface drift this tier exists to remove.
+    ``crew_agent`` carries the allocation's explicit member identity, including
+    "" for a literal template. The empty claim excludes a same-named member's
+    pin while preserving the template/global fallback. Without an explicit
+    claim, the shared identity resolver retains legacy crew-name inference for
+    callers such as Slack and cron.
 
     Returns ``None`` when nothing is pinned above the kiro layer, which leaves
     the provider factory to resolve the template pin / global itself. A crew pin
@@ -747,7 +747,8 @@ def _session_model(cfg: "KiroCrewConfig", agent: str | None) -> "str | None":
 
     Blocking I/O (globs + reads ``~/.kiro/agents/*.json``): call in an executor.
     """
-    crew = cfg.agents.get(agent) if agent else None
+    crew_name = _resolve_allocation_crew_identity(cfg, agent, crew_agent)
+    crew = cfg.agents.get(crew_name) if crew_name else None
     if crew is not None:
         crew_model = normalize_agent_model(crew.model)
         if crew_model:
@@ -1057,7 +1058,7 @@ class SessionManager:
             session_provider_type=lambda: _load_acp_session_provider_type(),
             unlink_session_queue=lambda session: _unlink_session_queue(session),
             unlink_queued_temp_paths=lambda kwargs: unlink_queued_temp_paths(kwargs),
-            session_model=lambda cfg, agent: _session_model(cfg, agent),
+            session_model=lambda cfg, agent, crew: _session_model(cfg, agent, crew_agent=crew),
             session_crew_effort=lambda cfg, agent: _session_crew_effort(cfg, agent),
             runtime_client_binding=lambda agent: runtime_client_binding(agent),
             apply_runtime_client_binding=(
@@ -1660,7 +1661,7 @@ class SessionManager:
         self._provider_factory = provider_factory
         # Installed by the dashboard once its state exists (set_subagent_probe);
         # None means "no dashboard, so no children can be attached".
-        self._subagent_probe: Callable[[str], bool] | None = None
+        self._subagent_probe: "Callable[[str], bool | Awaitable[bool]] | None" = None
         self._allocation_state = SessionRegistryState(
             start_sem=asyncio.Semaphore(_MAX_CONCURRENT_COLD_STARTS)
         )
@@ -2385,7 +2386,7 @@ class SessionManager:
         """Register the lifecycle recycle callback."""
         self._lifecycle_boundary().set_recycle_callback(cb)
 
-    def set_subagent_probe(self, fn: Callable[[str], bool] | None) -> None:
+    def set_subagent_probe(self, fn: "Callable[[str], bool | Awaitable[bool]] | None") -> None:
         """Install the "does *key* have sub-agent work attached?" predicate.
 
         The RSS ceiling consults it before recycling an idle session: with
@@ -2395,8 +2396,14 @@ class SessionManager:
         """
         self._subagent_probe = fn
 
-    def _has_attached_subagents(self, key: str) -> bool:
+    def _has_attached_subagents(self, key: str) -> bool | Awaitable[bool]:
         """Answer the installed sub-agent probe, or False when none is installed.
+
+        The probe's answer is handed back UNCOERCED: the dashboard installs a
+        coroutine probe (its queued half reads the task store, and the sweep
+        that asks is on the gateway loop), and ``bool()`` of a coroutine is True
+        for every session while never running the probe at all. The cleanup
+        boundary awaits an awaitable answer and coerces there.
 
         A raising probe propagates: the cleanup boundary treats that as
         "attached" so the session is kept.
@@ -2404,7 +2411,7 @@ class SessionManager:
         probe = self._subagent_probe
         if probe is None:
             return False
-        return bool(probe(key))
+        return probe(key)
 
     def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
         """Delegate the ordered compaction gate ladder."""
@@ -2664,6 +2671,10 @@ class SessionManager:
     def get_agent(self, key: str) -> str:
         """Return a folded session agent name."""
         return self._allocation_boundary().get_agent(key)
+
+    def get_agent_selection(self, key: str) -> tuple[str, str]:
+        """Snapshot the allocation-owned namespace and name for inheritance."""
+        return self._allocation_boundary().get_agent_selection(key)
 
     def set_approval_policy(self, key: str, policy: str) -> None:
         """Update a folded session approval policy with audit logging."""

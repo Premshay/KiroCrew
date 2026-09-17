@@ -2354,8 +2354,8 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    (not an animation), so the global reduced-motion animation kill-switch
    above leaves the confirmation visible. JS removes the classes after the
    fade completes (REVEAL_FLASH_FADE_MS in ChatSidebar.tsx covers it). */
-.session-row.session-reveal-flash{outline:2px solid var(--accent);outline-offset:-2px}
-.session-row.session-reveal-flash-fade{outline-color:transparent}
+.session-row.session-reveal-flash,.folder-row.session-reveal-flash,.folder-col.session-reveal-flash{outline:2px solid var(--accent);outline-offset:-2px}
+.session-row.session-reveal-flash-fade,.folder-row.session-reveal-flash-fade,.folder-col.session-reveal-flash-fade{outline-color:transparent}
 /* Stalled goal loop (ChatSidebar `goalLoopStalled`): the loop is armed but its
    last turn died and nothing is executing — the whole card flashes danger-red
    until the user resumes. Two-class specificity outranks the Tailwind
@@ -2455,13 +2455,18 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
 }
 
 /* Preview find (MarkdownPanel) uses the CSS Custom Highlight API — paints over
-   Range objects without mutating the react-markdown DOM. Only color /
-   background-color are honored by ::highlight(); box properties are ignored. */
+   Range objects without mutating the react-markdown DOM. Only color and
+   background-color are used; box properties such as border-radius are ignored. */
 ::highlight(mc-find) {
   background-color: var(--search-highlight);
 }
 ::highlight(mc-find-current) {
   background-color: var(--search-highlight-current);
+}
+
+/* The passage a comment composer is open over (MarkdownPanel annotation). */
+::highlight(mc-annotate) {
+  background-color: var(--accent-subtle, rgba(99, 102, 241, 0.15));
 }
 
 /* Anchored-comment highlights on the markdown / text artifact body are drawn

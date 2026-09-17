@@ -1355,6 +1355,7 @@
       "cmd_search_sessions": "Search Sessions",
       "fallback_sessions": "Search sessions for “{{query}}”",
       "group_apps": "Apps",
+      "group_folders": "Folders",
       "group_commands": "Commands",
       "group_settings": "Settings",
       "leave_scope": "Back to all commands",
@@ -1384,6 +1385,7 @@
       "no_match_show_recent": "No sessions match “{{query}}” — show recent instead",
       "kind": {
         "app": "App",
+        "folder": "Folder",
         "command": "Command",
         "setting": "Setting",
         "view": "View"
@@ -2078,6 +2080,7 @@
     "followUpBar": {
       "click_to_add_to_input_double_click_to_select_and": "Click to add to input (double-click to select and send)",
       "click_to_add_to_input_editable_before_sending": "Click to add to input (editable before sending)",
+      "tooltip_arrow_sends_now": "↑ sends now",
       "click_to_add_to_selection": "Click to add to selection",
       "click_to_remove_from_input": "Click to remove from input",
       "click_to_remove_from_input_double_click_to_send": "Click to remove from input (double-click to send)",
@@ -2368,6 +2371,10 @@
       "diff_status_failed": "Couldn’t check this file’s git changes."
     },
     "markdownRenderer": {
+      "download_failed": "Couldn't download the diagram. Try again.",
+      "diagram_actions": "More actions",
+      "download_svg": "Download SVG",
+      "download_png": "Download PNG",
       "click_to_browse_shift_click_to_open_in_file_explorer": "Click to browse / Shift+click to open in File Explorer",
       "click_to_browse_shift_click_to_reveal_in_finder": "Click to browse / Shift+click to reveal in Finder",
       "click_to_browse_shift_click_to_show_in_file_manager": "Click to browse / Shift+click to show in file manager",
@@ -2821,7 +2828,8 @@
       "this_chat_s_browser_session": "This chat's browser",
       "to_open_another_site_unlock_the_view_s_address_bar": "Click the padlock above the page to type another address there; the monitor button (top right) brings the preview bar back.",
       "your_page_is_in_pick_it_in_the_sidebar": "Your page is in {{session}} — pick it in the frame's sidebar.",
-      "links_with_a_query_or_hash_part_go_in_the_frame_s_own_address_bar": "Links with a ? or # part can't go through this address bar — open the site's plain address first, then click the padlock above the page and type the full link into the frame's own address bar."
+      "links_with_a_query_or_hash_part_go_in_the_frame_s_own_address_bar": "Links with a ? or # part can't go through this address bar — open the site's plain address first, then click the padlock above the page and type the full link into the frame's own address bar.",
+      "dashboard_policy_blocks_embedding_http_page": "The browser would allow this page, but this dashboard only embeds http:// pages served from 127.0.0.1 or localhost. That is a gateway policy, not a browser block."
     },
     "welcomeView": {
       "autopilot": "Autopilot",
@@ -3237,6 +3245,9 @@
       "label": "changes need a restart",
       "tooltip": "This setting cannot change while {{productName}} is running. The saved value is kept and applies the next time {{productName}} restarts (Settings → About, or the terminal where you launched it).",
       "schema_unavailable": "Couldn't check whether this setting needs a restart."
+    },
+    "pierreEditorImpl": {
+      "highlighting_unavailable_with_reason": "Syntax highlighting is unavailable until you reload. Content remains readable. Last failure: {{classification}} (generation {{generation}}, attempt {{attempt}}): {{reason}}"
     },
     "restartBlockers": {
       "title": "Restart is waiting on active sessions",
@@ -3736,7 +3747,8 @@
         "model_effective": "Running on {{model}} (backend selects the model)",
         "workflows": "Workflows",
         "workspace_empty": "No files in this workspace yet",
-        "workspace_truncated": "Large workspace — showing the first 10,000 files",
+        "workspace_truncated": "Large workspace: showing up to 10,000 files; all folders remain available",
+        "workspace_directory_truncated": "files hidden",
         "output_load_failed": "Couldn't load the output",
         "retry": "Retry",
         "cancel_failed": "Couldn't cancel the subagent",
@@ -4160,6 +4172,7 @@
     },
     "chatSidebar": {
       "adopt_failed": "Could not open this session here.",
+      "no_sessions_match_folders": "No sessions match — only a folder name did",
       "adopt_target_unknown": "This session is no longer open on {{name}}.",
       "answered_by": "answered by {{agent}}",
       "archive_session_one": "Archive {{count}} session",
@@ -4179,6 +4192,13 @@
       "loop": "Loop {{count}}/{{total}}",
       "loop_2": "Loop · {{count}}",
       "loop_interrupted": "interrupted",
+      "loop_waiting_on_you": "Waiting on you",
+      "loop_waiting_monitor": "Monitor paused",
+      "loop_waiting_cycle": "Paused at {{count}}/{{total}}",
+      "loop_waiting_cycle_2": "Paused at cycle {{count}}",
+      "loop_waiting_title": "The last reply asked you to choose. Open the session to answer.",
+      "loop_waiting_title_cycle": "Paused at cycle {{count}} of {{total}} — the last reply asked you to choose. Open the session to answer.",
+      "loop_waiting_title_cycle_2": "Paused at cycle {{count}} — the last reply asked you to choose. Open the session to answer.",
       "opening_session_locally": "Opening this session here…",
       "not_open_here_yet": "On {{name}} — click to open here",
       "on_instance": "On {{name}}",
@@ -4204,8 +4224,6 @@
       "connected_to": "Connected to {{label}}",
       "session_failed_to_switch_one": "{{count}} session failed to switch",
       "session_failed_to_switch_other": "{{count}} sessions failed to switch",
-      "started_in_channel": "This conversation started in {{channel}}.",
-      "started_in_direct_message": "This conversation started in a direct message.",
       "session_source": "Session",
       "new": "New",
       "new_chat": "New chat",
@@ -4998,6 +5016,10 @@
       "skillsTab": {
         "adds_new_requirements_to": "Adds new requirements to {{target}} — {{description}}",
         "delete_confirm": "Delete “{{name}}”?",
+        "update_failed_title": "Save failed",
+        "saving": "Saving…",
+        "delete_failed_error": "Could not delete “{{name}}”: {{error}}",
+        "readonly_skill_error": "This skill is managed on disk and cannot be changed from this page.",
         "dismiss_confirm": "Dismiss “{{name}}”?",
         "dismiss_all": "Dismiss All",
         "dismiss_all_confirm": "Dismiss all {{count}} pending skills?",
@@ -5356,11 +5378,21 @@
     },
     "settings": {
       "mobileLoginCard": {
+        "sign_in_on_mobile": "Sign in on mobile",
+        "create_a_one_time_link_for_mobile_or_another_browser": "Create a short-lived sign-in link for mobile or another browser. It expires in 5 minutes.",
+        "creating_link": "Creating link…",
+        "create_mobile_sign_in_link": "Create mobile sign-in link",
         "create_new_mobile_sign_in_link": "Create new link",
+        "mobile_sign_in_link": "Mobile sign-in link",
+        "copy_sign_in_link": "Copy sign-in link",
+        "link_copied": "Link copied",
         "link_expires_in_minutes": "This link expires in {{minutes}} minutes.",
+        "send_the_copied_link_to_your_mobile_device_then_open_it": "Send the copied link to your mobile device, then open it there.",
         "dashboard_url_required_to_create_a_mobile_sign_in_link": "The dashboard URL is not configured. Set dashboard.url to create a mobile sign-in link.",
+        "could_not_create_a_sign_in_link_try_again": "Could not create a sign-in link. Try again.",
         "restricted_sessions_cannot_create_a_sign_in_link": "Incognito and temporary sessions cannot create sign-in links. Switch to persistent mode to create one.",
-        "session_expired_sign_in_again_to_create_a_link": "Your session has expired. Sign in again, then create the link."
+        "session_expired_sign_in_again_to_create_a_link": "Your session has expired. Sign in again, then create the link.",
+        "copy_failed_select_the_link_and_copy_it_manually": "Copy failed. Select the link and copy it manually."
       },
       "aboutPanel": {
         "diverged": "Diverged",
@@ -5450,7 +5482,11 @@
         "auto_download_save_failed": "Couldn't save the automatic download setting.",
         "auto_update_setting_unavailable": "Couldn't load the auto-update setting. The switch shows the default until it loads.",
         "copy_failed_select_the_command_and_copy_it_manually": "Copy failed. Select the command and copy it manually.",
-        "update_info_unavailable": "Couldn't read this build's version and update channel from the app."
+        "update_info_unavailable": "Couldn't read this build's version and update channel from the app.",
+        "app_lane_label": "App",
+        "app_lane_title": "The desktop app you installed. Its own version, separate from the service below.",
+        "gateway_lane_label": "Gateway",
+        "gateway_lane_title": "The background service that runs your agents and serves this dashboard. The branch and commit chips are its build."
       },
       "developerPanel": {
         "feature_previews": "Feature Previews",
@@ -5621,6 +5657,12 @@
         "fallback_disabled": "Disabled",
         "fallback_auto": "Auto (recommended)",
         "failed_to_save_fallback_model": "Failed to save fallback model",
+        "refusal_fallback": "Content-filter fallback",
+        "refusal_fallback_desc": "When your current model's content filter declines a message, retry it once on this model. Your primary model returns on the next message.",
+        "refusal_fallback_model": "Content-filter fallback model",
+        "refusal_fallback_auto_hint": "Auto retries on the model the provider suggests in its refusal, when it names one. The retry is announced in chat. Disabled shows the refusal as before.",
+        "refusal_fallback_auto": "Auto (model named in the refusal)",
+        "failed_to_save_refusal_fallback_model": "Failed to save content-filter fallback model",
         "session_card_source_links": "PR and Issue Chips on Session Cards",
         "session_card_source_links_desc": "Show a chip on each session's sidebar card for every pull request, merge request and issue mentioned in that session. Turning it off also stops the periodic provider calls that keep those chips up to date.",
         "failed_to_load_tips_preference": "Failed to load tips preference.",
@@ -6386,6 +6428,7 @@
       "failed_to_load_app": "Failed to load app"
     },
     "membersPage": {
+      "drawer_delegated_working": "Delegated work running",
       "setup_in_crew_manager": "Set up private memory"
     }
   },

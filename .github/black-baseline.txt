@@ -9,7 +9,6 @@
 #   python3 scripts/check_black_formatting.py --update-baseline
 src/kiro_crew/_process_group_supervisor.py
 src/kiro_crew/acp/kas_wire.py
-src/kiro_crew/acp/liveness.py
 src/kiro_crew/acp/worker_pool.py
 src/kiro_crew/apps/__init__.py
 src/kiro_crew/apps/app_storage.py
@@ -192,7 +191,6 @@ src/kiro_crew/dashboard/handlers_cloud.py
 src/kiro_crew/dashboard/loop_watchdog.py
 src/kiro_crew/dashboard/port_reclaim.py
 src/kiro_crew/dashboard/routes/skills.py
-src/kiro_crew/dashboard/session_health.py
 src/kiro_crew/dashboard/session_memory.py
 src/kiro_crew/dashboard/slowloris.py
 src/kiro_crew/dashboard/stale_asset_watchdog.py
@@ -332,7 +330,6 @@ test/test_acp_tool_search.py
 test/test_acp_true_provider_error.py
 test/test_acp_turn_lock.py
 test/test_admission_gate.py
-test/test_agent_default_model.py
 test/test_agent_discovery.py
 test/test_agent_import_hoist.py
 test/test_agent_source_ownership_durability.py
@@ -441,7 +438,6 @@ test/test_channel_folders.py
 test/test_channel_model_inheritance.py
 test/test_channel_registry.py
 test/test_channel_resolver.py
-test/test_channel_slot_close_binding.py
 test/test_channel_slots.py
 test/test_channel_transcript_migration.py
 test/test_chat_backfill.py
@@ -452,7 +448,6 @@ test/test_chat_slot_create_folder.py
 test/test_chat_slot_end_wait.py
 test/test_chat_slot_interrupt.py
 test/test_chat_slot_reasoning_effort.py
-test/test_chat_tags.py
 test/test_chat_title.py
 test/test_chat_turn_timeout_consistency.py
 test/test_cli_desktop.py
@@ -512,7 +507,6 @@ test/test_dashboard_cron_concurrent_create.py
 test/test_dashboard_file_io.py
 test/test_dashboard_files_coverage.py
 test/test_dashboard_no_legacy.py
-test/test_dashboard_reset_sessions.py
 test/test_dashboard_route_table.py
 test/test_dashboard_server_coverage.py
 test/test_dashboard_sessions_memory.py
@@ -716,7 +710,6 @@ test/test_mcp_cron_orphan_validation.py
 test/test_mcp_cron_persistent_session.py
 test/test_mcp_cron_security.py
 test/test_mcp_custom_api.py
-test/test_mcp_dashboard_registration.py
 test/test_mcp_gateway_apps_spool.py
 test/test_mcp_gateway_backend_coverage.py
 test/test_mcp_gateway_claim.py
@@ -882,7 +875,6 @@ test/test_session_core_audit.py
 test/test_session_coverage.py
 test/test_session_end_interaction.py
 test/test_session_grid.py
-test/test_session_health.py
 test/test_session_keepalive.py
 test/test_session_map_locking.py
 test/test_session_map_migration.py
@@ -900,7 +892,6 @@ test/test_session_summary_extract.py
 test/test_session_summary_generate.py
 test/test_session_thread_map.py
 test/test_session_usage.py
-test/test_sessions_health_cache.py
 test/test_settingref_schema_fixture.py
 test/test_ship_report_issues.py
 test/test_side_context.py
@@ -1006,7 +997,6 @@ test/test_use_builtin_browser_config.py
 test/test_user_resolution_fallback.py
 test/test_validation.py
 test/test_validation_user_actions.py
-test/test_vector_memory.py
 test/test_vector_memory_coverage.py
 test/test_vendored_llama_payload.py
 test/test_voice_reply.py
@@ -1039,6 +1029,5 @@ test/test_workspace_absolute_paths.py
 test/test_write_secret_file.py
 test/test_ws_and_plan_memory_fixes.py
 test/test_ws_event_scoping.py
-test/test_xdist_auto_cap.py
 test/test_xdist_host_budget.py
 test/windows_sim.py

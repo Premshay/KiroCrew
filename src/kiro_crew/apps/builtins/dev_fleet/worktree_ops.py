@@ -1069,8 +1069,9 @@ async def _worktree_remove_locked(
             # the socket were removed under a running pod, that pod is now
             # uncontrollable and will terminate on its next watchdog cycle.
             # As a defense-in-depth measure, we also probe the unit file directly.
+            loop = asyncio.get_running_loop()
             try:
-                runtime.rt.require_backend()
+                await loop.run_in_executor(subprocess_executor(), runtime.rt.require_backend)
             except runtime.rt.PodBackendAbsent:
                 # Defense-in-depth: attempt a direct unit-state query. If this
                 # somehow succeeds (bus re-appeared between require_backend and
@@ -1106,6 +1107,11 @@ async def _worktree_remove_locked(
                     residue,
                     name,
                 )
+            except runtime.rt.PodError as exc:
+                return {
+                    "ok": False,
+                    "error": f"cannot verify pod backend: {runtime._redact(str(exc))}",
+                }
             else:
                 try:
                     loop = asyncio.get_running_loop()
@@ -1245,13 +1251,21 @@ async def _worktree_remove_locked(
             # the pod. Removing the checkout under a live pod would leave its
             # gateway running from deleted files, so re-verify inactivity now.
             if runtime._POD_AVAILABLE and cfg:
+                loop = asyncio.get_running_loop()
                 try:
-                    runtime.rt.require_backend()
+                    await loop.run_in_executor(subprocess_executor(), runtime.rt.require_backend)
                 except runtime.rt.PodBackendAbsent:
                     pass  # backend provably absent — no pods can exist
+                except runtime.rt.PodError as exc:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "cannot re-verify pod backend before removal: "
+                            f"{runtime._redact(str(exc))}"
+                        ),
+                    }
                 else:
                     try:
-                        loop = asyncio.get_running_loop()
                         active3 = await loop.run_in_executor(
                             subprocess_executor(), runtime.rt.active_names, cfg
                         )
@@ -2413,12 +2427,32 @@ async def _prunable(path: str, branch: str | None) -> dict:
 
 async def _prune_candidates() -> dict:
     worktrees = await repository._discover_worktrees()
+    # The per-worktree verdict (_prunable) is several read-only git calls plus
+    # one or more networked gh calls (a PR-status lookup, its per-repo fallback
+    # traversal, and a merged/closed head-OID check), so a plain serial loop
+    # scales with fleet size: a 111-worktree fleet floors at ~57s even at one gh
+    # call each, double the gateway app proxy's 30s _PROXY_TIMEOUT, so the
+    # preview returns 504 and the button never renders. Run the verdicts
+    # concurrently under the same _PRUNE_CONCURRENCY bound the parallel prune
+    # workers use -- this path is read-only git (rev-parse, status,
+    # rev-list/cherry, merge-base) so it never touches _GIT_MUTATION_LOCK, which
+    # only the destructive removal path holds.
+    prunable = [w for w in worktrees if not w.get("is_main")]
+    sem = asyncio.Semaphore(_PRUNE_CONCURRENCY)
+
+    async def _verdict(w: dict) -> tuple[dict, dict]:
+        async with sem:
+            v = await _prunable(w["path"], w.get("branch"))
+        return w, v
+
+    # gather preserves the argument order in its result list regardless of
+    # completion order, so candidates/kept below stay deterministic (input
+    # discovery order) even though the verdicts finish out of order.
+    verdicts = await asyncio.gather(*(_verdict(w) for w in prunable))
+
     candidates, kept = [], []
-    for w in worktrees:
-        if w.get("is_main"):
-            continue
+    for w, v in verdicts:
         name = Path(w["path"]).name
-        v = await _prunable(w["path"], w.get("branch"))
         row = {"name": name, "code": v["code"], "branch": w.get("branch")}
         if v["ok"]:
             # A closed-PR candidate carries the ancestry warning so the
@@ -2443,7 +2477,7 @@ async def _prune_candidates() -> dict:
                 row["dirty_untracked"] = v.get("dirty_untracked")
                 row["dirty_untracked_paths"] = v.get("dirty_untracked_paths")
             kept.append(row)
-    return {"ok": True, "candidates": candidates, "kept": kept, "scanned": len(worktrees) - 1}
+    return {"ok": True, "candidates": candidates, "kept": kept, "scanned": len(prunable)}
 
 
 async def _prune_run(

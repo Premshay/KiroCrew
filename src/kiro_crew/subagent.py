@@ -33,6 +33,13 @@ from kiro_crew.acp.liveness import (
 )
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE, PROVIDER_LABEL_DEFAULT
+from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401 - STOP_* resolved by run.py via bind_component_globals
+    STOP_CLASS_CANCELLED,
+    STOP_CLASS_FAILED,
+    STOP_CLASS_SUCCEEDED,
+    STOP_RECOVERY_MAX_RETRIES,
+    classify_stop_reason,
+)
 from kiro_crew.executors import run_in_embed_pool
 
 if TYPE_CHECKING:
@@ -45,6 +52,7 @@ from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_CLAUDE_CODE
 from kiro_crew.config import live
 from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig
+from kiro_crew.config.paths import data_home
 from kiro_crew.constants import SUBAGENT_COMPLETION_PREFIX, SUBAGENT_TIMEOUT_SECS
 from kiro_crew.context import (
     CONTEXT_GROUP_LESSONS,
@@ -117,8 +125,10 @@ from kiro_crew.subagent_cost import (
 )
 from kiro_crew.subagent_manager import (
     CancellationCoordinator,
+    ClaimPoint,
     ContinuationCoordinator,
     OrphanStallMonitor,
+    PreparedSpawn,
     RunEventCoordinator,
     SpawnAdmissionCoordinator,
     TerminalCoordinator,
@@ -273,6 +283,24 @@ def _available_agents_hint(available: list[str]) -> str:
     if withheld:
         hint += f" (+{withheld} more, call spawn_list)"
     return hint
+
+
+def _validate_app_agent_ownership(agent: str, app: str) -> str:
+    """The app-ownership proof the SpawnSDK runs at request time, repeated for
+    a spawn that waited in the queue: *agent* must be one of *app*'s own
+    materialized agents (``<app>--<agent>.json``). Returns the refusal reason,
+    or ``""`` when the agent is the app's own."""
+    prefix = f"{app}--"
+    try:
+        known = {a.name for a in list_agents() if a.filename.startswith(prefix)}
+    except Exception as exc:  # noqa: BLE001 - cannot confirm -> refuse
+        return f"cannot verify agent {agent!r} for app {app!r}: {exc}"
+    if agent not in known:
+        return (
+            f"app {app!r} may only spawn its OWN agents ({prefix}*); {agent!r} is not one "
+            "(refusing to run the host default or another app's agent)"
+        )
+    return ""
 
 
 def _validate_agent(requested: str, project_dir: str = "") -> tuple[str, str, str]:
@@ -616,8 +644,8 @@ def _subagent_default_effort() -> str:
         return ""
 
 
-def _spawn_effective_model(model: str, agent: str) -> str:
-    """The model the provider factory's effort gate will actually see, or ``""``.
+def _spawn_effective_model(model: str, agent: str, *, crew_agent: str | None = None) -> str | None:
+    """Resolve the factory's model; ``""`` means auto, ``None`` means unavailable.
 
     Not a re-encoding of the factory's precedence — the selection itself is
     :meth:`KiroCrewConfig.acp_effective_model`, the same function the factory
@@ -627,14 +655,15 @@ def _spawn_effective_model(model: str, agent: str) -> str:
     per-spawn *model*, else the subagent role pin — see ``_run_inner``, which
     forwards raw ``info.model`` including an explicit ``"auto"``), and, when no
     kwarg is passed, ``session._session_model`` for *agent* (a crew's own pin,
-    else non-sentinel global; ``None`` for a named kiro agent so the factory
-    resolves the agent's own JSON pin — which ``acp_effective_model`` then
-    does, identically). Never raises; ``""`` on any resolution failure.
+    else non-sentinel global; the factory resolves a named template's JSON pin).
+    An explicit empty ``crew_agent`` retains the template namespace; a member
+    claim retains that member's pin and bound template. Omitted claims keep the
+    helper's crew-name inference. Reporting never prepares a capability runtime.
     """
     try:
         # circular imports (config.loader / session import sibling modules at
         # load time, matching the lazy-import convention of _subagent_default_*)
-        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.config.loader import KiroCrewConfig, resolve_crew_identity
         from kiro_crew.session import _session_model
 
         # The kwarg the spawn path actually passes (see _run_inner): raw
@@ -642,31 +671,43 @@ def _spawn_effective_model(model: str, agent: str) -> str:
         # factory treats it as a truthy override — else the role pin.
         override: str | None = model or _subagent_default_model() or None
         cfg = KiroCrewConfig.load()
+        claim = resolve_crew_identity(cfg, agent or None, crew_agent)
+        if claim:
+            member = cfg.agents.get(claim)
+            if member is None or not isinstance(member.kiro_agent, str):
+                return None
+            # The factory receives the bound provider template, never the alias.
+            # This matters when the member defers to the template's own model.
+            agent = member.kiro_agent
         if override is None:
             # No kwarg: get_or_create resolves the session chain and passes
             # its result (possibly None) as model_override.
-            override = _session_model(cfg, agent or None)
+            override = _session_model(cfg, agent or None, crew_agent=claim)
         return cfg.acp_effective_model(agent or None, override) or ""
     except Exception:
-        return ""
+        return None
 
 
-def effort_drop_reason(model: str, reasoning_effort: str, agent: str = "") -> str:
+def effort_drop_reason(
+    model: str, reasoning_effort: str, agent: str = "", *, crew_agent: str | None = None
+) -> str:
     """Why a requested per-spawn effort will not take effect, or ``""``.
 
     Mirrors the model resolution the provider factory's effort gate actually
-    sees (explicit per-spawn model, else the subagent role pin, else the
-    session-level chain for *agent*: crew pin, else non-sentinel global) — an
-    unresolved model (the provider picks a served one, or a named kiro agent's
-    own pin resolves downstream) cannot carry an effort level through the
-    overlay. Returns a human-readable reason when *reasoning_effort* is set
+    sees (explicit per-spawn model, else the subagent role pin, else the selected
+    member's pin, template pin and global fallback). A resolved ``auto`` cannot
+    carry an effort level through the overlay. Returns a human-readable reason when
+    *reasoning_effort* is set
     but the resolved model is not effort-capable; ``""`` means the effort will
-    be delivered (or none was requested). Reporting-only: never raises and
-    never influences whether or how a spawn proceeds.
+    be delivered, none was requested, or the selection could not be resolved.
+    Reporting-only: never raises and never influences whether or how a spawn
+    proceeds. ``crew_agent`` has the same namespace semantics as allocation.
     """
     if not reasoning_effort:
         return ""
-    resolved = _spawn_effective_model(model, agent)
+    resolved = _spawn_effective_model(model, agent, crew_agent=crew_agent)
+    if resolved is None:
+        return ""
     if not resolved:
         return (
             "no concrete model is pinned — the model resolves to 'auto', which "
@@ -678,7 +719,9 @@ def effort_drop_reason(model: str, reasoning_effort: str, agent: str = "") -> st
     return ""
 
 
-def effort_applied_note(model: str, reasoning_effort: str, agent: str = "") -> str:
+def effort_applied_note(
+    model: str, reasoning_effort: str, agent: str = "", *, crew_agent: str | None = None
+) -> str:
     """The delivery mirror of :func:`effort_drop_reason`, or ``""``.
 
     Names the resolved model and the family-specific cli.json settings key the
@@ -686,12 +729,13 @@ def effort_applied_note(model: str, reasoning_effort: str, agent: str = "") -> s
     Claude) when a requested per-spawn effort WILL take effect. The key matters
     because kiro-cli silently ignores a level written under the wrong family
     key, so a bare "applied" would leave that failure mode unobservable.
-    Complementary with the drop reason over a non-empty request: exactly one of
-    the two is non-empty. Reporting-only, same totality contract.
+    Complementary with the drop reason when the selection can be resolved:
+    exactly one is non-empty for a requested effort. An unavailable selection
+    leaves both empty. Reporting-only, same totality contract.
     """
     if not reasoning_effort:
         return ""
-    resolved = _spawn_effective_model(model, agent)
+    resolved = _spawn_effective_model(model, agent, crew_agent=crew_agent)
     if not resolved or not model_supports_effort(resolved):
         return ""
     return f"{resolved} → {effort_settings_key(resolved)}.effort"
@@ -1379,6 +1423,8 @@ class SubagentInfo:
     # crew reads the global store, which is what every spawn did before crews
     # had silos.
     memory_store: str = ""
+    # A named member remains the conversation owner during a template override.
+    crew: str = field(default="", kw_only=True)
     # Session key override for continuation runs: a spawn_continue run reuses
     # the ORIGINAL run's session key (``subagent:<conv-id>``) so get_or_create
     # finds the persisted sid and arms session/load. Empty ⇒ the default
@@ -1461,6 +1507,33 @@ class SubagentInfo:
     # `_run` that sees `reaped` can leave `_running_count` inflated. At
     # 60-100 concurrent agents, a leaked slot starves the queue.
     _slot_released: bool = False
+    # Generation the durable task row was claimed under (``kiro_crew.taskq``).
+    # Every store write the run makes carries it, so a late write from a
+    # superseded dispatch of the same id is fenced out. 0 = no store row.
+    _taskq_generation: int = 0
+    # Scheduler-core fields (session-start gate, lane-slot waits; see
+    # docs/system-specs/modules/subagent.md § Lane-slot waits).
+    # Queue wait behind the session-start gate, ms; 0 when the gate was free.
+    _start_queue_wait_ms: float = 0.0
+    # True once the durable row was written ``running`` -- at the FIRST stream
+    # event of the run's own turn, not at execution start, so a row is never
+    # ``running`` while the session is still being created (RFC §4.4).
+    _taskq_running_marked: bool = False
+    # Provider built by a StartCollector's late adoption, handed to the run
+    # that was waiting for it; None otherwise.
+    _late_start_provider: Any = None
+    # The live WaitRecord (as a dict) while this run has yielded its lane
+    # slot for a wait; None while it holds a slot or has none to hold.
+    _wait_record: Any = None
+    # Set when the run's lane slot was yielded for a wait and a resume entry
+    # is queued in admission; cleared when the slot is granted back.
+    _resume_pending: bool = False
+    # The run loop's wake-up for a yielded slot: set by ``resume_grant`` when
+    # the pump hands the slot back, or by the dependency coordinator's
+    # ``on_fail`` when the wait ended in failure (``_wait_failed`` names why).
+    # None while the run holds its slot.
+    _resume_event: Any = None
+    _wait_failed: str = ""
     # True once the terminal report's `_on_done` injection has RETURNED, i.e.
     # the outcome actually reached the parent. Distinct from `_finalized` (the
     # claim, taken before delivery is attempted) and from the "delivered"
@@ -1468,6 +1541,21 @@ class SubagentInfo:
     # a report cancelled BEFORE delivery — which must be made recoverable on the
     # next start — from one cancelled AFTER it, which must not be re-delivered.
     _reported_to_parent: bool = False
+    # The run's final ACP ``stop_reason`` and its ``classify_stop_reason``
+    # class (a ``STOP_CLASS_*`` value), recorded by ``_run_inner`` on the
+    # completion that ended the run
+    # and carried on the ``subagent_done`` event so the parent sees WHY the run
+    # ended, not only whether ``error`` is set. Empty until the run completes.
+    stop_reason: str = ""
+    stop_class: str = ""
+    # True when the delivered ``result`` is a PARTIAL: text streamed before a
+    # non-success completion (stall, cancel, error). The parent must not read
+    # it as a finished answer.
+    partial: bool = False
+    # Continue-nudges already spent recovering a ``stalled`` / ``recovering``
+    # completion in place (``STOP_RECOVERY_MAX_RETRIES`` budget, shared with
+    # the main chat's ``slot._tool_stall_retries``).
+    _stop_recovery_used: int = 0
 
     @property
     def outcome(self) -> str:
@@ -1556,7 +1644,7 @@ class SpawnApprovalUnreachable(Exception):
     """A spawn-approval prompt has no surface that could ever answer it.
 
     Raised BY a :class:`SpawnApprovalCallback`, at the point it would otherwise
-    park, and handled by the spawn gate in ``subagent_manager/admission.py``.
+    park, and handled by the spawn gate in ``subagent_manager/admission/gate.py``.
 
     Why an exception rather than a ``False`` return, and why the callback rather
     than the gate decides:
@@ -1640,7 +1728,19 @@ class SubagentManager:
         self._memory_mode_for_session = memory_mode_for_session
         self._ctx_builder = ctx_builder
         self._on_done = on_done
+        # ``_max_concurrent`` is the EFFECTIVE cap every admission read site
+        # consults: ``min(user cap, adaptive cap)``. The user's resolved cap
+        # (``agent.max_subagents`` / auto-size) is the ceiling in
+        # ``_user_max_concurrent``; the adaptive controller lowers the runtime
+        # value through :meth:`set_effective_cap` and never writes the ceiling.
+        self._user_max_concurrent = max_concurrent
+        self._adaptive_cap: int | None = None
         self._max_concurrent = max_concurrent
+        #: Gates OUTSIDE this manager that are bounded by ``_max_concurrent``
+        #: and cannot see it change (the runner lane -- TaskRunner steps and
+        #: workflow ``ctx.agent()`` calls). Registered by the gateway through
+        #: :meth:`set_cap_raise_listener`; None everywhere else.
+        self._cap_raise_listener: Callable[[], object] | None = None
         self._default_turn_limit = default_turn_limit
         self._default_timeout = default_timeout if default_timeout > 0 else _TIMEOUT_SECS
         self._startup_deadline = startup_timeout if startup_timeout > 0 else _STARTUP_TIMEOUT_SECS
@@ -1794,10 +1894,95 @@ class SubagentManager:
         self._monitor = OrphanStallMonitor(self)
         self._terminal = TerminalCoordinator(self)
         self._admission = SpawnAdmissionCoordinator(self)
+        # Durable task queue (``kiro_crew.taskq``): ``_queue`` above is a bounded
+        # window over this store's rows. Schema, import and reconcile must
+        # finish before attachment. Loop callers open in a worker; synchronous
+        # callers open inline. Pending or failed opens refuse typed; only
+        # agent.task_queue_enabled=false selects the in-memory queue.
+        # ``admitted -> starting`` is written at claim; ``running`` at the
+        # run's first stream event; waits and wakes through admission.
+        self._taskq: Any = None
+        self._taskq_admit_wait_secs: float = 30.0
+        #: Set when ``agent.task_queue_enabled`` is on but the store could not
+        #: be opened: every spawn is then REFUSED (typed, ``task_store_unavailable``)
+        #: instead of accepted into an in-memory queue that a restart forgets.
+        self._taskq_unavailable: str | None = None
+        #: The re-open schedule for that refusal (``taskq_reopen_if_due``, driven
+        #: by the reaper sweep). The count is how many opens have failed, which is
+        #: the exponent of the shared recovery backoff; the deadline is monotonic,
+        #: and 0.0 means the next sweep may attempt one.
+        self._taskq_reopen_attempts: int = 0
+        self._taskq_reopen_at: float = 0.0
         self._continuation = ContinuationCoordinator(self)
         self._waves = WaveDigestCoordinator(self)
         self._run_events = RunEventCoordinator(self)
         self._cancellation = CancellationCoordinator(self)
+        self._taskq_init_task: asyncio.Task[None] | None = None
+        try:
+            loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or not SpawnAdmissionCoordinator.open_store_off_loop:
+            self._taskq = self._open_taskq()
+        else:
+            self._taskq_unavailable = "durable task queue is initializing"
+            self._taskq_init_task = loop.create_task(self._initialize_taskq())
+            self._admission.track_store_task(self._taskq_init_task)
+
+    def _open_taskq(self) -> Any:
+        """Open, migrate and reconcile on a worker, or in a synchronous caller."""
+        try:
+            cfg = KiroCrewConfig.load()
+            self._taskq_admit_wait_secs = float(cfg.agent.admit_wait_secs)
+            if not cfg.agent.task_queue_enabled:
+                self._taskq_unavailable = None
+                return None
+            store = self._admission.taskq_open(cfg, home=data_home())
+            if store is None and self._taskq_unavailable is None:
+                self._taskq_unavailable = "durable task queue could not be opened"
+                self._admission.taskq_arm_reopen(cfg)
+            return store
+        except Exception as exc:
+            logger.warning("durable task queue could not be opened", exc_info=True)
+            self._taskq_unavailable = f"durable task queue could not be opened: {exc}"
+            # Whoever records the refusal arms its retry, so no refusal path can
+            # leave the store waiting for a restart. No cfg here: the load itself
+            # is one of the things that may have raised.
+            self._admission.taskq_arm_reopen()
+            return None
+
+    async def _initialize_taskq(self) -> None:
+        opening = asyncio.create_task(asyncio.to_thread(self._open_taskq))
+        try:
+            store = await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            # The thread still owns the open; retrieve and close its result.
+            store = await opening
+            if store is not None:
+                await asyncio.to_thread(store.close)
+            raise
+        if getattr(self, "_shutting_down", False):
+            if store is not None:
+                await asyncio.to_thread(store.close)
+            return
+        if store is None and self._taskq is not None:
+            # A re-open never UN-attaches: this task can be one the reaper armed
+            # while the refusal stood, and an attach that happened meanwhile is
+            # the newer fact.
+            return
+        # Attach only after schema, integrity check, imports and reconcile finish.
+        # Before this assignment every entry point returns task_store_unavailable.
+        self._taskq = store
+        if store is not None:
+            self._taskq_unavailable = None
+            self._taskq_reopen_attempts = 0
+            if self._reaper_task is not None and not self._reaper_task.done():
+                self._drain_queue()
+
+    async def wait_taskq_ready(self) -> None:
+        """Wait for startup recovery without cancelling it if this caller leaves."""
+        if self._taskq_init_task is not None:
+            await asyncio.shield(self._taskq_init_task)
 
     def _effective_turn_limit(self, info: SubagentInfo) -> int:
         return self._run_events._effective_turn_limit_impl(info)
@@ -1877,13 +2062,13 @@ class SubagentManager:
         """
         sizing_now = self._sizing_fields(cfg)
         if self._last_sizing_fields is not None and sizing_now == self._last_sizing_fields:
-            cap = self._max_concurrent
+            cap = self._user_max_concurrent
         else:
             try:
                 cap = await asyncio.to_thread(resolve_max_subagents, cfg)
             except Exception:
                 logger.warning("resolve_max_subagents failed on reload; keeping the current cap")
-                cap = self._max_concurrent
+                cap = self._user_max_concurrent
         self._last_sizing_fields = sizing_now
         self.apply_limits(cfg, max_concurrent=cap)
 
@@ -1911,8 +2096,9 @@ class SubagentManager:
                 max_concurrent = resolve_max_subagents(cfg)
             except Exception:
                 logger.warning("resolve_max_subagents failed; keeping max_concurrent=%d", old_cap)
-                max_concurrent = old_cap
-        self._max_concurrent = max(1, int(max_concurrent))
+                max_concurrent = self._user_max_concurrent
+        self._user_max_concurrent = max(1, int(max_concurrent))
+        self._max_concurrent = self._clamp_effective_cap()
         try:
             self._default_turn_limit = int(agent.subagent_max_turns)
         except (TypeError, ValueError):
@@ -1952,10 +2138,8 @@ class SubagentManager:
             self._spawn_stagger_secs,
             self._result_ttl_secs,
         )
-        if self._max_concurrent > old_cap and self._queue:
-            # Freed capacity: the pump re-checks the gate itself and honours the
-            # stagger interval, so this never bursts.
-            self._drain_queue()
+        if self._max_concurrent > old_cap:
+            self._notify_cap_raised()
 
     @staticmethod
     async def _approve_and_log(
@@ -2169,7 +2353,12 @@ class SubagentManager:
             logger.debug("Failed to record slow command for %s", info.id, exc_info=True)
 
     def _claim_finalize(self, info: SubagentInfo, *, supersede_recovery: bool = False) -> bool:
-        return self._terminal._claim_finalize_impl(info, supersede_recovery=supersede_recovery)
+        claimed = self._terminal._claim_finalize_impl(info, supersede_recovery=supersede_recovery)
+        if claimed:
+            # The one reporter of the outcome also writes it to the task store,
+            # fenced by the generation the run was dispatched under.
+            self._admission.taskq_settle(info)
+        return claimed
 
     async def _report_terminal(
         self,
@@ -2256,6 +2445,74 @@ class SubagentManager:
     ) -> None:
         return self._terminal.notify_injection_failed_impl(info, reason)
 
+    def _clamp_effective_cap(self) -> int:
+        if self._adaptive_cap is None:
+            return self._user_max_concurrent
+        return max(0, min(self._user_max_concurrent, int(self._adaptive_cap)))
+
+    def set_cap_raise_listener(self, listener: Callable[[], object] | None) -> None:
+        """Register the ONE hook a cap raise rings, or ``None`` to drop it.
+
+        For a gate that is bounded by ``max_concurrent`` but lives outside this
+        manager: it can read the new cap whenever it likes, but it has no edge
+        to react to, and its own occupancy may never produce one (see
+        :meth:`_notify_cap_raised`). Set, never appended: the gateway owns the
+        single runner lane and re-registration replaces the stale handle.
+        """
+        self._cap_raise_listener = listener
+
+    def _notify_cap_raised(self) -> None:
+        """Fan freed capacity out to every gate the live cap bounds.
+
+        MUST be called on the event loop, not from a worker thread: the runner
+        lane resolves its parked waiters' futures, which is loop-affine.
+
+        The subagent queue drains through the staggered pump. The runner lane
+        (`taskq/adapters/runner.py`) reads this cap as its ceiling but parks its
+        waiters on a bare future, so a waiter parked while the cap was ``0``
+        holds no slot and has no running holder whose release would wake it:
+        this raise is its only edge. The lane keeps its own occupancy count, so
+        it grants exactly the FIFO prefix the new cap allows -- and nothing at
+        all while the effective cap is still ``0``.
+        """
+        if self._queue:
+            # Freed capacity: the pump re-checks the gate itself and honours the
+            # stagger interval, so this never bursts.
+            self._drain_queue()
+        listener = self._cap_raise_listener
+        if listener is None:
+            return
+        try:
+            listener()
+        except Exception:  # noqa: BLE001 - a broken hook must not block a raise
+            logger.debug("cap-raise listener failed", exc_info=True)
+
+    def set_effective_cap(self, cap: int | None) -> int:
+        """Adaptive-controller seam: bound the live cap beneath the user's.
+
+        ``None`` removes the bound. ``0`` pauses new grants (in-flight runs
+        finish; nothing is cancelled). A raise notifies every gate the cap
+        bounds exactly as a config raise does. Returns the cap now in force.
+        """
+        old_cap = self._max_concurrent
+        self._adaptive_cap = None if cap is None else max(0, int(cap))
+        self._max_concurrent = self._clamp_effective_cap()
+        if self._max_concurrent != old_cap:
+            logger.info(
+                "SubagentManager effective cap %d -> %d (user ceiling %d)",
+                old_cap,
+                self._max_concurrent,
+                self._user_max_concurrent,
+            )
+        if self._max_concurrent > old_cap:
+            self._notify_cap_raised()
+        return self._max_concurrent
+
+    @property
+    def user_max_concurrent(self) -> int:
+        """The user's resolved cap -- the ceiling the adaptive cap sits under."""
+        return self._user_max_concurrent
+
     @property
     def max_concurrent(self) -> int:
         return self._max_concurrent
@@ -2333,8 +2590,15 @@ class SubagentManager:
         _from_queue: bool = False,
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _store_accepted: bool = False,
+        _stop_before_claim: bool = False,
+        _claimed: "tuple[int, bool, str] | None" = None,
+        _window_hint: "bool | None" = None,
+        _child_registration: bool = True,
+        *,
+        crew: str = "",
     ) -> SubagentInfo | None:
-        return self._admission.spawn_impl(
+        result = self._admission.spawn_impl(
             task,
             parent_session_key,
             agent,
@@ -2359,7 +2623,114 @@ class SubagentManager:
             _from_queue,
             _preassigned_id,
             _memory_mode=_memory_mode,
+            _store_accepted=_store_accepted,
+            _stop_before_claim=_stop_before_claim,
+            _claimed=_claimed,
+            _window_hint=_window_hint,
+            _child_registration=_child_registration,
+            crew=crew,
         )
+        assert not isinstance(result, PreparedSpawn)
+        # ``ClaimPoint`` comes back ONLY for ``_stop_before_claim=True``, whose
+        # sole caller is the coroutine pump's ``_dispatch_async``; every other
+        # caller receives a ``SubagentInfo`` or None as declared.
+        return result  # type: ignore[return-value]
+
+    def prepare_spawn(self, task: str, **kwargs: Any) -> "SubagentInfo | PreparedSpawn | None":
+        """Run every policy gate of :meth:`spawn` and return the row to persist
+        instead of starting anything. A refusal comes back as the same done
+        ``SubagentInfo`` :meth:`spawn` would return; ``None`` is the legacy
+        at-capacity answer."""
+        kwargs.pop("_from_queue", None)
+        kwargs.pop("_store_accepted", None)
+        prepared = self._admission.spawn_impl(task, _prepare_only=True, **kwargs)
+        assert not isinstance(prepared, ClaimPoint)  # never requested here
+        return prepared
+
+    async def spawn_async(self, task: str, **kwargs: Any) -> SubagentInfo | None:
+        """:meth:`spawn` for event-loop callers (``/api/spawn``).
+
+        Write-before-ack with the write OFF the loop: the policy gates run
+        first (``prepare_spawn``), the row is written on the store's dedicated
+        writer thread (``TaskStore.run``), and only then does the sync
+        ``spawn`` start the run with ``_store_accepted=True`` -- the SQLite
+        lock wait never blocks the loop, and the caller is still acked only
+        once the row exists. Without a durable store this is plain ``spawn``.
+        """
+        store = self._admission.taskq_store()
+        if store is None:
+            return self.spawn(task, **kwargs)
+        prepared = self.prepare_spawn(task, **kwargs)
+        if not isinstance(prepared, PreparedSpawn):
+            return prepared
+        # From the moment the row exists until this call has claimed or
+        # windowed it, the pump's refill must not pick it up: the awaits below
+        # are where a concurrent drain could otherwise start it twice.
+        admitting: set[str] = self.__dict__.setdefault("_admitting_ids", set())
+        admitting.add(prepared.agent_id)
+        try:
+            return await self._spawn_async_accepted(task, prepared, **kwargs)
+        finally:
+            # A pressure defer posted on the way out must be ON the row before
+            # the pump may refill it, or the next pass re-runs the gate on a
+            # row whose ``next_run_at`` is not set yet.
+            await self._admission.await_pending_defer(prepared.agent_id)
+            admitting.discard(prepared.agent_id)
+
+    async def _spawn_async_accepted(
+        self, task: str, prepared: PreparedSpawn, **kwargs: Any
+    ) -> SubagentInfo | None:
+        store = self._admission.taskq_store()
+        assert store is not None
+        store_err = await store.run(self._admission.taskq_accept_record, prepared.record)
+        if store_err:
+            sel().log_tool_invocation(
+                session_key=str(kwargs.get("parent_session_key") or ""),
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="refused_task_store",
+                metadata={"error": str(store_err)[:200], "subagent_id": prepared.agent_id},
+            )
+            return self._announce_rejection(
+                SubagentInfo(
+                    id=prepared.agent_id,
+                    task=redact_credentials(redact_exfiltration_urls(task)[0])[0],
+                    agent=str(kwargs.get("agent") or ""),
+                    parent_session_key=str(kwargs.get("parent_session_key") or ""),
+                    done=True,
+                    error=f"spawn refused: task store unavailable ({store_err})",
+                    error_code=self._admission.TASK_STORE_UNAVAILABLE_CODE,
+                    batch_id=str(kwargs.get("batch_id") or ""),
+                    batch_total=max(0, int(kwargs.get("batch_total") or 0)),
+                )
+            )
+        params = dict(prepared.params)
+        params.pop("_preassigned_id", None)
+        # No store I/O on the loop from here on: the window decision and the
+        # claim run on the writer thread; the sync re-entry only registers.
+        await self._admission.ensure_coordinator_async()
+        window_hint = await self._admission.taskq_should_window_async(prepared.agent_id)
+        common: dict[str, Any] = dict(
+            _preassigned_id=prepared.agent_id,
+            _store_accepted=True,
+            _window_hint=window_hint,
+            _child_registration=False,  # the W3 branch runs awaited, below
+        )
+        first: Any = self.spawn(**params, **common, _stop_before_claim=True)
+        if not isinstance(first, ClaimPoint):
+            if first is not None and first.queued and not first.done:
+                await self._admission.taskq_child_registered_async(first)
+            return first
+        # The slot is reserved (ClaimPoint); the claim is awaited off-loop and
+        # the re-entry consumes the reservation or releases it.
+        result = await self._admission.claim_and_start(
+            first, lambda claimed: self.spawn(**params, **common, _claimed=claimed)
+        )
+        if result is not None and not result.done and result.id in self._agents:
+            # Nested child of a parent blocked in spawn_sub_agents: the parent
+            # yields its slot (taskq.waits, W3) with the store I/O off-loop.
+            await self._admission.taskq_child_registered_async(result)
+        return result
 
     async def _safe_announce(self, info: SubagentInfo) -> None:
         return await self._admission._safe_announce_impl(info)
@@ -2436,6 +2807,11 @@ class SubagentManager:
     async def _rebuild_conversation_registry(self) -> None:
         return await self._continuation._rebuild_conversation_registry_impl()
 
+    def native_child_resume_refusal(self, conversation_id: str) -> str | None:
+        """Typed refusal when *conversation_id* is a harness-native child of a
+        live session (no conversation of its own; the parent is the lever)."""
+        return self._continuation.native_child_resume_refusal(conversation_id)
+
     def continue_conversation(
         self,
         conv_id: str,
@@ -2458,6 +2834,54 @@ class SubagentManager:
             cwd,
             _preassigned_id,
             _memory_mode=_memory_mode,
+        )
+
+    async def continue_conversation_async(
+        self,
+        conv_id: str,
+        task: str,
+        parent_session_key: str = "",
+        agent: str = "",
+        model: str | None = None,
+        max_turns: int = 0,
+        cwd: str = "",
+        _preassigned_id: str = "",
+        _memory_mode: str | None = None,
+    ) -> SubagentInfo | None:
+        return await self._continuation.continue_conversation_async_impl(
+            conv_id,
+            task,
+            parent_session_key,
+            agent,
+            model,
+            max_turns,
+            cwd,
+            _preassigned_id,
+            _memory_mode,
+        )
+
+    def _continue_prelude(
+        self,
+        conv_id: str,
+        task: str,
+        parent_session_key: str = "",
+        agent: str = "",
+        model: str | None = None,
+        max_turns: int = 0,
+        cwd: str = "",
+        _preassigned_id: str = "",
+        _memory_mode: str | None = None,
+    ) -> "SubagentInfo | dict[str, Any] | None":
+        return self._continuation._continue_prelude_impl(
+            conv_id,
+            task,
+            parent_session_key,
+            agent,
+            model,
+            max_turns,
+            cwd,
+            _preassigned_id,
+            _memory_mode,
         )
 
     def recorded_cwd(self, conv_id: str) -> str:
@@ -2511,6 +2935,28 @@ class SubagentManager:
     def _drain_queue(self) -> None:
         return self._admission._drain_queue_impl()
 
+    async def _drain_queue_async(self) -> None:
+        return await self._admission._drain_queue_async_impl()
+
+    async def _drain_queue_pass(self) -> None:
+        return await self._admission._drain_queue_pass_impl()
+
+    def _drain_queue_sync(
+        self,
+        *,
+        refill: Callable[..., int],
+        dispatch: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        return self._admission._drain_queue_sync_impl(refill=refill, dispatch=dispatch)
+
+    async def _dispatch_async(self, params: dict[str, Any]) -> SubagentInfo | None:
+        return await self._admission._dispatch_async_impl(params)
+
+    def _after_dispatch(
+        self, params: dict[str, Any], drained: SubagentInfo | None, *, refill: Callable[..., int]
+    ) -> None:
+        return self._admission._after_dispatch_impl(params, drained, refill=refill)
+
     async def _spawn_with_approval(self, info: SubagentInfo) -> None:
         return await self._admission._spawn_with_approval_impl(info)
 
@@ -2553,6 +2999,9 @@ class SubagentManager:
     def batch_members_pending(self, batch_id: str) -> bool:
         return self._waves.batch_members_pending_impl(batch_id)
 
+    async def batch_members_pending_async(self, batch_id: str) -> bool:
+        return await self._waves.batch_members_pending_async_impl(batch_id)
+
     def wave_has_live_nested_spawns(self, batch_id: str) -> bool:
         return self._waves.wave_has_live_nested_spawns_impl(batch_id)
 
@@ -2573,8 +3022,14 @@ class SubagentManager:
     def _sweep_stuck_waves(self, now: float) -> None:
         return self._waves._sweep_stuck_waves_impl(now)
 
+    async def _sweep_stuck_waves_async(self, now: float) -> None:
+        return await self._waves._sweep_stuck_waves_async_impl(now)
+
     def _sweep_digest_holds(self, now: float) -> None:
         return self._waves._sweep_digest_holds_impl(now)
+
+    async def _sweep_digest_holds_async(self, now: float) -> None:
+        return await self._waves._sweep_digest_holds_async_impl(now)
 
     def force_digest_flush(
         self,
@@ -2653,6 +3108,9 @@ class SubagentManager:
     def _queued_depth(self, parent_session_key: str) -> int:
         return self._run_events._queued_depth_impl(parent_session_key)
 
+    async def _queued_depth_async(self, parent_session_key: str) -> int:
+        return await self._run_events._queued_depth_async_impl(parent_session_key)
+
     @property
     def queued_count(self) -> int:
         """Return all not-yet-registered spawns in the stagger queue."""
@@ -2661,8 +3119,14 @@ class SubagentManager:
     def queued_count_for(self, parent_session_key: str) -> int:
         return self._run_events.queued_count_for_impl(parent_session_key)
 
+    async def queued_count_for_async(self, parent_session_key: str) -> int:
+        return await self._run_events.queued_count_for_async_impl(parent_session_key)
+
     def has_pending_work_for(self, parent_session_key: str) -> bool:
         return self._run_events.has_pending_work_for_impl(parent_session_key)
+
+    async def has_pending_work_for_async(self, parent_session_key: str) -> bool:
+        return await self._run_events.has_pending_work_for_async_impl(parent_session_key)
 
     def _emit_queue_depth(self, parent_session_key: str, batch_id: str = "") -> None:
         return self._run_events._emit_queue_depth_impl(parent_session_key, batch_id)
@@ -2695,6 +3159,57 @@ class SubagentManager:
     async def _run_inner(self, info: SubagentInfo, session_key: str) -> None:
         return await self._run_events._run_inner_impl(info, session_key)
 
+    # Facades for the completion / stop-reason handling and the lane-slot
+    # waits that live in subagent_manager/run.py.
+    def _stop_recovery_wanted(self, info: SubagentInfo, stop: Any) -> bool:
+        return self._run_events._stop_recovery_wanted_impl(info, stop)
+
+    async def _yield_for_stop_recovery(self, info: SubagentInfo, event: Any) -> str | None:
+        return await self._run_events._yield_for_stop_recovery_impl(info, event)
+
+    async def _await_lane_resume(
+        self, info: SubagentInfo, *, reason: str, timeout: float, request: bool = True
+    ) -> bool:
+        return await self._run_events._await_lane_resume_impl(
+            info, reason=reason, timeout=timeout, request=request
+        )
+
+    async def _yield_for_dependency(self, info: SubagentInfo, signal: Any) -> bool:
+        return await self._run_events._yield_for_dependency_impl(info, signal)
+
+    async def _yield_for_infra_retry(self, info: SubagentInfo, infra: Any) -> str | None:
+        return await self._run_events._yield_for_infra_retry_impl(info, infra)
+
+    def _dependency_coordinator(self) -> Any:
+        return self._monitor._dependency_coordinator_impl()
+
+    def dependency_coordinator(self) -> Any:
+        """The manager's ONE ``DependencyCoordinator`` (or None without a store).
+
+        Public seam for the gateway: it registers this process-wide so the
+        main chat and the monitors read the shared ``retry_at`` per scope, and
+        subscribes the runner adapters' waiters to the same schedule.
+        """
+        return self._dependency_coordinator()
+
+    async def dependency_coordinator_async(self) -> Any:
+        """:meth:`dependency_coordinator` for an event-loop caller.
+
+        The FIRST build runs ``rebuild()`` over every waiting row, so a loop
+        caller that may be the first one takes it on the store's writer thread.
+        """
+        await self._admission.ensure_coordinator_async()
+        return self._dependency_coordinator()
+
+    def _taskq_pump(self) -> None:
+        self._monitor._taskq_pump_impl()
+
+    def _stop_error_text(self, info: SubagentInfo, stop: Any, event: Any) -> str:
+        return self._run_events._stop_error_text_impl(info, stop, event)
+
+    def _taskq_note_stop_recovery(self, info: SubagentInfo, data: dict[str, Any]) -> None:
+        self._run_events._taskq_note_stop_recovery_impl(info, data)
+
     def _should_use_session_sharing(self, info: SubagentInfo) -> bool:
         return self._run_events._should_use_session_sharing_impl(info)
 
@@ -2702,6 +3217,18 @@ class SubagentManager:
         self, info: SubagentInfo, session_key: str, agent: str
     ) -> "LLMProvider":
         return await self._run_events._create_shared_session_impl(info, session_key, agent)
+
+    # Facades for the session-start gate's late-adoption path;
+    # implementations live in run.py.
+    async def _await_late_start(
+        self, info: SubagentInfo, session_key: str, exc: Exception
+    ) -> "LLMProvider":
+        return await self._run_events._await_late_start_impl(info, session_key, exc)
+
+    async def _bind_shared_handle(
+        self, info: SubagentInfo, session_key: str, runtime: "AcpRuntime", handle: Any
+    ) -> "LLMProvider":
+        return await self._run_events._bind_shared_handle_impl(info, session_key, runtime, handle)
 
     def _get_parent_runtime(self, parent_session_key: str) -> "AcpRuntime | None":
         return self._run_events._get_parent_runtime_impl(parent_session_key)

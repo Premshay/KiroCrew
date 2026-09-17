@@ -33,6 +33,7 @@ import { computeReorderedFolders } from '../utils/reorderFolders'
 import { computeRecentRank, recencyTintShadow, clampTintCount } from '../utils/recencyTint'
 import { computeActiveSubtree, folderIsHidden, folderOffersHide } from '../utils/folderVisibility'
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
+import { highlightText } from '../utils/highlightText'
 import { boardCollapseKey, boardColumnFromDroppableId, loadBoardFolderCollapse, persistBoardOverride, persistClearFolderOverrides, clearFolderOverrides } from '../utils/boardFolderCollapse'
 import { slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
 import { toolStatusLabel } from '../utils/toolStatusLabel'
@@ -75,7 +76,7 @@ import { ChannelBrandIcon, hasChannelBrandIcon } from '../components/ChannelBran
 import { RemoteCrewChip } from '../components/RemoteCrewChip'
 import TagManagerList from '../components/TagManagerList'
 import { DndDraggable, DndDroppable, pointerWithinDeepest, closestEdge } from '../components/dnd'
-import { bySidebarOrder, collectFolderSubtreeIds } from '../utils/folderTree'
+import { bySidebarOrder, collectFolderSubtreeIds, folderNameText } from '../utils/folderTree'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import type { PaletteBoost } from '../utils/sessionColors'
@@ -113,6 +114,32 @@ import { compareText, fmtDateFields, fmtList } from '../i18n/format'
 /** Date-segment header between rows. Marks the geometry a row's own rect cannot
  *  see, so the hover hold can anchor on a pixel offset headers contribute to. */
 const DATE_HEADER_SELECTOR = '[data-date-header]'
+
+/**
+ * Row markers a reveal targets, by the kind of thing being revealed.
+ *
+ * Held as attribute NAMES rather than finished selectors because a reveal targets
+ * one specific row, so the selector has to carry an escaped value. Keeping the
+ * names here and composing in {@link rowSelector} means the two reveal callers
+ * name a kind and never spell a selector, so the "targeting goes through
+ * `data-session-row`, never `data-slot-key`" invariant lives in one place instead
+ * of in a comment at each call site.
+ */
+const REVEAL_ROW_ATTR = { session: 'data-session-row', folder: 'data-folder-row' } as const
+
+/**
+ * Second-choice marker for a FOLDER reveal, consulted only when the folder has no
+ * header row. That is the board lane: it renders a folder as a column body with
+ * this drop marker and no `data-folder-row` anywhere, so the primary selector
+ * cannot match and the reveal would expire silently. It is deliberately NOT in
+ * `REVEAL_ROW_ATTR` — this marker is ambiguous by design (the tree lane renders it
+ * too, on the folder BODY, and every board column renders its own copy), so it is
+ * only ever reached after the unambiguous header lookup has already missed.
+ */
+const REVEAL_FOLDER_FALLBACK_ATTR = 'data-folder-drop'
+
+/** Attribute selector for one row, with the value escaped for `querySelector`. */
+const rowSelector = (attr: string, value: string) => `[${attr}="${window.CSS.escape(value)}"]`
 /** Marks a dormant-collapse region, so the hold can tell which side of the
  *  expander the pointer found a row on. */
 const STALE_REGION_SELECTOR = '[data-stale-region]'
@@ -708,6 +735,12 @@ interface Slot {
   // An unanswered question card the turn is parked on. Its own subtitle, and it
   // suppresses the "your turn" dot for the same reason an approval does.
   needs_input?: boolean
+  // The NEWEST assistant reply ends with an `[OPTIONS:]` ask (payload
+  // `has_options`). Read by the loop-waiting subtitle: an armed loop whose
+  // newest reply is an explicit ask is holding for the user, not working.
+  // Newest-reply-only by construction — any later turn that talks over the
+  // marker clears it, so a superseded ask can never be resurrected (#10615).
+  has_options?: boolean
   // The transcript shows the last turn ending without a reply (trailing error
   // row or unanswered user row) — the state behind the composer's Resume
   // button. Always false while a turn runs. Read by the goal-loop subtitle so a
@@ -811,6 +844,30 @@ const TERMINAL_SOURCE_LINK_STATES: ReadonlySet<SourceLinkState> = new Set<Source
  * always did. */
 function showsChipCi(state: SourceLinkState | undefined): boolean {
   return state === undefined || !TERMINAL_SOURCE_LINK_STATES.has(state)
+}
+
+/** The channels a session row wears a brand mark for: one per channel that is
+ * currently connected, in first-seen order.
+ *
+ * Connected means at least one delivery on that channel is not paused — the
+ * same rule the session menu's Connect/Disconnect row uses to pick its verb, so
+ * the mark on the row and the verb in the menu can never disagree. `direction`
+ * plays no part: a channel the session was born in and a channel it was later
+ * connected to are the same fact to the reader of the list, and the one thing a
+ * disconnect changes on either is `paused`.
+ *
+ * One per channel, not one per link. A session born in Discord and mirrored to
+ * Discord carries two links for it, and a reader should see one Discord mark,
+ * not two.
+ *
+ * Exported for its own test; the row is the only production caller. */
+export function connectedChannelLinks(links: readonly SessionLink[] | undefined): SessionLink[] {
+  const byChannel = new Map<string, SessionLink>()
+  for (const link of links ?? []) {
+    if (link.paused || byChannel.has(link.channel)) continue
+    byChannel.set(link.channel, link)
+  }
+  return [...byChannel.values()]
 }
 
 /** The single status glyph a change chip shows, or null for none.
@@ -1908,6 +1965,16 @@ const SessionRow = memo(function SessionRow({
       detailedSubagentsRunning: subagentCount > 0,
     })
     const goalLoopStalled = !!goalLoop && !!s.interrupted && !liveWorkSupersedesInterruption
+    // An armed loop whose NEWEST reply is an explicit `[OPTIONS:]` ask. The
+    // loop cannot advance that decision itself — the user owes the answer — so
+    // it must not read as unattended progress (the goal-loop branch below).
+    // Gated on the newest reply only: `s.has_options` drops the moment any
+    // later turn talks over the marker, so a superseded ask can never be
+    // resurrected — the staleness that reverted the buried-[OPTIONS:] scan
+    // (#10615). Idle only: a running turn IS the loop working, and a stalled
+    // loop's danger row (below) outranks an ask its dead turn cannot collect.
+    const loopWaiting = (!!goalLoop || monitorOwnsRunning)
+      && !!s.has_options && !s.running && !s.interrupted
     // Ordinary sessions need the same reboot/error visibility as goal loops,
     // without claiming that an older interrupted parent turn has stopped live
     // child work. A goal loop keeps its richer cycle-specific treatment below;
@@ -2057,6 +2124,49 @@ const SessionRow = memo(function SessionRow({
           <div className={ROW_STATUS_LINE_CLS} title={needsInputLabel}>
             <MessageCircleQuestionMark size={ROW_ICON_PX} className="shrink-0" style={{ color: 'var(--info)' }} aria-hidden />
             <span className="truncate font-medium" style={{ color: 'var(--info)' }}>{needsInputLabel}</span>
+          </div>
+        ),
+      },
+      {
+        // An armed loop (goal loop or structured monitor) whose newest reply is
+        // an `[OPTIONS:]` ask. Ranked with the owed-decision cluster, above
+        // every "working" signal: the loop is holding for the user, and the
+        // pulsing goal-loop row below would read as unattended progress —
+        // the exact confusion this branch exists to remove. Static glyph,
+        // warn ink: nothing is running. The trailing detail keeps the loop's
+        // identity (cycle count / monitor status) so the row still says WHICH
+        // automation is waiting, per the goalLoopDetail pattern.
+        key: 'loop_waiting',
+        when: loopWaiting,
+        build: () => (
+          // The tooltip names the cycle count so the trailing fraction is
+          // glossed, not orphaned: the UX blind-reader could not tell the
+          // waiting row's trailing "Loop 18/80" and the progress row's leading
+          // "Loop 7/24" were the same counter. Monitors have no fraction, so
+          // they keep the generic title.
+          <div
+            className={ROW_STATUS_LINE_CLS}
+            title={goalLoop
+              ? (goalLoop.maxCycles > 0
+                ? i18nT('pages.chatSidebar.loop_waiting_title_cycle', { count: goalLoop.cycleCount, total: goalLoop.maxCycles })
+                : i18nT('pages.chatSidebar.loop_waiting_title_cycle_2', { count: goalLoop.cycleCount }))
+              : i18nT('pages.chatSidebar.loop_waiting_title')}
+          >
+            {goalLoop
+              ? <Goal size={ROW_ICON_PX} className="shrink-0" style={{ color: 'var(--warn)' }} aria-hidden />
+              : <MonitorRadar actionRunning={false} className="text-warn" />}
+            {/* Monitors get a visible "paused" gloss instead of the live
+                status string: "Waiting on you · Monitor · active" read as a
+                contradiction (UX span 4a221cc48433). Goal loops keep the
+                cycle fraction but PREFIX it with "Paused at" — reusing the
+                working row's "Loop N/M" verbatim made the two rows read as
+                the same state (UX span 03f52eaca7f7); the tooltip above
+                carries the full sentence. */}
+            <span className="truncate"><span className="font-medium" style={{ color: 'var(--warn)' }}>{i18nT('pages.chatSidebar.loop_waiting_on_you')}</span><span className="text-muted"> · {goalLoop
+              ? (goalLoop.maxCycles > 0
+                ? i18nT('pages.chatSidebar.loop_waiting_cycle', { count: goalLoop.cycleCount, total: goalLoop.maxCycles })
+                : i18nT('pages.chatSidebar.loop_waiting_cycle_2', { count: goalLoop.cycleCount }))
+              : i18nT('pages.chatSidebar.loop_waiting_monitor')}</span></span>
           </div>
         ),
       },
@@ -2619,60 +2729,34 @@ const SessionRow = memo(function SessionRow({
                 </span>
               )}
               {isOut && <span className="text-accent" title={i18nT('pages.chatSidebar.popped_out_to_a_separate_window')}><ExternalLink size={10} /></span>}
-              {slotChannelNamespace(s.key) && (() => {
-                // PROVENANCE ONLY: where this conversation started. That is
-                // history, so it stays true after the channel is disconnected —
-                // which is exactly why this glyph must not describe delivery.
-                // It previously said the session was "two-way" with the channel
-                // and that replies "are delivered there", a claim the disconnect
-                // makes false while this glyph still renders. Current delivery is
-                // the separate set of glyphs below, which filter on `paused`.
-                //
-                // `unified` gets its own key rather than an interpolated label:
-                // it has no proper noun, and an English article fragment inside
-                // a translated sentence is not something a locale can repair.
-                const ns = slotChannelNamespace(s.key)
-                const label = ns === 'unified'
-                  ? i18nT('pages.chatSidebar.started_in_direct_message')
-                  : i18nT('pages.chatSidebar.started_in_channel', { channel: slotChannelLabel(s.key) })
-                // Brand mark rather than a generic bubble: the row already tells
-                // you a chat happened, so the only new information this glyph can
-                // carry is WHICH app it came from. Namespaces with no mark of
-                // their own keep the bubble — ChannelBrandIcon would fall through
-                // to its `Link2` default, which reads as live mirroring and would
-                // collide with the link glyphs rendered just below.
-                return (
-                  <span className="text-muted shrink-0 inline-flex items-center" title={label} aria-label={label}>
-                    {hasChannelBrandIcon(ns) ? <ChannelBrandIcon channel={ns} size={10} /> : <MessageSquare size={10} />}
-                  </span>
-                )
-              })()}
-              {/* Live mirroring, per channel. The origin glyph above is derived
-               *  from the slot KEY (channelOrigin.ts) and already says where the
-               *  conversation STARTED, so this renders only channels currently
-               *  DELIVERING and never double-badges an origin. It replaces a
-               *  `linked_to_slack` Link glyph that fired for ANY channel, because
-               *  every non-Slack transport writes its id into slack_channel_id.
+              {/* One brand mark per channel this session is CONNECTED to, read
+               *  from `s.links` and nothing else. A second glyph used to be drawn
+               *  here from the slot KEY for the channel the session was born in.
+               *  That is a prefix read of the identity, and the property it
+               *  rendered is not one the session address model has — its §5.3
+               *  names capability, attachment and ingress, and "where did this
+               *  start?" is the question it retires (docs/request-for-change/
+               *  rfc-session-address-model.md). It also could not react to a
+               *  disconnect: a Slack-born row kept its mark after the user chose
+               *  "Disconnect from Slack", while the identical mark on a
+               *  dashboard-born row one line down vanished. So the strip reads
+               *  the one state the menu row toggles — `paused` — and nothing
+               *  about where the session came from.
                *
-               *  `both` counts as delivering: a two-way binding is strictly MORE
-               *  connected than a one-way mirror, and filtering on `out` alone left
-               *  a session with messages flowing both ways looking unlinked. A
-               *  disconnected channel is excluded — it keeps its direction, so
-               *  without the `paused` check the sidebar promised delivery for a
-               *  session whose own menu one row away reads "Connect to X". */}
-              {(s.links ?? [])
-                .filter(link => link.direction !== 'origin' && !link.paused)
-                .map((link, index) => (
-                  <span
-                    key={`${link.channel}:${link.direction}:${index}`}
-                    className="inline-flex text-[10px]"
-                    role="img"
-                    aria-label={i18nT('pages.chatSidebar.connected_to', { label: link.label })}
-                    title={i18nT('pages.chatSidebar.connected_to', { label: link.label })}
-                  >
-                    <ChannelBrandIcon channel={link.channel} size={10} />
-                  </span>
-                ))}
+               *  It replaces a `linked_to_slack` Link glyph that fired for ANY
+               *  channel, because every non-Slack transport writes its id into
+               *  slack_channel_id. */}
+              {connectedChannelLinks(s.links).map(link => (
+                <span
+                  key={link.channel}
+                  className="inline-flex text-[10px]"
+                  role="img"
+                  aria-label={i18nT('pages.chatSidebar.connected_to', { label: link.label })}
+                  title={i18nT('pages.chatSidebar.connected_to', { label: link.label })}
+                >
+                  <ChannelBrandIcon channel={link.channel} size={10} />
+                </span>
+              ))}
               {/* Runs-elsewhere marker, first in the strip for the same reason it
                *  is first on a federated search row: it qualifies the whole row,
                *  so a user scanning the list should meet it before the per-session
@@ -4605,9 +4689,17 @@ function ChatSidebar({
   // A folder drops out of the active list only when the user hid it AND it is
   // currently empty (no active session in its subtree). Re-engaging a session
   // clears `hidden` server-side, so visibility is `!hidden || hasActive`.
+  //
+  // A reveal adds its target's ancestor chain to `revealForcedVisible`, which
+  // overrides the hide for as long as this component lives. That is the whole
+  // mechanism: the user asked to SEE this folder now, and "hide when empty" still
+  // describes what they want on their next visit, so the rule is stepped over
+  // rather than rewritten. It is component state on purpose — nothing is persisted,
+  // so the override cannot outlive the visit it was needed for.
+  const [revealForcedVisible, setRevealForcedVisible] = useState<Set<string>>(new Set())
   const isFolderHidden = useCallback(
-    (f: ChatFolder) => folderIsHidden(f, foldersWithActiveSubtree),
-    [foldersWithActiveSubtree],
+    (f: ChatFolder) => !revealForcedVisible.has(f.id) && folderIsHidden(f, foldersWithActiveSubtree),
+    [foldersWithActiveSubtree, revealForcedVisible],
   )
 
   // Folder IDs whose sessions are excluded from the flat lane because the
@@ -4638,6 +4730,39 @@ function ChatSidebar({
     () => (slotFilter.trim().length >= SEARCH_MIN_CHARS ? slotSearchRanks : null),
     [slotFilter, slotSearchRanks],
   )
+
+  /**
+   * Folders whose OWN NAME contains the search box's text, plus every folder
+   * nested inside them. `null` when the box is empty or nothing matched.
+   *
+   * This is what makes typing a folder's name into the sidebar find the FOLDER and
+   * not just sessions that happen to mention it. Without it the text filter only
+   * ever asked about a session's own fields, so searching a container's name hid
+   * every session in it — the row you were looking for disappeared as you typed
+   * its parent's name.
+   *
+   * The set is the whole SUBTREE, not just the matched folder: naming a parent is
+   * how you ask for what is under it, and a match that stopped at the parent's own
+   * direct children would drop its grandchildren for no reason a reader could
+   * state. Plain substring, not `fuzzyMatch`, to match how the same box already
+   * tests a session title — one box, one notion of "matches".
+   */
+  const folderNameMatchIds = useMemo(() => {
+    const q = slotFilter.trim().toLowerCase()
+    if (!q) return null
+    // `isFolderHidden` is part of the predicate, not a tidy-up. A "hide when empty"
+    // folder renders no row, so counting its name as a match would make the lane's
+    // empty state say "the folders above matched by name" with no folder above it --
+    // the same contradiction the wording exists to remove, arriving through a
+    // different door. It costs nothing in session retention either: the hide only
+    // applies while the subtree holds no active session, so a hidden folder has none
+    // to keep.
+    const matched = folders.filter(f => !isFolderHidden(f) && folderNameText(f).toLowerCase().includes(q))
+    if (matched.length === 0) return null
+    const ids = new Set<string>()
+    for (const f of matched) for (const id of collectFolderSubtreeIds(folders, f.id)) ids.add(id)
+    return ids
+  }, [slotFilter, folders, isFolderHidden])
 
   /**
    * THE single declaration of every filter dimension. `filteredSlots`,
@@ -4687,6 +4812,15 @@ function ChatSidebar({
         filtersRow: slot => {
           if (!slotFilter) return true
           const q = slotFilter.toLowerCase()
+          // The slot's own CONTAINER matched by name: the query named the folder,
+          // so everything filed in it is what was asked for. Checked before the
+          // per-slot fields because it is the cheapest test and, for a folder
+          // search, the only one that can pass. `localSlotFolder`, not a raw
+          // `slotFolders` lookup, for the same reason the folder row's own count
+          // uses it: a peer row is never in a local folder, and a colliding key
+          // would otherwise pull a session this machine does not own into it.
+          const container = localSlotFolder(slot, slotFolders)
+          if (folderNameMatchIds && container && folderNameMatchIds.has(container)) return true
           const titleMatch = (slot.title || '').toLowerCase().includes(q)
           // Both id spellings match by PREFIX, so progressive typing works while an
           // interior run of the digits — an accident, not an id — does not.
@@ -4750,7 +4884,7 @@ function ChatSidebar({
         },
       },
     ]
-  }, [activeFilters, activeTagIds, filterTagIds, clearTagFilter, slotFilter, searchRanked, _derivedLookup, filterHiddenSubtree, folders, slotFolders])
+  }, [activeFilters, activeTagIds, filterTagIds, clearTagFilter, slotFilter, folderNameMatchIds, searchRanked, _derivedLookup, filterHiddenSubtree, folders, slotFolders])
 
   // State and in the memo deps on purpose, not a ref: a frozen run caches its
   // stale list against new deps, so clearing a ref would invalidate nothing.
@@ -5393,6 +5527,35 @@ function ChatSidebar({
     return m
   }, [folders])
 
+  /**
+   * Open `folderId` and every collapsed folder above it, so a reveal aimed at or
+   * inside it has something to scroll to.
+   *
+   * Both reveals start from a folder that must itself open: a session reveal starts
+   * at the row's CONTAINER, and a folder reveal starts at its TARGET. There is no
+   * caller that wants the ancestors without the folder they were reached through,
+   * which is why this takes no "include self" switch — an earlier version did, and
+   * it silently stopped expanding the folder a revealed session was filed in.
+   *
+   * Cycle-guarded: `folders.json` is hand-editable and a `parent_id` loop must not
+   * hang the tab. Board columns keep per-column collapsed overrides, which are
+   * dropped for each folder on the path as well — otherwise the revealed row stays
+   * hidden in whichever column's local state still holds an ancestor shut.
+   */
+  const expandFolderAncestors = useCallback((folderId: string) => {
+    const visited = new Set<string>()
+    const expand = (fid: string) => {
+      if (visited.has(fid)) return
+      visited.add(fid)
+      const f = folders.find(x => x.id === fid)
+      if (f?.collapsed) updateFolderMutation.mutate({ id: fid, body: { collapsed: false } })
+      setBoardCollapse(prev => clearFolderOverrides(prev, fid))
+      persistClearFolderOverrides(fid)
+      if (f?.parent_id) expand(f.parent_id)
+    }
+    expand(folderId)
+  }, [folders, updateFolderMutation])
+
   // Reveal-in-sidebar: consume the pending request held in the store (set by
   // the session header menu). Store state rather than a window event on
   // purpose: this component is unmounted while the drawer is collapsed, so an
@@ -5404,11 +5567,15 @@ function ChatSidebar({
   // Serial + pending timer for the in-flight reveal: a newer reveal cancels
   // the older retry loop, and unmount stops the pending timer outright.
   const revealRunRef = useRef<{ seq: number; timer: number | null }>({ seq: 0, timer: null })
-  // Row currently flashing as reveal confirmation, keyed by slot. Rendered
-  // into the row's className (not imperative classList mutation) so the
-  // highlight survives row remounts — list reorders and re-keyed renders
-  // would silently drop a manually-added DOM class.
-  const [revealFlash, setRevealFlash] = useState<{ key: string; fading: boolean } | null>(null)
+  // Row currently flashing as reveal confirmation. Rendered into the row's
+  // className (not imperative classList mutation) so the highlight survives row
+  // remounts — list reorders and re-keyed renders would silently drop a
+  // manually-added DOM class.
+  //
+  // `kind` is part of the identity, not decoration: a session is keyed by slot key
+  // and a folder by folder id, two namespaces that can collide, so without it a
+  // folder reveal could light up a session row that happens to share the string.
+  const [revealFlash, setRevealFlash] = useState<{ kind: 'session' | 'folder'; key: string; fading: boolean } | null>(null)
   const revealFlashTimersRef = useRef<number[]>([])
   useEffect(() => () => {
     const run = revealRunRef.current
@@ -5416,9 +5583,98 @@ function ChatSidebar({
     revealFlashTimersRef.current.forEach(clearTimeout)
   }, [])
   const sidebarRootRef = useRef<HTMLDivElement>(null)
+  /**
+   * Scroll a revealed row into view and flash it, retrying until the row exists.
+   *
+   * Shared by the session reveal and the folder reveal because the hard parts are
+   * identical for both: the target may not be in the DOM yet (ancestor expansion
+   * and filter resets land through mutations and re-renders, so a single
+   * fixed-delay attempt silently loses the race — #912 D3), the retry must be
+   * bounded, and a newer reveal must cancel an older one's pending loop. The two
+   * callers share ONE `revealRunRef` serial for that last reason: a folder reveal
+   * arriving mid-session-reveal supersedes it rather than racing it.
+   *
+   * The selector is derived from `kind` via {@link REVEAL_ROW_ATTR} and queried
+   * against this sidebar's subtree, never `document`: other surfaces and
+   * board-view duplicate renders carry the same row markers (#912 D5).
+   *
+   * A FOLDER has a second marker, and it is not redundant. `data-folder-row` is
+   * the tree lane's folder header and exists nowhere else, but the BOARD lane
+   * renders a folder as a column body carrying `data-folder-drop` and no header
+   * row at all — so in board view the primary selector matches nothing and the
+   * bounded retry loop just expires, leaving the click with no scroll and no
+   * flash. The fallback is ordered, never merged into one selector: in the tree
+   * lane `data-folder-drop` is ALSO rendered (the folder body wrapper), so a
+   * combined query could return whichever sorts first in the DOM. Trying the
+   * header first means the ambiguous marker is only ever consulted in the lane
+   * that has no header to be ambiguous with.
+   */
+  const runReveal = useCallback((kind: 'session' | 'folder', key: string, target: string) => {
+    const selectors = [rowSelector(REVEAL_ROW_ATTR[kind], target)]
+    if (kind === 'folder') selectors.push(rowSelector(REVEAL_FOLDER_FALLBACK_ATTR, target))
+    const run = revealRunRef.current
+    run.seq += 1
+    const seq = run.seq
+    if (run.timer != null) { clearTimeout(run.timer); run.timer = null }
+    let attempt = 0
+    const tryScroll = () => {
+      if (revealRunRef.current.seq !== seq) return
+      let el: HTMLElement | null = null
+      for (const sel of selectors) {
+        const found = sidebarRootRef.current?.querySelector<HTMLElement>(sel) ?? null
+        // A row inside a collapsed folder stays MOUNTED — FolderBody animates
+        // height rather than unmounting, and marks the body aria-hidden + inert
+        // (contract at the FolderBody call site). `[inert]` is this file's
+        // canonical "hidden row" spelling, the same filter the digit-target scan
+        // and sessionRowsInScope apply.
+        //
+        // Skipping it is what makes the retry loop correct rather than decorative.
+        // The first attempt runs SYNCHRONOUSLY, before the `expandFolderAncestors`
+        // setState has committed, so on the common path — search a folder, jump to
+        // it, ancestors still collapsed — the target is present and inert. Accepting
+        // it scrolled a height-0 collapsed row into view and returned, and the
+        // retry never fired because it only fires when nothing was found at all.
+        el = found && !found.closest('[inert]') ? found : null
+        if (el) break
+      }
+      if (!el) {
+        attempt += 1
+        if (attempt <= REVEAL_MAX_ATTEMPTS) run.timer = window.setTimeout(tryScroll, REVEAL_RETRY_MS)
+        // Row never became visible: either it never rendered (board lane with no
+        // matching column) or it stayed inert for the whole budget (an ancestor
+        // that never expanded). Not user-visible either way, so leave a trace for
+        // bug reports instead of vanishing.
+        // eslint-disable-next-line no-console -- records that the bounded retry loop exhausted REVEAL_MAX_ATTEMPTS; without it an unrendered row is indistinguishable from a reveal that worked
+        else console.debug('reveal-in-sidebar: row never became visible for', kind, key)
+        return
+      }
+      const reduce = !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+      if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'center' })
+      // Visible confirmation even when the row never moved (#912 D4): an
+      // accent outline that fades out (classes in index.css, rendered via
+      // revealFlash state). Outline, not background — the target is usually
+      // the ACTIVE row, which already carries the accent-subtle background —
+      // and not box-shadow, which the recency tint drives inline. The fade is
+      // a non-spatial color transition, so it needs no reduced-motion branch
+      // (same treatment as MarkdownPanel's flashCommentRow); the scroll above
+      // handles the spatial half. A newer flash replaces the older one
+      // immediately, so two rows are never highlighted at once.
+      revealFlashTimersRef.current.forEach(clearTimeout)
+      const same = (f: { kind: string; key: string } | null) => !!f && f.kind === kind && f.key === key
+      setRevealFlash({ kind, key, fading: false })
+      const t1 = window.setTimeout(() => setRevealFlash(f => (same(f) ? { kind, key, fading: true } : f)), REVEAL_FLASH_HOLD_MS)
+      const t2 = window.setTimeout(() => setRevealFlash(f => (same(f) ? null : f)), REVEAL_FLASH_HOLD_MS + REVEAL_FLASH_FADE_MS)
+      revealFlashTimersRef.current = [t1, t2]
+    }
+    tryScroll()
+  }, [])
   useEffect(() => {
     if (!revealRequest) return
-    const { key } = revealRequest
+    // One field carries both kinds, so each effect answers for its own and leaves
+    // the other's request alone. Two pending requests can no longer exist, which is
+    // what removes the ordering hazard the old field pair had.
+    if (revealRequest.kind !== 'session') return
+    const key = revealRequest.target
     // Consume immediately: the request must not survive to a later remount.
     dispatch(clearSlotReveal())
     const slot = localSlots.find(s => s.key === key)
@@ -5447,79 +5703,79 @@ function ChatSidebar({
       const container = slotFolders[key] || 'root'
       setStaleExpanded(prev => (prev.has(container) ? prev : new Set(prev).add(container)))
     }
-    if (slot.folder_id) {
-      // Expand all collapsed ancestor folders. Cycle-guarded: a hand-edited
-      // folders.json can contain a parent_id loop and must not hang the tab.
-      const visited = new Set<string>()
-      const expand = (fid: string) => {
-        if (visited.has(fid)) return
-        visited.add(fid)
-        const f = folders.find(x => x.id === fid)
-        if (f?.collapsed) updateFolderMutation.mutate({ id: fid, body: { collapsed: false } })
-        // A reveal must win in every board column too: drop any per-column
-        // collapsed overrides, or the revealed row stays hidden in columns
-        // whose local state keeps this ancestor collapsed.
-        setBoardCollapse(prev => clearFolderOverrides(prev, fid))
-        persistClearFolderOverrides(fid)
-        if (f?.parent_id) expand(f.parent_id)
-      }
-      expand(slot.folder_id)
+    if (slot.folder_id) expandFolderAncestors(slot.folder_id)
+    // Targeted by the `session` row marker (the ORIGIN-QUALIFIED identity), not
+    // `data-slot-key`. Once peer rows are merged into this list the raw slot
+    // key is no longer a unique namespace — a remote row with a byte-identical
+    // deterministic key carries the same `data-slot-key`, and `querySelector`
+    // returns whichever sorts first in the DOM, so a reveal aimed at the local
+    // session could scroll to the peer's row instead. `slot` above is resolved
+    // from the LOCAL `slots` prop, so its identity is the right target.
+    runReveal('session', key, sessionRowIdentity(slot))
+  }, [revealRequest, dispatch, localSlots, revealBlockingFilters, expandFolderAncestors, runReveal, isStaleExempt, slotFolders, staleCollapseMs, sortKey])
+  // ── Reveal a FOLDER row ───────────────────────────────────────────────────
+  // The folder twin of the session reveal above, driven by the command launcher's
+  // Folders group and the palette's Folders tab ("search a folder, land on it").
+  // Same store-held request + replay guarantee, because either surface can be opened
+  // from a page where this sidebar is not mounted at all. It reads the SAME
+  // `revealRequest` field and answers only for `kind === 'folder'`; the effects stay
+  // separate because this one clears the text filter and the folder hides, which the
+  // session effect must not name (it consults the filter registry instead --
+  // ChatSidebar.revealFilterDimensions pins that).
+  useEffect(() => {
+    if (!revealRequest) return
+    if (revealRequest.kind !== 'folder') return
+    const folderId = revealRequest.target
+    // Consume immediately: the request must not survive to a later remount.
+    dispatch(clearSlotReveal())
+    const target = folders.find(f => f.id === folderId)
+    if (!target) {
+      // Deleted folder, or a request that outlived the folder list it named.
+      // eslint-disable-next-line no-console -- a reveal's only success signal is the scroll+flash, so this early return is the one path where the user's click provably did nothing and nothing else records it
+      console.debug('reveal-in-sidebar: no folder for id', folderId)
+      return
     }
-    // The row may not be in the DOM yet: ancestor expansion and the filter
-    // resets above land through mutations and re-renders. Retry until the row
-    // exists (bounded), instead of one fixed-delay attempt that silently gives
-    // up whenever the re-render loses the race (#912 D3).
-    const run = revealRunRef.current
-    run.seq += 1
-    const seq = run.seq
-    if (run.timer != null) { clearTimeout(run.timer); run.timer = null }
-    let attempt = 0
-    const tryScroll = () => {
-      if (revealRunRef.current.seq !== seq) return
-      // Scoped to this sidebar, not `document`: other surfaces (and board-view
-      // duplicate renders) can carry the same data-slot-key (#912 D5).
-      //
-      // Targeted by `data-session-row` (the ORIGIN-QUALIFIED identity), not
-      // `data-slot-key`. Once peer rows are merged into this list the raw slot
-      // key is no longer a unique namespace — a remote row with a byte-identical
-      // deterministic key carries the same `data-slot-key`, and `querySelector`
-      // returns whichever sorts first in the DOM, so a reveal aimed at the local
-      // session could scroll to the peer's row instead. `slot` above is resolved
-      // from the LOCAL `slots` prop, so its identity is the right target.
-      // Invariant: DOM row targeting goes through `data-session-row`;
-      // `data-slot-key` stays what its name says and is only safe where a single
-      // origin is in play.
-      const el = sidebarRootRef.current?.querySelector<HTMLElement>(
-        `[data-session-row="${window.CSS.escape(sessionRowIdentity(slot))}"]`,
-      )
-      if (!el) {
-        attempt += 1
-        if (attempt <= REVEAL_MAX_ATTEMPTS) run.timer = window.setTimeout(tryScroll, REVEAL_RETRY_MS)
-        // Row never appeared (e.g. board lane with no matching column). Not
-        // user-visible, so leave a trace for bug reports instead of vanishing.
-        // eslint-disable-next-line no-console -- records that the bounded retry loop exhausted REVEAL_MAX_ATTEMPTS; without it an unrendered row is indistinguishable from a reveal that worked
-        else console.debug('reveal-in-sidebar: row never rendered for', key)
-        return
-      }
-      const reduce = !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-      if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'center' })
-      // Visible confirmation even when the row never moved (#912 D4): an
-      // accent outline that fades out (classes in index.css, rendered via
-      // revealFlash state). Outline, not background — the target is usually
-      // the ACTIVE row, which already carries the accent-subtle background —
-      // and not box-shadow, which the recency tint drives inline. The fade is
-      // a non-spatial color transition, so it needs no reduced-motion branch
-      // (same treatment as MarkdownPanel's flashCommentRow); the scroll above
-      // handles the spatial half. A newer flash replaces the older one
-      // immediately, so two rows are never highlighted at once.
-      revealFlashTimersRef.current.forEach(clearTimeout)
-      setRevealFlash({ key, fading: false })
-      const t1 = window.setTimeout(() => setRevealFlash(f => (f && f.key === key ? { key, fading: true } : f)), REVEAL_FLASH_HOLD_MS)
-      const t2 = window.setTimeout(() => setRevealFlash(f => (f && f.key === key ? null : f)), REVEAL_FLASH_HOLD_MS + REVEAL_FLASH_FADE_MS)
-      revealFlashTimersRef.current = [t1, t2]
+    // A text filter hides every folder whose subtree has no match, so a reveal
+    // arriving while the box holds an unrelated query would scroll to nothing.
+    // Clearing it is the same "reveal means show me this row" rule the session
+    // reveal applies to its own filter dimensions.
+    setSlotFilter('')
+    // Un-hide the folder and its ancestors from the flat lane. Hiding a parent
+    // hides the subtree (`filterHiddenSubtree`), so clearing only the target
+    // itself would leave it hidden behind an ancestor.
+    const chain = new Set<string>()
+    for (let cur: ChatFolder | undefined = target, guard = 0; cur && guard < folders.length + 1; guard += 1) {
+      chain.add(cur.id)
+      cur = cur.parent_id ? folders.find(f => f.id === cur!.parent_id) : undefined
     }
-    tryScroll()
-  }, [revealRequest, dispatch, localSlots, folders, revealBlockingFilters, updateFolderMutation, isStaleExempt, slotFolders, staleCollapseMs, sortKey])
+    setFilterHiddenFolders(prev => {
+      if (![...chain].some(id => prev.has(id))) return prev
+      const next = new Set(prev)
+      for (const id of chain) next.delete(id)
+      safeSetItem(HIDDEN_FOLDERS_LS_KEY, JSON.stringify([...next]))
+      return next
+    })
+    // "Hide when empty" is a second, independent reason a row can be absent, and it
+    // is a SERVER field: an empty hidden folder is dropped from the lane with no
+    // disclosure row listing it, so there is nothing in the DOM for the retry loop
+    // to find. It is force-shown for this reveal instead of being un-hidden on the
+    // server. The rule still describes what the user wants on their next visit --
+    // they asked to see this folder now, not to stop hiding it -- so a persisted
+    // write would answer a question they did not ask, and could not be undone from
+    // the row it reveals.
+    setRevealForcedVisible(chain)
+    // Expand the folder and every collapsed ancestor. The folder ITSELF opening is
+    // part of the destination here: landing on a folder means seeing what is in it.
+    expandFolderAncestors(folderId)
+    // A folder row only exists in the tree lane -- the flat lane renders sessions
+    // with no folder blocks at all -- so a reveal has to leave it. Deliberately
+    // WITHOUT writing `FLAT_VIEW_LS_KEY`: the lane is a persisted preference, and a
+    // flat-lane user who jumps to one folder has asked to see that folder, not to
+    // change which lane they open the app in. The switch lasts for this visit and
+    // their preference comes back on reload.
+    setFlatView(false)
+    runReveal('folder', folderId, folderId)
+  }, [revealRequest, dispatch, folders, expandFolderAncestors, runReveal, setSlotFilter, setFilterHiddenFolders, setFlatView])
   const renameCommit = useCallback((id: string, name: string) => {
     if (name.trim()) updateFolderMutation.mutate({ id, body: { name: name.trim() } })
     setEditingId(null)
@@ -6097,6 +6353,14 @@ function ChatSidebar({
     // own subtree (cycle guard). One O(1) lookup, computed once per row.
     const subtreeIds = folderSubtrees.get(folder.id) ?? collectFolderSubtreeIds(folders, folder.id)
     const reparentTargets = folders.filter(f => !subtreeIds.has(f.id))
+    // The board lane's answer to a reveal. A column has no folder HEADER row, so the
+    // tree's `folderFlash` has nothing to attach to here and a board reveal used to
+    // scroll to the column and then sit there unmarked -- the scroll alone is not the
+    // confirmation, since the target is often already on screen and nothing moves.
+    // Same state, same classes, attached to the box the reveal actually found.
+    const boardFolderFlash = revealFlash?.kind === 'folder' && revealFlash.key === folder.id
+      ? (revealFlash.fading ? 'fade' : 'flash')
+      : null
     const count = childSlots.length + deepChildren.filter(cf => {
       const cfSlots = filteredSlots.filter(s => colSlotKeys.has(sessionRowIdentity(s)) && localSlotFolder(s, slotFolders) === cf.id)
       return cfSlots.length > 0 || descendantMatch(
@@ -6133,7 +6397,13 @@ function ChatSidebar({
       <div ref={setNodeRef}
         data-testid={`col-${columnId}-folder-${folder.id}`}
         data-folder-drop={folder.id}
-        className={`rounded-md transition-all mb-0.5${isOver ? ' ring-1 ring-accent' : ''}`}
+        // `folder-col` is the board lane's counterpart to the tree's `folder-row`,
+        // and it exists for the flash: the reveal outline in index.css is declared
+        // COMPOUND (`.folder-row.session-reveal-flash`), so adding the flash class to
+        // a box carrying neither row class attaches a class that no rule matches and
+        // paints nothing. Naming this box gives the same declaration something to
+        // key on here.
+        className={`folder-col rounded-md transition-all mb-0.5${isOver ? ' ring-1 ring-accent' : ''}${boardFolderFlash ? ` session-reveal-flash${boardFolderFlash === 'fade' ? ' session-reveal-flash-fade' : ''}` : ''}`}
         onDragOver={e => { e.preventDefault(); e.stopPropagation(); e.currentTarget.classList.add('ring-1', 'ring-accent') }}
         onDragLeave={e => { e.stopPropagation(); e.currentTarget.classList.remove('ring-1', 'ring-accent') }}
         onDrop={e => {
@@ -6392,7 +6662,7 @@ function ChatSidebar({
         digitBadge={!isPeer && digitModifierHeld ? shortcutDigitByKey.get(s.key) : undefined}
         isRenaming={!isPeer && renamingSlot === s.key} renamingHere={renamingHere}
         renameValue={renamingHere ? renameValue : ''}
-        revealFlash={!isPeer && revealFlash?.key === s.key ? (revealFlash.fading ? 'fade' : 'flash') : null}
+        revealFlash={!isPeer && revealFlash?.kind === 'session' && revealFlash.key === s.key ? (revealFlash.fading ? 'fade' : 'flash') : null}
         dragInFlight={!!activeDrag}
         activeDraggedKey={activeDrag?.type === 'session' ? activeDrag.id : null}
         activeDraggedPinnedIndex={activeDrag?.type === 'session' ? (pinnedRank.get(activeDrag.id) ?? -1) : -1}
@@ -6508,6 +6778,51 @@ function ChatSidebar({
     )
   }
 
+  /**
+   * While the search box narrows the list, does this folder's subtree still put
+   * ANYTHING on screen? Answered without rendering, because the render cannot
+   * answer it: a nested block's `[]` is returned from inside `DndDraggable`'s own
+   * children function, which runs after `childNodes.push` has already committed
+   * the wrapper — so `childNodes.length > 0` reads true for a subtree that draws
+   * nothing, and both the drop gate and the header count believed it.
+   *
+   * That is not cosmetic. Searching "archive" kept `Sydney Property` on screen
+   * wearing the count `1` — the `1` being a subfolder that did not render —
+   * directly above the note saying no sessions matched. The row named nothing the
+   * query asked for and the number contradicted the sentence beneath it.
+   *
+   * Each clause mirrors one thing `renderFolderBlock` actually draws, so the
+   * predicate cannot drift from the render: own surviving sessions, the query
+   * having named this folder (`folderNameMatchIds` already covers a matched
+   * folder's whole subtree), the create-failure notice this folder owns, the
+   * "N hidden folders" peek row filed in this container, and recursively any
+   * child folder the tree is willing to draw. `visited` is the same cycle guard
+   * `renderFolderBlock` carries, for the same reason: `parent_id` comes off disk.
+   */
+  const narrowedSubtreeShowsSomething = (folder: ChatFolder, visited = new Set<string>()): boolean => {
+    if (visited.has(folder.id)) return false
+    visited.add(folder.id)
+    if (filteredSlots.some(s => localSlotFolder(s, slotFolders) === folder.id)) return true
+    if (folderNameMatchIds?.has(folder.id)) return true
+    if (folderCreateError?.folderId === folder.id) return true
+    if (hiddenByContainer.get(folder.id)?.length) return true
+    return folders.some(f => f.parent_id === folder.id
+      && !isFolderHidden(f) && !isFolderFilteredOut(f)
+      && narrowedSubtreeShowsSomething(f, visited))
+  }
+
+  /**
+   * The child folders this container will draw, in the order it draws them — the
+   * narrow's verdict included. Sorted, not raw array order: a subfolder's `order`
+   * is set by a drag AND by chat_folder_move's before/after, and the cache order
+   * reflects neither.
+   */
+  const drawableChildFolders = (folder: ChatFolder): ChatFolder[] =>
+    folders.filter(f => f.parent_id === folder.id
+      && !isFolderHidden(f) && !isFolderFilteredOut(f)
+      && (!listNarrowed || narrowedSubtreeShowsSomething(f)))
+      .sort(bySidebarOrder)
+
   const renderFolderHeader = (folder: ChatFolder, dragHandleProps?: React.HTMLAttributes<HTMLElement>, emptyBody = false) => {
     // Same predicate `renderFolderBlock` renders by, so the number describes what
     // the row can actually show. Counting a hidden-when-empty child made the count
@@ -6515,7 +6830,12 @@ function ChatSidebar({
     // count still said 1 - and the row then presented as a toggle with nothing to
     // toggle. A folder the user hid is a folder they asked not to see, so it is
     // not part of what this row holds.
-    const childFolders = folders.filter(f => f.parent_id === folder.id && !isFolderHidden(f) && !isFolderFilteredOut(f))
+    //
+    // `drawableChildFolders` carries the narrow's verdict for the same reason: with
+    // a search active, a child whose whole subtree draws nothing is not part of
+    // what this row holds either, and counting it printed a number the body below
+    // could not account for.
+    const childFolders = drawableChildFolders(folder)
     // `localSlotFolder`, not a raw `slotFolders` lookup: a peer row is never in a
     // folder, and a peer key colliding with a local one would otherwise count a
     // session this machine does not own toward the folder it does.
@@ -6535,8 +6855,20 @@ function ChatSidebar({
     // own subtree (cycle guard). One O(1) lookup, computed once per row.
     const subtreeIds = folderSubtrees.get(folder.id) ?? collectFolderSubtreeIds(folders, folder.id)
     const reparentTargets = folders.filter(f => !subtreeIds.has(f.id))
+    // Reveal confirmation for THIS folder. The `kind` check is what keeps a
+    // session reveal from lighting up a folder whose id equals that slot key.
+    const folderFlash = revealFlash?.kind === 'folder' && revealFlash.key === folder.id
+      ? (revealFlash.fading ? 'fade' : 'flash')
+      : null
     return (
       <div key={`folder-header-${folder.id}`}
+        // The reveal target for this folder (command palette Folders tab), and the
+        // only marker that identifies a folder ROW. Deliberately not the existing
+        // `data-folder-drop`: that one is a drop zone and is rendered once per
+        // BOARD COLUMN as well as here, so `querySelector` would return whichever
+        // copy sorts first in the DOM — the same ambiguity the session reveal
+        // avoids by targeting `data-session-row` instead of `data-slot-key`.
+        data-folder-row={folder.id}
         // Non-interactive container (role="group"): the row holds a collapse
         // toggle button + action buttons, so it must NOT itself be a button —
         // an interactive element can't legally contain other interactive
@@ -6594,7 +6926,7 @@ function ChatSidebar({
         // wearing the same one is the whole reason the previous round's dead click
         // read as broken. Its cluster is already visible at rest, so hover has
         // nothing left to reveal here either.
-        className={`group relative flex items-center gap-2 px-3.5 py-1.5 rounded-md text-sm text-muted transition-all${emptyRow ? '' : ' hover:text-text hover:bg-bg-hover'} ${draggable ? 'cursor-grab active:cursor-grabbing' : ''}`}>
+        className={`folder-row group relative flex items-center gap-2 px-3.5 py-1.5 rounded-md text-sm text-muted transition-all${emptyRow ? '' : ' hover:text-text hover:bg-bg-hover'} ${draggable ? 'cursor-grab active:cursor-grabbing' : ''}${folderFlash ? ` session-reveal-flash${folderFlash === 'fade' ? ' session-reveal-flash-fade' : ''}` : ''}`}>
         {editingId === folder.id && editScope === 'list' ? (
           <>
             <FolderGlyph color={folder.color} size={14} open={!collapsed} />
@@ -6654,8 +6986,18 @@ function ChatSidebar({
                 testId={`folder-collapse-${folder.id}`} />
               {/* Double-click rename is a mouse-only power shortcut; the accessible
                *  path is the ⋯-menu Rename item, so scope-disable the interaction rule. */}
+              {/* The matched letters are marked while the search box narrows the list.
+               *  Without it a folder row surfaced by a NAME match carries no cue at
+               *  all: the row for "Sydney Property" on a search for "archive" (its
+               *  subfolder) is indistinguishable from one whose own name matched, so
+               *  the lane reads as arbitrary. The launcher already marks its matched
+               *  letters, and this is the same signal in the surface the user was
+               *  looking at. `highlightText` returns the plain string when the term
+               *  is empty or absent, so ancestor and subtree rows — which have
+               *  nothing to mark — are untouched, and that difference is itself the
+               *  cue: the marked row is the one that explains the result. */}
               {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
-              <span className="flex-1 text-[13px] font-medium text-text truncate text-left" title={i18nT('pages.chatSidebar.double_click_to_rename')} onDoubleClick={e => { e.stopPropagation(); setEditingId(folder.id); setEditScope('list'); setEditName(folder.name) }}>{folder.name}</span>
+              <span className="flex-1 text-[13px] font-medium text-text truncate text-left" title={i18nT('pages.chatSidebar.double_click_to_rename')} onDoubleClick={e => { e.stopPropagation(); setEditingId(folder.id); setEditScope('list'); setEditName(folder.name) }}>{highlightText(folderNameText(folder), slotFilter.trim(), false, -1)}</span>
               {/* Channel-owned folder (created by per-channel session filing):
                *  show the channel's brand mark so the folder reads as "these are
                *  the Discord conversations" at a glance. Guarded the same way the
@@ -6822,16 +7164,20 @@ function ChatSidebar({
   const renderFolderBlock = (folder: ChatFolder, depth: number, visited = new Set<string>(), dragHandleProps?: React.HTMLAttributes<HTMLElement>, forceCollapsed = false): React.ReactNode[] => {
     if (depth > 10 || visited.has(folder.id)) return []
     visited.add(folder.id)
-    // Sorted, not raw array order: a subfolder's `order` is set by a drag AND by
-    // chat_folder_move's before/after, and the cache order reflects neither.
-    const childFolders = folders.filter(f => f.parent_id === folder.id).sort(bySidebarOrder)
     const childSlots = filteredSlots.filter(s => localSlotFolder(s, slotFolders) === folder.id)
     const childNodes: React.ReactNode[] = []
     // Nested subfolders are plain draggables (not sortables): dragging one
     // re-parents it — drop on another folder to move inside, or on the root
     // lane to move to the top level. The subtree ids ride along in the drag
     // data so collision detection can exclude self/descendants as targets.
-    for (const cf of childFolders.filter(cf => !isFolderHidden(cf) && !isFolderFilteredOut(cf))) {
+    //
+    // `drawableChildFolders`, not a raw parent_id filter: while the list is
+    // narrowed a child whose subtree draws nothing must be skipped HERE, before
+    // the push. The nested render returns `[]` from inside DndDraggable's
+    // children function, which runs long after this push, so a wrapper committed
+    // now can never be taken back — and `childNodes.length` is what the drop gate
+    // below and the header count both read.
+    for (const cf of drawableChildFolders(folder)) {
       childNodes.push(
         <DndDraggable key={`subfolder-drag-${cf.id}`} id={cf.id}
           data={{ type: 'folder', nested: true, subtree: [...(folderSubtrees.get(cf.id) ?? collectFolderSubtreeIds(folders, cf.id))] }}
@@ -6882,7 +7228,16 @@ function ChatSidebar({
     // unless this folder owns the active create-failure notice: a create fired
     // from the folder-picker menu can target a folder the narrow is hiding,
     // and eliding it would make the failure exactly as silent as before #8229.
-    if (listNarrowed && childNodes.length === 0 && folderCreateError?.folderId !== folder.id) return []
+    //
+    // Nor when the folder ITSELF is what the query named. An empty folder whose
+    // name matches is still the answer to "where is that folder" — dropping it
+    // would mean the one search guaranteed to name it is also the one search that
+    // cannot show it. `folderNameMatchIds` covers the matched folder's subtree, so
+    // a matched parent keeps its empty children too: they are part of what the
+    // query asked to see.
+    if (listNarrowed && childNodes.length === 0
+      && folderCreateError?.folderId !== folder.id
+      && !folderNameMatchIds?.has(folder.id)) return []
     // Wrap children in a bordered container so the folder's extent is visually
     // clear when multiple folders are open. Only wrap when there's content,
     // otherwise the FolderBody would render an empty 1px-tall strip with a line.
@@ -8207,9 +8562,23 @@ function ChatSidebar({
                     {renderHiddenReveal('root', hiddenByContainer.get('root') ?? [], 0)}
                     {/* Every folder block and the ungrouped bucket read
                         filteredSlots, so an empty one means nothing can render
-                        below — say so rather than leaving a blank lane. */}
+                        below — say so rather than leaving a blank lane.
+                        A folder-NAME search is the case where the plain wording
+                        lies: the matched folder rows are rendered directly above
+                        this line, so "No sessions match" alone reads as a
+                        contradiction ("no conversations matched, even though two
+                        folders did"). `folderNameMatchIds` is non-null only when
+                        at least one folder name matched, which is exactly when
+                        those rows are on screen, so it is the condition — not a
+                        proxy for it.
+                        The wording deliberately does NOT point at "the folders
+                        above": the tree keeps a folder that merely holds a
+                        subfolder, so a row that matched nothing can sit in that
+                        list, and a sentence claiming it matched is the same
+                        contradiction with the roles reversed. It claims only that
+                        a folder name matched; the marks say which row. */}
                     {filteredSlots.length === 0 && listNarrowed && (
-                      <div className="px-3 py-4 text-[12px] text-muted">{i18nT('pages.chatSidebar.no_sessions_match')}</div>
+                      <div className="px-3 py-4 text-[12px] text-muted">{i18nT(folderNameMatchIds ? 'pages.chatSidebar.no_sessions_match_folders' : 'pages.chatSidebar.no_sessions_match')}</div>
                     )}
                     {/* Ungrouped sessions live in a headerless droppable bucket
                      *  (folderId: null) that fills the remaining height below the

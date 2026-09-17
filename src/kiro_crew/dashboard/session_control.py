@@ -46,7 +46,12 @@ from kiro_crew.config.resolution import DEGRADED_WHOLE_CONFIG
 from kiro_crew.dashboard.chat_delivery import sanitize_outbound
 from kiro_crew.dashboard.chat_folders import _unhide_folder
 from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES as _PERSISTENCE_TRANSIENT_ROLES
-from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
+from kiro_crew.dashboard.chat_persistence import _pin_private_agent_assignment
+from kiro_crew.dashboard.chat_utils import (
+    drained_to_thread,
+    effective_session_key,
+    slot_history_key,
+)
 from kiro_crew.dashboard.create_rate_limit import SESSION_CREATE, allow_create
 from kiro_crew.dashboard.state import (
     MAX_LIVE_SLOTS,
@@ -56,9 +61,10 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.dashboard.stop_retry import allow_escalation
 from kiro_crew.history import metadata_now_iso, transcript_stem
-from kiro_crew.memory_stores import named_store_or_empty
+from kiro_crew.memory_stores import memory_store_version, named_store_or_empty
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
+from kiro_crew.session_agent_selection import record_agent_selection
 from kiro_crew.validation import MAX_LONG_STRING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -957,6 +963,11 @@ async def create_session(
     if caller_slot is None:
         raise SessionControlError("caller session is not open", code="caller_not_open", status=404)
     _refuse_ineligible_creator(state, caller_slot)
+    caller_memory_identity = (
+        slot_history_key(caller_slot),
+        caller_slot.agent,
+        caller_slot.memory_store,
+    )
 
     # The child is created in the CALLER'S workspace, not the default one.
     # Workspace is the memory boundary and `authorize_target` refuses a
@@ -1062,6 +1073,33 @@ async def create_session(
             code="agent_unresolved",
         )
 
+    # A workspace is not a memory silo: it can host agents on different stores,
+    # so a private member could otherwise mint a worker on `default`/global or a
+    # peer's store. require_memory_delegation is the guard the private spawn path
+    # uses -- a no-op for a caller with no private record, a refusal of any
+    # target_store that is not a private V2 caller's own. Off-loop: it reads the
+    # caller's binding from disk.
+    from kiro_crew.context import require_memory_delegation
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    try:
+        await asyncio.to_thread(
+            require_memory_delegation, log, caller_session_key, bindings.memory_store_name
+        )
+        # Only a protected caller record can authorize a child's private binding.
+        # Agent selection and editable slot metadata are not private authority.
+        caller_private_store = await asyncio.to_thread(
+            read_private_session_store, caller_session_key
+        )
+    except (UnknownMemoryStore, ValueError) as exc:
+        # UnknownMemoryStore is the delegation refusal proper; ValueError is the
+        # corrupt/unreadable binding-file case require_memory_delegation surfaces
+        # through read_private_session_store. Both are a store the caller may not
+        # delegate into -- map to one refusal rather than letting the bare
+        # ValueError escape as an unhandled 500.
+        raise SessionControlError(str(exc), code="agent_store_mismatch") from exc
+
     # SlotOrigin.USER, not SYSTEM: the visibility semantics must match an
     # ordinary session, because the point of creating it here is that the user
     # can see and take over the work. SYSTEM-origin slots fall outside the
@@ -1093,6 +1131,19 @@ async def create_session(
     # decision input to the allocation and everything above this point was read
     # before the coroutine suspended.
 
+    from kiro_crew.context import require_memory_delegation
+
+    try:
+        await asyncio.to_thread(
+            require_memory_delegation, log, caller_memory_identity[0], bindings.memory_store_name
+        )
+    except (OSError, ValueError):
+        raise SessionControlError(
+            "cannot verify delegation within the caller's memory assignment",
+            code="memory_delegation_denied",
+            status=403,
+        ) from None
+
     if folder_id:
         # Confirmed under the folder-store lock -- the only place existence
         # cannot go stale against a concurrent delete (see `read_folders`) --
@@ -1112,7 +1163,7 @@ async def create_session(
 
     # Re-resolved and re-gated HERE, adjacent to the allocation, because every
     # decision above was made before this coroutine suspended -- for the
-    # project directory, the config load, and the folder confirmation -- and the
+    # project directory, agent bindings, memory delegation and folder confirmation -- and the
     # inputs to those decisions are live state that can flip inside any of those
     # windows.
     #
@@ -1144,6 +1195,15 @@ async def create_session(
         raise SessionControlError(
             "caller session changed workspace while the session was being created",
             code="caller_workspace_changed",
+        )
+    if (
+        slot_history_key(live_caller),
+        live_caller.agent,
+        live_caller.memory_store,
+    ) != caller_memory_identity:
+        raise SessionControlError(
+            "caller session changed memory assignment while the session was being created",
+            code="caller_memory_changed",
         )
     _refuse_ineligible_creator(state, live_caller)
     # The child's origin tag, read off the caller that is live NOW -- see the
@@ -1289,6 +1349,39 @@ async def create_session(
         if title.strip():
             slot.title = sanitize_outbound(title.strip())[:200]
             slot._titled = True
+        # Bind only within the caller's protected store. An unbound/global caller
+        # may select a private agent, but that selection must not confer private
+        # authority. Its child keeps the ordinary, unbound creation behavior.
+        # The turn path reads this binding on the child's effective key, not its
+        # editable memory_store metadata. Write it before birth persistence and
+        # publication so a member's worker can take its first turn.
+        _store_name = named_store_or_empty(slot.memory_store)
+        if _store_name and caller_private_store == _store_name:
+            from kiro_crew.member_memory_auth import bind_private_session_store
+
+            try:
+                if await asyncio.to_thread(memory_store_version, _store_name) == 2:
+                    await asyncio.to_thread(
+                        bind_private_session_store, effective_session_key(slot), _store_name
+                    )
+            except BaseException as exc:
+                # Both off-loop hops can be cancelled. Retract before the suspended
+                # broadcast flushes, but never orphan a turn already in flight.
+                if not slot.running and not slot.messages:
+                    state._slots.pop(slot.key, None)
+                    state.push_slots_update()
+                if not isinstance(exc, Exception):
+                    raise
+                logger.warning(
+                    "create_session: binding child %s to private store %s failed; retracting",
+                    slot.key,
+                    _store_name,
+                    exc_info=True,
+                )
+                raise SessionControlError(
+                    "could not bind the new session to the caller's private memory",
+                    code="agent_store_mismatch",
+                ) from exc
         # Persist at birth. `save_slot_off_loop` cannot do this: the save it wraps
         # returns early on an empty message window -- a full save has nothing to
         # write -- so a freshly created session, which has no messages by
@@ -1301,10 +1394,34 @@ async def create_session(
         # behind is the worse of the two outcomes, because the caller sees an error and
         # the session exists anyway. Same retraction the fork path uses on a failed
         # build.
+        session_key = slot_history_key(slot)
+        native_context = state.sessions.get_provider(session_key) is not None or bool(
+            state.sessions.resumable_sid(session_key)
+        )
+        birth_persisted = False
+
+        def _persist_birth(metadata: dict[str, Any]) -> None:
+            nonlocal birth_persisted
+            # Authorized creation selects this member before there is a transcript.
+            # The first-turn guard cannot later infer that authority from metadata:
+            # even this empty birth record would look like unverified V1 history.
+            _pin_private_agent_assignment(
+                session_key,
+                agent_name,
+                cfg,
+                conversation_log=log,
+                native_context=native_context,
+            )
+            # Preserve the namespace resolved for this request, including a
+            # template later imported as a same-named private member. Automatic
+            # publication cannot overwrite a newer explicit owner selection.
+            record_agent_selection(session_key, agent_name, bindings)
+            log.update_metadata(session_key, metadata)
+            birth_persisted = True
+
         try:
-            await asyncio.to_thread(
-                log.update_metadata,
-                slot_history_key(slot),
+            await drained_to_thread(
+                _persist_birth,
                 {
                     "_type": "metadata",
                     # The slot's OWN durable identity, and its origin, both of which
@@ -1353,7 +1470,7 @@ async def create_session(
                     ),
                 },
             )
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # Retract, but never at the cost of work already in flight. The slot is
             # addressable from the moment `get_or_create_slot` publishes it, which is
             # before this await, so a turn can have started on it while the write was
@@ -1361,7 +1478,17 @@ async def create_session(
             # with nothing pointing at it -- unreachable, unstoppable, and invisible to
             # the stop verb. A phantom session that vanishes on the next restart is the
             # lesser harm, so liveness wins over tidiness and the slot stays.
-            if not slot.running and not slot.messages:
+            # Drain before deciding: cancellation cannot leave a worker writing
+            # identity/history after this handler retracts its slot. A completed
+            # birth survives cancellation just as a turn already in flight does.
+            # Protected identity stays pinned even on failure; a concurrent turn
+            # may already have consumed it, and history cannot revoke authority.
+            if (
+                not birth_persisted
+                and not slot.running
+                and not slot.messages
+                and state._slots.get(slot.key) is slot
+            ):
                 state._slots.pop(slot.key, None)
             state.push_slots_update()
             raise

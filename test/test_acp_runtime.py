@@ -34,6 +34,7 @@ import pytest
 from spawn_test_helpers import strip_spawn_shim
 
 from kiro_crew.acp.client import _OVERSIZE_DRAIN_MAX_BYTES
+from kiro_crew.acp.harness import SessionExtras
 from kiro_crew.acp.runtime import (
     _REQUEST_TIMEOUT,
     _SESSION_NEW_TIMEOUT,
@@ -44,6 +45,7 @@ from kiro_crew.acp.runtime import (
     AcpSessionHandle,
     _ColdStartAdmission,
 )
+from kiro_crew.acp.session_handle import NATIVE_CHILD_ROSTER_CAP
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KAS,
@@ -51,6 +53,7 @@ from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_SUBAGENT_ACTIVITY,
+    EVENT_SUBAGENT_LIST,
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
     JSONRPC_METHOD_NOT_FOUND,
@@ -66,8 +69,704 @@ from kiro_crew.acp.types import (
     METHOD_SET_MODE,
     JsonRpcMessage,
 )
+from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
+from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED
 
 # ── Harness ──
+
+
+@pytest.fixture
+def kas_readiness_wire(monkeypatch, tmp_path):
+    """Real demux and session startup; only the subprocess and clock are fake."""
+    from types import SimpleNamespace
+
+    import kiro_crew.acp.runtime as runtime_mod
+    import kiro_crew.acp.session_handle as sh
+
+    rt, reader, proc = _make_runtime()
+    rt._acp_backend = ACP_BACKEND_KAS
+    rt._can_load_session = True
+    rt._work_dir = tmp_path
+    clock = [0.0]
+    monkeypatch.setattr(sh, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+    monkeypatch.setattr(rt, "_session_start_budget", AsyncMock(return_value=30.0))
+    monkeypatch.setattr(
+        rt,
+        "_kas_custom_agents",
+        AsyncMock(
+            return_value=SessionExtras(
+                custom_agents=[
+                    {
+                        "id": "worker",
+                        "tools": ["@kirocrew-core", "@kirocrew-dashboard"],
+                        "mcpServers": {"kirocrew-core": {}, "external": {}},
+                    },
+                    {"id": "inactive", "mcpServers": {"kirocrew-work": {}}},
+                ]
+            )
+        ),
+    )
+    sent = asyncio.Queue()
+    reads = asyncio.Queue()
+    proc.stdin.write.side_effect = lambda raw: sent.put_nowait(json.loads(raw))
+    original_init = AcpSessionHandle.__init__
+
+    def observe_queue(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        get = self._queue.get
+
+        async def observed_get():
+            reads.put_nowait(None)
+            return await get()
+
+        monkeypatch.setattr(self._queue, "get", observed_get)
+
+    monkeypatch.setattr(AcpSessionHandle, "__init__", observe_queue)
+
+    async def take(queue):
+        return await asyncio.wait_for(queue.get(), timeout=3.0)
+
+    def status(
+        state="connecting", sid="ready-session", *, origin="client", extra_servers=(), **extra
+    ):
+        # ``origin=None`` reproduces the captured kiro-cli 2.18.0 wire: no
+        # ``_meta`` on ANY entry, not a foreign origin on one of them.
+        meta = (
+            {}
+            if origin is None
+            else {"_meta": {"kiro": {"resource": {"source": {"origin": origin}}}}}
+        )
+        _feed(
+            reader,
+            {
+                "method": "_kiro/mcp/status",
+                "params": {
+                    "sessionId": sid,
+                    "servers": [
+                        {"name": "kirocrew-core", "status": state, **meta, **extra},
+                        {"name": "kirocrew-dashboard", "status": "connected", **meta},
+                        {"name": "external", "status": "failed", "errorMessage": "irrelevant"},
+                        *({"name": name, "status": "connected", **meta} for name in extra_servers),
+                    ],
+                },
+            },
+        )
+
+    def tags(*names, sid="ready-session"):
+        _feed(
+            reader,
+            {
+                "method": "_kiro/tools/didChange",
+                "params": {
+                    "sessionId": sid,
+                    "tags": [{"source": "mcp", "tag": f"@{name}/some_tool"} for name in names],
+                },
+            },
+        )
+
+    async def handshake(
+        resume,
+        *,
+        switch=True,
+        pre_ready=False,
+        pre_frames=(),
+        injected=None,
+        session_key="",
+        agent_name="worker",
+    ):
+        kwargs = {"cwd": tmp_path, "agent": agent_name, "session_key": session_key}
+        servers = injected if injected is not None else [{"name": "kirocrew-dashboard"}]
+        if resume:
+            # Load gets the session injection through the existing overlay seam.
+            monkeypatch.setattr(
+                runtime_mod,
+                "pooled_session_servers",
+                lambda *_: servers,
+            )
+            start = rt.load_session("", "ready-session", **kwargs)
+        else:
+            start = rt.create_session(mcp_servers=servers, **kwargs)
+        task = asyncio.create_task(start)
+        request = await take(sent)
+        assert request["method"] == (METHOD_SESSION_LOAD if resume else METHOD_SESSION_NEW)
+        # The projection reaches the wire with the ACTIVE agent's hoistable
+        # managed declarations carried in the session-level array instead of the
+        # block (``hoist_managed_servers``); everything else is byte-identical.
+        projection = rt._kas_custom_agents.return_value.custom_agents
+        sent_agents = request["params"]["_meta"]["kiro"]["customAgents"]
+        assert len(sent_agents) == len(projection)
+        wire_names = [entry["name"] for entry in request["params"]["mcpServers"]]
+        assert len(wire_names) == len(set(wire_names)), "a name must appear once on the wire"
+        for sent_agent, projected in zip(sent_agents, projection):
+            hoisted = {
+                name
+                for name, entry in (projected.get("mcpServers") or {}).items()
+                if projected.get("id") == agent_name
+                and name in KIROCREW_BIN_MCP_SERVERS
+                and isinstance(entry.get("command"), str)
+                and entry.get("command")
+                and name not in {e["name"] for e in servers}
+            }
+            expected = dict(projected)
+            kept = {
+                k: v for k, v in (projected.get("mcpServers") or {}).items() if k not in hoisted
+            }
+            if kept:
+                expected["mcpServers"] = kept
+            else:
+                expected.pop("mcpServers", None)
+            assert sent_agent == expected
+            for name in hoisted:
+                assert name in wire_names
+                element = next(e for e in request["params"]["mcpServers"] if e["name"] == name)
+                assert element["type"] == "stdio"
+                assert element["command"] == projected["mcpServers"][name]["command"]
+                assert element["env"] == [
+                    {"name": k, "value": str(v)}
+                    for k, v in (projected["mcpServers"][name].get("env") or {}).items()
+                ]
+        if pre_ready:
+            status("connected")
+            tags("kirocrew-core", "kirocrew-dashboard")
+        for frame in pre_frames:
+            _feed(reader, frame)
+        _feed(
+            reader,
+            {
+                "id": request["id"],
+                "result": {
+                    "sessionId": "ready-session",
+                    "modes": {
+                        "currentModeId": "before" if switch else agent_name,
+                        "availableModes": [{"id": agent_name}],
+                    },
+                },
+            },
+        )
+        mode = await take(sent)
+        assert mode["method"] == METHOD_SET_MODE
+        _feed(reader, {"id": mode["id"], "result": {}})
+        return task
+
+    return SimpleNamespace(
+        runtime=rt,
+        reader=reader,
+        sent=sent,
+        reads=reads,
+        take=take,
+        clock=clock,
+        status=status,
+        tags=tags,
+        handshake=handshake,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+@pytest.mark.parametrize("revoked", [False, True], ids=["valid", "revoked"])
+async def test_derived_worker_identity_keeps_freshness_and_readiness(
+    kas_readiness_wire, monkeypatch, tmp_path, resume, revoked
+):
+    from kiro_crew import agent, agent_state
+    from kiro_crew.acp.harness import harness_for
+    from kiro_crew.config import paths as paths_mod
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: agents_dir)
+    monkeypatch.setattr(paths_mod, "kiro_agents_dir", lambda: agents_dir)
+    monkeypatch.setattr(agent_state, "config_dir", lambda: tmp_path / "derived-state")
+    default = agents_dir / "kirocrew.json"
+    spec = {
+        "name": "kirocrew",
+        "prompt": "Complete the assigned work.",
+        "tools": ["@kirocrew-core"],
+        "mcpServers": {"kirocrew-core": {"command": "unused"}},
+    }
+    default.write_text(json.dumps(spec), encoding="utf-8")
+    await asyncio.to_thread(agent._install_worker_agent)
+    key = "subagent:derived-worker"
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras(
+        "kirocrew-worker", work_dir=tmp_path, session_key=key
+    )
+    assert extras.derived_spec_snapshot is not None
+    for server in ("kirocrew-core", "kirocrew-work"):
+        assert extras.custom_agents[0]["mcpServers"][server]["env"]["KIROCREW_SESSION_KEY"] == key
+    wire = kas_readiness_wire
+    monkeypatch.setattr(wire.runtime, "_kas_custom_agents", AsyncMock(return_value=extras))
+    terminate = AsyncMock()
+    monkeypatch.setattr(wire.runtime, "terminate_session", terminate)
+    if revoked:
+        # The host will receive the old payload. Ready MCP reports must not
+        # authorize it after the owner's source grants have changed.
+        spec["mcpServers"] = {}
+        default.write_text(json.dumps(spec), encoding="utf-8")
+
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    try:
+        start = await wire.handshake(
+            resume,
+            pre_ready=revoked,
+            injected=[],
+            session_key=key,
+            agent_name="kirocrew-worker",
+        )
+        wire.runtime._kas_custom_agents.assert_awaited_once_with(
+            "kirocrew-worker", member_dispatch=False, session_key=key
+        )
+        if revoked:
+            wire.status("connected", extra_servers=("kirocrew-work",))
+            wire.tags("kirocrew-core", "kirocrew-work")
+            with pytest.raises(AcpRuntimeError, match="changed during worker load"):
+                await asyncio.wait_for(start, 3.0)
+            terminate.assert_awaited_once_with("ready-session")
+        else:
+            await wire.take(wire.reads)
+            wire.clock[0] = 7.0
+            wire.status()
+            await wire.take(wire.reads)
+            assert not start.done()
+            wire.status("connected", extra_servers=("kirocrew-work",))
+            await wire.take(wire.reads)
+            assert not start.done(), "a fresh template still needs actual tool exposure"
+            wire.tags("kirocrew-core", "kirocrew-work")
+            await asyncio.wait_for(start, 3.0)
+            terminate.assert_not_awaited()
+        assert wire.sent.empty(), "startup must not issue a prompt"
+    finally:
+        if start is not None:
+            if not start.done():
+                start.cancel()
+            await asyncio.gather(start, return_exceptions=True)
+        reader_task.cancel()
+        await asyncio.gather(reader_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+@pytest.mark.parametrize("pre_ready", [False, True], ids=["cold", "stale-mode"])
+async def test_kas_readiness_delays_prompt_until_active_managed_tools(
+    kas_readiness_wire, monkeypatch, resume, pre_ready
+):
+    """The first prompt cannot race core when startup takes more than six seconds."""
+    import kiro_crew.acp.session_handle as sh
+
+    monkeypatch.setattr(sh, "_MCP_DRAIN_NO_REPORT_CEILING", 6.0)
+    wire = kas_readiness_wire
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    try:
+        start = await wire.handshake(
+            resume, pre_ready=pre_ready, session_key="subagent:readiness-worker"
+        )
+        wire.runtime._kas_custom_agents.assert_awaited_once_with(
+            "worker", member_dispatch=False, session_key="subagent:readiness-worker"
+        )
+        # Two pre-mode snapshots must be consumed without satisfying this activation.
+        for _ in range(3 if pre_ready else 1):
+            await wire.take(wire.reads)
+        wire.clock[0] = 7.0
+        wire.status()
+        await wire.take(wire.reads)
+        assert not start.done()
+        assert wire.sent.empty()
+
+        wire.status("connected", sid="other-session")
+        wire.tags("kirocrew-core", "kirocrew-dashboard", sid="other-session")
+        wire.status("connected", sid=None)
+        wire.tags("kirocrew-core", "kirocrew-dashboard", sid=None)
+        wire.status("connected", origin="global")
+        wire.tags("kirocrew-dashboard")
+        for _ in range(3):
+            await wire.take(wire.reads)
+        await wire.take(wire.reads)
+        assert not start.done()
+
+        wire.status("connected")
+        await wire.take(wire.reads)
+        assert not start.done(), "Connected transport alone does not establish tool exposure"
+        wire.tags("kirocrew-core", "kirocrew-dashboard")
+        handle = await asyncio.wait_for(start, 3.0)
+        assert wire.sent.empty()
+
+        async def collect():
+            return [event async for event in handle.prompt("ready")]
+
+        turn = asyncio.create_task(collect())
+        try:
+            request = await wire.take(wire.sent)
+            assert request["method"] == "session/prompt"
+            _feed(wire.reader, {"id": request["id"], "result": {"stopReason": "end_turn"}})
+            await asyncio.wait_for(turn, 3.0)
+            assert wire.sent.empty()
+        finally:
+            if not turn.done():
+                turn.cancel()
+            await asyncio.gather(turn, return_exceptions=True)
+    finally:
+        if start is not None and not start.done():
+            start.cancel()
+        if start is not None:
+            await asyncio.gather(start, return_exceptions=True)
+        await _stop_reader(reader_task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+@pytest.mark.parametrize(
+    "state",
+    [
+        "failed",
+        "disabled",
+        "authorization",
+        "timeout",
+        "unreported",
+        "missing-catalog",
+        "legacy-provenance",
+    ],
+)
+async def test_kas_readiness_refuses_failure_or_missing_report(kas_readiness_wire, resume, state):
+    from kiro_crew.acp.session_handle import AcpRequestTimeout
+
+    wire = kas_readiness_wire
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    try:
+        start = await wire.handshake(resume)
+        await wire.take(wire.reads)
+        if state in ("timeout", "missing-catalog"):
+            wire.clock[0] = 31.0
+            wire.status("connected" if state == "missing-catalog" else "connecting")
+        elif state == "unreported":
+            wire.clock[0] = 31.0
+            _feed(
+                wire.reader, {"method": "session/update", "params": {"sessionId": "ready-session"}}
+            )
+        elif state == "authorization":
+            wire.status(
+                "connecting", failedAuthorization=True, errorMessage="authorization required"
+            )
+        elif state == "legacy-provenance":
+            # Captured kiro-cli 2.18.0: connected with a catalog, tag to follow,
+            # no origin anywhere. ``kirocrew-core`` reached the backend only via
+            # the agent block (the fixture injects just ``kirocrew-dashboard``),
+            # so it is refused before the timeout, naming the limit.
+            wire.status("connected", origin=None, tools=[{"name": "ping", "disabled": False}])
+            wire.tags("kirocrew-core", "kirocrew-dashboard")
+        else:
+            wire.status(state, errorMessage="managed test failure")
+        expected = (
+            AcpRequestTimeout
+            if state in ("timeout", "unreported", "missing-catalog")
+            else AcpRuntimeError
+        )
+        if not resume:
+            deletion = await wire.take(wire.sent)
+            assert deletion["method"] == "_kiro/session/delete"
+            assert deletion["params"] == {"sessionId": "ready-session"}
+            _feed(wire.reader, {"id": deletion["id"], "result": {}})
+        with pytest.raises(expected, match="kirocrew-core") as raised:
+            await asyncio.wait_for(start, 3.0)
+        if state == "legacy-provenance":
+            assert "connected without provenance" in str(raised.value)
+            assert "reports no MCP server origin" in str(raised.value)
+        assert wire.sent.empty(), "A failed startup must not prompt or delete a retained session"
+        assert "ready-session" not in wire.runtime._session_queues
+    finally:
+        if start is not None and not start.done():
+            start.cancel()
+        if start is not None:
+            await asyncio.gather(start, return_exceptions=True)
+        await _stop_reader(reader_task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+async def test_kas_readiness_accepts_provenance_less_wire_for_injected_servers(
+    kas_readiness_wire, resume
+):
+    """Captured kiro-cli 2.18.0 (``2.18.0-newload-global+session.json``): a
+    session-level injection connects as the session's own server on new and
+    load with no ``_meta`` anywhere. Injected names are therefore trusted on a
+    provenance-less snapshot; connection plus tag exposure is still required.
+    """
+    wire = kas_readiness_wire
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    try:
+        start = await wire.handshake(
+            resume, injected=[{"name": "kirocrew-core"}, {"name": "kirocrew-dashboard"}]
+        )
+        await wire.take(wire.reads)
+        wire.status("connecting", origin=None)
+        await wire.take(wire.reads)
+        assert not start.done()
+        wire.status("connected", origin=None, tools=[{"name": "ping", "disabled": False}])
+        await wire.take(wire.reads)
+        assert not start.done(), "Connected transport alone does not establish tool exposure"
+        wire.tags("kirocrew-core", "kirocrew-dashboard")
+        handle = await asyncio.wait_for(start, 3.0)
+        assert set(handle.mcp_session_report().payload()["ready"]) == {
+            "kirocrew-core",
+            "kirocrew-dashboard",
+        }
+        assert wire.sent.empty(), "startup must not issue a prompt"
+    finally:
+        if start is not None and not start.done():
+            start.cancel()
+        if start is not None:
+            await asyncio.gather(start, return_exceptions=True)
+        await _stop_reader(reader_task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+async def test_kas_default_managed_core_is_hoisted_and_ready_on_provenance_less_wire(
+    kas_readiness_wire, monkeypatch, resume
+):
+    """The ordinary install: ``kirocrew-core`` declared only by the agent spec,
+    nothing stubbed. The runtime carries the projected declaration in the
+    session-level array (``2.18.0-payload-probe.json``: that payload connects
+    Crew's own server past colliding global and workspace entries on new and
+    load), so the provenance-less wire reads it as injected and startup completes.
+    """
+    from kiro_crew.acp.kas_agents import to_client_custom_agent
+
+    wire = kas_readiness_wire
+    projected = to_client_custom_agent(
+        "worker",
+        {
+            "tools": ["@kirocrew-core"],
+            "allowedTools": [],
+            "mcpServers": {"kirocrew-core": {"command": "kirocrew", "args": ["mcp"]}},
+        },
+        "Test worker",
+        session_key="subagent:default-worker",
+    )
+    monkeypatch.setattr(
+        wire.runtime,
+        "_kas_custom_agents",
+        AsyncMock(return_value=SessionExtras(custom_agents=[projected])),
+    )
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    try:
+        start = await wire.handshake(resume, session_key="subagent:default-worker")
+        sent = wire.runtime._kas_custom_agents.call_args
+        assert sent.kwargs["session_key"] == "subagent:default-worker"
+        await wire.take(wire.reads)
+        wire.status("connected", origin=None, tools=[{"name": "ping", "disabled": False}])
+        await wire.take(wire.reads)
+        assert not start.done(), "exposure is still required for an injected server"
+        wire.tags("kirocrew-core", "kirocrew-dashboard")
+        handle = await asyncio.wait_for(start, 3.0)
+        assert set(handle.mcp_session_report().payload()["ready"]) == {
+            "kirocrew-core",
+            "kirocrew-dashboard",
+        }
+        assert set(handle.mcp_session_report().payload()["configured"]) == {
+            "kirocrew-core",
+            "kirocrew-dashboard",
+        }
+        assert wire.sent.empty(), "startup must not issue a prompt"
+    finally:
+        if start is not None and not start.done():
+            start.cancel()
+        if start is not None:
+            await asyncio.gather(start, return_exceptions=True)
+        await _stop_reader(reader_task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+async def test_kas_readiness_accepts_pre_response_reports_for_unchanged_mode(
+    kas_readiness_wire, resume
+):
+    wire = kas_readiness_wire
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    try:
+        start = await wire.handshake(resume, switch=False, pre_ready=True)
+        handle = await asyncio.wait_for(start, 3.0)
+        report = handle.mcp_session_report().payload()
+        assert set(report["ready"]) == {"kirocrew-core", "kirocrew-dashboard"}
+        assert wire.sent.empty()
+    finally:
+        if start is not None and not start.done():
+            start.cancel()
+        if start is not None:
+            await asyncio.gather(start, return_exceptions=True)
+        await _stop_reader(reader_task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+@pytest.mark.parametrize(
+    "tools,excluded,catalog_state,needs_tag",
+    [
+        (["read"], [], "enabled", False),
+        (["*"], ["@kirocrew-core"], "enabled", False),
+        (["@kirocrew-core/memory_recall"], ["@kirocrew-core/memory_recall"], "enabled", False),
+        (["@kirocrew-core/memory_recall"], ["@kirocrew-core/memory_recall"], "empty", False),
+        (
+            ["@kirocrew-core"],
+            ["@kirocrew-core/memory_recall", "@kirocrew-core/learn_add"],
+            "enabled",
+            False,
+        ),
+        (["@kirocrew-core/memory_recall"], [], "disabled", False),
+        (["*"], [], "disabled", False),
+        (["@kirocrew-core"], ["@kirocrew-core/learn_add"], "enabled", True),
+    ],
+    ids=[
+        "no-server-grant",
+        "excluded-server",
+        "excluded-selected-tool",
+        "excluded-selected-tool-empty-catalog",
+        "excluded-all-tools",
+        "disabled-selected-tool",
+        "disabled-all-tools",
+        "unapproved-recall-still-needs-exposure",
+    ],
+)
+async def test_kas_readiness_respects_projected_tool_restrictions(
+    kas_readiness_wire, monkeypatch, resume, tools, excluded, catalog_state, needs_tag
+):
+    """A declared server with intentionally hidden tools must still connect."""
+    from kiro_crew.acp.kas_agents import to_client_custom_agent
+
+    wire = kas_readiness_wire
+    projected = to_client_custom_agent(
+        "worker",
+        {
+            "tools": tools,
+            "excludedTools": excluded,
+            "allowedTools": [],
+            "mcpServers": {"kirocrew-core": {"command": "unused-test-mcp"}},
+        },
+        "Test worker",
+        member_dispatch=True,
+    )
+    original = json.loads(json.dumps(projected))
+    monkeypatch.setattr(
+        wire.runtime,
+        "_kas_custom_agents",
+        AsyncMock(return_value=SessionExtras(custom_agents=[projected])),
+    )
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    catalog = [
+        {"name": name, "disabled": catalog_state == "disabled"}
+        for name in ("memory_recall", "learn_add")
+        if catalog_state != "empty"
+    ]
+    try:
+        start = await wire.handshake(resume)
+        await wire.take(wire.reads)
+        wire.status("connecting", tools=[])
+        wire.tags("kirocrew-dashboard")
+        for _ in range(2):
+            await wire.take(wire.reads)
+        assert not start.done(), "A restricted tool policy does not waive connection readiness"
+        wire.status("connected", tools=catalog)
+        if needs_tag:
+            await wire.take(wire.reads)
+            assert not start.done(), "Approval policy does not remove exposure requirements"
+            wire.tags("kirocrew-core", "kirocrew-dashboard")
+        handle = await asyncio.wait_for(start, 3.0)
+        assert set(handle.mcp_session_report().payload()["ready"]) == {
+            "kirocrew-core",
+            "kirocrew-dashboard",
+        }
+        assert projected == original, "Readiness must not change the projected grants"
+        assert wire.sent.empty()
+    finally:
+        if start is not None and not start.done():
+            start.cancel()
+        if start is not None:
+            await asyncio.gather(start, return_exceptions=True)
+        await _stop_reader(reader_task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+@pytest.mark.parametrize("managed", [False, True], ids=["external-only", "managed-and-external"])
+async def test_kas_readiness_preserves_external_init_side_effects(
+    kas_readiness_wire, monkeypatch, caplog, resume, managed
+):
+    """OAuth/config/failure information survives without gating managed readiness."""
+    wire = kas_readiness_wire
+    oauth = {
+        "method": METHOD_MCP_OAUTH_REQUEST,
+        "params": {
+            "sessionId": "ready-session",
+            "serverName": "external-auth",
+            "oauthUrl": "https://example.com/authorize",
+        },
+    }
+    if not managed:
+        monkeypatch.setattr(
+            wire.runtime,
+            "_kas_custom_agents",
+            AsyncMock(
+                return_value=SessionExtras(
+                    custom_agents=[{"id": "worker", "mcpServers": {"external-auth": {}}}]
+                )
+            ),
+        )
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    caplog.set_level("INFO", logger="kiro_crew.acp.session_handle")
+    try:
+        start = await wire.handshake(resume, pre_frames=[oauth], injected=None if managed else [])
+        # The pre-mode OAuth frame is still captured; it cannot arm readiness.
+        for _ in range(2):
+            await wire.take(wire.reads)
+        cfg = [{"id": "effort", "options": ["low", "high"]}]
+        _feed(wire.reader, oauth)  # duplicated notifications stay deduplicated
+        _feed(
+            wire.reader,
+            {
+                "method": METHOD_SESSION_UPDATE,
+                "params": {
+                    "sessionId": "ready-session",
+                    "update": {"sessionUpdate": "config_option_update", "configOptions": cfg},
+                },
+            },
+        )
+        _feed(
+            wire.reader,
+            {
+                "method": "_kiro.dev/mcp/server_init_failure",
+                "params": {
+                    "sessionId": "ready-session",
+                    "serverName": "external-failed",
+                    "error": "external initialization failed",
+                },
+            },
+        )
+        if managed:
+            for _ in range(3):
+                await wire.take(wire.reads)
+            assert not start.done()
+            wire.status("connected")
+            wire.tags("kirocrew-core", "kirocrew-dashboard")
+        handle = await asyncio.wait_for(start, 3.0)
+        assert handle._config_options == cfg
+        assert handle.pop_pending_oauth_requests() == [
+            {"serverName": "external-auth", "oauthUrl": "https://example.com/authorize"}
+        ]
+        assert handle.pop_pending_oauth_requests() == []
+        assert "external-failed" in handle.mcp_session_report().payload()["failed"]
+        assert "MCP server init failure on ready-session: external-failed" in caplog.text
+        assert wire.sent.empty()
+    finally:
+        if start is not None and not start.done():
+            start.cancel()
+        if start is not None:
+            await asyncio.gather(start, return_exceptions=True)
+        await _stop_reader(reader_task)
 
 
 @pytest.fixture(autouse=True)
@@ -1185,7 +1884,12 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
 
     assert wrapped["argv"] == [launch_path, "acp", "--agent", runtime._agent]
     assert wrapped["mode"] == "auto"
-    assert wrapped["kwargs"] == {
+    wrap_kwargs = dict(wrapped["kwargs"])
+    # The per-process scratch window is allocated at spawn time; its path is
+    # runtime-owned, so only its presence and shape are pinned here.
+    extra_private = wrap_kwargs.pop("extra_private_dirs")
+    assert isinstance(extra_private, (list, tuple))
+    assert wrap_kwargs == {
         "strip_python_env": True,
         "is_kiro_cli": True,
     }
@@ -4665,7 +5369,7 @@ class TestAcpRuntimeLoadSession:
                 return {"modes": {"currentModeId": "kirocrew"}, "models": []}
             return {}
 
-        async def _fake_agents(agent, *, member_dispatch=False):
+        async def _fake_agents(agent, *, member_dispatch=False, session_key=""):
             from kiro_crew.acp.harness import SessionExtras
 
             return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
@@ -4709,7 +5413,7 @@ class TestAcpRuntimeLoadSession:
                 return {"modes": {"currentModeId": "kirocrew"}, "models": []}
             return {}
 
-        async def _fake_agents(agent, *, member_dispatch=False):
+        async def _fake_agents(agent, *, member_dispatch=False, session_key=""):
             from kiro_crew.acp.harness import SessionExtras
 
             return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
@@ -4744,7 +5448,7 @@ class TestAcpRuntimeLoadSession:
                 return {"modes": {"currentModeId": "kirocrew"}, "models": []}
             return {}
 
-        async def _fake_agents(agent, *, member_dispatch=False):
+        async def _fake_agents(agent, *, member_dispatch=False, session_key=""):
             from kiro_crew.acp.harness import SessionExtras
 
             calls.append(agent)
@@ -6820,7 +7524,7 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
     monkeypatch.setattr(
         runtime_mod,
         "wrap_argv",
-        lambda argv, mode, strip_python_env=False, is_kiro_cli=None: (argv, None),
+        lambda argv, mode, strip_python_env=False, is_kiro_cli=None, **_kw: (argv, None),
     )
     monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: argv)
     monkeypatch.setattr(runtime_mod, "augmented_path", lambda p: p)
@@ -6878,7 +7582,7 @@ async def test_runtime_spawn_names_its_own_browser_session(monkeypatch):
     monkeypatch.setattr(
         runtime_mod,
         "wrap_argv",
-        lambda argv, mode, strip_python_env=False, is_kiro_cli=None: (argv, None),
+        lambda argv, mode, strip_python_env=False, is_kiro_cli=None, **_kw: (argv, None),
     )
     monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: argv)
     monkeypatch.setattr(runtime_mod, "augmented_path", lambda p: p)
@@ -8374,6 +9078,353 @@ async def test_session_swap_on_warm_runtime_does_not_inherit_child_routing():
     finally:
         await _drain_audits(rt)
         await _stop_reader(task)
+
+
+# ── the recognition cap's residual: what a TRUNCATED roster says out loud ─────
+#
+# `_snapshot_subagent_sessions` recognises at most NATIVE_CHILD_ROSTER_CAP ids —
+# the same bound `AcpSessionHandle` counts them under — and reports what it
+# refused two ways: one warning naming the count, and a distinct auto-reject
+# reason on a permission request it cannot attribute. Both are SNAPSHOT-scoped:
+# the frame carries the backend's full list, so the previous frame's truncation
+# must not colour this frame's refusals. `test_native_subagent_boundary.py` pins
+# the cap and the two reasons end to end; what follows pins the two properties
+# an operator reads them THROUGH — one line per truncated roster rather than per
+# truncated id, and an attribution that expires with the snapshot that earned it.
+
+
+def _unroutable_permission_frame(child_sid: str, request_id: int) -> dict:
+    """A permission REQUEST for a session this runtime has no queue for."""
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": child_sid,
+            "toolCall": {"toolCallId": "tc-1", "title": "bash"},
+            "options": [
+                {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+            ],
+        },
+    }
+
+
+async def _await_count(seq: list, n: int, what: str, timeout: float = 5.0) -> None:
+    """Wait on the observable condition — the answer/audit runs as a spawned
+    task off the reader loop, so a sleep guess is the flake this suite's
+    `_drain` docstring describes."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while len(seq) < n:
+        if loop.time() >= deadline:
+            raise AssertionError(f"only {len(seq)} {what} recorded, expected {n}")
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_roster_overflow_warns_once_per_episode_not_once_per_frame(caplog):
+    """A truncation episode gets ONE warning, however many frames re-announce it.
+
+    Two volume properties, one per axis of the same product:
+
+    Per FRAME. The roster arrives as `subagent/list_update`, which kiro-cli
+    re-broadcasts on every child status change — so above the cap every
+    rebroadcast re-earns the warning at a frame rate this client does not
+    choose. Measured on this handler with the throttle removed: 10 over-cap
+    snapshots → 10 identical WARNING records (~245 message bytes each), and the
+    tail count holds at 40, so the log VOLUME is what grows, not the number. It
+    is the assertion below that fails in that state. The frames
+    below only move a child's `status`, which is the real steady state and the
+    case a "same count, don't log" throttle would appear to handle by accident:
+    it suppresses while the tail happens to hold still and floods again the
+    moment one child completes.
+
+    Per ID. A single frame's tail must not become one line per truncated id
+    either — the count is the whole diagnostic, "40 announced children are
+    unrecognisable here", and a per-id line states it only if the reader counts
+    the lines.
+
+    And a roster INSIDE the cap must say nothing at all: the warning has to
+    mean "children went unrecognised", never "a roster arrived", or an
+    operator cannot use its presence as the signal.
+    """
+    import logging
+
+    rt, _, _ = _make_runtime()
+    _register(rt, "parent-session")
+    overflow = 40
+    roster = [{"sessionId": f"c-{i}"} for i in range(NATIVE_CHILD_ROSTER_CAP + overflow)]
+    statuses = ("running", "pending", "completed")
+
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp.runtime"):
+        rt._snapshot_subagent_sessions({"subagents": roster})
+        truncation = [r for r in caplog.records if "recognition cap" in r.getMessage()]
+        assert len(truncation) == 1
+        assert truncation[0].levelno == logging.WARNING
+        assert str(overflow) in truncation[0].getMessage()
+        assert len(rt._subagent_sessions) == NATIVE_CHILD_ROSTER_CAP
+        assert rt._subagent_roster_overflow == overflow
+
+        # Nine more frames naming the SAME children with moved statuses. The id
+        # set is identical, the frame is not, and the tail count is unchanged.
+        for n in range(9):
+            rt._snapshot_subagent_sessions(
+                {
+                    "subagents": [
+                        {"sessionId": e["sessionId"], "status": statuses[(i + n) % 3]}
+                        for i, e in enumerate(roster)
+                    ]
+                }
+            )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        assert rt._subagent_roster_overflow == overflow
+        # Inside the interval the repeats are held, not emitted — this is the
+        # assertion that fails on the per-frame implementation.
+        assert rt._roster_overflow_repeats == 9
+        assert rt._roster_overflow_peak == overflow
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp.runtime"):
+        rt._snapshot_subagent_sessions({"subagents": roster[:8]})
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert rt._subagent_roster_overflow == 0
+    # The episode ended under one interval, so its residual repeat count is
+    # flushed rather than dropped: a truncation storm that stops quickly must
+    # still report more than its first frame.
+    assert [r.getMessage() for r in caplog.records if "further snapshot(s)" in r.getMessage()] == [
+        f"subagent roster truncated on 9 further snapshot(s); largest tail "
+        f"{overflow} id(s) past the {NATIVE_CHILD_ROSTER_CAP}-id recognition cap"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repeated_roster_truncation_folds_into_one_throttled_summary(caplog):
+    """The repeats become a throttled DEBUG summary carrying the count and peak.
+
+    Same mechanism as `_note_dropped_frame` above, deliberately: one interval
+    constant, a monotonic window, a count flushed on the next event past it, and
+    no timer task on the demux loop. What the summary carries is the count of
+    repeated snapshots and the LARGEST tail they named — the peak, because
+    sizing the cap reads the worst case, and which tail happens to be current at
+    an arbitrary flush instant is noise.
+    """
+    import logging
+
+    import kiro_crew.acp.runtime as runtime_mod
+
+    rt, _, _ = _make_runtime()
+    _register(rt, "parent-session")
+
+    def _over(extra: int) -> dict:
+        return {
+            "subagents": [{"sessionId": f"c-{i}"} for i in range(NATIVE_CHILD_ROSTER_CAP + extra)]
+        }
+
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp.runtime"):
+        rt._snapshot_subagent_sessions(_over(40))  # the loud one, opens the window
+        for extra in (40, 77, 40, 12):
+            rt._snapshot_subagent_sessions(_over(extra))
+        assert [
+            r.getMessage() for r in caplog.records if "further snapshot(s)" in r.getMessage()
+        ] == []
+
+        # Age the window out; the next truncated snapshot flushes the summary.
+        rt._roster_overflow_summary_at -= runtime_mod._ROSTER_OVERFLOW_SUMMARY_INTERVAL_SECS + 1.0
+        rt._snapshot_subagent_sessions(_over(40))
+
+    summaries = [r for r in caplog.records if "further snapshot(s)" in r.getMessage()]
+    assert len(summaries) == 1, [r.getMessage() for r in summaries]
+    assert summaries[0].levelno == logging.DEBUG
+    assert "truncated on 5 further snapshot(s)" in summaries[0].getMessage()
+    assert "largest tail 77 id(s)" in summaries[0].getMessage()
+    # Still exactly one loud record for the whole episode.
+    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+    # Flushing reopens the window rather than closing the episode.
+    assert rt._roster_overflow_repeats == 0
+    assert rt._roster_overflow_peak == 0
+    assert rt._roster_overflow_summary_at != 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_truncation_after_the_roster_recovers_is_loud_again(caplog):
+    """The reset boundary is the EPISODE, and both ways out of one re-arm it.
+
+    Without this the throttle would swallow a genuinely new truncation for the
+    rest of the runtime's life, which is worse than the volume it fixes: the
+    warning's whole job is that a truncated tail is otherwise invisible. The
+    boundary is the overflow count returning to 0, which is exactly the two
+    events that already retire the snapshot ATTRIBUTION (a roster inside the
+    cap, and the owning session unregistering) — one lifetime for both halves of
+    the same signal, so the loud line and the auto-reject reason can never
+    disagree about whether the cap is under pressure.
+    """
+    import logging
+
+    rt, _, _ = _make_runtime()
+    _register(rt, "parent-session")
+    over = {"subagents": [{"sessionId": f"c-{i}"} for i in range(NATIVE_CHILD_ROSTER_CAP + 40)]}
+    inside = {"subagents": [{"sessionId": "c-0"}]}
+
+    def _loud() -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp.runtime"):
+        rt._snapshot_subagent_sessions(over)
+        rt._snapshot_subagent_sessions(over)
+        assert len(_loud()) == 1
+        # Way out #1: a roster the cap did not truncate.
+        rt._snapshot_subagent_sessions(inside)
+        assert rt._roster_overflow_summary_at == 0.0
+        rt._snapshot_subagent_sessions(over)
+        assert len(_loud()) == 2, _loud()
+
+        # Way out #2: the owner leaves, taking its roster with it. The next
+        # owner's first truncation is a new episode.
+        rt._snapshot_subagent_sessions(over)
+        rt.unregister_session("parent-session")
+        assert rt._subagent_roster_overflow == 0
+        assert rt._roster_overflow_summary_at == 0.0
+        _register(rt, "successor-session")
+        rt._snapshot_subagent_sessions(over)
+        assert len(_loud()) == 3, _loud()
+        assert rt._subagent_owner == "successor-session"
+
+
+@pytest.mark.asyncio
+async def test_unroutable_permission_reason_follows_the_last_roster_snapshot():
+    """The cap-truncation attribution expires with the snapshot that earned it.
+
+    A `list_update` carries the backend's FULL child list, so the count of ids
+    it truncated describes that frame and nothing later. Left sticky, one
+    truncated roster would re-label every unknown-session denial for the rest of
+    the runtime's life as a cap truncation — and the SEL reason is precisely the
+    signal an operator uses to decide whether to raise the cap, so a stuck one
+    both invents cap pressure that is not there and buries the next real
+    truncation in it. Unregistering the owner is not the only way back: the very
+    next clean roster is already the whole truth.
+
+    Both halves are asserted where the operator reads them — the SEL row's
+    `error` field and the `child_permission_denied` metric — not on the private
+    counter alone.
+    """
+    import kiro_crew.sel as sel_mod
+
+    audited: list[dict] = []
+    denied: list[dict] = []
+
+    class _CapturingSel:
+        def log_tool_invocation(self, **kwargs):  # noqa: D401 - stub
+            audited.append(kwargs)
+
+    def _spy_counter(name, attrs=None, **_kw):
+        if name == CHILD_PERMISSION_DENIED:
+            denied.append(dict(attrs or {}))
+
+    rt, reader, proc = _make_runtime()
+    _register(rt, "parent-session")
+    task = await _start_reader(rt)
+    try:
+        with (
+            patch.object(sel_mod, "sel", lambda: _CapturingSel()),
+            patch("kiro_crew.acp.runtime.emit_counter", _spy_counter),
+        ):
+            # Snapshotted by direct call, not fed as a frame: a roster naming
+            # NATIVE_CHILD_ROSTER_CAP children serialises past this reader's
+            # line limit, so a fed frame would measure the stdout buffer
+            # instead of the cap.
+            rt._snapshot_subagent_sessions(
+                {"subagents": [{"sessionId": f"c-{i}"} for i in range(NATIVE_CHILD_ROSTER_CAP + 2)]}
+            )
+            assert rt._subagent_roster_overflow == 2
+
+            _feed(reader, _unroutable_permission_frame("ghost-a", 301))
+            await _drain(reader)
+            await _await_count(denied, 1, "denial metric")
+            await _drain_audits(rt)
+            assert denied == [{"surface": "runtime", "reason": "roster_overflow_auto_reject"}]
+            assert [row["error"] for row in audited] == ["roster_overflow_auto_reject"]
+
+            # A later roster that truncated NOTHING: this child was never
+            # announced, and saying "the cap truncated it" would be false.
+            rt._snapshot_subagent_sessions({"subagents": [{"sessionId": "c-0"}]})
+            assert rt._subagent_roster_overflow == 0
+
+            _feed(reader, _unroutable_permission_frame("ghost-b", 302))
+            await _drain(reader)
+            await _await_count(denied, 2, "denial metric")
+            await _drain_audits(rt)
+            assert denied[1] == {
+                "surface": "runtime",
+                "reason": "unregistered_session_auto_reject",
+            }
+            assert audited[1]["error"] == "unregistered_session_auto_reject"
+
+            # The owner leaving is the other way back: the truncated roster it
+            # owned is gone, so a denial on the warm runtime after it must not
+            # still be attributed to that roster's cap pressure.
+            rt._snapshot_subagent_sessions(
+                {"subagents": [{"sessionId": f"c-{i}"} for i in range(NATIVE_CHILD_ROSTER_CAP + 2)]}
+            )
+            rt.unregister_session("parent-session")
+            _feed(reader, _unroutable_permission_frame("ghost-c", 303))
+            await _drain(reader)
+            await _await_count(denied, 3, "denial metric")
+            await _drain_audits(rt)
+            assert denied[2]["reason"] == "unregistered_session_auto_reject"
+            assert audited[2]["error"] == "unregistered_session_auto_reject"
+
+        # No request was left hanging or counted as a drop: each got the
+        # request's own least-destructive reject option, immediately.
+        answered = [json.loads(c.args[0].decode()) for c in proc.stdin.write.call_args_list]
+        assert [(f["id"], f["result"]["outcome"]) for f in answered] == [
+            (301, {"outcome": "selected", "optionId": "reject_once"}),
+            (302, {"outcome": "selected", "optionId": "reject_once"}),
+            (303, {"outcome": "selected", "optionId": "reject_once"}),
+        ]
+        assert rt._dropped_frames == {}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_a_kas_frame_naming_the_parent_itself_gets_no_native_child_row():
+    """A parent is never its own sub-agent — in the count OR in the display row.
+
+    `_note_native_child` answers "is this id tracked as a child of mine", and
+    the KAS display roster keys its row on that answer, which is what keeps
+    every native-child store inside one cap. The parent's own id is refused by
+    the count, so it must be refused by the row too: a row the counted set does
+    not hold can never be recognised as a duplicate, and here it would also
+    render the session as a sub-agent of itself. The frame is still a parent
+    sub-agent frame, so it keeps emitting its list event rather than falling
+    through to be re-rendered as an ordinary tool call.
+    """
+    rt, _, _ = _make_runtime()
+    rt._acp_backend = ACP_BACKEND_KAS
+    handle = AcpSessionHandle("sA", asyncio.Queue(), rt)
+
+    def _subtask_frame(subtask_id: str, tool_call_id: str) -> dict:
+        return {
+            "sessionUpdate": "tool_call",
+            "toolCallId": tool_call_id,
+            "title": f"Sub-agent: {subtask_id}",
+            "status": "in_progress",
+            "_meta": {"kiro": {"agentSubtaskId": subtask_id, "kind": "agent-subtask"}},
+        }
+
+    events = handle._handle_kas_subagent(_subtask_frame("sA", "k1"))
+    assert events is not None and [e.kind for e in events] == [EVENT_SUBAGENT_LIST]
+    assert handle.native_child_sessions == frozenset()
+    assert handle._kas_subagent_roster == {}
+    assert handle.native_child_overflow == 0
+
+    # A real child on the same handle still gets its row, so the refusal above
+    # is about identity and not about the roster being inert.
+    handle._handle_kas_subagent(_subtask_frame("child-1", "k2"))
+    assert set(handle._kas_subagent_roster) == {"child-1"} == set(handle.native_child_sessions)
 
 
 def test_child_low_fidelity_requires_structured_security_context():
@@ -10626,3 +11677,34 @@ class TestStoreSessionConfigParseConsolidation:
         assert [m["modelId"] for m in handle.available_models] == ["kiro-model-x"]
         handle.store_session_config({"models": {"availableModels": "nope"}})
         assert [m["modelId"] for m in handle.available_models] == ["kiro-model-x"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+async def test_managed_readiness_keeps_external_wire_roster(kas_readiness_wire, resume):
+    wire = kas_readiness_wire
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    try:
+        start = await wire.handshake(
+            resume,
+            injected=[
+                {"name": "kirocrew-core"},
+                {"name": "kirocrew-dashboard"},
+                {"name": "external"},
+            ],
+        )
+        await wire.take(wire.reads)
+        wire.status("connected")
+        wire.tags("kirocrew-core", "kirocrew-dashboard")
+        handle = await asyncio.wait_for(start, 3.0)
+        report = handle.mcp_session_report().payload()
+        assert set(report["configured"]) == {"kirocrew-core", "kirocrew-dashboard", "external"}
+        assert "external" in report["failed"]
+        assert set(report["ready"]) == {"kirocrew-core", "kirocrew-dashboard"}
+    finally:
+        if start is not None:
+            if not start.done():
+                start.cancel()
+            await asyncio.gather(start, return_exceptions=True)
+        await _stop_reader(reader_task)

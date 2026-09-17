@@ -11,6 +11,7 @@ output we can assert directly), and the process-helper return contracts.
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import json
 import logging
@@ -31,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from kiro_crew import platform_compat as pc
+from kiro_crew import windows_acl
 
 
 @pytest.mark.skipif(
@@ -380,6 +382,72 @@ class TestRenameNoReplace:
         monkeypatch.setattr(pc, "_RENAME_NOREPLACE_FN", None)
         with pytest.raises(NotImplementedError):
             pc.rename_noreplace("source", "target", src_dir_fd=-1, dst_dir_fd=-1)
+
+    def test_syscall_fallback_builds_working_callable_on_known_arch(self, tmp_path, monkeypatch):
+        # Verify marshalling on every host. Linux additionally exercises the
+        # native syscall, independent of which libc path import-time chose.
+        host_machine = pc.platform.machine()
+        calls = []
+
+        def syscall(*args):
+            calls.append(args)
+            ctypes.set_errno(errno.EEXIST)
+            return -1
+
+        for machine, number in pc._SYS_RENAMEAT2_BY_MACHINE.items():
+            with monkeypatch.context() as patcher:
+                patcher.setattr(pc.platform, "machine", lambda: machine)
+                fn = pc._build_renameat2_via_syscall(types.SimpleNamespace(syscall=syscall))
+                assert fn is not None
+                assert fn(11, b"first", 12, b"published", 1) == -1
+                assert calls[-1] == (number, 11, b"first", 12, b"published", 1)
+                assert syscall.restype is ctypes.c_long
+                assert syscall.argtypes == [
+                    ctypes.c_long,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_uint,
+                ]
+                assert ctypes.get_errno() == errno.EEXIST
+        assert len(calls) == len(pc._SYS_RENAMEAT2_BY_MACHINE)
+        if not pc.IS_LINUX or host_machine not in pc._SYS_RENAMEAT2_BY_MACHINE:
+            # Portable marshalling above still runs; never issue a Linux
+            # syscall against another OS or guess an unmapped syscall number.
+            return
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = pc._build_renameat2_via_syscall(libc)
+        assert fn is not None
+
+        first = tmp_path / "first"
+        first.mkdir()
+        (first / "payload").write_text("published")
+        parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            rc = fn(parent_fd, b"first", parent_fd, b"published", 1)  # RENAME_NOREPLACE
+            assert rc == 0
+            assert (tmp_path / "published" / "payload").read_text() == "published"
+
+            # Occupied destination must refuse (EEXIST), not clobber.
+            (tmp_path / "loser").mkdir()
+            ctypes.set_errno(0)
+            rc = fn(parent_fd, b"loser", parent_fd, b"published", 1)
+            assert rc != 0
+            assert ctypes.get_errno() == errno.EEXIST
+        finally:
+            os.close(parent_fd)
+
+    def test_syscall_fallback_returns_none_on_unknown_arch(self, monkeypatch):
+        # An unmapped architecture must fail closed rather than issue a
+        # wrong-numbered syscall.
+        monkeypatch.setattr(pc.platform, "machine", lambda: "totally-made-up-arch")
+
+        class UnavailableLibc:
+            def __getattr__(self, name):
+                raise AssertionError(f"unknown architecture must not access libc.{name}")
+
+        assert pc._build_renameat2_via_syscall(UnavailableLibc()) is None
 
 
 class TestProcessHelpers:
@@ -2788,6 +2856,40 @@ class TestRestrictToOwnerArgvOnLinux:
         monkeypatch.setattr(pc.os, "chmod", lambda p, m: modes.append(m))
         pc.restrict_dir_to_owner(tmp_path)
         assert modes == [0o700], modes
+
+
+class TestPathVolumeIsRemote:
+    """The Windows half of "which kind of filesystem holds this", on Linux.
+
+    Nothing was established is None, never False: a caller that reads a failed
+    query as "local" is the case this tri-state exists to prevent.
+    """
+
+    def test_off_windows_the_answer_is_unknown(self, monkeypatch, tmp_path):
+        # POSIX callers have their own mount-table source, so the answer here is
+        # "nothing established". The branch is named rather than inherited from the
+        # host: on Windows this same call reaches a real volume and correctly reports
+        # a local one, which is a different fact from the one under test.
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        assert pc.path_volume_is_remote(tmp_path) is None
+
+    @pytest.mark.parametrize("verdict", [True, False, None])
+    def test_the_windows_volume_verdict_is_passed_through(self, monkeypatch, verdict):
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc.windows_acl, "volume_is_remote", lambda p: verdict)
+        assert pc.path_volume_is_remote("Z:\\kiro") is verdict
+
+    @pytest.mark.parametrize(
+        "exc", [windows_acl.AclUnavailable("no api"), OSError("call failed"), ValueError("root")]
+    )
+    def test_a_failed_query_is_unknown(self, monkeypatch, exc):
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+
+        def _boom(_path):
+            raise exc
+
+        monkeypatch.setattr(pc.windows_acl, "volume_is_remote", _boom)
+        assert pc.path_volume_is_remote("Z:\\kiro") is None
 
 
 class TestChmodShimsApply:

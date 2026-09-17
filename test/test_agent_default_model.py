@@ -362,6 +362,26 @@ class TestSessionModelCoversEverySurface:
         cfg = _cfg({"oncall": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "")
         assert _session_model(cfg, "pinned") is None
 
+    @pytest.mark.parametrize(
+        "template,global_model,expected",
+        [
+            ("unpinned", "global-model", "global-model"),
+            ("unpinned", "auto", None),
+            ("pinned", "global-model", None),
+            ("kirocrew", "global-model", "global-model"),
+        ],
+    )
+    def test_explicit_template_excludes_same_named_member_model(
+        self, specs_dir: Path, template: str, global_model: str, expected: str | None
+    ) -> None:
+        cfg = _cfg({template: {"kiro_agent": "kirocrew", "model": "member-model"}}, global_model)
+        assert _session_model(cfg, template, crew_agent="") == expected
+        assert _session_model(cfg, template) == "member-model"
+
+    def test_explicit_member_claim_selects_its_model(self, specs_dir: Path) -> None:
+        cfg = _cfg({"oncall": {"kiro_agent": "unpinned", "model": "member-model"}}, "global-model")
+        assert _session_model(cfg, "unpinned", crew_agent="oncall") == "member-model"
+
     def test_unknown_name_falls_back_to_the_global(self, specs_dir: Path) -> None:
         cfg = _cfg(
             {"oncall": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5"

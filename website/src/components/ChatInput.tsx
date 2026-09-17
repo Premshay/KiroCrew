@@ -53,6 +53,7 @@ import { useScrollEdges } from '../hooks/useScrollEdges'
 import VoiceStatusBar from './VoiceStatusBar'
 import VoiceDictationPanel, { useDictationPanelUsable } from './VoiceDictationPanel'
 import { createPortal } from 'react-dom'
+import { InstantTip, useInstantTip } from './InstantTip'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useBranding } from '../hooks/useBranding'
 import { useAppSelector, useAppDispatch } from '../store'
@@ -79,6 +80,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
 import { useComposerSpellcheck } from '../hooks/useComposerSpellcheck'
+import { useComposerSendMode } from '../hooks/useComposerSendMode'
 import { useLanguage } from '../i18n/LanguageProvider'
 import { pickToolLabel } from '../utils/toolLabel'
 import { deriveToolCallTitle } from '../utils/toolCallTitle'
@@ -176,11 +178,7 @@ const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/
 // test_accept_list_covers_every_accepted_extension pins this set against the
 // server's, from the Python side, since a vitest cannot read the Python constant.
 const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
-const FILE_ACCEPT =
-  IMAGE_ACCEPT +
-  ',' +
-  VIDEO_ACCEPT +
-  ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
+const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.drawio,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
@@ -624,9 +622,22 @@ interface ChatInputProps {
    * inherited case, so a served model does not read as something the user
    * chose. A pinned chip has nothing to explain. */
   modelIsInheritedDefault?: boolean
-  onAgentClick?: (rect: DOMRect) => void
-  onModelClick?: (rect: DOMRect) => void
-  onProjectClick?: (rect: DOMRect) => void
+  /**
+   * Picker openers (agent, model, project, and `onSessionControlClick` below).
+   * Each hands the host the chip's click-time rect AND the chip element itself:
+   * the host owns the picker's portal and must keep it glued to the chip while
+   * it is open (the composer moves under an open menu when the mobile keyboard
+   * closes, the composer grows, or a container scrolls), which needs a live
+   * element to re-read, not a one-time snapshot (#10616). Hosts feed both into
+   * `useAnchoredTriggerRect`.
+   */
+  onAgentClick?: (rect: DOMRect, trigger?: HTMLElement) => void
+  /** `composerHadFocus` is whether the message editor held focus when the chip
+   *  was pressed, read before the press moved focus onto the chip. The picker
+   *  uses it to hand focus back to the editor after a pick, and only then: a
+   *  user who was not typing does not get the composer focused under them. */
+  onModelClick?: (rect: DOMRect, trigger?: HTMLElement, composerHadFocus?: boolean) => void
+  onProjectClick?: (rect: DOMRect, trigger?: HTMLElement) => void
   /** App-contributed session controls (contributes.sessionControls in app.json). */
   sessionControls?: {
     key: string
@@ -643,7 +654,7 @@ interface ChatInputProps {
     /** Replaces the tooltip when the app explains its state. */
     statusTooltip?: string
   }[]
-  onSessionControlClick?: (key: string, rect: DOMRect) => void
+  onSessionControlClick?: (key: string, rect: DOMRect, trigger?: HTMLElement) => void
   contextPct?: number
   contextUsedTokens?: number
   contextWindowTokens?: number
@@ -707,7 +718,8 @@ interface ChatInputProps {
   automationSnapshotFailed?: boolean
   /** Session routing mode; crew/member cannot host direct monitor turns. */
   sessionMode?: string
-  /** Send-key mode. Default 'enter'. */
+  /** Send-key mode. Omitted means the user's stored Settings -> Chat ->
+   *  Composer preference; pass it only to override that (e.g. mobile). */
   sendOnEnter?: SendMode
   /** Follow-up options from assistant message */
   followUpOptions?: string[]
@@ -813,16 +825,11 @@ interface ChatInputProps {
 }
 
 /** Accent pill under a downscaled attachment chip. Hover (or focus) shows a
- *  styled tooltip with the resize details, portal-rendered above the chip so
- *  the strip's overflow-x-auto can't clip it. */
+ *  styled tooltip with the resize details through the shared `InstantTip`
+ *  (portal-rendered above the chip so the strip's overflow-x-auto can't clip
+ *  it; see that module for the show/hide gesture semantics). */
 function ResizeBadge({ resize }: { resize: ResizeInfo }) {
-  const [tip, setTip] = useState<{ top: number; left: number } | null>(null)
-  const ref = useRef<HTMLButtonElement>(null)
-  const show = () => {
-    const r = ref.current?.getBoundingClientRect()
-    if (r) setTip({ top: r.top - 8, left: r.left })
-  }
-  const hide = () => setTip(null)
+  const { tip, tipHandlers, tipId } = useInstantTip()
   return (
     <>
       {/* In flow under the thumbnail, not overlaid on it. The tile is a fixed
@@ -836,37 +843,14 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
           chip grow instead of the pill wrapping. */}
       <button
         type="button"
-        ref={ref}
-        aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', {
-          fromW: resize.fromW,
-          fromH: resize.fromH,
-          toW: resize.toW,
-          toH: resize.toH,
-        })}
+        aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', { fromW: resize.fromW, fromH: resize.fromH, toW: resize.toW, toH: resize.toH })}
         className="px-1.5 py-[1px] rounded-full border-0 text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default whitespace-nowrap"
-        onMouseEnter={show}
-        onMouseLeave={hide}
-        onFocus={show}
-        onBlur={hide}
-      >
-        {i18nT('components.chatInput.resized')}
-      </button>
-      {tip &&
-        createPortal(
-          <div
-            role="tooltip"
-            className="fixed z-[9999] -translate-y-full rounded-lg border border-border-strong bg-bg-elevated px-2.5 py-1.5 text-[11px] leading-snug shadow-lg pointer-events-none whitespace-nowrap"
-            style={{ top: tip.top, left: tip.left }}
-          >
-            <div className="text-text">
-              {i18nT('components.chatInput.resized_to_fit_model_limits')}
-            </div>
-            <div className="text-muted">
-              {resize.fromW}×{resize.fromH} → {resize.toW}×{resize.toH}
-            </div>
-          </div>,
-          document.body,
-        )}
+        {...tipHandlers}
+      >{i18nT('components.chatInput.resized')}</button>
+      <InstantTip tip={tip} tipId={tipId} className="w-max max-w-[calc(100vw-1rem)]">
+        <div className="text-text">{i18nT('components.chatInput.resized_to_fit_model_limits')}</div>
+        <div className="text-muted">{resize.fromW}×{resize.fromH} → {resize.toW}×{resize.toH}</div>
+      </InstantTip>
     </>
   )
 }
@@ -1140,7 +1124,7 @@ function ChatInput({
   automationCreationReady,
   automationSnapshotFailed,
   sessionMode,
-  sendOnEnter = 'enter',
+  sendOnEnter: sendOnEnterProp,
   followUpOptions,
   followUpPicked,
   onFollowUpSelect,
@@ -1297,6 +1281,11 @@ function ChatInput({
   // Read the composer-spellcheck preference here rather than as a prop, so every
   // render site of this component honours it and none can forget to pass it.
   const spellCheck = useComposerSpellcheck()
+  // Same for the send-key mode: the stored preference is the fallback, not a
+  // hardcoded 'enter'. A host omitting the prop (session-grid pane, side panel)
+  // would otherwise send on plain Enter for a user who chose Ctrl/Cmd+Enter.
+  const storedSendMode = useComposerSendMode()
+  const sendOnEnter = sendOnEnterProp ?? storedSendMode
   const uiLang = useLanguage().resolved
   const approvalLabelRaw = sanitizeLlmOutput(pendingApproval?.content || '').replace(/^🔧\s*/, '')
 
@@ -5847,95 +5836,75 @@ function ChatInput({
                       className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer ${
                         /* Open wins, so the chip you are pointing at always reads as
                    the active one; otherwise the app's own state colours it. */
-                        sc.active
-                          ? 'text-accent'
-                          : sc.state === 'ok'
-                            ? 'text-ok'
-                            : sc.state === 'warn'
-                              ? 'text-warn'
-                              : 'text-muted hover:text-text'
-                      }`}
-                      onClick={(e) =>
-                        onSessionControlClick?.(sc.key, e.currentTarget.getBoundingClientRect())
-                      }
-                      // Marks the chip as part of its own popover for dismissal
-                      // purposes: mousedown fires before click, so without this the
-                      // host's outside-click closes the popover and the chip's toggle
-                      // then re-opens it — a flicker instead of a dismissal.
-                      data-session-control-chip=""
-                      title={chipName}
-                      aria-label={chipName}
-                    >
-                      <AppIcon icon={sc.icon} size={13} />
-                      {!shelfCompact && <span className="truncate max-w-[140px]">{sc.label}</span>}
-                    </button>
-                  )
-                })}
-              </div>
-            )}
-            <div className="flex items-center gap-2 min-w-0 flex-1">
-              {onAgentClick && agentName && (
-                /* Chrome type: an agent name is a label, not code. `font-mono` would
+                sc.active
+                  ? 'text-accent'
+                  : sc.state === 'ok'
+                    ? 'text-ok'
+                    : sc.state === 'warn'
+                      ? 'text-warn'
+                      : 'text-muted hover:text-text'
+              }`}
+              onClick={e => onSessionControlClick?.(sc.key, e.currentTarget.getBoundingClientRect(), e.currentTarget)}
+              // Marks the chip as part of its own popover for dismissal
+              // purposes: mousedown fires before click, so without this the
+              // host's outside-click closes the popover and the chip's toggle
+              // then re-opens it — a flicker instead of a dismissal.
+              data-session-control-chip=""
+              title={chipName}
+              aria-label={chipName}
+            >
+              <AppIcon icon={sc.icon} size={13} />
+              {!shelfCompact && <span className="truncate max-w-[140px]">{sc.label}</span>}
+            </button>
+            )
+          })}
+            </div>
+          )}
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+          {onAgentClick && agentName && (
+            /* Chrome type: an agent name is a label, not code. `font-mono` would
                pin `var(--mono)`, which Settings → Display → Font Family never
                writes, so it would make the shelf ignore the user's typeface. */
-                <button
-                  className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
-                  onClick={(e) => onAgentClick(e.currentTarget.getBoundingClientRect())}
-                  disabled={isRunning}
-                  // Inherited default: explain what the ` . default` marker means, on
-                  // hover (title) AND keyboard focus / screen readers (aria-label),
-                  // because the marker alone reads as opaque (#8770 UX). No glyph, no
-                  // layout change -- text on demand. A pinned chip keeps the plain
-                  // switch hint; it has nothing to explain.
-                  title={
-                    isRunning
-                      ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
-                      : agentIsInheritedDefault
-                        ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
-                        : i18nT('components.chatInput.agent', {
-                            name: agentName,
-                          })
-                  }
-                  aria-label={
-                    isRunning
-                      ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
-                      : agentIsInheritedDefault
-                        ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
-                        : i18nT('components.chatInput.agent', {
-                            name: agentName,
-                          })
-                  }
-                >
-                  <Bot size={13} className="shrink-0 opacity-70" />
-                  {!shelfCompact && (
-                    <span className="truncate max-w-[160px]">{agentLabel ?? agentName}</span>
-                  )}
-                </button>
-              )}
-              {onProjectClick && (
-                /* Two sibling buttons inside one visual pill, NOT a nested button:
+            <button
+              className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
+              onClick={e => onAgentClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
+              disabled={isRunning}
+              // Inherited default: explain what the ` . default` marker means, on
+              // hover (title) AND keyboard focus / screen readers (aria-label),
+              // because the marker alone reads as opaque (#8770 UX). No glyph, no
+              // layout change -- text on demand. A pinned chip keeps the plain
+              // switch hint; it has nothing to explain.
+              title={isRunning
+                ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
+                : agentIsInheritedDefault
+                  ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
+                  : i18nT('components.chatInput.agent', { name: agentName })}
+              aria-label={isRunning
+                ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
+                : agentIsInheritedDefault
+                  ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
+                  : i18nT('components.chatInput.agent', { name: agentName })}
+            >
+              <Bot size={13} className="shrink-0 opacity-70" />
+              {!shelfCompact && <span className="truncate max-w-[160px]">{agentLabel ?? agentName}</span>}
+            </button>
+          )}
+          {onProjectClick && (
+          /* Two sibling buttons inside one visual pill, NOT a nested button:
              the folder segment opens the project picker and the branch segment
              copies. A <button> inside a <button> is invalid HTML and browsers
              collapse it, so the pill is a plain container and each segment owns
              its own click target and hover state. */
-                <div className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted">
-                  <button
-                    className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
-                    onClick={(e) => onProjectClick(e.currentTarget.getBoundingClientRect())}
-                    disabled={isRunning}
-                    title={
-                      isRunning
-                        ? i18nT('components.chatInput.stop_the_current_response_to_switch_project')
-                        : projectChipTitle
-                    }
-                    aria-label={
-                      isRunning
-                        ? i18nT('components.chatInput.stop_the_current_response_to_switch_project')
-                        : projectChipTitle
-                    }
-                  >
-                    <FolderOpen size={13} className="shrink-0 opacity-70" />
-                    {/* Budget favours the branch: the folder name is also in the tooltip
+          <div className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted">
+          <button
+            className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
+            onClick={e => onProjectClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
+            disabled={isRunning}
+            title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
+            aria-label={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
+          >
+            <FolderOpen size={13} className="shrink-0 opacity-70" />
+            {/* Budget favours the branch: the folder name is also in the tooltip
                 and the picker, whereas a clipped branch ("feat/pro…") is exactly
                 the ambiguity this label exists to remove. The enclosing shelf
                 group is flex-1/min-w-0, so both segments still shrink below

@@ -2186,29 +2186,16 @@ def _doctor_source_checkout(repo: Path) -> None:
 
 
 def _doctor_pod_session_bus(issues: list[str]) -> None:
-    """Report whether pods have a reachable ``systemd --user`` session bus.
+    """Report whether pods can reach the per-user service manager.
 
-    Pods are ``systemd --user`` units, so ``systemctl --user`` must be able to
-    reach the per-user systemd instance. A gateway started from a systemd SYSTEM
-    unit (``kirocrew service install``) inherits no login-session environment,
-    and if the per-user instance is not running at all there is nothing for
-    KiroCrew to point at — every pod verb then fails with "Failed to connect to
-    bus: No medium found". Diagnosing that belongs here.
+    Socket existence is not reachability: an outer sandbox can leave
+    ``$XDG_RUNTIME_DIR/bus`` visible while denying ``connect(2)``. The shared
+    pod probe keeps that state separate from an absent user session bus and from
+    an unclassified systemctl failure.
 
-    Three outcomes: socket present → pass; absent → ❌ with the remediation;
-    present but ``Linger=no`` → warn, because pods work now and will die on
-    logout.
-
-    Advisory only (never appended to ``issues``, like the embedding-model URL
-    probe): a host with no per-user systemd instance — a container, a CI runner,
-    a headless server — is not a broken install, it is one where an optional dev
-    feature is unavailable. macOS and Windows already report that as "not
-    applicable" and block nothing, so blocking on Linux would be inconsistent as
-    well as a false alarm for everyone who never runs a pod.
-
-    Doctor only reports: enabling linger changes the user's login-session
-    lifetime and is theirs to choose, never a side effect of installing a
-    service.
+    Advisory only. Pods are an optional development feature, so an unavailable
+    backend never changes doctor's exit code. Doctor reports the action but does
+    not enable linger or change the caller's sandbox.
     """
     del issues  # advisory-only diagnostic; keeps the call-site signature uniform
     print("\nPods")
@@ -2222,23 +2209,37 @@ def _doctor_pod_session_bus(issues: list[str]) -> None:
         print("  session bus: ⏹ not applicable (no `systemctl` on PATH)")
         return
 
-    # Local import: keeps the pod package out of the CLI's import graph for
-    # every other command (circular-safe — pod.runtime imports no CLI module).
-    from kiro_crew.pod.runtime import has_session_bus, session_bus_socket
+    # Local import keeps the pod package out of every other CLI command's import
+    # graph. pod.runtime imports no CLI module, so this remains circular-safe.
+    from kiro_crew.pod.runtime import (
+        USER_BUS_NO_SESSION,
+        USER_BUS_REACHABLE,
+        USER_BUS_SANDBOXED_AWAY,
+        probe_user_bus,
+        user_bus_failure_message,
+    )
 
-    uid = getattr(os, "getuid", lambda: -1)()
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or str(uid)
-    sock = session_bus_socket()
-    if not has_session_bus():
-        print(f"  session bus: ❌ none for uid {uid} (looked for {sock})")
-        print("               Pods are systemd --user units, so `kirocrew pod` is")
-        print("               unavailable until one exists. Everything else works.")
-        print(f"               Fix: loginctl enable-linger {user}")
+    result = probe_user_bus()
+    if result.status != USER_BUS_REACHABLE:
+        label = {
+            USER_BUS_NO_SESSION: "no user session bus",
+            USER_BUS_SANDBOXED_AWAY: "sandboxed away",
+        }.get(result.status, "unreachable")
+        print(f"  session bus: ❌ {label} ({result.socket})")
+        for line in user_bus_failure_message(result).splitlines():
+            print(f"               {line}")
+        print("               Everything else works.")
         return
-    print(f"  session bus: ✅ {sock}")
+
+    print(f"  session bus: ✅ {result.socket}")
+    user = (
+        os.environ.get("USER")
+        or os.environ.get("LOGNAME")
+        or str(getattr(os, "getuid", lambda: -1)())
+    )
     if _linger_enabled(user) is False:
-        print("  linger:      ⚠️  disabled — the per-user systemd instance exits on " "logout,")
-        print("               taking running pods with it. " f"Fix: loginctl enable-linger {user}")
+        print("  linger:      ⚠️  disabled — the per-user systemd instance exits on logout,")
+        print(f"               taking running pods with it. Fix: loginctl enable-linger {user}")
 
 
 # Where SwapTotal is read from. A module attribute (not inlined) so tests can
@@ -2681,6 +2682,138 @@ def _format_job_labels(entries: list[tuple[str, str]]) -> str:
         return ", ".join(labels)
     shown = ", ".join(labels[:_CRON_REPORT_CAP])
     return f"{shown}, +{len(labels) - _CRON_REPORT_CAP} more"
+
+
+def _doctor_task_store(issues: list[str]) -> None:
+    """Report the durable task queue: depth, oldest wait, journal warnings.
+
+    Reads ``$KIROCREW_HOME/tasks/tasks.db`` directly with a read-only view of
+    the store's own diagnostics, so a wedged gateway cannot hide a backlog.
+    Silent on a fresh install with no store yet. A network-filesystem data home
+    is reported here because the store then runs on ``journal_mode=DELETE``,
+    which is slower but never a refusal.
+    """
+    from kiro_crew.config.paths import data_home
+    from kiro_crew.taskq import TaskStore, TaskStoreUnavailable
+
+    path = TaskStore.default_path(data_home())
+    # A quarantined copy beside the live file is the boot-time verdict that the
+    # previous store was corrupt: the gateway recreated it empty and moved the
+    # damaged file here. Say so, once per copy, until the operator removes it.
+    quarantined = sorted(path.parent.glob(f"{path.name}.corrupt-*")) if path.parent.exists() else []
+    for copy in quarantined:
+        if copy.name.endswith(("-journal", "-wal", "-shm")):
+            continue
+        print(f"  task store: ⚠️  a corrupt store was quarantined as {copy.name}")
+        issues.append(
+            f"task store {path} was found corrupt at a gateway boot and quarantined as "
+            f"{copy}; work accepted into the old file was not recovered -- inspect or "
+            "delete the quarantined copy"
+        )
+    if not path.exists():
+        return
+    store = TaskStore(path, diagnostic=True)
+    try:
+        store.open()
+        lines = store.doctor_lines()
+        by_state = store.count_by_state()
+    except TaskStoreUnavailable as exc:
+        print(f"  task store: ⚠️  {path} cannot be opened ({exc})")
+        issues.append(
+            f"task store {path} cannot be opened: accepted subagent work cannot be "
+            "persisted or recovered until this is fixed"
+        )
+        return
+    finally:
+        store.close()
+    for line in lines:
+        print(f"  {line}")
+    queued = {state: n for state, n in sorted(by_state.items()) if n}
+    if queued:
+        print("  task states: " + ", ".join(f"{state}={n}" for state, n in queued.items()))
+    for warning in store.warnings:
+        issues.append(warning)
+
+
+def _doctor_overload_resilience(cfg: KiroCrewConfig) -> None:
+    """Print the overload-resilience contract this install runs under.
+
+    Configuration and static platform facts only: the live gate counts, the
+    adaptive caps and the per-scope dependency schedules are gateway-process
+    state, served by ``GET /api/sessions/health`` — a doctor process cannot
+    read them and must not pretend to. What it CAN state is the bound each
+    mechanism is configured to (so a stuck queue can be read against its
+    budget) and which liveness evidence this host's platform provides.
+    """
+    from kiro_crew.recovery.ladder import configure_default_ladder
+
+    agent = cfg.agent
+    gw = cfg.mcp_gateway
+    print(
+        "  admission: session_start_concurrency="
+        f"{agent.session_start_concurrency} "
+        f"spawn_gate={gw.spawn_concurrency_initial} "
+        f"[{gw.spawn_concurrency_min}..{gw.spawn_concurrency_max}] "
+        f"queue_wait={gw.spawn_queue_wait_secs}s "
+        f"dispatch_window={agent.task_dispatch_window} "
+        f"(live gate counts: GET /api/sessions/health)"
+    )
+    mode = agent.adaptive_concurrency_mode if agent.adaptive_concurrency else "off"
+    print(
+        f"  adaptive concurrency: {mode} floor={agent.adaptive_floor} "
+        f"initial={agent.adaptive_initial} sample={agent.controller_sample_secs}s"
+    )
+    print("  recovery ladder:")
+    # Through the boot seam a gateway uses, on this process's own ladder: these
+    # rows are the CONFIGURED schedule, so they cannot disagree with the
+    # dependency-wait line below, which reads the same two keys. Still config
+    # only — a doctor process has no live attempt count to show.
+    for row in configure_default_ladder(cfg).table():
+        print(
+            f"    {row['layer']}: backoff {row['backoff_base_secs']:g}s→"
+            f"{row['backoff_max_secs']:g}s, {row['attempts_before_escalation']} attempts → "
+            f"{row.get('escalates_to') or 'notify'}"
+        )
+    print(
+        "  dependency waits: backoff "
+        f"{agent.recovery_backoff_base_secs:g}s→{agent.recovery_backoff_max_secs:g}s "
+        "(the shared recovery schedule), "
+        f"max_attempts={agent.dependency_max_attempts}, "
+        f"deadline={agent.dependency_wait_deadline_secs}s"
+    )
+    print(f"  interactive commands: policy={agent.interactive_command_policy}")
+    print(
+        "  uncharged residency: native children (kiro-cli use_subagent / KAS subtasks) "
+        "are counted on the parent session, never a budget slot, lane slot or task row "
+        '(live count: GET /api/sessions/health "uncharged")'
+    )
+    print(f"  liveness evidence: {_liveness_platform_line()}")
+
+
+def _liveness_platform_line() -> str:
+    """Which stall evidence this platform's liveness oracle can produce.
+
+    Mirrors the platform matrix in ``acp/liveness.py``: a missing column is a
+    DECLARED degradation (bounded by the no-progress budget), never a stall
+    the oracle silently calls WORKING.
+    """
+    if sys.platform.startswith("linux"):
+        return (
+            "linux /proc — process tree, CPU+IO movement, STUCK_INPUT (blocked "
+            "tty/pipe read), established-flat sockets: full matrix"
+        )
+    if sys.platform == "darwin":
+        return (
+            "macOS libproc — process tree and CPU-only movement; STUCK_INPUT and "
+            "socket evidence absent (a live but flat shell child reads UNKNOWN "
+            "platform_limited and is bounded by the no-progress budget)"
+        )
+    if sys.platform.startswith("win"):
+        return (
+            "windows — no process-tree backend; shell and MCP tool calls read "
+            "UNKNOWN platform_limited and are bounded by the no-progress budget"
+        )
+    return f"{sys.platform} — no process-tree backend; UNKNOWN platform_limited"
 
 
 def _doctor_cron_health(issues: list[str]) -> None:
@@ -3776,6 +3909,12 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # Reads crons.json off disk, not the gateway API: the gateway's own
     # per-job badge and hourly failure re-alert cannot report a wedged gateway.
     _doctor_cron_health(issues)
+
+    # ── Durable task queue (silent when no tasks.db exists yet) ──
+    _doctor_task_store(issues)
+
+    # ── Overload resilience: configured bounds + platform liveness evidence ──
+    _doctor_overload_resilience(cfg)
 
     # ── Agent Spec Paths (dead command/args/env paths) ──
     # Own module + single call so a sibling sweep wiring into doctor rebases

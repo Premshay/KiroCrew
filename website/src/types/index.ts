@@ -4,10 +4,11 @@ export interface StatusData {
   sessions: number
   messages: number
   /**
-   * `null` means UNKNOWN — the WS pusher's count refresh has not succeeded
-   * yet (e.g. the lesson store is failing). StatCard renders null as a
-   * loading skeleton; publishing 0 instead would assert an authoritative
-   * false zero (issue #7204). HTTP/SSE paths always send numbers.
+   * `null` means UNKNOWN — the shared count cache has not refreshed
+   * successfully yet (e.g. the lesson store is failing). StatCard renders null
+   * as a loading skeleton; publishing 0 instead would assert an authoritative
+   * false zero (issue #7204). All three transports (WS push, /api/status, SSE)
+   * read the same cache and may send null.
    */
   cron_jobs: number | null
   subagents: number
@@ -467,6 +468,19 @@ export interface CronJob {
 
 export interface Lesson {
   rule: string; category: string; ts: string
+  /** The `DELETE /api/lessons` selector that names exactly this row. A lesson's
+   *  identity is `(rule, repo_scope)`, so two same-rule rows in two scopes are
+   *  two lessons: `""` is the global row, a fragment is that scope's row, and
+   *  `null` is a row whose stored scope is unusable -- send NO selector for it,
+   *  the unselective delete is the only path that reaches such a row. */
+  repo_scope?: string | null
+  /** Which JSONL file the row was read from, when the list is the JSONL union of
+   *  the global file and the active workspace's. `DELETE /api/lessons` defaults to
+   *  the global file, so a workspace row's delete must carry these back or it
+   *  removes a same-text global row and leaves this one. Absent on vector rows,
+   *  where the delete reaches the store whatever `scope` says. */
+  scope?: 'global' | 'workspace'
+  workspace?: string
 }
 
 /** One row of `GET /api/memory/stores` — a declared memory store.
