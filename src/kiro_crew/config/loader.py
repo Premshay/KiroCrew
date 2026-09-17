@@ -4993,6 +4993,67 @@ class KiroCrewConfig:
             return model_registry.to_provider_id(m, namespace)
         return model_registry.to_acp_id(m)
 
+    def crew_pinned_effort(self, agent: str | None, crew_agent: str | None = None) -> str:
+        """The reasoning effort THIS CREW pins, or ``""`` when it pins none.
+
+        The tier between an explicit per-session override and the configured
+        default: a crew that pins nothing resolves ``""`` and therefore inherits
+        exactly what it inherited before this field existed.
+
+        Keyed on :func:`resolve_crew_identity` — the same canonical
+        ``config.agents`` key the provider factory and the warm-pool claim
+        already agree on — so ONE lookup covers every surface that can start a
+        session (dashboard, cron, Slack, webhook, spawn). That matters more here
+        than for ``model``, whose crew pin arrives as the caller's
+        ``model_override``: a schedule- or webhook-woken crew has no dashboard
+        slot to carry an override, so a per-caller resolution would leave those
+        crews — the ones a pin is most useful for — on the global default.
+        """
+        crew = self._crew_record(agent, crew_agent)
+        return coerce_effort(crew.reasoning_effort) if crew is not None else ""
+
+    def _crew_record(
+        self, agent: str | None, crew_agent: str | None
+    ) -> "KiroCrewAgentConfig | None":
+        """The ``config.agents`` record this session runs as, or ``None``."""
+        key = resolve_crew_identity(self, agent, crew_agent)
+        return self.agents.get(key) if key else None
+
+    def resolve_session_effort(self, agent: str | None, crew_agent: str | None = None) -> str:
+        """The effort a NEW session resolves to, short of an explicit override.
+
+        The crew's own pin first, then the role-aware default: a background
+        worker agent (``kirocrew-lite`` / ``kirocrew-heartbeat``) takes the
+        ``background`` role effort, everything else the chat default. A pin the
+        operator typed on the crew therefore outranks BOTH defaults, including
+        the role one — the pin is a choice, the role effort is a built-in.
+
+        Shared with the crews API's readout deliberately. The pane's job is to
+        say what a session will actually run at, and a second copy of this chain
+        would drift from the one the factory applies — a crew bound to a
+        background agent would be reported at the chat default while running at
+        the role effort.
+
+        The role check keys on the crew's BOUND ``kiro_agent``, not on ``agent``,
+        because that parameter carries different things on different surfaces:
+        the dashboard passes a kiro agent name, while Slack threads, cron jobs and
+        spawned agents pass a CREW name (the convention
+        :func:`resolve_crew_identity` documents). Keying on the raw value made an
+        unpinned crew bound to a background worker run at the chat default
+        whenever the surface named the crew — the same class of drift in the other
+        direction. With no crew record to read, ``agent`` IS the agent name (the
+        background/heartbeat session keys pass it directly) and is used as-is.
+        """
+        crew = self._crew_record(agent, crew_agent)
+        if crew is not None:
+            pinned = coerce_effort(crew.reasoning_effort)
+            if pinned:
+                return pinned
+        template = crew.kiro_agent if crew is not None else (agent or "")
+        if template in BACKGROUND_WORKER_AGENTS:
+            return self.agent.resolve_effort("background")
+        return self.agent.reasoning_effort
+
     @staticmethod
     def _resolve_named_agent_model(agent: str, agents_dir: Path | None = None) -> str:
         """Return a named agent's own kiro ``model`` field, or ``""`` if none.
@@ -5134,12 +5195,6 @@ class KiroCrewConfig:
         tool_search = self.agent.tool_search
         tool_search_min_pct = self.agent.tool_search_min_pct
         tool_search_min_tokens = self.agent.tool_search_min_tokens
-        # Global default effort for new sessions. A per-slot override always
-        # wins; this only fills in when the slot carries none, so a session that
-        # has never touched the effort control still starts at the user's
-        # configured default instead of the provider/model default.
-        default_effort = self.agent.reasoning_effort
-
         # MCP gateway: resolve overlay + socket once, iff some server is stubbed
         # through the gateway. Routing is what puts a stub in the path, and the
         # stub is what carries both the render/callback path and any sharing —
@@ -5227,15 +5282,12 @@ class KiroCrewConfig:
                 _backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
             )
             _eff_per_model: dict[str, str] = {}
-            # Role-aware effort default: background worker agents (lite /
-            # heartbeat) resolve the "background" role effort; everything else
-            # uses the chat default. An explicit override (the dashboard slot's
-            # effort, or a sub-agent's resolved "subagent" effort) still wins.
-            if agent in ("kirocrew-lite", "kirocrew-heartbeat"):
-                base_effort = self.agent.resolve_effort("background")
-            else:
-                base_effort = default_effort
-            _eff = reasoning_effort_override or base_effort
+            # Everything below an explicit override — the crew's pin, then the
+            # role-aware default — resolves in resolve_session_effort, which the
+            # crews API also serves its readout from. An explicit override (the
+            # dashboard slot's effort, or a sub-agent's resolved "subagent"
+            # effort) still wins over all of it.
+            _eff = reasoning_effort_override or self.resolve_session_effort(agent, crew_agent)
             if (
                 m
                 and _eff
