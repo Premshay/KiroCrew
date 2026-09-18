@@ -6514,6 +6514,34 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             slot._fallback_slot_model = ""
             slot._fallback_pick_gen = 0
 
+        def _unwind_model_commit() -> None:
+            """Restore the pin this request cleared, while the clear is still ours.
+
+            ``slot.model`` is authorized by generation, not by the identity
+            comparison the other fields use: its unlocked writers include
+            rewrites that are not picks at all (``chat_runner`` normalizes the
+            value and backfills the canonical id, replacing the token without
+            touching ``_model_pick_gen``). Every real pick bumps that
+            generation and no incidental rewrite does, which is what separates
+            "a concurrent pick owns this" from "still my clear". Every exit
+            that restores the agent calls this, because a refused switch that
+            keeps the cleared pin has changed something while reporting
+            failure.
+            """
+            if (
+                committed_model_pick_gen is not None
+                and slot._model_pick_gen == committed_model_pick_gen
+                and slot._active_fallback_model is committed_active_fallback_model
+            ):
+                slot.model = prior_model
+                slot._model_pick_gen = prior_model_pick_gen
+                slot._fallback_candidate_idx = prior_fallback_candidate_idx
+                slot._fallback_walked = prior_fallback_walked
+                slot._active_fallback_model = prior_active_fallback_model
+                slot._fallback_primary_model = prior_fallback_primary_model
+                slot._fallback_slot_model = prior_fallback_slot_model
+                slot._fallback_pick_gen = prior_fallback_pick_gen
+
         # Resolve workspace from agent bindings. The response value is seeded
         # from the slot's CURRENT workspace, not a "default" literal: if
         # resolution below fails, the response still names this value, and
@@ -6557,6 +6585,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     # derived fields, reset or history write has committed yet.
                     if slot.agent is committed_agent:
                         slot.agent = prior_agent
+                    _unwind_model_commit()
                     denied = await require_owner_dashboard_request(request, "chat.slot_agent")
                     if denied is not None:
                         return denied
@@ -6665,6 +6694,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         except asyncio.CancelledError:
             if slot.agent is committed_agent:
                 slot.agent = prior_agent
+            _unwind_model_commit()
             raise
         except Exception:
             logger.warning("Failed to resolve agent bindings for %r", agent_name, exc_info=True)
@@ -6674,6 +6704,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             # protected selection. Leave the established conversation usable.
             if slot.agent is committed_agent:
                 slot.agent = prior_agent
+            _unwind_model_commit()
             from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
             from kiro_crew.memory_stores import UnknownMemoryStore
 
@@ -6737,28 +6768,9 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             """
             if slot.agent is committed_agent:
                 slot.agent = prior_agent
-            # slot.model is the ONE field authorized by generation rather than
-            # token identity, because it has writers that are not picks: a
-            # concurrent turn normalizes it (chat_runner _normalize_model) and
-            # backfills its canonical id, replacing the token object without
-            # touching _model_pick_gen. Requiring identity here let those
-            # incidental rewrites read as "a concurrent pick owns this", so a
-            # rejected switch kept its own cleared model and prior_model was
-            # never restored. The generation is what actually separates the two
-            # cases: every real pick bumps it, no incidental rewrite does.
-            if (
-                committed_model_pick_gen is not None
-                and slot._model_pick_gen == committed_model_pick_gen
-                and slot._active_fallback_model is committed_active_fallback_model
-            ):
-                slot.model = prior_model
-                slot._model_pick_gen = prior_model_pick_gen
-                slot._fallback_candidate_idx = prior_fallback_candidate_idx
-                slot._fallback_walked = prior_fallback_walked
-                slot._active_fallback_model = prior_active_fallback_model
-                slot._fallback_primary_model = prior_fallback_primary_model
-                slot._fallback_slot_model = prior_fallback_slot_model
-                slot._fallback_pick_gen = prior_fallback_pick_gen
+            # The model unwind is shared with the exits that restore the agent
+            # before this helper became reachable; see _unwind_model_commit.
+            _unwind_model_commit()
             if committed_workspace is not None and slot.workspace is committed_workspace:
                 slot.workspace = pre_await_workspace
             if committed_project is not None and slot.project is committed_project:
