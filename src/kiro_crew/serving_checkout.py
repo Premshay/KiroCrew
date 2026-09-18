@@ -54,16 +54,16 @@ _reported: set[tuple[str, float]] = set()
 _started_at: float | None = None
 
 
-def _read_process_start() -> float | None:
-    """Wall-clock start of THIS process, from /proc; None when unreadable.
+def _start_from_stat(stat_path: Path) -> float | None:
+    """Wall-clock start of the process *stat_path* describes; None if unreadable.
 
-    ``/proc/self/stat`` field 22 is the start time in clock ticks since boot, and
-    the process name it follows may contain spaces, so the split happens after
-    the closing paren. Boot time comes from CLOCK_BOOTTIME, which shares the
-    kernel's suspend-inclusive clock.
+    ``stat`` field 22 is the start time in clock ticks since boot, and the
+    process name it follows may contain spaces and parentheses, so the split
+    happens after the LAST closing paren. Boot time comes from CLOCK_BOOTTIME,
+    which shares the kernel's suspend-inclusive clock.
     """
     try:
-        fields = Path("/proc/self/stat").read_bytes().rsplit(b")", 1)[1].split()
+        fields = stat_path.read_bytes().rsplit(b")", 1)[1].split()
         ticks = float(fields[19])
         boot_secs = time.clock_gettime(time.CLOCK_BOOTTIME)
         return time.time() - (boot_secs - ticks / os.sysconf("SC_CLK_TCK"))
@@ -75,8 +75,18 @@ def process_started_at() -> float:
     """Start of this process, resolved once."""
     global _started_at
     if _started_at is None:
-        _started_at = _read_process_start() or time.time()
+        _started_at = _start_from_stat(Path("/proc/self/stat")) or time.time()
     return _started_at
+
+
+def pid_started_at(pid: int) -> float | None:
+    """Start of *pid*, or None when it is gone or unreadable.
+
+    A freshly spawned process (the doctor CLI) cannot answer "has the checkout
+    moved since the GATEWAY started?" from its own start time, so it asks about
+    the gateway process instead.
+    """
+    return _start_from_stat(Path(f"/proc/{pid}/stat"))
 
 
 def newest_source_mtime(root: Path = PACKAGE_ROOT) -> tuple[float, str]:
@@ -90,6 +100,20 @@ def newest_source_mtime(root: Path = PACKAGE_ROOT) -> tuple[float, str]:
         if mtime > newest:
             newest, newest_path = mtime, str(entry)
     return newest, newest_path
+
+
+def drift_since(started_at: float, *, root: Path = PACKAGE_ROOT) -> CodeDrift | None:
+    """The newest source written after *started_at*, or None when none was.
+
+    Takes its reference time as an argument and caches nothing: a fresh process
+    asks about ANOTHER process's start (the gateway it is diagnosing), which is
+    a different question from this process's own drift and must not overwrite
+    the cached answer to that one.
+    """
+    newest, path = newest_source_mtime(root)
+    if newest <= started_at:
+        return None
+    return CodeDrift(path=path, mtime=newest, age_secs=newest - started_at)
 
 
 def scan(
@@ -109,11 +133,7 @@ def scan(
     if not force and _scanned_at is not None and (moment - _scanned_at) < CHECK_INTERVAL_SECS:
         return _current
     _scanned_at = moment
-    newest, path = newest_source_mtime(root)
-    started = process_started_at()
-    _current = (
-        CodeDrift(path=path, mtime=newest, age_secs=newest - started) if newest > started else None
-    )
+    _current = drift_since(process_started_at(), root=root)
     return _current
 
 

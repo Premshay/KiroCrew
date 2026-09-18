@@ -108,6 +108,7 @@ from kiro_crew.service import apparmor
 from kiro_crew.service import common as common_service
 from kiro_crew.service import controller as service_controller
 from kiro_crew.service import linux as service_linux
+from kiro_crew.serving_checkout import drift_since, pid_started_at
 from kiro_crew.session_pid_sig import signing_health
 from kiro_crew.stall_attribution import attribute_dump, describe
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
@@ -2104,6 +2105,43 @@ def _git_line(repo: Path, *args: str) -> str | None:
     return res.stdout.strip().splitlines()[0].strip() if res.stdout.strip() else None
 
 
+def _doctor_checkout_drift() -> None:
+    """Report sources rewritten after the running gateway started.
+
+    The gateway imports from the deployed checkout, so a merge or an editor
+    write during a run leaves it executing one revision and importing the next.
+    The two only disagree where an import happens late, and the symptom then
+    arrives in an unrelated request as an ImportError — a checkout that moved is
+    not something the feature that breaks can explain.
+
+    Doctor is a fresh process, so its own start time says nothing about the
+    gateway's: the comparison is against the gateway process, and it reports
+    unknown rather than guessing when no gateway is running or its start cannot
+    be read. Advisory only, matching the branch probe below it — the row names
+    the file and the remedy, and restarting mid-turn stays the operator's call.
+    """
+    try:
+        pid = _read_gateway_pid()
+    except Exception:
+        pid = None
+    if pid is None:
+        print("  code drift:  ⏭  gateway not running (nothing to compare)")
+        return
+    started = pid_started_at(pid)
+    if started is None:
+        print(f"  code drift:  ⚠️  pid {pid} alive but its start time is unreadable")
+        return
+    drift = drift_since(started)
+    if drift is None:
+        print(f"  code drift:  ✅ sources predate the running gateway (pid {pid})")
+        return
+    print(
+        f"  code drift:  ⚠️  {drift.path} was written "
+        f"{drift.age_secs / 60:.0f} min after the gateway started"
+    )
+    print("               Fix: restart the gateway so it serves one revision.")
+
+
 def _doctor_source_checkout(repo: Path) -> None:
     """Report whether an editable install's source tree is current.
 
@@ -2127,6 +2165,10 @@ def _doctor_source_checkout(repo: Path) -> None:
     a host that never talks to the remote.
     """
     print("\nSource Checkout")
+    # Printed before the git rows and their early returns: this row is about the
+    # RUNNING process, so a checkout with no .git — or no default branch to
+    # compare against — still gets its drift reported.
+    _doctor_checkout_drift()
     if not (repo / ".git").exists():
         print(f"  source:      ⏹ not a git checkout ({repo})")
         return

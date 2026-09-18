@@ -80,3 +80,47 @@ def test_process_start_is_this_process_not_import_time() -> None:
     started = serving_checkout.process_started_at()
 
     assert 0 < started <= time.time()
+
+
+def test_drift_since_compares_against_the_reference_it_is_given(tmp_path: Path) -> None:
+    now = time.time()
+    changed = _write(tmp_path, "changed.py", mtime=now - 30)
+
+    # A reference later than the newest write means nothing moved after it.
+    assert serving_checkout.drift_since(now + 10, root=tmp_path) is None
+
+    drift = serving_checkout.drift_since(now - 300, root=tmp_path)
+
+    assert drift is not None
+    assert drift.path == str(changed)
+    assert drift.age_secs == pytest.approx(270.0, abs=1.0)
+
+
+def test_drift_since_leaves_the_cached_process_scan_alone(tmp_path: Path) -> None:
+    """The doctor asks about another process; that must not answer for this one.
+
+    ``scan`` caches what the dashboard publishes, so a doctor call that wrote
+    through to it would make the gateway's own payload report a drift measured
+    against a different process's start.
+    """
+    now = time.time()
+    _write(tmp_path, "changed.py", mtime=now - 30)
+    serving_checkout.reset_for_tests(started_at=now - 300)
+    cached = serving_checkout.scan(force=True, now=now, root=tmp_path)
+    assert cached is not None
+
+    serving_checkout.drift_since(now - 10, root=tmp_path)
+
+    assert serving_checkout.current() == cached
+
+
+def test_pid_started_at_matches_this_process() -> None:
+    assert serving_checkout.pid_started_at(os.getpid()) == pytest.approx(
+        serving_checkout.process_started_at(), abs=1.0
+    )
+
+
+def test_pid_started_at_is_none_for_a_process_that_does_not_exist() -> None:
+    """A gateway that exits between the pid read and the stat read is reported
+    as unknown, not as an exception out of the doctor command."""
+    assert serving_checkout.pid_started_at(0) is None
