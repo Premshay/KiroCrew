@@ -23,7 +23,6 @@ from kiro_crew import (
     model_registry,
     resource_status,
     session_directive,
-    session_ledger_emit,
 )
 from kiro_crew.acp.client import (
     AcpAuthRequired,
@@ -62,7 +61,7 @@ from kiro_crew.acp.types import (
     classify_stop_reason,
 )
 from kiro_crew.acp_backends import ACP_BACKENDS_COMPACT
-from kiro_crew.agent_discovery import warm_project_agent_names
+from kiro_crew.agent_discovery import agent_welcome_message, warm_project_agent_names
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.autonudge import get_instance
@@ -93,6 +92,7 @@ from kiro_crew.context_management import (
     strip_plan_markers,
     validate_plan_format,
 )
+from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard.chat_persistence import (
     persist_post_restart_continuation,
@@ -876,6 +876,65 @@ def _redact_display_text(text: str) -> str:
     return text
 
 
+async def _surface_agent_welcome(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    agent: str,
+) -> None:
+    """Render *agent*'s ``welcomeMessage`` into *slot*, at most once per activation.
+
+    The one consumer of the agent-config field. An agent JSON may carry a
+    ``welcomeMessage`` — a usage hint its author wants the user to read when the
+    agent takes over — and this is the only place it reaches a user. Kiro Crew's
+    own bundled agents ship one, so the field is not a niche extension point.
+
+    Three properties are the whole design, and each one rules out an
+    alternative that looks simpler:
+
+    * **A transcript row, not prompt context.** Role ``notice``: durable (not in
+      ``_TRANSIENT_ROLES``, so it persists and survives a reload) but NOT one of
+      the ``user``/``assistant`` roles the history replay feeds back to the
+      model. Inlining the hint into the system prompt is the workaround the
+      issue reports as the thing to remove — it re-sends the text every turn.
+    * **One shot per activation.** Both call sites clear through
+      ``slot._welcomed_agent``, because a switch and the session start its own
+      reset produces are two events for ONE activation, and each path would
+      otherwise emit for the other.
+    * **Untrusted text.** The field is read from a user-writable, tool-shared
+      directory. ``NoticeCard`` renders a ``notice`` row as plain text (no
+      markdown, no HTML), the reader caps its length, and it is passed through
+      the same display redactors as any other foreign string reaching a
+      transcript — so a hint carrying a credential or an exfil URL cannot ship
+      one into the persisted window.
+
+    Best-effort: the disk read is offloaded (this runs on the gateway's shared
+    event loop) and a failure renders nothing rather than failing the turn.
+    """
+    if not agent:
+        # The default crew has no spec, so there is nothing to render — but the
+        # claim is RELEASED rather than merely skipped: leaving it set made
+        # A -> default -> A read as "already welcomed A" and swallow A's second
+        # activation, which the one-shot rule is per activation, not per slot.
+        slot._welcomed_agent = ""
+        return
+    if slot._welcomed_agent == agent:
+        return
+    # Claimed BEFORE the await: two events for one activation can both reach
+    # this point, and the offload yields the loop between the guard and the
+    # append. Recording the failure case as "welcomed" too is deliberate — a
+    # hint that could not be read is not worth retrying on every later event
+    # for the same agent.
+    slot._welcomed_agent = agent
+    try:
+        text = await asyncio.to_thread(agent_welcome_message, agent, project=slot.project or None)
+    except Exception:  # noqa: BLE001 - decoration must never fail a turn
+        logger.debug("Failed to read welcomeMessage for agent %r", agent, exc_info=True)
+        return
+    if not text:
+        return
+    append_and_surface(state, slot, "notice", _redact_display_text(text), "msg msg-info")
+
+
 def _redacted_hook_block(event: Any, pre_hook_results: Any) -> tuple[str, str]:
     """Build a redacted ``(tool title, hook reason)`` recovery entry."""
     return (
@@ -1455,7 +1514,7 @@ def _ledger_model(slot: Any, fallback: str = "") -> str:
     entry therefore states a model that was not used, in a file nothing rewrites.
 
     ``served_model`` is the session fact, and it is empty when the backend serves
-    its own default. The ledger records that emptiness rather than naming a model,
+    its own default. The crew log records that emptiness rather than naming a model,
     for the same reason it omits an unmeasured token count: absent beats false.
 
     *fallback* covers only a slot shape that cannot report the fact at all -- the
@@ -1464,6 +1523,26 @@ def _ledger_model(slot: Any, fallback: str = "") -> str:
     if hasattr(slot, "served_model"):
         return str(getattr(slot, "served_model", "") or "")
     return fallback
+
+
+def _ledger_lineage(slot: Any) -> tuple[str, str]:
+    """The ``(parent_slot, parent_sid)`` a session's ``session/opened`` may cite.
+
+    Both come from the slot, and both are used ONLY when ``_lineage_minted`` says
+    THIS gateway process stamped them at ``session_create`` time. ``_created_by``
+    is also restored from transcript metadata for the ownership boundary, and that
+    file is editable by an agent's file tools, so promoting a restored value to
+    gateway-authored lineage would let a metadata edit forge the one record the
+    crew log's fence exists to protect. A slot with no witness -- a person's own
+    tab, a fork, a restore after a restart -- yields two empty strings, and the
+    emitter then writes no ``parent`` at all.
+    """
+    if not bool(getattr(slot, "_lineage_minted", False)):
+        return "", ""
+    return (
+        str(getattr(slot, "_created_by", "") or ""),
+        str(getattr(slot, "_created_by_sid", "") or ""),
+    )
 
 
 def _sync_served_model(slot: Any, client: Any) -> None:
@@ -4781,10 +4860,10 @@ def _flush_segment(
     # is read from the slot's client and the emitter's live record, so there is one
     # source for it rather than a copy threaded through every caller; the step is
     # derived inside the emitter from the same record.
-    _ledger_sid_here = session_ledger_emit.session_id_of(getattr(slot, "_acp_client", None))
-    session_ledger_emit.on_message_sent(
+    _ledger_sid_here = crew_log_emit.session_id_of(getattr(slot, "_acp_client", None))
+    crew_log_emit.on_message_sent(
         _ledger_sid_here,
-        session_ledger_emit.live_turn(_ledger_sid_here),
+        crew_log_emit.live_turn(_ledger_sid_here),
         text=redacted,
         interrupted=interrupted,
     )
@@ -7156,7 +7235,7 @@ TURN_ACTOR_META_KEY = "turnActor"
 #: the producer at ``queue_append`` and is not derivable from the entry's text,
 #: which is the point: the banners these two injections wrap their text in
 #: (``CRON_NOTIFY_PREFIX``, ``SUBAGENT_COMPLETION_PREFIXES``) are strings a user
-#: can type, and attributing a turn in the session ledger is a claim a reader
+#: can type, and attributing a turn in the session's log is a claim a reader
 #: takes as fact. Same source, same reason as ``is_system_injection_item``.
 #:
 #: ``SYNTHETIC_RECOVERY_KIND`` is deliberately absent: a recovery's actor is
@@ -7182,7 +7261,7 @@ def _actor_for_queue_items(items: "list[dict]") -> str:
     for item in items:
         meta = item.get("meta")
         stamped = meta.get(TURN_ACTOR_META_KEY, "") if isinstance(meta, dict) else ""
-        if isinstance(stamped, str) and stamped in session_ledger_emit.ACTORS:
+        if isinstance(stamped, str) and stamped in crew_log_emit.ACTORS:
             return stamped
     return ""
 
@@ -7808,11 +7887,11 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     }
     if peer_channel_request_refs:
         _run_kwargs["_peer_channel_request_refs"] = peer_channel_request_refs
-    # Provenance for the session ledger, from the enqueue-time ``kind`` tag — the
+    # Provenance for the session's log, from the enqueue-time ``kind`` tag — the
     # same unforgeable source ``is_system_injection_item`` classifies on, and for
     # the same reason: the banner these injections wrap their text in is something
     # a user can type. Left unset when no consumed entry carries a mapped kind,
-    # which the ledger records as a user turn.
+    # which the crew log records as a user turn.
     _queue_actor = _actor_for_queue_items(consumed)
     if _queue_actor:
         _run_kwargs["_turn_actor"] = _queue_actor
@@ -7821,7 +7900,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     if irreversible_delivery_callbacks:
         _run_kwargs["_on_irreversibly_consumed"] = _note_irreversibly_consumed
     # The row this turn runs carried its attachment lists through the queue, and this
-    # is the site that has the item, so the ledger's ids come from here. Collected
+    # is the site that has the item, so the crew log's ids come from here. Collected
     # across `consumed` because a row that carries attachments drains ALONE
     # (`carries_attachments`), so there is exactly one such row to read.
     _drained_attachment_meta: dict[str, list[str]] = {}
@@ -8138,13 +8217,27 @@ async def _run_chat(
     # issues from inside that wake is its own act. Cron, app and sub-agent
     # injections never set it.
     _directive_self_wake: bool = False,
+    # The id of the nudge/monitor loop whose delivered wake this turn is (set only
+    # by ``_fire_dashboard_nudge`` alongside ``_directive_self_wake``). SCOPES the
+    # structural-terminal slot verdict to the exact loop that produced
+    # it: a slot outlives any single loop (stop one, arm another on the same
+    # slot), so a slot-wide flag would let a stopped malformed loop's verdict
+    # deactivate a DIFFERENT loop armed later on that slot. Empty for every
+    # non-self-wake turn.
+    _directive_loop_id: str = "",
+    # The loop's CONFIG GENERATION at fire time (``loop.config_generation``),
+    # recorded with the verdict so the structural stop is applied under an ATOMIC
+    # (id, generation) fence: a stale completion of an OLD instruction cannot
+    # deactivate a loop whose config advanced since (the A->B->A race that a
+    # message-value key could not tell apart). Captured by the fire path.
+    _directive_loop_gen: int = 0,
     _directive_channel_origin: bool = False,
     # Who caused this turn, from the dispatch that knows -- a consumed queue
     # entry's enqueue-time ``kind`` tag, or an injector calling this runner
-    # directly. Recorded in the session ledger, so it must not be derivable from
+    # directly. Recorded in the session's log, so it must not be derivable from
     # the message TEXT: a user can type the cron or sub-agent banner, and the
-    # ledger's whole premise is that a reader takes it as fact. Empty means no
-    # dispatch claimed it, which the ledger records as ``user``.
+    # crew log's whole premise is that a reader takes it as fact. Empty means no
+    # dispatch claimed it, which the crew log records as ``user``.
     _turn_actor: str = "",
     regenerate_hint: str = "",
     _on_consumed: "Callable[[bool], None] | None" = None,
@@ -8274,7 +8367,7 @@ async def _run_chat(
     # message, which the user writes.
     _ledger_actor = _turn_actor or ("autonudge" if _directive_self_wake else "user")
 
-    # Append-only session ledger identity, declared HERE rather than only where
+    # Append-only the session's log identity, declared HERE rather than only where
     # it is filled in below: the mid-turn steer cut flushes a segment from a
     # nested closure, and a closure reading one of these before the turn path
     # assigns it would raise instead of simply recording nothing. Each is
@@ -8282,16 +8375,16 @@ async def _run_chat(
     # makes every emitter call a no-op.
     _ledger_sid = ""
     _turn_msg_boundary = 0
-    # The turn's ORDINAL for the ledger, kept separate from the message-slice
+    # The turn's ORDINAL for the crew log, kept separate from the message-slice
     # index above even though both start at the same value. The slice index is
     # reset when a mid-turn clear empties the message list, because the turn-stats
     # scan is relative to that list -- and a shared local would silently move the
-    # ledger's ordinal to 0 at the same moment, so the turn's own closers would
+    # crew log's ordinal to 0 at the same moment, so the turn's own closers would
     # name a turn that never started.
     _ledger_turn_no = 0
     _ledger_step = 0
     _ledger_step_t0 = time.monotonic()
-    # The turn's terminal ledger payload, captured at the terminal event and
+    # The turn's terminal crew log payload, captured at the terminal event and
     # emitted in the finally: the closers must follow the turn's last flushed
     # assistant message, which happens after the stream loop breaks.
     _ledger_terminal: "dict | None" = None
@@ -8482,7 +8575,7 @@ async def _run_chat(
         ONE helper for every recovery path, so the log copy cannot be forgotten by
         the next path added -- the same reason redaction lives at the emitter's
         boundary rather than at its call sites. Four handlers had this block
-        inline and none of them reached the ledger, so a turn that streamed text
+        inline and none of them reached the crew log, so a turn that streamed text
         the user watched got a closer saying it ended and nothing saying what it
         had produced.
 
@@ -8498,7 +8591,7 @@ async def _run_chat(
         _redacted = redact_credentials(redact_exfiltration_urls(assistant_text)[0])[0]
         slot.append("assistant", _redacted, "msg msg-a")
         _append_redaction_notice(slot, _redacted)
-        session_ledger_emit.on_message_sent(
+        crew_log_emit.on_message_sent(
             _ledger_sid,
             _ledger_turn_no,
             step=_ledger_step,
@@ -8758,6 +8851,17 @@ async def _run_chat(
     # this reset is a no-op for them and a later real turn can still recover.
     if message not in _SYNTHETIC_RECOVERY_MSGS:
         slot._posttoken_retry_used = False
+        # Clear the last turn's structural-terminal verdict at the START of a
+        # GENUINE new turn. The auto-nudge fire path reads this to refuse
+        # re-firing an identical context the backend rejected for its shape;
+        # a real new turn (a human /clear then a fresh message, or any turn
+        # whose context differs) is exactly the event that should let the loop
+        # re-arm, so the flag must not outlive it. A SYNTHETIC recovery turn
+        # re-runs the SAME message on a reset session, so it deliberately does
+        # NOT clear the flag -- the context that tripped the parser is unchanged.
+        slot._last_turn_structural_terminal = False
+        slot._last_turn_structural_terminal_loop_id = ""
+        slot._last_turn_structural_terminal_loop_gen = 0
     # A queued refusal retry (agent.refusal_fallback_model) replays the user's
     # OWN words, so it can never be recognized by membership in the fixed
     # synthetic-recovery texts above -- and not by TEXT at all: the drain
@@ -9641,6 +9745,18 @@ async def _run_chat(
                 needs_reinjection=False,
             ).delivers_section
         )
+        # Session start on a named agent: the greeting belongs to the moment
+        # the agent becomes the one answering, which for a cold start is here.
+        # `kiro_agent` FIRST, because that is the spec that answers: a crew
+        # alias's `slot.agent` is the member the human picked, which names no
+        # agent spec, so the roster lookup finds nothing and the running
+        # template's hint is dropped. Falls back to `slot.agent` for an ordinary
+        # slot, where no template resolution happened and the two are the same
+        # name. Both empty means the default crew, which has no spec to carry a
+        # hint. Guarded per activation, so the cold start that an agent switch's
+        # own session reset produces does not re-emit the row it appended.
+        if is_new:
+            await _surface_agent_welcome(state, slot, kiro_agent or slot.agent)
         # Member activity pointer — once per SESSION, not per turn: the log
         # answers "which sessions did this member take part in", so a per-turn
         # append would inflate every count taken from it. `slot.agent` is the
@@ -9679,11 +9795,11 @@ async def _run_chat(
         register_idle = getattr(slot._acp_client, "set_claude_idle_handler", None)
         if callable(register_idle):
             register_idle(lambda event: _render_claude_idle_event(state, slot, event))
-        # Append-only session ledger (flag-gated, fail-soft). The id is read
+        # Append-only the session's log (flag-gated, fail-soft). The id is read
         # once here and reused at every emit site below, so a turn that never
         # got a session id emits nothing rather than guessing one. ``owner`` is
         # "default" because a crew-bound slot never reaches this local runner.
-        _ledger_sid = session_ledger_emit.session_id_of(client)
+        _ledger_sid = crew_log_emit.session_id_of(client)
         # This consumer implements the low-fidelity child downgrade (the
         # interactive card) — opt in so the handle-level fail-close gate
         # yields those events here instead of rejecting them itself.
@@ -9813,20 +9929,39 @@ async def _run_chat(
                 f"will be used automatically once it's offered again.",
                 "msg msg-info",
             )
-        # Append-only session ledger (flag-gated, fail-soft). Written HERE rather
+        # Append-only the session's log (flag-gated, fail-soft). Written HERE rather
         # than at session acquisition, because `model` has to name what the session
         # RUNS on and that is not settled until the verdict above: a withheld pin is
         # kept on the slot, and an unpinned slot's pin is backfilled, both after the
         # handle exists. This is still ahead of every turn entry, and the announce
         # decision itself is latched inside the emitter, so a retry after the header
         # landed cannot skip it.
-        session_ledger_emit.on_session_opened(
+        #
+        # `_created_by` is `session_create`'s attribution, stamped on the slot at
+        # mint -- so it is already settled here, at the child's FIRST turn. The
+        # creator's session id is read from `_created_by_sid`, FROZEN at mint from
+        # the live caller handle, NOT re-read live here: the creator slot can be
+        # closed and replaced between mint and this first turn, and a replacement
+        # is a distinct handle with its own session id, so a live read would cite
+        # the replacement's crew log and corrupt this child's immutable
+        # `session/opened` lineage with no recovery. The creator's crew log is keyed
+        # by that frozen id, so `parent_sid` is what lets a fold open the unit that
+        # was live when this child was made; a creator whose handle had no session
+        # at mint gets its slot recorded, sid absent.
+        #
+        # Both fields are used ONLY when `_lineage_minted` says this process
+        # stamped them -- see `_ledger_lineage` for why a restored `_created_by`
+        # must never be promoted to gateway-authored lineage.
+        _creator_key, _creator_sid = _ledger_lineage(slot)
+        crew_log_emit.on_session_opened(
             _ledger_sid,
             agent=slot.agent or "",
             slot=slot.key,
             model=_ledger_model(slot),
             cwd=slot.project or "",
             resumed=bool(resumed),
+            parent_slot=_creator_key,
+            parent_sid=_creator_sid,
         )
         agent_label = kiro_agent or slot.agent or "default"
         # The label states what the session RUNS on, so a withheld pin reports the
@@ -10692,7 +10827,7 @@ async def _run_chat(
         _turn_cost_usd = 0.0
         _turn_model = ""
         _turn_msg_boundary = len(slot.messages)
-        # The ledger ordinal is the ABSOLUTE durable position, not the window
+        # The crew log ordinal is the ABSOLUTE durable position, not the window
         # length. `slot.messages` is front-trimmed at `_MAX_SLOT_MESSAGES`, so past
         # that cap its length stops growing and every later turn drew the SAME
         # ordinal -- the emitter then read distinct turns as retries of one and
@@ -10718,7 +10853,7 @@ async def _run_chat(
             getattr(slot, "_disk_older_durable_count", 0) or 0
         ) + durable_row_count(slot.messages)
 
-        # Append-only session ledger: what the request was configured as, what
+        # Append-only the session's log: what the request was configured as, what
         # the gateway put in front of the model, and the body it accepted. All
         # three name ``_ledger_turn_no``, the one ordinal every entry of this
         # turn uses, and all three are written BEFORE the dispatch gates below --
@@ -10727,7 +10862,7 @@ async def _run_chat(
         # The accepted input first, then the two facts DERIVED from it. Context is
         # composed from this message, so a fold that read the composition first
         # would see a derived fact before its cause.
-        session_ledger_emit.on_message_received(
+        crew_log_emit.on_message_received(
             _ledger_sid,
             _ledger_turn_no,
             role="user",
@@ -10735,14 +10870,14 @@ async def _run_chat(
             source=telemetry_channel_of(session_key),
             attachments=_attachments,
         )
-        session_ledger_emit.on_request_configured(
+        crew_log_emit.on_request_configured(
             _ledger_sid,
             _ledger_turn_no,
             model=_ledger_model(slot, slot.model or agent_model),
             provider=provider_name,
             context_window=read_context_tokens(client)[1],
         )
-        session_ledger_emit.on_context_composed(
+        crew_log_emit.on_context_composed(
             _ledger_sid,
             _ledger_turn_no,
             blocks=slot_ctx_blocks,
@@ -10762,7 +10897,7 @@ async def _run_chat(
         try:
             if monitor_completion is not None:
                 if not await monitor_completion.authorize():
-                    session_ledger_emit.on_turn_refused(
+                    crew_log_emit.on_turn_refused(
                         _ledger_sid,
                         _ledger_turn_no,
                         "not_authorized",
@@ -10773,7 +10908,7 @@ async def _run_chat(
             state.sessions.begin_turn(session_key)
         except SessionClosingError:
             logger.info("Aborting dispatch for %s — gateway is shutting down", session_key)
-            session_ledger_emit.on_turn_refused(
+            crew_log_emit.on_turn_refused(
                 _ledger_sid,
                 _ledger_turn_no,
                 "gateway_closing",
@@ -10799,7 +10934,7 @@ async def _run_chat(
                 "was still being prepared (no session existed to cancel yet)",
                 session_key,
             )
-            session_ledger_emit.on_turn_refused(
+            crew_log_emit.on_turn_refused(
                 _ledger_sid,
                 _ledger_turn_no,
                 "stopped_before_dispatch",
@@ -10829,7 +10964,7 @@ async def _run_chat(
                 "the turn was being prepared",
                 session_key,
             )
-            session_ledger_emit.on_turn_refused(
+            crew_log_emit.on_turn_refused(
                 _ledger_sid,
                 _ledger_turn_no,
                 "replay_superseded_before_dispatch",
@@ -10843,7 +10978,7 @@ async def _run_chat(
             return
         if monitor_completion is not None:
             monitor_completion.mark_accepted()
-        # Append-only session ledger (flag-gated, fail-soft). Emitted HERE, after
+        # Append-only the session's log (flag-gated, fail-soft). Emitted HERE, after
         # every gate above has passed, because ``turn/started`` asserts that the
         # turn RAN: a start written before authorization leaves an orphan for each
         # refusal, and the interrupted-turn repair would later close it as though
@@ -10853,7 +10988,7 @@ async def _run_chat(
         # stop-generation read above and the stream's turn registration below --
         # the emitter hands the write to its own thread and returns -- so the
         # atomic span those two gates rely on is unchanged.
-        session_ledger_emit.on_turn_started(
+        crew_log_emit.on_turn_started(
             _ledger_sid,
             _ledger_turn_no,
             _ledger_actor,
@@ -10868,7 +11003,7 @@ async def _run_chat(
         # dispatch would leave a step/started for a model call that never ran and
         # never completes -- the same reason turn/started waits for the gates -- and
         # the step's duration would include the time the gates took.
-        _ledger_step = session_ledger_emit.on_step_started(_ledger_sid, _ledger_turn_no)
+        _ledger_step = crew_log_emit.on_step_started(_ledger_sid, _ledger_turn_no)
         _ledger_step_t0 = time.monotonic()
         event_stream = client.stream_command(message) if is_slash else client.stream(full_message)
         async for event in event_stream:
@@ -10958,7 +11093,7 @@ async def _run_chat(
                     # went on to produce this text, so the tools it was waiting on
                     # did finish. The turn-end closers cannot say that and take the
                     # emitter's `unknown` default instead.
-                    session_ledger_emit.close_open_tool_calls(
+                    crew_log_emit.close_open_tool_calls(
                         _ledger_sid, _ledger_turn_no, status="completed"
                     )
                     # Text after a tool group means the model was called AGAIN:
@@ -10966,13 +11101,13 @@ async def _run_chat(
                     # This transition is the only per-model-call boundary the
                     # stream exposes -- its terminal event is the turn's, not a
                     # call's -- so the step is derived here rather than reported.
-                    session_ledger_emit.on_step_completed(
+                    crew_log_emit.on_step_completed(
                         _ledger_sid,
                         _ledger_turn_no,
                         _ledger_step,
                         ms=int((time.monotonic() - _ledger_step_t0) * 1000),
                     )
-                    _ledger_step = session_ledger_emit.on_step_started(_ledger_sid, _ledger_turn_no)
+                    _ledger_step = crew_log_emit.on_step_started(_ledger_sid, _ledger_turn_no)
                     _ledger_step_t0 = time.monotonic()
                 in_tool_group = False
                 # The streamed delta is NOT written to the ledger. Redacting each
@@ -11078,7 +11213,7 @@ async def _run_chat(
                 # emitting the call first put the tool ahead of the text that
                 # preceded it and a fold would read the narration as the call's
                 # result.
-                session_ledger_emit.on_tool_called(
+                crew_log_emit.on_tool_called(
                     _ledger_sid,
                     _ledger_turn_no,
                     name=event.tool_name or "",
@@ -11087,7 +11222,7 @@ async def _run_chat(
                     call_id=event.tool_call_id or "",
                     # Digested to a hash and a size, never recorded: that answers
                     # "same arguments as last time" and "how big was it" without
-                    # the ledger becoming where a shell command's secrets land.
+                    # the crew log becoming where a shell command's secrets land.
                     # This is the already-redacted display string, so a value the
                     # user could not see is not hashed into a durable file either.
                     args=event.tool_input or "",
@@ -11445,7 +11580,7 @@ async def _run_chat(
                         if event.refusal
                         else (event.tool_status or ("completed" if event.tool_final else "unknown"))
                     )
-                    session_ledger_emit.on_tool_completed(
+                    crew_log_emit.on_tool_completed(
                         _ledger_sid,
                         _ledger_turn_no,
                         name=event.tool_name or "",
@@ -13303,7 +13438,7 @@ async def _run_chat(
                 # Advance the durable POSITION base by the rows this clear
                 # evicts, exactly as the trim path does (`_ChatSlot.append`)
                 # and as every restore path recomputes it. The base plus the
-                # window's durable rows is the ledger turn ordinal and the
+                # window's durable rows is the crew log turn ordinal and the
                 # session_control `since` cursor space; emptying the window
                 # without crediting the base made the next turn draw an
                 # ordinal an earlier turn already wrote (two unrelated turns
@@ -13443,6 +13578,11 @@ async def _run_chat(
                         f"🔄 Switched to agent: {new_agent}",
                         "msg msg-a",
                     )
+                    # The new agent's own greeting, beside the line announcing
+                    # it. After the switch row so the two read in causal order,
+                    # and after `slot.agent` is set so the guard is keyed on the
+                    # agent now active.
+                    await _surface_agent_welcome(state, slot, new_agent)
                     state.broadcast_ws(
                         "slot_agent_switch",
                         {"slot": slot.key, "agent": new_agent},
@@ -13820,7 +13960,7 @@ async def _run_chat(
                 #      joins. Attributing the sample to the slot would file every
                 #      linked Slack or Telegram turn under ``dashboard`` — the
                 #      same blind spot in a new place.
-                # The turn's ledger closers are STASHED, not emitted here. This
+                # The turn's crew log closers are STASHED, not emitted here. This
                 # point is inside the stream loop, and the turn's LAST assistant
                 # message is flushed after the loop breaks -- so emitting now puts
                 # `turn/completed` in the file ahead of a `message/sent` belonging
@@ -16016,20 +16156,20 @@ async def _run_chat(
             and slot._transient_5xx_retries >= TRANSIENT_RETRIES
             and _prompt_depth == 0
             and not _should_suppress_requeue(slot)
-            and (_fallback_model := await _fallback_swap_for_turn(slot, client)) is not None
+            and (_fb_candidate := await _fallback_swap_for_turn(slot, client)) is not None
         ):
-            # Append-only session ledger (flag-gated, fail-soft). Emitted HERE,
+            # Append-only the session's log (flag-gated, fail-soft). Emitted HERE,
             # in the branch body, so it runs after _fallback_swap_for_turn has
             # released slot._model_pick_lock rather than while it is held. This
             # is the one model decision a transcript cannot answer afterwards:
             # the user picked the primary and the turn ran somewhere else.
-            session_ledger_emit.on_model_selected(
-                _ledger_sid, _fallback_model, "fallback", turn=_ledger_turn_no
+            crew_log_emit.on_model_selected(
+                _ledger_sid, _fb_candidate, "fallback", turn=_ledger_turn_no
             )
             # ── Throttle-exhaustion model fallback (agent.fallback_model) ──
             # The same-model budget above is spent and the error is still
             # transient (throttle/capacity). _fallback_swap_for_turn already
-            # moved the live session onto `_fallback_model` via the substitute
+            # moved the live session onto `_fb_candidate` via the substitute
             # set_model path (and returned None — falling through to the
             # terminal branch exactly as today — when the chain is empty,
             # exhausted, or unusable). Announce the swap visibly (never
@@ -16049,21 +16189,25 @@ async def _run_chat(
             # in v1 and Stop-suppressed cycles never swap (both guarded in
             # the condition before the side-effecting swap runs).
             slot.purge_chunks()
-            primary, _ = redact_exfiltration_urls(
+            _fb_primary_safe, _ = redact_exfiltration_urls(
                 slot._fallback_primary_model or "the selected model"
             )
-            primary, _ = redact_credentials(primary)
-            candidate, _ = redact_exfiltration_urls(_fallback_model)
-            candidate, _ = redact_credentials(candidate)
+            _fb_primary_safe, _ = redact_credentials(_fb_primary_safe)
+            _fb_cand_safe, _ = redact_exfiltration_urls(_fb_candidate)
+            _fb_cand_safe, _ = redact_credentials(_fb_cand_safe)
+            # Persisted notice card (withheld-pin pattern): the explanation has
+            # to survive a reload because the state it explains does (the
+            # session stays on the fallback until the restore probe succeeds).
             slot.append(
                 "notice",
-                f"⚠️ {primary} is throttled — running on {candidate} until {primary} recovers.",
+                f"⚠️ {_fb_primary_safe} is throttled — running on {_fb_cand_safe} "
+                f"until {_fb_primary_safe} recovers.",
                 "msg msg-info",
             )
             logger.info(
                 "Re-queuing slot %s on fallback model %s (candidate %d of chain)",
                 slot.key,
-                candidate,
+                _fb_candidate,
                 slot._fallback_candidate_idx,
             )
             slot._transient_5xx_retries = fallback_rewound_transient_budget()
@@ -16102,6 +16246,7 @@ async def _run_chat(
                     0,
                     message,
                     kind=SYNTHETIC_RECOVERY_KIND,
+                    # Verbatim replay, same rule as the same-model retry above.
                     payload=payload_for_replay(_is_synthetic),
                 )
         elif _turn_emitted and acp_error_is_transient(exc) and not slot._posttoken_retry_used:
@@ -16455,6 +16600,32 @@ async def _run_chat(
                     "msg msg-err",
                     meta=_unentitled_meta,
                 )
+                # Record a STRUCTURAL terminal outcome for this slot's last turn,
+                # but ONLY for a self-driven nudge fire (``_directive_self_wake``).
+                # A malformed-request rejection is deterministic in the payload's
+                # SHAPE: re-sending the identical context reproduces it, so the
+                # auto-nudge loop must stop re-firing rather than spend cycle
+                # after cycle on the same rejection. The flag is read by the fire
+                # path to STOP the loop, so it must reflect the LOOP's OWN cycle:
+                # a HUMAN turn that happens to be malformed on a slot that also
+                # carries an active loop must NOT set it, or the next fire would
+                # stop an unrelated loop the human never drove. The nudge turn is
+                # the only producer marked ``_directive_self_wake`` (gateway sets
+                # it on the fire path), so gating here is exactly that scope.
+                # Cleared at the start of every genuine new turn so a human
+                # /clear-then-message re-arms the loop. getattr-guarded: only
+                # AcpError carries the attribute, and this branch also catches
+                # plain errors.
+                if _directive_self_wake and getattr(exc, "structural_terminal", False):
+                    slot._last_turn_structural_terminal = True
+                    # Scope the verdict to the loop id AND the config generation
+                    # it fired under. The fire guard applies the stop through an
+                    # ATOMIC (id, generation) fence in AutoNudgeService, so a
+                    # stale completion of an old instruction cannot stop a loop
+                    # whose config advanced (A->B->A). loop id is still recorded
+                    # because a generation is per-loop, not globally unique.
+                    slot._last_turn_structural_terminal_loop_id = _directive_loop_id
+                    slot._last_turn_structural_terminal_loop_gen = _directive_loop_gen
                 # This branch ENDS the retry cycle: the error is terminal and
                 # nothing is re-queued. Refresh the transient-5xx budget now so the
                 # NEXT cycle — the Continue press this very error message invites
@@ -16527,7 +16698,7 @@ async def _run_chat(
         if not (isinstance(exc, MemoryStartupUnavailable) and not _memory_preparation_admitted):
             await state.sessions.record_failure(session_key)
     finally:
-        # The turn's ledger closers, in the one order a reader can trust: every
+        # The turn's crew log closers, in the one order a reader can trust: every
         # `message/sent` for this turn has now been flushed, so the tool closer,
         # the last step's completion and the turn's own completion land after the
         # text they close over. Emitted HERE rather than at the terminal event
@@ -16538,16 +16709,16 @@ async def _run_chat(
             # before the turn completes so a turn never completes with an open
             # call inside it -- the shape the interrupted-turn repair exists to
             # fix, which a live turn must not produce in the first place.
-            session_ledger_emit.close_open_tool_calls(_ledger_sid, _ledger_turn_no)
+            crew_log_emit.close_open_tool_calls(_ledger_sid, _ledger_turn_no)
             # The turn's LAST model call has no tool group after it to close it,
             # so the turn's end does.
-            session_ledger_emit.on_step_completed(
+            crew_log_emit.on_step_completed(
                 _ledger_sid,
                 _ledger_turn_no,
                 _ledger_step,
                 ms=int((time.monotonic() - _ledger_step_t0) * 1000),
             )
-            session_ledger_emit.on_turn_completed(_ledger_sid, _ledger_turn_no, **_ledger_terminal)
+            crew_log_emit.on_turn_completed(_ledger_sid, _ledger_turn_no, **_ledger_terminal)
             _ledger_terminal = None
             _ledger_turn_open = False
         elif _ledger_turn_open:
@@ -16565,14 +16736,14 @@ async def _run_chat(
             # `_record_model` are assigned inside the terminal-event arm, so
             # naming them here would raise inside a `finally` and mask the very
             # exception that brought us here.
-            session_ledger_emit.close_open_tool_calls(_ledger_sid, _ledger_turn_no)
-            session_ledger_emit.on_step_completed(
+            crew_log_emit.close_open_tool_calls(_ledger_sid, _ledger_turn_no)
+            crew_log_emit.on_step_completed(
                 _ledger_sid,
                 _ledger_turn_no,
                 _ledger_step,
                 ms=int((time.monotonic() - _ledger_step_t0) * 1000),
             )
-            session_ledger_emit.on_turn_failed(
+            crew_log_emit.on_turn_failed(
                 _ledger_sid,
                 _ledger_turn_no,
                 error=_ledger_error,

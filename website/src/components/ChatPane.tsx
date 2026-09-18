@@ -1731,18 +1731,102 @@ export default function ChatPane({
              landed, and handing it back would invite a second answer to a
              question already gone. */
             onFallbackSend={(text) => {
-              const fail = (reason?: string, status?: SendReceiptStatus) => {
-                reportSendFailure(reason, status)
-                restoreIntoComposer(text, [], slotKey)
-              }
+              const fail = (reason?: string, status?: SendReceiptStatus) => { reportSendFailure(reason, status); restoreIntoComposer(text, [], slotKey) }
               void sendTurn({ message: text, slot: slotKey }).then((receipt) => {
-                if (
-                  receipt.status === 'refused' ||
-                  receipt.status === 'transport-error' ||
-                  receipt.status === 'response-late'
-                ) {
+                if (receipt.status === 'refused' || receipt.status === 'transport-error' || receipt.status === 'response-late') {
                   fail(receipt.reason, receipt.status)
                 }
+              })
+            }}
+            /* No-ask_id card: the card IS the interaction, answered in one click.
+               A native AskUserQuestion card is raised while its own turn is still
+               running and waiting on the answer, so a plain send would queue
+               behind that turn and the question would never be consumed (#10634).
+               When the slot is busy the turn is live, so steer the answer INTO it
+               (`steer: true`); when the turn has ended, `busy` is false and this
+               starts an ordinary next turn, exactly as the non-blocking
+               `ask_question` card does. `busy` is the shared `selectComposerBusy`
+               rule (chatSlice) the main chat keys on too, so the two routes match.
+               Steer ONLY the native card (no `ask_id`, no server `card_id`): the
+               client always mints a local `cardId`, so the discriminator is
+               `serverCardId`, which the server sets only for the non-blocking
+               `ask_question` card. That card can be answered while sub-agents keep
+               the slot busy, and it must still start a next turn.
+
+               Recovery differs by whether this is a live steer. A LIVE steer uses
+               the receipt-aware policy owned by `applySteerReceipt` (issue #9457),
+               exactly as the main chat's steer path: a `refused`/`transport-error`
+               reports and restores; a `response-late` restores and warns
+               delivery-unconfirmed -- UNLESS the `steer_push`/user echo carrying
+               this send's `sendId` already reconciled the optimistic bubble, in
+               which case the steer provably landed and the indeterminate HTTP
+               outcome is ignored (no restore, no duplicate). That echo
+               short-circuit is why a CONFIRMED steer is never handed back as if it
+               failed. An IDLE answer is an ordinary send with no live turn to
+               reconcile against, so it keeps the plain report-and-restore the card
+               fallback has always used. `onFallbackSend` is left untouched as the
+               expired-blocking-card (404) recovery path and is NOT reused here. */
+            onDirectSend={(text) => {
+              // The card IS the interaction, answered in one click. A NATIVE
+              // AskUserQuestion card (no `ask_id`, no server `card_id`) is raised
+              // while its own turn is still running and waiting on the answer, so
+              // a plain send would queue behind that turn and the question would
+              // never be consumed (#10634): when the slot is busy that turn is
+              // live, so the answer STEERS into it. The client always mints a
+              // local `cardId`, so the discriminator is `serverCardId`, which the
+              // server sets only for the non-blocking `ask_question` card; that
+              // card can be answered while sub-agents keep the slot busy and must
+              // still start a next turn, never steer.
+              //
+              // Both routes are otherwise ONE path: mint an optimistic user bubble
+              // carrying the `sendId`, POST through `sendTurn`, and reconcile the
+              // bubble through `applySteerReceipt` + `resolveOptimisticSteer`
+              // exactly as `doSteer` does. `resolveOptimisticSteer` is what makes
+              // every receipt cell correct without a bespoke ladder: a `turn`
+              // outcome DEMOTES the bubble to a plain user row (so a dispatched
+              // answer stays in the transcript and survives reload), and every
+              // other outcome (`queued`/drop) REMOVES it (so a queued answer shows
+              // only as its QueueStack card, never a duplicate, and a failed one
+              // leaves no orphan). The card cleared on submit, so a genuine
+              // non-delivery hands the answer back to the composer via `restore`,
+              // UNLESS the `steer_push`/user echo carrying this `sendId` already
+              // reconciled the bubble -- proof it landed, so no restore and no
+              // duplicate. Only the `steer` POST flag and the pre-append chunk
+              // drain differ between the two routes.
+              const steerLive = busy && !pendingQuestion?.ask_id && !pendingQuestion?.serverCardId
+              const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+              // Drain the per-frame chunk buffer before the append, as `doSteer`
+              // does: a pre-steer chunk still buffered means the finalize-on-steer
+              // finds no streaming row, so the bubble would flush BELOW it and
+              // post-steer chunks would corrupt transcript order (#6075 class).
+              // Only a live steer injects into a streaming turn, so only it drains.
+              if (steerLive) drainPendingChunks()
+              dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'user', content: text, cls: 'msg msg-u', ts: new Date().toISOString(), meta: { ...(steerLive ? { steer: true } : {}), optimistic: true, sendId } } }))
+              void sendTurn({ message: text, slot: slotKey, meta: { sendId }, ...(steerLive ? { steer: true } : {}) }).then((receipt) => {
+                applySteerReceipt(receipt, {
+                  // A confirmed echo is stronger evidence than a missing/late HTTP
+                  // response: if it landed, do NOT restore (the fix for the
+                  // "confirmed steers restored as failed" finding).
+                  echoReconciled: () => selectSendConfirmed(store.getState(), slotKey, sendId),
+                  // The card cleared on submit, so the answer lives nowhere else:
+                  // hand it back on every non-delivered ruling. The bubble is
+                  // dropped by `resolveBubble` below, so this never leaves an
+                  // orphan row beside the restored text.
+                  restore: () => restoreIntoComposer(text, [], slotKey),
+                  reportFailure: (reason, status) => reportSendFailure(reason, status),
+                  // The leading char is NoticeCard's WARN tone selector (parseNotice
+                  // strips it and renders a lucide TriangleAlert -- it is never shown
+                  // as an emoji icon). Built from code points so the source carries
+                  // no emoji literal for the no-emoji-as-icons gate to match.
+                  warnUnconfirmed: () => dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: String.fromCodePoint(0x26A0, 0xFE0F) + ' ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } })),
+                  // Demote the bubble to a plain user row when the answer landed on
+                  // a turn; drop it on every other outcome (queued/refused/late) so
+                  // a queued answer shows only as its QueueStack card and a failed
+                  // one leaves no orphan.
+                  resolveBubble: (outcome) => dispatch(resolveOptimisticSteer({ slot: slotKey, sendId, outcome: outcome === 'turn' ? 'turn' : 'queued' })),
+                  // Text-only card answer: no queued-stash binding to carry.
+                  stashDemoted: () => undefined,
+                })
               })
             }}
           />
@@ -1755,8 +1839,8 @@ export default function ChatPane({
             onDismiss={() => setUploadError('')}
           />
           {/* No hand-off: same composer draft. The shared notice toast (App.tsx)
-            is transient; a per-slot setting write that did not persist must
-            also be reported in the pane whose control failed. */}
+              is transient; a per-slot setting write that did not persist must
+              also be reported in the pane whose control failed. */}
           <ErrorNotice
             variant="inline"
             className="mx-4 mt-2"
@@ -1765,7 +1849,7 @@ export default function ChatPane({
             onDismiss={() => setSwitchError('')}
           />
           {/* No hand-off: the composer draft is untouched by a failed stop; the
-            turn is still running, so the Stop button stays for a retry. */}
+              turn is still running, so the Stop button stays for a retry. */}
           <ErrorNotice
             variant="inline"
             className="mx-4 mt-2"
@@ -1774,8 +1858,8 @@ export default function ChatPane({
             onDismiss={() => setStopError('')}
           />
           {/* No hand-off: the composer draft is untouched by a failed rename; the
-            title in the bar is the one the store still holds, so the user can
-            simply try again. */}
+              title in the bar is the one the store still holds, so the user can
+              simply try again. */}
           <ErrorNotice
             variant="inline"
             className="mx-4 mt-2"
@@ -1786,20 +1870,20 @@ export default function ChatPane({
           />
 
           {/* Quote transit: the selection flies from where it was taken into this
-            pane's composer (the wrapper below is the landing target — same
-            shape as ChatPage's inputAreaRef). */}
-        {quoteFlight && <FlyingQuote text={quoteFlight.text} from={quoteFlight.from} targetRef={inputAreaRef} onComplete={endQuoteFlight} />}
-        <div ref={inputAreaRef} className="relative z-10">
-        <Composer
-          ref={composerRef}
-          slotKey={slotKey}
-          value={input}
-          onChange={setInput}
-          voice={composerVoiceOptions}
-        >
-        <ChatInput
-          value={input}
-          onChange={setInput}
+              pane's composer (the wrapper below is the landing target — same
+              shape as ChatPage's inputAreaRef). */}
+          {quoteFlight && <FlyingQuote text={quoteFlight.text} from={quoteFlight.from} targetRef={inputAreaRef} onComplete={endQuoteFlight} />}
+          <div ref={inputAreaRef} className="relative z-10">
+          <Composer
+            ref={composerRef}
+            slotKey={slotKey}
+            value={input}
+            onChange={setInput}
+            voice={composerVoiceOptions}
+          >
+          <ChatInput
+            value={input}
+            onChange={setInput}
           onSend={doSend}
           isRunning={busy}
           onStop={onStop}

@@ -484,17 +484,17 @@ async def test_a_requeued_steer_records_queued_and_never_steered(tmp_path, monke
     message, so this is the only place that can record it at all.
     """
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("KIROCREW_SESSION_LEDGER", "1")
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "1")
     import json
 
-    from kiro_crew import ledger as lg
-    from kiro_crew import session_ledger_emit
+    from kiro_crew import crew_log as lg
+    from kiro_crew.crew_log import emit as crew_log_emit
 
-    session_ledger_emit.reset_caches()
+    crew_log_emit.reset_caches()
     sid = "sess-steer-requeue"
-    session_ledger_emit.on_session_opened(sid, agent="kirocrew", slot="chat-1")
-    session_ledger_emit.on_turn_started(sid, 1, "user")
-    assert session_ledger_emit.flush()
+    crew_log_emit.on_session_opened(sid, agent="kirocrew", slot="chat-1")
+    crew_log_emit.on_turn_started(sid, 1, "user")
+    assert crew_log_emit.flush()
 
     state = _make_state(tmp_path)
     slot = _busy(_slot(state, "chat-1"))
@@ -515,7 +515,7 @@ async def test_a_requeued_steer_records_queued_and_never_steered(tmp_path, monke
     outcome = await cd.steer_into_running_turn(state, slot, "run this instead")
 
     assert outcome == cd.STEER_REQUEUED
-    assert session_ledger_emit.flush()
+    assert crew_log_emit.flush()
     body = [
         json.loads(line)
         for line in lg.ledger_path("session", sid).read_text(encoding="utf-8").splitlines()[1:]
@@ -526,7 +526,7 @@ async def test_a_requeued_steer_records_queued_and_never_steered(tmp_path, monke
     assert len(mine) == 1, f"expected one entry for one message, got {[e['type'] for e in mine]}"
     assert mine[0]["type"] == "message/queued"
     assert mine[0]["data"]["source"] == "steer"
-    session_ledger_emit.reset_caches()
+    crew_log_emit.reset_caches()
 
 
 @pytest.mark.asyncio
@@ -3598,6 +3598,137 @@ def test_a_created_slot_records_the_caller_that_asked_for_it(tmp_path, monkeypat
     assert state.creator_slot_count(caller.key) == 1
 
 
+def test_the_creator_session_id_is_frozen_at_mint_not_read_live(tmp_path, monkeypatch):
+    """The child's parent lineage must cite the creator that was live AT MINT.
+
+    The creator SID is stamped on the child at ``session_create`` time, from the
+    live caller handle. If instead it were read live at the child's first turn,
+    a creator slot closed and replaced in between (a distinct handle with its own
+    session id) would make the child cite the REPLACEMENT's crew log -- and that id
+    lands in the append-only, immutable ``session/opened`` entry with no recovery.
+
+    Mutation guard: re-read the creator SID live at emit (from the current slot
+    handle) and this test reddens, because the replacement below carries a
+    different session id than the one frozen at mint.
+    """
+    from unittest.mock import MagicMock
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller.agent = "researcher"
+    creator_client = MagicMock()
+    creator_client.session_id = "acp-sess-creator-at-mint"
+    caller._acp_client = creator_client
+    _agent_resolves(monkeypatch, "default")
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+    assert child is not None
+
+    # Frozen at mint from the live caller handle, and witnessed by this process.
+    assert getattr(child, "_created_by_sid", "") == "acp-sess-creator-at-mint"
+    assert getattr(child, "_lineage_minted", False) is True
+
+    # The sid is NOT written into the birth metadata: the transcript is a file an
+    # agent's file tools can edit, so nothing read back from it may become the
+    # gateway-authored crew-log lineage. Only the attribution rides the metadata,
+    # for the ownership boundary.
+    written = state.conversation_log.get_metadata(sc.slot_history_key(child))
+    assert written.get("created_by") == caller.key
+    assert "created_by_sid" not in written
+
+    # Now the creator's handle is replaced with a distinct session id -- the exact
+    # window the finding names. The frozen value on the child must NOT follow it.
+    replacement = MagicMock()
+    replacement.session_id = "acp-sess-replacement"
+    caller._acp_client = replacement
+    assert getattr(child, "_created_by_sid", "") == "acp-sess-creator-at-mint"
+
+
+def test_a_slot_nobody_minted_in_this_process_carries_no_lineage_witness(tmp_path):
+    """A slot that was not created through ``session_create`` in THIS process --
+    a person's own tab, a fork, a restore -- has no lineage witness, whatever its
+    ``_created_by`` says. The crew-log ``session/opened.parent`` write is gated on
+    the witness, so restored or hand-edited attribution never becomes lineage.
+
+    Mutation guard: default the flag to True, or set it on the plain
+    ``get_or_create_slot`` path, and this test reddens.
+    """
+    state = _make_state(tmp_path)
+    plain = _slot(state, "chat-9")
+    plain._created_by = "chat-1"  # what a restore from transcript metadata sets
+    assert getattr(plain, "_lineage_minted", False) is False
+    assert getattr(plain, "_created_by_sid", "") == ""
+
+
+def test_the_opened_entry_cites_lineage_only_from_a_witnessed_mint():
+    """``_ledger_lineage`` is the one seam between the slot and the crew-log
+    ``session/opened.parent`` write. It yields the creator only when this process
+    minted the slot; attribution that arrived any other way -- restored from a
+    transcript an agent's file tools can edit, or set by hand -- yields nothing,
+    so the emitter writes no ``parent`` and no metadata edit can forge lineage.
+
+    Mutation guard: drop the witness check and the second case reddens; read the
+    sid live instead of the frozen field and the first case reddens.
+    """
+    from types import SimpleNamespace
+
+    from kiro_crew.dashboard.chat_runner import _ledger_lineage
+
+    minted = SimpleNamespace(
+        _created_by="chat-1", _created_by_sid="acp-sess-creator-at-mint", _lineage_minted=True
+    )
+    assert _ledger_lineage(minted) == ("chat-1", "acp-sess-creator-at-mint")
+
+    restored = SimpleNamespace(
+        _created_by="chat-1", _created_by_sid="acp-forged-by-editing-the-transcript"
+    )
+    assert _ledger_lineage(restored) == ("", "")
+    restored_explicit = SimpleNamespace(
+        _created_by="chat-1", _created_by_sid="acp-sess-x", _lineage_minted=False
+    )
+    assert _ledger_lineage(restored_explicit) == ("", "")
+
+    minted_without_handle = SimpleNamespace(
+        _created_by="chat-1", _created_by_sid="", _lineage_minted=True
+    )
+    assert _ledger_lineage(minted_without_handle) == ("chat-1", "")
+
+
+def test_an_oversize_creator_session_id_is_dropped_at_mint_not_retained(tmp_path, monkeypatch):
+    """The creator sid is backend-authored, so it is bounded where it is RETAINED.
+
+    An id past ``MAX_ACP_SESSION_ID_LEN`` is not stored on the child -- dropped,
+    never truncated, so it cannot push the child's ``session/opened`` entry over
+    the crew log's size cap and lose the whole entry. The sid is optional: absent
+    is a legal record, a clipped id would be a wrong one. (The sid never reaches
+    the birth metadata in any case; the bound is about the in-memory slot and the
+    entry it feeds.)
+    """
+    from unittest.mock import MagicMock
+
+    from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller.agent = "researcher"
+    creator_client = MagicMock()
+    creator_client.session_id = "s" * (MAX_ACP_SESSION_ID_LEN + 1)
+    caller._acp_client = creator_client
+    _agent_resolves(monkeypatch, "default")
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert getattr(child, "_created_by_sid", "") == ""
+    # Still a witnessed mint: the slot half of the lineage is recorded, sid absent.
+    assert getattr(child, "_lineage_minted", False) is True
+    written = state.conversation_log.get_metadata(sc.slot_history_key(child))
+    assert "created_by_sid" not in written
+    # The attribution itself is unaffected: the slot key is ours, not the backend's.
+    assert getattr(child, "_created_by", "") == caller.key
+
+
 def test_one_caller_cannot_consume_everybody_elses_slots(tmp_path, monkeypatch):
     """The per-creator ceiling bounds the DISTRIBUTION, not just the total.
 
@@ -3928,7 +4059,7 @@ def test_the_delivery_path_never_claims_a_turn_consumed_a_steer(tmp_path, monkey
     Mutation guard: recording the delivered case here -- from a live ordinal or any
     other guess -- reddens this.
     """
-    from kiro_crew import session_ledger_emit
+    from kiro_crew.crew_log import emit as crew_log_emit
     from kiro_crew.dashboard import chat_delivery
 
     state = _make_state(tmp_path)
@@ -3938,19 +4069,19 @@ def test_the_delivery_path_never_claims_a_turn_consumed_a_steer(tmp_path, monkey
 
     appended: list[str] = []
     queued_for: list[str] = []
-    monkeypatch.setattr(session_ledger_emit, "session_id_of", lambda _client: "acp-1")
+    monkeypatch.setattr(crew_log_emit, "session_id_of", lambda _client: "acp-1")
     # Spied on the shared write seam rather than on one entry point, so an entry
     # written under ANY type is caught rather than only a steer-shaped one.
     monkeypatch.setattr(
-        session_ledger_emit,
+        crew_log_emit,
         "_write",
         lambda _sid, entry_type, *a, **kw: appended.append(entry_type),
     )
     monkeypatch.setattr(
-        session_ledger_emit, "on_message_queued", lambda sid, **_kw: queued_for.append(sid)
+        crew_log_emit, "on_message_queued", lambda sid, **_kw: queued_for.append(sid)
     )
     # A turn IS running, so a guess would have had something plausible to record.
-    monkeypatch.setattr(session_ledger_emit, "live_turn", lambda _sid: 13)
+    monkeypatch.setattr(crew_log_emit, "live_turn", lambda _sid: 13)
 
     def _consume_inside_the_rpc(*_a, **_kw):
         # The running turn takes the registration, which is what makes the
@@ -3979,7 +4110,7 @@ def test_a_stop_race_that_only_expects_a_requeue_records_nothing(tmp_path, monke
 
     Mutation guard: recording the queued outcome here reddens this.
     """
-    from kiro_crew import session_ledger_emit
+    from kiro_crew.crew_log import emit as crew_log_emit
     from kiro_crew.dashboard import chat_delivery
 
     state = _make_state(tmp_path)
@@ -3988,10 +4119,8 @@ def test_a_stop_race_that_only_expects_a_requeue_records_nothing(tmp_path, monke
     slot._acp_client = _steerable(accepted=True)
 
     queued: list[str] = []
-    monkeypatch.setattr(session_ledger_emit, "session_id_of", lambda _client: "acp-1")
-    monkeypatch.setattr(
-        session_ledger_emit, "on_message_queued", lambda sid, **_kw: queued.append(sid)
-    )
+    monkeypatch.setattr(crew_log_emit, "session_id_of", lambda _client: "acp-1")
+    monkeypatch.setattr(crew_log_emit, "on_message_queued", lambda sid, **_kw: queued.append(sid))
 
     def _stop_without_requeueing(*_a, **_kw):
         # A stop lands while the steer is still registered, and nothing has moved
@@ -4020,7 +4149,7 @@ def test_a_requeued_steer_is_recorded_as_a_queued_message(tmp_path, monkeypatch)
 
     Mutation guard: recording `send_id` reddens this, because the two differ here.
     """
-    from kiro_crew import session_ledger_emit
+    from kiro_crew.crew_log import emit as crew_log_emit
     from kiro_crew.dashboard import chat_delivery
 
     state = _make_state(tmp_path)
@@ -4029,9 +4158,9 @@ def test_a_requeued_steer_is_recorded_as_a_queued_message(tmp_path, monkeypatch)
     slot._acp_client = _steerable(accepted=True)
 
     queued: list[dict] = []
-    monkeypatch.setattr(session_ledger_emit, "session_id_of", lambda _client: "acp-1")
+    monkeypatch.setattr(crew_log_emit, "session_id_of", lambda _client: "acp-1")
     monkeypatch.setattr(
-        session_ledger_emit, "on_message_queued", lambda sid, **kw: queued.append(dict(kw))
+        crew_log_emit, "on_message_queued", lambda sid, **kw: queued.append(dict(kw))
     )
     seen: dict[str, str] = {}
 

@@ -43,6 +43,7 @@ from kiro_crew.config.loader import (
     resolve_agent_bindings,
 )
 from kiro_crew.config.resolution import DEGRADED_WHOLE_CONFIG
+from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.dashboard.chat_delivery import sanitize_outbound
 from kiro_crew.dashboard.chat_folders import _unhide_folder
 from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES as _PERSISTENCE_TRANSIENT_ROLES
@@ -65,7 +66,7 @@ from kiro_crew.memory_stores import memory_store_version, named_store_or_empty
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.session_agent_selection import record_agent_selection
-from kiro_crew.validation import MAX_LONG_STRING
+from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN, MAX_LONG_STRING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from kiro_crew.dashboard.state import DashboardState, _ChatSlot
@@ -1073,32 +1074,38 @@ async def create_session(
             code="agent_unresolved",
         )
 
-    # A workspace is not a memory silo: it can host agents on different stores,
-    # so a private member could otherwise mint a worker on `default`/global or a
-    # peer's store. require_memory_delegation is the guard the private spawn path
-    # uses -- a no-op for a caller with no private record, a refusal of any
-    # target_store that is not a private V2 caller's own. Off-loop: it reads the
+    # Only a protected caller record can authorize a child's private binding.
+    # Agent selection and editable slot metadata are not private authority. This
+    # reads that record and nothing else: the delegation refusal itself belongs to
+    # the `require_memory_delegation` gate further down, which already refuses any
+    # target store that is not a private V2 caller's own. Off-loop: it reads the
     # caller's binding from disk.
-    from kiro_crew.context import require_memory_delegation
+    #
+    # Keyed on `caller_memory_identity[0]` -- the CANONICAL history key -- and NOT
+    # on `caller_session_key`. The argument arrives as whatever spelling the caller
+    # used for itself (canonical key, slot key, or transcript stem), while
+    # `read_private_session_store` recognizes only the canonical form, so keying
+    # this on the raw argument makes the caller's private authority depend on how
+    # it spelled its own name: the slot and stem spellings read back as unbound.
+    # For an authorization input that is not a lenient read, it is a bypass -- the
+    # caller chooses the spelling.
     from kiro_crew.member_memory_auth import read_private_session_store
-    from kiro_crew.memory_stores import UnknownMemoryStore
 
     try:
-        await asyncio.to_thread(
-            require_memory_delegation, log, caller_session_key, bindings.memory_store_name
-        )
-        # Only a protected caller record can authorize a child's private binding.
-        # Agent selection and editable slot metadata are not private authority.
         caller_private_store = await asyncio.to_thread(
-            read_private_session_store, caller_session_key
+            read_private_session_store, caller_memory_identity[0]
         )
-    except (UnknownMemoryStore, ValueError) as exc:
-        # UnknownMemoryStore is the delegation refusal proper; ValueError is the
-        # corrupt/unreadable binding-file case require_memory_delegation surfaces
-        # through read_private_session_store. Both are a store the caller may not
-        # delegate into -- map to one refusal rather than letting the bare
-        # ValueError escape as an unhandled 500.
-        raise SessionControlError(str(exc), code="agent_store_mismatch") from exc
+    except (OSError, ValueError):
+        # The same refusal, in the same words, as the delegation gate below: a
+        # protected record that cannot be read authorizes nothing. `from None` and
+        # a fixed message on purpose -- the exception text of a function that reads
+        # a binding FILE can carry that file's path, and a refusal must not hand
+        # the caller the location of another member's record.
+        raise SessionControlError(
+            "cannot verify delegation within the caller's memory assignment",
+            code="memory_delegation_denied",
+            status=403,
+        ) from None
 
     # SlotOrigin.USER, not SYSTEM: the visibility semantics must match an
     # ordinary session, because the point of creating it here is that the user
@@ -1272,6 +1279,31 @@ async def create_session(
         # unattributed, so ordinary human use never consumes an automated caller's
         # share.
         slot._created_by = caller_key
+        # Freeze the creator's ACP session id HERE, at mint, from the live caller
+        # handle we just authorized -- not later at the child's first turn. The
+        # creator slot can be closed and replaced between this mint and that turn,
+        # and a replacement is a distinct handle with its own session id; reading
+        # the id live at emit would then cite the replacement's crew log and corrupt
+        # the child's immutable `session/opened` lineage with no recovery path.
+        # `live_caller` is the same object the authorization gate above resolved,
+        # so this is the id that was live when the child was made. Empty when the
+        # caller's handle has no ACP session yet, which is recorded as absent.
+        # Bounded HERE, at retention, by the one constant every store of a
+        # backend-authored session id shares: an id past it is dropped, not
+        # truncated, so an oversize backend id can neither grow the slot's
+        # metadata nor make the child's ``session/opened`` entry too large to
+        # land -- the sid is optional, its absence is a legal record.
+        _creator_sid = crew_log_emit.session_id_of(getattr(live_caller, "_acp_client", None))
+        slot._created_by_sid = _creator_sid if len(_creator_sid) <= MAX_ACP_SESSION_ID_LEN else ""
+        # Witness that THIS process stamped the two fields above at mint. Neither
+        # the flag nor the sid is persisted: the transcript is a file an agent's
+        # file tools can edit, and the crew log is fenced from those tools exactly
+        # so nothing in it can be forged as gateway-authored -- so the child's
+        # first turn writes `session/opened.parent` only when this flag is set,
+        # never from `created_by` read back off disk. A restart between mint and
+        # the child's first turn therefore loses the link rather than trusting
+        # metadata for it.
+        slot._lineage_minted = True
         # The creator's interactive auto-approve grant follows the work it is
         # handing off. Without this a trusted operator dispatches a worker that
         # then blocks on an approval prompt nobody is watching -- the same failure
@@ -1411,6 +1443,12 @@ async def create_session(
                 cfg,
                 conversation_log=log,
                 native_context=native_context,
+                # The store this creation was actually cleared for. The pin derives
+                # its own store from the selected agent's config entry, which is a
+                # different value from the one `require_memory_delegation` checked
+                # above -- so without this the gate authorizes one store and the
+                # pin binds another.
+                authorized_store=bindings.memory_store_name,
             )
             # Preserve the namespace resolved for this request, including a
             # template later imported as a same-named private member. Automatic
@@ -1453,6 +1491,10 @@ async def create_session(
                     # losing it on restart would strand every worker a member
                     # dispatched — controllable in memory, orphaned after reboot.
                     **({"created_by": slot._created_by} if slot._created_by else {}),
+                    # `created_by_sid` is deliberately NOT written: the transcript
+                    # is agent-editable, so nothing read back from it may become
+                    # crew-log lineage. The sid lives on the slot for this process
+                    # only (see `_lineage_minted`).
                     # The agent's memory silo, recorded ONLY when it is not the
                     # default. This is what lets the consolidator write an agent's
                     # semantic, episodic and lesson rows into its own store

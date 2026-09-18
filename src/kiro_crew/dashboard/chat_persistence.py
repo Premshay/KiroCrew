@@ -835,12 +835,25 @@ def _pin_private_agent_assignment(
     *,
     conversation_log=None,
     native_context: bool = False,
+    authorized_store: str | None = None,
 ) -> str:
     """Pin an authorized member selection, never a name recovered from history.
 
     Callers must authorize the owner's request or its session-control creation
     before using this helper. The session-control route rejects private callers
     from these aggregate controls. Legacy members keep their declared V1 memory.
+
+    ``authorized_store`` is the store a caller's authorization actually covers,
+    for the one caller that HAS such a value: ``create_session`` runs
+    ``require_memory_delegation`` against ``bindings.memory_store_name``, so that
+    is the only store its creation is cleared for. The store pinned here is
+    derived from the SELECTED AGENT's config entry instead, and the two are not
+    the same value -- so without this fence the gate authorizes one store and the
+    pin writes another, and the new session runs on private memory its own
+    ``slot.memory_store`` does not name. Passing it makes the act match the check.
+
+    Left ``None`` by the owner's own agent picks, where the pick IS the authority
+    and there is no separately-authorized store to compare against.
     """
     selected = agent or config.default_agent
     if selected == "default":
@@ -848,6 +861,10 @@ def _pin_private_agent_assignment(
     member = config.agents.get(selected)
     store = getattr(member, "memory_store", "")
     if not store:
+        return ""
+    if authorized_store is not None and named_store_or_empty(store) != named_store_or_empty(
+        authorized_store
+    ):
         return ""
     record = config.memory_stores.get(store) if isinstance(store, str) else None
     if record is None or record.memory_version != 2:
@@ -1182,6 +1199,11 @@ def _rehydrate_slot_from_history(
             # worker a member dispatched would come back unowned and the
             # fail-closed `not_creator` check would strand them.
             slot._created_by = str(meta["created_by"])
+            # `created_by_sid` is never restored, and `_lineage_minted` stays False
+            # on a restored slot: this file is editable by an agent's file tools,
+            # so a value read back from it must not become the gateway-authored
+            # crew-log lineage record. Attribution above is restored for the
+            # ownership boundary only.
         if meta.get("folder_id"):
             slot.folder_id = meta["folder_id"]
         if meta.get("channel_folder_filed"):
@@ -1746,6 +1768,8 @@ def _apply_recent_session(
         # loses its creator binding and authorize_target refuses the
         # legitimate member with not_creator.
         slot._created_by = str(meta["created_by"])
+        # `created_by_sid` is never restored here either -- see
+        # _rehydrate_slot_from_history: transcript metadata is not a lineage source.
     if meta.get("folder_id"):
         slot.folder_id = meta["folder_id"]
     if meta.get("channel_folder_filed"):
@@ -3199,6 +3223,8 @@ def _save_slot_to_history(
                     # session-control authorization reads it, so dropping it here
                     # would orphan a member's workers on the next restart.
                     fields["created_by"] = slot._created_by
+                # `_created_by_sid` is NOT persisted (lineage is process-local; see
+                # _ChatSlot._lineage_minted).
                 if slot.linked_session_key:
                     fields["linked_session_key"] = slot.linked_session_key
                 if getattr(slot, "channel_origin", False):
@@ -3579,6 +3605,7 @@ def _save_slot_to_history(
                 # Creator attribution — read by the member ownership boundary in
                 # session-control authorization; see the partial-save mirror above.
                 meta_line["created_by"] = slot._created_by
+            # `_created_by_sid` is NOT persisted -- see the partial-save mirror above.
             # Artifact companion binding — persisted so a bound
             # session restored after a gateway restart (or resumed from the
             # History page) comes back as the artifact's active bound session.

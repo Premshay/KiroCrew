@@ -57,6 +57,7 @@ from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
     MONITOR_TERMINAL_REASON,
+    STRUCTURAL_TERMINAL_REASON,
     AutoNudgeService,
     NudgeLoop,
 )
@@ -238,7 +239,7 @@ from kiro_crew.messaging.link import (
     channel_namespace_of,
     parse_session_key,
 )
-from kiro_crew.messaging.renderer import SilentRenderer, chunk_for_transport
+from kiro_crew.messaging.renderer import SilentRenderer, chunk_for_transport, display_safe
 from kiro_crew.messaging.transport import InboundMessage, delivery_confirmed
 from kiro_crew.monitoring.completion import (
     MonitorCompletionHook,
@@ -869,6 +870,13 @@ class _GateTally:
     denial and an unattended-approval timeout also arrive unapproved, but they
     describe the policy state or an absent approver rather than a defect in the
     job — and a job's failure counter drives auto-pause, which is durable.
+
+    A refusal is reported whether or not other calls got through. The prose
+    a run returns is the model's account of what it did, and a model whose
+    final write was refused still reports the write as done: the refused
+    call's work simply never happened, and the only record of it was the SEL
+    audit row. ``all_blocked`` decides the FAILURE budget; ``partially_blocked``
+    decides whether the run's status and its delivery name the refusal.
     """
 
     def __init__(self) -> None:
@@ -896,6 +904,56 @@ class _GateTally:
         """
         return bool(self.refused) and self.approved == 0 and self.unresolved == 0
 
+    @property
+    def partially_blocked(self) -> bool:
+        """At least one tool was security-blocked while the run was not a
+        total block: another call ran, or another refusal left the run's
+        capability unknown. The refused call's work did not happen either
+        way, so the run is reported, but it is not evidence of a job that
+        cannot work and spends nothing from the failure budget."""
+        return bool(self.refused) and not self.all_blocked
+
+    def refusal_summary(self) -> str:
+        """One redacted, capped line naming what the gate refused.
+
+        Shared by the job's ``last_error`` and the banner on the delivered
+        result, so the cron row and the notification cannot disagree about
+        which call was lost. At most three titles are named so a run that
+        tripped the gate many times still reads as one line.
+
+        Titles are LLM-authored, and the banner lands in the result BODY,
+        which the Slack leg posts as parsed mrkdwn without a mention defang
+        (:func:`render_for_slack` redacts; it does not touch ``<!channel>``).
+        So the line goes through :func:`display_safe`, the shared outbound
+        display sink: display-form credential redaction plus the zero-width
+        break in ``<!`` and ``@`` that stops a refused call titled
+        ``<!channel>`` from paging a whole channel the moment the run reports
+        it. The break is invisible on the dashboard cron row, so one spelling
+        serves both surfaces.
+        """
+        named = ", ".join(t or "<untitled tool>" for t in self.refused[:3])
+        if self.all_blocked:
+            head = f"all {len(self.refused)} tool call(s) blocked by the security gate: "
+        else:
+            total = self.approved + self.unresolved + len(self.refused)
+            head = f"{len(self.refused)} of {total} tool call(s) blocked by the security gate: "
+        return display_safe(head + named)[:_CRON_FAILURE_DETAIL_CAP]
+
+
+def _annotate_partial_block(result_text: str, tally: _GateTally) -> str:
+    """Prefix a partially-blocked run's result with the refusal it carries.
+
+    The result is what every delivery leg (dashboard bell and slot, channel,
+    Slack) shows and what the dedup hash is taken over, so one prefix here is
+    what puts the refused call in front of the user beside the prose that may
+    claim the work was done. A fully blocked run is not annotated: its verdict
+    is a failure alert in its own right, and a tool-free or clean run has
+    nothing to name.
+    """
+    if not tally.partially_blocked:
+        return result_text
+    return f"⛔ {tally.refusal_summary()} — that work did not happen.\n\n{result_text}"
+
 
 def _apply_gate_verdict(job: CronJob, tally: _GateTally) -> bool:
     """Record a finished cron run's success or failure from its gate outcomes.
@@ -911,6 +969,15 @@ def _apply_gate_verdict(job: CronJob, tally: _GateTally) -> bool:
     ``try`` whose handler counts too, so a blocked turn whose delivery then
     failed would otherwise reach the auto-pause threshold in three runs rather
     than five — pausing on arithmetic instead of on evidence.
+
+    Three outcomes, not two. A run with every call refused is a failure and
+    is counted. A run with SOME call refused keeps ``last_status = "error"``
+    with the refusal as its reason but is counted in neither direction: the
+    approved calls prove the job can work, so it must not march toward
+    auto-pause, and the lost call means it did not succeed, so it must not
+    read as ``ok`` and must not reset a failure streak or the failure-alert
+    dedup the way a success does. Only a run with no refusal at all records a
+    success.
     """
     if tally.all_blocked:
         # Nothing the model attempted was permitted, so the run accomplished
@@ -918,10 +985,7 @@ def _apply_gate_verdict(job: CronJob, tally: _GateTally) -> bool:
         # consecutive_failures and clears auto_paused, so recording one here
         # would keep a structurally-failing job firing on its schedule forever.
         job.last_status = "error"
-        _named = ", ".join(t or "<untitled tool>" for t in tally.refused[:3])
-        job.last_error = redact(
-            f"all {len(tally.refused)} tool call(s) blocked by the security gate: " + _named
-        )[:500]
+        job.last_error = tally.refusal_summary()
         job.record_failure()
         if job.auto_paused:
             logger.warning(
@@ -930,6 +994,16 @@ def _apply_gate_verdict(job: CronJob, tally: _GateTally) -> bool:
                 job.consecutive_failures,
             )
         return True
+    if tally.partially_blocked:
+        # The run did work AND lost work. "error" is the one non-ok status the
+        # row, cron_list and the history record understand, and the reason
+        # names the refused call. Neither counter moves: not record_failure(),
+        # because the approved calls are evidence the job can work; not
+        # record_success(), because that would reset a failure streak and the
+        # failure-alert dedup on a run that did not fully succeed.
+        job.last_status = "error"
+        job.last_error = tally.refusal_summary()
+        return False
     # Clear failure dedup on any success, regardless of whether the success
     # result itself is a dup. A successful run means the job recovered — next
     # failure should always alert fresh. record_success() owns the reset now, so
@@ -4004,7 +4078,7 @@ class GatewayOrchestrator:
                                     wrapped,
                                     _directive_user_origin=False,
                                     # Structural provenance for the session
-                                    # ledger: the queued twin above carries
+                                    # crew log: the queued twin above carries
                                     # CRON_NOTIFICATION_KIND, and this branch is
                                     # the same injector dispatching directly.
                                     _turn_actor="cron",
@@ -5318,6 +5392,7 @@ class GatewayOrchestrator:
                                     )
                 if _seq_downgraded:
                     result_text = _annotate_model_downgrade(result_text)
+                result_text = _annotate_partial_block(result_text, _gate)
                 job.set_run_result(result_text)
                 # This path owns the same verdict as the single-agent one, so a
                 # multi-agent job's failure counter moves in both directions —
@@ -5417,6 +5492,11 @@ class GatewayOrchestrator:
                 if _model_downgraded:
                     result_text = _annotate_model_downgrade(result_text)
                 result_text = _annotate_model_fallback(result_text, client)
+                # Before set_run_result and the dedup hash below, so the stored
+                # result, the slot, the bell and every transport carry the
+                # refusal, and a run that lost a call never hashes equal to
+                # one that did not.
+                result_text = _annotate_partial_block(result_text, _gate)
 
                 job.set_run_result(result_text)
 
@@ -6360,12 +6440,19 @@ class GatewayOrchestrator:
                 await self.autonudge_svc.remove(loop.id)
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         if wake_message is None:
-            msg_body = await compose_nudge_body(
-                loop.message, loop.stop_sentinel_path, loop.slot_key
-            )
+            # Snapshot message, sentinel AND config generation TOGETHER, before
+            # the compose_nudge_body() await, so a concurrent PATCH during that
+            # suspension cannot pair the old message with a new generation (which
+            # would make the malformed verdict match the reconfigured loop and
+            # wrongly stop it). The fence below compares this captured generation.
+            _fired_message = loop.message
+            _fired_sentinel = loop.stop_sentinel_path
+            _fired_generation = loop.config_generation
+            msg_body = await compose_nudge_body(_fired_message, _fired_sentinel, loop.slot_key)
             tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
         else:
             tagged = wake_message
+            _fired_generation = loop.config_generation
         # Fail closed: an unattended turn MUST run under the HookManager
         # PreToolUse governance gate (mirrors cron's default approval path).
         # Without ctx_builder there are no hooks to enforce the gate — skip.
@@ -6569,8 +6656,11 @@ class GatewayOrchestrator:
             if _driver_completion_hook is not None and _driver_completion_hook.accepted:
                 return MonitorDispatchResult.DISPATCHED
             return MonitorDispatchResult.BUSY
-        except Exception:
+        except Exception as exc:
             logger.exception("AutoNudge: slack nudge turn failed for %s (loop %s)", key, loop.id)
+            await self._stop_message_loop_if_structural_terminal(
+                loop, exc, wake_message, _fired_generation
+            )
             if (
                 wake_message is not None
                 and _driver_completion_hook is not None
@@ -6835,6 +6925,72 @@ class GatewayOrchestrator:
             logger.exception("AutoNudge: webex nudge failed (loop %s)", loop.id)
             return False
 
+    async def _stop_message_loop_if_structural_terminal(
+        self,
+        loop: NudgeLoop,
+        exc: BaseException,
+        wake_message: str | None,
+        fired_generation: int,
+    ) -> bool:
+        """Stop a MESSAGE loop whose fired turn raised a structural rejection.
+
+        A malformed-request rejection ("Improperly formed request") is
+        deterministic in the payload's SHAPE, so re-firing the identical nudge
+        context can only reproduce it -- an undelivered cycle that the service
+        would otherwise re-arm with backoff, forever, since undelivered cycles
+        never reach ``max_cycles``. This is the CHANNEL-adapter counterpart to
+        the dashboard fire path's pre-dispatch guard: a channel adapter runs its
+        turn inline and holds the exception directly, so it reads the verdict off
+        the exception (``AcpError.structural_terminal``) rather than through the
+        slot flag the dashboard path relays. Scoped to message loops
+        (``wake_message is None``): a structured monitor wake carries its own
+        actionable context, not this repeated prompt, and keeps its own dispatch
+        contract. Returns True when it stopped the loop. getattr-guarded: only
+        AcpError carries the attribute.
+
+        ``fired_generation`` is ``loop.config_generation`` captured at fire time.
+        The stop is applied through ``AutoNudgeService.update(expected_generation
+        =...)``, which compares it against the loop's CURRENT generation UNDER
+        THE SERVICE LOCK: an inline channel turn can be slow, and a concurrent
+        ``PATCH /api/autonudge/{id}`` can change the instruction (advancing the
+        generation) WHILE the turn runs -- possibly back to the same text
+        (A->B->A). The atomic fence refuses the stale stop with no TOCTOU window;
+        a value compare on ``message`` could not tell a re-committed A apart.
+        """
+        if wake_message is not None:
+            return False
+        if not getattr(exc, "structural_terminal", False):
+            return False
+        if self.autonudge_svc is None:
+            return False
+        stopped_loop = await self.autonudge_svc.update(
+            loop.id,
+            active=False,
+            stopped_reason=STRUCTURAL_TERMINAL_REASON,
+            expected_generation=fired_generation,
+        )
+        if stopped_loop is None or stopped_loop.active:
+            # The fence refused: the loop's config generation advanced under the
+            # in-flight turn, so this malformed verdict belongs to an OLD
+            # instruction and must not deactivate the reconfigured loop.
+            logger.info(
+                "AutoNudge: loop %s on %s not stopped — its config generation "
+                "advanced while the malformed turn ran, so the rejection does "
+                "not apply to the current instruction",
+                loop.id,
+                loop.slot_key,
+            )
+            return False
+        logger.warning(
+            "AutoNudge: loop %s on %s stopped — its delivered turn was rejected "
+            "as structurally malformed, so re-firing the same context cannot "
+            "help; the loop stays inactive and a later directive (after a fresh "
+            "conversation) may re-arm it",
+            loop.id,
+            loop.slot_key,
+        )
+        return True
+
     async def _fire_dashboard_nudge(
         self, loop: NudgeLoop, wake_message: str | None = None
     ) -> bool | MonitorDispatchResult:
@@ -6910,8 +7066,80 @@ class GatewayOrchestrator:
                 loop.slot_key,
                 loop.id,
             )
+        # STRUCTURAL-TERMINAL GUARD (message loops only). If the slot's LAST
+        # delivered turn ended on a malformed-request rejection, the backend
+        # refused the payload's SHAPE, deterministically -- re-injecting the same
+        # nudge context can only reproduce it. Firing again would spend cycle
+        # after cycle (the reported cycles 13, 14, ...) on an identical doomed
+        # turn, so STOP the loop instead. The verdict is scoped to the loop id
+        # (``_last_turn_structural_terminal_loop_id``) AND applied under an ATOMIC
+        # (id, generation) fence in AutoNudgeService.update(expected_generation=):
+        # the loop's config generation captured at fire time
+        # (``_last_turn_structural_terminal_loop_gen``) must still match under the
+        # service lock, or the completion is a STALE result of an OLD instruction
+        # (the A->B->A race) and the stop is refused there with no TOCTOU window.
+        # The loop stays INACTIVE when stopped; the stop is REPLACEABLE
+        # (STRUCTURAL_TERMINAL_REASON), which does not re-arm on its own -- it
+        # only PERMITS a later directive to re-arm the loop, and any such re-arm
+        # advances the generation so this verdict cannot follow it. The slot's
+        # verdict is cleared at the start of every genuine new turn (chat_runner).
+        # A structured monitor WAKE (``wake_message is not None``) carries its own
+        # actionable context and is out of scope here. Tested with ``is True``
+        # (not truthiness) so a bare MagicMock slot's truthy attribute cannot
+        # trip it; getattr keeps minimal slot doubles safe.
+        if (
+            wake_message is None
+            and getattr(slot, "_last_turn_structural_terminal", False) is True
+            and getattr(slot, "_last_turn_structural_terminal_loop_id", "") == loop.id
+            and self.autonudge_svc is not None
+        ):
+            _expected_gen = int(getattr(slot, "_last_turn_structural_terminal_loop_gen", 0) or 0)
+            stopped_loop = await self.autonudge_svc.update(  # type: ignore[union-attr]
+                loop.id,
+                active=False,
+                stopped_reason=STRUCTURAL_TERMINAL_REASON,
+                expected_generation=_expected_gen,
+            )
+            # The fence answers three cases, and only ONE may dispatch:
+            #   * inactive loop  -> stopped (verdict applied): return UNAVAILABLE.
+            #   * None            -> update refused the mutation because the loop
+            #     is quiescing/removed under maintenance (``_acquire_mutation_lock``
+            #     returns None), NOT a live target: return UNAVAILABLE, matching
+            #     the sibling ``_stop_message_loop_if_structural_terminal`` seam,
+            #     which treats None as not-a-live-loop.
+            #   * still-active loop -> the fence refused because the config
+            #     generation advanced under the turn (stale completion): fall
+            #     through and dispatch the reconfigured loop.
+            # So dispatch happens ONLY for a non-None ACTIVE loop; a None must not
+            # be conflated with "refused, still firing".
+            if stopped_loop is None or not stopped_loop.active:
+                logger.warning(
+                    "AutoNudge: loop %s on slot %s not dispatched — its last "
+                    "delivered turn was rejected as structurally malformed and "
+                    "the loop is stopped or is not a live target; re-firing "
+                    "the same context cannot help, and a later directive (after "
+                    "a fresh conversation) may re-arm it",
+                    loop.id,
+                    loop.slot_key,
+                )
+                return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
+            logger.info(
+                "AutoNudge: loop %s structural stop skipped — config generation "
+                "advanced under the fired turn, so the verdict is stale",
+                loop.id,
+            )
         if wake_message is None:
-            msg = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
+            # Snapshot message, sentinel AND config generation TOGETHER, before
+            # the compose_nudge_body() await: a concurrent PATCH during that
+            # suspension could otherwise pair the OLD message with the NEW
+            # generation, so the malformed verdict would match the reconfigured
+            # loop's generation and wrongly stop it. The generation recorded with
+            # the verdict must be the one that goes with the message the turn
+            # actually runs.
+            _fired_message = loop.message
+            _fired_sentinel = loop.stop_sentinel_path
+            _fired_generation = loop.config_generation
+            msg = await compose_nudge_body(_fired_message, _fired_sentinel, loop.slot_key)
             tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg}"
         else:
             tagged = wake_message
@@ -7092,6 +7320,13 @@ class GatewayOrchestrator:
         # carries this mark. On a crew/member slot the wake only exists because
         # ``_dashboard_mode_admits`` already proved the loop self-armed.
         run_kwargs["_directive_self_wake"] = True
+        # Scope the structural-terminal verdict this turn may record to THIS loop
+        # and the CONFIG GENERATION it fires under (the snapshot captured with the
+        # message above, before compose_nudge_body's await), so the stop is
+        # applied via an atomic (id, generation) fence and a stale completion
+        # cannot deactivate a loop whose config advanced under the turn.
+        run_kwargs["_directive_loop_id"] = loop.id
+        run_kwargs["_directive_loop_gen"] = _fired_generation if wake_message is None else 0
         if completion_hook is not None:
             run_kwargs["monitor_completion"] = completion_hook
             # Structured monitor turns own a single durable budgeted turn.
@@ -9023,7 +9258,7 @@ class GatewayOrchestrator:
                                     announce,
                                     _directive_user_origin=False,
                                     # Structural provenance for the session
-                                    # ledger: the queued twin above carries
+                                    # crew log: the queued twin above carries
                                     # SUBAGENT_COMPLETION_KIND, and this branch
                                     # is the same injector dispatching directly.
                                     _turn_actor="subagent",
@@ -13218,7 +13453,7 @@ class GatewayOrchestrator:
         # session by this point, so the sweep is not racing a mapping publisher --
         # the same position the sweep already held here before this change.
         await asyncio.to_thread(cleanup_orphaned_sessions)
-        # The session ledger's buffered appends, for EVERY gateway mode. The
+        # The session's log's buffered appends, for EVERY gateway mode. The
         # dashboard registers its own cleanup hook, but a mode that builds no
         # dashboard app -- slack-only is the plain case -- never runs one, and
         # os._exit below skips atexit, so without this the buffer dies with the
@@ -13230,12 +13465,12 @@ class GatewayOrchestrator:
             # Imported HERE, not at module scope: AUTOSDE's
             # no-new-work-on-gateway-boot-path rule asks for an optional subsystem's
             # import to be gated, and a shutdown drain is the only use in this module.
-            from kiro_crew import session_ledger_emit
+            from kiro_crew.crew_log import emit as crew_log_emit
 
-            if not await asyncio.to_thread(session_ledger_emit.drain_for_shutdown):
-                logger.warning("session ledger did not fully drain before exit")
+            if not await asyncio.to_thread(crew_log_emit.drain_for_shutdown):
+                logger.warning("the session's log did not fully drain before exit")
         except Exception:  # noqa: BLE001 - shutdown must not raise
-            logger.debug("session ledger drain failed during shutdown", exc_info=True)
+            logger.debug("the session's log drain failed during shutdown", exc_info=True)
         # This is a hard exit too: os._exit skips atexit, so the log queue's
         # drain hook never runs here either. Without this the whole shutdown
         # tail is lost -- including the "Graceful shutdown timed out" warning

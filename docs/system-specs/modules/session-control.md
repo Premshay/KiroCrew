@@ -77,7 +77,19 @@ Creation copies two different kinds of state, and the split is deliberate.
 boundary; a child left in `default` would be both a boundary crossing and
 unaddressable by its own creator), inherits the caller's agent when none is
 named, takes that workspace's project directory as its cwd, and is attributed to
-the caller via `created_by` so the per-creator slot ceiling is countable.
+the caller via `created_by` so the per-creator slot ceiling is countable. The
+caller's ACP session id is also frozen onto the child at this mint
+(`_created_by_sid`), from the live caller handle, so the child's `session/opened`
+lineage cites the creator that was live when it was made rather than a
+replacement that may take the creator's slot before the child's first turn. The
+id is backend-authored, so it is bounded where it is retained: one past
+`MAX_ACP_SESSION_ID_LEN` (`kiro_crew/validation.py`, the constant every store of a
+backend session id shares) is dropped at mint, never truncated -- the sid
+is optional and absent is a legal record. The mint also sets `_lineage_minted`, the
+in-memory witness that THIS process stamped both fields; neither the witness nor
+the sid is written to the transcript, which an agent's file tools can edit, so a
+metadata edit cannot forge the gateway-authored lineage the fenced crew log
+records (see `crew-log-emitter.md`).
 
 **Approval posture** — the caller's `_trust` and `_trust_reads` transfer, so a
 trusted operator's dispatched worker does not stall on a prompt nobody is
@@ -235,19 +247,39 @@ of its private store:
   store. The guard (the one the private spawn path uses) is a no-op for a caller
   with no private record and a refusal of any target store that is not the private
   V2 caller's own; the refusal, and a corrupt/unreadable binding file, both map to
-  the `agent_store_mismatch` 4xx rather than an unhandled 500.
-- **The child's private binding** is written at birth only when the caller's
-  protected session record names the child's resolved V2 store. Agent selection
-  and editable slot metadata cannot grant private authority. An unbound/global
-  caller keeps ordinary creation behavior, with no private binding even when the
-  chosen agent names a V2 store. A private caller aimed at a foreign or global
-  store is refused by the delegation guard above.
-  The binding uses the child's effective session key — the key the turn path's
+  the `memory_delegation_denied` 403 rather than an unhandled 500. A 403, not a
+  validation 4xx: the store is a legal name and the request is well formed, so the
+  answer is "you may not delegate there", and the refusal carries a FIXED message
+  with `from None` — the guard reads binding files, so its own text can name one.
+- **The caller's protected record** is read to decide whether the child may
+  inherit private authority, and it is read under the caller's CANONICAL history
+  key. `caller_session_key` arrives as any of three spellings of the same session
+  (canonical key, slot key, transcript stem) while the protected read recognizes
+  only the canonical one, so keying it on the raw argument makes the caller's own
+  authority depend on the spelling it chose — the slot and stem forms read back as
+  unbound. For an authorization input that is a bypass, not a lenient read.
+- **The child's private binding** is written before the slot's birth metadata or
+  broadcast, using the child's effective session key — the key the turn path's
   `_bind_private_slot_memory` reads. Without it a member's worker cannot take its
-  first turn. It is written before the slot's birth metadata or broadcast. A
-  version-read or binding-write failure retracts an idle, empty child and reports
-  `agent_store_mismatch`; cancellation retracts the same way and propagates.
-  Work already running is never orphaned by retraction.
+  first turn. A version-read or binding-write failure retracts an idle, empty child
+  and reports `agent_store_mismatch`; cancellation retracts the same way and
+  propagates. Work already running is never orphaned by retraction.
+- **The birth-time pin is fenced to the authorized store.**
+  `_pin_private_agent_assignment` derives the store to pin from the SELECTED
+  AGENT's config entry, which is a different value from the
+  `bindings.memory_store_name` the delegation guard checked. `create_session`
+  therefore passes that authorized store down, and the pin writes nothing when the
+  two disagree — otherwise the guard clears one store and the pin binds another,
+  leaving a session running on private memory its own `slot.memory_store` does not
+  name. The owner's own agent picks pass no authorized store, because there the
+  pick IS the authority.
+
+  An unbound/global caller keeps ordinary creation behavior and gains nothing: its
+  own protected record is untouched. Its child, however, IS bound — to the selected
+  member's own store, the store the guard authorized. Leaving that child unbound
+  while `slot.memory_store` names a V2 store is not the safe reading: the turn path
+  raises `memory_unavailable` on exactly that pair, so the session could never take
+  a turn.
 
 ### The fence propagates to what a fenced caller creates
 
@@ -266,6 +298,14 @@ A grandchild carries its parent's key there and is fenced by the same test, and 
 chain whose middle slot has been closed cannot fail open because no chain is
 walked. A person's own tab and a fork reach `get_or_create_slot` directly and stay
 unattributed, so ordinary human use is unaffected.
+
+The same attribution is the one lineage fact the child's append-only crew log
+records: its `session/opened` carries `parent {slot, sid?}` -- `_created_by` as the
+slot, and `_created_by_sid`, the creator's ACP session id frozen at mint from the
+live caller handle -- but only while the slot carries the in-memory mint witness
+(`_lineage_minted`); the `created_by` restored from transcript metadata after a
+restart serves this fence and never the crew log (see `crew-log-emitter.md`). The
+fence above reads the slot; a fold that builds the tree of sessions reads the crew log.
 
 There is deliberately NO attendance exemption. `_ChatSlot._human_seen` looks like
 the right hatch and is not: it records that a human has EVER driven the slot, is

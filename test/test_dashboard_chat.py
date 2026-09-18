@@ -5392,9 +5392,9 @@ class TestFlushSegment:
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("peer-ledger")
         sent = MagicMock()
-        monkeypatch.setattr(chat_runner.session_ledger_emit, "session_id_of", lambda _: "sid")
-        monkeypatch.setattr(chat_runner.session_ledger_emit, "live_turn", lambda _: 7)
-        monkeypatch.setattr(chat_runner.session_ledger_emit, "on_message_sent", sent)
+        monkeypatch.setattr(chat_runner.crew_log_emit, "session_id_of", lambda _: "sid")
+        monkeypatch.setattr(chat_runner.crew_log_emit, "live_turn", lambda _: 7)
+        monkeypatch.setattr(chat_runner.crew_log_emit, "on_message_sent", sent)
         chat_runner._flush_segment(
             state, slot, "partial reply", broadcast=False,
             message_meta={"between_turn": True}, interrupted=True,
@@ -18744,7 +18744,7 @@ class TestAcpProcessDiedRecovery:
 
         state, slot, client, run_chat = self._make_state_and_slot(tmp_path)
         sent = MagicMock()
-        monkeypatch.setattr(chat_runner.session_ledger_emit, "on_message_sent", sent)
+        monkeypatch.setattr(chat_runner.crew_log_emit, "on_message_sent", sent)
 
         async def stream(message):
             yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="partial provider reply")
