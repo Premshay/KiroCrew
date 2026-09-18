@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 from aiohttp import web
 
-from kiro_crew import platform_compat, port_resolution, work_dispatch
+from kiro_crew import platform_compat, port_resolution, serving_checkout, work_dispatch
 from kiro_crew.apps.backend import start_deferred_app_backends, start_enabled_app_backends
 from kiro_crew.apps.hook_reconcile import init_hook_reconciler, stop_hook_reconciler
 from kiro_crew.apps.hooks_integration import (
@@ -253,6 +253,24 @@ async def _prune_browser_snapshots_loop() -> None:
         except Exception:
             logger.debug("browser snapshot prune failed", exc_info=True)
         await asyncio.sleep(30 * 60.0)
+
+
+async def _serving_checkout_drift_loop() -> None:
+    """Warn when the checkout this process imports from moves underneath it.
+
+    The gateway's import root is the deployed checkout, so a merge or an editor
+    write during a run leaves the process executing one revision while later
+    imports read the next. The warning names the changed file; the remedy is a
+    restart, which belongs to the operator rather than to this loop. The first
+    pass is delayed so it never competes with boot work for disk.
+    """
+    await asyncio.sleep(serving_checkout.CHECK_INTERVAL_SECS)
+    while True:
+        try:
+            serving_checkout.report(await asyncio.to_thread(serving_checkout.scan))
+        except Exception:
+            logger.debug("serving checkout drift scan failed", exc_info=True)
+        await asyncio.sleep(serving_checkout.CHECK_INTERVAL_SECS)
 
 
 #: The tailnet publish state is a subprocess round trip (`tailscale serve
@@ -4879,6 +4897,10 @@ async def start_dashboard(
     _snap_pruner = asyncio.create_task(_prune_browser_snapshots_loop())
     _snap_pruner.add_done_callback(lambda t: t.result() if not t.cancelled() else None)
     state._browser_snapshot_pruner = _snap_pruner  # prevent GC
+
+    _drift_watch = asyncio.create_task(_serving_checkout_drift_loop())
+    _drift_watch.add_done_callback(lambda t: t.result() if not t.cancelled() else None)
+    state._serving_checkout_drift_watch = _drift_watch  # prevent GC
 
     # Start terminal title poller (pushes live foreground-command / cwd titles)
     _title_poller = asyncio.create_task(handlers.poll_terminal_titles(app))

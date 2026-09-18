@@ -5942,19 +5942,28 @@ function ChatInput({
                       </span>
                     )}
                   </button>
+                  {/* On a phone the label budget sheds the FOLDER name, not the
+                      branch: the picker and the tooltip already name the folder,
+                      while the branch has no other surface on a touch device --
+                      no hover to read a title, and the Git panel is a tap away.
+                      Compact therefore keeps the branch alone, and the separator
+                      goes with the folder name it joined. */}
                   {!shelfCompact && !!projectBranch && (
+                    <span className="opacity-40 shrink-0" aria-hidden="true">
+                      ·
+                    </span>
+                  )}
+                  {!!projectBranch && (
                     <>
-                      <span className="opacity-40 shrink-0" aria-hidden="true">
-                        ·
-                      </span>
                       {/* Copying stays enabled while a response is running — unlike
                   switching project, reading the branch name is harmless. A git
                   ref IS code, so it sets `font-mono` itself (the pill container
-                  does not supply it). */}
+                  does not supply it). Compact caps it tighter, because there the
+                  branch is the chip's only label. */}
                       <CopyBranchButton
                         branch={projectBranch}
                         label={projectDetached ? 'commit' : 'branch name'}
-                        className="max-w-[220px] font-mono opacity-70 hover:opacity-100 hover:text-text"
+                        className={`${shelfCompact ? 'max-w-[140px]' : 'max-w-[220px]'} font-mono opacity-70 hover:opacity-100 hover:text-text`}
                       />
                     </>
                   )}
