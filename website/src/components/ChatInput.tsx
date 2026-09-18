@@ -5795,7 +5795,12 @@ function ChatInput({
           // this the chip is silently invisible whenever no other pill happens
           // to be present — the control is declared, mounted and unreachable.
           !!sessionControls?.length) && (
-          <div ref={shelfRef} className="pt-1 flex items-center gap-2 min-w-0">
+          /* The shelf wraps instead of squeezing. Its middle group carries a
+             `shrink-0` git badge, so a row free to compress that group below its
+             own content lets the badge paint over the context readout beside it.
+             Wrapping keeps every chip at its natural width and moves the
+             overflow to a second line, at any model-name length. */
+          <div ref={shelfRef} className="pt-1 flex flex-wrap items-center gap-2 min-w-0">
             {/* App-contributed session controls live in their OWN group, not
               beside the agent/project chips. `max-two-buttons-per-row`
               (AUTOSDE.yaml, blocking) caps a horizontal group at 2 action
@@ -5860,7 +5865,7 @@ function ChatInput({
           })}
             </div>
           )}
-          <div className="flex items-center gap-2 min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-1">
           {onAgentClick && agentName && (
             /* Chrome type: an agent name is a label, not code. `font-mono` would
                pin `var(--mono)`, which Settings → Display → Font Family never
