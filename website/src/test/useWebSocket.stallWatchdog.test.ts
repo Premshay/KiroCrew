@@ -8,7 +8,12 @@ import { createElement, type ReactNode } from 'react'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
-import { useWebSocket, ROW_STALL_MS, ROW_STALL_TICK_MS } from '../hooks/useWebSocket'
+import {
+  useWebSocket,
+  ROW_STALL_MS,
+  ROW_STALL_TICK_MS,
+  ROW_STALL_PROBE_EVERY,
+} from '../hooks/useWebSocket'
 import { api } from '../api/client'
 import chatReducer from '../store/chatSlice'
 
@@ -78,6 +83,48 @@ describe('row-delivery stall watchdog', () => {
     })
 
     expect(detailCalls()).toBeGreaterThan(before)
+    unmount()
+  })
+
+  it('arms from the server when this client believes the slot is idle', async () => {
+    // The client has no idea a turn is running: no run frame ever arrived.
+    expect(testStore.getState().chat.slotRunning).toBe(false)
+    vi.mocked(api.chatSlots).mockResolvedValue([
+      { key: 'chat-active', running: true, last_ts: '2026-09-18T03:00:00Z' },
+    ])
+
+    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
+    // The first tick only stamps progress; the probe then lands on the fourth
+    // tick after it, so allow one extra.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_TICK_MS * (ROW_STALL_PROBE_EVERY + 1))
+    })
+    expect(api.chatSlots).toHaveBeenCalled()
+    const before = detailCalls()
+
+    // The server says a turn is running and no row has moved: heal.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_MS + ROW_STALL_TICK_MS * 2)
+    })
+
+    expect(detailCalls()).toBeGreaterThan(before)
+    unmount()
+  })
+
+  it('stays quiet when the server agrees nothing is running', async () => {
+    vi.mocked(api.chatSlots).mockResolvedValue([{ key: 'chat-active', running: false }])
+
+    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_TICK_MS * ROW_STALL_PROBE_EVERY)
+    })
+    const before = detailCalls()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_MS * 3)
+    })
+
+    expect(detailCalls()).toBe(before)
     unmount()
   })
 

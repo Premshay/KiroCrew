@@ -447,6 +447,10 @@ const CHUNK_BUF_FLUSH_CHARS = 50_000
  *  threshold is asserted rather than guessed at in the spec. */
 export const ROW_STALL_MS = 100_000
 export const ROW_STALL_TICK_MS = 15_000
+/** Ticks between server cross-checks while the client believes the slot is
+ *  IDLE (see the watchdog). Every tick would be one GET per 15s; every fourth
+ *  is one per minute, which is the cadence the missed-turn case needs. */
+export const ROW_STALL_PROBE_EVERY = 4
 
 export function useWebSocket() {
   const dispatch = useAppDispatch()
@@ -3589,6 +3593,32 @@ export function useWebSocket() {
     let rows = -1
     let tail = -1
     let stampedAt = Date.now()
+    let ticks = 0
+    /* Whether the SERVER last said this slot is running. Every local signal
+     * dies with the transport, so a turn started on another device whose run
+     * frame was lost leaves this client believing the slot is idle -- and the
+     * client that believes a slot is idle never arms the watchdog above, which
+     * is the one case a reload-only recovery would otherwise be permanent. */
+    let serverRunning = false
+    const probeServerRunning = (key: string) => {
+      // Promise.resolve: a stubbed client in a test may hand back a plain
+      // value, and the tick must never throw inside a timer callback.
+      void Promise.resolve(api.chatSlots())
+        .then((payload: unknown) => {
+          const list = Array.isArray(payload)
+            ? payload
+            : ((payload as { slots?: unknown[] } | null)?.slots ?? [])
+          const row = (list as Array<{ key?: string; running?: boolean }>).find(
+            (s) => s?.key === key,
+          )
+          // Absent means the slot is gone or the payload moved on: keep the
+          // watchdog disarmed rather than arming it on a stale belief.
+          serverRunning = !!row?.running
+        })
+        .catch(() => {
+          /* transient: the next probe asks again */
+        })
+    }
     const id = setInterval(() => {
       const chat = appStore.getState().chat
       const msgs = chat.messages
@@ -3602,12 +3632,29 @@ export function useWebSocket() {
         stampedAt = Date.now()
         return
       }
-      if (!chat.activeSlot || !(chat.slotRunning || chat.slotState !== 'idle')) {
+      const believesRunning = chat.slotRunning || chat.slotState !== 'idle'
+      /* Cross-check only when the client believes NOTHING is running: that is
+       * the blind spot. While it believes a turn is running, a probe would
+       * only re-fetch what the 100s rule already governs. Visible tabs only --
+       * a hidden tab has no reader to heal, and the visibility return forces a
+       * reconnect that reconciles anyway. The probe never heals by itself: it
+       * can only arm the same no-progress rule, so a healthy turn cannot cause
+       * a rebuild. */
+      if (
+        !believesRunning &&
+        chat.activeSlot &&
+        document.visibilityState === 'visible' &&
+        ++ticks % ROW_STALL_PROBE_EVERY === 0
+      ) {
+        probeServerRunning(chat.activeSlot)
+      }
+      if (!chat.activeSlot || !(believesRunning || serverRunning)) {
         stampedAt = Date.now()
         return
       }
       if (Date.now() - stampedAt < ROW_STALL_MS) return
       stampedAt = Date.now()
+      serverRunning = false
       dispatch(refreshSlot(chat.activeSlot))
     }, ROW_STALL_TICK_MS)
     return () => clearInterval(id)
