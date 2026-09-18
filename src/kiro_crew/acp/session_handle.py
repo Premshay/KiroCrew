@@ -4801,6 +4801,15 @@ class AcpSessionHandle:
                     # later non-interactive retry of it is not a safe replay.
                     self._tool_output_seen.add(ev.tool_call_id)
                 self._tool_dispatched = False
+                # The tool clock covers a call that is still in flight; this is
+                # the other half. Once the result lands, the turn is waiting on
+                # the MODEL again, so the stale clock has to cover that wait.
+                # Arming only on a text chunk left the gap after the last result
+                # unwatched: a turn whose model never sends the follow-up sat
+                # outside every watchdog -- rows complete, no terminal event --
+                # and parked the slot with no probe and no log line to explain
+                # it.
+                self._stale_eligible = True
                 self._inflight_tool = None
                 self._inflight_interactive = None
                 self._inflight_tool_call_id = ""

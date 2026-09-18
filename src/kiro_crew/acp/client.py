@@ -11278,6 +11278,10 @@ class AcpClient:
                     # tool that streams progress then silently stalls is still
                     # caught.)
                     self._tool_dispatched = False
+                    # The tool clock covers a call that is still in flight; this is
+                    # the other half. Once the result lands, the turn is waiting on the
+                    # MODEL again, so the stale clock has to cover that wait.
+                    self._stale_eligible = True
                     # Fire the PostToolUse HOOK ENGINE now that the tool RESULT
                     # (and its output) exists — the Pre-vs-Post split is required
                     # because fire_tool_hooks above is PreToolUse-only. No-op
