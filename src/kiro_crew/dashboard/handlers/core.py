@@ -22,7 +22,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
 import kiro_crew.config.resolution as _resolution
-from kiro_crew import beacon, platform_compat, stt
+from kiro_crew import beacon, platform_compat, serving_checkout, stt
 from kiro_crew.acp_backends import selectable_backend_values
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES_LIMIT
@@ -462,6 +462,12 @@ def _liveness_payload(request: web.Request) -> dict[str, object]:
         # Anonymous non-loopback probes get only the liveness bit, avoiding an
         # exact-version fingerprint on the public probe boundary.
         payload.update({"app": "kirocrew", "version": kiro_crew.__version__})
+        # A checkout that moved under this process is the same class of
+        # direct-local fact as the version above: a later import may already be
+        # reading a revision this process never loaded.
+        drift = serving_checkout.current()
+        if drift is not None:
+            payload["code_drift"] = drift.to_payload()
     return payload
 
 
