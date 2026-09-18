@@ -486,6 +486,17 @@ export interface LearningsResponse {
   consolidating?: boolean
   /** Why the last merge did not apply. The ruleset is unchanged when set. */
   consolidate_error?: string | null
+  /** The machine-readable cause behind `consolidate_error`, when there is one. */
+  consolidate_error_code?: string | null
+}
+
+/** The outcome of dropping staged candidates: no merge, no ruleset change. */
+export interface CandidateDeleteResponse {
+  ok: boolean
+  namespace: string
+  requested: number
+  removed: number
+  remaining: number
 }
 
 // --- Navigation --------------------------------------------------------------

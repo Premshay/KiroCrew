@@ -98,6 +98,19 @@ function localizedCode(code: string, group: 'request' | 'apply'): string {
   }
 }
 
+/** The merge finished and its proposal was refused. One sentence for every
+ *  cause is why this was unfixable: name the two the operator can act on. */
+function localizedConsolidationFailure(code: string): string {
+  switch (code) {
+    case 'candidate_promotion_not_eligible':
+      return i18nT('apps.codeReviewSage.views.learningView.preview_failed_promotion_ineligible')
+    case 'malformed_worker_output':
+      return i18nT('apps.codeReviewSage.views.learningView.preview_failed_worker_output')
+    default:
+      return i18nT('apps.codeReviewSage.views.learningView.preview_failed')
+  }
+}
+
 function localizedDecisionAction(action: string): string {
   switch (action) {
     case 'archive':
@@ -281,6 +294,7 @@ export default function LearningView() {
   const [previewIdsBeforeRequest, setPreviewIdsBeforeRequest] = useState<string[]>([])
   const [awaitingPreview, setAwaitingPreview] = useState(false)
   const [previewFailure, setPreviewFailure] = useState<string | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<string[] | null>(null)
 
   const learningsQuery = useQuery({
     queryKey: ['code-review-sage', 'learnings', ns],
@@ -339,6 +353,16 @@ export default function LearningView() {
         })
       }
     },
+  })
+  const deleteCandidates = useMutation({
+    mutationFn: (candidateIds: string[]) => sageApi.deleteCandidates(ns as string, candidateIds),
+    onSuccess: () => {
+      setPendingDelete(null)
+      setSelectedIds([])
+      setPreviewFailure(null)
+      void qc.invalidateQueries({ queryKey: ['code-review-sage', 'learnings', ns] })
+    },
+    onError: () => setPendingDelete(null),
   })
   const applyPreview = useMutation({
     mutationFn: () =>
@@ -399,11 +423,16 @@ export default function LearningView() {
     }
   }, [awaitingPreview, previewId, previewIdsBeforeRequest, previewsQuery.data?.previews])
   useEffect(() => {
-    if (awaitingPreview && learningsQuery.data?.consolidate_error) {
-      setAwaitingPreview(false)
-      setPreviewFailure(i18nT('apps.codeReviewSage.views.learningView.preview_failed'))
-    }
-  }, [awaitingPreview, learningsQuery.data?.consolidate_error])
+    if (!awaitingPreview || !learningsQuery.data?.consolidate_error) return
+    setAwaitingPreview(false)
+    setPreviewFailure(
+      localizedConsolidationFailure(learningsQuery.data.consolidate_error_code ?? ''),
+    )
+  }, [
+    awaitingPreview,
+    learningsQuery.data?.consolidate_error,
+    learningsQuery.data?.consolidate_error_code,
+  ])
   if (!ns) {
     return (
       <div className="h-full overflow-y-auto scrollbar-none px-4 md:px-6 py-6">
@@ -441,6 +470,9 @@ export default function LearningView() {
       : applyPreview.error
         ? i18nT('apps.codeReviewSage.views.learningView.apply_unknown')
         : null
+  const deleteError = deleteCandidates.error
+    ? i18nT('apps.codeReviewSage.views.learningView.delete_failed')
+    : null
 
   return (
     <div className="h-full overflow-y-auto scrollbar-none px-4 md:px-6 py-6">
@@ -483,9 +515,9 @@ export default function LearningView() {
               {i18nT('apps.codeReviewSage.views.learningView.preparing_preview')}
             </p>
           )}
-          {(previewFailure || requestError || applyError) && (
+          {(previewFailure || requestError || applyError || deleteError) && (
             <ErrorNotice
-              message={previewFailure || requestError || applyError}
+              message={previewFailure || requestError || applyError || deleteError}
               variant="inline"
               askAgent
               className="mt-2"
@@ -603,6 +635,33 @@ export default function LearningView() {
                     )}
                     {i18nT('apps.codeReviewSage.views.learningView.create_preview')}
                   </Btn>
+                  {pendingDelete ? (
+                    <>
+                      <span className="text-[12px] text-warn">
+                        {i18nT('apps.codeReviewSage.views.learningView.delete_confirm', {
+                          count: pendingDelete.length,
+                        })}
+                      </span>
+                      <Btn
+                        type="button"
+                        disabled={deleteCandidates.isPending}
+                        onClick={() => deleteCandidates.mutate(pendingDelete)}
+                      >
+                        {i18nT('apps.codeReviewSage.views.learningView.delete_confirm_action')}
+                      </Btn>
+                      <Btn type="button" onClick={() => setPendingDelete(null)}>
+                        {i18nT('apps.codeReviewSage.views.learningView.cancel')}
+                      </Btn>
+                    </>
+                  ) : (
+                    <Btn
+                      type="button"
+                      disabled={selectedIds.length === 0 || deleteCandidates.isPending}
+                      onClick={() => setPendingDelete([...selectedIds])}
+                    >
+                      {i18nT('apps.codeReviewSage.views.learningView.delete_selected')}
+                    </Btn>
+                  )}
                 </>
               )}
             </div>
@@ -621,34 +680,44 @@ export default function LearningView() {
                       key={c.id}
                       className="rounded-lg border border-warn/40 bg-card px-3.5 py-2.5"
                     >
-                      <label className="flex cursor-pointer items-start gap-3">
-                        <input
-                          type="checkbox"
-                          checked={isSelected}
-                          onChange={() => toggleCandidate(c.id)}
-                          aria-label={i18nT(
-                            'apps.codeReviewSage.views.learningView.select_candidate',
-                            { title: c.title },
-                          )}
-                          className="mt-1 h-4 w-4 accent-[var(--accent)]"
-                        />
-                        <span className="min-w-0 flex-1">
-                          <span className="block text-[13px]">
-                            <ImpactTag impact={c.impact} />
-                            <strong className="text-text">{c.title}</strong>
+                      <div className="flex items-start gap-3">
+                        <label className="flex min-w-0 flex-1 cursor-pointer items-start gap-3">
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleCandidate(c.id)}
+                            aria-label={i18nT(
+                              'apps.codeReviewSage.views.learningView.select_candidate',
+                              { title: c.title },
+                            )}
+                            className="mt-1 h-4 w-4 accent-[var(--accent)]"
+                          />
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-[13px]">
+                              <ImpactTag impact={c.impact} />
+                              <strong className="text-text">{c.title}</strong>
+                            </span>
+                            <span className="mt-1 block text-[12.5px] text-muted leading-[1.6]">
+                              {c.guidance}
+                            </span>
                           </span>
-                          <span className="mt-1 block text-[12.5px] text-muted leading-[1.6]">
-                            {c.guidance}
+                          <span
+                            className={`shrink-0 text-[11px] ${isSelected ? 'text-accent' : 'text-muted'}`}
+                          >
+                            {isSelected
+                              ? i18nT('apps.codeReviewSage.views.learningView.selected')
+                              : i18nT('apps.codeReviewSage.views.learningView.retained_unselected')}
                           </span>
-                        </span>
-                        <span
-                          className={`shrink-0 text-[11px] ${isSelected ? 'text-accent' : 'text-muted'}`}
+                        </label>
+                        <button
+                          type="button"
+                          disabled={deleteCandidates.isPending}
+                          onClick={() => setPendingDelete([c.id])}
+                          className="shrink-0 text-[11px] text-muted underline hover:text-danger disabled:opacity-50"
                         >
-                          {isSelected
-                            ? i18nT('apps.codeReviewSage.views.learningView.selected')
-                            : i18nT('apps.codeReviewSage.views.learningView.retained_unselected')}
-                        </span>
-                      </label>
+                          {i18nT('apps.codeReviewSage.views.learningView.delete_confirm_action')}
+                        </button>
+                      </div>
                     </li>
                   )
                 })}

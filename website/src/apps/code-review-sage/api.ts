@@ -5,6 +5,7 @@
 // dashboard session cookie — no tokens are added here.
 import type {
   AddRepoResponse,
+  CandidateDeleteResponse,
   ChatState,
   ConsolidationPreviewApplyResponse,
   ConsolidationPreviewDetailResponse,
@@ -227,6 +228,17 @@ export const sageApi = {
     candidateIds: string[],
   ): Promise<ConsolidationPreviewRequest> =>
     sendJSON('/learnings/consolidate', 'POST', {
+      namespace,
+      candidate_ids: candidateIds,
+    }),
+
+  /** Drop staged candidates without a merge. `candidateIds` is the exact set of
+   *  staged entries to remove; the ruleset and the governed records are untouched. */
+  deleteCandidates: (
+    namespace: string,
+    candidateIds: string[],
+  ): Promise<CandidateDeleteResponse> =>
+    sendJSON('/learnings/candidates', 'DELETE', {
       namespace,
       candidate_ids: candidateIds,
     }),
