@@ -33,7 +33,6 @@ there is no ``--agent`` flag to verify after spawn, and no spec to refuse over.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -91,21 +90,23 @@ class DeepseekHarness(MembershipHarness):
         """
         from kiro_crew.acp import client as client_mod
         from kiro_crew.acp.session_handle import AcpRuntimeError
+        from kiro_crew.agent_sdk.backends import launch_for
 
-        deepseek_bin, search_path = await asyncio.to_thread(client_mod._resolve_deepseek_bin)
+        launch = launch_for(self.backend)
+        deepseek_bin, search_path = await client_mod._resolve_self_served_bin_cached(
+            self.backend
+        )
         if not isinstance(deepseek_bin, str) or not deepseek_bin:
             # The wording mirrors the client's own not-found message, so an
             # operator reads one instruction from either transport.
             raise AcpRuntimeError(
-                f"{client_mod.DEEPSEEK_BIN} not found "
+                f"{launch.binary} not found "
                 f"({client_mod.describe_search_path(search_path)}). Install it with "
-                f"'{client_mod.DEEPSEEK_INSTALL_COMMAND}', or set "
-                f"{client_mod._ENV_DEEPSEEK_BIN} to the executable. The ACP plugin "
-                f"package alone does not serve ACP: it is a plugin, and this binary "
-                f"is the host that boots the profile it lives in."
+                f"'{launch.install_command}', or set {launch.bin_env_var} to the "
+                f"executable. {launch.missing_hint}"
             )
         return SpawnPlan(
-            argv=[deepseek_bin, *client_mod.DEEPSEEK_ACP_PROFILE_ARGS],
+            argv=[deepseek_bin, *launch.acp_args],
             session_model=ctx.model or None,
         )
 

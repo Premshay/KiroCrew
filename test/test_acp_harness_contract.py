@@ -17,6 +17,7 @@ patched a local name would leave the real filesystem work running.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import inspect
 import json
@@ -364,9 +365,47 @@ async def test_a_missing_binary_aborts_the_spawn(monkeypatch, tmp_path, backend)
     # it to one family would leave the next host's spawn unasserted.
     monkeypatch.setattr(client_mod, "_resolve_codex_acp_bin", lambda: (None, "/nowhere"))
     monkeypatch.setattr(client_mod, "_resolve_claude_acp_bin", lambda: (None, "/nowhere"))
-    monkeypatch.setattr(client_mod, "_resolve_deepseek_bin", lambda: (None, "/nowhere"))
+    # The self-served family resolves through the cached module-level helper, so
+    # the cache is emptied too: a hit would answer with a real earlier verdict and
+    # the patch would never be reached.
+    monkeypatch.setattr(client_mod, "_self_served_bin_caches", {})
+    monkeypatch.setattr(
+        client_mod, "_resolve_self_served_bin", lambda _backend: (None, "/nowhere")
+    )
     with pytest.raises(AcpRuntimeError, match="not found"):
         await harness_for(backend).resolve_spawn(_ctx(tmp_path))
+
+
+def test_every_client_helper_a_harness_calls_exists():
+    """A harness reads the client module's own helpers, so a rename there must
+    fail HERE rather than at the first spawn.
+
+    The coupling is invisible by construction: a harness imports
+    ``kiro_crew.acp.client`` inside the method and calls ``client_mod.<helper>``,
+    which is an AttributeError only once that path runs -- and the stubs in this
+    file patch such names onto the module, so a test can create the very
+    attribute production lacks. Walking the harness sources keeps the two in step
+    without executing a spawn.
+    """
+    harness_dir = Path(inspect.getsourcefile(client_mod)).parent / "harness"
+    missing: list[str] = []
+    for path in sorted(harness_dir.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        aliases = {
+            alias.asname
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "kiro_crew.acp"
+            for alias in node.names
+            if alias.name == "client"
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+                continue
+            if node.value.id in aliases and not hasattr(client_mod, node.attr):
+                missing.append(f"{path.name}: client_mod.{node.attr}")
+    assert not missing, (
+        "a harness calls a helper the client module no longer defines: " + ", ".join(missing)
+    )
 
 
 def test_kiro_injects_the_api_key_and_kas_strips_it(monkeypatch):
