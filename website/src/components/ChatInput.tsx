@@ -1648,6 +1648,12 @@ function ChatInput({
   const [plusOpen, setPlusOpen] = useState(false)
   const [sketchOpen, setSketchOpen] = useState(false)
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false)
+  // Where the trigger was when the panel opened. The panel is portalled now, so
+  // it cannot anchor to its wrapper: the shelf is an `overflow-x-auto` scroller,
+  // and an absolutely-positioned child of a scroll container is clipped -- with
+  // the panel inside the shelf, tapping the context readout opened nothing. A
+  // viewport rect survives the portal.
+  const [ctxPopoverRect, setCtxPopoverRect] = useState<DOMRect | null>(null)
   // Per-session auto-compact threshold (slider in the context popover). The
   // debounce timer collapses a slider drag into one POST; the fetch itself is
   // the React Query below (declared after the shared queryClient), so the
@@ -1759,11 +1765,17 @@ function ChatInput({
   }, [voiceRecording, onVoiceCancel, onVoiceToggle])
 
   const ctxWrapRef = useRef<HTMLDivElement>(null)
+  // The portalled panel is outside `ctxWrapRef` in the DOM, so the outside-click
+  // test below has to know about it too -- otherwise a mousedown on the panel's
+  // own auto-compact slider reads as a click outside and closes it.
+  const ctxPanelRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!ctxPopoverOpen) return
     const handler = (e: MouseEvent) => {
-      if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node))
-        setCtxPopoverOpen(false)
+      const target = e.target as Node
+      const insideTrigger = !!ctxWrapRef.current?.contains(target)
+      const insidePanel = !!ctxPanelRef.current?.contains(target)
+      if (!insideTrigger && !insidePanel) setCtxPopoverOpen(false)
     }
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
@@ -6027,7 +6039,10 @@ function ChatInput({
                     <div ref={ctxWrapRef} className="relative flex items-center">
                       <button
                         className={`inline-flex items-center h-7 px-2.5 rounded-md transition-colors border-none cursor-pointer ${ctxPopoverOpen ? 'bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]' : 'bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]'}`}
-                        onClick={() => setCtxPopoverOpen((o) => !o)}
+                        onClick={(e) => {
+                          setCtxPopoverRect(e.currentTarget.getBoundingClientRect())
+                          setCtxPopoverOpen((o) => !o)
+                        }}
                         title={
                           hasKnownWindow
                             ? contextTip(contextPct)
@@ -6050,8 +6065,23 @@ function ChatInput({
                           </span>
                         )}
                       </button>
-                      {ctxPopoverOpen && (
-                        <div className="absolute bottom-full right-0 mb-1 z-[60] w-52 rounded-xl border border-border bg-bg-elevated shadow-xl p-3 animate-slide-up">
+                      {ctxPopoverOpen &&
+                        ctxPopoverRect &&
+                        createPortal(
+                          <div
+                            ref={ctxPanelRef}
+                            className="fixed z-[60] w-52 rounded-xl border border-border bg-bg-elevated shadow-xl p-3 animate-slide-up"
+                            style={{
+                              left: Math.max(
+                                8,
+                                Math.min(
+                                  ctxPopoverRect.right - 208,
+                                  window.innerWidth - 208 - 8,
+                                ),
+                              ),
+                              bottom: window.innerHeight - ctxPopoverRect.top + 4,
+                            }}
+                          >
                           <div className="flex items-center justify-between mb-2">
                             <span className="text-[11px] font-semibold text-text">
                               {hasKnownWindow
@@ -6175,8 +6205,9 @@ function ChatInput({
                               )}
                             </div>
                           )}
-                        </div>
-                      )}
+                          </div>,
+                          document.body,
+                        )}
                     </div>
                   )
                 })()}
@@ -6209,12 +6240,11 @@ function ChatInput({
                           })
                   }
                 >
-                  {/* The 180px cap is a desktop budget. On a compact shelf a long
-                      provider-prefixed id claims most of the row and squeezes the
-                      agent/project/badge group down to the widths where its
-                      `shrink-0` glyphs used to bleed over the context readout, so
-                      the cap follows the shelf instead of the other way round. */}
-                  <span className={`truncate ${shelfCompact ? 'max-w-[96px]' : 'max-w-[180px]'}`}>{modelName}</span>
+                  {/* The full id, uncapped: the shelf scrolls now, so a long
+                      provider-prefixed name costs a scroll instead of a squeeze.
+                      Truncation was only ever a workaround for a row that had
+                      nowhere to put the overflow. */}
+                  <span className="whitespace-nowrap">{modelName}</span>
                   {modelIsInheritedDefault && (
                     // Outside the truncating span: a long provider-prefixed id must
                     // ellipsize its own tail, never the marker that tells a served
