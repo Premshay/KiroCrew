@@ -36,6 +36,7 @@ from chat_test_helpers import _make_ready_kiro_prerequisite
 from member_memory_helpers import patch_private_memory_supported
 
 from kiro_crew import name_grant
+from kiro_crew.acp.client import ClaudeAutonomousTurn
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -1530,6 +1531,43 @@ class TestPersistClaudeAutonomousTurn:
         assert [message["content"] for message in slot.messages] == ["Routine complete."]
         assert slot.messages[0]["meta"]["mid"] == "m-claude-msg-routine"
         assert save.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_accepts_the_namespaced_owner_key_for_its_own_slot(self, tmp_path):
+        """The turn carries the ACP session key; the slot key is the bare name.
+
+        Comparing them raw makes a session's own background delivery look like
+        another slot's, so the reply was dropped and its tab kept waiting.
+        """
+        state, slot = _state(tmp_path), _slot()
+        turn = ClaudeAutonomousTurn(
+            text="Background reply.",
+            origin="task-notification",
+            timestamp="2026-08-28T00:00:00Z",
+            message_id="msg-owned",
+            session_key=f"dashboard:{slot.key}",
+        )
+
+        with patch.object(chat_runner, "save_slot_off_loop", new_callable=AsyncMock):
+            await chat_runner._persist_claude_autonomous_turn(state, slot, turn)
+
+        assert [message["content"] for message in slot.messages] == ["Background reply."]
+
+    @pytest.mark.asyncio
+    async def test_still_rejects_a_turn_owned_by_another_slot(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        turn = ClaudeAutonomousTurn(
+            text="Another tab's reply.",
+            origin="task-notification",
+            timestamp="2026-08-28T00:00:00Z",
+            message_id="msg-other",
+            session_key="dashboard:chat-some-other-slot",
+        )
+
+        with patch.object(chat_runner, "save_slot_off_loop", new_callable=AsyncMock):
+            await chat_runner._persist_claude_autonomous_turn(state, slot, turn)
+
+        assert slot.messages == []
 
     @pytest.mark.asyncio
     async def test_redacts_autonomous_text_before_persisting(self, tmp_path):

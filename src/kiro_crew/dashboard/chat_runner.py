@@ -4895,6 +4895,31 @@ async def _render_claude_idle_event(
         logger.warning("idle row render failed for slot %s", slot.key, exc_info=True)
 
 
+def _autonomous_owner_is_slot(session_key: str, slot_key: str) -> bool:
+    """True when a Claude autonomous turn belongs to *slot_key*.
+
+    ``ClaudeAutonomousTurn.session_key`` carries the ACP session key, captured
+    while the native cycle ran, and that key is the NAMESPACED dashboard key
+    (``dashboard:chat-...``); ``ChatSlot.key`` is the bare slot name. Comparing
+    the two directly makes every autonomous turn look like it arrived from
+    another slot, so a session's own background delivery was rejected and the
+    reply never reached its tab.
+
+    Accept either spelling. The prefix is the only difference, and stripping it
+    here does not depend on the live surface registry the way
+    ``dashboard_slot_key`` does -- the owner can be checked while no tab is
+    currently attached.
+    """
+    if not session_key:
+        return True
+    if session_key == slot_key:
+        return True
+    for prefix in ("dashboard:", "dashboard_"):
+        if session_key.startswith(prefix) and session_key[len(prefix) :] == slot_key:
+            return True
+    return False
+
+
 async def _persist_claude_autonomous_turn(
     state: DashboardState,
     slot: _ChatSlot,
@@ -4907,7 +4932,7 @@ async def _persist_claude_autonomous_turn(
     use it as the durable delivery id and retry the same row after a failed
     save instead of folding its text into whichever prompt happens next.
     """
-    if turn.session_key and turn.session_key != slot.key:
+    if not _autonomous_owner_is_slot(turn.session_key, slot.key):
         logger.error(
             "Rejected Claude autonomous turn for another dashboard slot "
             "(turn_owner=%s, target_slot=%s, origin=%s)",
