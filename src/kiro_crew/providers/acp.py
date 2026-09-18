@@ -638,7 +638,9 @@ class AcpProvider(LLMProvider):
         dashboard reads as "this crew cannot take images" and warns about, rather
         than letting the whole prompt be rejected by the harness.
         """
-        return bool(getattr(self._client, "supports_image_prompt", False))
+        # Passed through unchanged: ``None`` means a live model switch made the
+        # capability unknown, which the composer reads as "do not warn".
+        return getattr(self._client, "supports_image_prompt", False)
 
     @property
     def is_session_sharing_eligible(self) -> bool:

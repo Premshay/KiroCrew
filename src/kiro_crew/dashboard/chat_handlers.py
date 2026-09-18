@@ -7360,6 +7360,13 @@ async def _try_live_model_switch(
         return False
     try:
         await provider.client.set_model(wire)
+        # The image capability was negotiated for the model this session
+        # opened on. The switch has landed, so that answer now describes a
+        # model the session no longer runs: mark it unknown and let the next
+        # send try the image, falling back to the path as text if refused.
+        _note_model_changed = getattr(provider.client, "note_model_changed", None)
+        if callable(_note_model_changed):
+            _note_model_changed()
     except AcpModelUnavailable:
         # NOT a "the call didn't land" failure, so the reset fallback below is
         # the wrong recovery: it would tear down the live conversation and then

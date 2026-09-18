@@ -4511,6 +4511,27 @@ async def _run_preflight_bounded(
             "once the disk responds."
         ) from None
 
+def _blocks_carry_an_image(blocks: Any) -> bool:
+    """Whether a built prompt carries an inline image block."""
+    return any(
+        isinstance(block, dict) and block.get("type") == "image"
+        for block in (blocks or ())
+    )
+
+
+def _is_image_refusal(message: str) -> bool:
+    """Whether an error is the harness refusing the image, not the turn.
+
+    Both spellings are in the field: a backend that advertises once answers
+    "not advertised by this connection", and one that resolves the model per
+    prompt answers "does not declare image input". Anything else propagates.
+    """
+    lowered = message.lower()
+    return (
+        "not advertised by this connection" in lowered
+        or "does not declare image input" in lowered
+    )
+
 
 class AcpClient:
     """JSON-RPC 2.0 client over stdio with kiro-cli acp."""
@@ -4649,6 +4670,10 @@ class AcpClient:
         # just the image, so the prompt path reads this instead of assuming.
         # Empty until the handshake, cleared on reset so a respawn re-reads it.
         self._prompt_capabilities: dict[str, Any] = {}
+        # True once a live switch has replaced the model these answers were
+        # negotiated for, which makes the capability UNKNOWN rather than
+        # false: the harness described the model the session no longer runs.
+        self._prompt_capability_stale: bool = False
         # The mirror's CLIENT OBLIGATION from the same spec parse as the array
         # (``SessionProjection.denied_tools``): ``(server, tool)`` pairs the spec
         # switched off that the backend cannot refuse on the wire, so this client
@@ -5004,15 +5029,29 @@ class AcpClient:
         return list(self._available_commands)
 
     @property
-    def supports_image_prompt(self) -> bool:
-        """True when the harness advertised ``promptCapabilities.image``.
+    def supports_image_prompt(self) -> bool | None:
+        """Whether this connection advertised ``promptCapabilities.image``.
 
-        Fails closed: an un-handshaked or silent backend reports False, so the
-        prompt path sends text only instead of an image block the agent rejects
-        whole. ``AcpRuntime`` answers the same question from the same field; the
-        two transports must not disagree about what a session can carry.
+        ``True``/``False`` are the handshake's answer. ``None`` means a live
+        model switch invalidated it: the capability belongs to the model the
+        session was opened on, and the harness re-negotiates nothing
+        mid-connection. Unknown is not a refusal -- the send path tries the
+        image and falls back to the path as text if the harness refuses it.
+
+        Still fails closed before the handshake: no answer at all is False, so
+        a backend that never handshaked is never sent an image block.
         """
+        if self._prompt_capability_stale:
+            return None
         return bool(self._prompt_capabilities.get("image", False))
+
+    def note_model_changed(self) -> None:
+        """Forget the capability negotiated for the model just replaced.
+
+        The harness advertised for the model it handshook on and does not
+        re-advertise, so the old answer is evidence about neither.
+        """
+        self._prompt_capability_stale = True
 
     @property
     def agent_version(self) -> str:
@@ -9020,6 +9059,7 @@ class AcpClient:
         self._mcp_ref_spec = None
         self._agent_mcp_capabilities = {}
         self._prompt_capabilities = {}
+        self._prompt_capability_stale = False
         self._spec_denied_tools = frozenset()
         # Save PIDs before clearing state — needed for untracking
         saved_pid = self._pid
@@ -11781,20 +11821,42 @@ class AcpClient:
 
     async def _send_prompt(self, message: str) -> int:
         # Shared with AcpSessionHandle.prompt via prompt_blocks so the two paths
-        # cannot drift -- which means gating on the SAME advertised capability:
-        # an image block sent to a harness that never advertised image input is
-        # rejected whole, so the path stays in the text for a tool to open.
-        return await self._send_request(
-            METHOD_PROMPT,
-            {
-                "sessionId": self._session_id,
-                # Offloaded: see the note in session_handle.prompt -- image
-                # reads and base64 encoding must not block the event loop.
-                "prompt": await asyncio.to_thread(
-                    build_prompt_blocks, message, allow_image=self.supports_image_prompt
-                ),
-            },
-        )
+        # cannot drift -- which means gating on the SAME capability: only a known
+        # ``False`` keeps the path in the text. ``None`` (the session switched
+        # away from the model that was advertised for) tries the image, because
+        # the harness answering for the CURRENT model is the only authority.
+        allow_image = self.supports_image_prompt is not False
+        # Offloaded: see the note in session_handle.prompt -- image reads and
+        # base64 encoding must not block the event loop.
+        blocks = await asyncio.to_thread(build_prompt_blocks, message, allow_image=allow_image)
+        try:
+            return await self._send_request(
+                METHOD_PROMPT, {"sessionId": self._session_id, "prompt": blocks}
+            )
+        except Exception as exc:
+            # A refusal of the IMAGE is not a refusal of the turn: a harness that
+            # cannot take the block rejects the whole prompt, and the documented
+            # fallback leaves the path in the message as text so a tool-capable
+            # agent can still open the file. Recalled here rather than surfaced,
+            # and remembered so the next turn does not repeat it.
+            if (
+                not allow_image
+                or not _blocks_carry_an_image(blocks)
+                or not _is_image_refusal(str(exc))
+            ):
+                raise
+            self._prompt_capabilities = {"image": False}
+            self._prompt_capability_stale = False
+            logger.info("acp: image prompt refused by this connection; resending as text")
+            return await self._send_request(
+                METHOD_PROMPT,
+                {
+                    "sessionId": self._session_id,
+                    "prompt": await asyncio.to_thread(
+                        build_prompt_blocks, message, allow_image=False
+                    ),
+                },
+            )
 
     async def _read_prompt_response(self, req_id: int, timeout: float) -> str:
         output: list[str] = []

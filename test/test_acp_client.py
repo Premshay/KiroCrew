@@ -13702,3 +13702,85 @@ class TestImagePromptCapability:
         monkeypatch.setattr(client, "_send_request", _fake_send)
         await client._send_prompt("look at /tmp/shot.png")
         assert seen["allow_image"] is True
+
+    def test_a_model_switch_makes_the_capability_unknown(self, tmp_path):
+        """The answer belongs to the model the session handshook on.
+
+        After a live switch the harness has advertised for a model the session
+        no longer runs, and it re-negotiates nothing mid-connection, so the old
+        answer is evidence about neither. Unknown is not a refusal.
+        """
+        client = self._client(tmp_path, {"image": False})
+        assert client.supports_image_prompt is False
+        client.note_model_changed()
+        assert client.supports_image_prompt is None
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_capability_tries_the_image(self, tmp_path, monkeypatch):
+        seen = {}
+
+        def _fake_build(message, *, allow_image=True, **kwargs):
+            seen["allow_image"] = allow_image
+            return [{"type": "image"}, {"type": "text", "text": message}]
+
+        monkeypatch.setattr(acp_client, "build_prompt_blocks", _fake_build)
+        client = self._client(tmp_path, {"image": False})
+        client.note_model_changed()
+
+        async def _fake_send(method, params, **kwargs):
+            return 1
+
+        monkeypatch.setattr(client, "_send_request", _fake_send)
+        await client._send_prompt("look at /tmp/shot.png")
+        assert seen["allow_image"] is True
+
+    @pytest.mark.asyncio
+    async def test_an_image_refusal_is_retried_as_text(self, tmp_path, monkeypatch):
+        """Recalled, not surfaced: the turn survives and the agent gets the path."""
+        calls = []
+
+        def _fake_build(message, *, allow_image=True, **kwargs):
+            if allow_image:
+                return [{"type": "image"}, {"type": "text", "text": message}]
+            return [{"type": "text", "text": message}]
+
+        monkeypatch.setattr(acp_client, "build_prompt_blocks", _fake_build)
+        client = self._client(tmp_path, {"image": False})
+        client.note_model_changed()
+
+        async def _fake_send(method, params, **kwargs):
+            calls.append(params["prompt"])
+            if len(calls) == 1:
+                raise acp_client.AcpError(
+                    "Invalid params: inline image prompts were not advertised"
+                    " by this connection"
+                )
+            return 2
+
+        monkeypatch.setattr(client, "_send_request", _fake_send)
+        assert await client._send_prompt("look at /tmp/shot.png") == 2
+        assert [block["type"] for block in calls[1]] == ["text"]
+        assert client._prompt_capabilities == {"image": False}
+        assert client.supports_image_prompt is False
+
+    @pytest.mark.asyncio
+    async def test_a_failure_that_is_not_about_the_image_is_not_retried(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+
+        def _fake_build(message, *, allow_image=True, **kwargs):
+            return [{"type": "text", "text": message}]
+
+        monkeypatch.setattr(acp_client, "build_prompt_blocks", _fake_build)
+        client = self._client(tmp_path, {"image": False})
+        client.note_model_changed()
+
+        async def _fake_send(method, params, **kwargs):
+            calls.append(params)
+            raise acp_client.AcpError("transport closed")
+
+        monkeypatch.setattr(client, "_send_request", _fake_send)
+        with pytest.raises(acp_client.AcpError):
+            await client._send_prompt("hello")
+        assert len(calls) == 1

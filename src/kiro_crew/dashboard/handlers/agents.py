@@ -4160,7 +4160,10 @@ async def _discover_agent_models(state: DashboardState, name: str) -> dict[str, 
         )
         available = await provider.discover_models()
         efforts = getattr(provider, "get_valid_effort_levels", lambda: [])()
-        supports_images = bool(getattr(provider, "supports_image_prompt", False))
+        # None (unknown, after a model switch) must survive as None: the
+        # composer warns only on an explicit False.
+        _images = getattr(provider, "supports_image_prompt", False)
+        supports_images = _images if isinstance(_images, bool) else None
         configured_models = acp_model_config_options(getattr(provider, "acp_config_options", []))
         if configured_models:
             available = configured_models
