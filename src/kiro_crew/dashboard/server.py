@@ -806,6 +806,21 @@ _MIXED_INTERNAL_API_PATHS = frozenset(
         # anything holding the internal secret. This route is local-only triage
         # state — no forge write, no shared ledger.
         "/api/apps/issue-radar/investigation",
+        # Code Review Sage, reached by the ``code_review_sage_api`` MCP tool. Its
+        # routes are same-origin authed, so the internal secret is the only way an
+        # agent session can call them: a sandboxed seat cannot mint the owner token
+        # they expect, because host provenance is proved by namespace identity and a
+        # seat's own sandbox makes that undeterminable.
+        # ``/review`` admits the kickoff alone -- ``/review-repo`` is excluded, since
+        # this matcher needs a "/" after the prefix. ``/runs`` DOES carry its
+        # sub-routes: ``{run_id}`` and ``/report``, and with them ``/cancel``,
+        # ``/archive`` and ``/post``, which the tool's own allowlist refuses. The
+        # transport admits one notch more than the tool exposes; stated here rather
+        # than hidden, because that gap is the price of admitting the per-run reads
+        # at all. Settings, repository configuration, ``namespaces``, ``learnings``,
+        # ``followup`` and ``chat`` stay unreachable.
+        "/api/apps/code-review-sage/review",
+        "/api/apps/code-review-sage/runs",
         # Ops Mission Control agent surface — the routes the app's SOP-driven
         # crons and investigation slots call through the ``ops_mission_control_api``
         # MCP tool (the app's ONLY credentialed agent path; same trust model as

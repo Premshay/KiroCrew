@@ -84,3 +84,33 @@ def test_handler_refuses_before_it_reaches_the_app(monkeypatch: pytest.MonkeyPat
 def test_the_tool_is_advertised_and_schema_validated() -> None:
     assert "code_review_sage_api" in [t["name"] for t in apps.schemas()]
     assert MCP_CORE_SCHEMAS["code_review_sage_api"] is CODE_REVIEW_SAGE_API_SCHEMA
+
+
+def test_the_gateway_admits_exactly_the_bridge_paths() -> None:
+    """The internal-secret handshake is per-path, so the bridge needs its own.
+
+    Without these entries the gateway answers 403 ``Token required`` before the
+    request ever reaches the app -- which is what the first live run returned.
+    """
+
+    from kiro_crew.dashboard.server import (
+        _MIXED_INTERNAL_API_PATHS,
+        _STRICT_INTERNAL_API_PATHS,
+    )
+
+    admitted = _MIXED_INTERNAL_API_PATHS | _STRICT_INTERNAL_API_PATHS
+
+    def reachable(path: str) -> bool:
+        # server.py matches exact-or-prefix: path == p or path.startswith(p + "/")
+        return any(path == p or path.startswith(p + "/") for p in admitted)
+
+    assert reachable("/api/apps/code-review-sage/review")
+    assert reachable("/api/apps/code-review-sage/runs")
+    assert reachable("/api/apps/code-review-sage/runs/0af7e5c68b85")
+    assert reachable("/api/apps/code-review-sage/runs/0af7e5c68b85/report")
+    # Off-surface routes must stay unreachable: configuration, repository
+    # management, and the variant kickoff the tool deliberately does not expose.
+    assert not reachable("/api/apps/code-review-sage/settings")
+    assert not reachable("/api/apps/code-review-sage/repos")
+    assert not reachable("/api/apps/code-review-sage/review-repo")
+    assert not reachable("/api/apps/code-review-sage/namespaces")
