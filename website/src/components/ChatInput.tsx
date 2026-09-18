@@ -6201,7 +6201,12 @@ function ChatInput({
                           })
                   }
                 >
-                  <span className="truncate max-w-[180px]">{modelName}</span>
+                  {/* The 180px cap is a desktop budget. On a compact shelf a long
+                      provider-prefixed id claims most of the row and squeezes the
+                      agent/project/badge group down to the widths where its
+                      `shrink-0` glyphs used to bleed over the context readout, so
+                      the cap follows the shelf instead of the other way round. */}
+                  <span className={`truncate ${shelfCompact ? 'max-w-[96px]' : 'max-w-[180px]'}`}>{modelName}</span>
                   {modelIsInheritedDefault && (
                     // Outside the truncating span: a long provider-prefixed id must
                     // ellipsize its own tail, never the marker that tells a served
