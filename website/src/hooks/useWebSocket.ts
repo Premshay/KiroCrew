@@ -329,10 +329,6 @@ const CHUNK_BUF_FLUSH_CHARS = 50_000
  *  threshold is asserted rather than guessed at in the spec. */
 export const ROW_STALL_MS = 100_000
 export const ROW_STALL_TICK_MS = 15_000
-/** Ticks between server cross-checks while the client believes the slot is
- *  IDLE (see the watchdog). Every tick would be one GET per 15s; every fourth
- *  is one per minute, which is the cadence the missed-turn case needs. */
-export const ROW_STALL_PROBE_EVERY = 4
 
 export function useWebSocket() {
   const dispatch = useAppDispatch()
@@ -2668,6 +2664,16 @@ export function useWebSocket() {
     reconnectTimerRef.current = setTimeout(connect, 0)
   }, [connect])
 
+  /* The watchdog's escalation target. `forceReconnect` depends on `connect` and
+   * so on the whole socket setup, while the watchdog's interval must keep one
+   * progress stamp across renders: taking the callback through a ref keeps a
+   * new identity from restarting the interval and resetting that stamp, which
+   * a re-created callback would do often enough that the 100s rule never fires. */
+  const forceReconnectRef = useRef(forceReconnect)
+  useEffect(() => {
+    forceReconnectRef.current = forceReconnect
+  }, [forceReconnect])
+
   /* Row-delivery watchdog.
    *
    * A dropped socket already has two owners: the reconnect handler above
@@ -2691,38 +2697,24 @@ export function useWebSocket() {
    *
    * ROW_STALL_MS sits above the longest legitimate silence inside a working
    * turn (about 100s between tool rows on a slow agent). A false positive costs
-   * one GET and one no-op merge -- never a lost row.
+   * one GET and one no-op merge -- never a lost row. The steady state costs
+   * nothing: a tick reads app state and issues no request unless a slot this
+   * client believes is running has gone ROW_STALL_MS without progress.
+   *
+   * Scope, deliberately: this watches the slot THIS client believes is running.
+   * A client whose belief is wrong -- a turn started on another device whose run
+   * frame was lost, so the slot looks idle here -- is NOT covered: nothing
+   * re-checks a slot this client believes idle, and the socket carries no
+   * timer-driven liveness signal to hang that check on. Covering it from here
+   * would cost a steady slots GET per visible tab to guard a case no report has
+   * produced. The successor is a per-connection keepalive frame, which gives
+   * every frame family one clock to test silence against instead of a poll per
+   * belief.
    */
   useEffect(() => {
     let rows = -1
     let tail = -1
     let stampedAt = Date.now()
-    let ticks = 0
-    /* Whether the SERVER last said this slot is running. Every local signal
-     * dies with the transport, so a turn started on another device whose run
-     * frame was lost leaves this client believing the slot is idle -- and the
-     * client that believes a slot is idle never arms the watchdog above, which
-     * is the one case a reload-only recovery would otherwise be permanent. */
-    let serverRunning = false
-    const probeServerRunning = (key: string) => {
-      // Promise.resolve: a stubbed client in a test may hand back a plain
-      // value, and the tick must never throw inside a timer callback.
-      void Promise.resolve(api.chatSlots())
-        .then((payload: unknown) => {
-          const list = Array.isArray(payload)
-            ? payload
-            : ((payload as { slots?: unknown[] } | null)?.slots ?? [])
-          const row = (list as Array<{ key?: string; running?: boolean }>).find(
-            (s) => s?.key === key,
-          )
-          // Absent means the slot is gone or the payload moved on: keep the
-          // watchdog disarmed rather than arming it on a stale belief.
-          serverRunning = !!row?.running
-        })
-        .catch(() => {
-          /* transient: the next probe asks again */
-        })
-    }
     const id = setInterval(() => {
       const chat = appStore.getState().chat
       const msgs = chat.messages
@@ -2737,29 +2729,49 @@ export function useWebSocket() {
         return
       }
       const believesRunning = chat.slotRunning || chat.slotState !== 'idle'
-      /* Cross-check only when the client believes NOTHING is running: that is
-       * the blind spot. While it believes a turn is running, a probe would
-       * only re-fetch what the 100s rule already governs. Visible tabs only --
-       * a hidden tab has no reader to heal, and the visibility return forces a
-       * reconnect that reconciles anyway. The probe never heals by itself: it
-       * can only arm the same no-progress rule, so a healthy turn cannot cause
-       * a rebuild. */
-      if (
-        !believesRunning &&
-        chat.activeSlot &&
-        document.visibilityState === 'visible' &&
-        ++ticks % ROW_STALL_PROBE_EVERY === 0
-      ) {
-        probeServerRunning(chat.activeSlot)
-      }
-      if (!chat.activeSlot || !(believesRunning || serverRunning)) {
+      if (!chat.activeSlot || !believesRunning) {
         stampedAt = Date.now()
         return
       }
       if (Date.now() - stampedAt < ROW_STALL_MS) return
       stampedAt = Date.now()
-      serverRunning = false
-      dispatch(refreshSlot(chat.activeSlot))
+      const slot = chat.activeSlot
+      /* What this client held when the stall was declared. A returned page that
+       * carries a durable row outside this set is proof the socket missed
+       * deliveries rather than the turn being slow: the server produced rows
+       * while the transcript sat still, over a socket that never closed.
+       * `meta.mid` identifies the server's own rows; client-only rows have none
+       * and prove nothing. */
+      const held = new Set<string>()
+      for (const row of msgs) {
+        // `meta.mid` is typed `unknown` on the row, so the string test is what
+        // makes it a usable set key -- and a row whose mid is not a string
+        // proves nothing about what the socket delivered.
+        const mid = row?.meta?.mid
+        if (typeof mid === 'string' && mid) held.add(mid)
+      }
+      void dispatch(refreshSlot(slot))
+        .unwrap()
+        .then((page) => {
+          const rows = page?.messages ?? []
+          const missed = rows.some((row) => {
+            const mid = row?.meta?.mid
+            return typeof mid === 'string' && !!mid && !held.has(mid)
+          })
+          if (!missed) return
+          /* Escalate to a reconnect: its catch-up re-reads every frame family
+           * this socket carries (slots, notifications, approvals, questions,
+           * workflow runs, artifacts, member threads), which is what the frozen
+           * sidebar and badges need -- this slot's rows were only the visible
+           * symptom. Gated on the proof above, so a turn that is merely slow
+           * -- the likelier reading of 100s of silence -- never pays for a
+           * socket teardown, which discards buffered partial chunks. */
+          forceReconnectRef.current()
+        })
+        .catch(() => {
+          /* A failed GET proves nothing about the socket; the next stall tick
+           * asks again, and the rows path reports its own failures. */
+        })
     }, ROW_STALL_TICK_MS)
     return () => clearInterval(id)
   }, [dispatch, appStore])

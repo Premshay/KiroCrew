@@ -8,12 +8,7 @@ import { createElement, type ReactNode } from 'react'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
-import {
-  useWebSocket,
-  ROW_STALL_MS,
-  ROW_STALL_TICK_MS,
-  ROW_STALL_PROBE_EVERY,
-} from '../hooks/useWebSocket'
+import { useWebSocket, ROW_STALL_MS, ROW_STALL_TICK_MS } from '../hooks/useWebSocket'
 import { api } from '../api/client'
 import chatReducer from '../store/chatSlice'
 
@@ -29,6 +24,8 @@ vi.mock('../api/client', () => ({
   },
 }))
 
+const WS_INSTANCES: MockWebSocket[] = []
+
 class MockWebSocket {
   static OPEN = 1
   static CONNECTING = 0
@@ -39,6 +36,10 @@ class MockWebSocket {
   onerror: ((ev: Event) => void) | null = null
   send = vi.fn()
   close = vi.fn()
+
+  constructor() {
+    WS_INSTANCES.push(this)
+  }
 }
 
 describe('row-delivery stall watchdog', () => {
@@ -47,6 +48,7 @@ describe('row-delivery stall watchdog', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.stubGlobal('WebSocket', MockWebSocket)
+    WS_INSTANCES.length = 0
     testStore = createTestStore({
       chat: { ...chatReducer(undefined, { type: '@@INIT' }), activeSlot: 'chat-active' },
     })
@@ -67,6 +69,8 @@ describe('row-delivery stall watchdog', () => {
   }
 
   const detailCalls = () => vi.mocked(api.chatSlotDetail).mock.calls.length
+  // A reconnect constructs a new socket, so the count is the observable for it.
+  const socketCount = () => WS_INSTANCES.length
 
   it('re-hydrates the active slot when a running turn stops delivering rows', async () => {
     // Upstream has no `startRemoteTurn` reducer; the plain running setter is
@@ -88,49 +92,12 @@ describe('row-delivery stall watchdog', () => {
     unmount()
   })
 
-  it('arms from the server when this client believes the slot is idle', async () => {
-    // The client has no idea a turn is running: no run frame ever arrived.
-    expect(testStore.getState().chat.slotRunning).toBe(false)
-    vi.mocked(api.chatSlots).mockResolvedValue([
-      { key: 'chat-active', running: true, last_ts: '2026-09-18T03:00:00Z' },
-    ])
-
-    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
-    // The first tick only stamps progress; the probe then lands on the fourth
-    // tick after it, so allow one extra.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(ROW_STALL_TICK_MS * (ROW_STALL_PROBE_EVERY + 1))
-    })
-    expect(api.chatSlots).toHaveBeenCalled()
-    const before = detailCalls()
-
-    // The server says a turn is running and no row has moved: heal.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(ROW_STALL_MS + ROW_STALL_TICK_MS * 2)
-    })
-
-    expect(detailCalls()).toBeGreaterThan(before)
-    unmount()
-  })
-
-  it('stays quiet when the server agrees nothing is running', async () => {
-    vi.mocked(api.chatSlots).mockResolvedValue([{ key: 'chat-active', running: false }])
-
-    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(ROW_STALL_TICK_MS * ROW_STALL_PROBE_EVERY)
-    })
-    const before = detailCalls()
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(ROW_STALL_MS * 3)
-    })
-
-    expect(detailCalls()).toBe(before)
-    unmount()
-  })
-
-  it('leaves an idle slot alone however long its rows sit still', async () => {
+  it('leaves an idle slot alone, and asks the server nothing, however long its rows sit still', async () => {
+    /* The watchdog's steady state must cost nothing: its tick reads app state
+     * and issues no request at all unless a slot it believes is RUNNING has
+     * stopped moving. A slot this client believes idle is not its business --
+     * re-checking that belief needs a server round trip per visible tab, which
+     * this fix deliberately does not charge. */
     const { unmount } = renderHook(() => useWebSocket(), { wrapper })
     await act(async () => {
       await vi.advanceTimersByTimeAsync(ROW_STALL_TICK_MS * 2)
@@ -142,6 +109,64 @@ describe('row-delivery stall watchdog', () => {
     })
 
     expect(detailCalls()).toBe(before)
+    expect(api.chatSlots).not.toHaveBeenCalled()
+    unmount()
+  })
+
+  it('reconnects once a refresh proves the socket missed rows', async () => {
+    /* The page came back over HTTP carrying a durable row this client never
+     * held while the turn is still believed running: the socket is the broken
+     * half, so the recovery escalates to the reconnect whose catch-up re-reads
+     * every frame family, not this slot's rows alone. */
+    testStore.dispatch({ type: 'chat/setSlotRunning', payload: true })
+    vi.mocked(api.chatSlotDetail).mockResolvedValue({
+      messages: [
+        { id: 'srv-1', role: 'assistant', content: 'row the socket missed', meta: { mid: 'm-1' } },
+      ],
+      running: true,
+      has_more: false,
+      total: 1,
+      queue: [],
+    })
+    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_TICK_MS)
+    })
+    const before = socketCount()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_MS + ROW_STALL_TICK_MS * 2)
+    })
+
+    expect(detailCalls()).toBeGreaterThan(0)
+    expect(socketCount()).toBeGreaterThan(before)
+    unmount()
+  })
+
+  it('does not reconnect when the refresh returns nothing this client lacked', async () => {
+    /* A slow turn is the ordinary reading of 100s of silence, and a teardown
+     * there would discard buffered partial chunks for nothing. With no row the
+     * client never held there is no proof, so the cheap re-fetch stands alone. */
+    testStore.dispatch({ type: 'chat/setSlotRunning', payload: true })
+    vi.mocked(api.chatSlotDetail).mockResolvedValue({
+      messages: [],
+      running: true,
+      has_more: false,
+      total: 0,
+      queue: [],
+    })
+    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_TICK_MS)
+    })
+    const before = socketCount()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_MS + ROW_STALL_TICK_MS * 2)
+    })
+
+    expect(detailCalls()).toBeGreaterThan(0)
+    expect(socketCount()).toBe(before)
     unmount()
   })
 })
