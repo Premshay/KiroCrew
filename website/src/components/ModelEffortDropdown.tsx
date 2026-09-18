@@ -7,6 +7,7 @@ import ReasoningEffortDropdown from './ReasoningEffortDropdown'
 
 import { useImeGuard } from '../hooks/useImeGuard'
 import { i18nT } from '../i18n/t'
+import { modelLabel } from '../lib/model'
 
 interface Props {
   anchorRect: DOMRect
@@ -245,7 +246,7 @@ export default function ModelEffortDropdown({
                   {pinModelUnavailable
                     ? <Trans
                         i18nKey="components.modelEffortDropdown.pin_model_unavailable"
-                        components={{ model: <span className="font-mono">{pinModelName}</span> }}
+                        components={{ model: <span className="font-mono">{modelLabel(pinModelName, models)}</span> }}
                       />
                     : pinnedToAgent
                     ? <Trans
@@ -255,7 +256,7 @@ export default function ModelEffortDropdown({
                     : <Trans
                         i18nKey="components.modelEffortDropdown.set_default_for_agent"
                         components={{
-                          model: <span className="font-mono">{pinModelName}</span>,
+                          model: <span className="font-mono">{modelLabel(pinModelName, models)}</span>,
                           agent: <span className="font-mono">{agentName}</span>,
                         }}
                       />}
