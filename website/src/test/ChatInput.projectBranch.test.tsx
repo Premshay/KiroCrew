@@ -172,3 +172,45 @@ describe('ChatInput project chip branch copy', () => {
     await waitFor(() => expect(writeText).toHaveBeenCalledWith('feat/example'))
   })
 })
+
+describe('ChatInput project chip on a phone-width shelf', () => {
+  // Below 420px the shelf collapses its labels to icon-only. The BRANCH is the
+  // segment that has to survive that: the picker and the chip's own title both
+  // name the folder, while a touch device cannot hover a title to reach the
+  // branch and the Git panel is a tap away -- so shedding the branch leaves the
+  // session's git context with no surface at all.
+  class NarrowShelfObserver {
+    constructor(private readonly cb: ResizeObserverCallback) {}
+    observe(el: Element) {
+      // 364px is what a 390px phone leaves the shelf row.
+      this.cb(
+        [{ target: el, contentRect: { width: 364 } } as unknown as ResizeObserverEntry],
+        this as unknown as ResizeObserver,
+      )
+    }
+    disconnect() {}
+    unobserve() {}
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal('ResizeObserver', NarrowShelfObserver)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('keeps the branch visible when the shelf sheds its labels', () => {
+    renderWithProviders(<ChatInput {...defaultProps} projectBranch="feat/example" />)
+    expect(branchBtn()).toHaveTextContent('feat/example')
+    // The folder name is what sheds, and its separator goes with it.
+    expect(chip()).not.toHaveTextContent('KiroCrew')
+    expect(chip().textContent).not.toContain('·')
+  })
+
+  it('still names the folder in the title when the label sheds', () => {
+    renderWithProviders(<ChatInput {...defaultProps} projectBranch="feat/example" />)
+    expect(chip().getAttribute('title')).toContain('/home/u/work/KiroCrew')
+    expect(chip().getAttribute('title')).toContain('Branch: feat/example')
+  })
+})
