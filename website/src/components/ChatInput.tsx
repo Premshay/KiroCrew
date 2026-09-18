@@ -1672,9 +1672,12 @@ function ChatInput({
     ro.observe(el)
     shelfRoRef.current = ro
   }, [])
-  // Below ~340px the labels no longer fit comfortably alongside the context bar
-  // + model chip, so collapse the chips (agent/project) to icon-only.
-  const shelfCompact = shelfWidth < 340
+  // The labels no longer fit alongside the context bar, the model chip AND the
+  // working-tree badge, so collapse the chips (agent/project) to icon-only. The
+  // threshold is a phone width, not 340: a 390px phone leaves the shelf ~364px,
+  // which cleared 340 and overflowed -- the badge then painted over the context
+  // readout. 420 covers the phone range with the labels shed.
+  const shelfCompact = shelfWidth < 420
   // Tooltip for the project chip. The chip itself shows the basename (plus the
   // branch when known); the tooltip carries the full path so nothing that was
   // previously discoverable is lost, and names the branch even when the label
@@ -5795,12 +5798,12 @@ function ChatInput({
           // this the chip is silently invisible whenever no other pill happens
           // to be present — the control is declared, mounted and unreachable.
           !!sessionControls?.length) && (
-          /* The shelf wraps instead of squeezing. Its middle group carries a
-             `shrink-0` git badge, so a row free to compress that group below its
-             own content lets the badge paint over the context readout beside it.
-             Wrapping keeps every chip at its natural width and moves the
-             overflow to a second line, at any model-name length. */
-          <div ref={shelfRef} className="pt-1 flex flex-wrap items-center gap-2 min-w-0">
+          /* One line, never a second row: the labels shed first (shelfCompact)
+             and `overflow-x-auto` backstops an unusually long model id, so the
+             row scrolls rather than compressing the middle group below its own
+             content -- which is what let its `shrink-0` working-tree badge paint
+             over the context readout beside it. */
+          <div ref={shelfRef} className="pt-1 flex items-center gap-2 min-w-0 overflow-x-auto">
             {/* App-contributed session controls live in their OWN group, not
               beside the agent/project chips. `max-two-buttons-per-row`
               (AUTOSDE.yaml, blocking) caps a horizontal group at 2 action
