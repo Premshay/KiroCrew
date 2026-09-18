@@ -1046,6 +1046,23 @@ def _resolve_self_served_bin(backend: str) -> tuple[str | None, str]:
     return None, search_path
 
 
+async def _resolve_self_served_bin_cached(backend: str) -> tuple[str | None, str]:
+    """Find *backend*'s executable through the per-backend cache.
+
+    The cache is not only an optimisation: its first answer is what the install
+    probe's ``restart_required`` reply reports on, so a spawn path that resolved
+    around it would contradict what the operator was just told. Every consumer of
+    a self-served harness's binary comes through here -- the client transport
+    (:meth:`AcpClient._resolve_self_served_launch`) and the harness objects a
+    direct runtime consumer spawns, which have no client instance to ask.
+    """
+    if backend not in _self_served_bin_caches:
+        _self_served_bin_caches[backend] = await asyncio.to_thread(
+            _resolve_self_served_bin, backend
+        )
+    return _self_served_bin_caches[backend]
+
+
 def _opencode_readback_remedy() -> str:
     """What an operator does when the harness's config cannot be read back at all."""
     return (
@@ -7753,11 +7770,7 @@ class AcpClient:
         H13).
         """
         launch = launch_for(self.backend)
-        if self.backend not in _self_served_bin_caches:
-            _self_served_bin_caches[self.backend] = await asyncio.to_thread(
-                _resolve_self_served_bin, self.backend
-            )
-        binary, search_path = _self_served_bin_caches[self.backend]
+        binary, search_path = await _resolve_self_served_bin_cached(self.backend)
         if not binary:
             raise AcpError(
                 f"{launch.binary} not found "
