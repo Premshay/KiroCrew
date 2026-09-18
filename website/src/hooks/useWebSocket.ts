@@ -447,10 +447,6 @@ const CHUNK_BUF_FLUSH_CHARS = 50_000
  *  threshold is asserted rather than guessed at in the spec. */
 export const ROW_STALL_MS = 100_000
 export const ROW_STALL_TICK_MS = 15_000
-/** Ticks between server cross-checks while the client believes the slot is
- *  IDLE (see the watchdog). Every tick would be one GET per 15s; every fourth
- *  is one per minute, which is the cadence the missed-turn case needs. */
-export const ROW_STALL_PROBE_EVERY = 4
 
 export function useWebSocket() {
   const dispatch = useAppDispatch()
@@ -3587,52 +3583,24 @@ export function useWebSocket() {
    *
    * ROW_STALL_MS sits above the longest legitimate silence inside a working
    * turn (about 100s between tool rows on a slow agent). A false positive costs
-   * one GET and one no-op merge -- never a lost row.
+   * one GET and one no-op merge -- never a lost row. The steady state costs
+   * nothing: a tick reads app state and issues no request unless a slot this
+   * client believes is running has gone ROW_STALL_MS without progress.
+   *
+   * Scope, deliberately: this watches the slot THIS client believes is running.
+   * A client whose belief is wrong -- a turn started on another device whose run
+   * frame was lost, so the slot looks idle here -- is NOT covered: nothing
+   * re-checks a slot this client believes idle, and the socket carries no
+   * timer-driven liveness signal to hang that check on. Covering it from here
+   * would cost a steady slots GET per visible tab to guard a case no report has
+   * produced. The successor is a per-connection keepalive frame, which gives
+   * every frame family one clock to test silence against instead of a poll per
+   * belief.
    */
   useEffect(() => {
     let rows = -1
     let tail = -1
     let stampedAt = Date.now()
-    let ticks = 0
-    /* Whether the SERVER said this slot is running. Every local signal dies
-     * with the transport, so a turn started on another device whose run frame
-     * was lost leaves this client believing the slot is idle -- and the client
-     * that believes a slot is idle never arms the watchdog above, which is the
-     * one case a reload-only recovery would otherwise be permanent. The answer
-     * is latched: see the probe. */
-    let serverRunning = false
-    /* The slot that latch belongs to. A probe answer only means something for
-     * the slot it asked about, so switching slots releases the latch instead of
-     * letting a stale arm drive recovery for a different one. */
-    let probedSlot = ''
-    const probeServerRunning = (key: string) => {
-      // Through the shared cache: this is the same slots list the sidebar
-      // reads, so a bare client call would both duplicate an in-flight request
-      // and leave the cache unaware of the answer.
-      void queryClient
-        .fetchQuery({ queryKey: ['chat-slots'], queryFn: () => api.chatSlots() })
-        .then((payload: unknown) => {
-          const list = Array.isArray(payload)
-            ? payload
-            : ((payload as { slots?: unknown[] } | null)?.slots ?? [])
-          const row = (list as Array<{ key?: string; running?: boolean }>).find(
-            (s) => s?.key === key,
-          )
-          /* Latch the POSITIVE answer only. A later probe reporting
-           * `running: false` says the turn ended, not that its rows came back:
-           * clearing the latch there disarms the recovery this probe just
-           * armed whenever a turn finishes inside the arm -> ROW_STALL_MS
-           * window, and the transcript stays frozen until a reload. The
-           * recovery releases the latch itself, once it has run. */
-          if (row?.running) {
-            serverRunning = true
-            probedSlot = key
-          }
-        })
-        .catch(() => {
-          /* transient: the next probe asks again */
-        })
-    }
     const id = setInterval(() => {
       const chat = appStore.getState().chat
       const msgs = chat.messages
@@ -3646,43 +3614,17 @@ export function useWebSocket() {
         stampedAt = Date.now()
         return
       }
-      // The latch belongs to the slot it was armed for; switching slots (or
-      // closing one) releases it, so a stale arm cannot drive recovery for a
-      // different slot.
-      if (probedSlot && probedSlot !== chat.activeSlot) {
-        serverRunning = false
-        probedSlot = ''
-      }
       const believesRunning = chat.slotRunning || chat.slotState !== 'idle'
-      /* Cross-check only when the client believes NOTHING is running: that is
-       * the blind spot. While it believes a turn is running, a probe would
-       * only re-fetch what the 100s rule already governs. Visible tabs only --
-       * a hidden tab has no reader to heal, and the visibility return forces a
-       * reconnect that reconciles anyway. The probe never heals by itself: it
-       * can only arm the same no-progress rule, so a healthy turn cannot cause
-       * a rebuild. */
-      if (
-        !believesRunning &&
-        chat.activeSlot &&
-        document.visibilityState === 'visible' &&
-        ++ticks % ROW_STALL_PROBE_EVERY === 0
-      ) {
-        probeServerRunning(chat.activeSlot)
-      }
-      if (!chat.activeSlot || !(believesRunning || serverRunning)) {
+      if (!chat.activeSlot || !believesRunning) {
         stampedAt = Date.now()
         return
       }
       if (Date.now() - stampedAt < ROW_STALL_MS) return
       stampedAt = Date.now()
-      // The recovery has run, so the latch has done its job. If the rows are
-      // still frozen, the next probe re-arms it from the server's own answer.
-      serverRunning = false
-      probedSlot = ''
       dispatch(refreshSlot(chat.activeSlot))
     }, ROW_STALL_TICK_MS)
     return () => clearInterval(id)
-  }, [dispatch, appStore, queryClient])
+  }, [dispatch, appStore])
 
   useEffect(() => {
     closingRef.current = false // reset for StrictMode re-mount
