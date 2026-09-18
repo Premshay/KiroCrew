@@ -2607,6 +2607,78 @@ OPS_MISSION_CONTROL_API_SCHEMA = ToolSchema(
     custom_validator=_validate_omc_api,
 )
 
+# Code Review Sage (agent surface). The app's routes are same-origin authed like
+# ``/config``, so an agent session can reach them only through a tool that calls
+# them with the gateway's own credential. Minting one directly is not an option
+# for a sandboxed seat: ``member_memory_auth.local_owner_bootstrap_allowed``
+# proves host provenance by comparing namespaces with the gateway, and a caller
+# inside its own namespace makes that comparison undeterminable, so it fails
+# closed. The surface is the review LIFECYCLE -- fire a review, list runs, read
+# one run and its report. Settings, repository configuration and the
+# post/archive/cancel actions are deliberately NOT here: an agent that wants one
+# of those is asking a human to have decided already.
+CODE_REVIEW_SAGE_ALLOWED_CALLS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("POST", "/review"),
+        ("GET", "/runs"),
+    }
+)
+# Run ids are opaque hex-ish stamps. The first character is alphanumeric so a
+# dots-only segment (``..``, ``.``) can never match and be resolved by the HTTP
+# client into a route this allowlist did not admit.
+_CRS_RUN_ID = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
+_CRS_DYNAMIC_CALLS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("GET", re.compile(rf"^/runs/{_CRS_RUN_ID}$")),
+    ("GET", re.compile(rf"^/runs/{_CRS_RUN_ID}/report$")),
+)
+_CRS_API_METHODS = frozenset({"GET", "POST"})
+_CRS_API_MAX_PATH = 512
+# Same shape as the ops query pattern: value-position only, so a query can never
+# rewrite the path it is appended to.
+_CRS_QUERY_RE = re.compile(r"^[A-Za-z0-9_.=&%+,:-]*$")
+# A review request carries a list of PR URLs; 32 KiB is well past the largest
+# legitimate body (the ops bound, reused because the shape is the same).
+_CRS_MAX_BODY = 32_768
+
+
+def code_review_sage_call_allowed(method: object, path: object) -> bool:
+    """Whether *method* *path* is part of the Sage agent surface.
+
+    Both the tool schema and the handler ask this, so an admitted call cannot
+    mean one thing at the boundary and another at the request.
+    """
+    if not isinstance(method, str) or not isinstance(path, str):
+        return False
+    if (method, path) in CODE_REVIEW_SAGE_ALLOWED_CALLS:
+        return True
+    return any(
+        method == allowed_method and rx.match(path)
+        for allowed_method, rx in _CRS_DYNAMIC_CALLS
+    )
+
+
+def _validate_crs_api(cleaned: dict[str, Any]) -> None:
+    method = cleaned.get("method")
+    path = cleaned.get("path")
+    if not code_review_sage_call_allowed(method, path):
+        raise ValidationError("path", f"{method} {path} is not part of the agent surface")
+    if cleaned.get("query") and method != "GET":
+        raise ValidationError("query", "query is only accepted on GET calls")
+    if cleaned.get("body_json") and method == "GET":
+        raise ValidationError("body_json", "GET calls take no body")
+
+
+CODE_REVIEW_SAGE_API_SCHEMA = ToolSchema(
+    tool_name="code_review_sage_api",
+    fields=[
+        FieldSpec("method", str, required=True, allowed=_CRS_API_METHODS),
+        FieldSpec("path", str, required=True, max_len=_CRS_API_MAX_PATH),
+        FieldSpec("query", str, max_len=512, pattern=_CRS_QUERY_RE, default=""),
+        FieldSpec("body_json", str, max_len=_CRS_MAX_BODY, default=""),
+    ],
+    custom_validator=_validate_crs_api,
+)
+
 # Dev Fleet pod lifecycle (agent surface). A pod name is a git worktree basename,
 # so it reaches `git worktree list` matching and a filesystem path before
 # `rt.validate_name` -- the real authority -- ever sees it. Bounded here so an
@@ -3548,6 +3620,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "deploy_artifact": DEPLOY_ARTIFACT_SCHEMA,
     "issue_radar_record_investigation": ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
     "ops_mission_control_api": OPS_MISSION_CONTROL_API_SCHEMA,
+    "code_review_sage_api": CODE_REVIEW_SAGE_API_SCHEMA,
     "pod_up": POD_UP_SCHEMA,
     "pod_down": POD_DOWN_SCHEMA,
     "pod_status": POD_STATUS_SCHEMA,

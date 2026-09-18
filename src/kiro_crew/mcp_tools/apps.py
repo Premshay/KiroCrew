@@ -28,6 +28,7 @@ from kiro_crew.validation import (
     _ISSUE_RADAR_CREW_PHASES,
     _ISSUE_RADAR_CREW_SKIP_SCOPES,
     OPS_MISSION_CONTROL_ALLOWED_CALLS,
+    code_review_sage_call_allowed,
     sanitize_json_values,
 )
 
@@ -95,6 +96,57 @@ def schemas() -> list[dict[str, Any]]:
                     "summary": {"type": "string", "description": "One-paragraph summary"},
                 },
                 "required": ["owner", "repo", "number"],
+            },
+        },
+        {
+            "name": "code_review_sage_api",
+            "description": (
+                "Call the Code Review Sage app's HTTP API with the gateway's own "
+                "credential. This is the ONLY way an agent session reaches that "
+                "API: its routes are same-origin authed like /config, and a "
+                "sandboxed seat cannot mint the owner token they expect — host "
+                "provenance is proved by namespace identity, which a seat's own "
+                "sandbox makes undeterminable, so the mint fails closed. Use it "
+                "to fire a review and to read the runs it produced. Paths are "
+                "rooted at the app base (pass '/review', not the full URL). "
+                "Reachable: POST /review, GET /runs, GET /runs/<run_id>, "
+                "GET /runs/<run_id>/report. Settings, repository configuration "
+                "and the post/archive/cancel actions are deliberately not "
+                "callable from here."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST"],
+                        "description": "HTTP method",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "API path relative to /api/apps/code-review-sage. "
+                            'POST: /review with body {"changes":["<PR url>"]}. '
+                            "GET: /runs, /runs/<run_id>, /runs/<run_id>/report."
+                        ),
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Optional query string without the leading '?', GET only "
+                            "— e.g. 'limit=20' on /runs"
+                        ),
+                    },
+                    "body_json": {
+                        "type": "string",
+                        "description": (
+                            "JSON object for POST bodies, serialized as a string — "
+                            'e.g. \'{"changes": ["https://github.com/o/r/pull/1"]}\' '
+                            "for /review"
+                        ),
+                    },
+                },
+                "required": ["method", "path"],
             },
         },
         {
@@ -489,6 +541,48 @@ def issue_radar_record_investigation(name: str, args: dict[str, Any]) -> str:
     )
 
 
+def code_review_sage_api(name: str, args: dict[str, Any]) -> str:
+    _crs_method = args["method"]
+    _crs_path = args["path"]
+    if not code_review_sage_call_allowed(_crs_method, _crs_path):
+        return (
+            f"Error: {_crs_method} {_crs_path} is not part of the "
+            "code-review-sage agent surface."
+        )
+    _crs_body: dict[str, Any] = {}
+    _crs_body_raw = args.get("body_json") or ""
+    if _crs_body_raw:
+        try:
+            _crs_parsed = json.loads(_crs_body_raw)
+        except ValueError:
+            return "Error: body_json is not valid JSON."
+        if not isinstance(_crs_parsed, dict):
+            return "Error: body_json must encode a JSON object."
+        # Same reason as the ops bridge: schema sanitization saw body_json as one
+        # opaque string, so walk the DECODED structure and redact on the way in.
+        _crs_body = mcp_core._redact_json_strings(sanitize_json_values(_crs_parsed))
+    _crs_query = args.get("query") or ""
+    _crs_url = "/api/apps/code-review-sage" + _crs_path
+    if _crs_query:
+        _crs_url += "?" + _crs_query
+    _crs_resp = (
+        mcp_core._get(_crs_url)
+        if _crs_method == "GET"
+        else mcp_core._post(_crs_url, _crs_body)
+    )
+    # Redact BEFORE truncating: slicing first can cut a credential in half at the
+    # cap, leaving a fragment the redaction pattern no longer matches.
+    _crs_text = redact(json.dumps(_crs_resp, ensure_ascii=False, default=str))
+    _crs_cap = 60_000
+    if len(_crs_text) > _crs_cap:
+        _crs_text = (
+            _crs_text[:_crs_cap]
+            + f"\n… truncated ({len(_crs_text)} chars total). Read one run "
+            "(/runs/<run_id>) to see the rest."
+        )
+    return _crs_text
+
+
 def ops_mission_control_api(name: str, args: dict[str, Any]) -> str:
     _omc_method = args["method"]
     _omc_path = args["path"]
@@ -814,6 +908,7 @@ def issue_radar_crew_record(name: str, args: dict[str, Any]) -> str:
 
 HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "issue_radar_record_investigation": issue_radar_record_investigation,
+    "code_review_sage_api": code_review_sage_api,
     "ops_mission_control_api": ops_mission_control_api,
     "pod_up": pod_up,
     "pod_down": pod_down,
