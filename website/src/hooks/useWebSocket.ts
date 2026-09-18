@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { isArtifactEditing } from '../utils/artifactEditGuard'
 import { isReconcileNote } from '../lib/noteContract'
-import { useAppDispatch, useAppSelector } from '../store'
+import { useAppDispatch, useAppSelector, useAppStore } from '../store'
 import { store } from '../store'
 import {
   sseStatus,
@@ -443,8 +443,14 @@ const bufferedText = (entry: ChunkBufEntry): string => entry.parts.map((p) => p.
  *  same 50 KB threshold for the same reason. */
 const CHUNK_BUF_FLUSH_CHARS = 50_000
 
+/** See the row-delivery watchdog inside `useWebSocket`. Exported so the
+ *  threshold is asserted rather than guessed at in the spec. */
+export const ROW_STALL_MS = 100_000
+export const ROW_STALL_TICK_MS = 15_000
+
 export function useWebSocket() {
   const dispatch = useAppDispatch()
+  const appStore = useAppStore()
   const queryClient = useQueryClient()
   const wsRef = useRef<WebSocket | null>(null)
   const closingRef = useRef(false) // true when cleanup intentionally closes WS
@@ -3553,6 +3559,59 @@ export function useWebSocket() {
     wsRef.current = null
     reconnectTimerRef.current = setTimeout(connect, 0)
   }, [connect])
+
+  /* Row-delivery watchdog.
+   *
+   * A dropped socket already has two owners: the reconnect handler above
+   * re-hydrates the active slot, and `useDashboardHealthProbe` polls
+   * /api/status while `dashboard.connected === false`. Neither covers the case
+   * this guards. The socket stays OPEN -- so nothing reconnects and the probe
+   * never runs -- while chat frames for the active slot stop arriving. The
+   * transcript then freezes mid-turn with no client-visible sign, and
+   * `slotRunning`, set at send and cleared only by a `_done`/error frame, stays
+   * true: the composer keeps offering Stop for a turn whose rows have stopped
+   * updating, and the only way back is a manual reload -- which works only
+   * because it re-fetches over HTTP instead of trusting the live channel.
+   *
+   * This is that re-fetch, moved inside the running app. While the active slot
+   * believes it is running and neither the row count nor the tail row's length
+   * has moved for ROW_STALL_MS, dispatch the same `refreshSlot` the reconnect
+   * path uses. It is idempotent (a count-matched server page replaces
+   * `messages`) and self-healing: `refreshSlot.fulfilled` writes `slotRunning`
+   * from the server's own `running`, so a turn that ended while its rows were
+   * stranded stops claiming to be running.
+   *
+   * ROW_STALL_MS sits above the longest legitimate silence inside a working
+   * turn (about 100s between tool rows on a slow agent). A false positive costs
+   * one GET and one no-op merge -- never a lost row.
+   */
+  useEffect(() => {
+    let rows = -1
+    let tail = -1
+    let stampedAt = Date.now()
+    const id = setInterval(() => {
+      const chat = appStore.getState().chat
+      const msgs = chat.messages
+      const last = msgs[msgs.length - 1]
+      const lastLen = last ? (last.rawText ?? last.content ?? '').length : 0
+      // Any change to the row count, or to the tail row's text, is progress --
+      // including a chunk appended in place to the streaming row.
+      if (msgs.length !== rows || lastLen !== tail) {
+        rows = msgs.length
+        tail = lastLen
+        stampedAt = Date.now()
+        return
+      }
+      if (!chat.activeSlot || !(chat.slotRunning || chat.slotState !== 'idle')) {
+        stampedAt = Date.now()
+        return
+      }
+      if (Date.now() - stampedAt < ROW_STALL_MS) return
+      stampedAt = Date.now()
+      dispatch(refreshSlot(chat.activeSlot))
+    }, ROW_STALL_TICK_MS)
+    return () => clearInterval(id)
+  }, [dispatch, appStore])
 
   useEffect(() => {
     closingRef.current = false // reset for StrictMode re-mount
