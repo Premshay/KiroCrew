@@ -213,22 +213,31 @@ def test_the_contract_declares_every_seam_this_suite_covers():
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_every_override_accepts_the_base_signature(backend):
-    """An override that narrows a seam's signature breaks the caller.
+    """An override that narrows ANY seam's signature breaks the caller.
 
     ``_kas_custom_agents`` passes every declared keyword, so a host that drops
     one raises TypeError on ``session/new`` for that backend alone -- which is how
     a harness landed without ``session_key`` and nothing noticed: the seam tests
     call the method without the keyword, and the abstract-set check above only
     asks whether the seam exists, never whether it still accepts what the base
-    declares.
+    declares. Every abstract seam is checked, so the next narrowing is caught by the
+    same test rather than by a failed session.
     """
     harness = harness_for(backend)
-    declared = set(inspect.signature(HarnessAdapter.session_extras).parameters)
-    override = set(inspect.signature(type(harness).session_extras).parameters)
-    assert declared <= override, (
-        f"{type(harness).__name__}.session_extras does not accept "
-        f"{sorted(declared - override)}"
-    )
+    narrowed: list[str] = []
+    for seam in sorted(HarnessAdapter.__abstractmethods__):
+        base = getattr(HarnessAdapter, seam, None)
+        override = getattr(type(harness), seam, None)
+        if not callable(base) or not callable(override) or base is override:
+            continue
+        try:
+            declared = set(inspect.signature(base).parameters)
+            provided = set(inspect.signature(override).parameters)
+        except (TypeError, ValueError):
+            continue
+        if not declared <= provided:
+            narrowed.append(f"{seam} drops {sorted(declared - provided)}")
+    assert not narrowed, f"{type(harness).__name__}: " + "; ".join(narrowed)
 
 
 # ── Seam 1: spawn ──
