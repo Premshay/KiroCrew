@@ -1,6 +1,6 @@
 ---
 name: llm-council
-description: Use for hard, high-stakes, ambiguous, or subjective questions, group decisions, or reviews where a second (and third) opinion from different model families adds real signal. Convene a cross-vendor LLM council — the main session acts as Chairman and spawns several subagents, each pinned to a DIFFERENT model (Anthropic / OpenAI / DeepSeek / Zhipu / Qwen / etc. via kiro-cli). Three modes — synthesis (independent answers merged into one), vote (structured ballots + majority tally), and adversarial (red-team a target artifact into a SHIP/REVISE/REJECT verdict).
+description: Use for hard, high-stakes, ambiguous, or subjective questions, group decisions, or reviews where a second (and third) opinion from different model families adds real signal. Convene a cross-vendor LLM council — the main session acts as Chairman and spawns several subagents, each pinned to a DIFFERENT vendor's crew seat (crew-claude / crew-codex / crew-deepseek-pro / crew-antigravity / crew-local). Three modes — synthesis (independent answers merged into one), vote (structured ballots + majority tally), and adversarial (red-team a target artifact into a SHIP/REVISE/REJECT verdict).
 triggers: ask the council, convene the council, council on this, panel of models, vote on this, models vote, red-team, adversarial review, other models say, cross-check with other models, second opinion from multiple models
 inject_on_trigger: false
 ---
@@ -11,9 +11,9 @@ inject_on_trigger: false
 
 Answer with a **panel of different-vendor models** instead of one. The **main
 session is the Chairman**: it fans a task out to N subagents — each `spawn_run`
-pinned to a different model via the `model` override — collects their outputs, and
+pinned to a different vendor's crew seat via `agent=` — collects their outputs, and
 produces one result. Cross-vendor is the point (a same-model panel echoes one bias);
-kiro-cli is already the gateway (`kiro-cli chat --list-models`), so no external egress.
+the seats are already wired through the crew, so no external egress.
 
 ## Modes at a glance
 
@@ -36,22 +36,23 @@ model runs**. It is a deliberate, occasional move. If unsure it's worth it, ask 
 
 ## Procedure (you are the Chairman)
 
-1. **Pick the roster** (3–4 members, cross-vendor). Run `kiro-cli chat --list-models
-   --format json`, then pick a **strong general model from each of 3–4 different
-   vendors** (e.g. Anthropic, OpenAI, DeepSeek, Zhipu) — cross-vendor diversity is the
-   payoff. Skip deprecated or restricted-use models unless opted in. Honor a
-   user-supplied roster verbatim. `--list-models` is a CATALOG, not an entitlement:
-   a listed model can still be unavailable to this session, so keep a fallback pick
-   for each slot. `reasoning_effort` ('low' | 'medium' | 'high' | 'xhigh' | 'max') is
+1. **Pick the roster** (3–4 members, cross-vendor). The menu is the **crew seat
+   roster** from `spawn_list`: `crew-claude*` Anthropic, `crew-codex*` OpenAI,
+   `crew-deepseek` / `crew-deepseek-pro` DeepSeek, `crew-antigravity*` Google,
+   `crew-local*` local. Default panel: `crew-codex`, `crew-deepseek-pro`,
+   `crew-antigravity`, plus `crew-claude` only when the Chairman is not Anthropic.
+   Pin with `agent=`; leave `model=` unset so each seat's harness picks. Do NOT read
+   `kiro-cli chat --list-models`: it is the Kiro CLI's hosted catalogue, not a route
+   this crew uses, and `model=` passes any id from it through unverified. Honor a
+   user-supplied roster verbatim. `reasoning_effort` ('low' | 'medium' | 'high' | 'xhigh' | 'max') is
    batch-wide and wins over the configured role pin — setting it forces one dedicated
    process per subagent (~3-5s start, ~400 MB each, against ~200ms and near-zero for
    session sharing), which is worth it for `adversarial` on a high-stakes artifact and
    wasteful for a cheap `vote`.
-2. **Fan out — one `spawn_run` PER member.** ⚠️ `spawn_run`'s `model` applies to the
-   whole call, so a multi-model panel is N separate calls, each a single `task` with a
-   distinct `model` — NOT one call with a `tasks` array. (`agents` varies per task;
-   `model` does not.) Use the mode's member prompt (below) as the `task`. Keep a
-   private map of `subagent id → model`. Pass `include_memory=false` on every member
+2. **Fan out — one `spawn_run` with a `tasks` array and a matching `agents` array**
+   (one seat per task; `agents` varies per task, so a cross-vendor panel is ONE call).
+   Use the mode's member prompt (below) as each `task`. Keep a private map of
+   `subagent id → seat`. Pass `include_memory=false` on every member
    spawn: the member prompt is self-contained, and inherited memory re-imports the
    Chairman's framing into every supposedly independent answer, which is the shared
    bias a council exists to break. `include_lessons=false` too unless a member will
@@ -67,32 +68,25 @@ model runs**. It is a deliberate, occasional move. If unsure it's worth it, ask 
 
 ## Choosing the panel (Chairman orchestrates)
 
-Always **3–4 cross-vendor models** — discover the live menu with `kiro-cli chat
---list-models` (`rate_multiplier` = credit cost, lower is cheaper; larger
-`context_window_tokens` = longer inputs). You (the Chairman) pick the concrete models;
-bias by the task:
+Always **3–4 cross-vendor seats** from the `spawn_list` roster (vendor map in step 1).
+You (the Chairman) pick the concrete seats; bias by the task:
 
-- **Hard / high-stakes / divergent** → the strongest reasoners available (top-tier
-  general model per vendor) + a strong-synthesizer chairman.
-- **High-fan-out / low-stakes / simple `vote`** → the cheapest models (lowest
-  `rate_multiplier`), still spread across vendors.
-- **Code review (`adversarial` on code)** → include coder-specialized models plus one
-  strong general reasoner.
-- **Long inputs** → prefer the largest-context models.
-- **Unsure** → one strong general model per vendor across 3–4 vendors.
+- **Hard / high-stakes / divergent** → the strong seats (`crew-deepseek-pro`,
+  `crew-codex`, `crew-antigravity`) + a strong-synthesizer chairman.
+- **High-fan-out / low-stakes / simple `vote`** → the flash seats (`crew-deepseek`,
+  `crew-local`), still spread across vendors.
+- **Code review (`adversarial` on code)** → the `-atlas` / `-harness` variants of the
+  seats carry project steering; include one strong general reasoner.
+- **Unsure** → one seat per vendor across 3–4 vendors.
 
 **Chairman:** the main session by default; use a top-tier synthesizer (an Anthropic
-Opus/Sonnet-class model) when the panel diverges or stakes are high.
+Opus/Sonnet-class seat) when the panel diverges or stakes are high.
 
-**Agent selection (only when the conductor skill is enabled).** If Kiro Crew's
-**conductor skill** is on — you will see its agent-roster routing table loaded in your
-context — a member may be an **(agent, model) tuple** rather than a bare model: pass
-`spawn_run(agent="<roster-name>", model="<id>")` to run a specialist agent (e.g. a code
-reviewer or security agent) on a chosen vendor model. Use it for domain panels where
-specialist context beats a generic reasoner (e.g. `adversarial` code review). Rules:
-pick agents ONLY from the conductor roster (never invent names); set `model=` explicitly
-so vendor diversity is preserved (it overrides the agent's default model). If the
-conductor skill is NOT enabled, use model-only members — do not attempt agent selection.
+**Specialist agents.** A member may be a specialist agent from the roster (a code
+reviewer, a security conductor) instead of a plain vendor seat when domain context
+beats a generic reasoner (e.g. `adversarial` code review). Pick names ONLY from
+`spawn_list`; never invent one, and never add `model=` to force a vendor — the seat
+is the vendor.
 
 ## Mode: synthesis (default)
 
@@ -194,7 +188,7 @@ Adjudicate any severity disagreement; cite "Response N" only for a disputed issu
 - **target + roles** (adversarial) — the artifact under review; roles default to all
   critics, optionally make one a defender for a red-team/blue-team split.
 - **synthesis model** — the Chairman is you (the main session) by default; to make it
-  cross-vendor, spawn one more subagent with a chosen `model=` and the chairman rubric.
+  cross-vendor, spawn one more subagent on a chosen seat (`agent=`) with the chairman rubric.
 
 ## Research tools & least privilege
 
