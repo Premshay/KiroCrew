@@ -519,7 +519,48 @@ def _resolve_excluded_tools(caller_session: str = "", *, member_memory_proof: st
                     resources=f"session_key={session_key}",
                 )
                 return set()
-            raise
+            # 403 = "member_session_unverified": the gateway will not verify the
+            # member-memory proof this caller sent, so it refuses to answer with
+            # a member's policy.  That is a verdict about the proof, not a
+            # transient gateway failure -- and the same question is answerable
+            # without it.  Retry once as a plain session (no proof header) and
+            # take that policy, because a caller whose member identity cannot be
+            # verified is exactly a caller that should get the non-member
+            # policy.  Without this the refusal reaches the generic handler
+            # below, which logs a stack trace and fails the tool filter open for
+            # a minute on every adapter spawn.
+            if http_exc.code == 403:
+                sel().log_api_access(
+                    caller=os.environ.get("KIROCREW_SESSION_KEY", "mcp"),
+                    operation="tool_policy.member_session_unverified",
+                    outcome="retry_without_proof",
+                    source="mcp_shared",
+                    resources=f"session_key={session_key}",
+                )
+                from kiro_crew.member_memory_auth import PROOF_HEADER
+
+                without_proof = urllib.request.Request(
+                    f"{api_base}/api/session-tool-policy",
+                    headers={
+                        k: v
+                        for k, v in headers.items()
+                        if k.lower() != PROOF_HEADER.lower()
+                    },
+                )
+                try:
+                    with loopback_urlopen(without_proof, timeout=5) as resp:
+                        policy = json.loads(resp.read())
+                except Exception:
+                    # Refused without a proof too: nothing left to try, and the
+                    # negative cache keeps the next attempt 60s away.
+                    logger.debug(
+                        "tool policy refused without a member proof (session=%s)",
+                        session_key,
+                        exc_info=True,
+                    )
+                    raise http_exc
+            else:
+                raise
 
         exclude = policy.get("exclude", [])
         if isinstance(exclude, list):

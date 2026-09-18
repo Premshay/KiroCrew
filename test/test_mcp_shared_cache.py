@@ -330,3 +330,70 @@ class TestCachesAreIndependent:
         with patch.object(mcp_shared, "loopback_urlopen", urlopen):
             mcp_shared._resolve_excluded_tools()
         assert urlopen.call_count == 1
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Member proof refused (403 member_session_unverified).
+# ─────────────────────────────────────────────────────────────────────
+
+class TestMemberProofRefused:
+    """A gateway that cannot verify the member proof must not cost a minute of
+    fail-open plus a stack trace: the same question is answerable without it."""
+
+    @staticmethod
+    def _header_names(request) -> set[str]:
+        return {k.lower() for k in request.headers}
+
+    def test_403_retries_without_the_proof_and_uses_that_policy(
+        self, caplog, fake_sel, patch_session_setup, monkeypatch
+    ):
+        caplog.set_level(logging.WARNING, logger="kiro_crew.mcp_shared")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")
+        urlopen = MagicMock(
+            side_effect=[
+                _make_http_error(403),
+                _make_http_response({"exclude": ["member-tool"]}),
+            ]
+        )
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            resolved = mcp_shared._resolve_excluded_tools(
+                "subagent:abc", member_memory_proof="proof123"
+            )
+        assert resolved == {"member-tool"}
+        assert urlopen.call_count == 2
+
+        first, second = (call.args[0] for call in urlopen.call_args_list)
+        assert "x-member-session-proof" in self._header_names(first)
+        assert "x-member-session-proof" not in self._header_names(second)
+
+        ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
+        assert "tool_policy.member_session_unverified" in ops
+        assert "tool_policy.resolution_failed" not in ops
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kiro_crew.mcp_shared" and r.levelno >= logging.WARNING
+        ]
+        assert warnings == []
+        # The retry's policy is cached: the refusal is not asked again.
+        assert mcp_shared._excluded_tools_by_session["subagent:abc"] == {"member-tool"}
+
+    def test_403_twice_falls_open_on_the_long_cache(
+        self, fake_sel, patch_session_setup, monkeypatch
+    ):
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")
+        urlopen = MagicMock(side_effect=_make_http_error(403))
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            assert (
+                mcp_shared._resolve_excluded_tools(
+                    "subagent:abc", member_memory_proof="proof123"
+                )
+                == set()
+            )
+        # Refused with the proof, then refused without it.
+        assert urlopen.call_count == 2
+        ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
+        assert "tool_policy.member_session_unverified" in ops
+        assert "tool_policy.resolution_failed" in ops
+        assert mcp_shared._last_failure_time > 0
+        assert mcp_shared._last_startup_race_time == 0.0
