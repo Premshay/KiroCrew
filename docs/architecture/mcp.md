@@ -836,7 +836,7 @@ Containment for app agents has three layers:
 |-------|-----------|----------------|
 | Agent config | `managedToolPolicy` renders as `disabledTools`; a `neutralize` entry re-declares a server with every tool disabled and does not add it to `tools` | Written at registration, no network |
 | kiro-cli | Reads `disabledTools` and filters before the model sees the list | In-process, no network |
-| MCP server | `GET /api/session-tool-policy` returns the calling session's `managedToolPolicy.exclude`, and the server filters `tools/list` and `tools/call` | Gateway round-trip |
+| MCP server | `GET /api/session-tool-policy` returns the calling session's `managedToolPolicy.exclude`, and the server filters `tools/list` and `tools/call`; a `403 member_session_unverified` is re-asked once without the member proof, so an unverifiable caller gets the non-member policy instead of the fail-open empty set | Gateway round-trip |
 
 `managedToolPolicy` and `includeMcpJson` are in
 `bridges._FRAMEWORK_OWNED_AGENT_KEYS`, so they are refreshed from the template on
