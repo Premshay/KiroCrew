@@ -6196,6 +6196,30 @@ class _CommitToken(str):
     __slots__ = ()
 
 
+def clear_slot_model_binding(slot: Any) -> None:
+    """Drop the model pin and its fallback walk, as one unit.
+
+    Model ids and fallback recovery belong to the provider that serves the
+    slot's agent, so every writer that changes the agent clears them through
+    here -- the dashboard switch and a provider-reported in-turn switch alike.
+    An id the new provider does not serve would otherwise be re-sent, and a
+    stale walk would resume on the wrong model.
+
+    ``_active_fallback_model`` takes a FRESH token rather than a plain ``""``:
+    the switch handler authorizes its rollback with ``slot._active_fallback_model
+    is committed_active_fallback_model``, so a later clear has to be
+    distinguishable by identity from the one being unwound.
+    """
+    slot.model = _CommitToken("")
+    slot._model_pick_gen += 1
+    slot._fallback_candidate_idx = 0
+    slot._fallback_walked = []
+    slot._active_fallback_model = _CommitToken("")
+    slot._fallback_primary_model = ""
+    slot._fallback_slot_model = ""
+    slot._fallback_pick_gen = 0
+
+
 # Serializes slot SWITCH transactions that share one session, keyed by
 # ``effective_session_key``. The per-slot locks the switch handlers take
 # (``slot._lock``, ``slot._model_pick_lock``) are created per ``_ChatSlot``,
@@ -6502,17 +6526,11 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         if agent_changed:
             # Model ids and fallback recovery are tied to the provider that
             # serves this agent. Leave no old-provider id for a replacement
-            # session to send while the reset below awaits.
-            slot.model = _CommitToken("")
-            slot._model_pick_gen += 1
+            # session to send while the reset below awaits. Cleared through the
+            # shared helper so the in-turn switch cannot drift from it.
+            clear_slot_model_binding(slot)
             committed_model_pick_gen = slot._model_pick_gen
-            slot._fallback_candidate_idx = 0
-            slot._fallback_walked = []
-            slot._active_fallback_model = _CommitToken("")
             committed_active_fallback_model = slot._active_fallback_model
-            slot._fallback_primary_model = ""
-            slot._fallback_slot_model = ""
-            slot._fallback_pick_gen = 0
 
         def _unwind_model_commit() -> None:
             """Restore the pin this request cleared, while the clear is still ours.
@@ -6928,7 +6946,11 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     await drained_to_thread(
                         conversation_log.update_metadata,
                         _history_key_for(name),
-                        {"agent": str(slot.agent)},
+                        # Both keys, mirroring the persist this unwinds: a
+                        # restore naming only the agent leaves the cleared
+                        # model in the transcript, and a restart rehydrates the
+                        # switch that was just rolled back.
+                        {"agent": str(slot.agent), "model": str(slot.model)},
                     )
                 except Exception:
                     logger.warning(

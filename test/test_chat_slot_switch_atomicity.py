@@ -1631,6 +1631,29 @@ class TestLinkedSlotSessionKey:
             assert slot.agent == "old-agent"
 
     @pytest.mark.asyncio
+    async def test_the_rollback_metadata_names_the_model_too(self, monkeypatch):
+        # The persist writes agent+model, so its restore has to correct both.
+        # Restoring only the agent leaves the cleared model on disk, and the
+        # restart reads model back from exactly this record.
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
+            lambda request: True,
+        )
+        slot = _ChatSlot("test")
+        slot.agent = "old-agent"
+        slot.model = "claude-opus-5"
+        state = _mock_state(slot, provider=None)
+        state.sessions.reset = AsyncMock(return_value=True)
+        state.conversation_log = MagicMock()
+        # First write (the persist) fails; the restore write succeeds.
+        state.conversation_log.update_metadata.side_effect = [OSError("disk full"), None]
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/agent", json={"agent": "new-agent"})
+            assert resp.status == 503
+        restore = state.conversation_log.update_metadata.call_args_list[-1]
+        assert restore.args[1] == {"agent": "old-agent", "model": "claude-opus-5"}
+
+    @pytest.mark.asyncio
     async def test_agent_switch_sees_the_linked_sessions_active_turn(self):
         # The busy probe lands on the live linked session: an in-flight
         # channel turn answers 409 instead of tearing the turn (or a
