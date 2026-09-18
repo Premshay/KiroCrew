@@ -3594,16 +3594,23 @@ export function useWebSocket() {
     let tail = -1
     let stampedAt = Date.now()
     let ticks = 0
-    /* Whether the SERVER last said this slot is running. Every local signal
-     * dies with the transport, so a turn started on another device whose run
-     * frame was lost leaves this client believing the slot is idle -- and the
-     * client that believes a slot is idle never arms the watchdog above, which
-     * is the one case a reload-only recovery would otherwise be permanent. */
+    /* Whether the SERVER said this slot is running. Every local signal dies
+     * with the transport, so a turn started on another device whose run frame
+     * was lost leaves this client believing the slot is idle -- and the client
+     * that believes a slot is idle never arms the watchdog above, which is the
+     * one case a reload-only recovery would otherwise be permanent. The answer
+     * is latched: see the probe. */
     let serverRunning = false
+    /* The slot that latch belongs to. A probe answer only means something for
+     * the slot it asked about, so switching slots releases the latch instead of
+     * letting a stale arm drive recovery for a different one. */
+    let probedSlot = ''
     const probeServerRunning = (key: string) => {
-      // Promise.resolve: a stubbed client in a test may hand back a plain
-      // value, and the tick must never throw inside a timer callback.
-      void Promise.resolve(api.chatSlots())
+      // Through the shared cache: this is the same slots list the sidebar
+      // reads, so a bare client call would both duplicate an in-flight request
+      // and leave the cache unaware of the answer.
+      void queryClient
+        .fetchQuery({ queryKey: ['chat-slots'], queryFn: () => api.chatSlots() })
         .then((payload: unknown) => {
           const list = Array.isArray(payload)
             ? payload
@@ -3611,9 +3618,16 @@ export function useWebSocket() {
           const row = (list as Array<{ key?: string; running?: boolean }>).find(
             (s) => s?.key === key,
           )
-          // Absent means the slot is gone or the payload moved on: keep the
-          // watchdog disarmed rather than arming it on a stale belief.
-          serverRunning = !!row?.running
+          /* Latch the POSITIVE answer only. A later probe reporting
+           * `running: false` says the turn ended, not that its rows came back:
+           * clearing the latch there disarms the recovery this probe just
+           * armed whenever a turn finishes inside the arm -> ROW_STALL_MS
+           * window, and the transcript stays frozen until a reload. The
+           * recovery releases the latch itself, once it has run. */
+          if (row?.running) {
+            serverRunning = true
+            probedSlot = key
+          }
         })
         .catch(() => {
           /* transient: the next probe asks again */
@@ -3631,6 +3645,13 @@ export function useWebSocket() {
         tail = lastLen
         stampedAt = Date.now()
         return
+      }
+      // The latch belongs to the slot it was armed for; switching slots (or
+      // closing one) releases it, so a stale arm cannot drive recovery for a
+      // different slot.
+      if (probedSlot && probedSlot !== chat.activeSlot) {
+        serverRunning = false
+        probedSlot = ''
       }
       const believesRunning = chat.slotRunning || chat.slotState !== 'idle'
       /* Cross-check only when the client believes NOTHING is running: that is
@@ -3654,11 +3675,14 @@ export function useWebSocket() {
       }
       if (Date.now() - stampedAt < ROW_STALL_MS) return
       stampedAt = Date.now()
+      // The recovery has run, so the latch has done its job. If the rows are
+      // still frozen, the next probe re-arms it from the server's own answer.
       serverRunning = false
+      probedSlot = ''
       dispatch(refreshSlot(chat.activeSlot))
     }, ROW_STALL_TICK_MS)
     return () => clearInterval(id)
-  }, [dispatch, appStore])
+  }, [dispatch, appStore, queryClient])
 
   useEffect(() => {
     closingRef.current = false // reset for StrictMode re-mount

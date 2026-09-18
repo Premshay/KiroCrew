@@ -128,6 +128,35 @@ describe('row-delivery stall watchdog', () => {
     unmount()
   })
 
+  it('keeps recovering when the turn finishes inside the arm window', async () => {
+    /* A turn started on another device whose run frame was lost: this client
+     * believes the slot is idle and only the probe knows better. It must not
+     * lose that answer when the turn ends before the 100s rule fires -- a
+     * clearing probe used to disarm the recovery it had just armed, leaving the
+     * transcript frozen until a reload. */
+    expect(testStore.getState().chat.slotRunning).toBe(false)
+    vi.mocked(api.chatSlots).mockResolvedValue([
+      { key: 'chat-active', running: true, last_ts: '2026-09-18T03:00:00Z' },
+    ])
+
+    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_TICK_MS * (ROW_STALL_PROBE_EVERY + 1))
+    })
+    expect(api.chatSlots).toHaveBeenCalled()
+
+    // The turn ends before the stall deadline: every later probe says idle.
+    vi.mocked(api.chatSlots).mockResolvedValue([{ key: 'chat-active', running: false }])
+    const before = detailCalls()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_MS + ROW_STALL_TICK_MS * 2)
+    })
+
+    expect(detailCalls()).toBeGreaterThan(before)
+    unmount()
+  })
+
   it('leaves an idle slot alone however long its rows sit still', async () => {
     const { unmount } = renderHook(() => useWebSocket(), { wrapper })
     await act(async () => {
