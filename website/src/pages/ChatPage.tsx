@@ -4530,7 +4530,11 @@ export default function ChatPage({
   // model `["deepseek-official","deepseek-v4-pro"]`) must never show that raw.
   const shownModelLabel = modelLabel(shownModel, availableModels)
   // Warn while the image is still pending, not after the harness rejects the
-  // whole prompt. `undefined` is "no crew runtime answered", which never warns.
+  // whole prompt. ``supportsImages`` is the SESSION's negotiated capability,
+  // captured when its ACP connection was opened -- a model switch afterwards
+  // does not change it, so the copy must blame the session, never the model the
+  // picker happens to show. `undefined` is "no crew runtime answered", which
+  // never warns.
   const showImageHint =
     localModelCatalog.supportsImages === false &&
     pendingFiles.some((path) => IMG_EXT.test(path))
