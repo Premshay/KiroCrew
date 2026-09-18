@@ -5866,7 +5866,7 @@ function ChatInput({
                pin `var(--mono)`, which Settings → Display → Font Family never
                writes, so it would make the shelf ignore the user's typeface. */
             <button
-              className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
+              className={`inline-flex items-center gap-1.5 h-7 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
               onClick={e => onAgentClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
               disabled={isRunning}
               // Inherited default: explain what the ` . default` marker means, on
@@ -5895,9 +5895,14 @@ function ChatInput({
              copies. A <button> inside a <button> is invalid HTML and browsers
              collapse it, so the pill is a plain container and each segment owns
              its own click target and hover state. */
-          <div className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted">
+          /* No `min-w-0` on the pill or its folder segment: the FolderOpen
+             glyph is `shrink-0`, so a box allowed to collapse to zero lets the
+             icon bleed sideways under the git badge that follows it. Leaving the
+             automatic minimum in place floors the segment at the icon, and the
+             label still truncates because `truncate` zeroes its own min-content. */
+          <div className="inline-flex items-center gap-1.5 h-7 text-[12px] text-muted">
           <button
-            className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
+            className="inline-flex items-center gap-1.5 h-7 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
             onClick={e => onProjectClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
             disabled={isRunning}
             title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
