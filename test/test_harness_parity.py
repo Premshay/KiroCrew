@@ -299,6 +299,7 @@ def test_every_steer_member_has_a_wire_format() -> None:
         ACP_BACKEND_KIRO,
         ACP_BACKEND_KAS,
         ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_DEEPSEEK,
     }, "a new steer member needs its own wire format in AcpClient.steer"
 
 
