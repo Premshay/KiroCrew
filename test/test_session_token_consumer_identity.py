@@ -245,7 +245,7 @@ class TestFromEnvReadsTheToken:
 
 
 # ---------------------------------------------------------------------------
-# _resolve_excluded_tools — the managed-tool-policy lookup
+# _resolve_tool_policy — the managed-tool-policy lookup
 # ---------------------------------------------------------------------------
 
 

@@ -721,7 +721,12 @@ def _session_key_from_token() -> str:
     and again on every warm-pool ``rekey()``, and the MAC is what makes the file
     trustworthy in a directory an agent can write.
 
-    Read by BOTH resolvers, and read at the SAME position in both: after the
+    The read itself belongs to
+    :func:`kiro_crew.session_token_sig.session_key_from_env_token`, the one reader
+    every resolver shares — this module's two, the client-side
+    ``mcp_caller.CallerContext.from_env`` and the managed-tool-policy lookup in
+    ``mcp_shared`` — so the token's position and its fail-closed behaviour cannot
+    drift between them. Read at the SAME position in each: after the
     gateway-injected per-call caller context, and BEFORE the
     ``KIROCREW_SESSION_KEY`` env var. That order is load-bearing rather than
     arbitrary — a warm-pool process is re-keyed to a new session while the env its
