@@ -77,6 +77,7 @@ from kiro_crew.session_directive import (
     clear_vouch,
     refuse_if_markerless,
 )
+from kiro_crew.session_token_sig import session_key_from_env_token
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.trigger_match import rank_triggered
 from kiro_crew.validation import (
@@ -736,12 +737,7 @@ def _session_key_from_token() -> str:
     session into a crashed tool call.
     """
     try:
-        from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
-        from kiro_crew.session_token_sig import verify_session_token
-
-        token = os.environ.get(STUB_SESSION_TOKEN_ENV, "")
-        if token:
-            return verify_session_token(token)
+        return session_key_from_env_token()
     except Exception:
         # No logger here, and no bare stderr write: this module runs inside the
         # kirocrew-core stdio MCP server, whose stray stdout/stderr would corrupt
