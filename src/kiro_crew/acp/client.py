@@ -11750,10 +11750,10 @@ class AcpClient:
         For a member of ``ACP_BACKENDS_STEER_ADVERTISED`` the handshake has the
         final say. Membership there is a claim about the PROTOCOL; the flag is
         what this connection's binary actually answers to, and the two differ on
-        a machine with an older claude-agent-acp on PATH. Reporting True on a
-        binary that has no handler is the one failure this whole path must not
-        have: the dashboard would show the message as steered while the backend
-        answered method-not-found and dropped it.
+        a machine with an older claude-agent-acp or dsh-acp installed. Reporting
+        True on a binary that has no handler is the one failure this whole path
+        must not have: the dashboard would show the message as steered while the
+        backend answered method-not-found and dropped it.
         """
         if self.backend not in ACP_BACKENDS_STEER:
             return False

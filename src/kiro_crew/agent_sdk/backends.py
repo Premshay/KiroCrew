@@ -777,8 +777,10 @@ ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset({ACP_BACKEND_KIRO})
 ACP_BACKENDS_MEMBER_DISPATCH = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS})
 
 # Backends implementing the ``_session/steer`` extension (mid-turn steer).
-# claude-agent-acp does not implement it, so a steer sent there is answered with
-# method-not-found rather than reaching the turn.
+# claude-agent-acp speaks its own spelling (``_session/steering``, answered with
+# ``{outcome: injected|startedNewTurn|failed}`` and advertised as
+# ``initialize._meta.steering.supported``), so its membership is gated on the
+# handshake advertisement (``ACP_BACKENDS_STEER_ADVERTISED``).
 # codex-acp (1.11.0) has a steering channel, but not this one and not usable for
 # what membership buys. Measured against a real adapter: it is a different method
 # (``_session/steering``, ``{sessionId, prompt: [ContentBlock]}``, answered with
@@ -797,9 +799,18 @@ ACP_BACKENDS_MEMBER_DISPATCH = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS})
 # ``sessionCapabilities`` of close, fork, list and resume, and nothing else.
 # pi is not a member: pi-acp's ``initialize`` result advertises ``loadSession`` and
 # ``sessionCapabilities`` of list and delete, and no steering extension.
-# deepseek is not a member: it advertises close, list and resume only, and permits
-# one in-flight prompt per session, so a mid-turn steer has no verb to travel on.
-ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+# deepseek is a member: its bridge serves the kiro-cli-dialect ``_session/steer``
+# verb (``@deepseek-ai/dsh-acp``), splices the message at the running turn's next
+# step, and echoes ``steering_queued``/``steering_consumed`` over ``session/update``
+# exactly like kiro-cli. Membership is gated on the handshake advertisement
+# (``ACP_BACKENDS_STEER_ADVERTISED``), so an installed dsh-acp without the verb
+# reads as unsteerable and takes the queue fallback instead of dropping a message.
+ACP_BACKENDS_STEER = frozenset({
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_DEEPSEEK,
+})
 
 # Backends that can serve a MANUAL ``/compact`` (the user-typed slash command).
 # Both members act on the ``/compact`` prompt that ``AcpProvider.compact()``

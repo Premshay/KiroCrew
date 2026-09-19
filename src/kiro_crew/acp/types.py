@@ -215,10 +215,11 @@ ACP_CLIENT_CAPABILITIES: dict = {
 # must be able to ask a capability question without importing ``kiro_crew.acp``,
 # whose ``__init__`` pulls in the client and runtime.
 
-# claude-agent-acp advertises its steering extension at initialize. Keep the
-# connection-level confirmation separate from the transport-level steer set: an
-# older adapter may have the same backend identity but no working steering RPC.
-ACP_BACKENDS_STEER_ADVERTISED = frozenset({ACP_BACKEND_CLAUDE})
+# claude-agent-acp and dsh-acp advertise their steering extensions at initialize.
+# Keep the connection-level confirmation separate from the transport-level steer
+# set: an older adapter may have the same backend identity but no working
+# steering RPC.
+ACP_BACKENDS_STEER_ADVERTISED = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_DEEPSEEK})
 
 # ── Provider labels ──
 # The backend identity key persisted in the session map. It indexes three
