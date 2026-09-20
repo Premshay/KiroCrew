@@ -2990,6 +2990,48 @@ class TestAgentRegistrationFailsClosed:
         assert (kiro_agents_dir() / "auto-improvement-discovery.json").is_file()
 
 
+class TestSessionRunnerPlatformRouting:
+    def test_availability_and_resolution_use_the_platform_factory(self, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from kiro_crew.apps.builtins.auto_improvement.spine import agent_runner as ar
+        from kiro_crew.platform import context
+
+        cfg = SimpleNamespace(create_provider_factory=Mock(side_effect=AssertionError("base bypass")))
+        factory = Mock()
+        registry = SimpleNamespace(create_factory=Mock(return_value=factory))
+        monkeypatch.setattr(ar.KiroCrewConfig, "load", lambda: cfg)
+        monkeypatch.setattr(context, "current_context", lambda: SimpleNamespace(providers=registry))
+
+        assert ar.SessionAgentRunner.available()
+        runner = ar.SessionAgentRunner()
+        assert runner._resolve_factory() is factory
+        assert runner._resolve_factory() is factory
+        assert registry.create_factory.call_count == 2
+        cfg.create_provider_factory.assert_not_called()
+
+    def test_registration_reuses_the_app_bridge_spec(self, tmp_path, monkeypatch):
+        import json
+
+        from kiro_crew.apps.builtins.auto_improvement.spine import agent_runner as ar
+        from kiro_crew.config.paths import kiro_agents_dir
+
+        monkeypatch.setenv("KIRO_HOME", str(tmp_path / "kiro"))
+        agents = kiro_agents_dir()
+        agents.mkdir(parents=True, exist_ok=True)
+        src = Path(ar.__file__).resolve().parent.parent / "agents" / "discovery.json"
+        spec = json.loads(src.read_text())
+        spec["mcpServers"] = {"auto-improvement:auto-improvement": {"command": "app-mcp"}}
+        installed = agents / "auto-improvement--auto-improvement-discovery.json"
+        installed.write_text(json.dumps(spec))
+        before = installed.read_bytes()
+
+        assert ar.SessionAgentRunner().ensure_agent_registered()
+        assert not (agents / "auto-improvement-discovery.json").exists()
+        assert installed.read_bytes() == before
+
+
 class TestProvisionalCommitFailsClosed:
     """The provisional commit ignored `git commit`'s return code and always returned True.
 
