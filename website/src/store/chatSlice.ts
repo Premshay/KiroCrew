@@ -45,7 +45,7 @@ import { secureRandomId } from '../utils/secureId'
 import { mergeIntoDraft } from '../utils/chatDrafts'
 import { isRejectedDecision } from '../utils/approvalDecision'
 import { automationForSlot, type AutomationRecord } from '../monitoring/automation'
-import { findReport, parseErrorCode } from '../utils/errorReport'
+import { findReport, parseErrorCode, type ErrorReport } from '../utils/errorReport'
 import type { HistoryDeleteRefusal } from '../utils/historyDeleteRefusal'
 
 const SKIP_ROLES = new Set(['chunk', 'done'])
@@ -1005,9 +1005,11 @@ interface ChatState {
    *  (#6372). ChatPage renders it through the pane-level ErrorNotice — the
    *  `errors-use-error-notice` surface — above the composer. Carries the
    *  NAME, not the sentence, so the copy re-resolves on locale switch; ''
-   *  when the slot list no longer knew the title. Cleared by the next
+   *  when the slot list no longer knew the title. The optional report keeps
+   *  the API endpoint, status, and backend code available to Ask the agent
+   *  while the displayed sentence stays localized. Cleared by the next
    *  `switchSlot.pending` or the notice's dismiss. */
-  switchSlotGone: { name: string; kind: 'gone' | 'failed' } | null
+  switchSlotGone: { name: string; kind: 'gone' | 'failed'; report?: ErrorReport } | null
   loadingOlder: boolean
   /** Last older-history fetch was rejected; surfaced on the top-of-transcript bar. */
   slotOlderError: boolean
@@ -2471,6 +2473,13 @@ export type SwitchSlotArg =
 const switchSlotKey = (arg: SwitchSlotArg): string =>
   typeof arg === 'object' && arg !== null ? arg.key : arg
 
+/** Preserve the API report behind a localized switch failure without changing
+ *  journal-less reducer fixtures or the serialized rejection contract. */
+const switchSlotFailureReport = (error: unknown): { report?: ErrorReport } => {
+  const report = findReport(errMessage(error))
+  return report ? { report } : {}
+}
+
 export const switchSlot = createAsyncThunk<
   Awaited<ReturnType<typeof fetchSlotDetail>>,
   SwitchSlotArg,
@@ -2631,6 +2640,7 @@ export const switchSlot = createAsyncThunk<
             chatSlice.actions.setSwitchSlotGone({
               name: name ?? '',
               kind: 'gone',
+              ...switchSlotFailureReport(e),
             }),
           )
         }
@@ -2694,6 +2704,7 @@ export const switchSlot = createAsyncThunk<
             chatSlice.actions.setSwitchSlotGone({
               name: name ?? '',
               kind: 'failed',
+              ...switchSlotFailureReport(e),
             }),
           )
         }
@@ -2716,6 +2727,7 @@ export const switchSlot = createAsyncThunk<
         chatSlice.actions.setSwitchSlotGone({
           name: name ?? '',
           kind: 'failed',
+          ...switchSlotFailureReport(e),
         }),
       )
     }
@@ -4127,6 +4139,65 @@ function getSlotSub(state: ChatState, slot: string, id: string): SubagentActivit
   return getSlotSubs(state, slot)?.[id]
 }
 
+/** `getSlotSub` for the reducers that must not LOSE a frame: it creates the
+ *  entry when the wire names an agent this store holds none for, then returns it
+ *  to be mutated.
+ *
+ *  A read-only accessor is the right shape for a reducer whose frame only
+ *  decorates a card (an approval toggle has nothing to say about an agent it
+ *  cannot find). It is the wrong shape for the incremental lifecycle frames --
+ *  tool, streaming text, stalled, retrying -- because those are the ONLY
+ *  evidence the panel gets between one spawn frame and one done frame. Dropping
+ *  them when the container is missing makes the agent invisible for its whole
+ *  run and then complete out of nowhere, and the gap is reachable in normal use:
+ *  `clearSubagentsForSnapshot` keeps only `pending` entries across a reconnect,
+ *  so every agent already running at that moment has its entry discarded while
+ *  its remaining frames are all incremental ones.
+ *
+ *  A created entry is deliberately a MINIMUM: the frame that reaches here
+ *  carries no task text or agent name, so those stay empty and a later frame
+ *  that does carry them (`subagent_done`, a snapshot replay) fills them in. A
+ *  card reading "running, last tool X" with no title is worth more to the
+ *  operator than no card at all, which is the alternative.
+ *
+ *  Guards mirror the lifecycle reducers exactly, because this one WRITES:
+ *  `isUnsafeKey` refuses a poisoned slot or id outright, and `safeKey` reroutes
+ *  one to an inert own-property if it ever slips past. A hostile
+ *  `__proto__`/`constructor`/`prototype` id therefore creates nothing and
+ *  returns `undefined`, so the frame is dropped exactly as before. */
+function upsertSlotSub(state: ChatState, slot: string, id: string): SubagentActivity | undefined {
+  if (isUnsafeKey(slot) || isUnsafeKey(id)) return undefined
+  const existing = getSlotSub(state, slot, id)
+  if (existing) return existing
+  // An OWNERLESS frame must not mint a bucket. `isUnsafeKey` does not cover this:
+  // `isUnsafeKey('')` is false, and a degraded spawn (`parent_session_key: ''`)
+  // reaches here carrying `slot: ''`. Creating `slotActivity['']` would be a
+  // session bucket no session owns, which the global activity view then reports
+  // as an owned running agent, and nothing later removes it -- a snapshot replay
+  // refuses the same input, so it never overwrites the bucket.
+  // :func:`sseSubagentSnapshot` fails closed on the same condition.
+  //
+  // Scoped to the bucket branch on purpose. A frame whose slot IS the active one
+  // mints nothing: the write lands in `state.subagents`, which is where the
+  // lifecycle reducers put it too, so refusing that path would change behaviour
+  // this function did not introduce (the store's default `activeSlot` is `null`,
+  // and frames carrying that same value legitimately target the active map).
+  let subs: Record<string, SubagentActivity>
+  if (slot !== state.activeSlot) {
+    if (!slot) return undefined
+    subs = (state.slotActivity[safeKey(slot)] ??= { toolLog: [], subagents: {} }).subagents
+  } else {
+    subs = state.subagents
+  }
+  return (subs[safeKey(id)] ??= {
+    id, task: '', agent: '',
+    status: 'running', streaming: '', lastTool: '', startedAt: Date.now(), elapsed: 0,
+    // The frame that reached here carries no start time, so this instant is an
+    // assumption and is flagged as one rather than rendered as fact.
+    startedAtAssumed: true,
+  })
+}
+
 /**
  * Live "sub-agents running" signal for a slot, derived from the
  * subagent_spawn/tool/done WS events (the only real-time source — see the
@@ -4612,12 +4683,8 @@ const chatSlice = createSlice({
     },
     /** See `switchSlotGone` on ChatState. Set by `switchSlot`'s catch for an
      *  `announceOnMissing` caller whose target 404ed. */
-    setSwitchSlotGone(state, action: PayloadAction<{ name: string; kind: 'gone' | 'failed' }>) {
-      state.switchSlotGone = action.payload
-    },
-    clearSwitchSlotGone(state) {
-      state.switchSlotGone = null
-    },
+    setSwitchSlotGone(state, action: PayloadAction<{ name: string; kind: 'gone' | 'failed'; report?: ErrorReport }>) { state.switchSlotGone = action.payload },
+    clearSwitchSlotGone(state) { state.switchSlotGone = null },
     /** Dismiss the unresumable-surface notice (#5925). Deliberately does NOT
      *  clear `lastResumeRequestId`: that ordering token belongs to the resume
      *  in flight, and forgetting it would let an older resume's late answer
@@ -5733,6 +5800,7 @@ const chatSlice = createSlice({
         lastTool: '',
         startedAt: existing?.startedAt || Date.now(),
         elapsed: 0,
+        startedAtAssumed: existing?.startedAt ? existing.startedAtAssumed : undefined,
         toolCount: 0,
         stalled: false,
         controllable: action.payload.controllable ?? existing?.controllable ?? true,
@@ -5749,8 +5817,9 @@ const chatSlice = createSlice({
       }>,
     ) {
       const { slot, id } = action.payload
-      // Prototype-pollution guard is centralized in getSlotSub.
-      const a = getSlotSub(state, slot, id)
+      // Prototype-pollution guard is centralized in upsertSlotSub, which also
+      // creates the entry when this is the first frame naming the agent.
+      const a = upsertSlotSub(state, slot, id)
       if (a) {
         a.lastTool = action.payload.tool
         a.status = 'tool'
@@ -5769,14 +5838,10 @@ const chatSlice = createSlice({
       // one-shot cancel auto-continue (subagent_recovering): the agent is
       // still alive and recovering — show ⟳ instead of letting it look hung.
       const { slot, id } = action.payload
-      if (id === '__proto__' || id === 'constructor' || id === 'prototype') return
-      const a = getSlotSubs(state, slot)?.[id]
-      if (a) {
-        a.retrying = true
-        a.stalled = false
-        a.idleSecs = undefined
-        a.stalledAt = undefined
-      }
+      // Through the shared accessor, so this call site carries no hand-written
+      // copy of the poisoned-key list that could drift from `isUnsafeKey`.
+      const a = upsertSlotSub(state, slot, id)
+      if (a) { a.retrying = true; a.stalled = false; a.idleSecs = undefined; a.stalledAt = undefined }
     },
     sseSubagentStalled(
       state,
@@ -5788,8 +5853,9 @@ const chatSlice = createSlice({
       }>,
     ) {
       const { slot, id } = action.payload
-      // Prototype-pollution guard is centralized in getSlotSub.
-      const a = getSlotSub(state, slot, id)
+      // Prototype-pollution guard is centralized in upsertSlotSub, which also
+      // creates the entry when this is the first frame naming the agent.
+      const a = upsertSlotSub(state, slot, id)
       if (!a) return
       a.stalled = action.payload.stalled
       // Keep the idle span with the flag it justifies, and clear it on the
@@ -5819,7 +5885,7 @@ const chatSlice = createSlice({
       }>,
     ) {
       for (const u of action.payload.updates || []) {
-        const a = getSlotSub(state, u.slot, u.id)
+        const a = upsertSlotSub(state, u.slot, u.id)
         if (!a) continue
         // Order matters: retrying (attempt) applies FIRST so a tool field in
         // the same merged entry — meaning work resumed — clears it last.
@@ -5852,7 +5918,7 @@ const chatSlice = createSlice({
       }>,
     ) {
       for (const c of action.payload.chunks || []) {
-        const a = getSlotSub(state, c.slot, c.id)
+        const a = upsertSlotSub(state, c.slot, c.id)
         if (!a) continue
         a.retrying = false
         a.streaming += c.text
@@ -5958,7 +6024,17 @@ const chatSlice = createSlice({
         if (action.payload.child_session && !a.childSession)
           a.childSession = action.payload.child_session
         if (isNative && action.payload.result !== undefined) a.result = action.payload.result
-      } else {
+        // A done frame carries authoritative `elapsed`, which reconstructs the
+        // real start for an entry whose start was only ASSUMED -- the same
+        // reconstruction the no-entry branch below already performs. Without it
+        // the entry would keep claiming its start is unknown after the one frame
+        // that settles it.
+        if (a.startedAtAssumed) {
+          a.startedAt = Date.now() - action.payload.elapsed * 1000
+          a.startedAtAssumed = undefined
+        }
+      }
+      else {
         subs[action.payload.id] = {
           id: action.payload.id,
           task: action.payload.task || '',

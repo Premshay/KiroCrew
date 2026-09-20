@@ -221,6 +221,11 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         # CLEARED by absence once the flush delivers them — carried forward
         # instead, a restart would re-deliver a note the user already saw.
         "deferred_notes",
+        # Durable copy of the queued user prompts. Owned, not monotonic: the
+        # value is written while prompts wait and must be CLEARED by absence
+        # once the drain consumes them — carried forward instead, a restart
+        # would hand back a prompt whose turn already ran.
+        "queued_prompts",
         "pinned",
         "color_index",
         "color_hex",
@@ -945,7 +950,7 @@ def _cleanup_old_archives(retention_days: int | None = None, base: Path | None =
     (``session.archive_retention_days``).  A negative value disables cleanup
     entirely — the user manages archive deletion manually.
 
-    The same pass expires closed SESSION LEDGERS, on the same setting and inside
+    The same pass expires closed SESSION CREW LOGS, on the same setting and inside
     the same throttle (:func:`kiro_crew.crew_log.store.sweep_expired`). One switch
     governs both because a session's message bodies live in its crew log now: a
     build that expired the transcript archive while the crew log it points into grew
@@ -991,11 +996,11 @@ def _cleanup_old_archives(retention_days: int | None = None, base: Path | None =
                 pass
     if removed:
         logger.info("Cleaned %d expired archive files (>%dd)", removed, retention_days)
-    _cleanup_expired_ledgers(retention_days, now)
+    _cleanup_expired_crew_logs(retention_days, now)
     return removed
 
 
-def _cleanup_expired_ledgers(retention_days: int, now: float) -> None:
+def _cleanup_expired_crew_logs(retention_days: int, now: float) -> None:
     """Expire closed the sessions' logs, best-effort, never at the transcript's cost.
 
     Off the event loop, which is what makes the added filesystem work safe rather
@@ -1849,12 +1854,11 @@ class ConversationLog:
         A transcript file is created by the first METADATA write -- a title,
         an agent pick, a model pick -- long before any message is exchanged,
         so :meth:`has_log` answers "does a file exist", not "was anything
-        said". Callers deciding whether a conversation already carries V1
-        history (the private-memory admission seam) need the second question:
+        said". Callers deciding whether a conversation already carries
+        context before selecting a member need the second question:
         a metadata-only file is an empty conversation.
 
-        Fails CLOSED, because that seam grants permanent private ownership on
-        a False: an absent file is empty, but a file that exists and cannot be
+        An absent file is empty, but a file that exists and cannot be
         read raises ``OSError`` rather than reading as empty, and a record that
         cannot be delivered intact or is not valid JSON counts as content --
         unverifiable history is still history. The forgiving tail readers are
@@ -2934,7 +2938,7 @@ class ConversationLog:
         require_memory_consolidation_session_key(key, expected_store)
         binding = read_private_session_store(key)
         if binding is not None and binding != expected_store:
-            raise ValueError("The transient session belongs to another private store")
+            raise ValueError("The transient session belongs to another memory store")
         path = self._path(key)
         existed = path.exists()
         deleted = self.delete_session(key)

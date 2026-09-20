@@ -177,7 +177,25 @@ async def _capture(backend: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, A
     # session/load resolves its own roster from the gateway overlay, which stats
     # files. Pin it to the same roster session/new is given so the two requests
     # are comparable and neither moves with the host's gateway configuration.
-    monkeypatch.setattr(runtime_mod, "pooled_session_servers", lambda overlay, agent: _MCP_ROSTER)
+    # ``**_kw`` keeps the double mirroring the real signature, which takes the
+    # session's checkout as ``work_dir``; a double that refuses it would make the
+    # capture fall through to a different code path than the one under test.
+    monkeypatch.setattr(
+        runtime_mod, "pooled_session_servers", lambda overlay, agent, **_kw: _MCP_ROSTER
+    )
+
+    # Pin the per-session identity token, for the same reason the work dir and the
+    # session ids above are pinned: it is minted from ``secrets`` on every session
+    # start, so an unpinned capture could never match a golden twice. Pinning the
+    # INPUT rather than scrubbing the output keeps the golden a byte gate on the
+    # whole element, the env pair included -- which is the part that must not
+    # change silently.
+    monkeypatch.setattr(runtime_mod, "mint_stub_session_token", lambda: _SESSION_TOKEN)
+
+    # ...and the signed mapping publication it triggers, which writes to the real
+    # data home. The capture is about the frames the runtime BUILDS; a filesystem
+    # write is neither on the wire nor this gate's business.
+    monkeypatch.setattr(runtime_mod, "publish_session_token", lambda token, key: None)
 
     # Pin the per-session identity token, for the same reason the work dir and the
     # session ids above are pinned: it is minted from ``secrets`` on every session

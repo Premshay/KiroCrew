@@ -50,7 +50,13 @@ from kiro_crew.dashboard.session_pulse_counter import increment_user_session_cou
 from kiro_crew.dashboard.side_state import SideState
 from kiro_crew.dashboard.slot_buffers import SlotBufferCoordinator
 from kiro_crew.dashboard.slot_projection import SlotProjection
-from kiro_crew.dashboard.slot_queue_repository import SlotQueueRepository
+from kiro_crew.dashboard.slot_queue_repository import (
+    EMPTY_QUEUE_SIGNATURE,
+    SlotQueueRepository,
+    durable_queue_entries,
+    durable_queue_view,
+    queue_persist_signature,
+)
 from kiro_crew.dashboard.slot_registry import SlotRegistry
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.dashboard.websocket_hub import WebSocketHub
@@ -103,6 +109,11 @@ from kiro_crew.validation import (
     SESSION_RESTART_CONTINUATION_MAX,
     sanitize_string,
 )
+from kiro_crew.session_compaction import (
+    COMPACT_OUTCOME_COMPACTED,
+    COMPACT_OUTCOME_RECYCLED,
+    COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE,
+)
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard._types import (  # noqa: F401
@@ -115,6 +126,7 @@ if TYPE_CHECKING:
         SubagentManager,
         TaskRunner,
     )
+    from kiro_crew.dashboard.listener_guard import ListenerGuard  # noqa: F401
     from kiro_crew.dashboard.loop_watchdog import LoopStallWatchdog  # noqa: F401
     from kiro_crew.messaging.transport import MessagingTransport  # noqa: F401
     from kiro_crew.power import SleepInhibitor  # noqa: F401
@@ -812,6 +824,23 @@ _SSE_INTERVAL_SECS = 5
 _NOTIFICATIONS_FILE = "notifications.jsonl"
 _MAX_PERSISTED_NOTIFICATIONS = 200
 _AUTO_COMPACT_NOTICE = "🔄 Auto-compacted at {pct:.0f}%."
+#: The notice for the arm that REPLACES the session instead of summarizing it. A
+#: separate template because ``_AUTO_COMPACT_NOTICE`` would announce a summary that
+#: never happened, and the user's next question -- why does the agent not remember
+#: this -- is answerable only if the notice said what actually occurred.
+_AUTO_RECYCLE_NOTICE = (
+    "♻️ Compaction didn't succeed at {pct:.0f}%, so the session was restarted "
+    "instead. The conversation above is still here; the agent no longer remembers it."
+)
+#: The same restart, for a backend that never had a compaction to attempt. Only this
+#: one may name the missing capability: the notice above is reached by kiro-cli and
+#: opencode sessions whose compaction merely failed, and telling those users their
+#: backend cannot compact would be false.
+_AUTO_RESTART_UNCOMPACTABLE_NOTICE = (
+    "♻️ Context reached {pct:.0f}% and this backend cannot compact at all, so "
+    "the session was restarted. The conversation above is still here; the agent no "
+    "longer remembers it."
+)
 _AUTO_COMPACT_FAILED_NOTICE = (
     "⚠ Auto-compact failed at {pct:.0f}% — will retry after cooldown. "
     "You can run `/compact` manually."
@@ -2063,6 +2092,7 @@ class _ChatSlot:
         "_model_withheld",
         "_model_withheld_for",
         "served_model",
+        "_session_requested_model",
         "reasoning_effort",
         "autocompact_pct",
         "mode",
@@ -2081,8 +2111,12 @@ class _ChatSlot:
         "_pending_consumers",
         "_pending_release_deferred",
         "_queue",
+        "_queue_persisted_sig",
+        "_queue_persist_inflight",
+        "_queue_persist_owed",
         "_last_enqueue_ts",
         "_approval_futures",
+        "_approval_stopped",
         "_trust",
         "_trust_scope",
         "_trust_reads",
@@ -2169,6 +2203,7 @@ class _ChatSlot:
         "_fallback_slot_model",
         "_model_pick_gen",
         "_fallback_pick_gen",
+        "_fallback_client_pick_epoch",
         "_refusal_fallback_primary",
         "_refusal_fallback_candidate",
         "_refusal_fallback_session_key",
@@ -2179,6 +2214,12 @@ class _ChatSlot:
         "_refusal_replay_queue_id",
         "_refusal_replay_stop_gen",
         "_refusal_replay_session_stop_gen",
+        "_model_access_fallback_used",
+        "_model_access_recovery_pending",
+        "_model_access_recovery_stop_gen",
+        "_model_access_recovery_session_stop_gen",
+        "_model_access_recovery_session_key",
+        "_model_access_recovery_queue_id",
         "_posttoken_retry_used",
         "_last_turn_structural_terminal",
         "_last_turn_structural_terminal_loop_id",
@@ -2249,6 +2290,9 @@ class _ChatSlot:
         "_pending_steers",
         "_steer_delivery_ids",
         "_steer_send_ids",
+        "_steer_user_origin",
+        "_steer_admissions",
+        "_steer_audience_fences",
         "_wait_state",
         "_end_wait_request",
         "_wait_last_ping",
@@ -2287,6 +2331,12 @@ class _ChatSlot:
         # when any of slot.model's writers re-pins the slot.
         self._model_withheld: bool = False
         self._model_withheld_for: str = ""
+        # The model selection handed to the provider allocation that produced
+        # the live session. None means this process did not observe that
+        # allocation; "" means every selection tier deferred to the backend.
+        # Session/opened reads this instead of re-resolving at first turn, since
+        # an eager allocation can outlive a config change.
+        self._session_requested_model: str | None = None
         # The model id the live session resolved to, for a slot that is
         # inheriting rather than pinning. "" = unknown. Written through
         # `record_served_model`.
@@ -2362,11 +2412,34 @@ class _ChatSlot:
         # purge never runs again for that slot, so the rows it declined to drop
         # outlive every consumer and the leak survives its own fix.
         self._pending_release_deferred: bool = False
-        self._queue: list[dict[str, str]] = []  # [{"id": uuid, "content": str}, ...]
+        self._queue: list[dict[str, Any]] = []  # [{"id": uuid, "content": str}, ...]
+        # Signature of the durable queue value this slot's last committed save
+        # wrote (see slot_queue_repository.queue_persist_signature). Drift
+        # between it and the live queue is what tells the periodic flush a
+        # queued prompt is not on disk yet, so durability does not depend on
+        # every queue mutation site remembering to mark the slot dirty. Starts
+        # at the EMPTY signature: a slot with nothing queued owes no write, and
+        # an unnecessary save would rewrite the transcript and invalidate every
+        # cache keyed on its mtime.
+        self._queue_persisted_sig: str = EMPTY_QUEUE_SIGNATURE
+        # Single-flight for the immediate queue write (``start_queue_persist``).
+        # Loop-affine: set on the event loop, cleared in the future's done
+        # callback, which the loop also runs. The executor thread doing the save
+        # never reads either one, so they need no lock.
+        self._queue_persist_inflight: bool = False
+        self._queue_persist_owed: bool = False
         # Newest enqueue instant, read only while ``_queue`` is non-empty — see
         # ``_note_enqueue``.
         self._last_enqueue_ts: str = ""
         self._approval_futures: dict[str, asyncio.Future[str]] = {}  # type: ignore[type-arg]
+        # Approval ids a STOP rejected, rather than a person. A stop resolves the
+        # future with an ordinary "rejected", so the runner cannot tell the two
+        # apart at the point it records the decision, and its ledger entry would
+        # name a person who never answered. The id is added where the stop
+        # resolves the future and removed where the runner reads it, so nothing
+        # accumulates and a later human rejection on this slot cannot inherit the
+        # attribution. Ids rather than a flag, for exactly that reason.
+        self._approval_stopped: set[str] = set()
         self._trust: bool = False  # auto-approve tools for this slot
         # SafetyOverride scope key holding an EXPIRING, SEL-audited auto-approve
         # grant, for an unattended app worker with no human present to click
@@ -2679,6 +2752,13 @@ class _ChatSlot:
         # provider backfill must not be mistaken for a user model selection.
         self._model_pick_gen: int = 0
         self._fallback_pick_gen: int = 0
+        # The shared client's explicit-pick epoch at fallback activation. The
+        # slot-local _fallback_pick_gen is invisible to a pick made through a
+        # session alias (a channel-born slot and its dashboard twin share one
+        # wire session and one client object); the restore probe compares this
+        # shared epoch so an alias's explicit pick is not silently overwritten,
+        # mirroring _refusal_client_pick_epoch on the refusal path.
+        self._fallback_client_pick_epoch: int = 0
         # Content-filter (refusal) fallback state (agent.refusal_fallback_model).
         # _refusal_fallback_primary/_refusal_fallback_candidate are the models
         # to restore/verify at the start of the NEXT genuine turn after a
@@ -2718,6 +2798,49 @@ class _ChatSlot:
         self._refusal_replay_queue_id: str = ""
         self._refusal_replay_stop_gen: int = 0
         self._refusal_replay_session_stop_gen: int = 0
+        # One-shot guard for the reactive model-access-denial fallback: a new
+        # conversation whose configured model (commonly the "auto" sentinel) is
+        # refused for entitlement, not throttled, is re-prompted at most ONCE on
+        # the first advertised model this account can run, rather than failing
+        # the first reply. One attempt only, so an account entitled to nothing
+        # falls through to the terminal entitlement error naming what was tried
+        # instead of looping. Refreshed at the start of a genuine user turn but
+        # NOT when the incoming turn is the swap's own replay (the
+        # _model_access_recovery_pending latch below carries that fact across),
+        # so a still-unentitled candidate cannot trigger a second swap.
+        self._model_access_fallback_used: bool = False
+        # Set when a model-access swap re-queues the user's ORIGINAL message as a
+        # synthetic recovery. That replay is indistinguishable from a fresh user
+        # turn at reset time (it carries the user's own words, not a synthetic
+        # marker), so this one-turn latch tells the reset to preserve
+        # _model_access_fallback_used for exactly that replay and is consumed
+        # there.
+        self._model_access_recovery_pending: bool = False
+        # _stop_generation snapshotted when that recovery is enqueued. A soft Stop
+        # (first press) does NOT clear the queue and the drain's continuation
+        # purge does not cover a message replay, so the drain compares this
+        # snapshot against the live counter at dequeue: any increment (or a
+        # pending steer / user follow-up) means the user cancelled or superseded
+        # the turn while the recovery waited, and the replay is dropped instead of
+        # dispatched.
+        self._model_access_recovery_stop_gen: int = 0
+        # Session-scoped counterpart of the snapshot above. A Stop issued on a
+        # linked channel surface advances only the session-scoped counter, not
+        # the slot one, so the dequeue drain compares this too — without it a
+        # linked-channel Stop with nothing queued would leave the cancelled
+        # replay in the queue head to dispatch.
+        self._model_access_recovery_session_stop_gen: int = 0
+        #: The session binding the model-access recovery replay's swap ran under,
+        #: captured at enqueue. The drain and consume seam compare the live key
+        #: against it and drop the replay when they differ, so a cron result
+        #: binding an unbound slot mid-episode cannot replay the original prompt
+        #: into the newly bound session.
+        self._model_access_recovery_session_key: str = ""
+        #: The queue id of the model-access recovery replay, recorded at enqueue
+        #: so the drain abort removes only THIS entry. SYNTHETIC_RECOVERY_KIND is
+        #: shared across recovery paths, so a blanket removal by kind would
+        #: destroy co-queued unrelated recoveries.
+        self._model_access_recovery_queue_id: str = ""
         # One-shot guard for the post-token (text-only) transient retry: a turn
         # that has already streamed answer tokens may be re-prompted at most
         # ONCE on a transient 5xx (and only when no tool call fired). Reset on a
@@ -3037,6 +3160,44 @@ class _ChatSlot:
         # carries `meta.sendId` like an accepted steer's row does. A steer
         # that persists its own row stamps the id directly and drops this entry.
         self._steer_send_ids: dict[str, str] = {}
+        # Whether an in-flight steer was typed by the session's OWN human, keyed by
+        # the same message text as the two maps above and kept in the same LOCKSTEP.
+        # The requeue reads it to decide `directive_user_origin`, which exempts a
+        # queue entry from the drain's LINKED drop. That exemption exists because
+        # "the author typed into the session's own surface" -- true of the composer,
+        # false of a `session_send` steer from a peer -- so the requeue cannot
+        # derive it from the slot and has to be told. Absent means NOT the session's
+        # own human: an unrecorded steer fails closed into the ordinary drop.
+        self._steer_user_origin: dict[str, bool] = {}
+        # The containment that held when an in-flight steer was AUTHORIZED, keyed by
+        # the same message text and kept in the same LOCKSTEP. The requeue stamps it
+        # on the queue entry instead of reading the slot again: its own moment is the
+        # turn's teardown, on the far side of the steer RPC's suspension, so a mirror
+        # linked during that suspension would be folded into the baseline and then
+        # read as "held at admission" by the drain -- which is exactly the audience
+        # the authorization refused. Absent means the entry carries NO containment
+        # key, which puts it on the drain's fail-closed floor: checked against every
+        # currently held constraint rather than against a baseline built at teardown.
+        self._steer_admissions: dict[str, dict] = {}
+        # Admission snapshots of the peer steers that influenced THIS turn, keyed by
+        # an opaque token. The turn consults them before publishing its CROSS-SURFACE
+        # reply leg and withholds it when a constraint newly holds:
+        # the steer RPC suspends on `stdin.drain()`, `_deliver_cross_surface_reply`
+        # resolves the mirror live at reply-delivery time, and a fast turn can deliver
+        # before the sender's post-RPC check resumes -- so reacting after the fact
+        # cannot stop a reply that is already sent. An entry is recorded BEFORE the
+        # RPC, synchronously with the authorization that admitted the send.
+        #
+        # The entry is RETAINED for the whole turn rather than released once the
+        # sender's own check passes: the reply publishes later still, and a mirror
+        # bound between that check and the publication would be just as unauthorized.
+        # Keeping the admission here lets the decision be made where it can be exact
+        # -- synchronously at delivery, against the containment holding THEN -- which
+        # is also why an ordinary steer costs the channel audience nothing.
+        #
+        # TURN-SCOPED: the turn's teardown empties it, so one turn's withheld reply
+        # never silences the next, whose authorization is its own.
+        self._steer_audience_fences: dict[str, dict] = {}
         # In-flight `wait` tool sleep, as reported by the tool's own keepalive
         # ping: {"wait_id": str, "seconds": int, "deadline_ts": float}. The
         # deadline is on the dashboard's clock (see api_session_keepalive) so
@@ -4158,6 +4319,30 @@ class _ChatSlot:
     def queue_promote_by_id(self, queue_id: str) -> bool:
         return self._queue_repository.queue_promote_by_id(self, queue_id)
 
+    def durable_queue_entries(self) -> list[dict[str, Any]]:
+        """The queued user prompts a metadata writer may persist right now."""
+        return durable_queue_entries(self._queue)
+
+    def durable_queue_view(self) -> tuple[list[dict[str, Any]], int]:
+        """Persistable queued prompts and the candidate count, from one read.
+
+        Used where the two are SUBTRACTED (the save's over-cap report), so the
+        difference describes one observation of the queue rather than two.
+        """
+        return durable_queue_view(self._queue)
+
+    @property
+    def queue_persist_pending(self) -> bool:
+        """True while a queued user prompt differs from what is on disk.
+
+        A queued prompt is the user's own words with NO other copy: the
+        transcript row for it is written by the drain, not by the enqueue, so
+        until a save carries the queue itself the only record is this process's
+        memory. The periodic flush reads this beside ``_dirty`` so an enqueue
+        (or any in-place queue mutation) reaches disk on the next pass.
+        """
+        return queue_persist_signature(self.durable_queue_entries()) != self._queue_persisted_sig
+
     @property
     def task(self) -> asyncio.Task[Any] | None:
         return self._task
@@ -4248,6 +4433,7 @@ class _ChatSlot:
         site added later cannot drop half the pair.
         """
         self.record_model_withheld(None)
+        self._session_requested_model = None
         self.record_served_model(None)
 
     @property
@@ -4837,6 +5023,11 @@ class DashboardState:
         # entrypoint (faulthandler enabled) and stopped on shutdown. Annotated
         # here so the assignment in start_dashboard type-checks under mypy strict.
         self._loop_watchdog: "LoopStallWatchdog | None" = None
+        # Listener guard: rebinds the TCP site when its LISTEN socket dies (the
+        # Windows proactor accept-failure path) and carries the non-zero exit
+        # status the gateway uses when it cannot. Armed after the site binds,
+        # detached on cleanup; annotated here for mypy.
+        self._listener_guard: "ListenerGuard | None" = None
         # Prevent-sleep inhibitor + its poll task. Held to prevent GC and
         # released/cancelled on shutdown; annotated here so the assignments in
         # start_dashboard type-check under mypy.
@@ -4884,6 +5075,7 @@ class DashboardState:
         self.file_indexes = FileIndexRegistry()
         # Runtime services share the gateway's policy, never a model-supplied mode.
         from kiro_crew.dashboard.handlers._shared import (
+            live_session_memory_mode,
             require_live_session_memory_mode,
             resolve_session_memory_mode,
         )
@@ -4893,6 +5085,9 @@ class DashboardState:
                 self, key
             )
         if self.context_builder is not None:
+            self.context_builder.live_memory_mode_for_session = (
+                lambda key: live_session_memory_mode(self, key)
+            )
             self.context_builder.memory_mode_for_session = lambda key: resolve_session_memory_mode(
                 self, key
             )
@@ -4952,7 +5147,13 @@ class DashboardState:
     def wire_session_compact_callback(self) -> None:
         """Register the dashboard's compaction callback on the session manager."""
 
-        async def _on_compacted(key: str, pct: float, *, success: bool) -> None:
+        async def _on_compacted(
+            key: str,
+            pct: float,
+            *,
+            success: bool,
+            outcome: str = COMPACT_OUTCOME_COMPACTED,
+        ) -> None:
             from kiro_crew.dashboard.chat_utils import dashboard_slot_key
 
             slot_key = dashboard_slot_key(key)
@@ -4962,17 +5163,26 @@ class DashboardState:
                 # get the notice: silently summarized history is the confusing
                 # outcome this notice exists to prevent.
                 if is_channel_session_key(key):
-                    await self._notify_channel_compaction(key, pct, success=success)
+                    await self._notify_channel_compaction(
+                        key, pct, success=success, outcome=outcome
+                    )
             else:
                 # No tab to append to, so the notice would be dropped and the
                 # user would see summarized history with no explanation. Route
                 # it to its own conversation instead.
-                await self._notify_channel_compaction(key, pct, success=success)
+                await self._notify_channel_compaction(key, pct, success=success, outcome=outcome)
                 return
             slot = self.get_slot(slot_key)
             if slot is None:
                 return
-            template = _AUTO_COMPACT_NOTICE if success else _AUTO_COMPACT_FAILED_NOTICE
+            if not success:
+                template = _AUTO_COMPACT_FAILED_NOTICE
+            elif outcome == COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE:
+                template = _AUTO_RESTART_UNCOMPACTABLE_NOTICE
+            elif outcome == COMPACT_OUTCOME_RECYCLED:
+                template = _AUTO_RECYCLE_NOTICE
+            else:
+                template = _AUTO_COMPACT_NOTICE
             message = template.format(pct=pct)
             try:
                 # Tag kind="compaction" so this proactive auto-compact notice
@@ -5004,7 +5214,14 @@ class DashboardState:
 
         self.sessions.set_compact_callback(_on_compacted)
 
-    async def _notify_channel_compaction(self, key: str, pct: float, *, success: bool) -> None:
+    async def _notify_channel_compaction(
+        self,
+        key: str,
+        pct: float,
+        *,
+        success: bool,
+        outcome: str = COMPACT_OUTCOME_COMPACTED,
+    ) -> None:
         """Deliver the auto-compact notice to a channel-originated session.
 
         Isolated from the dashboard leg: a channel that is unreachable, ungoverned
@@ -5012,7 +5229,9 @@ class DashboardState:
         the session manager's background task.
         """
         try:
-            await deliver_channel_compaction_notice(self, key, pct, success=success)
+            await deliver_channel_compaction_notice(
+                self, key, pct, success=success, outcome=outcome
+            )
         except Exception:
             logging.getLogger(__name__).exception(
                 "Failed to deliver channel compact notice for %s", key
@@ -6746,8 +6965,17 @@ class DashboardState:
         """
         return int(getattr(self, "_folders_generation", 0) or 0)
 
-    async def mutate_folders(self, mutate: Callable[[list[dict[str, Any]]], tuple[bool, _T]]) -> _T:
-        """Serialize a folder mutation and confirm its off-loop persistence."""
+    async def mutate_folders(
+        self,
+        mutate: Callable[[list[dict[str, Any]]], tuple[bool, _T]],
+        on_committed: Callable[[], None] | None = None,
+    ) -> _T:
+        """Serialize a folder mutation and confirm its off-loop persistence.
+
+        ``on_committed`` runs under the repository lock only after the write
+        is proven, so callers can attach side effects that must not outlive a
+        rolled-back or no-op transaction.
+        """
 
         def _mark_committed() -> None:
             # This runs under the repository lock and only after the write is
@@ -6755,6 +6983,8 @@ class DashboardState:
             # re-fetch a tree that never changed, and concurrent commits must
             # not collapse two monotonic generation bumps into one.
             self._folders_generation = self.folders_generation() + 1
+            if on_committed is not None:
+                on_committed()
 
         return await _FOLDER_REPOSITORY.mutate(
             lambda: self._folders,

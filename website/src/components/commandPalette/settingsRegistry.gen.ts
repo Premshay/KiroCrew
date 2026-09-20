@@ -1127,6 +1127,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.show-pasted-text-in-full",
+    "label": "Show Pasted Text in Full",
+    "labelKey": "pages.settings.chatPanel.show_pasted_text_in_full",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.show-thinking-inline",
     "label": "Show Thinking Inline",
     "labelKey": "pages.settings.chatPanel.show_thinking_inline",
@@ -1378,7 +1386,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.decisions-jev",
     "label": "Decisions (Jev)",
     "labelKey": "pages.developer.featurePreviewsTab.decisions",
-    "description": "Jev is a small, cheap decision model. This preview lets Kiro Crew ask it one yes-or-no or pick-one question at three moments: which skills to load for your message, whether a skill it has just learned repeats one you already have, and whether a scheduled job's result says anything new. Shadow-only in this release — nothing Jev answers changes what Kiro Crew does; each answer is written to a log on this machine so the two can be compared. This switch is saved on the machine that runs Kiro Crew, not in this browser, so it applies on every device you open it from.",
+    "description": "Jev is a small, fast decision model. With this on, Kiro Crew asks Jev which one of your skills fits the message you just sent — or that none does — and uses Jev's pick for the share of your sessions shown under the switch; the rest keep the word-matching rule this build ships with. If Jev is slow, unreachable or answers with nothing usable, that message falls back to the same rule, so a decision never holds up your reply. Each call is also recorded in a log on the machine that runs Kiro Crew, for diagnostics. This switch is saved on the machine that runs Kiro Crew, not in this browser, so it applies on every device you open it from.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -1537,6 +1545,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "display",
     "type": "buttonGroup",
     "occurrence": 1
+  },
+  {
+    "id": "display.spend-a-few-credits-to-check-your-balance",
+    "label": "Spend a few credits to check your balance",
+    "labelKey": "pages.settings.displayPanel.credit_usage_scrape",
+    "description": "When your usage data is not available for free, your balance can still be checked by sending one billed message, about every 10 minutes while a dashboard tab is open. Each check spends a small number of credits.",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "dashboard.usage_text_scrape_enabled"
   },
   {
     "id": "display.theme",

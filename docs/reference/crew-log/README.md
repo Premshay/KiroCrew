@@ -14,6 +14,9 @@ unit's history.
 These pages say WHAT the format is. For WHY it is shaped this way, read
 [`crew-log-core.md`](../../system-specs/modules/crew-log-core.md) and
 [`crew-log-emitter.md`](../../system-specs/modules/crew-log-emitter.md).
+For how a session's file is FOLDED into the views a reader sees, and the routes
+and frame that serve them, read
+[`crew-log-projection.md`](../../system-specs/modules/crew-log-projection.md).
 
 ## Contents
 
@@ -23,7 +26,8 @@ These pages say WHAT the format is. For WHY it is shaped this way, read
 | [session-types.md](session-types.md) | Every session log entry type, one subsection each, with fields and an example. |
 | [crew-types.md](crew-types.md) | The crew's log's type families and the two dispatch contracts. |
 | [reading-and-writing.md](reading-and-writing.md) | Reader API, writer rules, ownership, and the fail-soft emitter. |
-| [errors.md](errors.md) | Every `LedgerError` code, its trigger, and what a caller does about it. |
+| [errors.md](errors.md) | Every `CrewLogError` code, its trigger, and what a caller does about it. |
+| [reading-from-an-agent.md](reading-from-an-agent.md) | The read-only `kirocrew-crew-log` MCP server: its three tools, their caps and codes, who may read what, and the one-line agent-spec grant. |
 
 ## Glossary
 

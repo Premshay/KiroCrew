@@ -75,8 +75,8 @@ class SpawnContext:
     home: Path
     """One snapshot of the home directory, for the same reason."""
 
-    private_memory: bool = field(default=False, kw_only=True)
-    """Trusted private execution flag; never supplied by an agent-controlled spec."""
+    member_context: bool = field(default=False, kw_only=True)
+    """Capture native member context sources for session delivery deduplication."""
 
     sandbox_mode: str = "auto"
     """The sandbox tier this spawn will use, as configured.
@@ -104,6 +104,14 @@ class SpawnPlan:
     """The argv to spawn, plus what the spawn decided about itself."""
 
     argv: list[str]
+
+    rss_depth: int | None = field(default=None, kw_only=True)
+    """Resolved RSS generations below the pid Crew launches.
+
+    ``None`` measures the whole descendant subtree. A bounded value is already
+    relative to the launched pid, including any resident sandbox launcher, so the
+    shared spawn path only copies it and performs no host-specific probe.
+    """
 
     native_context_documents: tuple[tuple[str, str], ...] = field(default=(), kw_only=True)
     """Admitted sources owned by this exact native launch configuration."""
@@ -260,8 +268,10 @@ class TeardownPolicy:
 class ReclaimPolicy:
     """When a warm process is recycled.
 
-    Both numbers are already per-instance on the runtime, so a host with a
-    different memory profile needs no branch -- only different values.
+    The two numbers are already per-instance on the runtime, so a host with a
+    different memory profile needs no branch -- only different values. The process
+    scope belongs to :class:`SpawnPlan`, where the harness can resolve it against
+    the exact spawn configuration before this threshold is applied.
     """
 
     max_age_secs: float
@@ -314,6 +324,18 @@ class HarnessAdapter(abc.ABC):
     @abc.abstractmethod
     def pod_home_remap(self) -> bool:
         """The child's ``HOME`` is remapped when spawned inside a pod bundle."""
+
+    @property
+    @abc.abstractmethod
+    def client_meta_settings(self) -> bool:
+        """The host reads feature settings from ``initialize``'s ``_meta.kiro.settings``.
+
+        When true the runtime fills that channel at spawn (today: MCP Tool
+        Search, gated on the spawn agent's loader grant). When false the host
+        takes its settings elsewhere -- kiro-cli reads the workspace ``cli.json``
+        overlay -- and the handshake is sent exactly as :attr:`client_capabilities`
+        declares it.
+        """
 
     @property
     @abc.abstractmethod
@@ -454,4 +476,8 @@ class HarnessAdapter(abc.ABC):
         The runtime's values are passed in so an operator's configuration still
         wins; a harness narrows them for a host that is known to leak faster,
         and otherwise passes them straight through.
+
+        A host that measures a different process scope may return a ceiling in
+        that scope's unit rather than narrow the input. The resolved scope travels
+        separately on :class:`SpawnPlan`.
         """

@@ -186,9 +186,14 @@ slash-free in practice). Clone/fork keep the id in the JSON body instead.
 POST/PATCH/DELETE require an unrestricted session. The HTTP body envelope is
 capped at 2 MiB; the store enforces a per-content cap of 25 MiB
 (`artifacts.MAX_CONTENT_BYTES`), large enough for cloned/pulled rich artifacts
-(HTML reports, CSVs). The MCP save/update field cap
-(`validation.ARTIFACT_CONTENT_MAX`) imports that same constant so the tool and
-store paths never disagree.
+(HTML reports, CSVs). The number is owned by `constants.ARTIFACT_MAX_CONTENT_BYTES`;
+`artifacts.MAX_CONTENT_BYTES` and the MCP save/update field cap
+(`validation.ARTIFACT_CONTENT_MAX`) are both that name, so the tool and store
+paths never disagree. It lives in the `constants` leaf rather than in `artifacts`
+because `validation` importing `artifacts` closed the cycle `artifacts -> hooks
+-> webhooks -> validation -> artifacts`, which raised ImportError in any process
+whose first `kiro_crew` import reached `artifacts` before `validation`;
+`test_agent_import_hoist.py` pins that `validation` never imports `artifacts`.
 
 **Folders:** `Artifact.folder_id` (`""` = unfiled) is an opaque,
 rename-safe membership id, tolerant-loaded for legacy meta.json.
@@ -451,9 +456,25 @@ wrong bytes at a URL the user already knows about; a stale withdrawal leaves con
 served that the user believes they took down, which is the worse failure and the one
 worth surfacing as an error the user can act on.
 
-The public-exposure warning and the blocking `PublicPublishAckModal` are
-unchanged and unconditional — every destination gets both, on the clean path and
-on a scan override.
+The public-exposure warning and the blocking `PublicPublishAckModal` are gated
+on the selected destination's `public_reachable` descriptor field
+(`PublishProvider.public_reachable`, class attribute, default `True`, carried
+on each `GET /api/artifacts/publish-providers` row). A destination whose
+published link is served with no authentication gets both, on the clean path
+and on a scan override, exactly as before. A destination that declares `False`
+-- one that stores content privately behind a login -- gets neither: the
+confirm click publishes directly, because both surfaces say the content is
+going onto the open internet, and a gate that lies where the destination is
+private teaches the user to click past it where it is public. The publish flow
+always requests `visibility: PUBLIC`, so `False` asserts that even a
+publication the provider files as PUBLIC is served only to an authenticated
+reader; a provider whose PUBLIC publications are readable by anyone must leave
+it `True`. The default is
+`True` and the frontend treats an omitted field as `True`, so a provider must
+declare that it needs authentication; the failure mode of the wrong default is
+a public link with no warning. App-registered rows from
+`GET /api/publish-providers` are the public-web deploy surface and are always
+treated as reachable.
 
 ## Widget auto-registration
 

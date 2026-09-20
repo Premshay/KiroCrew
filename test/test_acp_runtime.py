@@ -179,10 +179,14 @@ def kas_readiness_wire(monkeypatch, tmp_path):
         servers = injected if injected is not None else [{"name": "kirocrew-dashboard"}]
         if resume:
             # Load gets the session injection through the existing overlay seam.
+            # ``**_kw``: the real signature takes the session's checkout as
+            # ``work_dir``, and a double that refuses it makes ``load_session``
+            # raise before it ever reaches the wire, so every assertion below
+            # fails as a handshake timeout instead of naming the double.
             monkeypatch.setattr(
                 runtime_mod,
                 "pooled_session_servers",
-                lambda *_: servers,
+                lambda *_, **_kw: servers,
             )
             start = rt.load_session("", "ready-session", **kwargs)
         else:
@@ -523,14 +527,17 @@ async def test_kas_readiness_accepts_provenance_less_wire_for_injected_servers(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+@pytest.mark.parametrize("catalog", [True, False], ids=["catalog", "no-catalog"])
 async def test_kas_default_managed_core_is_hoisted_and_ready_on_provenance_less_wire(
-    kas_readiness_wire, monkeypatch, resume
+    kas_readiness_wire, monkeypatch, resume, catalog
 ):
     """The ordinary install: ``kirocrew-core`` declared only by the agent spec,
     nothing stubbed. The runtime carries the projected declaration in the
     session-level array (``2.18.0-payload-probe.json``: that payload connects
     Crew's own server past colliding global and workspace entries on new and
     load), so the provenance-less wire reads it as injected and startup completes.
+    Exposure comes from the connected entry's own catalog when it carries one
+    (2.18.0 through 2.22.0 all do), and only otherwise from a tag frame.
     """
     from kiro_crew.acp.kas_agents import to_client_custom_agent
 
@@ -557,10 +564,13 @@ async def test_kas_default_managed_core_is_hoisted_and_ready_on_provenance_less_
         sent = wire.runtime._kas_custom_agents.call_args
         assert sent.kwargs["session_key"] == "subagent:default-worker"
         await wire.take(wire.reads)
-        wire.status("connected", origin=None, tools=[{"name": "ping", "disabled": False}])
-        await wire.take(wire.reads)
-        assert not start.done(), "exposure is still required for an injected server"
-        wire.tags("kirocrew-core", "kirocrew-dashboard")
+        if catalog:
+            wire.status("connected", origin=None, tools=[{"name": "ping", "disabled": False}])
+        else:
+            wire.status("connected", origin=None)
+            await wire.take(wire.reads)
+            assert not start.done(), "exposure is still required for an injected server"
+            wire.tags("kirocrew-core", "kirocrew-dashboard")
         handle = await asyncio.wait_for(start, 3.0)
         assert set(handle.mcp_session_report().payload()["ready"]) == {
             "kirocrew-core",
@@ -604,21 +614,20 @@ async def test_kas_readiness_accepts_pre_response_reports_for_unchanged_mode(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
 @pytest.mark.parametrize(
-    "tools,excluded,catalog_state,needs_tag",
+    "tools,excluded,catalog_state",
     [
-        (["read"], [], "enabled", False),
-        (["*"], ["@kirocrew-core"], "enabled", False),
-        (["@kirocrew-core/memory_recall"], ["@kirocrew-core/memory_recall"], "enabled", False),
-        (["@kirocrew-core/memory_recall"], ["@kirocrew-core/memory_recall"], "empty", False),
+        (["read"], [], "enabled"),
+        (["*"], ["@kirocrew-core"], "enabled"),
+        (["@kirocrew-core/memory_recall"], ["@kirocrew-core/memory_recall"], "enabled"),
+        (["@kirocrew-core/memory_recall"], ["@kirocrew-core/memory_recall"], "empty"),
         (
             ["@kirocrew-core"],
             ["@kirocrew-core/memory_recall", "@kirocrew-core/learn_add"],
             "enabled",
-            False,
         ),
-        (["@kirocrew-core/memory_recall"], [], "disabled", False),
-        (["*"], [], "disabled", False),
-        (["@kirocrew-core"], ["@kirocrew-core/learn_add"], "enabled", True),
+        (["@kirocrew-core/memory_recall"], [], "disabled"),
+        (["*"], [], "disabled"),
+        (["@kirocrew-core"], ["@kirocrew-core/learn_add"], "enabled"),
     ],
     ids=[
         "no-server-grant",
@@ -628,13 +637,17 @@ async def test_kas_readiness_accepts_pre_response_reports_for_unchanged_mode(
         "excluded-all-tools",
         "disabled-selected-tool",
         "disabled-all-tools",
-        "unapproved-recall-still-needs-exposure",
+        "unapproved-recall-exposed-by-catalog",
     ],
 )
 async def test_kas_readiness_respects_projected_tool_restrictions(
-    kas_readiness_wire, monkeypatch, resume, tools, excluded, catalog_state, needs_tag
+    kas_readiness_wire, monkeypatch, resume, tools, excluded, catalog_state
 ):
-    """A declared server with intentionally hidden tools must still connect."""
+    """A declared server with intentionally hidden tools must still connect.
+
+    The last case is the one with an exposed tool: its connected catalog is the
+    exposure evidence, so no tag frame is needed (none arrives on 2.22.0).
+    """
     from kiro_crew.acp.kas_agents import to_client_custom_agent
 
     wire = kas_readiness_wire
@@ -671,10 +684,6 @@ async def test_kas_readiness_respects_projected_tool_restrictions(
             await wire.take(wire.reads)
         assert not start.done(), "A restricted tool policy does not waive connection readiness"
         wire.status("connected", tools=catalog)
-        if needs_tag:
-            await wire.take(wire.reads)
-            assert not start.done(), "Approval policy does not remove exposure requirements"
-            wire.tags("kirocrew-core", "kirocrew-dashboard")
         handle = await asyncio.wait_for(start, 3.0)
         assert set(handle.mcp_session_report().payload()["ready"]) == {
             "kirocrew-core",
@@ -1877,7 +1886,7 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
         return work_dir, None
 
     monkeypatch.setattr(runtime_mod, "bind_voice_safe_agent_workspace_async", _unbound_workspace)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", stop_spawn)
+    monkeypatch.setattr(runtime_mod, "create_subprocess_limited", stop_spawn)
 
     runtime = AcpRuntime(work_dir=tmp_path / "workspace")
     with pytest.raises(_StopSpawn):
@@ -2054,11 +2063,35 @@ def _death_records(caplog):
 
 def _neuter_kill_side_effects(monkeypatch, proc):
     """Keep kill() away from the host: never signal the fake PID (4242 could be
-    a real process), never touch the PID-tracking files."""
+    a real process), never touch the PID-tracking files.
+
+    The Windows drain stand-in awaits ``process.wait()`` because the real
+    ``terminate_windows_asyncio_tree`` does, and that await is what populates
+    ``returncode``. A stand-in returning without it hands the Windows branch a
+    process whose status is unreadable, so every assertion about the post-reap
+    exit status would read the unreaped placeholder on that platform alone --
+    the double disagreeing with the code rather than the code being wrong.
+
+    That await carries the real one's BOUND as well, off the same constant: a
+    child that never exits makes the real drain raise rather than wait forever,
+    so a stand-in awaiting without the bound turns a test whose child never
+    exits into a hang instead of a failure.
+    """
     import kiro_crew.acp.runtime as rt_mod
 
     proc.wait = AsyncMock(return_value=0)
+
+    async def _drain_windows_tree(process):
+        await asyncio.wait_for(
+            process.wait(),
+            timeout=rt_mod.platform_compat._WINDOWS_TREE_REAP_TIMEOUT_SECS,
+        )
+        return True
+
     monkeypatch.setattr(rt_mod.platform_compat, "kill_process_tree", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rt_mod.platform_compat, "terminate_windows_asyncio_tree", _drain_windows_tree
+    )
     monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: False)
     monkeypatch.setattr(rt_mod, "_untrack_pid", lambda p: None)
     monkeypatch.setattr(rt_mod, "_untrack_session_pid", lambda p: None)
@@ -2215,6 +2248,294 @@ async def test_unexpected_process_exit_still_warns_with_diagnostic_shape(caplog)
     assert "process exited (rc=1)" in msg
     assert "returncode=1" in msg
     assert "stderr_tail: <none>" in msg
+
+
+# ── A returncode nobody could read yet is labelled, never printed as None ─────
+#
+# ``_kill_inner`` marks the death BEFORE it signals, so pending waiters learn of
+# it first. ``_mark_dead`` then reads ``returncode`` on a process that has not
+# been reaped, and the line it wrote was indistinguishable from a child killed
+# by a signal whose status was never captured: ``killed [returncode=None]
+# stderr_tail: <none>`` — the shape an operator chasing an external killer had
+# to work from. The status is labelled at mark time and filled in once the reap
+# lands.
+
+
+def _reap_records(caplog):
+    """The post-reap amendment records, selected by the raw log template."""
+    return [r for r in caplog.records if str(r.msg).startswith("AcpRuntime reaped after kill")]
+
+
+@pytest.mark.asyncio
+async def test_kill_of_live_runtime_labels_the_unreaped_returncode(caplog, monkeypatch):
+    """A live runtime killed by a caller has no exit status at mark time. The
+    death line must say so rather than print a bare ``returncode=None``, which
+    reads as "died by signal, status unknown" — the wrong suspect."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    assert proc.returncode is None  # live: nothing has reaped it
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(reason="displaced by a new allocation")
+
+    msg = _death_records(caplog)[0].getMessage()
+    assert "returncode=<not reaped>" in msg
+    assert "returncode=None" not in msg
+    assert "displaced by a new allocation" in msg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("expected", "level"), [(False, "WARNING"), (True, "INFO")])
+async def test_kill_amends_the_summary_once_the_reap_completes(
+    expected, level, caplog, monkeypatch
+):
+    """The status IS knowable after the reap. It is written into the retained
+    summary — which outlives the log, riding AcpProcessDied into a turn's error
+    and a cron's last_error — and logged at the death's own severity, so an
+    operator filtering one level never sees the death without the code."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+
+    async def _wait():
+        proc.returncode = -15  # the SIGTERM this kill just sent
+        return proc.returncode
+
+    proc.wait = _wait
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(expected=expected, reason="warm mint teardown")
+
+    summary = rt.death_summary()
+    assert summary is not None
+    assert "[returncode=-15]" in summary
+    assert "<not reaped>" not in summary
+    assert "returncode=None" not in summary
+    assert "warm mint teardown" in summary
+    reaped = _reap_records(caplog)
+    assert [r.levelname for r in reaped] == [level]
+    assert "returncode=-15" in reaped[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_reap_amendment_leaves_the_stderr_tail_untouched(caplog, monkeypatch):
+    """The amendment rebuilds the line from its parts, so a child stderr line
+    that happens to carry this format's own ``[returncode=...]`` shape is
+    carried through verbatim. Editing the composed text instead would rewrite
+    that tail as an exit status -- the diagnostic destroying its own evidence,
+    in the one string that outlives the log."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    echoed = "child said [returncode=<not reaped>] on its way out"
+    rt._stderr_lines = [echoed]
+
+    async def _wait():
+        proc.returncode = -15
+        return proc.returncode
+
+    proc.wait = _wait
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(reason="displaced by a new allocation")
+
+    summary = rt.death_summary()
+    assert summary is not None
+    assert summary.endswith(f"stderr_tail: {echoed}")
+    assert "[returncode=-15]" in summary
+    # Exactly one status field, and the child's copy is not it.
+    assert summary.count("[returncode=") == 2
+    assert summary.count("[returncode=-15]") == 1
+
+
+@pytest.mark.asyncio
+async def test_reap_amendment_leaves_the_reason_untouched(caplog, monkeypatch):
+    """The REASON can carry child text too, and it sits BEFORE the status field:
+    ``_exit_reason`` appends the child's last stderr line, and a reader-crash
+    reason embeds an exception message. So bounding a text rewrite to the first
+    hit is not enough either — the first hit can be inside the reason."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    poisoned = "reader crash: boom [returncode=<not reaped>] while draining"
+    rt._mark_dead(poisoned)  # a death already recorded, status not yet read
+
+    async def _wait():
+        proc.returncode = -15
+        return proc.returncode
+
+    proc.wait = _wait
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(reason="reaping a dead runtime")
+
+    summary = rt.death_summary()
+    assert summary is not None
+    assert summary.startswith(poisoned)
+    assert summary.endswith("[returncode=-15] stderr_tail: <none>")
+
+
+@pytest.mark.asyncio
+async def test_the_windows_branch_amends_the_summary_too(caplog, monkeypatch):
+    """The Windows teardown runs INSTEAD of the POSIX ladder and returns from
+    ``_kill_inner`` on its own, so it has to record the reap itself. Pinned with
+    the platform forced rather than left to the Windows shards, because a branch
+    only one CI lane reaches is a branch whose loss is invisible everywhere else
+    -- and the status it carries outlives the log, riding ``AcpProcessDied`` into
+    a turn's error and a cron's ``last_error``."""
+    import logging
+
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    monkeypatch.setattr(rt_mod.platform_compat, "IS_WINDOWS", True)
+
+    async def _wait():
+        proc.returncode = 1  # a Win32 exit code, never a negative signal
+        return proc.returncode
+
+    proc.wait = _wait
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(expected=True, reason="warm mint teardown")
+
+    summary = rt.death_summary()
+    assert summary is not None
+    assert "[returncode=1]" in summary
+    assert "<not reaped>" not in summary
+    assert "returncode=None" not in summary
+    reaped = _reap_records(caplog)
+    assert [r.levelname for r in reaped] == ["INFO"]
+
+
+@pytest.mark.asyncio
+async def test_an_unconfirmed_windows_drain_leaves_the_placeholder(caplog, monkeypatch):
+    """A drain that cannot confirm every member's exit RAISES and keeps the
+    process pinned for maintenance to retry. The status is then genuinely
+    unknown, so the placeholder must survive: amending it from a handle whose
+    tree was never drained would state an exit this runtime cannot vouch for."""
+    import logging
+
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    monkeypatch.setattr(rt_mod.platform_compat, "IS_WINDOWS", True)
+
+    async def _drain_fails(process):
+        raise OSError("Windows tree tracking retirement did not complete")
+
+    monkeypatch.setattr(rt_mod.platform_compat, "terminate_windows_asyncio_tree", _drain_fails)
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        with pytest.raises(OSError):
+            await rt.kill(reason="warm mint teardown")
+
+    summary = rt.death_summary()
+    assert summary is not None
+    assert "[returncode=<not reaped>]" in summary
+    assert _reap_records(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_no_amendment_when_the_status_was_already_known(caplog, monkeypatch):
+    """A process that exited on its own is marked WITH its code, so nothing is
+    owed after the reap — not even when the stderr tail happens to carry the
+    unread-status shape. Deciding this from the summary's text rather than from
+    the status actually recorded would answer yes on that tail."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    proc.returncode = 1  # already exited: the status was read at mark time
+    rt._stderr_lines = ["child said [returncode=<not reaped>] on its way out"]
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(reason="reaping a dead runtime")
+
+    summary = rt.death_summary()
+    assert summary is not None
+    assert "[returncode=1]" in summary
+    assert _reap_records(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_kill_keeps_the_label_when_no_status_ever_arrives(caplog, monkeypatch):
+    """Both waits can time out (a child wedged in uninterruptible sleep), and
+    the status is then still unknown. ``<not reaped>`` must stay: nothing may
+    claim a code that was never observed.
+
+    The two waits are the POSIX ladder's, so the platform is forced to it: on
+    Windows that ladder never runs, and this child is exactly the one whose
+    drain raises instead of returning -- a different contract, pinned by
+    ``test_an_unconfirmed_windows_drain_leaves_the_placeholder``."""
+    import logging
+
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    monkeypatch.setattr(rt_mod.platform_compat, "IS_WINDOWS", False)
+    # The signal delivery itself is covered by the tree-kill tests; this one is
+    # about what the summary says when the reap window closes empty.
+    monkeypatch.setattr(rt, "_signal_tree", AsyncMock(return_value={}))
+    rt._KILL_TERM_TIMEOUT = 0.01
+    rt._KILL_REAP_TIMEOUT = 0.01
+
+    async def _never():
+        await asyncio.sleep(3600)
+
+    proc.wait = _never
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(reason="failed session setup cleanup")
+
+    summary = rt.death_summary()
+    assert summary is not None
+    assert "[returncode=<not reaped>]" in summary
+    assert _reap_records(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_death_of_a_never_spawned_runtime_says_no_process(caplog, monkeypatch):
+    """No process to ask is a third answer, distinct from both a real code and
+    an unreaped one — and it is the state the reported kill site was in."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    rt._process = None  # spawn never completed
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(reason="reaping a dead shared subagent runtime before respawn")
+
+    msg = _death_records(caplog)[0].getMessage()
+    assert "returncode=<no process>" in msg
+    assert "returncode=None" not in msg
+
+
+@pytest.mark.asyncio
+async def test_reader_crash_on_a_running_child_does_not_print_returncode_none(caplog):
+    """The label is not kill-only. A reader crash or a broken pipe kills the
+    RUNTIME while the child is still running, so the status is unread on those
+    paths too — and the same bare ``None`` reached the log from them."""
+    import logging
+
+    rt, _, _ = _make_runtime()
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        rt._mark_dead("reader crash: boom")
+
+    msg = _death_records(caplog)[0].getMessage()
+    assert "returncode=<not reaped>" in msg
+    assert "returncode=None" not in msg
+    assert "returncode=None" not in (rt.death_summary() or "")
 
 
 # ── process-exit reason carries the child's last stderr line ──────────────────
@@ -2467,7 +2788,7 @@ async def test_is_stale_none_when_old_but_small_rss(monkeypatch):
     rt._max_age_secs = 6 * 3600
     rt._spawn_monotonic = time.monotonic() - 600.0  # older than the probe band
     rt._max_rss_mb = 500.0
-    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", lambda pid: 10.0)
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", lambda pid, depth=None: 10.0)
     assert await rt._is_stale() is None
 
 
@@ -2487,8 +2808,166 @@ async def test_is_stale_rss_when_tree_over_threshold(monkeypatch):
     rt._max_age_secs = 6 * 3600
     rt._spawn_monotonic = time.monotonic() - 600.0  # old enough to probe
     rt._max_rss_mb = 100.0
-    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", lambda pid: 250.0)
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", lambda pid, depth=None: 250.0)
     assert await rt._is_stale() == "rss"
+
+
+@pytest.mark.asyncio
+async def test_the_declared_reclaim_scope_reaches_the_probe(monkeypatch):
+    """A harness that bounds its RSS scope must have that bound actually applied.
+
+    The ceiling and the scope are one decision: applied without its scope, a
+    core-only ceiling is judged against a whole-subtree measurement, which for a
+    host whose subtree is dominated by a per-session fleet reads as a leak on the
+    first session and recycles a healthy process. Pinned on the ARGUMENT the probe
+    receives, because a policy field that is stored and never passed is exactly the
+    failure that looks correct in the policy object.
+    """
+    rt, _, _ = _make_runtime()
+    rt._max_age_secs = 6 * 3600
+    rt._spawn_monotonic = time.monotonic() - 600.0
+    rt._max_rss_mb = 1024.0
+    rt._max_rss_depth = 1
+    seen: list[object] = []
+
+    def _probe(pid, depth=None):
+        seen.append(depth)
+        return 250.0
+
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", _probe)
+    assert await rt._is_stale() is None
+    assert seen == [1]
+
+
+@pytest.mark.asyncio
+async def test_an_unbounded_scope_is_the_default_and_is_passed_as_such(monkeypatch):
+    """Every kiro-family host measures the whole subtree, and must keep doing so."""
+    rt, _, _ = _make_runtime()
+    rt._max_age_secs = 6 * 3600
+    rt._spawn_monotonic = time.monotonic() - 600.0
+    rt._max_rss_mb = 100.0
+    seen: list[object] = []
+
+    def _probe(pid, depth=None):
+        seen.append(depth)
+        return 250.0
+
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", _probe)
+    assert await rt._is_stale() == "rss"
+    assert seen == [None]
+
+
+def test_a_forking_sandbox_backend_adds_one_generation():
+    """``self._pid`` is the launcher there, not the adapter the harness counts from.
+
+    The probe is patched in the module that CALLS it, not in ``kiro_crew.sandbox``:
+    the harness binds the name at import, so patching the definition site leaves the
+    real backend probe in place and the assertion reads this host instead of the case.
+    """
+    from kiro_crew.acp.harness.codex import _sandbox_wrapper_generations
+
+    with patch("kiro_crew.acp.harness.codex.detect_backend", return_value="namespace"):
+        assert _sandbox_wrapper_generations("standard") == 1
+
+
+@pytest.mark.parametrize("backend", ["sandbox-exec", "none"])
+def test_an_execing_or_absent_backend_adds_none(backend):
+    """Both leave the adapter AS ``self._pid``, so a declared depth is already right."""
+    from kiro_crew.acp.harness.codex import _sandbox_wrapper_generations
+
+    with patch("kiro_crew.acp.harness.codex.detect_backend", return_value=backend):
+        assert _sandbox_wrapper_generations("standard") == 0
+
+
+def test_a_failed_probe_answers_zero_and_can_only_under_count():
+    """Fail-safe direction: an offset too small reaches the ceiling late, never early."""
+    from kiro_crew.acp.harness.codex import _sandbox_wrapper_generations
+
+    with patch("kiro_crew.acp.harness.codex.detect_backend", side_effect=OSError("boom")):
+        assert _sandbox_wrapper_generations("standard") == 0
+
+
+def test_the_spawn_path_does_not_branch_on_rss_depth():
+    """H13: a host-specific RSS scope adds no conditional to the shared spawn."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(AcpRuntime._spawn_admitted)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        attributes = {
+            child.attr for child in ast.walk(node.test) if isinstance(child, ast.Attribute)
+        }
+        assert attributes.isdisjoint({"rss_depth", "_max_rss_depth"})
+
+
+@pytest.mark.asyncio
+async def test_a_bounded_scope_is_offset_by_the_launcher_generation(monkeypatch):
+    """The bug this pins: a launcher counted as the adapter hides the growing child.
+
+    Under a forking backend the tree is launcher -> adapter -> app-server, so a
+    harness declaring "the adapter and its direct children" needs depth 2 measured
+    from ``self._pid``. Applied unoffset, the sum stops at the adapter -- which is
+    the FLAT process -- and the ceiling never sees the child that actually grows, so
+    the leak detector reads healthy forever.
+    """
+    rt, _, _ = _make_runtime()
+    rt._max_age_secs = 6 * 3600
+    rt._spawn_monotonic = time.monotonic() - 600.0
+    rt._max_rss_mb = 1024.0
+    rt._max_rss_depth = 2
+    seen: list[object] = []
+
+    def _probe(pid, depth=None):
+        seen.append(depth)
+        return 100.0
+
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", _probe)
+    assert await rt._is_stale() is None
+    assert seen == [2]
+
+
+@pytest.mark.asyncio
+async def test_the_offset_does_not_touch_an_unbounded_scope(monkeypatch):
+    """An extra generation at the top changes nothing when the whole subtree is summed.
+
+    So the offset must stay out of the kiro-family answer entirely rather than being
+    added and then ignored -- a None that arrives as an integer would silently bound
+    a measurement nothing asked to bound.
+    """
+    rt, _, _ = _make_runtime()
+    rt._max_age_secs = 6 * 3600
+    rt._spawn_monotonic = time.monotonic() - 600.0
+    rt._max_rss_mb = 100.0
+    rt._max_rss_depth = None
+    seen: list[object] = []
+
+    def _probe(pid, depth=None):
+        seen.append(depth)
+        return 250.0
+
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", _probe)
+    assert await rt._is_stale() == "rss"
+    assert seen == [None]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_bounded_measurement_does_not_recycle(monkeypatch):
+    """None is "unknown, do not judge" -- the platform without a bounded walk.
+
+    Answering with a subtree total there would apply a bounded host's ceiling to an
+    unbounded measurement. Abstaining leaves the age ceiling governing, which is why
+    a None must not read as a breach.
+    """
+    rt, _, _ = _make_runtime()
+    rt._max_age_secs = 6 * 3600
+    rt._spawn_monotonic = time.monotonic() - 600.0
+    rt._max_rss_mb = 1.0
+    rt._max_rss_depth = 1
+    monkeypatch.setattr("kiro_crew.acp.runtime._get_rss_tree_mb", lambda pid, depth=None: None)
+    assert await rt._is_stale() is None
 
 
 @pytest.mark.asyncio
@@ -5227,22 +5706,29 @@ class TestAcpRuntimePidTracking:
 
         calls: dict[str, list[int]] = {"pid": [], "session": []}
         import kiro_crew.acp.runtime as rt_mod
+        import kiro_crew.session_pid as pid_mod
 
-        # runtime.py imports these at module top (from kiro_crew.session_pid
-        # import _untrack_pid, _untrack_session_pid), so kill() resolves them in
-        # the runtime namespace — patch WHERE USED, not the source module.
-        monkeypatch.setattr(rt_mod, "_untrack_pid", lambda p: calls["pid"].append(p))
-        monkeypatch.setattr(rt_mod, "_untrack_session_pid", lambda p: calls["session"].append(p))
-        # os.killpg / getpgid on the fake PID would raise — the kill() body
-        # already guards those with OSError/ProcessLookupError, so let them fire.
-        #
-        # kill() only untracks once pid_exists() confirms the process is GONE, so
-        # stub that decision instead of betting the fake PID is absent from the
-        # host's process table. It is not a safe bet: Windows recycles PIDs from a
-        # small space, and on a CI runner spawning subprocesses across xdist
-        # workers 4242 was intermittently a REAL live process -- kill() then took
-        # the survivor branch and this asserted `[] == [4242]`.
-        monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: False)
+        def untrack(kind, pid):
+            calls[kind].append(pid)
+            return True
+
+        if rt_mod.platform_compat.IS_WINDOWS:
+            # Windows retires metadata inside the owned drain, under its pin.
+            # Keep that path real and replace only the kernel-facing operations.
+            pc = rt_mod.platform_compat
+            monkeypatch.setattr(pc, "_WINDOWS_TREE_ADMISSIONS", set())
+            monkeypatch.setattr(pc, "_PENDING_WINDOWS_TREE_CLEANUPS", {})
+            monkeypatch.setattr(pc, "duplicate_asyncio_process_handle", lambda p: 5151)
+            monkeypatch.setattr(pc, "_windows_process_handle_identity", lambda h: (4242, 77, 88))
+            monkeypatch.setattr(pc, "_drain_windows_process_tree", lambda state: True)
+            monkeypatch.setattr(pc, "close_process_handle", lambda h: None)
+            monkeypatch.setattr(pid_mod, "_untrack_pid", lambda p: untrack("pid", p))
+            monkeypatch.setattr(pid_mod, "_untrack_session_pid", lambda p: untrack("session", p))
+        else:
+            monkeypatch.setattr(rt_mod, "_untrack_pid", lambda p: untrack("pid", p))
+            monkeypatch.setattr(rt_mod, "_untrack_session_pid", lambda p: untrack("session", p))
+            monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: False)
+            monkeypatch.setattr(rt_mod.platform_compat, "kill_process_tree", lambda *a: None)
 
         await rt.kill()
 
@@ -5267,8 +5753,19 @@ class TestAcpRuntimePidTracking:
         monkeypatch.setattr(rt_mod, "_untrack_pid", lambda p: calls["pid"].append(p))
         monkeypatch.setattr(rt_mod, "_untrack_session_pid", lambda p: calls["session"].append(p))
         monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: True)
+        monkeypatch.setattr(rt_mod.platform_compat, "kill_process_tree", lambda *a: None)
+        monkeypatch.setattr(
+            rt_mod.platform_compat,
+            "terminate_windows_asyncio_tree",
+            AsyncMock(side_effect=OSError("fixture tree still alive")),
+        )
 
-        await rt.kill()
+        if rt_mod.platform_compat.IS_WINDOWS:
+            with pytest.raises(OSError, match="fixture tree still alive"):
+                await rt.kill()
+            assert rt._process is proc
+        else:
+            await rt.kill()
 
         assert calls["pid"] == []
         assert calls["session"] == []
@@ -5326,8 +5823,8 @@ def _without_identity_env(elements):
 class TestAcpRuntimeLoadSession:
     """load_session() must mirror AcpClient._initialize_session's resume path:
     issue session/load DIRECTLY (no session/new first) under the ORIGINAL sid,
-    with the same cwd + mcpServers (pooled broker stubs re-declared; [] when no
-    overlay is configured) + _kiro.dev/session_file _meta. The double-session
+    with the same cwd + mcpServers (pooled stubs and managed direct tools)
+    + _kiro.dev/session_file _meta. The double-session
     drift it replaces produced stopReason='refusal'."""
 
     @pytest.mark.asyncio
@@ -5359,12 +5856,13 @@ class TestAcpRuntimeLoadSession:
         assert methods[0] == METHOD_SESSION_LOAD
 
         load_params = sent[0][1]
+        servers = load_params["mcpServers"]
+        assert [entry["name"] for entry in servers] == ["kirocrew-core", "kirocrew-cron"]
+        assert all(_identity_tokens(servers))
         assert load_params == {
             "sessionId": "sid-123",
             "cwd": "/work",
-            # [] because _make_runtime configures no MCP-gateway overlay — the
-            # non-pooled path is unchanged by the stub re-declaration.
-            "mcpServers": [],
+            "mcpServers": servers,
             "_meta": {"_kiro.dev/session_file": "/home/u/.kiro/sessions/cli/sid-123.json"},
         }
         # Handle adopts the ORIGINAL sid and its queue is registered.
@@ -5489,6 +5987,61 @@ class TestAcpRuntimeLoadSession:
         )
 
     @pytest.mark.asyncio
+    async def test_the_kas_resume_report_reads_the_hoisted_array(self, monkeypatch):
+        """The session report must name the array the resume SENT, post-hoist.
+
+        ``hoist_managed_servers`` moves a managed server out of the agent definition
+        and into the session array, so on KAS the array the wire carries is not the
+        one the roster was bound from. The report and the stall diagnostic read that
+        binding, so a resume that re-assigned only the request param would describe
+        servers it did not send -- the pre-hoist roster -- while the session ran on
+        the hoisted one.
+        """
+        rt, _, _ = _make_runtime()
+        rt._can_load_session = True
+        sent: list[tuple[str, dict]] = []
+
+        async def _fake_send(method, params, timeout=None):
+            sent.append((method, params))
+            if method == METHOD_SESSION_LOAD:
+                return {"modes": {"currentModeId": "kirocrew"}, "models": []}
+            return {}
+
+        async def _fake_agents(agent, *, member_dispatch=False, session_key=""):
+            from kiro_crew.acp.harness import SessionExtras
+
+            return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
+
+        def _hoist(agents, agent, servers):
+            # The shape the real hoist produces: a managed server appears on the
+            # array that was not in the roster the caller passed in.
+            return agents, list(servers) + [{"name": "hoisted", "command": "/bin/h"}]
+
+        import kiro_crew.acp.runtime as runtime_mod
+
+        reported: list[list] = []
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
+        monkeypatch.setattr(runtime_mod, "hoist_managed_servers", _hoist)
+        monkeypatch.setattr(
+            rt,
+            "_guard_unresolved_mcp_refs",
+            lambda handle, spec, agent, wire: reported.append(wire),
+        )
+        rt._acp_backend = ACP_BACKEND_KAS
+
+        await rt.load_session("", "sid-hoist", cwd="/work", agent="kirocrew")
+
+        load_params = sent[0][1]
+        names = [e.get("name") for e in load_params["mcpServers"]]
+        assert "hoisted" in names, "the hoisted server never reached the wire"
+        assert reported, "the wire roster was never handed to the report/guard"
+        assert [e.get("name") for e in reported[-1]] == names, (
+            "the report reads a different array than the resume sent; rebind "
+            "wire_servers at the hoist rather than only load_params['mcpServers']"
+        )
+
+    @pytest.mark.asyncio
     async def test_load_session_keeps_the_transcript_path_alongside_the_agents(self, monkeypatch):
         """Merged, not assigned: a third _meta writer must not drop an earlier one.
 
@@ -5574,12 +6127,15 @@ class TestAcpRuntimeLoadSession:
         await rt.load_session("/k/sid.json", "sid", cwd="/w", agent="kirocrew")
 
         # Mirror of AcpClient's kiro-branch load_params (client.py step 2).
-        # mcpServers is [] on BOTH paths here because no overlay is configured;
+        # Direct managed tools retain per-session caller attribution on resume;
         # the pooled case is covered by test_load_session_redeclares_pooled_stubs.
+        servers = captured["mcpServers"]
+        assert [entry["name"] for entry in servers] == ["kirocrew-core", "kirocrew-cron"]
+        assert all(_identity_tokens(servers))
         expected = {
             "sessionId": "sid",
             "cwd": "/w",
-            "mcpServers": [],
+            "mcpServers": servers,
             "_meta": {"_kiro.dev/session_file": "/k/sid.json"},
         }
         assert captured == expected
@@ -5659,7 +6215,11 @@ class TestAcpRuntimeLoadSession:
 
         await rt.load_session("/k/sid.json", "sid-r", cwd="/w", agent="kirocrew")
         load_params = next(p for m, p in sent if m == METHOD_SESSION_LOAD)
-        assert [e["name"] for e in load_params["mcpServers"]] == ["builder-mcp"]
+        assert [e["name"] for e in load_params["mcpServers"]] == [
+            "builder-mcp",
+            "kirocrew-core",
+            "kirocrew-cron",
+        ]
 
         # Parity with create_session for the same agent + overlay: the two
         # injection paths must never diverge.
@@ -5703,7 +6263,9 @@ class TestAcpRuntimeLoadSession:
         loop_thread = threading.current_thread()
         seen: list[threading.Thread] = []
 
-        def _recording_pooled(overlay_dir, agent, channel_id=None):
+        def _recording_pooled(overlay_dir, agent, channel_id=None, **_kw):
+            # ``**_kw`` so the double keeps mirroring the real signature, which
+            # takes the session's checkout as ``work_dir``.
             seen.append(threading.current_thread())
             return []
 
@@ -7643,7 +8205,7 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
     monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: argv)
     monkeypatch.setattr(runtime_mod, "augmented_path", lambda p: p)
     monkeypatch.setattr(runtime_mod, "resolve_krb5_ccname", lambda env: None)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(runtime_mod, "create_subprocess_limited", _fake_exec)
 
     rt = AcpRuntime(sandbox_mode="auto")  # default tier
     with pytest.raises(_StopSpawn):
@@ -7701,7 +8263,7 @@ async def test_runtime_spawn_names_its_own_browser_session(monkeypatch):
     monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: argv)
     monkeypatch.setattr(runtime_mod, "augmented_path", lambda p: p)
     monkeypatch.setattr(runtime_mod, "resolve_krb5_ccname", lambda env: None)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(runtime_mod, "create_subprocess_limited", _fake_exec)
 
     names = []
     for _ in range(2):
@@ -10566,6 +11128,205 @@ async def test_pre_turn_drain_counts_an_error_response_terminal(caplog):
     assert "SECRETBOOM" not in _drain_lines[0], "error payload leaked into the drain warning"
     # No attribution: the drain cannot know which caller owned this response.
     assert "that turn's" not in _drain_lines[0], _drain_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_keeps_a_response_a_live_waiter_is_owed(caplog):
+    """A response whose req_id is STILL registered in ``_awaited_responses``
+    has a live consumer inside ``_wait_for_response``, so the drain must hand
+    it back rather than destroy it.
+
+    The abandoned TURN's own frames are owed to nobody: ``_run_turn`` refuses
+    to start while ``_turn_done`` is clear, and ``_turn_done`` is set in its
+    own ``finally``, so by the time the drain runs that turn's generator has
+    already exited. Discarding those is correct. A command/config call
+    (``send_command`` / ``compact`` / ``set_config_option``) is different: it
+    does not touch ``_turn_done``, so its ``_wait_for_response`` can be in
+    flight when the next turn starts — and for a oneshot the response IS the
+    terminal. Dropping it strands that caller until its own timeout (60s for
+    ``send_command``), which then reports failure for a call the backend
+    answered.
+
+    ``_awaited_responses`` is the discriminator that tells the two apart, and
+    the dispatch loop already routes on exactly it; the drain was the one queue
+    consumer that did not.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    # A live set_config_option waiter: registered, still inside its wait.
+    handle._awaited_responses.add(77)
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict({"jsonrpc": "2.0", "id": 77, "result": {"ok": True}})
+    )
+    # An ordinary leftover from the abandoned turn — owed to nobody, still dropped.
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict({"jsonrpc": "2.0", "id": 4, "result": {"stopReason": "cancelled"}})
+    )
+
+    _drain_lines = await _drain_warning_lines(handle, caplog)
+
+    # The owed frame survived the drain and is readable by its waiter.
+    _kept = await handle._wait_for_response(77, timeout=1.0)
+    assert _kept.id == 77
+    assert _kept.result == {"ok": True}
+
+    # Only the unowed frame was counted as discarded.
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    assert "1 leftover frame(s)" in _drain_lines[0], _drain_lines[0]
+    assert "1 of them" in _drain_lines[0], _drain_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_drops_a_response_no_waiter_is_owed(caplog):
+    """The retention is scoped to a REGISTERED waiter, not to every response.
+
+    A command call that already timed out has discarded its req_id in
+    ``_wait_for_response``'s ``finally``, so its late answer is owed to nobody
+    and must still drain — otherwise the retention leaks a stray frame into
+    every following turn. This is the mutant that would survive a bare
+    "keep all responses" rule.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    assert not handle._awaited_responses
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict({"jsonrpc": "2.0", "id": 77, "result": {"ok": True}})
+    )
+
+    _drain_lines = await _drain_warning_lines(handle, caplog)
+
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    assert "1 leftover frame(s)" in _drain_lines[0], _drain_lines[0]
+    assert handle._queue.empty(), "an unowed response was retained instead of drained"
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_answers_a_permission_request_whose_id_collides():
+    """The retention must not swallow a server→client REQUEST that happens to
+    carry the same integer id as an awaited response.
+
+    The two id spaces are independent: our client→server ids come from
+    ``AcpRuntime._next_id`` (starts at 1) and the backend mints its own request
+    ids, so a numeric collision is ordinary rather than exotic. A retained
+    permission request is never answered, which strands the backend's oneshot —
+    the exact hang the drain exists to prevent. ``method is None`` is what keeps
+    the retention to responses only.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+    handle.reject_tool = AsyncMock()
+
+    # Our own outstanding command call is waiting on id 3 ...
+    handle._awaited_responses.add(3)
+    # ... and the backend's stranded permission REQUEST also has id 3.
+    q["sA"].put_nowait(_permission_msg(3))
+
+    import contextlib
+
+    gen = handle.prompt("hi", timeout=0.2)
+    with contextlib.suppress(StopAsyncIteration, asyncio.TimeoutError, Exception):
+        await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+    await gen.aclose()
+
+    handle.reject_tool.assert_awaited_once_with(3)
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_keeps_an_owed_frame_when_cancelled_mid_drain():
+    """A cancellation part-way through the drain must not lose a response
+    already collected for a live waiter.
+
+    The permission arm re-raises ``CancelledError`` so the prompt aborts, which
+    is exactly when a retained frame is easiest to lose: everything read before
+    the cancellation point is held in a local list, and a re-injection reached
+    only on the loop's normal exit would never run. The frames go back from a
+    ``finally``, so the abort still pays the waiter what it is owed.
+
+    The queue order is the point: the owed response is read FIRST, so it is
+    already collected when the stranded permission request triggers the abort.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+    handle.reject_tool = AsyncMock(side_effect=asyncio.CancelledError())
+
+    handle._awaited_responses.add(77)
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict({"jsonrpc": "2.0", "id": 77, "result": {"ok": True}})
+    )
+    q["sA"].put_nowait(_permission_msg(5))
+
+    gen = handle.prompt("hi", timeout=0.2)
+    with pytest.raises(asyncio.CancelledError):
+        await gen.__anext__()
+
+    # The abort still handed the owed response back, and its waiter can read it.
+    _kept = await handle._wait_for_response(77, timeout=1.0)
+    assert _kept.id == 77
+    assert _kept.result == {"ok": True}
+    # The handle is reusable: the cancel path re-set _turn_done.
+    assert handle._turn_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_hands_back_an_owed_frame_before_awaiting_a_reject():
+    """A retained frame is never held across an await.
+
+    ``reject_tool`` writes to the child's stdin and that write is not bounded
+    short: a backend that already delivered a command response but has stopped
+    reading its own stdin applies backpressure that blocks it. An owed waiter
+    carries a 60s deadline, so a frame parked in the retain list for the length
+    of that write can expire and the call reports "" for a response the backend
+    delivered. The await is also the yield point at which the waiting
+    ``_wait_for_response`` gets scheduled, so handing the frame back BEFORE it
+    is what actually pays the waiter.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    _seen_at_reject: list[list[int | str | None]] = []
+
+    async def _reject(_req_id):
+        # What the queue holds at the moment the slow write would begin.
+        _seen_at_reject.append([m.id for m in list(handle._queue._queue) if m is not None])
+
+    handle.reject_tool = _reject
+
+    handle._awaited_responses.add(77)
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict({"jsonrpc": "2.0", "id": 77, "result": {"ok": True}})
+    )
+    q["sA"].put_nowait(_permission_msg(5))
+
+    import contextlib
+
+    gen = handle.prompt("hi", timeout=0.2)
+    with contextlib.suppress(StopAsyncIteration, asyncio.TimeoutError, Exception):
+        await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+    await gen.aclose()
+
+    assert _seen_at_reject, "reject_tool was never reached"
+    assert 77 in _seen_at_reject[0], (
+        "the owed response was still parked in the retain list while reject_tool "
+        f"was awaited; queue held {_seen_at_reject[0]}"
+    )
+    # And it is still there afterwards for its waiter, re-injected exactly once.
+    _kept = await handle._wait_for_response(77, timeout=1.0)
+    assert _kept.result == {"ok": True}
+    assert all(
+        m is None or m.id != 77 for m in list(handle._queue._queue)
+    ), "the owed response was re-injected twice"
 
 
 @pytest.mark.asyncio

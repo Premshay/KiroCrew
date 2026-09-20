@@ -2180,15 +2180,6 @@ class MemoryConfig:
         default=365,
         metadata=_meta("History Max Days", "Maximum days of history to retain."),
     )
-    private_provisioning_enabled: bool = field(
-        default=True,
-        metadata=_meta(
-            "New Private Memory",
-            "Allow creating private V2 member stores and explicit V1-to-V2 setup. "
-            "Turn off to pause provisioning; existing V2 execution, management "
-            "and isolation continue.",
-        ),
-    )
     backup_enabled: bool = field(
         default=True,
         metadata=_meta(
@@ -3744,6 +3735,10 @@ class DashboardConfig:
 
 @dataclass
 class KiroCrewAgentConfig:
+    member_id: str = field(
+        default="",
+        metadata=_meta("Member ID", "Immutable identity assigned when member memory is created."),
+    )
     kiro_agent: str = field(
         default="",
         metadata=_meta("Kiro Agent", "Kiro agent name (modeId for session/set_mode)."),
@@ -3874,13 +3869,19 @@ class WorkspaceConfig:
 
 @dataclass
 class MemoryStoreConfig:
+    owner_member_id: str = field(
+        default="",
+        metadata=_meta("Owner Member ID", "Immutable member identity stored in this database."),
+    )
     owner_member: str = field(
         default="",
-        metadata=_meta("Owner Member", "The sole Crew Member owning this private memory store."),
+        metadata=_meta(
+            "Owner Member", "Display label of the Crew Member owning this memory store."
+        ),
     )
     memory_version: int = field(
         default=1,
-        metadata=_meta("Memory Version", "1 for existing memory; 2 for private member memory."),
+        metadata=_meta("Memory Version", "1 for existing memory; 2 for member memory."),
     )
     description: str = field(
         default="",
@@ -3971,8 +3972,9 @@ class SkillsConfig:
             "Each match injects that skill's full content, unless the skill sets "
             "inject_on_trigger: false (pointer-only; requires max_triggered > 0 to "
             "have any effect). Defaults to 0 (disabled): the agent discovers skills "
-            "from the Available Skills index and reads them on demand via cat, "
-            "$skillname, or skill_search. Set to a positive integer to re-enable "
+            "from a short name/purpose index and skill_search using short keywords. "
+            "Search loads confined project bodies safely; $skillname loads a named skill. "
+            "Set to a positive integer to re-enable "
             "per-turn word-overlap trigger matching.",
         ),
     )
@@ -3981,14 +3983,11 @@ class SkillsConfig:
         default=False,
         metadata=_meta(
             "Lazy Skill Injection",
-            "When true, the session-start skills block injects only a usage-ranked "
-            "top-K of on-demand skills (bounded by its own section budget) and leaves "
-            "the long tail discoverable via the skill_search tool / $skillname / "
-            "triggers; each context section also gets its own independent char cap so "
-            "the global ceiling becomes their sum (~190k) and a large skills set can "
-            "never crowd out memory/lessons. Disabled by default (0-impact upgrade, "
-            "like prewarm_count=0): off means the legacy full skills dump under a "
-            "single shared 165k budget — unchanged behavior.",
+            "When true, show a bounded usage-ranked index of on-demand skills instead "
+            "of the default short skill_search discovery entry. Both modes use the "
+            "same Crew background budget, independent of model window size. Pinned "
+            "instructions, native skill mappings, explicit loading and trigger gates "
+            "are preserved.",
         ),
     )
     # ── Auto skill creation ──
@@ -4951,6 +4950,7 @@ class ResolvedBindings:
     memory_store_name: str
     effective_memory_config: dict
     kiro_agent: str
+    execution_context: object | None = None
     # The Kiro Crew agent's own default model, "" when it pins none. Ranks below
     # a per-session pick and above the bound kiro agent's pin / the global
     # agent.model fallback. Defaulted so existing keyword constructions and
@@ -4996,6 +4996,8 @@ class ResolvedBindings:
         ``requested_resolved``/``effective_memory_config`` (the former is
         request metadata the caller checks separately; the latter is derived
         from ``memory_store_name`` plus global config shared by both sides).
+        ``execution_context`` carries the admitted session's identity and mode;
+        session selection checks those separately before comparing these targets.
         """
         return (
             self.kiro_agent == other.kiro_agent
@@ -5807,6 +5809,257 @@ class InstancesConfig:
                 _DEFAULT_PROBE_FAILS,
             )
             object.__setattr__(self, "probe_failure_threshold", _DEFAULT_PROBE_FAILS)
+
+
+# Sampling bucket bounds, as a percentage of sessions. 0 admits nothing, 100
+# admits everything; both the parse below and the gate clamp to this range rather
+# than treating an out-of-range value as a second way to disable the seam.
+DECISION_BUCKET_MIN = 0
+DECISION_BUCKET_MAX = 100
+
+DECISION_PROVIDER_ENDPOINT_DEFAULT = "https://api.typesafe.ai/v1/systemone"
+DECISION_PROVIDER_MODEL_DEFAULT = "jev-latest"
+
+# How much PRIOR CONVERSATION one decision may carry, as a char budget rather than
+# a message count, because what it bounds is the size of the request that leaves
+# the machine -- a count bounds neither.
+#
+# The default is 0, and that is the whole point: consent is recorded against what
+# the owner reviewed, and the text they reviewed says the message excerpt and the
+# candidate descriptions leave the machine. Shipping prior turns under that
+# standing grant would widen egress with no new choice, so an owner who wants the
+# conversation sent raises this themselves.
+DECISION_HISTORY_BUDGET_DEFAULT = 0
+
+
+@dataclass
+class DecisionProviderConfig:
+    """Where the System One provider lives and what one call may cost."""
+
+    endpoint: str = field(
+        default=DECISION_PROVIDER_ENDPOINT_DEFAULT,
+        metadata=_meta(
+            "Endpoint",
+            "Full URL of the evaluation endpoint. Override only to point at a "
+            "compatible proxy — the request and response field names are fixed by "
+            "the TypeSafe API, not by this setting.",
+        ),
+    )
+    api_key: str = field(
+        default="secret://TYPESAFE_API_KEY",
+        metadata=_meta(
+            "API Key",
+            "The provider credential reference. Only 'secret://TYPESAFE_API_KEY' is "
+            "honoured: it reads that one entry from the dashboard secrets vault "
+            "(Settings › Secrets), so no key is ever stored in config.json. A literal "
+            "key here is NOT used, and no other vault entry is readable through this "
+            "field, because config.json is agent-writable. With no usable key the "
+            "seam logs a row saying so and returns None — it never sends an empty "
+            "bearer credential.",
+            sensitive=True,
+        ),
+    )
+    model: str = field(
+        default=DECISION_PROVIDER_MODEL_DEFAULT,
+        metadata=_meta(
+            "Model",
+            "Provider model id. 'jev-latest' is TypeSafe's flagship System One model. "
+            "Letters, digits, dots, dashes and underscores, up to 64 characters; "
+            "anything else is refused before a request is sent, because this field "
+            "travels in the request and config.json is agent-writable.",
+        ),
+    )
+    timeout_ms: int = field(
+        default=1000,
+        metadata=_meta(
+            "Timeout (ms)",
+            "Total budget for one decision, in milliseconds. Exceeding it logs "
+            "error='timeout' and returns None, so this is the ceiling the seam "
+            "adds to the path it sits in — not a target. Values at or below zero "
+            "are floored to 1ms rather than disabling the timeout.",
+        ),
+    )
+
+
+@dataclass
+class DecisionsConfig:
+    """Decision seam (``src/kiro_crew/decisions/``). Off by default.
+
+    There is deliberately NO ``enabled`` field here. The switch that lets
+    conversation state leave the machine is an authorization, not a preference,
+    and ``config.json`` is writable by an auto-approved agent shell -- so it lives
+    on the KEYSTONE leaf ``decisions_consent.json`` (``decisions.consent``), the
+    same placement as ``computer_use.json`` and ``aws_service_consent.json``. This
+    section carries only the knobs that grant nothing on their own: the sampling
+    share, the prior-conversation budget (0 by default, so raising it is a choice),
+    and the provider. There is no per-point arm and no shadow mode: one point ships
+    (``skills.select``).
+
+    Every field is hot-applied (no ``restart=True`` anywhere): the gate reads the
+    live snapshot per call, so a bucket change takes effect on the next decision
+    without a gateway restart.
+    """
+
+    bucket: int = field(
+        default=DECISION_BUCKET_MAX,
+        metadata=_meta(
+            "Bucket (%)",
+            "Percentage of sessions the seam fires for, 0-100, decided by a hash "
+            "of the session key so a session is consistently in or out. 0 fires "
+            "for nobody, 100 for everybody. Out-of-range numbers are clamped; a "
+            "value that is not a whole number reads as 0 (nobody sampled), never "
+            "as everybody. To switch the seam off, withdraw consent in Settings > "
+            "Developer > Feature Previews, not a zero bucket.",
+        ),
+    )
+    history_budget_chars: int = field(
+        default=DECISION_HISTORY_BUDGET_DEFAULT,
+        metadata=_meta(
+            "History budget (chars)",
+            "How many characters of PRIOR conversation one decision may carry, on "
+            "top of the current message. Earlier user and assistant turns are added "
+            "newest-first until this many characters are spent and the last one is "
+            "clipped to fit; tool output is never sent. The default is 0 -- no prior "
+            "turns -- because consent is recorded against the text the owner "
+            "reviewed, which names the message excerpt and the candidate "
+            "descriptions; raising this widens what leaves the machine, so it is a "
+            "choice rather than an upgrade. A negative value reads as 0.",
+        ),
+    )
+    provider: DecisionProviderConfig = field(
+        default_factory=DecisionProviderConfig,
+        metadata=_meta("Provider", "Where decisions are sent and what they may cost."),
+    )
+
+    @classmethod
+    def from_raw(cls, section: object) -> "DecisionsConfig":
+        """Build from a raw ``decisions`` dict -- the ONE parse site.
+
+        Lives here rather than in the loader because the bucket bounds are
+        declared a few lines above, and a normalizer that read them from another
+        module would need those names re-exported across a frozen module boundary
+        (``test_config_module_boundaries``).
+
+        Every value is NORMALIZED rather than validated-and-rejected: this
+        section gates a seam that is off by default, so the fail-closed reading
+        of any unreadable value is the default, and a hand-edited config.json
+        must not stop the gateway booting.
+
+        Accepts whatever ``json.loads`` produced, including ``None`` and a
+        non-dict, for the same reason ``ResourceLimitsConfig.from_raw`` does. A
+        config carrying the earlier ``preview``/``points``/``enabled`` spelling
+        is read for its bucket and provider only: consent is never inferred from
+        ``config.json``, whatever key it carries, because that file is what the
+        keystone exists to keep the decision out of.
+        """
+        if not isinstance(section, dict):
+            return cls()
+
+        raw_provider = section.get("provider")
+        raw_provider = raw_provider if isinstance(raw_provider, dict) else {}
+
+        def _text(key: str, default: str) -> str:
+            """A non-empty stripped string, else *default*.
+
+            An empty or blank value resolves to the DEFAULT rather than to ``""``:
+            the implementation falls back to the documented endpoint and model
+            anyway, so storing ``""`` would leave the saved config disagreeing
+            with what is in force -- the same reason ``bucket`` is clamped here.
+            """
+            raw = raw_provider.get(key)
+            return raw.strip() if isinstance(raw, str) and raw.strip() else default
+
+        provider = DecisionProviderConfig(
+            endpoint=_text("endpoint", DecisionProviderConfig.endpoint),
+            api_key=_text("api_key", DecisionProviderConfig.api_key),
+            model=_text("model", DecisionProviderConfig.model),
+            timeout_ms=_safe_int(
+                raw_provider.get("timeout_ms", DecisionProviderConfig.timeout_ms),
+                DecisionProviderConfig.timeout_ms,
+            ),
+        )
+
+        return cls(
+            # Clamped here as well as in the gate. The gate clamps because it
+            # must never trust a value it did not parse; clamping here is what
+            # makes the SAVED config say what is in force, so an operator who
+            # wrote 500 sees 100 come back rather than a number that behaves as
+            # 100 while reading as 500.
+            #
+            # ABSENT reads as the default (every session); MALFORMED reads as 0.
+            # The two must not share a fallback: this number decides how much
+            # conversation state leaves the machine, so a hand-edit that fails to
+            # parse must fail closed to "nobody", never open to "everybody".
+            bucket=_safe_int(
+                section.get("bucket", DECISION_BUCKET_MAX),
+                DECISION_BUCKET_MIN,
+                DECISION_BUCKET_MIN,
+                DECISION_BUCKET_MAX,
+            ),
+            # Unreadable reads as the DEFAULT, which for this key is 0 -- the same
+            # direction a malformed bucket takes, because both decide how much
+            # conversation leaves the machine and neither may fail open. Floored at
+            # 0 so a negative number cannot read as unbounded.
+            history_budget_chars=_safe_int(
+                section.get("history_budget_chars", DECISION_HISTORY_BUDGET_DEFAULT),
+                DECISION_HISTORY_BUDGET_DEFAULT,
+                0,
+            ),
+            provider=provider,
+        )
+
+
+@dataclass
+class MonitoringConfig:
+    """Which side justifies itself when a session picks a monitoring path.
+
+    Two paths can watch the same pull request today and NEITHER is gated. The
+    probe-gated structured monitor (``monitor_watch``) and the per-interval
+    prompt loop (``monitor_start``) are both armable on a stock install, and
+    ``GET /api/monitors`` answers ``enabled`` from whether the service object
+    exists rather than from any key, so there has never been a switch that
+    turns the structured engine on or off.
+
+    What is genuinely unsettable is which of the two an arming takes, and the
+    reason is that no code chooses: the choice is made by the model reading the
+    two tool descriptions. So this section is read exactly where those
+    descriptions are built -- ``mcp_tools/control.py::schemas()`` -- and
+    nowhere else. That is the honest extent of it, and the help text below says
+    so rather than implying an enforcement this key does not have.
+    """
+
+    prefer_structured_arming: bool = field(
+        default=False,
+        metadata=_meta(
+            "Prefer the structured monitor when arming",
+            "Which side has to justify itself before a supported pull request is "
+            "watched. Off, the default and the shipped wording: the structured "
+            "monitor monitor_watch is admissible only once the caller has "
+            "satisfied itself that the objective is fully determined by typed "
+            "provider facts, a judgement that leans to the prompt loop whenever "
+            "the caller is unsure. On: a supported pull request is enough, and "
+            "the prompt loop monitor_start becomes the exception that needs its "
+            "own reason. Both positions send evidence the typed provider cannot "
+            "observe -- comments, advisory review findings -- to the prompt loop, "
+            "so this moves the burden rather than swapping two defaults. What it "
+            "changes is the text those two descriptions give the agent: it does "
+            "not refuse either tool and cannot guarantee which one the agent "
+            "picks. Neither path is gated by this key -- both are armable with it "
+            "off -- so turning it on grants no new unattended capability. The "
+            "value is read afresh every time the tool list is built, so no "
+            "gateway restart is needed; a session already open keeps the tool "
+            "list it was given, so the change reaches the next session. Two "
+            "things to know before turning it on. The structured path observes "
+            "typed provider facts only -- lifecycle, checks, mergeability, "
+            "review decision, review threads -- and not generic comments or "
+            "advisory review findings, so an objective that depends on reading "
+            "those still needs the prompt loop. And this key is reversible but "
+            "an already-armed structured monitor is not: stopping one records a "
+            "retained USER_STOP outcome that refuses a re-arm, so moving such a "
+            "session to the prompt loop needs its owner to clear that record in "
+            "the dashboard's monitor popover first.",
+        ),
+    )
 
 
 @dataclass

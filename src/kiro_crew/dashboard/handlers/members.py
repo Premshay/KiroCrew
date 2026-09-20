@@ -114,7 +114,7 @@ def _member_names_for_slug(cfg: KiroCrewConfig, slug: str) -> list[str]:
         if not _AGENT_NAME_RE.match(name):
             continue
         try:
-            if members_mod.slug_for_name(name) == slug:
+            if members_mod.member_slug(name, cfg) == slug:
                 out.append(name)
         except MemberSlugError:
             continue
@@ -161,7 +161,7 @@ async def api_members(request: web.Request) -> web.Response:
         if not _AGENT_NAME_RE.match(name):
             continue
         try:
-            slug = members_mod.slug_for_name(name)
+            slug = members_mod.member_slug(name, cfg)
         except MemberSlugError:
             continue
         store = agent_cfg.memory_store
@@ -287,16 +287,12 @@ async def api_members(request: web.Request) -> web.Response:
 
 
 def _member_thread_slot(cfg, member: str, slug: str) -> tuple[str, str]:
-    """Keep protected V2 DMs; otherwise give private memory a fresh generation."""
-    from kiro_crew.member_memory_auth import read_private_session_store
+    """Choose the member's deterministic DM key without opening learned memory."""
     from kiro_crew.memory_stores import require_member_memory_store
 
-    store = require_member_memory_store(cfg, member)
+    store = require_member_memory_store(cfg, member, require_directory=False)
     record = cfg.memory_stores.get(store)
     if record is None or record.memory_version != 2:
-        return members_mod.member_slot_key(slug), ""
-    legacy_key = members_mod.member_thread_session_alias(slug)
-    if read_private_session_store(legacy_key) == store:
         return members_mod.member_slot_key(slug), ""
     return members_mod.member_slot_key(slug, store), store
 
@@ -514,6 +510,69 @@ async def api_member_thread(request: web.Request) -> web.Response:
         from kiro_crew.member_memory_auth import read_private_session_store
 
         canonical_key = members_mod.member_thread_session_alias(slug, generation)
+
+        async def reopen_bound_thread() -> web.Response:
+            """Return a running member thread validated against current ownership.
+
+            Read-only: it writes no assignment and does not touch the turn. Both
+            reachable running paths share it, so the opener that finds a turn
+            already in flight and the one whose turn starts during its slot-lock
+            wait are answered by the same validation rather than by two.
+            """
+            from kiro_crew.dashboard.chat_persistence import member_store_ownership_holds
+            from kiro_crew.dashboard.handlers.agents import _get_config_lock
+            from kiro_crew.memory_stores import memory_store_namespace_lock
+
+            # Do not hold the slot lock while waiting for config: member
+            # updates already take config before slot.
+            try:
+                assigned_store = await asyncio.to_thread(read_private_session_store, canonical_key)
+            except Exception as exc:
+                from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
+
+                return _store_unavailable_response(member_store, exc)
+            async with _get_config_lock(), slot._lock:
+
+                @memory_store_namespace_lock()
+                def current_binding():
+                    current = KiroCrewConfig.load()
+                    if not member_store_ownership_holds(current, member_name, member_store):
+                        return None
+                    return members_mod.read_dm_binding(slug)
+
+                try:
+                    binding = await asyncio.to_thread(current_binding)
+                except Exception as exc:
+                    from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
+
+                    return _store_unavailable_response(member_store, exc)
+                if (
+                    state._slots.get(slot_key) is not slot
+                    or effective_session_key(slot) != canonical_key
+                    or slot.agent != member_name
+                    or slot.mode != members_mod.DM_SLOT_MODE
+                    or slot.memory_store != member_store
+                    or assigned_store != member_store
+                    or binding is None
+                    or binding.get("slot_key") != slot.key
+                    or binding.get("member") != member_name
+                ):
+                    error = "member thread changed or its private binding is inconsistent"
+                    if effective_session_key(slot) != canonical_key:
+                        error = "the member thread is linked to another session"
+                    elif slot.memory_store != member_store or assigned_store != member_store:
+                        error = "the member thread has a different member memory assignment"
+                    return web.json_response(
+                        {"error": error, "code": "member_slot_conflict"},
+                        status=409,
+                    )
+                return web.json_response(
+                    {"slot_key": slot.key, "slug": slug, "member": member_name}
+                )
+
+        if slot.running:
+            return await reopen_bound_thread()
+        running_after_wait = False
         async with slot._lock:
             if effective_session_key(slot) != canonical_key:
                 return web.json_response(
@@ -525,22 +584,14 @@ async def api_member_thread(request: web.Request) -> web.Response:
                 )
             try:
                 if slot.running:
-                    # Opening a live DM must not assign or repair its identity.
-                    # Reuse only the already protected store, including while
-                    # the turn waits for approval. The common recheck below
-                    # rejects a slot changed during this off-loop read.
-                    protected_store = await asyncio.to_thread(
-                        read_private_session_store, canonical_key
-                    )
-                    if protected_store != member_store or slot.memory_store != member_store:
-                        return web.json_response(
-                            {
-                                "error": "the member thread has a different private-memory assignment",
-                                "code": "member_slot_conflict",
-                            },
-                            status=409,
-                        )
-                    assigned_store = member_store
+                    # The turn started while this opener waited for the slot.
+                    # Its entry snapshot cannot authorize reuse, and taking the
+                    # config lock here would invert the config -> slot order,
+                    # so re-enter the running path once after this lock is
+                    # released: it validates current ownership under config
+                    # then slot, which is the answer this window deserves
+                    # rather than a conflict the caller has to retry through.
+                    running_after_wait = True
                 else:
                     # The owner selected this slug, not an editable transcript
                     # or DM binding. A collision needs a protected assignment.
@@ -564,19 +615,37 @@ async def api_member_thread(request: web.Request) -> web.Response:
                 from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
 
                 return _store_unavailable_response(member_store, exc)
-            if (
-                state._slots.get(slot_key) is not slot
-                or effective_session_key(slot) != canonical_key
-                or slot.agent != member_name
-            ):
-                return web.json_response(
-                    {
-                        "error": "member thread changed during assignment",
-                        "code": "member_slot_conflict",
-                    },
-                    status=409,
-                )
-            slot.memory_store = assigned_store
+            if not running_after_wait:
+                if slot.running:
+                    # A turn started while this opener awaited the namespaced
+                    # assignment above. ``slot._lock`` does not exclude it:
+                    # ``api_chat`` reads ``slot.running`` and publishes
+                    # ``slot.task`` without taking the slot lock, so the window
+                    # is the await, not the lock. Publishing an assignment onto
+                    # a thread whose turn is already in flight is the write this
+                    # route exists to avoid, so drop it -- the same treatment
+                    # the pre-assignment window above gets -- and answer through
+                    # the read-only reopen path instead. The assignment
+                    # ``pin_private_agent_store`` already published cannot
+                    # repoint that turn: ``bind_session_execution`` compares the
+                    # record it read and refuses a differing member or store.
+                    running_after_wait = True
+                elif (
+                    state._slots.get(slot_key) is not slot
+                    or effective_session_key(slot) != canonical_key
+                    or slot.agent != member_name
+                ):
+                    return web.json_response(
+                        {
+                            "error": "member thread changed during assignment",
+                            "code": "member_slot_conflict",
+                        },
+                        status=409,
+                    )
+                else:
+                    slot.memory_store = assigned_store
+        if running_after_wait:
+            return await reopen_bound_thread()
 
     created = (
         binding is None
@@ -844,8 +913,10 @@ async def api_member_rules_put(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    # Reuse this off-loop snapshot for identity validation and collision checks.
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
     try:
-        if members_mod.slug_for_name(member) != slug:
+        if members_mod.member_slug(member, cfg) != slug:
             return web.json_response(
                 {"error": "member does not match slug", "code": "member_slug_mismatch"}, status=400
             )
@@ -853,9 +924,6 @@ async def api_member_rules_put(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "member does not match slug", "code": "member_slug_mismatch"}, status=400
         )
-    # Config load does filesystem reads + validation — off-loop, like every
-    # other handler's config access on a request path.
-    cfg = await asyncio.to_thread(KiroCrewConfig.load)
     if member not in cfg.agents:
         return web.json_response(
             {"error": "no crew member for this slug", "code": "member_not_found"}, status=404

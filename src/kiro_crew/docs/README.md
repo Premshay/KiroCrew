@@ -22,6 +22,7 @@ organized for someone browsing the repository.
 | Doc | Covers |
 |---|---|
 | [agents.md](agents.md) | Switching between specialized agents per conversation, thread, or cron job. |
+| [agent-spec-fields.md](agent-spec-fields.md) | Every agent-spec field, what it does, and how that differs per ACP backend. |
 | [skills.md](skills.md) | Drop-in markdown knowledge packs for domain-specific workflows. |
 | [monitoring.md](monitoring.md) | Token-efficient pull-request monitoring and finite legacy fallbacks. |
 | [cron-and-scheduling.md](cron-and-scheduling.md) | Scheduling recurring tasks. |
@@ -46,6 +47,7 @@ organized for someone browsing the repository.
 | [session-ledger.md](session-ledger.md) | The durable per-session work record that survives context compaction. |
 | [artifacts.md](artifacts.md) | Saving, versioning, and reverting generated UI and documents. |
 | [computer-use.md](computer-use.md) | Reading and driving native desktop applications; opt-in and off by default. |
+| [decisions.md](decisions.md) | Jev skill selection: letting a small fast model pick the automatic skill for a sampled conversation, with trigger matching as the fallback and a basic diagnostic log. |
 | [browser-control.md](browser-control.md) | Driving a real web page from the dashboard's Browser panel. |
 
 ## Channels
@@ -92,5 +94,7 @@ Three constraints make this tree different from `docs/`:
 
 Because every doc here reaches every user, keep the content task-oriented and free
 of internal design narration. An engineering note belongs in
-[`../../../docs/`](../../../docs/README.md) instead. Each doc's first paragraph is
+[`../../../docs/`](../../../docs/README.md) instead — for example
+[how the model's context is assembled](../../../docs/architecture/context-management.md),
+which cites private symbols and so lives there rather than here. Each doc's first paragraph is
 read verbatim as a feature description, so write it to stand alone.

@@ -10,7 +10,9 @@ and that no entry point bypasses them.
 """
 
 import asyncio
+import copy
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,36 @@ KEY = "dashboard:chat-retry"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["persistent", "incognito", "temporary"])
+async def test_consolidation_captures_execution_off_loop(tmp_path, monkeypatch, mode):
+    from kiro_crew import execution_context
+    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED, ConsolidationOutcome
+
+    captured = execution_context.ExecutionContext(
+        None, execution_context.MemoryStoreRef("default"), "template", "kirocrew", mode
+    )
+    loop_thread = threading.get_ident()
+    reads = []
+
+    def read(key):
+        reads.append((threading.get_ident(), key))
+        return captured
+
+    monkeypatch.setattr(execution_context, "read_session_execution", read)
+    consolidator = _make_consolidator(_seed_log(tmp_path, count=0))
+    consolidator._call_llm = AsyncMock()
+    result = await asyncio.wait_for(consolidator._consolidate(KEY), 10)
+    if mode == "persistent":
+        assert result == ConsolidationOutcome("empty", old_offset=0, new_offset=0)
+    else:
+        assert result is _CONSOLIDATION_REFUSED
+    consolidator._call_llm.assert_not_awaited()
+    assert len(reads) == 1
+    assert reads[0][0] != loop_thread
+    assert reads[0][1] == KEY
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("version", "seed_source", "assistant_value"),
     (
@@ -52,7 +84,7 @@ async def test_pending_extraction_rechecks_its_actual_transcript(
     from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
     from kiro_crew.context import ContextBuilder
     from kiro_crew.memory_stores import memory_store_dir_for, provision_member_memory
-    from kiro_crew.vector_memory import VectorMemoryStore
+    from kiro_crew.vector_memory import VectorMemoryStore, open_member_database
 
     store_name = None
     directory = tmp_path / "global"
@@ -62,11 +94,13 @@ async def test_pending_extraction_rechecks_its_actual_transcript(
         store_name = provision_member_memory(cfg, "writer")
         cfg.save()
         directory = memory_store_dir_for(store_name)
-        monkeypatch.setattr(
-            "kiro_crew.member_memory_auth.require_private_memory_execution", lambda: None
+    if version == 2:
+        vectors = open_member_database(
+            directory / "memory.db", member_id=cfg.agents["writer"].member_id, store_id=store_name
         )
-    vectors = VectorMemoryStore(db_path=directory / "memory.db")
-    vectors.init()
+    else:
+        vectors = VectorMemoryStore(db_path=directory / "memory.db")
+        vectors.init()
     try:
         assert vectors.set_semantic("user.email", "old@example.com", 1, seed_source) is None
         log = _seed_log(tmp_path, count=0)
@@ -111,7 +145,11 @@ async def test_pending_extraction_rechecks_its_actual_transcript(
             assert outcome.status == "consolidated"
             # An assistant append preserves eligibility, not extra write authority.
             assert json.loads(row["value_json"]) == assistant_value
-            c._memory.append_history.assert_called_once()
+            if version == 2:
+                assert "changed their email" in vectors.read_editable_history()
+                c._memory.append_history.assert_not_called()
+            else:
+                c._memory.append_history.assert_called_once()
             assert log.consolidation_counts(KEY)[1] == 1
         else:
             # A changed source is left pending, not failed: it must not consume
@@ -151,12 +189,210 @@ def _make_consolidator(log: ConversationLog, **kw: Any) -> HistoryConsolidator:
     memory.read_projects.return_value = ""
     kw.setdefault("history_idle_secs", 0)
     kw.setdefault("sessions", None)
+    kw.setdefault("auto_consolidation_enabled", True)
     return HistoryConsolidator(log=log, memory=memory, migrated=True, **kw)
 
 
 def _total(log: ConversationLog, key: str = KEY) -> int:
     """The transcript's current message total, as an entry point would supply it."""
     return log.consolidation_counts(key)[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["idle", "expiry", "threshold"])
+@pytest.mark.parametrize("mode", ["incognito", "temporary"])
+async def test_privacy_refusal_finishes_scheduling_without_callback_errors(
+    tmp_path, monkeypatch, entry, mode
+):
+    from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+    log = _seed_log(tmp_path, count=history_mod._CONSOLIDATION_THRESHOLD)
+    consolidator = _make_consolidator(log)
+    consolidator._last_activity[KEY] = time.time() - 10
+    execution = ExecutionContext(None, MemoryStoreRef("default"), "template", "kirocrew", mode)
+    monkeypatch.setattr("kiro_crew.execution_context.read_session_execution", lambda key: execution)
+    llm = AsyncMock()
+    monkeypatch.setattr(consolidator, "_call_llm", llm)
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    errors = []
+    loop.set_exception_handler(lambda loop, context: errors.append(context))
+    try:
+        if entry == "idle":
+            consolidator.check_idle_sessions()
+        elif entry == "expiry":
+            consolidator.consolidate_session(KEY)
+        else:
+            consolidator.maybe_consolidate(KEY)
+        assert consolidator._tasks
+        await asyncio.gather(*list(consolidator._tasks))
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+    assert not errors
+    assert not consolidator._tasks
+    assert not consolidator._running
+    assert KEY not in consolidator._history_consolidated
+    assert consolidator._prefs_offset.get(KEY, 0) == 0
+    assert log.unconsolidated_count(KEY) == history_mod._CONSOLIDATION_THRESHOLD
+    llm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["idle", "expiry", "threshold"])
+async def test_operator_auto_opt_out_preserves_manual_consolidation(tmp_path, monkeypatch, entry):
+    from kiro_crew.history_consolidation import _CONSOLIDATION_THRESHOLD
+
+    monkeypatch.setenv("KIROCREW_AUTO_CONSOLIDATION_ENABLED", "false")
+    log = _seed_log(tmp_path, count=_CONSOLIDATION_THRESHOLD)
+    c = _make_consolidator(log, auto_consolidation_enabled=None)
+    c._last_activity[KEY] = 0
+    llm = AsyncMock(return_value={"history_entry": "manual maintenance"})
+    monkeypatch.setattr(c, "_call_llm", llm)
+    if entry == "idle":
+        c.check_idle_sessions()
+    elif entry == "expiry":
+        c.consolidate_session(KEY)
+    else:
+        c.maybe_consolidate(KEY)
+    assert not c._tasks
+    assert not c._running
+    llm.assert_not_awaited()
+    outcome = await asyncio.wait_for(c.consolidate_now(KEY), 10)
+    assert outcome.completed and outcome.complete
+    assert log.unconsolidated_count(KEY) == 0
+    llm.assert_awaited_once()
+
+
+@pytest.fixture(params=[False, True], ids=["plain", "truncated"])
+def member_receipt_case(tmp_path, monkeypatch, request):
+    from kiro_crew import execution_context, history_consolidation
+    from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+    from kiro_crew.context import ContextBuilder
+    from kiro_crew.memory_stores import memory_store_dir_for, provision_member_memory
+    from kiro_crew.vector_memory import open_member_database
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents["writer"] = KiroCrewAgentConfig()
+    store_name = provision_member_memory(cfg, "writer")
+    cfg.save()
+    execution = execution_context.resolve_member_execution(cfg, "writer")
+    vectors = open_member_database(
+        memory_store_dir_for(store_name) / "memory.db",
+        member_id=execution.member_id,
+        store_id=store_name,
+    )
+    try:
+        log = _seed_log(tmp_path, count=0)
+        for i in range(5):
+            log.append(KEY, "user", f"message {i} " + ("x" * 300 if request.param else ""))
+        monkeypatch.setattr(
+            history_consolidation, "_CONSOLIDATION_OVERSIZED_MESSAGE_MAX_CHARS", 120
+        )
+        rendered = history_consolidation._consolidation_chunk(log.read_messages(KEY))
+        limit = sum(len(history_consolidation._fmt_message(row)) for row in rendered[:2])
+        monkeypatch.setattr(history_consolidation, "_CONSOLIDATION_CHUNK_MAX_CHARS", limit)
+        c = _make_consolidator(log, vector_store=vectors)
+        monkeypatch.setattr(execution_context, "read_session_execution", lambda key: execution)
+        monkeypatch.setattr(ContextBuilder, "ensure_store", AsyncMock(return_value=vectors))
+        monkeypatch.setattr(ContextBuilder, "get_memory_for", lambda *a, **kw: c._memory)
+        yield log, c, vectors
+    finally:
+        vectors.close()
+
+
+async def _commit_chunk_without_acknowledgement(log, c):
+    with (
+        patch.object(
+            c, "_call_llm", AsyncMock(return_value={"history_entry": "first chunk"})
+        ) as llm,
+        patch.object(log, "mark_consolidated", side_effect=OSError("offset write failed")),
+    ):
+        with pytest.raises(OSError, match="offset write failed"):
+            await asyncio.wait_for(c._consolidate(KEY), 10)
+    llm.assert_awaited_once()
+    assert log.consolidation_retry_state(KEY)[0] == 1
+    assert log.unconsolidated_count(KEY) == 5
+    await asyncio.to_thread(log.update_metadata, KEY, {"consolidation_retry_at": 0})
+
+
+@pytest.mark.asyncio
+async def test_member_chunk_receipt_recovers_without_rebilling_or_skipping_tail(
+    member_receipt_case,
+):
+    from kiro_crew.history_consolidation import ConsolidationOutcome
+
+    log, c, vectors = member_receipt_case
+    await _commit_chunk_without_acknowledgement(log, c)
+    history_before = vectors.read_editable_history()
+    c = _make_consolidator(log, vector_store=vectors)
+    with patch.object(c, "_call_llm", AsyncMock()) as llm:
+        recovered = await asyncio.wait_for(c._consolidate(KEY), 10)
+    llm.assert_not_awaited()
+    assert recovered == ConsolidationOutcome(
+        "consolidated", old_offset=0, new_offset=2, complete=False
+    )
+    assert vectors.read_editable_history() == history_before
+    assert log.unconsolidated_count(KEY) == 3
+    assert log.consolidation_retry_state(KEY) == (0, 0.0)
+    with patch.object(
+        c, "_call_llm", AsyncMock(return_value={"history_entry": "next chunk"})
+    ) as llm:
+        second = await asyncio.wait_for(c._consolidate(KEY), 10)
+        final = await asyncio.wait_for(c._consolidate(KEY), 10)
+    assert llm.await_count == 2
+    assert second == ConsolidationOutcome(
+        "consolidated", old_offset=2, new_offset=4, complete=False
+    )
+    assert final == ConsolidationOutcome("consolidated", old_offset=4, new_offset=5)
+    assert log.unconsolidated_count(KEY) == 0
+
+
+@pytest.mark.asyncio
+async def test_member_receipt_cannot_acknowledge_an_unprocessed_tail(member_receipt_case):
+    log, c, vectors = member_receipt_case
+    await _commit_chunk_without_acknowledgement(log, c)
+    original = vectors.consolidation_receipt
+
+    def mismatched_receipt(source_id):
+        return {**original(source_id), "source_total": 5}
+
+    with (
+        patch.object(vectors, "consolidation_receipt", mismatched_receipt),
+        patch.object(c, "_call_llm", AsyncMock()) as llm,
+    ):
+        with pytest.raises(ValueError, match="source changed"):
+            await asyncio.wait_for(c._consolidate(KEY), 10)
+    llm.assert_not_awaited()
+    assert log.unconsolidated_count(KEY) == 5
+    assert log.consolidation_retry_state(KEY)[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_member_receipt_reports_rejected_acknowledgement(member_receipt_case):
+    log, c, _vectors = member_receipt_case
+    await _commit_chunk_without_acknowledgement(log, c)
+    original = log.mark_consolidated
+
+    def rewrite_before_acknowledgement(key, offset, generation):
+        rows = copy.deepcopy(log.read_messages(key))
+        rows[0]["content"] = "replacement transcript"
+        log.rewrite_session(key, rows)
+        # Dashboard snapshot saves advance this generation; housekeeping rewrites do not.
+        log.update_metadata(key, {"rotation_generation": generation + 1})
+        assert log.rotation_generation(key) == generation + 1
+        original(key, offset, generation)
+
+    with (
+        patch.object(log, "mark_consolidated", rewrite_before_acknowledgement),
+        patch.object(c, "_call_llm", AsyncMock()) as llm,
+    ):
+        outcome = await asyncio.wait_for(c._consolidate(KEY), 10)
+    llm.assert_not_awaited()
+    assert outcome.status == "skipped"
+    assert not outcome.completed and not outcome.complete
+    assert outcome.new_offset == 0
+    assert log.unconsolidated_count(KEY) == 5
 
 
 def _span(
@@ -187,9 +423,7 @@ def _dashboard_state(log: ConversationLog) -> DashboardState:
     sessions.channel_key_for_stem = MagicMock(return_value=None)
     return DashboardState(
         sessions=sessions,
-        crons=MagicMock(
-            list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})
-        ),
+        crons=MagicMock(list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})),
         lessons=MagicMock(load_all=MagicMock(return_value=[])),
         start_time=0.0,
         conversation_log=log,
@@ -230,9 +464,7 @@ class _FakeRequest(dict):
 
 class TestFailureAfterTheBilledCall:
     @pytest.mark.asyncio
-    async def test_exception_after_llm_call_does_not_retry_on_the_next_tick(
-        self, tmp_path
-    ):
+    async def test_exception_after_llm_call_does_not_retry_on_the_next_tick(self, tmp_path):
         """A raise between the LLM call and the marker must arm backoff.
 
         The idle sweep's done-callback only sets its in-memory throttle when the
@@ -244,9 +476,10 @@ class TestFailureAfterTheBilledCall:
         c = _make_consolidator(log)
         c._last_activity[KEY] = time.time() - 10
 
-        with patch.object(
-            c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})
-        ), patch.object(log, "mark_consolidated", side_effect=RuntimeError("disk full")):
+        with (
+            patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})),
+            patch.object(log, "mark_consolidated", side_effect=RuntimeError("disk full")),
+        ):
             c.check_idle_sessions()
             assert c._tasks, "idle sweep did not schedule a consolidation"
             await asyncio.gather(*list(c._tasks), return_exceptions=True)
@@ -264,16 +497,12 @@ class TestFailureAfterTheBilledCall:
         assert not c._tasks, "consolidation re-fired while inside the backoff window"
 
     @pytest.mark.asyncio
-    async def test_a_failure_before_the_llm_call_does_not_consume_budget(
-        self, tmp_path
-    ):
+    async def test_a_failure_before_the_llm_call_does_not_consume_budget(self, tmp_path):
         """Nothing was billed yet, so the attempt is free."""
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
 
-        with patch.object(
-            log, "snapshot_for_consolidation", side_effect=RuntimeError("io error")
-        ):
+        with patch.object(log, "snapshot_for_consolidation", side_effect=RuntimeError("io error")):
             with pytest.raises(RuntimeError):
                 await c._consolidate(KEY, include_history=True)
 
@@ -372,9 +601,7 @@ class TestSuccessClearsTheAccounting:
             await c._consolidate(KEY, include_history=True)
         assert log.consolidation_retry_state(KEY)[0] == 1
 
-        with patch.object(
-            c, "_call_llm", AsyncMock(return_value={"history_entry": "ok"})
-        ):
+        with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "ok"})):
             with history_mod.allow_on_loop_persist():
                 log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
             await c._consolidate(KEY, include_history=True)
@@ -417,9 +644,7 @@ class TestTheAccountingIsReadUncached:
     """
 
     @pytest.mark.asyncio
-    async def test_a_second_writers_count_is_not_hidden_by_a_warm_cache(
-        self, tmp_path
-    ):
+    async def test_a_second_writers_count_is_not_hidden_by_a_warm_cache(self, tmp_path):
         log = _seed_log(tmp_path)
         # A separate ConversationLog over the same directory stands in for the
         # other process — its own caches, its own view of the file.
@@ -464,9 +689,7 @@ class TestTheAccountingIsReadUncached:
         assert other.consolidation_retry_state(KEY)[0] == 3
 
     @pytest.mark.asyncio
-    async def test_a_backed_off_span_is_not_re_fired_from_a_warm_cache(
-        self, tmp_path
-    ):
+    async def test_a_backed_off_span_is_not_re_fired_from_a_warm_cache(self, tmp_path):
         """End to end: the idle sweep must see the other process's backoff."""
         log = _seed_log(tmp_path)
         other = ConversationLog(base_dir=tmp_path / "sessions")
@@ -479,8 +702,7 @@ class TestTheAccountingIsReadUncached:
 
         c.check_idle_sessions()
         assert not c._tasks, (
-            "the sweep billed an LLM turn for a span another process had just "
-            "put into backoff"
+            "the sweep billed an LLM turn for a span another process had just " "put into backoff"
         )
 
 
@@ -515,9 +737,7 @@ class TestHostileMetadataDoesNotBreakTheGate:
         assert _make_consolidator(log).retry_eligible(KEY) is True
 
     @pytest.mark.asyncio
-    async def test_a_nan_deadline_does_not_disable_consolidation_forever(
-        self, tmp_path
-    ):
+    async def test_a_nan_deadline_does_not_disable_consolidation_forever(self, tmp_path):
         """Every ``now >= nan`` is false, so a NaN deadline never expires."""
         raws = ('"consolidation_retry_at": NaN', '"consolidation_retry_at": "NaN"')
         for i, raw in enumerate(raws):
@@ -525,9 +745,9 @@ class TestHostileMetadataDoesNotBreakTheGate:
             _plant_raw_meta(log, KEY, raw)
 
             assert log.consolidation_retry_state(KEY)[1] == 0.0
-            assert _make_consolidator(log).retry_eligible(KEY) is True, (
-                f"{raw} permanently disabled consolidation for the session"
-            )
+            assert (
+                _make_consolidator(log).retry_eligible(KEY) is True
+            ), f"{raw} permanently disabled consolidation for the session"
 
     @pytest.mark.asyncio
     async def test_a_non_numeric_value_reads_as_zero(self, tmp_path):
@@ -541,9 +761,7 @@ class TestHostileMetadataDoesNotBreakTheGate:
         assert log.consolidation_retry_state(KEY) == (0, 0.0)
 
     @pytest.mark.asyncio
-    async def test_the_manual_trigger_does_not_500_on_hostile_metadata(
-        self, tmp_path
-    ):
+    async def test_the_manual_trigger_does_not_500_on_hostile_metadata(self, tmp_path):
         """The gate runs inside a request handler — a raise there is a 500."""
         from kiro_crew.dashboard.handlers.memory import api_memory_consolidate
 
@@ -564,9 +782,7 @@ class TestHostileMetadataDoesNotBreakTheGate:
             await asyncio.gather(*list(c._tasks), return_exceptions=True)
 
     @pytest.mark.asyncio
-    async def test_an_absurd_stored_count_does_not_explode_the_backoff_shift(
-        self, tmp_path
-    ):
+    async def test_an_absurd_stored_count_does_not_explode_the_backoff_shift(self, tmp_path):
         """The exponent is attacker-influenced; ``2 ** n`` must stay bounded."""
         log = _seed_log(tmp_path)
         _plant_raw_meta(log, KEY, '"consolidation_attempts": 100000000')
@@ -629,9 +845,7 @@ class TestOnlyASentTurnConsumesTheCap:
         assert log.unconsolidated_count(KEY) == 3
 
     @pytest.mark.asyncio
-    async def test_repeated_pre_dispatch_failures_never_abandon_the_span(
-        self, tmp_path
-    ):
+    async def test_repeated_pre_dispatch_failures_never_abandon_the_span(self, tmp_path):
         """Past the cap count, the span must still be unmarked and retryable."""
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
@@ -647,9 +861,9 @@ class TestOnlyASentTurnConsumesTheCap:
                 await c._consolidate(KEY, include_history=True)
 
         assert log.consolidation_retry_state(KEY)[0] == 0
-        assert log.unconsolidated_count(KEY) == 3, (
-            "a broken environment abandoned a span without one billed turn"
-        )
+        assert (
+            log.unconsolidated_count(KEY) == 3
+        ), "a broken environment abandoned a span without one billed turn"
         # Still eligible once the deadline passes: the messages are not lost.
         with history_mod.allow_on_loop_persist():
             log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
@@ -676,9 +890,7 @@ class TestOnlyASentTurnConsumesTheCap:
         assert second == pytest.approx(2 * _CONSOLIDATION_BACKOFF_BASE_SECS, abs=5)
 
     @pytest.mark.asyncio
-    async def test_a_post_dispatch_empty_result_still_consumes_an_attempt(
-        self, tmp_path
-    ):
+    async def test_a_post_dispatch_empty_result_still_consumes_an_attempt(self, tmp_path):
         """The other half of the contract: a sent turn is still charged."""
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
@@ -731,9 +943,7 @@ class TestOnlyASentTurnConsumesTheCap:
 
 class TestAccountingNeverResurrectsADeletedSession:
     @pytest.mark.asyncio
-    async def test_recording_a_failure_for_a_deleted_session_is_a_no_op(
-        self, tmp_path
-    ):
+    async def test_recording_a_failure_for_a_deleted_session_is_a_no_op(self, tmp_path):
         """_update_metadata_locked upserts, so a blind write recreates the file."""
         log = _seed_log(tmp_path)
         path = log._path(KEY)
@@ -743,9 +953,7 @@ class TestAccountingNeverResurrectsADeletedSession:
         path.unlink()
 
         with history_mod.allow_on_loop_persist():
-            attempts, retry_at = log.record_consolidation_failure(
-                KEY, 900.0, 86400.0, span
-            )
+            attempts, retry_at = log.record_consolidation_failure(KEY, 900.0, 86400.0, span)
 
         assert (attempts, retry_at) == (0, 0.0)
         assert not path.exists(), "a deleted session was resurrected as empty history"
@@ -770,7 +978,7 @@ class TestAccountingNeverResurrectsADeletedSession:
         c = _make_consolidator(log)
         path = log._path(KEY)
 
-        async def _delete_then_fail(_prompt):
+        async def _delete_then_fail(_prompt, *, memory_store: str = "", session_key: str = ""):
             path.unlink()
             return None
 
@@ -816,9 +1024,7 @@ class TestRotationDoesNotClearACappedBudget:
         assert meta.get("consolidation_retry_at")
 
     @pytest.mark.asyncio
-    async def test_an_offset_beyond_the_message_count_retains_the_capped_state(
-        self, tmp_path
-    ):
+    async def test_an_offset_beyond_the_message_count_retains_the_capped_state(self, tmp_path):
         """The count fallback also resets to 0 without advancing the marker."""
         log = _seed_log(tmp_path)
         with history_mod.allow_on_loop_persist():
@@ -832,9 +1038,7 @@ class TestRotationDoesNotClearACappedBudget:
             log.mark_consolidated(KEY, 999, 0)
 
         assert log.get_metadata(KEY)["last_consolidated"] == 0
-        assert (
-            log.consolidation_retry_state(KEY)[0] == _CONSOLIDATION_MAX_ATTEMPTS
-        )
+        assert log.consolidation_retry_state(KEY)[0] == _CONSOLIDATION_MAX_ATTEMPTS
 
     @pytest.mark.asyncio
     async def test_an_applied_offset_still_releases_the_budget(self, tmp_path):
@@ -925,9 +1129,9 @@ class TestRotationReleasesTheBudgetForNewContent:
             )
 
         assert log.consolidation_retry_state(KEY)[0] == _CONSOLIDATION_MAX_ATTEMPTS
-        assert _make_consolidator(log).retry_eligible(KEY) is False, (
-            "the same failing span bought another billed attempt"
-        )
+        assert (
+            _make_consolidator(log).retry_eligible(KEY) is False
+        ), "the same failing span bought another billed attempt"
 
     @pytest.mark.asyncio
     async def test_a_fresh_budget_still_waits_out_the_backoff(self, tmp_path):
@@ -994,18 +1198,16 @@ class TestRotationReleasesTheBudgetForNewContent:
 
         with history_mod.allow_on_loop_persist():
             log.update_metadata(KEY, {"consolidation_retry_at": 0.0})
-        assert c.retry_eligible(KEY) is True, (
-            "a rotation left the session permanently unable to consolidate"
-        )
+        assert (
+            c.retry_eligible(KEY) is True
+        ), "a rotation left the session permanently unable to consolidate"
 
         with patch.object(
             c, "_call_llm", AsyncMock(return_value={"history_entry": "after rotation"})
         ):
             await c._consolidate(KEY, include_history=True)
 
-        assert log.unconsolidated_count(KEY) == 0, (
-            "post-rotation content never consolidated"
-        )
+        assert log.unconsolidated_count(KEY) == 0, "post-rotation content never consolidated"
         assert "consolidation_attempts" not in log.get_metadata(KEY)
 
 
@@ -1030,9 +1232,9 @@ class TestARotationDuringTheTurnStampsTheAttemptedSpan:
                 # attempted messages and bumps the generation mid-turn.
                 for i in range(5):
                     log.append(KEY, "user", f"{i}" * _OVER_CAP_ROW_CHARS)
-            assert log.get_metadata(KEY)["rotation_generation"] >= 1, (
-                "premise broken: no rotation fired during the turn"
-            )
+            assert (
+                log.get_metadata(KEY)["rotation_generation"] >= 1
+            ), "premise broken: no rotation fired during the turn"
             return None
 
         return AsyncMock(side_effect=_turn)
@@ -1116,13 +1318,9 @@ class TestForeignWritersCannotEraseTheAccounting:
         assert retry_at == pytest.approx(deadline, abs=1)
         assert log.get_metadata(KEY)["title"] == "kept"
 
-    def test_a_dashboard_slot_save_preserves_the_retry_accounting(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_dashboard_slot_save_preserves_the_retry_accounting(self, tmp_path, monkeypatch):
         """The save rebuilds the whole metadata line from the slot's own state."""
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.state.config_dir", lambda: tmp_path
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         log = ConversationLog(base_dir=tmp_path)
         log.init()
         for i in range(3):
@@ -1154,19 +1352,13 @@ class TestForeignWritersCannotEraseTheAccounting:
         assert meta.get("consolidation_attempts_generation") == 0
         assert meta.get("rotation_generation") == 2
 
-    def test_a_slot_owned_field_is_still_cleared_by_omission(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_slot_owned_field_is_still_cleared_by_omission(self, tmp_path, monkeypatch):
         """Preserving unowned keys must not make the slot's own state unclearable."""
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.state.config_dir", lambda: tmp_path
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         log = ConversationLog(base_dir=tmp_path)
         log.init()
         log.append("dashboard:chat1", "user", "m0")
-        log.update_metadata(
-            "dashboard:chat1", {"pinned": True, "consolidation_attempts": 1}
-        )
+        log.update_metadata("dashboard:chat1", {"pinned": True, "consolidation_attempts": 1})
 
         state = _dashboard_state(log)
         slot = _rehydrate_slot_from_history(state, "chat1")
@@ -1182,9 +1374,7 @@ class TestForeignWritersCannotEraseTheAccounting:
     def test_the_helper_never_shadows_an_owned_key(self):
         rebuilt = {"title": "new"}
         existing = {"title": "old", "consolidation_attempts": 2, "rotation_generation": 1}
-        out = history_mod.carry_unowned_metadata(
-            rebuilt, existing, frozenset({"title"})
-        )
+        out = history_mod.carry_unowned_metadata(rebuilt, existing, frozenset({"title"}))
         assert out == {
             "title": "new",
             "consolidation_attempts": 2,
@@ -1226,9 +1416,7 @@ class TestAnEditedTranscriptEarnsAFreshBudget:
                 "consolidation_retry_at": time.time() + retry_in,
                 "consolidation_attempts_generation": 0,
                 "consolidation_attempts_offset": 0,
-                "consolidation_attempts_count": log.consolidation_counts(
-                    "dashboard:chat1"
-                )[0],
+                "consolidation_attempts_count": log.consolidation_counts("dashboard:chat1")[0],
             },
         )
         return log
@@ -1242,9 +1430,7 @@ class TestAnEditedTranscriptEarnsAFreshBudget:
         slot._dirty = True
         _save_slot_to_history(state, slot, snapshot)
 
-    def test_a_regenerated_reply_is_not_held_by_the_old_spans_cap(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_regenerated_reply_is_not_held_by_the_old_spans_cap(self, tmp_path, monkeypatch):
         log = self._plant_capped_slot(tmp_path, monkeypatch, retry_in=-1.0)
         before = log.consolidation_counts("dashboard:chat1")[0]
         c = _make_consolidator(log)
@@ -1265,8 +1451,7 @@ class TestAnEditedTranscriptEarnsAFreshBudget:
             "test would release the charge on its own"
         )
         assert int(meta.get("last_consolidated", 0) or 0) == 0, (
-            "premise broken: the rewrite moved the marker, which releases the "
-            "charge on its own"
+            "premise broken: the rewrite moved the marker, which releases the " "charge on its own"
         )
         assert meta.get("consolidation_attempts") == _CONSOLIDATION_MAX_ATTEMPTS, (
             "premise broken: the accounting was dropped outright, so this passes "
@@ -1277,17 +1462,14 @@ class TestAnEditedTranscriptEarnsAFreshBudget:
         ), "premise broken: the replacement reply never reached disk"
 
         assert log.consolidation_retry_state("dashboard:chat1", after)[0] == 0, (
-            "the replacement reply inherited the exhausted budget of the span it "
-            "replaced"
+            "the replacement reply inherited the exhausted budget of the span it " "replaced"
         )
         assert c.retry_eligible("dashboard:chat1", message_count=after), (
             "a reply no consolidation turn has ever read is permanently "
             "ineligible for consolidation"
         )
 
-    def test_the_edit_advances_the_sessions_content_identity(
-        self, tmp_path, monkeypatch
-    ):
+    def test_the_edit_advances_the_sessions_content_identity(self, tmp_path, monkeypatch):
         """The release above is the span-identity semantics, not a special case."""
         log = self._plant_capped_slot(tmp_path, monkeypatch)
         state = _dashboard_state(log)
@@ -1317,16 +1499,14 @@ class TestAnEditedTranscriptEarnsAFreshBudget:
         count = log.consolidation_counts("dashboard:chat1")[0]
         attempts, retry_at = log.consolidation_retry_state("dashboard:chat1", count)
         assert attempts == 0, "the edit did not release the exhausted budget"
-        assert retry_at == pytest.approx(armed, abs=1), (
-            "the edit discarded the armed backoff deadline"
-        )
+        assert retry_at == pytest.approx(
+            armed, abs=1
+        ), "the edit discarded the armed backoff deadline"
         assert not _make_consolidator(log).retry_eligible(
             "dashboard:chat1", message_count=count
         ), "an edit let the session skip a backoff it had not served"
 
-    def test_an_edit_invalidates_an_attempt_already_in_flight(
-        self, tmp_path, monkeypatch
-    ):
+    def test_an_edit_invalidates_an_attempt_already_in_flight(self, tmp_path, monkeypatch):
         """The completion write of a turn that snapshotted the PRE-edit span must
         not mark the replacement tail consolidated.
 
@@ -1359,13 +1539,11 @@ class TestAnEditedTranscriptEarnsAFreshBudget:
             "the regenerated reply was marked consolidated without ever being "
             "extracted — silent memory loss"
         )
-        assert log.consolidation_counts(key)[1] == total, (
-            "the replacement content is not queued for consolidation"
-        )
+        assert (
+            log.consolidation_counts(key)[1] == total
+        ), "the replacement content is not queued for consolidation"
 
-    def test_a_steady_flush_leaves_the_content_identity_alone(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_steady_flush_leaves_the_content_identity_alone(self, tmp_path, monkeypatch):
         """Only an EDIT advances it; a re-serialization of the same window is not
         evidence about content, or every flush would release the cap."""
         log = self._plant_capped_slot(tmp_path, monkeypatch, retry_in=-1.0)
@@ -1413,9 +1591,7 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
                     ),
                     "consolidation_attempts_generation": 0,
                     "consolidation_attempts_offset": 0,
-                    "consolidation_attempts_count": (
-                        _total(log) if count is None else count
-                    ),
+                    "consolidation_attempts_count": (_total(log) if count is None else count),
                 },
             )
 
@@ -1430,9 +1606,7 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
         assert log.get_metadata(KEY)["consolidation_attempts_count"] == 3
 
     @pytest.mark.asyncio
-    async def test_the_extent_is_the_attempted_count_not_the_current_size(
-        self, tmp_path
-    ):
+    async def test_the_extent_is_the_attempted_count_not_the_current_size(self, tmp_path):
         """A message arriving DURING the failing turn must not be swallowed.
 
         It was never sent to the provider, so recording the post-turn size would
@@ -1442,7 +1616,7 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
 
-        async def _append_then_fail(_prompt):
+        async def _append_then_fail(_prompt, *, memory_store: str = "", session_key: str = ""):
             with history_mod.allow_on_loop_persist():
                 log.append(KEY, "user", "arrived mid-turn")
             return None
@@ -1451,8 +1625,7 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
             await c._consolidate(KEY, include_history=True)
 
         assert log.get_metadata(KEY)["consolidation_attempts_count"] == 3, (
-            "the mid-turn message was recorded as attempted, so growth can never "
-            "release it"
+            "the mid-turn message was recorded as attempted, so growth can never " "release it"
         )
         # It reads as growth, so the counter does not describe this span. (The
         # armed deadline still applies — a fresh budget is not a free turn.)
@@ -1465,9 +1638,7 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
         log = _seed_log(tmp_path)
         self._plant_capped(log)
 
-        assert log.consolidation_retry_state(KEY, _total(log))[0] == (
-            _CONSOLIDATION_MAX_ATTEMPTS
-        )
+        assert log.consolidation_retry_state(KEY, _total(log))[0] == (_CONSOLIDATION_MAX_ATTEMPTS)
         assert _eligible(_make_consolidator(log), log) is False
 
     @pytest.mark.asyncio
@@ -1481,8 +1652,7 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
             log.append(KEY, "user", "arrived after the cap")
 
         assert log.consolidation_retry_state(KEY, _total(log))[0] == 0, (
-            "one failed abandon write refused every message the session will "
-            "ever write again"
+            "one failed abandon write refused every message the session will " "ever write again"
         )
         assert _eligible(c, log) is True
 
@@ -1515,15 +1685,10 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
         meta = log.get_metadata(KEY)
         assert meta["consolidation_attempts"] == _CONSOLIDATION_MAX_ATTEMPTS
         assert meta["consolidation_attempts_count"] == 4, (
-            "the cap re-armed against the OLD extent, so the same growth would "
-            "release it again"
+            "the cap re-armed against the OLD extent, so the same growth would " "release it again"
         )
-        assert log.consolidation_retry_state(KEY, _total(log))[0] == (
-            _CONSOLIDATION_MAX_ATTEMPTS
-        )
-        assert _eligible(c, log) is False, (
-            "the original failing prefix can re-bill indefinitely"
-        )
+        assert log.consolidation_retry_state(KEY, _total(log))[0] == (_CONSOLIDATION_MAX_ATTEMPTS)
+        assert _eligible(c, log) is False, "the original failing prefix can re-bill indefinitely"
 
     @pytest.mark.asyncio
     async def test_a_shrink_alone_does_not_release_the_cap(self, tmp_path):
@@ -1531,9 +1696,7 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
         log = _seed_log(tmp_path)
         self._plant_capped(log, count=99)
 
-        assert log.consolidation_retry_state(KEY, _total(log))[0] == (
-            _CONSOLIDATION_MAX_ATTEMPTS
-        )
+        assert log.consolidation_retry_state(KEY, _total(log))[0] == (_CONSOLIDATION_MAX_ATTEMPTS)
         assert _eligible(_make_consolidator(log), log) is False
 
     @pytest.mark.asyncio
@@ -1556,9 +1719,7 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
             c.retry_eligible(KEY, message_count=total)
             log.consolidation_retry_state(KEY, total)
 
-        assert reads == [], (
-            "the eligibility check read the whole transcript on the event loop"
-        )
+        assert reads == [], "the eligibility check read the whole transcript on the event loop"
 
     @pytest.mark.asyncio
     async def test_content_written_after_a_failed_abandon_consolidates(self, tmp_path):
@@ -1578,9 +1739,7 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
         with history_mod.allow_on_loop_persist():
             log.append(KEY, "user", "arrived after the cap")
 
-        with patch.object(
-            c, "_call_llm", AsyncMock(return_value={"history_entry": "recovered"})
-        ):
+        with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "recovered"})):
             c.consolidate_session(KEY)
             assert c._tasks, (
                 "one failed abandon write left the session permanently unable to "
@@ -1768,9 +1927,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
 
-        with patch.object(
-            c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})
-        ) as spy:
+        with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})) as spy:
             await c._consolidate(KEY, include_history=True)
 
         spy.assert_awaited_once()
@@ -1794,9 +1951,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         assert log.consolidation_retry_state(KEY, _total(log))[0] == 1
 
     @pytest.mark.asyncio
-    async def test_the_inner_gate_backstops_a_caller_without_a_pre_check(
-        self, tmp_path
-    ):
+    async def test_the_inner_gate_backstops_a_caller_without_a_pre_check(self, tmp_path):
         """A caller whose pre-check misses — a future entry point without one,
         or a pre-check that raced the backoff being recorded — still cannot
         bill the span: the gate inside _consolidate is the enforcement, the
@@ -1844,9 +1999,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         # it would not be if the refusal above had left the claim in place.
         with history_mod.allow_on_loop_persist():
             log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
-        with patch.object(
-            c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})
-        ) as spy:
+        with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})) as spy:
             c.consolidate_session(KEY)
             assert c._tasks, "a released key was still refused after the backoff"
             await asyncio.gather(*list(c._tasks), return_exceptions=True)
@@ -1894,9 +2047,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         # delayed the extraction rather than dropping it.
         with history_mod.allow_on_loop_persist():
             log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
-        with patch.object(
-            c, "_call_llm", AsyncMock(return_value={"noop": True})
-        ) as spy:
+        with patch.object(c, "_call_llm", AsyncMock(return_value={"noop": True})) as spy:
             c.maybe_consolidate(KEY)
             assert c._tasks, "the un-advanced offset did not re-arm the threshold"
             await asyncio.gather(*list(c._tasks), return_exceptions=True)
@@ -1921,15 +2072,11 @@ class TestConsolidateIsTheEligibilityChokePoint:
         spy.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_consolidate_now_reports_success_outside_the_backoff(
-        self, tmp_path
-    ):
+    async def test_consolidate_now_reports_success_outside_the_backoff(self, tmp_path):
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
 
-        with patch.object(
-            c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})
-        ) as spy:
+        with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})) as spy:
             outcome = await c.consolidate_now(KEY)
             assert outcome.status == "consolidated"
 

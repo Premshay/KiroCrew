@@ -1814,7 +1814,6 @@
         "semantic_keys": [],
         "history_idle_hours": 3.0,
         "history_max_days": 365,
-        "private_provisioning_enabled": true,
         "backup_enabled": true,
         "backup_keep": 7,
         "migrated": false
@@ -2146,20 +2145,6 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 365
-    },
-    {
-      "path": "memory.private_provisioning_enabled",
-      "kind": "core",
-      "type": "boolean",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "New Private Memory",
-      "help": "Allow creating private V2 member stores and explicit V1-to-V2 setup. Turn off to pause provisioning; existing V2 execution, management and isolation continue.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": true
     },
     {
       "path": "memory.backup_enabled",
@@ -2520,7 +2505,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Max Triggered",
-      "help": "Maximum number of skills a single message may flag as relevant (≥0). Each match injects that skill's full content, unless the skill sets inject_on_trigger: false (pointer-only; requires max_triggered > 0 to have any effect). Defaults to 0 (disabled): the agent discovers skills from the Available Skills index and reads them on demand via cat, $skillname, or skill_search. Set to a positive integer to re-enable per-turn word-overlap trigger matching.",
+      "help": "Maximum number of skills a single message may flag as relevant (≥0). Each match injects that skill's full content, unless the skill sets inject_on_trigger: false (pointer-only; requires max_triggered > 0 to have any effect). Defaults to 0 (disabled): the agent discovers skills from a short name/purpose index and skill_search using short keywords. Search loads confined project bodies safely; $skillname loads a named skill. Set to a positive integer to re-enable per-turn word-overlap trigger matching.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0
@@ -2534,7 +2519,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Lazy Skill Injection",
-      "help": "When true, the session-start skills block injects only a usage-ranked top-K of on-demand skills (bounded by its own section budget) and leaves the long tail discoverable via the skill_search tool / $skillname / triggers; each context section also gets its own independent char cap so the global ceiling becomes their sum (~190k) and a large skills set can never crowd out memory/lessons. Disabled by default (0-impact upgrade, like prewarm_count=0): off means the legacy full skills dump under a single shared 165k budget — unchanged behavior.",
+      "help": "When true, show a bounded usage-ranked index of on-demand skills instead of the default short skill_search discovery entry. Both modes use the same Crew background budget, independent of model window size. Pinned instructions, native skill mappings, explicit loading and trigger gates are preserved.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
@@ -3977,6 +3962,162 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "slack"
+    },
+    {
+      "path": "monitoring",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Monitoring",
+      "help": "How a session's choice between the two monitoring paths is framed. Neither path is gated by this section; both are armable with it at its default.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "prefer_structured_arming": false
+      }
+    },
+    {
+      "path": "monitoring.prefer_structured_arming",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Prefer the structured monitor when arming",
+      "help": "Which side has to justify itself before a supported pull request is watched. Off, the default and the shipped wording: the structured monitor monitor_watch is admissible only once the caller has satisfied itself that the objective is fully determined by typed provider facts, a judgement that leans to the prompt loop whenever the caller is unsure. On: a supported pull request is enough, and the prompt loop monitor_start becomes the exception that needs its own reason. Both positions send evidence the typed provider cannot observe -- comments, advisory review findings -- to the prompt loop, so this moves the burden rather than swapping two defaults. What it changes is the text those two descriptions give the agent: it does not refuse either tool and cannot guarantee which one the agent picks. Neither path is gated by this key -- both are armable with it off -- so turning it on grants no new unattended capability. The value is read afresh every time the tool list is built, so no gateway restart is needed; a session already open keeps the tool list it was given, so the change reaches the next session. Two things to know before turning it on. The structured path observes typed provider facts only -- lifecycle, checks, mergeability, review decision, review threads -- and not generic comments or advisory review findings, so an objective that depends on reading those still needs the prompt loop. And this key is reversible but an already-armed structured monitor is not: stopping one records a retained USER_STOP outcome that refuses a re-arm, so moving such a session to the prompt loop needs its owner to clear that record in the dashboard's monitor popover first.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "decisions",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Decisions",
+      "help": "Decision seam — typed decisions asked of a System One model at named points. Off until the dashboard owner consents in Settings > Developer > Feature Previews (the keystone decisions_consent.json, not a key here); until then every point returns None with no network call and no log write.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "bucket": 100,
+        "history_budget_chars": 0,
+        "provider": {
+          "endpoint": "https://api.typesafe.ai/v1/systemone",
+          "api_key": "secret://TYPESAFE_API_KEY",
+          "model": "jev-latest",
+          "timeout_ms": 1000
+        }
+      }
+    },
+    {
+      "path": "decisions.bucket",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Bucket (%)",
+      "help": "Percentage of sessions the seam fires for, 0-100, decided by a hash of the session key so a session is consistently in or out. 0 fires for nobody, 100 for everybody. Out-of-range numbers are clamped; a value that is not a whole number reads as 0 (nobody sampled), never as everybody. To switch the seam off, withdraw consent in Settings > Developer > Feature Previews, not a zero bucket.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 100
+    },
+    {
+      "path": "decisions.history_budget_chars",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "History budget (chars)",
+      "help": "How many characters of PRIOR conversation one decision may carry, on top of the current message. Earlier user and assistant turns are added newest-first until this many characters are spent and the last one is clipped to fit; tool output is never sent. The default is 0 -- no prior turns -- because consent is recorded against the text the owner reviewed, which names the message excerpt and the candidate descriptions; raising this widens what leaves the machine, so it is a choice rather than an upgrade. A negative value reads as 0.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0
+    },
+    {
+      "path": "decisions.provider",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Provider",
+      "help": "Where decisions are sent and what they may cost.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "endpoint": "https://api.typesafe.ai/v1/systemone",
+        "api_key": "secret://TYPESAFE_API_KEY",
+        "model": "jev-latest",
+        "timeout_ms": 1000
+      }
+    },
+    {
+      "path": "decisions.provider.endpoint",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Endpoint",
+      "help": "Full URL of the evaluation endpoint. Override only to point at a compatible proxy — the request and response field names are fixed by the TypeSafe API, not by this setting.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "https://api.typesafe.ai/v1/systemone"
+    },
+    {
+      "path": "decisions.provider.api_key",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": true,
+      "tags": [],
+      "label": "API Key",
+      "help": "The provider credential reference. Only 'secret://TYPESAFE_API_KEY' is honoured: it reads that one entry from the dashboard secrets vault (Settings › Secrets), so no key is ever stored in config.json. A literal key here is NOT used, and no other vault entry is readable through this field, because config.json is agent-writable. With no usable key the seam logs a row saying so and returns None — it never sends an empty bearer credential.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "secret://TYPESAFE_API_KEY"
+    },
+    {
+      "path": "decisions.provider.model",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Model",
+      "help": "Provider model id. 'jev-latest' is TypeSafe's flagship System One model. Letters, digits, dots, dashes and underscores, up to 64 characters; anything else is refused before a request is sent, because this field travels in the request and config.json is agent-writable.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "jev-latest"
+    },
+    {
+      "path": "decisions.provider.timeout_ms",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Timeout (ms)",
+      "help": "Total budget for one decision, in milliseconds. Exceeding it logs error='timeout' and returns None, so this is the ceiling the seam adds to the path it sits in — not a target. Values at or below zero are floored to 1ms rather than disabling the timeout.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 1000
     },
     {
       "path": "watchdog",
@@ -7968,6 +8109,20 @@
       "defaultValue": null
     },
     {
+      "path": "agents.*.member_id",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Member ID",
+      "help": "Immutable identity assigned when member memory is created.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
       "path": "agents.*.kiro_agent",
       "kind": "core",
       "type": "string",
@@ -8262,6 +8417,20 @@
       "defaultValue": null
     },
     {
+      "path": "memory_stores.*.owner_member_id",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Owner Member ID",
+      "help": "Immutable member identity stored in this database.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
       "path": "memory_stores.*.owner_member",
       "kind": "core",
       "type": "string",
@@ -8270,7 +8439,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Owner Member",
-      "help": "The sole Crew Member owning this private memory store.",
+      "help": "Display label of the Crew Member owning this memory store.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
@@ -8284,7 +8453,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Memory Version",
-      "help": "1 for existing memory; 2 for private member memory.",
+      "help": "1 for existing memory; 2 for member memory.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 1

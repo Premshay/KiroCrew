@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator, Callable, MutableMapping, Set
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
 from kiro_crew.metrics.sessions import (
     END_REASON_RECYCLED,
     discard_session_start,
@@ -322,7 +323,7 @@ class BackgroundSessionRuntime:
                 remaining.append(runtime)
                 continue
             try:
-                await runtime.kill(expected=True)  # drained displacement teardown
+                await runtime.kill(expected=True, reason="drained displacement teardown")
                 logger.info("Reaped a drained displaced _bg runtime (PID %s)", runtime.pid)
             except Exception:
                 logger.warning("Failed to reap a drained _bg runtime; will retry", exc_info=True)
@@ -388,7 +389,7 @@ class BackgroundSessionRuntime:
                 cause,
             )
             try:
-                await runtime.kill(expected=True)  # deliberate displacement teardown
+                await runtime.kill(expected=True, reason="deliberate displacement teardown")
             except Exception:
                 logger.warning(
                     "Displacement kill failed; parking the runtime for the reaper",
@@ -519,10 +520,16 @@ class BackgroundSessionRuntime:
                                 "get_bg_session: dead _bg runtime kill failed",
                                 exc_info=True,
                             )
+                    agent_cfg = self._owner._cfg.agent
                     runtime_kwargs: dict[str, Any] = {
                         "sandbox_mode": getattr(self._owner._cfg.agent, "sandbox", "auto"),
                         "acp_backend": configured_backend,
                         "expect_mcp_reports": False,
+                        "tool_search": ToolSearchSettings.from_config(
+                            getattr(agent_cfg, "tool_search", True),
+                            getattr(agent_cfg, "tool_search_min_pct", None),
+                            getattr(agent_cfg, "tool_search_min_tokens", None),
+                        ),
                     }
                     # Per-agent ACP client binding, applied the same way every
                     # other runtime spawn applies it (subagent runtimes, the

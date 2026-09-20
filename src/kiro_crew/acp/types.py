@@ -25,10 +25,14 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKEND_PI,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_CLIENT_META_SETTINGS,
     ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_CONTEXT_RECYCLE,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
+    ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
@@ -42,13 +46,17 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_POD_HOME_REMAP,
     ACP_BACKENDS_RESUME_WITHOUT_LOAD,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
+    ACP_BACKENDS_SESSION_EVICTION,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_SESSION_SHARING,
+    ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
-    acp_runtime_backends,
+    ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
+    ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY,
     effort_config_option_id,
     model_registry_namespace,
+    overlay_project_scope,
     selectable_backends,
 )
 
@@ -134,6 +142,17 @@ METHOD_SESSION_TERMINATE = "_kiro.dev/session/terminate"
 #: ``terminate`` exists for, and the record is what would otherwise accumulate.
 #: Takes the same ``{"sessionId": ...}`` params and is idempotent.
 METHOD_KAS_SESSION_DELETE = "_kiro/session/delete"
+#: The STANDARD ACP evict verb, for a host that implements it. codex-acp does: it
+#: drops the session from its local map and unsubscribes the Codex thread, so the
+#: sessionId stops answering while the thread's own record survives on the Codex
+#: side -- the same evict-not-delete shape as kiro-cli's ``terminate``. A REQUEST,
+#: answered with ``{}``; sent as a notification the adapter ignores it and the
+#: session stays resident, which is the leak this verb exists to close. Also
+#: idempotent: closing an already-closed id answers ``{}`` again. Measured live
+#: against codex-acp 1.11.0; the gated test
+#: ``test_codex_session_mcp.py::test_real_codex_acp_session_close_evicts`` re-runs
+#: that measurement on every install that has the adapter.
+METHOD_SESSION_CLOSE = "session/close"
 METHOD_COMPACTION_STATUS = "_kiro.dev/compaction/status"
 METHOD_CLEAR_STATUS = "_kiro.dev/clear/status"
 METHOD_AGENT_SWITCHED = "_kiro.dev/agent/switched"
@@ -180,14 +199,33 @@ TODO_TEXT_MAX = 500
 
 # Capabilities we advertise during `initialize`.
 #
-# `fs` and `terminal` stay false: KiroCrew does not serve the agent's file or
-# terminal requests over ACP — the agent uses its own tools for that, and
-# advertising them would invite requests we have no handler for.
+# Nothing is advertised that has no inbound handler. Kiro Crew serves exactly one
+# server-initiated request, `session/request_permission`; everything else reaches
+# `_reject_unknown_server_request` and comes back `-32601 method not found`.
+#
+# `elicitation` was declared here as a forward-bet on kiro-cli routing an MCP
+# server's `elicitation/create` out over ACP. It is withdrawn because the bet is
+# not free, which is what the bet assumed. A client that sees the capability
+# routes its human-in-the-loop prompts through `elicitation/create` INSTEAD of
+# falling back to `session/request_permission` -- codex-acp gates exactly that
+# way on `clientCapabilities.elicitation.form` -- so declaring a capability we do
+# not serve does not sit inert waiting for a handler. It replaces a path that
+# works with one that returns an error, and the client reads that error as a
+# cancellation of the tool call the human was approving.
+#
+# So the declaration goes back to honest, and every affected client returns to the
+# fallback that already works. Re-add the key in the same change that registers a
+# handler for it, never before: `test_acp_client_capabilities.py` fails if the two
+# drift apart again.
+#
+# `fs` and `terminal` stay false for the same reason, and always have: Kiro Crew
+# does not serve the agent's file or terminal requests over ACP -- the agent uses
+# its own tools for that, and advertising them would invite requests we have no
+# handler for.
 ACP_CLIENT_CAPABILITIES: dict = {
     "fs": {"readTextFile": False, "writeTextFile": False},
     "terminal": False,
-    # claude-agent-acp only forwards nested Task/Agent transcript updates when
-    # the client explicitly opts in. This opens no callback surface.
+    # Claude forwards nested Task/Agent updates only when the client opts in.
     "_meta": {"subagent-transcript": True},
 }
 

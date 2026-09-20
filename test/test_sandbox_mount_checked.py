@@ -320,21 +320,58 @@ def test_every_tier_routes_all_eight_mounts_through_the_guard() -> None:
         assert script.count("_mount_or_die(") == 9
 
 
-def test_launcher_refuses_before_mounts_if_the_child_keeps_the_host_namespace() -> None:
+@pytest.mark.parametrize("outcome", ["same", "distinct", "unshare-error", "stat-error"])
+def test_launcher_refuses_before_mounts_if_the_child_keeps_the_host_namespace(
+    tmp_path: Path, outcome: str
+) -> None:
     """A successful handshake is not enough: the child must have a distinct mount NS.
 
     This is deliberately placed before the mount-control checks.  A child that has
     not crossed the namespace boundary must never reach the propagation or bind-mount
     calls, because those calls would alter the gateway's live mount table.
     """
+    import ctypes
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
     script = _build_launcher_script("strict")
     host_marker = '_host_mount_namespace = os.stat("/proc/self/ns/mnt").st_ino'
-    child_marker = '_child_mount_namespace = os.stat(f"/proc/{pid}/ns/mnt").st_ino'
+    child_marker = 'if os.stat("/proc/self/ns/mnt").st_ino == _host_mount_namespace:'
     refuse_marker = "child did not enter a distinct mount namespace"
     assert host_marker in script
     assert child_marker in script
     assert refuse_marker in script
+    assert script.index(host_marker) < script.index("pid = os.fork()")
     assert script.index(refuse_marker) < script.index("# Private mount propagation")
+    start = script.index("        # Step 2: enter mount namespace")
+    end = script.index(_PROP_END, start)
+    region = tmp_path / "namespace_guard.py"
+    region.write_text(textwrap.dedent(script[start:end]))
+    mount = Mock()
+    stat = Mock(return_value=SimpleNamespace(st_ino=102 if outcome == "distinct" else 101))
+    if outcome == "stat-error":
+        stat.side_effect = OSError("namespace unavailable")
+    namespace = {
+        "_libc": SimpleNamespace(
+            unshare=Mock(return_value=-1 if outcome == "unshare-error" else 0)
+        ),
+        "_CLONE_NEWNS": 0x00020000,
+        "_host_mount_namespace": 101,
+        "_mount_or_die": mount,
+        "_MS_REC": 16384,
+        "_MS_PRIVATE": 1 << 18,
+        "os": SimpleNamespace(stat=stat),
+        "sys": sys,
+        "ctypes": ctypes,
+    }
+    if outcome == "distinct":
+        runpy.run_path(str(region), init_globals=namespace)
+        mount.assert_called_once()
+    else:
+        error = OSError if outcome == "stat-error" else SystemExit
+        with pytest.raises(error):
+            runpy.run_path(str(region), init_globals=namespace)
+        mount.assert_not_called()
 
 
 # --------------------------------------------------------------------------

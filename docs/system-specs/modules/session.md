@@ -79,6 +79,11 @@ the facade, and patchable module dependencies are resolved through injected
 call-time functions. Persistence remains owned by the existing `SessionMap`
 contract; this decomposition does not change its stored format.
 
+Provider-native conversation IDs are persisted only while that provider owns
+the registered session and the session is not marked for account-change
+retirement. Late stream events cannot restore a cleared old-account resume ID
+or overwrite a replacement provider's mapping.
+
 The owner protocols and forwarding dependency adapters are transitional
 compatibility boundaries, not extension points. New internal behavior belongs
 on the service that owns its state; widen a protocol or adapter only when an
@@ -88,194 +93,69 @@ tests have moved off the corresponding legacy seam.
 
 ## Agent selection provenance
 
-A dashboard conversation records whether its agent name selected a provider
-template or a configured member. Discovery may later import that template as a
-same-named private member; this does not change the existing conversation's
-namespace. `session_agent_selection.py` persists the validated choice by exact
-effective session key under
-`member-memory-bindings/agent-selections/<sha256-key>.json`, inside the existing
-sandbox-readonly directory. Owner creation and authorized explicit agent
-selection record the choice, and a validated dispatch records it before provider
-allocation. There is one small selection record per effective conversation key,
-not per turn. Closing a slot does not remove it: saved history can reopen that
-conversation after restart. Records currently persist after transcript deletion
-too; history deletion has no tombstone that retires the key or fences delayed
-saves. Selection retention follows the existing protected identity lifetime,
-rather than treating removal of an editable transcript as revocation of identity.
-A permitted non-owner dashboard caller may select a provider
-template or an existing V1 member, including the default assistant. A private V2
-member choice requires the owner and is refused before provider reset or history
-mutation. Non-owner resolution retains the namespace it first resolved, even if
-discovery imports a same-named member during the request; a V1-to-V2 change during
-resolution is refused too. A non-owner choice cannot authorize private admission
-on a later turn, which still requires an existing protected private assignment.
-Selecting the default assistant resolves and publishes its choice just like a
-named selection. If lookup fails or returns an unresolved name for a conversation
-with a protected choice, the endpoint retains the old agent and returns 503
-before provider reset or metadata writes. A cancelled lookup restores only its
-own provisional agent value. Legacy conversations without a protected choice
-retain their existing unresolved-lookup behavior.
-Resolution captures the current record revision, including an absent record.
-Automatic publication compares that observation under the writer lock and
-refuses a changed selection; a same-value publication is a no-op. An owner
-choice of another agent or namespace therefore survives an obsolete prewarm or
-turn, including a writer thread that finishes after cancellation.
-If an owner switch loses its slot or session during publication, rollback
-restores only that request's record; a later successful selection keeps its win.
-Rebound responses keep the `session_rebound` code and tell the user to retry
-saving the member assignment or agent selection.
-Owner creation and selection drain their publication and rollback threads before
-honoring cancellation. Owner slot creation takes the slot lock before its first
-post-mint await and the session lock for selection publication, in the same order
-as an explicit switch. A delayed template create therefore cannot overwrite a
-later same-name member choice. Creation still explicitly replaces an existing
-protected history selection after the private-memory checks succeed. Protected
-rollback compares the published revision so it cannot erase a later choice.
-Before allocating a new local owner conversation, creation gives gateway memory
-recovery the same bounded grace period as first-turn admission. This applies to
-the default assistant too: binding resolution checks its memory readiness.
-Timeout or recovery failure returns `503 store_unavailable` before allocating a
-slot or publishing identity. The shared recovery task survives request cancellation.
-An explicit switch holds its slot and session locks through cleanup, restores its
-slot fields, and drains protected selection and history rollback as one sequence.
-If the first private-memory grant for an empty owner chat fails after selection
-publication, the same rollback restores all three records before releasing the locks.
-Repeated cancellation during publication or rebound/error cleanup cannot skip
-history restoration or leave a rollback writer running after the handler exits.
-The transcript agent write must succeed before an explicit switch publishes its
-protected selection. A failed write restores request-owned slot fields, attempts
-to restore the transcript and returns 503 without publishing a new selection.
-Cancellation drains the transcript writer and its rollback, including a rollback
-for a rebound session, before releasing the switch locks. If history restoration
-itself fails, recent-session restore, explicit resume and dormant-slot rehydration
-recover the agent from the existing protected selection. The transcript's
-provisional name cannot replace that committed choice. Async restoration fetches
-the protected name off-loop with its other disk inputs; slot mutation remains on
-the event loop. This read grants no private-memory admission and does not change
-the protected record.
+Each session owns one canonical `execution_context` in its ordinary metadata.
+The frozen record binds `member_id` (or explicit Global/V1), `MemoryStoreRef`,
+member/template namespace, provider template, privacy mode and app attribution.
+A configured member has an immutable persisted ID independent of its editable
+label. Templates, projects and display names cannot select member memory.
+Discovery of a same-named member cannot reinterpret an existing template session.
+Resolved dispatch bindings use the canonical `default` name for Global memory,
+including when restored from a captured execution record. Equivalent aliases
+therefore compare equally without changing the selected conversation identity.
 
-Real turns, completion callbacks and eager allocation resolve in that recorded
-namespace. Template allocations pass an explicit empty `crew_agent` through both
-eager and real turns, so capability preparation cannot substitute the default
-member's generation. Member allocations keep their canonical member claim.
-`SessionManager.get_agent_selection(key)` snapshots that allocation-owned
-namespace and name for child inheritance. It returns the captured member alias
-even before capability enrollment, or the literal template for a non-member
-allocation. An absent parent retains the default template; malformed live
-selection state refuses inheritance. Roster changes cannot change this snapshot.
-Templates must still exist, and a recorded member cannot fall back
-to a same-named template after removal. Default-model resolution uses the same
-namespace. The record grants no private-memory authority; all protected store,
-native-context and restored-history checks below still apply. In particular,
-reselecting a private member does not migrate an existing V1 conversation.
-The explicit empty crew claim also excludes a same-named member's model pin.
-A literal template keeps its own model pin or the global fallback; an explicit
-caller model still wins. Legacy callers without a crew claim retain their
-crew-name inference.
+Admission captures the record before asynchronous work and passes it directly to
+provider allocation and prompt construction. Automatic selection publication
+compares the captured record; an explicit concurrent choice wins over delayed
+preparation. Rollback compares only the record this operation published, including
+live restricted-session records. Slot/session locks, drained cancellation,
+ordinary owner/app permissions and governance remain in force. A malformed or
+missing member carrier reports memory unavailable and never chooses Global.
+Existing ordinary V1 sessions retain their V1 behavior; old V2 grants are not
+migrated or used as a second authority.
 
-Missing provenance retains legacy resolution, never infers a template from
-an absent private binding. An unreadable or invalid record refuses allocation.
-Live agent names that conflict with an existing protected record refuse
-allocation. History restoration instead uses the protected name, so a crash
-between an explicit switch's history and selection writes retains the last
-committed choice. A missing protected record keeps the strict legacy path; an
-unreadable record cannot authorize execution. A live provider
-switch publishes its validated template selection, with the current revision
-check, before changing the slot name that history saves. That event can select a
-new template; a restored transcript alone cannot authorize the same change.
-A cancelled provider switch drains its publication thread before restoring the
-exact selection revision it wrote. A failed post-publication slot or binding
-check uses the same rollback. Repeated cancellation cannot abandon publication
-or rollback, and rollback cannot replace a later owner's selection. The slot
-name changes only after publication and binding checks succeed.
-An already ambiguous legacy conversation therefore still needs an explicit
-owner choice or a new conversation.
+Persistent sessions serialize this record in their existing owner metadata.
+Incognito and Temporary sessions keep it in live session state and suppress
+Crew transcript/body persistence. Incognito may read memory; Temporary does not.
+Both refuse learned-memory writes. Children inherit the strictest admitted mode,
+even after a parent closes; replacing a parent cannot broaden their policy.
+If an existing persistent session becomes restricted, its existing owner record
+atomically tightens only retention metadata. No restricted body is added or
+rewritten, and restart cannot recover a weaker mode. A new restricted session
+does not create a durable owner record.
+
+Tab close and idle archival snapshot the live restricted identity before yielding;
+cleanup does not read durable session metadata. Tab close retires its nudge loop
+before other asynchronous work. After the last consumer and provider stop, cleanup
+releases only the captured identity, preserving any replacement session carrier.
 
 ## Private member session ownership
 
-Private essential-context receipts live on the serving provider, not the logical
-session key or shared ContextBuilder. Their identity includes the inner client,
-native session ID and existing `process_instance` token. Replacing a client or
-provider, including an in-place `_Session.adopt_provider`, cannot inherit an old
-receipt. Explicit compaction and in-stream compaction events invalidate receipts;
-a late terminal from the pre-compaction epoch cannot restore one. The existing
-member lifecycle decides forced refresh for fresh, resumed and reinjection turns.
-Private minimal sessions retain their own initial snapshot and receipt.
+The section name is retained for existing documentation links. Member memory is
+application routing, not a confidentiality boundary against arbitrary code under
+the same OS user. There is no separate protected session/run grant, memory PID
+ancestry database, member HMAC capability, namespace mount or Seatbelt memory rule.
+Ordinary transport authentication, owner/app permissions, audit integrity,
+credential redaction and the host sandbox remain independent requirements.
 
+The member and store in an admitted session stay fixed. An explicit provider
+switch may change a template only through the session selection path; it cannot
+select another member store. A new member choice opens a new conversation where
+required by the dashboard ownership contract. Restoring history restores its
+canonical record, rather than resolving the latest display alias or project.
+Cron, workflow and subagent owners carry the same record in their own durable
+state so they do not depend on the lifetime of an originating chat.
 
-An ordinary dashboard chat that has already used private member memory keeps
-that ownership for its lifetime. The agent-switch endpoint reads the protected
-binding for the effective session key before changing any slot fields, resetting
-the provider or writing history. Choosing another member (including the default
-assistant) returns `409 private_memory_session_pinned` and asks the owner to start
-a new conversation. An unreadable binding returns 503; resetting the same member
-and switching an unbound V1 conversation keep their existing behavior.
+Permanent rules, briefing and profile documents are read directly using stable
+member identity. They remain available when the learned database is unavailable.
+Normal member prompts do not inject learned/core rows; explicit recall reports
+an unavailable or mismatched database without falling back to Global.
 
-The provider's in-turn agent-switch event follows the same private boundary in
-every dashboard slot mode. Before provider allocation, the runner validates the
-store off the event loop and freezes its V2 owner from the memory version and
-ownership record. Database schema migrations do not identify a V2 turn. Any
-provider-reported switch on that private turn leaves the selected member intact,
-shows a pinned-member notice, stops consuming further events and resets the
-provider. The notice prevents an empty-response retry from replaying completed
-tool actions. Ordinary unbound V1 chats retain their agent-switch behavior.
-
-Member chat turns validate the member's private memory before provider
-allocation and persist the binding used by memory tools and consolidation.
-Binding resolution runs off-loop using captured member, project and session
-selections. The runner rechecks those fields before private binding and again
-before provider allocation; a changed or replaced slot refuses. Owner
-create/switch paths recheck slot identity after resolution;
-switches retain their commit-token rollback and last pre-reset busy checks. This
-does not allow a protected session key to acquire a different member's store.
-History can restore a displayed agent and recorded store, but cannot grant a
-new private assignment. Recent-session restore, explicit resume, dormant-slot
-rehydration and channel surfacing require an existing protected session binding
-before a V2 turn. This also applies when an empty historical agent now resolves
-to a private configured default. An unresolved member, changed binding or
-unreadable private store surfaces an error instead of borrowing Global Memory V1.
-
-An owner creating a private chat pins the selected member before saving history.
-Authorized `session_create` dispatch does the same before its birth metadata is
-written, so the new worker can start and resume with its protected assignment.
-It also publishes the template/member namespace captured during resolution;
-discovery before the first send cannot turn that template into a private member.
-Publication compares the protected selection revision and cannot replace a newer
-owner choice. Birth writes drain before cancellation is honored. A successful
-write keeps its slot even if the request was cancelled; a failed write retracts
-only an idle, empty slot still owned by that request. Protected identity records
-remain pinned after a history failure: the slot was already addressable, so a
-concurrent turn may have consumed that authority. The private assignment continues
-to reject Global or another member on that key, including after restart.
-The creation path still refuses pre-existing unverified history or native
-context; it cannot adopt an old conversation by writing a member name into it.
-Private callers remain excluded from the owner's session-control routes.
-Opening a member from Members can pin its canonical session after positive owner
-authorization. A linked-session conflict and a live thread's private-memory
-assignment mismatch retain the same refusal code but name their distinct causes;
-running alone is not a refusal reason. A transcript's linked key and the legacy DM binding file cannot
-authorize another session; a colliding member slug needs an existing protected
-match. Uninitialized legacy members remain openable for explicit initialization.
-An explicit owner agent choice on an unbound restored ordinary chat admits its
-next turn only after the existing switch rollback checks succeed. Restarting
-before that turn requires the owner to choose again. Internal callers and
-restored metadata cannot perform that admission.
-
-Cron tabs require the protected assignment published by private cron dispatch.
-A legacy job's provider-template alias cannot become a private member on a
-dashboard follow-up; if it resolves to V2 without that assignment, the turn
-refuses and explains how the owner can select a member explicitly.
-
-Speculative eager allocation stops for every private V2 binding, including
-resume prefetch. The actual turn verifies the protected binding and persists
-the slot before provider allocation.
-It also stops when an explicitly selected member is unresolved, when a restored
-store disagrees with the current resolver, or when its declaration is
-unavailable or inconsistent, and leaves the user-facing explanation to that
-turn. Global Memory V1 and a valid named V1 declaration retain speculative
-eager allocation. Store identity is part of the eager binding snapshot, and
-slot replacement, a running real turn or any binding change after an awaited
-lookup makes the eager task stand down before allocation.
+Essential-context receipts belong to the serving provider, not a shared builder
+or logical key. Inner client, native session ID and process-instance identity
+prevent replacement providers from inheriting receipts. Compaction invalidates
+receipts and late pre-compaction completions cannot restore them. Fresh/resumed
+member lifecycle rules still control reinjection. Member prompt documents are
+prepared before process launch; a warm runtime prepared without them is bypassed.
 
 ## Member capability generations
 
@@ -283,7 +163,7 @@ Enrolled members prepare capabilities only when allocating a new runtime.
 `session_capabilities.prepare_runtime` reconciles ordinary Parent updates and
 verifies the saved materialization off-loop before provider construction. It
 passes the immutable template explicitly while preserving the canonical member,
-private memory binding, history key, caller model and approval policy. An explicit
+member memory binding, history key, caller model and approval policy. An explicit
 or resumed cwd wins; otherwise the member's configured workspace is used. A cwd
 that disagrees with the saved Parent identity refuses startup.
 When no caller model is supplied, allocation resolves the member's model pin by
@@ -358,19 +238,43 @@ Callers: heartbeat callback, taskrunner lesson extraction.
 `get_bg_session()` acquires a `_bg` handle, dispatching by `agent.acp_backend`
 and returning `AcpSessionHandle | _ProviderBgSession`. Dispatch is via
 `_bg_backend_supports_runtime()` — positive membership in
-`_bg_runtime_backends()`, i.e. `ACP_BACKENDS_ACP_RUNTIME & selectable_backends()`,
-never an inequality (harness parity). The intersection is defense-in-depth: a
+`_bg_runtime_backends()` — the intersection of `ACP_BACKENDS_ACP_RUNTIME`,
+`ACP_BACKENDS_SESSION_EVICTION` and `selectable_backends()` — never an
+inequality (harness parity). The selectability term is defense-in-depth: a
 runtime-capable harness that is not operator-selectable must not be spawnable
 here from a config object that skipped the loader's normalisation.
 
-This path reads the frozenset and **not** `acp_runtime_backends()`, so the
-`KIROCREW_CODEX_ACP_RUNTIME` preview switch does not reach it. Background handles
-are the high-churn ones — title generation, suggestions, folders and nav each take
-their own ephemeral `sessionId` — and codex's teardown verb `session/cancel` ends
-the turn without evicting the session from the adapter's map, which on a shared
-process is unbounded growth at a rate the user never controls. The preview is
-scoped to the foreground, where the runtime's age/RSS recycle eventually collects
-the process; codex joins this set only once per-session eviction exists.
+The eviction term is what decides whether a harness that runs on the shared
+runtime may also serve this path. Background handles are the high-churn ones —
+title generation, suggestions, folders and nav each take their own ephemeral
+`sessionId`, many per conversation, at a rate the user never controls — so a
+teardown that does not evict is unbounded growth here. Membership in
+`ACP_BACKENDS_SESSION_EVICTION` is the claim that the teardown verb Crew sends
+actually frees one session, and it is earned by measurement. Codex is a member
+on that basis: its teardown is the standard `session/close` sent as a request,
+after which the same `sessionId` no longer answers `session/set_config_option`
+(measured live against codex-acp 1.11.0). It was excluded for as long as the
+verb Crew sent was `session/cancel`, after which the session kept answering and
+a further `session/prompt`'s `cachedReadTokens` showed the context resident —
+`cancel` interrupts a turn, it does not end a session. The delivery is part of
+the fact: the same `close` sent as a notification is ignored and evicts
+nothing, which is why the harness declares `notification=False` and why a gated
+live test re-measures both on every install with the adapter.
+
+The background path is not the only reader. `AcpSessionProvider.new_conversation`
+— the warm-reset primitive the workflow pool reaches for — reads the same set,
+because the whole reason that path is cheap is that `old.destroy()` reclaims the
+previous session on the already-running process. On a non-evicting harness that
+call frees nothing, so each pool reset would leave one more resident session, and
+here the "person opens chats" bound does not apply: a pooled workflow resets at
+whatever rate its steps run. Nor can a recycle rule be relied on to rescue it,
+because a rule that measures a narrower scope than where the sessions live
+never sees the growth, leaving the age ceiling as the only reaper. So a
+non-evicting backend is REFUSED there before any session is created, and
+`WorkerPool.reset` takes its existing hard-reset fallback — slower, and correct
+for every harness. Refusing before the `session/new` rather than after is the
+whole point: creating first would leak exactly the session the refusal exists to
+prevent.
 
 - **runtime-capable backend** (`_bg_runtime_backends()`) — each caller (title
   generation, suggestions, folders, nav) gets its **own** ephemeral `sessionId`
@@ -585,19 +489,92 @@ send time.
   notice/un-landing applies only to ZERO-tool-call turns — a mixed turn that
   executed tools and then leaked its final dispatch as text lands normally
   (un-landing a turn whose earlier calls had real side effects would
-  misdescribe it) and is logged at WARNING as a diagnostic instead.
-- **Context compaction**: at ≥ configured threshold (`session.autocompact_pct`, default 70%, valid 5–90), compacts **in place** on a backend that can serve
-  `/compact`: kiro-cli via a `/compact` **prompt** (`session/prompt` +
-  `_kiro.dev/compaction/status` watch — never the string form of
-  `_kiro.dev/commands/execute`, which kiro-cli 2.14.0 exits rc=0 on),
-  claude via SDK `/compact`. A backend OUTSIDE `ACP_BACKENDS_COMPACT` is
-  declined instead (`"compact_unsupported"`, see the gate ladder below):
-  KAS never answers the `/compact` prompt with a compaction status, so an
-  ungated dispatch stranded the status wait for the whole budget WHILE
-  HOLDING the turn semaphore and then recycled the session, losing the live
-  conversation (#7812) — it summarizes on its own initiative and its
-  `summarization_completed` frame resets the meter, so declining leaves
-  nothing unmanaged. The
+  misdescribe it) and gets its own notice card, worded for that shape:
+  the earlier calls were ATTEMPTED and may already have taken effect, so the
+  reader is told to check what landed rather than that nothing ran
+  (`should_notice_mixed_turn_leak`).
+- **Leak dropped at a compaction boundary** (issue #11995): a REAL
+  (non-synthesized) mid-turn compaction terminal is a segment boundary, so the
+  runner clears `assistant_text` there — text streamed before the
+  summarization belongs to the window that was just summarized and must not
+  carry into the segment flushed afterwards. Both gates above read that
+  accumulator AT TURN END, so a leak that streamed BEFORE the boundary was
+  invisible to them and both declined on an empty segment, while the raw
+  invoke block had already reached the user (chunks stream to the wire as they
+  arrive) and the boundary flushes nothing. The turn then took the
+  post-compaction continuation arm precisely BECAUSE the segment was blank, so
+  the session showed raw machine syntax followed by "continuing
+  automatically", ran no tool, and accounted for neither. The scan therefore
+  runs AT the boundary, before the clear, and only the resulting boolean
+  travels to turn end (`should_notice_compaction_dropped_leak`); a scan placed
+  after the clear reads an empty string and silently restores the defect, which
+  is why the ordering carries a source-level ratchet, and the recorded fact
+  ACCUMULATES (`or`) so a turn crossing two boundaries does not lose the first
+  one's leak to a later clean segment. Strictly notice-only and weaker than both
+  siblings: it un-lands nothing and sets no flag a recovery arm reads. Because it
+  owns no turn outcome it is evaluated OUTSIDE the `if`/`elif` chain its siblings
+  sit in — every arm of that chain owns the outcome and two are recoveries (the
+  L1 infrastructure retry, the promise-only guard), and since these gates exclude
+  neither shape, an exclusive slot would starve a turn that both dropped a leak
+  and needed a recovery. One turn still gets one leak card, enforced by a flag
+  the siblings set (`leak_already_noticed`) rather than by position. It needs no
+  tool-count gate (that gate protects un-landing, and there is nothing here to
+  un-land) and no stage-execution gate (a notice changes no turn result the stage
+  loop reads).
+- **Context compaction**: at ≥ configured threshold (`session.autocompact_pct`, default 70%, valid 5–90), compacts **in place** on a member of
+  `ACP_BACKENDS_COMPACT` — kiro-cli, claude, codex and opencode. They divide by WHERE
+  the
+  done signal lands, which is `ACP_BACKENDS_INLINE_COMPACTION`: kiro-cli sends a
+  `/compact` **prompt** (`session/prompt` + `_kiro.dev/compaction/status` watch —
+  never the string form of `_kiro.dev/commands/execute`, which kiro-cli 2.14.0
+  exits rc=0 on) and its result arrives afterwards, while claude, codex and opencode
+  finish the whole compaction inside the prompt turn. claude and opencode emit no
+  status at all; codex reports the compaction as a `tool_call` pair marked
+  `_meta.contextCompaction` (translated by
+  `_dispatch.parse_codex_compaction_update`) that arrives before the prompt
+  response, so its terminal is read from the stream like kiro-cli's.
+  For the two that emit nothing `wait_for_compaction()` answers `completed` from the
+  capability
+  rather than from the queue — but only when the turn reached its own end
+  boundary uncancelled, since a cancelled turn compacted nothing and a false
+  `completed` resets the meter AND arms the cooldown. Awaiting the queue for an
+  inline member instead spends the full `COMPACT_WAIT_TIMEOUT_SECS` and then
+  recycles a session that had just compacted correctly. That answer lives on the
+  WAIT, because both routes to a compaction reach it — the manual entry points
+  through `provider.compact()`, the autocompact through
+  `stream_command("/compact")`.
+
+  A backend outside that set takes one of three arms, each a positive
+  membership so that an unclassified harness cannot fall into a claim by
+  accident:
+
+  - `ACP_BACKENDS_HARNESS_MANAGED_COMPACTION` (KAS) is **declined**
+    (`"compact_unsupported"`, see the gate ladder below). KAS never answers the
+    `/compact` prompt with a compaction status, so an ungated dispatch stranded
+    the status wait for the whole budget WHILE HOLDING the turn semaphore and
+    then recycled the session, losing the live conversation (#7812) — it
+    summarizes on its own initiative and its `summarization_completed` frame
+    resets the meter, so declining leaves nothing unmanaged.
+  - `ACP_BACKENDS_CONTEXT_RECYCLE` (deepseek) is **recycled**. Its ACP surface
+    carries no compaction of any kind, so declining bounded nothing and the
+    context grew toward the harness's own window. `_recycle_unmanaged` reaches
+    the same destination a failed compaction already reaches, on the reason
+    rather than after spending the timeout that proves it. The arm falls THROUGH
+    the gate rung rather than returning from it, so `unconfirmed`, `in_progress`
+    and `cooldown` still run first — an ambiguous reading must not spend a
+    recycle.
+  - A backend in none of the three is **declined and logged at WARNING**, naming
+    the missing membership. Declining is the safe action, since the alternative
+    ends a conversation and no harness earns that by never having been
+    classified, but it is not a settled condition and the log says so. pi and goose
+    are that case today: both look inline in SOURCE but have no driven capture,
+    which is the bar `ACP_BACKENDS_COMPACT` holds its members to.
+
+  Every surface that refuses a manual `/compact` picks among three sentences via
+  `messaging.commands.compact_refusal_arm`, so a surface supplies wording only and
+  cannot disagree with the others about which case a backend is in.
+
+  The
   process and session ID survive, so queued/agentic work continues
   automatically. kiro-cli only: if the in-place compact fails, times out,
   or the provider lacks native support, falls back to the legacy
@@ -679,7 +656,122 @@ send time.
   the resolution falls through to `"auto"` exactly as an absent spec does.
 - **Idle cleanup**: expires sessions after `session.timeout_secs` (default
   60min). Never expires `BACKGROUND_KEY`. Dashboard per-tab sessions
-  (`dashboard:{slot_key}`) idle-expire like any other session. The policy is
+  (`dashboard:{slot_key}`) idle-expire like any other session.
+  A session is also expired on a second, clock-independent axis: its owning
+  dashboard slot is gone. `SessionCleanup._owner_is_gone()` answers that, and it
+  asks a deliberately different question of two populations. A
+  `dashboard:`-prefixed key is slot-owned by construction, so absence from
+  `CleanupState.active_dashboard_slots` settles it; that set is published by
+  `chat_utils._sync_dashboard_slots`, which sends the *effective* key of every
+  open slot. A key of any other shape, such as a channel-born slot's channel key
+  or a linked slot's `linked_session_key` (`taskrunner:{id}:chat:{tok}`,
+  `cron:{job}`), is slot-owned only if a published live set once carried it.
+  That is recorded in `CleanupState.slot_owned_keys` at publish time and pruned
+  to the keys that still have a live session OR a slot open right now, so the
+  record is bounded by two finite sets rather than by uptime. That prune runs at
+  BOTH ends, each sweep and each publish, because the sweep is not guaranteed to
+  run at all: `session.timeout_secs=0` leaves `idle_sweep_enabled` false, and the
+  sweep is where the other prune lives, so a record bounded only there would grow
+  with every key ever published and never shrink. The two use one expression, so
+  they are idempotent rather than two policies. The
+  second half of that bound is load-bearing: a slot publishes its linked key as
+  soon as it opens, which can precede the first turn that creates the session,
+  and a prune against the session map alone would forget the record while the
+  slot is still open. A key kept only because it is in the live set cannot be
+  reaped while it stays there, since `_owner_is_gone` requires absence from that
+  same set. A key that `messaging.link.is_channel_session_key` recognises is
+  never recorded at all: a dashboard slot opened on a channel conversation
+  publishes the CONVERSATION's own key (`slack:{ts}` and its siblings), which
+  the channel owns, so dismissing that viewer proves nothing about whether the
+  thread is finished and reaping it would tear a live conversation's runtime
+  down mid-thread. The sweep already skips `channel:`-prefixed keys for the same
+  reason; the other channel namespaces do not carry that prefix, so the
+  exclusion is spelled at the record as well.
+
+  The record describes ONE incarnation, so on the TERMINATED-OWNER path it
+  is released just before that session's `reset`, not left for the next sweep's
+  prune: the prune runs during the scan, ahead of every reset, so a record left
+  behind outlives its session and a later fire arriving under the same key would
+  inherit a claim it never made and be reaped though it never had a tab. An IDLE
+  reap deliberately keeps the record: there the slot is typically still open,
+  which is why the owner-gone test said no, and the record describes the SLOT's
+  claim, which outlives any one session under it. The
+  release sits before the `reset` rather than after it succeeds, so a publish
+  landing inside `reset`'s await re-adds the key, which is the right answer when
+  a slot reopens for it. A `reset` that DECLINES because the session turned busy
+  restores the record itself, because the release described a session that is
+  still registered: without that restore the key would leave this axis entirely
+  while its tab stays closed, since it is absent from the live set, carries no
+  `dashboard:` prefix and nothing else re-adds it, and would fall back to the
+  idle clock. That restore is also conditioned on the terminated-owner path, so
+  a declined idle reset cannot CREATE a claim for a session no slot ever made
+  one for. The record is what makes the axis safe:
+  without it, absence from the live set is equally true of a `cron:` fire, a
+  `taskrunner:{id}:task{n}` step or a `hook:` session that is running right now
+  and never had a tab, so reaping on absence alone would end live work instead
+  of finished work. Two further guards apply to this axis only, and the probe
+  call one of them makes carries a third question the RSS recycle shares. It
+  consults the
+  same `CleanupDeps.has_attached_subagents` probe the RSS recycle uses,
+  fail-closed, because with session sharing on a parent's children run on its
+  runtime after its own turn ends and the busy semaphore cannot see them. That
+  same wrapper answers a second question FIRST, and synchronously: whether a
+  completion injection is in flight for the key
+  (`CleanupDeps.has_pending_injection`, installed by the gateway over its
+  `_cron_injecting` counter). The gateway raises that counter before awaiting
+  the injected turn's store read, so until `get_or_create` runs the session
+  holds no permit, the delivering sub-agent is already `done` and so absent from
+  the running set, and a closed tab leaves no in-flight delivery either: every
+  other signal reads "finished" while a turn is already committed to that
+  session, and the reset discards the runtime that turn is about to write into.
+  The counter is the only witness, which is why the gateway's own three reset
+  sites consult it and the sweep, as the fourth resetter, now does too. It is
+  read inside the SHARED fail-closed wrapper, so the RSS recycle honours it as
+  well, and an unreadable counter keeps the session like any other unanswerable
+  probe. The sweep asks it in its own right, BEFORE the axis split, so both reap
+  branches honour it: the axis that elected a session says nothing about whether
+  a turn is committed to it, and the clock alone can elect a never-tabbed
+  `cron:{job}` parent whose `last_used` went stale during the very sub-agent run
+  whose completion injection is in flight. For the idle branch that read is the
+  last one before its reset. The two branches that suspend on the sub-agent probe
+  -- the orphan branch and the RSS recycle -- read the counter ONCE MORE after
+  that probe, because it suspends and an injection starting inside its await is
+  invisible to any earlier read. On both, that re-read is the last statement
+  before `reset` and nothing between them suspends. Neither read is the atomic
+  one, though: `reset` itself suspends on the registry lock before it validates
+  anything, so an injection beginning while that lock is contended is invisible
+  to every read a caller took first. Both resetters therefore pass
+  `reset(skip_if_injecting=True)`, which asks the counter UNDER that lock beside
+  the identity and semaphore re-validations, so the answer is atomic with the
+  pop. The sweep's own reads stay as a cheap early-out that names its own reason
+  in the log. The option is opt-in, so a user-initiated reset still wins over an
+  injection, and it fails closed locally: an unreadable counter declines that one
+  reset rather than raising through a sweep with other candidates to visit.
+  The guard DEFERS the reap rather
+  than exempting the key: once the counter returns to zero the next sweep expires
+  it, so the runtime this axis exists to release is not held for good by a window
+  that has closed.
+  Every verdict this sweep reaches is about ONE incarnation, so on this axis the
+  reset is pinned to it: the scan carries the session object out with its key and
+  passes it as `reset(expect_session=...)`, which revalidates identity under the
+  registry lock and declines on a mismatch. Two awaits separate the scan from the
+  act, so the key can change hands in between -- a cron job firing again, a tab
+  reopened and a turn taken -- and a key-only reset would hand that newcomer a
+  verdict reached about its predecessor. The record restore on a declined reset
+  is conditioned on the same identity, which covers both reasons for a decline:
+  a session that is merely busy is the one whose claim was released, so the claim
+  goes back, while a key that changed hands must not have a claim invented for
+  its new holder. The idle axis keeps its long-standing key-only reset. And
+  the answer is then re-asserted against the current live set. That re-assert
+  must be the LAST read of the live set before `reset`, which is why it sits
+  after the probe rather than before it: two awaits separate the scan from the
+  act, the lock release and the probe's off-loop task-store read, and a slot can
+  reopen in either window. Everything between the re-assert and `reset` is
+  synchronous by requirement, so a check placed any earlier reopens the window
+  it exists to close and a session the user has just resumed loses its runtime.
+  While no live set has been published at all
+  (`active_dashboard_slots is None`) the axis expires nothing, so a build with
+  no dashboard keeps the idle timer as its only reaper. The policy is
   **re-read every tick**, not frozen at loop start: `_adopt_idle_policy()` runs
   at the top of the loop and again before each sleep, taking
   `session.timeout_secs` and `session.watchdog_rss_max_mb` off the manager's
@@ -797,7 +889,15 @@ send time.
   (installed by `chat_utils.wire_session_subagent_probe()` from both
   `server.py` start paths via `SessionManager.set_subagent_probe`, built over
   the shared attached-children predicate) right before `reset`, and a probe
-  that raises counts as attached. That predicate is a COROUTINE
+  that raises counts as attached. The same wrapper asks one further question
+  before that coroutine probe: whether a completion injection is in flight
+  (`CleanupDeps.has_pending_injection`), so the ceiling cannot recycle a runtime
+  an already-committed turn is about to write into either. The recycle then asks
+  that counter AGAIN once the probe returns, as the last statement before
+  `reset`: the wrapper's read happens before the probe suspends, so an injection
+  starting inside that await would otherwise be invisible on this path, and
+  neither `skip_if_busy` nor `expect_session` can see it -- an injecting session
+  holds no semaphore, and the injected turn resolves to the same object. That predicate is a COROUTINE
   (`chat_utils.subagents_attached_async`): its queued half reads the task store
   and this sweep runs on the gateway loop, so `set_subagent_probe` accepts an
   awaitable answer and the cleanup boundary awaits it; a sync probe (a double, a
@@ -2182,6 +2282,20 @@ liveness, never by the root's fate: `AcpClient._reset_state()` and
 children confirmed gone and log the survivors at WARNING.  A child that
 escaped the group kill by calling `setsid` keeps its entry, because that entry
 is the only handle the periodic sweep and the next startup cleanup have on it.
+
+A root that is already gone when teardown runs is handled on the runtime path
+by `AcpRuntime._signal_tree` → `_signal_orphaned_runtime_group`: the group id
+is the root pid (a session leader), and the group's MEMBERS are signalled, each
+re-verified by start id at the instant of the signal — never the group number,
+which can be handed to a fresh session leader at any moment.  A member counts
+once `_marked_group_members` finds it carrying this spawn's
+`KIROCREW_SPAWN_INSTANCE` (the per-spawn token on the root's environment, the
+one thing a fresh runtime on a recycled root pid cannot share) together with
+`KIROCREW_SPAWNED` and a runtime argv identity.  This is the tree the snapshot
+cannot cover — a root that died before its first scan — and the tracked sweep
+cannot either, since nothing was recorded.  Linux only; see
+[acp-client](acp-client.md).
+
 If the gateway crashes, the entries remain in the file for the next startup.
 
 **Detection**: reads `kiro_pids.txt`, processes only `child:parent` lines
@@ -2349,31 +2463,13 @@ a trust root on its own; publication therefore also writes a
   graceful-shutdown sweep asks for the narrowing. This pass touches only the
   `session_pid_<pid>` family, never the shared `kiro_session_pids.txt` that
   pass 1 rewrites.
-- **Private member API authority**: the trusted publisher also writes the live
-  private process incarnation, session and immutable target store to
-  `member-memory-bindings/pids/<pid>.json`, under the precreated sandbox-readonly
-  root. Private V2 recall, lesson writes, and consolidation require a positive
-  kernel peer/ancestor match to this record, or a live-process-bound delegated proof
-  issued by the trusted MCP gateway after the same check. The shared internal
-  secret and legacy writable sidecars alone grant no private member authority.
-  A rekey, recycled process, unreadable record, or expired proof refuses the
-  request. Proof signing material is under the sandbox-hidden `memory_stores`
-  root; pooled backends receive proof only in the current call's trusted metadata.
-  Global V1 publication leaves no private PID binding, preserving shared V1 tab
-  behavior. A private session's first trusted preparation additionally pins
-  `member-memory-bindings/sessions/<sha256-key>/memory.json`; later metadata must
-  agree, including after restart. Neither erasing the metadata nor changing it
-  to another store can change this permanent private identity.
-- **Private runtime allocation**: every allocation resolves that trusted binding
-  off the event loop before reusing a provider or claiming a warm process. Private
-  cron, consolidation, delegated and interactive sessions bypass the V1 warm pool
-  and cannot share an ACP runtime. A task with a private parent or target uses its
-  own provider; a private parent with an unbound child refuses execution until the
-  child's trusted memory binding is established. An already-live provider whose isolation differs from its binding
-  is explicitly refused until the session is restarted. Global V1 allocation and
-  sharing stay unchanged. MCP caller discovery checks protected process ancestry
-  before cached identity, environment or legacy sidecars; a malformed protected
-  record remains unresolved and never falls back to those legacy sources.
+- **Member execution routing**: the ordinary session/run owner record carries
+  the immutable member/store snapshot. Strict MCP caller identity still uses
+  the existing transport token and signed `session_pid` publication. No separate
+  member PID publication, process ancestry scan, or member proof token exists.
+  Providers receive the admitted privacy mode before startup; restricted workers
+  do not retain Crew native-transcript copies or raw-frame logs. External engine
+  retention follows that provider's own supported behavior.
 - **Threat model** (full version in the `session_pid_sig.py` module
   docstring): file forgery, cross-pid replay, tampering, and symlink
   planting are blocked; deliberate same-uid impersonation via
@@ -2434,14 +2530,129 @@ untracked orphans and SIGKILLed them mid-chat (surfacing as
 
 ### Cross-platform process management (platform_compat)
 
+### Reclaim identity: a projected marker set, and a subtractive token
+
+`kiro_session_pids.txt` entries are swept by `_sweep_pid_entries` (periodic, in two
+phases) and `cleanup_orphaned_session_roots` (startup). What authorizes a signal in
+both is `_is_managed_agent_process(pid)` — does this PID still name the kind of process
+the entry described — plus each arm's own condition: a dead owning gateway, and for a
+token-less entry a reparent to init or to the dead gateway.
+
+That gate is per-TOKEN and exact wherever a command line can be read (Linux `/proc`,
+macOS `ps`), never a substring of the whole line: the projected names include
+three-character ones, and `dsh` sits inside `friendship`, `goose` inside `mongoose`. The
+tokens allowed to answer are chosen by POSITION: `argv[0]`, and — only when `argv[0]`'s
+basename is `node`, `nodejs` or `node.exe` — `argv[1]`, which is the script slot of a
+Node-hosted adapter.
+
+`argv[1]` exactly, never "the first token that does not look like a flag". Crew launches an
+adapter as `[node, <script>]` and passes no interpreter options, so the script is always at
+index 1 — while scanning past options hands an option VALUE to the name test. `--require`
+and its kin take one, so `node app.js --require /any/path` would offer `/any/path` as the
+script slot, and a path an unrelated process merely MENTIONS would authorize a SIGKILL of
+it. Distinguishing a value-taking Node option from a boolean one needs a table of Node's
+flags, which is an open set and a moving one; index 1 is neither. A leading `-` at index 1
+opens no slot, because Crew never emits one. Node spellings only: every registered backend's bespoke adapter is a
+Node entry script, and each name in that set widens the slot in which a harness name is
+accepted, so one added for an interpreter nothing launches under is authority granted for
+a shape that does not exist. An adapter shipping as a Python entry script adds its
+interpreter there with its own review. The rest of argv is excluded because arguments are
+chosen by whoever started the process and say nothing about what it is; accepting them let
+`node build.js --agent goose` authorize a SIGKILL.
+
+The script slot accepts two spellings, because the resolver produces two, and they are
+matched by two different KINDS of identity. The bin shim is `node /opt/n/bin/codex-acp`,
+where the basename IS the name, matched exactly. The package entry is
+`node <pkg>/dist/index.js`, where the basename is `index.js` and names nothing — so that
+one is matched against the RESOLVED RELATIVE PATH, one of
+`backends.node_adapter_entry_relpaths()`, segment for segment against the token's tail.
+The install root above the package is free, because the resolver walks several roots; from
+the package name down it is exact.
+
+Matching a NAME found along the path is what this replaces, and the difference is which
+axis stays open. A package directory's name is chosen by whoever installed it, so reading
+the harness names out of it leaves "what a process may call itself" unbounded — and the
+harness set includes single-binary harnesses Crew never hands to Node at all (`goose` runs
+as `goose acp`, likewise `opencode` and `dsh`). A real unrelated npm application at
+`node /srv/goose/dist/index.js` therefore answered for a harness and would be SIGKILLed by
+the periodic reclaim. The three launch paths are a closed set this repository publishes, so
+comparing them closes the axis instead of narrowing it: `ACP_BACKEND_NODE_ADAPTER_PACKAGES`
+in `agent_sdk.backends` is the one table, the resolvers build their entry paths from it, and
+the reclaim reads the same list — so a path the resolver can produce and the reclaim cannot
+recognise, or a path the reclaim accepts and Crew never spawns, are both a failing test
+rather than a leaked process or a wrong kill.
+
+`_MANAGED_AGENT_MARKERS` is PROJECTED from the backend registry
+(`agent_sdk.backends.agent_process_markers`), not written by hand. A hand-written
+`("kiro-cli", "claude")` pair answered for two of the eight harnesses Crew spawns, so
+a dead gateway's `codex-acp`, `opencode`, `pi-acp`, `goose` or `dsh` orphan answered
+"not ours" — and the branch for an unrecognised PID both spares the process and drops
+its tracking entry, the one file every sweep mechanism keys off to find it. Spared and
+forgotten. A harness added later is one row in `ACP_BACKEND_PROCESS_NAMES`, and a
+ratchet in `test_pid_lifecycle` fails when a registered backend has no row. The three
+self-served harnesses read their own `ACP_BACKEND_LAUNCH` row so the two cannot
+disagree, and the three bespoke adapters' own `*_ACP_BIN` constants (plus
+`KIRO_CLI_BIN`) INDEX the table rather than repeating it — `acp.client` may read
+`agent_sdk.backends`, a stdlib-only leaf, even though `session_pid` may not read the
+ACP layer, so the one-way dependency removes the duplicate spelling instead of only
+policing it. A test asserts the equality, so a literal reintroduced in either place is
+caught there rather than by a sweep failing to recognise the process the adapter spawns.
+
+The recorded start token is SUBTRACTIVE EVIDENCE ONLY, the same rule `kiro_pids.txt`
+follows. A live value that differs from the recorded one proves the PID was recycled
+and prunes the entry without a signal; an unreadable live value is "unknown" and
+retains the entry for the next pass; a value that MATCHES authorizes nothing, because
+the tracking file is same-uid-writable and the token is readable from `/proc` for any
+introspectable PID, so the file's contents may not confer a capability. A settled
+token does remove the weaker PPid recycle test in the startup arm, which predates this
+and is load-bearing: an orphan does not always reparent to init, since a child placed
+in its own cgroup scope reparents to that user manager, a subreaper.
+
+Because the token grants nothing, its Linux boot-relativity costs a missed prune
+rather than a wrong kill. `platform_compat._own_identity_token` is the reboot-unique
+form should a future change need one.
+
+The periodic sweep's two phases do not pass a verdict between them. The kill phase
+re-reads the entry and re-applies the subtractive check, since an event-loop hop
+separates the phases and a PID can be reallocated across it. A candidate whose entry is
+absent from that re-read is SKIPPED, not killed: nothing in the file then records what
+the PID was, so the recycle guard has no input, and an absent entry is also one this
+pass owes no write-back. The unreadable-file arm returns an empty index, which makes a
+transient read failure cost zero kills for one pass rather than un-vouched kills for
+every candidate. The phase also prunes by the entry's own TEXT: a rebuilt `<gw>:<pid>`
+string never matches a token-bearing line, so a reaped process's entry survived in the
+file and every later pass met a dead PID there.
+
+RESIDUAL — Windows. Only an image name is readable cheaply there (a real command line
+means a WMI query per PID, and these sweeps ask for every tracked entry), so an
+interpreter-hosted adapter reads as `node.exe` whatever names the set holds, and its
+orphans are not reclaimed by name on that platform. The image name is still compared
+EXACTLY against the same basename set, so the gap can only ever spare a process, never kill
+an unrelated one. Closing it needs a per-PID identity Windows can read cheaply, which is
+its own change; it is stated here rather than narrowed, because a better name match cannot
+reach it. The basename split handles `\` as well as `/` regardless, so a Windows-shaped
+argv0 in a command line that DOES get read is not carried whole into an exact-name test.
+
+Windows synchronous provider fallback, including `_proc` and `_active_proc`
+shapes, uses the same exact-tree cleanup admission as ACP teardown. Capacity
+refusal preserves the root/tracking and never falls back to root-only signalling.
+`retire_windows_tree_tracking` checks both PID-file writers and removes the
+protected-PID shield only while the cleanup owner still pins the incarnation.
+A failed writer retains the receipt and its reservation for maintenance. Numeric
+root absence does not retire a pending tree's session record. Manual overflow
+is permanent for this gateway process; see the cleanup bounds and recovery
+procedure in [platform-compat](../common/platform-compat.md#windows-session-tree-teardown).
+
 All process liveness/kill/PID-file-lock operations in `session.py` and
 `session_pid.py` go through `kiro_crew.platform_compat` so KiroCrew runs natively on
 Windows as well as macOS/Linux. The critical correctness reason is that
 **`os.kill(pid, 0)` is NOT a liveness probe on Windows — it terminates the process** —
 so every liveness check uses `platform_compat.pid_exists(pid)` (or the tri-state
 `pid_liveness`) instead, kills use `kill_pid` / `kill_process_tree`, the PID-reuse
-guard reads the parent via `get_ppid`, the managed-agent check uses
-`process_matches(pid, ("kiro-cli","claude"))`, and the PID-file locks use
+guard reads the parent via `get_ppid`, the managed-agent check authorizes on argv
+for every entry (`process_matches(pid, _MANAGED_AGENT_MARKERS)`, with the recorded
+`get_process_start_id` token as subtractive evidence only — see "Reclaim identity"
+above), and the PID-file locks use
 `platform_compat.file_lock` / `acquire_lock` / `try_acquire_lock` (POSIX `flock`
 vs Windows `msvcrt`). On POSIX the behavior is unchanged.
 

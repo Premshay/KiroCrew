@@ -44,7 +44,9 @@ produces exactly those silent failures, which is why the helper is named per cal
 | Signals | `platform_compat.SIGKILL` / `SIGTERM` | `signal.SIGKILL` (undefined on Windows) |
 | Spawn isolation | `start_new_session=IS_POSIX` + `creationflags=CREATE_NEW_PROCESS_GROUP` | bare `start_new_session=True` |
 | Wait on a subprocess PIPE with a deadline | a daemon reader thread feeding a `queue.Queue`, consumed with a bounded `get` (`testing/harness.py`'s `_StdoutPump`) | `selectors.DefaultSelector()` on the pipe (select()-based on Windows, which accepts SOCKETS only, so registering a pipe RAISES there) |
+| Re-enter an edition's stable gateway launcher | `reexec_launcher(launcher, args)` after `gateway_restart.resolve_restart_launcher()` validates it; keeps the dispatch pathname, original arguments and UTF-8 environment | resolving the symlink basename away, passing Python `-m` flags to a launcher, or evaluating a shell command |
 | Re-exec the current Python module | `reexec_python_module(module, args)` | `os.execv(sys.executable, [sys.executable, ...])` (breaks when the Windows interpreter path contains spaces) |
+| Launch a Kiro Crew-owned Python child | `isolated_python_argv(*args, executable=...)`; it adds `-s` for the bundle and parents whose user site is already unavailable, unless the option prefix carries `-s` or stronger `-I` | a raw `[sys.executable, ...]`, or an ad hoc `PYTHONNOUSERSITE` env that another spawn path can omit |
 | Replace the current process with another program (a supervised service body) | spawn a child, record its pid + `process_start_time`, and `wait()` on it under `IS_WINDOWS` (see `pod.windows.supervise_gateway`) | `os.execve` (on Windows this SPAWNS and terminates the caller, so the pid changes and the service manager sees the unit exit while the real program keeps running orphaned) |
 | Open an exact Windows process object for later tree discovery/termination | `open_process_termination_handle(pid, expected_token)` validates the opened handle's creation identity before returning it (caller closes with `close_process_handle`); combine with `descendant_termination_handles` so the anchored root and each retained child receive a final post-exit snapshot | opening by PID and checking the token beforehand (PID reuse can occur between those operations) |
 | Race-free Job object assignment | `creationflags \|= CREATE_SUSPENDED`, then `apply_job_limits`, then `resume_process_main_thread` | assigning a job to an already-running child (descendants it already spawned escape) |
@@ -63,8 +65,98 @@ produces exactly those silent failures, which is why the helper is named per cal
 | FD soft limit | `raise_nofile_soft_limit(n)` | `resource.setrlimit` |
 | Port to PID | `find_listening_pids(port)` / `listening_pid_tool_available()`; `find_port_listeners(port)` when ownership must be scoped to the local address actually probed | `lsof` directly |
 | Spawn a system tool (`ps`, `lsof`, `netstat`, `taskkill`) | `trusted_system_bin(name)`, treating `None` as "unavailable" | a bare argv name (resolved through a `PATH` that can lead with same-uid-writable dirs) |
+| Spawn the AWS CLI (`aws`) | `trusted_aws_bin()` — `trusted_system_bin` plus a `/usr/local/bin` fallback (the installers' default `--bin-dir`), accepted only when `_is_root_owned_path` resolves the path COMPONENT BY COMPONENT and finds every directory it walks through — including the directories on a symlinked component's target side — plus the final target, root-owned, not group/world-writable, and (via `os.access(..., effective_ids=True)`, the only form that reads a POSIX ACL) not writable by the non-root account through an ACL entry `st_mode` cannot express. Running AS root DECLINES: there `os.access` answers True for everything, so the ACL arm has no signal, and the entry it would catch grants a NON-root user write — the one case root must not execute. Only the `/usr/local/bin` fallback is lost under root; `trusted_system_bin` does not route through this. The fallback also refuses a `#!` SCRIPT (`_is_native_program`): a shebang names its interpreter in the file's CONTENT, which the path walk never validated, and `sudo pip install awscli` against a pyenv Python produces exactly that — AWS CLI v2 ships a native executable, so the case this exists for is unaffected. Both conditions live in ONE predicate, `_local_aws_bin_is_trusted`, because the resolver and `aws_bin_declined_on_ownership` both ask and must never contradict each other about one file. Debian policy has `/usr/local` subdirectories `root:staff` mode `2775`, so the fallback DECLINES by default on stock Debian/Ubuntu: intended, because a `staff` member can replace the binary. A diagnostic must then report the decline with `aws_bin_declined_on_ownership()` rather than as absence | adding `/usr/local/bin` to `_TRUSTED_SYSTEM_BIN_DIRS` (Intel macOS Homebrew owns that directory as the console user, so membership alone would let a same-uid process supply `ps`, `lsof` and every other pinned tool); or validating the path with `realpath` (collapses a chain, so a hop through writable space vanishes) or a lexical `dirname` walk (`os.stat` follows symlinks and `dirname` does not, so a symlinked component's target ancestors are never seen) |
 | Read a Windows system tool's ANSWER (`schtasks /Query`, `tasklist`, `sc query`) | the tool's **exit code**, or a fact the program under test recorded itself | parsing its stdout (column headers AND status words are translated by the UI language, so a match on `"Running"` reports every instance down on a non-English host — the fail-OPEN direction) |
 | strftime no-pad | `strftime(dt, "%-I")` | bare `dt.strftime("%-I")` (`ValueError` on Windows) |
+
+## Internal Python child user-site isolation
+
+Every Kiro Crew-owned Python service, helper, and runtime dependency installer that
+can run under the bundled interpreter routes argv through `isolated_python_argv`.
+The helper adds `-s` for the bundle and for parents whose user site is already
+unavailable, removing the interpreter's user-site directory without dropping
+`PYTHONPATH`, cwd import behavior, or other required environment settings. A caller
+that already carries `-I` stays unchanged; `-I` is stronger because it also ignores
+Python environment variables and the cwd. A non-bundled parent that currently allows
+the user site preserves that policy because Kiro Crew itself may be installed there.
+
+A module-style child that imports `kiro_crew` from the parent's own user site
+keeps the parent's user-site policy. Isolation is forced only when the parent's
+own launch rewrite injects the child's import path, never because the child
+inherited `PYTHONPATH`. A caller MUST therefore pass `force_isolation=True`
+only for that launcher-injected path, such as the path-based dependency shim,
+or for a script or entry path that does not import `kiro_crew` from the user
+site. The explicit override keeps `-s` on non-bundled, user-site-enabled
+interpreters only where removing the user site cannot remove the child target.
+
+This contract does not apply to user-authored cron scripts, project test commands, or
+other workloads whose documented environment may include `--user` packages. The
+explicit inventory in `test/test_internal_python_isolation.py` names the internal
+boundaries. It includes resident runtime workers such as
+`piper_runtime.PiperRuntime._start`; their module launches follow the same unforced
+parent-policy decision. Adding one requires routing it through the helper and adding it
+to that inventory, so a later spawn cannot silently return to the user-site-dependent
+behavior.
+## Confined decision-log append
+
+`platform_log_append.append_line` owns the decision log's filesystem transaction.
+The configured home is resolved once as the trusted anchor; the immediate log
+subdirectory and daily file are never resolved through links. POSIX pins the
+anchor with `pinned_fs.pin_parent`, creates the directory relative to that pin,
+and opens the directory and leaf with no-follow flags. Windows opens the resolved
+anchor and the log directory with `FILE_LIST_DIRECTORY` access and read-only
+sharing (attribute-only access takes no part in Windows sharing, so it would pin
+nothing), rejecting reparse attributes on both, so a data-write or delete open of
+either directory is a sharing violation while the append runs. The leaf uses
+`CreateFileW` read/write, open-or-create, without following reparse points, and
+its `GetFinalPathNameByHandleW` path must equal the pinned directory plus the
+leaf name; a swap that landed before the pins is refused rather than written
+through. Every native handle or descriptor is closed on failure as well as success.
+
+Fresh POSIX directories/files request 0700/0600; existing modes are untouched.
+The leaf is created with `O_CREAT | O_EXCL`. If another creator won or the file
+already exists, one non-creating open uses the same pinned directory and retains
+`O_NOFOLLOW`, `O_APPEND` and `O_NONBLOCK`. This avoids Darwin's concurrent
+nonexclusive-create `ENOENT` without re-resolving the parent or following a
+swapped link. A leaf that disappears between that `EEXIST` and the open is one
+more lost interleaving: the existing bounded create-directory retry runs the whole
+pinned sequence again, so the record is still written, through the same exclusive
+no-follow create, under the same resolved anchor. Each failed attempt closes its
+descriptors. Exhaustion raises `FileNotFoundError` naming the full path.
+Other open errors propagate. Windows keeps its native open-or-create path.
+Windows uses inherited ACLs, not a claim that POSIX mode bits enforce privacy.
+The open file must be regular and have exactly one hard link. The existing
+cross-platform file lock spans EOF validation, short-write/EINTR retries and
+rollback. File offsets are explicitly reset inside the lock, including on Windows.
+Lock acquisition and retries share a finite deadline that starts once the log is
+open, so the create-and-pin ahead of it never spends the budget it cannot be
+cancelled by. The OPEN carries a second budget of the same length, spent only on
+Windows and only on `ERROR_SHARING_VIOLATION`: another process holding a transient
+handle with narrower sharing than the access asked for is what contention looks
+like there before the lock is reached, so the open is retried for that one error
+while the budget lasts and reports it unchanged afterwards. Two budgets rather
+than one because a slow open must not reach the lock with nothing left; the retry
+covers the open alone, so no partial write is ever replayed. No additional worker
+is spawned; a stalled filesystem syscall itself is not cancellable by either
+deadline.
+
+On write failure, rollback removes only the bytes counted for that append when
+the file has exactly the expected size. Existing bytes or unrelated growth are
+never truncated. A pre-existing torn tail, including one left by failed rollback
+or process death, is terminated with a newline before the next record is written,
+so one torn row costs one unparseable line and never joins the record after it.
+This is best-effort observation, not a
+durable journal: no fsync or crash-atomic publication is promised. POSIX locks
+serialize cooperating writers, not arbitrary same-user mutations or hostile
+filesystem mounts. Descriptor pinning prevents redirected opens, not POSIX rename
+of an already-open inode outside its original directory.
+
+The retention sweep reuses the same pin: `pinned_log_dir` yields the no-follow directory descriptor on POSIX (names are listed with `scandir(fd)` and removed with `unlink(name, dir_fd=...)`) and holds the directory handle on Windows, so a swapped directory link cannot redirect a deletion. The decision caller catches append failures and warns without failing its turn.
+`test/test_platform_log_append.py` exercises ordinary appends on every platform,
+link refusal, short writes, rollback, concurrent writers, deadlines and cleanup.
+Native Windows cases also require rename and directory-write-handle exclusion,
+refusal of a redirected leaf handle, and release after failed CRT handle
+conversion; Linux simulations do not verify these.
 
 ## Embedding threading and cancellation
 
@@ -143,6 +235,172 @@ This covers an **already observed, handle-pinned** chain. An intermediary that d
 before it was ever observed/pinned remains unverifiable; a single numeric snapshot
 is not enough to recover that chain. The deterministic and self-owned native
 regressions are in `test/test_platform_compat.py`, `TestProcessDescendants`.
+
+## Windows session-tree teardown
+
+Windows physical ACP starts reserve cleanup bookkeeping atomically before the
+spawn await, across threads and event loops. Both transports use the same
+process-wide admission set: `_WINDOWS_CLEANUP_ROOT_LIMIT` is 64 physical trees,
+including starting, live, failed and manually quarantined trees. This is a separate
+internal cleanup limit, not a change to pool, RSS, Job or timeout configuration.
+A live tree keeps its reservation, so simultaneous failures cannot exhaust the
+space needed to retain already-admitted roots. A cancelled launch settles its
+spawn task and takes ownership of any returned child before attempting cleanup;
+only an empty failed-launch reservation or a verified retired tree is refunded.
+The suspended-resume worker also settles before cancellation initiates teardown.
+
+The Windows factory capture boundary is the successful native `CreateProcess`
+return, before CPython closes child-side pipe descriptors, publishes the Popen
+handle, closes the initial thread handle, registers the process wait, or connects
+async pipes. The cleanup reservation receives the exact native process handle
+there; CPython and cleanup then share one reference-counted `subprocess.Handle`.
+A post-creation exception publishes this owner for maintenance even without a
+returned asyncio `Process`. Pre-creation exceptions refund the empty reservation.
+The initial thread handle also has a per-call reference-counted owner so an early
+pipe-descriptor failure cannot skip its release.
+
+The reservation's exact handle is recorded before the tree's identity is read, and
+that read runs on `subprocess_executor()` rather than the starting loop. The read
+polls for an exit FILETIME the kernel publishes slightly after it reports the exit,
+so a child that dies the moment it resumes makes it wait tenths of a second — on a
+loop that is serving every other session. Recording the handle first is what makes
+the hop safe: a cancellation arriving during the read still leaves this exact child
+retained for maintenance instead of dropping it.
+
+This narrowly reuses CPython functions with per-call substituted global bindings;
+it does not replace asyncio/Popen globals or install methods on the live loop.
+Only the standard CPython Proactor subprocess implementation is admitted; a
+different loop implementation refuses before creation. The admission reads private
+CPython shapes, so it is version-coupled and the coupling is measured rather than
+assumed: the shipped predicate and its capture were exercised against a real child
+process on stock Windows CPython 3.12, 3.13 and 3.14 — every minor `requires-python
+= ">=3.12"` admits that exists to measure — and a non-Proactor loop was refused in
+the same run. `requires-python` carries no upper bound, so a later minor is
+unmeasured by construction: it either satisfies the predicate or refuses every
+tracked Windows start rather than capturing nothing silently, which is the intended
+direction of failure. Both refusals name the measured interpreters, so the remedy
+reaches the operator without this file; re-running that measurement is the gate for
+adopting a new minor, and the committed form of it is
+`test/test_runtime_cleanup_windows.py::test_native_admission_and_owner_shutdown_refund_after_verified_drain`,
+which spawns a real admitted tree through this capture on whichever interpreter is
+running. It runs on the Windows CI shards, so a minor that reshapes these internals
+turns the adoption question into a failing check rather than an archaeology exercise.
+POSIX and untracked
+Windows launches retain their original path. This is in-process ownership, not
+protection against gateway death, interpreter failure or resource exhaustion
+inside the native call/capture itself.
+
+`_WINDOWS_CLEANUP_IDENTITY_LIMIT` is 4096 exact objects per tree (root included),
+shared by retained handles, signalled identities and terminal-scan identities.
+This gives generous build/browser fan-out headroom while bounding retention per
+tree; the number of trees is separately bounded by the root reservation cap, so
+the aggregate follows from those two named limits rather than a figure recorded
+here that would drift when either constant moves. These are engineering
+bookkeeping ceilings, not measurements of maximum workload size. Discovery checks
+the retained/candidate union before opening new child handles. Its breadth-first
+candidate stores share that limit. Toolhelp's unrelated-host input is separately
+bounded at `_WINDOWS_CLEANUP_SNAPSHOT_LIMIT` (65536 entries) during enumeration,
+not after allocating the complete process table. Snapshot overflow is incomplete
+evidence, never an empty tree. Temporary unvalidated candidate handles are closed
+on discovery failure; previously owned root/intermediary pins remain retained.
+
+Any identity/snapshot overflow permanently marks the tree
+`manual-handling-required` in this gateway process. It keeps its pins and tracking,
+receives no automatic refund and is excluded from retries. A later shorter
+snapshot cannot clear the mark. New Windows physical starts are refused while
+any such mark exists; other already-admitted trees remain owned and can drain.
+The transition emits an error with the root PID and retained count. This is
+**bookkeeping quarantine, not OS isolation**: unobserved descendants may still
+run. No API, eviction rule or successful numeric PID probe clears the condition.
+Ordinary transient failures without overflow continue to retry automatically.
+
+Operator recovery is manual: preserve the diagnostics and tracking, stop creating
+new work, and use independently verified process ownership to account for and stop
+the affected workload, including descendants not represented by the retained
+pins. Do not kill a process merely because it reused a logged PID. If complete
+ownership/absence cannot be established, a planned host reboot is the reliable
+way to end surviving processes (save unrelated work first). Restart the gateway
+only after that independent cleanup or host restart. A gateway restart alone
+neither terminates all descendants nor proves they are gone; it loses this
+process-local quarantine and its pins. Deleting tracking files is not recovery.
+
+ACP runtime and direct-client teardown retain the original asyncio process
+object and drain it through `terminate_windows_asyncio_tree`. The Windows
+`kill_process_tree_pinned` path uses the same `terminate_windows_process_tree_owned`
+operation after confirming the recorded creation identity. Neither path relies
+on a still-running root PID or a successful `taskkill` return code.
+
+The bounded worker discovers descendants through exact handles, terminates each
+verified object and scans each parent again after confirmed exit. A successful
+pass closes every acquired handle. A failed pass from an owning caller transfers
+the original root and every already observed intermediary handle into
+process-local pending state keyed by the exact root incarnation; it retains no
+provider or client object. Repeated transfers deduplicate and close only the
+redundant root handle. The existing off-loop
+`session_pid.cleanup_orphaned_session_roots` maintenance entry advances a finite,
+fair snapshot of that state before its ordinary PID-file orphan scan; a tree
+already draining on another caller is skipped with a non-blocking lock and
+rotated behind its peers, so one busy entry cannot hold up the sweep (caller-
+initiated cleanup keeps its blocking serialization). A denied
+tree remains retained and visible and moves behind its peers; only an
+exact-handle-verified complete drain retires the state. On completion, a
+synchronous maintenance callback retires the session layer's PID-file records
+and protected-PID shield WHILE the state lock is held and the exact root handle
+still pins the incarnation, BEFORE any handle is closed — so a recycled pid
+cannot register fresh tracking between the close and the untrack. The handles are
+closed only after that callback succeeds; a transient callback/write failure
+leaves the state un-retired with its handles open, so its receipt survives for
+the next tick rather than being lost, and an in-flight duplicate owner that has
+already completed the same state contributes no second retirement. This is
+same-process retry continuity, not crash recovery: the
+maintenance path never reconstructs a missing original handle or gains cleanup
+authority from a PID, a PID-file entry, or a successful `TerminateProcess`
+return. Phase-one periodic PID identification remains non-destructive.
+
+Caller cancellation is delivered after its current cleanup attempt settles.
+Unknown identity/ancestry, denied access or a non-draining tree is a failure, not
+an empty tree; ACP retains the original process and PID tracking when the owning
+call does not complete, while the transferred exact handles remain independently
+retryable after provider/client references are dropped.
+
+This does not reconstruct an intermediary that exited before any available
+handle observed it, and the completeness a successful drain asserts is therefore
+scoped to the members it retains: the pinned root plus every descendant some
+snapshot reached through a still-certifiable chain. An ancestry chain that IS
+observed but cannot be certified raises rather than certifying a subset — that
+much is a refusal, never permission to signal numeric PIDs. A live grandchild
+whose only edge to the root ran through an intermediary that exited before the
+first scan is a different case and must not be read as covered by that refusal:
+Toolhelp reports its parent as a vanished PID, so no walk from the root reaches
+it, the drain confirms the exits it can see and reports success, and that
+residue falls to the PID-file orphan sweep exactly as it did before this
+change. Pinning at spawn closes the window for the ROOT, which is the reaped-root
+case this fix exists for; it does not pin an intermediary nobody has seen yet. POSIX teardown and Windows resource Job limits are
+unchanged. Native small-process regressions live in
+`test/test_runtime_cleanup_windows.py`; deterministic timing/error contracts
+live in `test/test_windows_tree_reap.py`.
+
+Reading a handle's identity has two callers with different needs, and the split
+is load-bearing. A drain must certify that a member exited, so it asks for the
+exit bound and accepts a short poll while the kernel publishes the exit
+`FILETIME`. `get_process_start_id` answers a narrower question — which process
+object a PID names — and publishes itself as non-blocking and safe to call
+directly from the event loop, so its Windows arm asks for the creation half
+alone: no liveness wait, no poll, and no sleep on a coroutine's thread. The
+creation `FILETIME` is the whole identity, so answering without the exit half
+costs the caller nothing.
+
+Teardown deliberately does not keep a Job handle and call `TerminateJobObject`
+instead of draining exact handles. The Job that `apply_job_limits` creates is
+anonymous and is closed before that function returns, so there is no handle to
+retain and no name to reopen; `KILL_ON_JOB_CLOSE` is left unset on purpose,
+because setting it would tie an agent tree's LIFETIME to a resource ceiling's
+handle. That ceiling is also fail-soft by published contract — a missing Job must
+not fail a spawn, and four Win32 call sites log and continue — so making
+reclamation depend on it would either turn every ceiling failure into a refused
+start or leave exactly the degraded host with no reclamation at all. A Job also
+enforces by REFUSING new members rather than killing existing ones, so a
+saturated Job is a state the gateway must survive, not a teardown primitive.
 
 ## Pod lifetime Job primitives
 

@@ -27,6 +27,7 @@ import urllib.error
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -528,14 +529,14 @@ class TestSpawnRunArgumentHandling:
 
     def test_keep_spawn_advertises_continuability(self):
         with patch.object(mcp_core, "_post", return_value={"id": "ag1"}):
-            out = _call_tool("spawn_run", {"task": "one", "keep": True})
+            out = _call_tool("spawn_run", {"task": "one", "keep": True, "solo_reason": "bulk_data"})
         assert "GUARANTEED continuability" in out
         assert "spawn_release" in out
 
     def test_transport_error_is_reported_as_unknown_acceptance(self):
         err = {"error": "read timeout", "transport_error": True}
         with patch.object(mcp_core, "_post", return_value=err) as m:
-            out = _call_tool("spawn_run", {"task": "one"})
+            out = _call_tool("spawn_run", {"task": "one", "solo_reason": "bulk_data"})
         assert "acceptance status is unknown" in out
         assert "Do not retry automatically" in out
         # A transport failure must NOT be reconciled as a lost wave member.
@@ -601,7 +602,7 @@ class TestSpawnRunArgumentHandling:
     def test_approval_mode_env_is_forwarded(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("KIROCREW_APPROVAL_MODE", "auto")
         with patch.object(mcp_core, "_post", return_value={"id": "ag1"}) as m:
-            _call_tool("spawn_run", {"task": "one"})
+            _call_tool("spawn_run", {"task": "one", "solo_reason": "bulk_data"})
         assert m.call_args[0][1]["approval_mode"] == "auto"
 
 
@@ -1026,6 +1027,36 @@ class TestWorkflowListCancelRerun:
 
 
 class TestSkillSearch:
+    """A session-bound call searches through the gateway (project scope); a
+    session-less CLI call falls back to the local loader."""
+
+    @staticmethod
+    def _gateway(monkeypatch: pytest.MonkeyPatch, matches: list[dict]) -> list[str]:
+        seen: list[str] = []
+
+        def _get(path: str, **_kw: object) -> dict:
+            seen.append(path)
+            return {"matches": matches}
+
+        monkeypatch.setattr(mcp_core, "_get", _get)
+        monkeypatch.setattr(
+            mcp_core,
+            "SkillsLoader",
+            lambda **_kw: pytest.fail("session-bound skill_search must not use the local loader"),
+        )
+        return seen
+
+    @staticmethod
+    def _assert_gateway_query(seen: list[str], *, query: str, limit: int) -> None:
+        assert len(seen) == 1
+        parsed = urlsplit(seen[0])
+        assert parsed.path == "/api/skills/-/discover"
+        assert parse_qs(parsed.query) == {
+            "scope": ["installed"],
+            "q": [query],
+            "limit": [str(limit)],
+        }
+
     def test_matches_are_rendered_with_load_hints(self, monkeypatch: pytest.MonkeyPatch):
         matches = [
             {
@@ -1035,68 +1066,96 @@ class TestSkillSearch:
                 "path": "/skills/kirocrew-dev/babysit/SKILL.md",
             }
         ]
-        monkeypatch.setattr(
-            mcp_core,
-            "SkillsLoader",
-            lambda **_kw: SimpleNamespace(search_skills=lambda _q, limit: matches),
-        )
+        seen = self._gateway(monkeypatch, matches)
         out = _call_tool("skill_search", {"query": "babysit"})
         assert "Skills matching 'babysit' (top 1)" in out
         # Whitespace in the description is collapsed.
         assert "Monitor a PR" in out
         assert "cat /skills/kirocrew-dev/babysit/SKILL.md" in out
         assert "$babysit" in out
+        self._assert_gateway_query(seen, query="babysit", limit=20)
+
+    def test_confined_match_renders_its_body_instead_of_a_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        matches = [{"name": "p", "key": "p", "description": "d", "content": "BODY_TEXT"}]
+        self._gateway(monkeypatch, matches)
+        out = _call_tool("skill_search", {"query": "p"})
+        assert "[Skill instructions — reference data]\nBODY_TEXT" in out
+        assert "cat " not in out
 
     def test_long_description_is_truncated(self, monkeypatch: pytest.MonkeyPatch):
         matches = [{"name": "s", "key": "s", "description": "d" * 500, "path": "/p"}]
-        monkeypatch.setattr(
-            mcp_core,
-            "SkillsLoader",
-            lambda **_kw: SimpleNamespace(search_skills=lambda _q, limit: matches),
-        )
+        self._gateway(monkeypatch, matches)
         out = _call_tool("skill_search", {"query": "s"})
         assert "d" * 300 + "..." in out
         assert "d" * 301 not in out
 
     def test_no_matches_suggests_broader_keywords(self, monkeypatch: pytest.MonkeyPatch):
+        self._gateway(monkeypatch, [])
+        out = _call_tool("skill_search", {"query": "zzz"})
+        assert "No skills matched 'zzz'" in out
+
+    def test_pid_walked_identity_never_selects_a_project(self, monkeypatch: pytest.MonkeyPatch):
+        """A tokenless spawn child resolves leniently to its PARENT slot. The
+        gateway route returns that project's confined skill bodies, so only a
+        signed identity may reach it; the walk falls back to the global loader."""
+        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:parent")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        monkeypatch.setattr(
+            mcp_core,
+            "_get",
+            lambda *_a, **_kw: pytest.fail("unsigned identity reached the gateway"),
+        )
         monkeypatch.setattr(
             mcp_core,
             "SkillsLoader",
-            lambda **_kw: SimpleNamespace(search_skills=lambda _q, limit: []),
+            lambda **_kw: SimpleNamespace(
+                search_skills=lambda q, limit: [
+                    {"name": "global-only", "key": "g/global-only", "description": q, "path": "/g"}
+                ]
+            ),
         )
-        out = _call_tool("skill_search", {"query": "zzz"})
-        assert "No skills matched 'zzz'" in out
+        out = _call_tool("skill_search", {"query": "x"})
+        assert "global-only" in out
+
+    def test_gateway_error_is_reported_not_swallowed(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(mcp_core, "_get", lambda *_a, **_kw: {"error": "project not trusted"})
+        out = _call_tool("skill_search", {"query": "x"})
+        assert out.startswith("Error: skill_search failed: RuntimeError: project not trusted")
 
     @pytest.mark.parametrize("raw,expected", [(0, 20), (999, 50), (5, 5)])
     def test_limit_is_defaulted_and_clamped(
         self, monkeypatch: pytest.MonkeyPatch, raw: int, expected: int
     ):
-        seen: list[int] = []
-
-        def _loader(**_kw: object) -> SimpleNamespace:
-            def _search(_q: str, limit: int) -> list[dict]:
-                seen.append(limit)
-                return []
-
-            return SimpleNamespace(search_skills=_search)
-
-        monkeypatch.setattr(mcp_core, "SkillsLoader", _loader)
+        seen = self._gateway(monkeypatch, [])
         _call_tool("skill_search", {"query": "x", "limit": raw})
-        assert seen == [expected]
+        self._assert_gateway_query(seen, query="x", limit=expected)
 
     def test_limit_defaults_when_omitted(self, monkeypatch: pytest.MonkeyPatch):
+        seen = self._gateway(monkeypatch, [])
+        _call_tool("skill_search", {"query": "x"})
+        self._assert_gateway_query(seen, query="x", limit=20)
+
+    def test_without_a_session_the_local_loader_answers(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        monkeypatch.setattr(
+            mcp_core, "_get", lambda *_a, **_kw: pytest.fail("no session: no gateway call")
+        )
         seen: list[int] = []
 
         def _loader(**_kw: object) -> SimpleNamespace:
             def _search(_q: str, limit: int) -> list[dict]:
                 seen.append(limit)
-                return []
+                return [{"name": "s", "key": "s", "description": "d", "path": "/p"}]
 
             return SimpleNamespace(search_skills=_search)
 
         monkeypatch.setattr(mcp_core, "SkillsLoader", _loader)
-        _call_tool("skill_search", {"query": "x"})
-        assert seen == [20]
+        out = _call_tool("skill_search", {"query": "x", "limit": 7})
+        assert seen == [7]
+        assert "Skills matching 'x' (top 1)" in out
 
     def test_loader_failure_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch):
         def _boom(**_kw: object) -> SimpleNamespace:
@@ -1104,7 +1163,7 @@ class TestSkillSearch:
 
         monkeypatch.setattr(mcp_core, "SkillsLoader", _boom)
         out = _call_tool("skill_search", {"query": "x"})
-        assert out.startswith("skill_search failed: RuntimeError")
+        assert out.startswith("Error: skill_search failed: RuntimeError")
 
 
 class TestRegisterHook:
@@ -1469,8 +1528,10 @@ class TestValidateArgs:
             _validate_args("workflow_status", {"run_id": "r1", "junk": "x"})
 
     def test_schemaless_tool_passes_through_untouched(self):
+        # ``memory_recall`` validates its own ``query`` in the handler and has no
+        # entry in MCP_CORE_SCHEMAS, so it exercises the pass-through branch.
         raw = {"anything": 1}
-        assert _validate_args("learn_list", raw) == raw
+        assert _validate_args("memory_recall", raw) == raw
 
     def test_invalid_run_id_pattern_is_rejected(self):
         from kiro_crew.validation import ValidationError

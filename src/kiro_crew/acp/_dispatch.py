@@ -68,6 +68,19 @@ from kiro_crew.session_directive import CORE_MCP_SERVER
 
 logger = logging.getLogger(__name__)
 
+# Starvation guard for both read loops (AcpClient._prompt_loop and
+# AcpSessionHandle._dispatch_events): the longest one task step may hold the
+# event loop before it must yield. Neither loop's read is a suspension point
+# when input is already buffered -- ``asyncio.wait_for`` runs its awaitable
+# inline, ``Queue.get`` returns without awaiting on a non-empty queue, and
+# ``StreamReader.readline`` returns without awaiting when the line is already
+# in its buffer -- so a backlog drains entirely inside one task step, starving
+# every other session, the dashboard websocket and the loop-stall heartbeat for
+# the whole drain. Budgeted by wall clock rather than frame count because
+# per-frame consumer cost varies by orders of magnitude, and loop-held time is
+# the quantity the watchdog measures. Shared so the two loops cannot drift.
+DRAIN_YIELD_AFTER_S = 0.05
+
 
 def build_session_new_params(
     cwd: str | Path,
@@ -772,6 +785,64 @@ def parse_claude_compaction_notice(chunk: str) -> tuple[str, str] | None:
     reason_prefix = f"{_CLAUDE_COMPACTION_FAILED_MARKER}: "
     if text.startswith(reason_prefix):
         return "failed", text[len(reason_prefix) :].strip().rstrip(".")
+    return None
+
+
+#: The key codex-acp stamps on ``_meta`` for a context-compaction frame, with a
+#: ``{"version": 1}`` payload. Its own name for the field, so a reader can match
+#: this literal against the adapter bundle.
+_CODEX_COMPACTION_META_KEY = "contextCompaction"
+
+
+def parse_codex_compaction_update(update: dict[str, Any]) -> str | None:
+    """Classify a codex-acp context-compaction frame, or ``None``.
+
+    Returns ``started`` or ``completed`` -- the same vocabulary kiro-cli's
+    ``_kiro.dev/compaction/status``, KAS's summarization kinds and the claude
+    notices already use -- so codex becomes the fourth producer of
+    ``EVENT_COMPACTION_STATUS`` and every consumer works with no per-surface
+    change.
+
+    codex-acp reports compaction as an ordinary ``tool_call`` pair rather than an
+    out-of-band notification, and unlike the claude adapter it stamps the pair:
+    ``_meta.contextCompaction`` is a MARKER, so this is a structural match rather
+    than a guess about prose. Captured off codex-acp 1.11.0 driven over stdio::
+
+        tool_call        kind=think  status=in_progress  title="Compact conversation"
+                         _meta={"contextCompaction": {"version": 1}}
+        tool_call_update             status=completed    title="Compact conversation"
+                         _meta={"contextCompaction": {"version": 1}}
+        session/prompt response -> {"stopReason": "end_turn"}
+
+    Matched on the marker and the FRAME KIND, never on the title -- the title is
+    display text the adapter is free to reword, and it is localized on some
+    clients.
+
+    Two arms rather than three, because there is no third frame to read:
+
+    * There is no ``failed`` status. A compaction that errors emits an
+      ``agent_message_chunk`` ("Error running remote compact task: ...") and then
+      the adapter's ``runCompact`` never resolves, so the ``session/prompt``
+      request itself is never answered (observed: a 240s wait with no response).
+      Synthesizing a ``failed`` from that text would be the prose guess this
+      marker exists to avoid, and the strand is a prompt-timeout problem rather
+      than a compaction-status one.
+    * A ``tool_call`` whose status is already ``completed`` is deliberately NOT a
+      terminal. That is the shape a past compaction takes when the adapter
+      REPLAYS a loaded session's history, and reading it as a live terminal would
+      reset the context counters against a window nobody just summarized.
+    """
+    kind = update.get("sessionUpdate")
+    if kind not in (UPDATE_TOOL_CALL, UPDATE_TOOL_CALL_UPDATE):
+        return None
+    meta = update.get("_meta")
+    if not isinstance(meta, dict) or _CODEX_COMPACTION_META_KEY not in meta:
+        return None
+    status = update.get("status")
+    if kind == UPDATE_TOOL_CALL and status == "in_progress":
+        return "started"
+    if kind == UPDATE_TOOL_CALL_UPDATE and status == "completed":
+        return "completed"
     return None
 
 
@@ -1914,9 +1985,9 @@ def _measure_tool_output(redacted: str) -> tuple[str, int]:
     drift apart: a crew log reader comparing two entries has no way to tell which
     parser produced either one.
     """
-    from kiro_crew.crew_log.emit import enabled as _ledger_enabled
+    from kiro_crew.crew_log.emit import enabled as _crew_log_enabled
 
-    if not _ledger_enabled():
+    if not _crew_log_enabled():
         return "", -1
     raw = redacted.encode("utf-8", "replace")
     return hashlib.sha256(raw).hexdigest(), len(raw)
@@ -2319,7 +2390,11 @@ def _todo_payload(raw_output: Any) -> dict[str, Any] | None:
     return None
 
 
-def parse_todo_snapshot(update: dict[str, Any]) -> dict[str, Any] | None:
+def parse_todo_snapshot(
+    update: dict[str, Any],
+    tool_name_cache: dict[str, str] | None = None,
+    cache_scope: str = "",
+) -> dict[str, Any] | None:
     """Normalise a ``todo_list`` tool result into a UI-ready snapshot.
 
     Returns ``{description, tasks: [{id, text, completed}]}`` or None when this
@@ -2330,10 +2405,32 @@ def parse_todo_snapshot(update: dict[str, Any]) -> dict[str, Any] | None:
     An empty ``tasks`` list is a MEANINGFUL result (the agent cleared its list),
     so it returns a snapshot with zero tasks rather than None. Only a genuine
     non-match or unparseable payload yields None.
+
+    ``tool_name_cache`` / ``cache_scope`` are the caller's own per-tool caches,
+    passed the way :func:`_build_tool_refinement_event` takes them, and they are
+    what identifies the call: see the fallback below.
     """
     if not isinstance(update, dict):
         return None
-    if _kiro_tool_name(update) != KIRO_TOOL_TODO_LIST:
+    # kiro-cli puts ``_meta`` on the ``tool_call`` frame ALONE. The result frame
+    # this parses carries none (captured in test/fixtures/acp_frames/kiro/
+    # session.jsonl), so asking THAT frame for its identity answers "" and the
+    # snapshot is dropped on every live call, taking the task panel and the crew
+    # log's plan/updated entry with it. So fall back to the name the preceding
+    # tool_call frame cached under this call id, the same recovery
+    # build_permission_event makes for the permission frame, which carries no
+    # _meta for the same reason.
+    #
+    # A frame that DOES assert an identity is believed as it stands: the cache
+    # only answers for a frame that asserts nothing. Read under
+    # scoped_tool_cache_key because these entries are origin-bound, so a
+    # backend-internal child replaying a parent's id reads nothing.
+    tool_name = _kiro_tool_name(update)
+    if not tool_name and tool_name_cache is not None:
+        call_id = update.get("toolCallId") or ""
+        if isinstance(call_id, str) and call_id:
+            tool_name = tool_name_cache.get(scoped_tool_cache_key(cache_scope, call_id)) or ""
+    if tool_name != KIRO_TOOL_TODO_LIST:
         return None
     payload = _todo_payload(update.get("rawOutput"))
     if payload is None:
@@ -2552,10 +2649,17 @@ def parse_session_update(
             events.append(refine)
         # A todo_list result carries the agent's whole task list. Emit it as an
         # ADDITIONAL event rather than swallowing the update — the tool call
-        # itself must still render in the transcript like any other.
-        todo = parse_todo_snapshot(update)
+        # itself must still render in the transcript like any other. The name
+        # cache is what identifies it: this frame carries no _meta of its own.
+        todo = parse_todo_snapshot(update, tool_name_cache, cache_scope=cache_scope)
         if todo is not None:
-            events.append(AcpEvent(kind=EVENT_TODO_UPDATE, todo=todo))
+            events.append(
+                AcpEvent(
+                    kind=EVENT_TODO_UPDATE,
+                    tool_call_id=str(update.get("toolCallId") or ""),
+                    todo=todo,
+                )
+            )
         return events
     return events
 
@@ -2690,6 +2794,7 @@ __all__ = [
     "parse_prompt_token_usage",
     "parse_text_chunk",
     "parse_claude_compaction_notice",
+    "parse_codex_compaction_update",
     "make_unified_diff",
     "select_tool_title",
     "is_shell_kind",

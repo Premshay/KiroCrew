@@ -27,7 +27,14 @@ import { useMenuKeyboard } from '../hooks/useMenuKeyboard'
 import { i18nT } from '../i18n/t'
 import { useFileMenuItems, visibleFileMenuItems, invokeFileMenuItem, FileMenuItemIcon, FileMenuItemLabel, type ContributedFileMenuItem, type ReportFileMenuError } from '../apps/fileMenuContributions'
 import { downloadFileToDisk } from '../utils/fileReadUrl'
+import { findReport } from '../utils/errorReport'
+import {
+  gitFilterRefusalCause,
+  gitFilterRefusalCopyKey,
+  isGitFilterRefusal,
+} from '../utils/gitStatusError'
 import { normalizeWindowsPath } from '../utils/fileTokens'
+import { errMessage } from '../utils/thunkError'
 import { recallExpandedPaths, rememberExpandedPaths } from './treeExpansionMemory'
 import { TreeSkeleton } from './tree'
 
@@ -80,7 +87,7 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
   // is what makes an onClick div compliant rather than a static-element one.
   const itemCls =
     'flex items-center gap-2 rounded-md px-2.5 py-1.5 text-[12.5px] text-text ' +
-    'cursor-pointer hover:bg-bg-hover focus:bg-bg-hover outline-none'
+    'cursor-pointer hover:bg-bg-hover focus:bg-bg-hover outline-hidden'
   const activate = (run: () => void) => (e: React.MouseEvent | React.KeyboardEvent) => {
     if ('key' in e) {
       if (e.key !== 'Enter' && e.key !== ' ') return
@@ -330,7 +337,7 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     refetchInterval: 10_000,
     refetchOnWindowFocus: true,
   })
-  const { data: status } = useQuery({
+  const { data: status, error: statusError } = useQuery({
     queryKey: ['git-status', projectDir],
     queryFn: () => api.projectGitStatus(projectDir),
     enabled: !!projectDir && (mode === 'changed' || !!tree?.repo),
@@ -614,6 +621,34 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     ),
     [],
   )
+
+  // A failed status request is terminal for this load. Changed mode has no
+  // other payload that can make the tree ready, so reuse the Git panel's
+  // unavailable notice instead of leaving the loading shimmer on screen.
+  if (mode === 'changed' && statusError) {
+    return (
+      <div className="h-full p-2">
+        {/* A filter-driver refusal is NOT an outage, so it must not wear the
+            generic failed copy here either: that spelling is permanent for an
+            LFS-configured repository and names no cause, which is the defect
+            the refusal codes exist to end. Same localized sentence the Git
+            panel shows. */}
+        {/* NO title, for the same reason as the rail: `inline` puts title and
+            message in one flex row, which at tree width stacks the title into
+            two-word fragments. The message carries the cause. */}
+        <ErrorNotice
+          variant="inline"
+          className="whitespace-normal"
+          message={isGitFilterRefusal(statusError)
+            ? i18nT(gitFilterRefusalCopyKey(gitFilterRefusalCause(statusError)))
+            : i18nT('components.workspaceTree.status_failed')}
+          report={findReport(errMessage(statusError))}
+          askAgent
+          testId="workspace-tree-status-error"
+        />
+      </div>
+    )
+  }
 
   // Data still in flight: an empty tree is indistinguishable from an empty
   // workspace, so show shimmer rows until the first payload decides which.

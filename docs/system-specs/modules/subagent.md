@@ -6,143 +6,80 @@ The subagent module (`kiro_crew/subagent.py`) spawns isolated background agents 
 
 Supports `on_tool_approval` callback for interactive tool approval (routed through gateway's approval system in Normal/Trust modes).
 
-Private member memory is a durable run identity. `spawn_run(crew=...)` carries
-the canonical member name separately from an optional template override through
-admission, queueing and provider allocation. The runner revalidates the member's
-store and resolves its current template before publishing `kind=member` in the
-protected selection. An explicit `agent` overrides only that turn; implicit
-continuation after restart returns to the recorded member and its capabilities.
-An ordinary spawn inherits the calling session's recorded store. Admission and provider allocation both
-validate named stores, and an unavailable store refuses execution instead of
-using Global Memory V1. The run transcript carries the same binding for tools
-and consolidation.
+Subagent admission captures a frozen `ExecutionContext` before queueing,
+approval or provider allocation. An ordinary child inherits its parent's member
+and store. Explicit `target_member` (and Crew dispatch's member selector) resolves
+an existing target under the ordinary spawn, owner/app and governance checks.
+An `agent` override changes the execution template only; a project or template
+name never selects memory. The queued task parameters carry the serialized
+snapshot, so restarting or draining the queue never re-resolves a replacement
+parent or current member display label.
+Async spawn and cold continuation read missing canonical records off-loop once.
+Session-map, busy, retention and policy mutations stay on-loop, with busy/admission
+rechecked after the read. Retry carries the original run's member, app and mode
+even after its parent closes; it never reconstructs them from the current parent.
 
-`create_agent_folder` publishes `memory.json` under the run's protected
-`member-memory-bindings/<id>/` directory before dispatch. This top-level tree is
-precreated and mounted read-only inside the sandbox, while remaining readable
-for cron metadata lookup. The writable `trust/` tree is never a migration source
-for memory authority. Continuation
-reads that record after a gateway restart, never an agent-edited `state.json`
-store field. An absent protected record for a V2 run returns
-`memory_unavailable`; unreadable run metadata also refuses rather than proving
-legacy absence. A readable legacy run with no memory binding keeps V1. Retry and
-continuation preserve the store even when the parent uses different memory.
+Incognito and temporary spawns retain queued work only in memory. They always
+keep their queue entry, including when the durable dispatch window is full, and
+refill never evicts that sole copy. Only persistent entries consume the durable
+window budget; the shared running cap, stagger, child reserve and host-pressure
+checks still apply. A restricted spawn refused under pressure has no durable row
+to defer, and a restricted start never claims a nonexistent row. Cancellation
+removes its in-memory entry; a process restart cannot replay it. Restricted
+admission diagnostics retain identifiers and lifecycle outcomes, not task text
+or callback exception bodies.
 
-The protected run record also carries the admitted `memory_mode`. Recreating an
-existing record can only retain or tighten that mode; replacing the editable
-`state.json` or changing its parent cannot change the protected value. Mode
-restoration refuses missing, malformed and legacy records without a mode rather
-than interpreting unknown admission as persistent. Store-only legacy lookup keeps
-its separate compatibility contract. The creation caller must supply the mode
-captured at admission, not re-read a replacement parent when queued work starts.
-`SubagentManager` accepts a trusted `memory_mode_for_session` resolver and freezes
-its answer before queueing or waiting for approval. The queue carries that value
-to the started `SubagentInfo`, and `_log_spawned` publishes it with the binding.
-An invalid answer refuses admission; failure to publish the binding blocks provider
-allocation for Global runs as well as named stores. Standalone embedders without
-a resolver use persistent mode; the gateway must wire its own session-policy resolver.
-Before allocating a continuation's provider, the shared run path restores the
-original conversation's protected mode off-loop and combines it with the new
-caller's admitted mode. It tightens both protected records without rewriting the
-original `state.json`; later continuations, including after restart, cannot undo
-that restriction. Memory calls refuse while this recovery is pending. Failure
-prevents provider allocation, and repeated cancellation drains an in-flight mode
-publication before returning. The same allocation boundary covers direct manager
-calls and automatic follow-ups, not only the HTTP continuation route.
+`create_agent_folder` writes the canonical `execution_context` inside the run's
+ordinary `state.json`. This record also owns selected template, stable member ID,
+store ID, privacy mode and app attribution. New runs create no `memory.json` or
+`agent.json` grant registry and no private/public body copy. Continuation reads
+this owner record, retains its member/store after the original parent closes,
+and fails on unknown or malformed member identity rather than choosing Global.
+Existing V1 run records remain readable; old V2 formats are not migrated. The
+pre-canonical writer marked Global and named V1 runs with `memory_binding_version=2`
+as well: those runs read their existing `member-memory-bindings/<id>/memory.json`
+only to retain the matching V1 store, original app owner and retention mode. A
+missing, redirected or malformed sidecar refuses continuation. This is an existing
+V1 consumer dependency, not V2 compatibility or a new registry writer; neither
+the sidecar nor real memory data is migrated or repaired. Follow-up runs use the
+canonical execution record.
+Run execution publication and continuation read/owner-check/publication run in
+one worker block using the captured context. Cancellation drains publication
+before cleanup; filesystem locks and durable writes do not block the gateway loop.
+The selection namespace describes persona selection independently of memory:
+an explicitly selected template can inherit its parent's member/store. A one-turn
+template override does not rewrite continuation lineage. A new continuation may
+refresh ordinary member persona/capability configuration before dispatch, while
+retaining the original member/store from the captured owner record.
 
-Dedicated subagents call `messaging.identity.publish_turn_identity` with their
-own session key before every stream attempt, including continuation and
-transient retries. The publisher resolves the currently registered provider's
-host PID through `SessionManager.get_pid`, so a replaced process receives its
-own process-start-bound record before its next prompt. Cleanup identity and the
-protected dispatch binding do not substitute for this publication. Shared
-sessions skip this writer: they do not own the runtime's PID mapping.
+The run's mode can only retain or tighten its original restriction. Incognito
+and Temporary runs have live state and suppress persisted task, result and
+transcript bodies; Incognito may recall memory, Temporary cannot. Neither can
+write learned memory. Transient run state is discarded once terminal writers
+settle; a retained conversation keeps only its original run state until release
+or the existing conversation TTL. The canonical app owner remains separate from memory
+routing: an absent or invalid app field in a new record is not a person-owned
+run. Explicit template selection cannot remove app scope or bypass governance.
 
-Memory-route session recognition checks the full dedicated child key in
-`SessionManager`, including the original conversation key reused on continuation.
-Shared children are not entries in that manager: `has_live_shared_session` checks
-an active, unreaped run and the exact handle queue in the live runtime registry.
-A completed run, retained transcript, parent PID, or destroyed/replaced handle
-cannot provide this recognition. The existing handle destruction and dedicated
-reset paths revoke it without an extra registry or persistence lifecycle.
-Private member sessions still require dedicated runtimes and their own proof;
-recognition does not bypass store ownership or incognito/temporary policy.
+The ordinary `messaging.identity.publish_turn_identity` still publishes strict
+transport/session identity before each dedicated attempt. Shared runtime handles
+carry their own session key and ordinary token; member confidentiality proof and
+PID ancestry publication are removed. Shared runtime ownership, unreaped handle
+recognition, cleanup identities, spawn approval and callback delivery remain
+unchanged. Member capability and native prompt documents still require a runtime
+prepared for that member before launch.
 
-The private-workflow E2E attaches an authenticated owner WebSocket before nested
-spawn dispatch, waits for registration, and approves only the returned spawn's
-matching request through the existing one-shot HTTP approval route. It grants
-no session trust or global auto-approval. Result polling reads the complete
-unchanged JSON stream, stops on a failed terminal child, and reports only fixed
-state/reason labels plus missing-file and non-JSON poll counts.
+Prompt construction receives the captured context explicitly and reads permanent
+rules/brief/profile documents directly. Learned database preparation is optional
+for this prompt; an explicit learned-memory operation fails on unavailable or
+wrong-store data without selecting Global. Provider privacy mode is supplied
+before shared-session creation or dedicated startup.
 
-The same protected `memory.json` records the run's `app` owner. An explicit
-empty string identifies a person-owned run; a missing value does not. Continuation
-inherits ownership from the live run or this protected record before spawn
-admission, so both governance and internal HTTP attribution retain the app scope.
-Tightening a run's memory mode preserves its app owner and selected identity.
-It never accepts `state.json` as ownership authority. After eviction or restart,
-older runs without a protected app field refuse continuation with `resume_failed`
-and require a new conversation. Supplying an explicit template cannot bypass
-that refusal.
-
-Continuations retain the original run's selected template or member when `agent`
-is omitted.
-The runner reads `member-memory-bindings/<id>/agent.json` off the event loop and
-validates availability before provider allocation. This record shares the
-sandbox-readonly memory identity tree; `state.json` remains diagnostic and never
-selects an identity. The private record format is version 2, with `kind` equal to
-`template` or `member` and `agent` carrying the selected literal or canonical
-member name. An explicit spawn `agent` selects a template. Initial implicit
-inheritance takes an immutable `(kind, name)` snapshot from SessionManager's
-allocation-owned state: `capability_member` identifies a member even before
-capability enrollment, while non-member allocations retain their template name.
-Neither current roster membership nor provider attribution fields can change
-that namespace. An absent parent retains the default template; malformed or
-unavailable selection on a present parent refuses execution.
-
-An initial run publishes that selection; a follow-up copies the original selection,
-independently of its one-turn override, before allocating a provider. Continuing
-that follow-up, live or after restart, therefore retains the original identity.
-Publication failure refuses execution, and cancellation drains the protected
-writer before finalization. A recorded empty template keeps the default.
-Version-1 nonempty records are ambiguous: earlier writers could record a crew
-alias as a template. They refuse implicit continuation without guessing from
-today's roster. A version-1 empty record retains its default-template meaning.
-An absent, unreadable or invalid protected record likewise refuses implicit
-continuation; the caller can supply an explicit template through normal admission
-and governance checks. When the original selection is unavailable, that explicit
-turn records unknown lineage (`agent: null`, `kind: null`), which refuses later
-implicit continuation.
-It still publishes through the drained writer, including when reusing a
-preassigned run id. Neither writable diagnostics nor the temporary override can
-establish the missing lineage.
-A caller-supplied template overrides the current turn without changing the
-conversation's selection or its independently protected private-memory identity.
-
-Template allocations explicitly pass `crew_agent=""`, including dedicated
-fallback after a shared-runtime failure. A same-named member therefore cannot
-replace a retained template. Member selections resolve strictly in the member
-namespace and must still match the protected memory assignment; a removed member
-or changed assignment refuses rather than selecting a same-named template or
-rebinding memory. Members use dedicated SessionManager allocation with an explicit
-canonical crew claim, preserving capability preparation, generation adoption and
-startup verification. The generated provider template never replaces the durable
-member identity. Missing templates refuse turns that would execute them.
-For an inherited selection, the runner checks its logical name (literal template
-or canonical member) against the caller's spawn policy and app scope before
-allocation. Omitting the name cannot bypass that check.
-Channel `spawn` and `bg` commands resolve the parent's recorded memory binding
-off-loop and pass that store into admission. Private bindings retain their
-protected-assignment checks; unreadable or mismatched metadata stops dispatch
-rather than falling back to Global Memory V1.
-
-Continuation tools keep the original `subagent:<conversation-id>` session key,
-while the manager registers each follow-up under its new run id. Internal HTTP
-caller recognition resolves a missing original record through the unique active
-continuation with that exact conversation key. App ownership uses the same
-lookup. A queued or completed continuation cannot replace a missing caller
-record, and private memory still requires its canonical protected session/store
-binding and verified process proof.
+Continuation tools retain the original `subagent:<conversation-id>` while each
+follow-up has its own run ID. Ordinary HTTP caller recognition uses the unique
+active continuation for that conversation; queued or completed runs cannot supply
+a live caller. The frozen record supplies memory and app scope independently of
+that liveness check.
 
 Every backend records the provider's actual working directory alongside its
 session id. The next continuation uses this directory even when its target is
@@ -322,16 +259,16 @@ Spawns a background agent. Returns `SubagentInfo` or `None` if at capacity. Uses
 Admission order (`subagent_manager/admission/gate.py::spawn_impl`):
 1. Policy refusals that leave no durable trace: empty task, memory identity,
    `cwd` outside `subagent_cwd_allowed_roots`, spawn governance.
-2. **Persist** the row in the task store (write-before-ack; see § Durable task
+2. For persistent work, **persist** the row in the task store (write-before-ack; see § Durable task
    queue). A store write failure is a refusal with
    `error_code="task_store_unavailable"`; the id is never handed out as accepted.
 3. Memory floor (`spawn_min_memory_gb`) and posture gate (`admission_gate`,
-   `cached_admission_check`): with a store, **defer** (row stays `queued`,
+   `cached_admission_check`): with a persistent row, **defer** (row stays `queued`,
    `next_run_at = now + admit_wait_secs`, pump wake-up armed, caller gets a
    `queued` id); without one, refuse as before.
-4. Capacity / stagger gate: queue (window or store-only) or proceed.
+4. Capacity / stagger gate: queue (persistent window/store-only or restricted memory-only) or proceed.
 5. Agent name validation (a failure marks the row `failed`), then the **atomic
-   claim** (`admitted`, generation++). A row cancelled while it waited fails the
+   claim** for persistent work (`admitted`, generation++). A row cancelled while it waited fails the
    claim here and is never started.
 6. Register, take the slot, `starting`; then the approval branch below.
 
@@ -359,9 +296,13 @@ is decided in strict priority order:
    `reason=name_grant`, the refusal code, and `tier=hook_auto_approve`. This
    matters most here: the subagent surface runs unattended, so an unverified
    shadowed name would be honoured with nobody watching. On Windows the check
-   cannot model the shell's lookup at all, so it declines every name-based
-   shell grant there — a headless subagent (no parent `auto` policy, no
-   interactive approver) then rejects shell tools its allowlist used to grant.
+   models the shell's lookup and returns per-command verdicts as it does on
+   POSIX, except in two host states that still decline every name grant:
+   `windows_lookup_not_modelled` when Windows cannot report where the user's
+   Documents folder is, and `ambiguous_env` when a per-user PowerShell profile
+   sits at one of the paths derived from it. In those two states a headless
+   subagent (no parent `auto` policy, no interactive approver) rejects shell
+   tools its allowlist would otherwise grant.
 3. **Parent policy** — `parent_policy == "auto"` → auto-approve. Resolved once
    at `_run_inner` start (see the chain below); an active global YOLO folds
    into this snapshot rather than being re-read per event.
@@ -611,6 +552,8 @@ The slow-command record (`record_slow_command`, `subagent_persistence.py`) is ap
 ### Running-card progress events
 
 `subagent_tool` is fired on **`EVENT_TOOL_CALL`** (not only `EVENT_PERMISSION_REQUEST`) — kiro-auto-allowed tools surface only as informational `tool_call` updates, so this is the sole progress signal a simple/read-only task emits. Payload carries `{tool, tool_kind, turns, tool_count}`; `info.tool_count` increments per observed tool call. The `subagent_snapshot` reconnect payload (`dashboard/ws.py`, built by `build_subagent_snapshot()`) also carries `tool_count`, `stalled`, and — only while stalled — `idle_secs`, recomputed at replay time from `last_activity` (clamped at 0, omitted entirely for a healthy agent) so a reloading client recovers progress/stall state including the span that justifies the stall badge (a transition-only WS signal always needs a matching snapshot field).
+
+An incremental progress frame **creates** the panel entry when the client holds none for the id it names, rather than being discarded. The store's incremental reducers (`sseSubagentTool`, `sseSubagentStalled`, `sseSubagentRetrying`, `sseSubagentBatchUpdate`, `sseSubagentBatchChunks`) resolve through `upsertSlotSub` (`website/src/store/chatSlice.ts`), which returns the existing entry or mints a minimal one (`status: 'running'`, empty `task`/`agent`, filled in by any later frame that carries them). This is required because these frames are the only evidence the panel receives between one `subagent_spawn` and one `subagent_done`, and `clearSubagentsForSnapshot` keeps only `pending` entries across a reconnect — so an agent already running at that moment has its entry discarded while every frame it has left is an incremental one, and a reducer that refused to create would leave it invisible for the rest of its run. The prototype-pollution contract is unchanged: `upsertSlotSub` refuses a poisoned slot or id via `isUnsafeKey` and routes any write through `safeKey`, so such a frame creates nothing. Reducers whose frame only decorates an existing card (`markSubagentApproving`) keep the read-only `getSlotSub` and still require one.
 
 
 ### Model Provenance (#3582)
@@ -968,6 +911,16 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   `unknown`, so such a run ends `unknown_side_effect` (never silently re-run)
   unless its tombstone proves an outcome; the existing orphan reconciliation
   still delivers the notification.
+- **Boot rows wait for the memory fence.** That boot wake-up is armed while the
+  gateway is still inside its memory barrier, so the gateway builds the manager
+  with `defer_queue_dispatch=True`: `_queue_dispatch_held` makes
+  `_drain_queue_impl` refuse every pass, claiming nothing, and
+  `release_queue_dispatch()` — called only from
+  `_start_subagent_dispatch_after_memory_ready()` once the fence is ready — opens
+  the pump and drains whatever accumulated. A manager built without the flag
+  (tests, tools) pumps as soon as it can. The first refused pass logs one debug
+  line naming the queue depth and store state, so a hold that is never released
+  is visible instead of presenting as rows accepted but never claimed.
 - **Memory pressure defers.** See admission order step 3. SEL outcomes:
   `deferred_low_memory` / `deferred_memory_critical` (store) vs the legacy
   `refused_low_memory` / `refused_memory_critical`.
@@ -1148,9 +1101,9 @@ POSTs to `http://localhost:5476/api/spawn` (dashboard API). Returns immediately 
 Exposed via `kirocrew-core` MCP server. Always fire-and-forget — results
 are delivered back to the calling session via completion event injection.
 
-**Single task:**
+**Single task** (gated -- see "The solo gate" below):
 ```python
-spawn_run(task="search docs for X")
+spawn_run(task="grep the 2 GB build log for the first traceback", solo_reason="bulk_data")
 ```
 
 **Batch parallel:**
@@ -1162,9 +1115,30 @@ All agents spawn at once. The tool returns immediately with agent IDs.
 Results arrive as `[Subagent completion event]` messages in the session,
 processed by the LLM automatically.
 
+**The solo gate.** One sub-agent for one task is a round-trip with no
+parallelism gain, so a one-task call is a handshake, not a straight dispatch.
+`spawn_run(task=...)` (and `spawn_sub_agents` with one entry) that names no
+`solo_reason` and no `model` / `agent` / `crew` is refused before any POST --
+nothing is spawned, and the result asks whether the caller can do the task
+itself. The caller either does the work in its own session, calls again with a
+`solo_reason` from the closed vocabulary in `solo_spawn.py` (`bulk_data`: the
+step would flood the caller's context with bulk output; `fresh_context`: the
+result would be wrong if the run saw this session's context), or names a
+model / agent / crew that genuinely differs from its own. The tool marks such a
+POST with `solo=true`; `/api/spawn` then compares the named agent against the
+parent session's RESOLVED template (never its member alias), the named model
+against a dashboard slot's pinned model, and the named crew against the
+parent's member selection, and refuses a match with `400 solo_spawn_unjustified`.
+An unknown parent fact fails open. `keep: true` alone is not a reason. All
+three outcomes are audited as `spawn.solo` (denied / allowed on a reason /
+allowed on a difference, with the ground). Batches of 2+ tasks and
+programmatic clients (the SDK, apps posting to `/api/spawn` directly, which
+never send `solo`) are not gated.
+
 Parameters:
-- `task` (str): single task description
+- `task` (str): single task description -- gated; see "The solo gate"
 - `tasks` (list[str]): multiple tasks for parallel execution
+- `solo_reason` (str, optional): `bulk_data` or `fresh_context` -- why ONE task is being spawned alone; required for a one-task call that names no `model` / `agent` / `crew` other than the caller's own
 - `cwd` (str, optional): absolute path to launch subagent in. Must be under a configured `subagent_cwd_allowed_roots` entry (default: `~/workspace`, `~/workspaces`, `~/workplace`, `~/workplaces`). Validated via realpath + prefix match. Pool skipped when cwd is set. These roots are a least-privilege allowlist and are never widened automatically: a persisted list whose roots all fail to exist on the host rejects every cwd, and the operator must edit `agent.subagent_cwd_allowed_roots` (or delete the key to take the shipped default). Neither the loader nor the guard stats the configured roots.
 - `max_turns` (int, optional): override tool-call budget for this spawn (default: config or 100)
 - `agent` (str, optional): agent name for the subagent
@@ -1180,7 +1154,7 @@ keeps the default template. If selection or model resolution is unavailable,
 both optional receipt fields are omitted; this is distinct from a successfully
 resolved `auto`, which reports the effort drop. Receipt lookup runs off the event
 loop after the live selection snapshot, never prepares capabilities, and never
-changes submission, allocation, governance, or private-memory authority.
+changes submission, allocation, governance, or the captured memory binding.
 
 Response semantics:
 - An ID means the submission was accepted. A running subagent returns its durable agent ID; capacity/stagger queueing returns a temporary `qN` receipt that is replaced by the durable ID when the queue drains. Use `spawn_list` or the completion event to discover the durable ID rather than treating the receipt as a result path.
@@ -1487,6 +1461,11 @@ adopted live by `reconfigure` through `update_completion_keep`. User-facing docs
 [`src/kiro_crew/docs/troubleshooting.md`](../../../src/kiro_crew/docs/troubleshooting.md).
 
 ### Dashboard API: `POST /api/spawn`
+
+The view-only Agent Worlds hook polls the global `GET /api/spawn` list and reads
+its `{"agents": [...]}` envelope; it does not call the parent-scoped
+`running_agents_for(parent_key)`, so both dedicated and shared-process children
+are eligible for sprites.
 
 Crew binding resolution and inherited memory lookup for persisted parent runs
 execute off the gateway event loop. Unavailable member memory remains a typed

@@ -200,7 +200,7 @@ import { useComposerVoiceSlice, type ComposerVoiceInputProps } from '../chat-cor
 import SkillPickerMenu from './SkillPickerMenu'
 import { skillsCacheStaleTime } from '../lib/skillsCache'
 import ProjectSkillsTrustDialog from './ProjectSkillsTrustDialog'
-import { matchFileToken, matchSkillToken, replaceTokenAtCaret } from './composerTokens'
+import { matchFileToken, matchPathToken, matchSkillToken, PATH_TOKEN_RE, replaceTokenAtCaret } from './composerTokens'
 import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
 import { useMeasuredHeight } from '../hooks/useMeasuredHeight'
 
@@ -703,6 +703,8 @@ interface ChatInputProps {
   projectDetached?: boolean
   /** Uncommitted file count in the project's working tree (0 = clean). */
   projectGitDirty?: number
+  /** True when the server capped the listing, so the count above is a floor. */
+  projectGitDirtyTruncated?: boolean
   /** Commits ahead of / behind the branch's upstream, when it tracks one. */
   projectGitAhead?: number
   projectGitBehind?: number
@@ -748,6 +750,11 @@ interface ChatInputProps {
   pasteBlocks?: PasteBlock[]
   /** Replace the current list of paste blocks (add/remove). */
   onPasteBlocksChange?: (next: PasteBlock[]) => void
+  /** Leave a long paste as full editable text instead of collapsing it into a
+   *  `[ Paste #N · M lines ]` chip. Defaults false — the chip is the established
+   *  behaviour, and it is what keeps a very large paste off the main thread.
+   *  Cmd/Ctrl+Shift+V still forces one raw paste when this is off. */
+  showFullPastes?: boolean
   /** Opt into the first Lexical composer migration slice. Defaults off so the
    *  established textarea path remains the production fallback until parity is complete. */
   lexicalComposer?: boolean
@@ -1113,6 +1120,7 @@ function ChatInput({
   projectBranch,
   projectDetached,
   projectGitDirty,
+  projectGitDirtyTruncated,
   projectGitAhead,
   projectGitBehind,
   memoryMode,
@@ -1134,6 +1142,7 @@ function ChatInput({
   followUpSourceKey,
   pasteBlocks = [],
   onPasteBlocksChange,
+  showFullPastes = false,
   lexicalComposer = false,
   knowledgeChip,
   autoFocusKey,
@@ -1703,12 +1712,20 @@ function ChatInput({
   // sync, which is also what hides the badge.
   const gitBadgeTitle = useMemo(() => {
     const parts: string[] = []
-    if (projectGitDirty)
-      parts.push(i18nT('components.gitPanel.uncommitted', { count: projectGitDirty }))
+    if (projectGitDirty) {
+      // A capped listing makes the count a floor, so it is read as "500+" here
+      // and in the badge below -- the same claim the Git panel's pill makes.
+      parts.push(i18nT(
+        projectGitDirtyTruncated
+          ? 'components.gitPanel.uncommitted_capped'
+          : 'components.gitPanel.uncommitted',
+        { count: projectGitDirty },
+      ))
+    }
     if (projectGitAhead) parts.push('\u2191' + String(projectGitAhead))
     if (projectGitBehind) parts.push('\u2193' + String(projectGitBehind))
     return parts.join(' \u00b7 ')
-  }, [projectGitDirty, projectGitAhead, projectGitBehind])
+  }, [projectGitDirty, projectGitDirtyTruncated, projectGitAhead, projectGitBehind])
   // Focus the composer when the dictation panel is up (as before) OR while a
   // batch transcript is landing (voiceTranscribing), so Enter sends and typing
   // edits the result. Deliberately NOT keyed on bare voiceRecording: focusing
@@ -1753,8 +1770,7 @@ function ChatInput({
     if (!voiceRecording || !cancel) return
     const handler = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.isComposing || e.defaultPrevented) return
-      if (slashMenuOpenRef.current || filePickerOpenRef.current || skillPickerOpenRef.current)
-        return
+      if (slashMenuOpenRef.current || filePickerOpenRef.current || skillPickerOpenRef.current || pathPickerOpenRef.current) return
       if (document.querySelector('[role="dialog"]')) return
       e.preventDefault()
       e.stopPropagation()
@@ -1907,6 +1923,18 @@ function ChatInput({
   )
   const [slashMenuOpen, setSlashMenuOpen] = useState(false)
   const [filePickerOpen, setFilePickerOpen] = useState(false)
+  // Shell-style `./` / `../` completion. Its own open/query pair rather than a
+  // flag on the @ picker's, because the two carry different tokens and only one
+  // token can end at the caret — see `pathTokenAt` below.
+  const [pathPickerOpen, setPathPickerOpen] = useState(false)
+  const [pathQuery, setPathQuery] = useState('')
+  // The path token ending at the caret, or null. Gated on a project dir: `./`
+  // names nothing without the root it resolves against, so with no project the
+  // menu stays shut rather than opening on a listing that cannot be produced.
+  const pathTokenAt = useCallback(
+    (before: string) => (project ? matchPathToken(before) : null),
+    [project],
+  )
   const [fileQuery, setFileQuery] = useState('')
   const [skillPickerOpen, setSkillPickerOpen] = useState(false)
   const [skillQuery, setSkillQuery] = useState('')
@@ -2353,34 +2381,39 @@ function ChatInput({
   // Mirror the paste blocks so the undo-recording effect (keyed on
   // [value, autoFocusKey], not pasteBlocks) always snapshots the freshest set.
 
-  const handleLexicalChange = useCallback(
-    (nextValue: string) => {
-      valueFromUserRef.current = true
-      onChange(nextValue)
-      const selection = lexicalControlRef.current?.getSelection()
-      const caret = selection?.start ?? nextValue.length
-      const before = nextValue.slice(0, caret)
-      setSlashMenuOpen(typedCommandMenus && nextValue.startsWith('/'))
-      const fileQueryAtCaret = onFileSelect ? matchFileToken(before) : null
-      if (fileQueryAtCaret !== null) {
-        setFilePickerOpen(true)
-        setFileQuery(fileQueryAtCaret)
-      } else {
-        setFilePickerOpen(false)
-        setFileQuery('')
-      }
-      const skillQueryAtCaret = fileQueryAtCaret === null ? matchSkillToken(before) : null
-      if (typedCommandMenus && skillQueryAtCaret !== null) {
-        setSkillPickerOpen(true)
-        setSkillQuery(skillQueryAtCaret)
-      } else {
-        setSkillPickerOpen(false)
-        setSkillQuery('')
-      }
-      if (selection && voiceCaretRef) voiceCaretRef.current = selection
-    },
-    [onChange, onFileSelect, typedCommandMenus, voiceCaretRef],
-  )
+  const handleLexicalChange = useCallback((nextValue: string) => {
+    valueFromUserRef.current = true
+    onChange(nextValue)
+    const selection = lexicalControlRef.current?.getSelection()
+    const caret = selection?.start ?? nextValue.length
+    const before = nextValue.slice(0, caret)
+    setSlashMenuOpen(typedCommandMenus && nextValue.startsWith('/'))
+    const fileQueryAtCaret = onFileSelect ? matchFileToken(before) : null
+    if (fileQueryAtCaret !== null) {
+      setFilePickerOpen(true)
+      setFileQuery(fileQueryAtCaret)
+    } else {
+      setFilePickerOpen(false)
+      setFileQuery('')
+    }
+    const skillQueryAtCaret = fileQueryAtCaret === null ? matchSkillToken(before) : null
+    if (typedCommandMenus && skillQueryAtCaret !== null) {
+      setSkillPickerOpen(true)
+      setSkillQuery(skillQueryAtCaret)
+    } else {
+      setSkillPickerOpen(false)
+      setSkillQuery('')
+    }
+    const pathQueryAtCaret = pathTokenAt(before)
+    if (pathQueryAtCaret !== null) {
+      setPathPickerOpen(true)
+      setPathQuery(pathQueryAtCaret)
+    } else {
+      setPathPickerOpen(false)
+      setPathQuery('')
+    }
+    if (selection && voiceCaretRef) voiceCaretRef.current = selection
+  }, [onChange, onFileSelect, pathTokenAt, typedCommandMenus, voiceCaretRef])
   const pasteBlocksRef = useRef(pasteBlocks)
   pasteBlocksRef.current = pasteBlocks
   // --- Prompt undo/redo history (per slot) ---
@@ -2432,6 +2465,8 @@ function ChatInput({
   filePickerOpenRef.current = filePickerOpen
   const skillPickerOpenRef = useRef(false)
   skillPickerOpenRef.current = skillPickerOpen
+  const pathPickerOpenRef = useRef(false)
+  pathPickerOpenRef.current = pathPickerOpen
 
   // Auto-focus textarea when the active session changes (autoFocusKey).
   // Track the previous key in a ref so the effect only acts on real key
@@ -2613,10 +2648,9 @@ function ChatInput({
       // Picker open state is derived only in the textarea's own onChange, so the
       // parent-driven send-clear would otherwise leave a stale menu open.
       setSlashMenuOpen(false)
-      setFilePickerOpen(false)
-      setFileQuery('')
-      setSkillPickerOpen(false)
-      setSkillQuery('')
+      setFilePickerOpen(false); setFileQuery('')
+      setSkillPickerOpen(false); setSkillQuery('')
+      setPathPickerOpen(false); setPathQuery('')
     }
     // Exit history mode when value diverges from the recalled message
     // (user edited it, or the send pipeline cleared it).
@@ -2631,10 +2665,9 @@ function ChatInput({
   // previous tab's menu over; an unsent draft never hits the clear above.
   useEffect(() => {
     setSlashMenuOpen(false)
-    setFilePickerOpen(false)
-    setFileQuery('')
-    setSkillPickerOpen(false)
-    setSkillQuery('')
+    setFilePickerOpen(false); setFileQuery('')
+    setSkillPickerOpen(false); setSkillQuery('')
+    setPathPickerOpen(false); setPathQuery('')
   }, [slotId])
 
   // Record undo snapshots as the controlled value changes.
@@ -3257,6 +3290,7 @@ function ChatInput({
         slashMenuOpenRef.current ||
         filePickerOpenRef.current ||
         skillPickerOpenRef.current ||
+      pathPickerOpenRef.current ||
         ime.isComposing(e) ||
         e.metaKey ||
         e.ctrlKey ||
@@ -3372,7 +3406,7 @@ function ChatInput({
 
       // Big paste → collapse into a `[ Paste #N ]` chip. Uses the cleaned text so
       // the chip's line count and stored content exclude the stripped blanks.
-      if (onPasteBlocksChange && !forceRaw && shouldCollapsePaste(cleaned)) {
+      if (onPasteBlocksChange && !forceRaw && !showFullPastes && shouldCollapsePaste(cleaned)) {
         e.preventDefault()
         const block: PasteBlock = {
           id: makePasteId(),
@@ -3446,7 +3480,7 @@ function ChatInput({
         })
       }
     },
-    [onUploadFiles, onPasteBlocksChange, pasteBlocks, value, onChange],
+    [onUploadFiles, onPasteBlocksChange, pasteBlocks, value, onChange, showFullPastes],
   )
 
   /** Replace a collapsed-paste token with its full content in the textarea and
@@ -4488,38 +4522,55 @@ function ChatInput({
         />
       )}
 
-      {typedCommandMenus && (
-        <SkillPickerMenu
-          query={skillQuery}
-          anchorRef={composerAnchorRef}
-          open={skillPickerOpen}
-          sendOnEnter={sendOnEnter}
-          slotKey={skillSlotKey}
-          project={project}
-          agent={agentName}
-          onSelect={({ leaf }) => {
-            // Token left literal — backend appends the skill body; the user still
-            // sees their $token marker. Caret-relative replace via shared helper.
-            applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${leaf} `)
-            setSkillPickerOpen(false)
-            setSkillQuery('')
-          }}
-          onTrustRequest={({ leaf }) => {
-            // An unconsented project skill: close the menu and ask, rather than
-            // inserting a token that would resolve to nothing.
-            setSkillPickerOpen(false)
-            setSkillQuery('')
-            const requestId = nextTrustRequestIdRef.current + 1
-            nextTrustRequestIdRef.current = requestId
-            activeTrustRequestIdRef.current = requestId
-            setTrustPrompt({ requestId, leaf, slotKey: skillSlotKey, project })
-          }}
-          onClose={() => {
-            setSkillPickerOpen(false)
-            setSkillQuery('')
-          }}
-        />
-      )}
+      {/* Path completion is not gated on `onFileSelect`: a completed `./path`
+          is text the user typed, not a staged attachment, so there is nothing to
+          hand to the host. It IS gated on a project dir, which is the root every
+          `./` resolves against. */}
+      <FilePickerMenu
+        pathMode
+        query={pathQuery}
+        anchorRef={composerAnchorRef}
+        open={pathPickerOpen}
+        project={project}
+        sendOnEnter={sendOnEnter}
+        onSelect={({ relativePath, kind }) => {
+          // A shell completes a directory to `dir/` and waits for the next
+          // segment; a file completion is finished, so it gets the trailing
+          // space. Re-seeding the query on a directory keeps the menu open on
+          // the new level — the programmatic insert never reaches the composer's
+          // own onChange, so the token has to be handed over here.
+          applyPickedToken(PATH_TOKEN_RE, kind === 'dir' ? relativePath : `${relativePath} `)
+          if (kind === 'dir') setPathQuery(relativePath)
+          else { setPathPickerOpen(false); setPathQuery('') }
+        }}
+        onClose={() => { setPathPickerOpen(false); setPathQuery('') }}
+      />
+
+      {typedCommandMenus && <SkillPickerMenu
+        query={skillQuery}
+        anchorRef={composerAnchorRef}
+        open={skillPickerOpen}
+        sendOnEnter={sendOnEnter}
+        slotKey={skillSlotKey}
+        project={project}
+        agent={agentName}
+        onSelect={({ leaf }) => {
+          // Token left literal — backend appends the skill body; the user still
+          // sees their $token marker. Caret-relative replace via shared helper.
+          applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${leaf} `)
+          setSkillPickerOpen(false); setSkillQuery('')
+        }}
+        onTrustRequest={({ leaf }) => {
+          // An unconsented project skill: close the menu and ask, rather than
+          // inserting a token that would resolve to nothing.
+          setSkillPickerOpen(false); setSkillQuery('')
+          const requestId = nextTrustRequestIdRef.current + 1
+          nextTrustRequestIdRef.current = requestId
+          activeTrustRequestIdRef.current = requestId
+          setTrustPrompt({ requestId, leaf, slotKey: skillSlotKey, project })
+        }}
+        onClose={() => { setSkillPickerOpen(false); setSkillQuery('') }}
+      />}
       <ProjectSkillsTrustDialog
         key={trustPrompt?.requestId ?? 0}
         open={trustPrompt !== null}
@@ -4787,6 +4838,7 @@ function ChatInput({
                         blocks={pasteBlocks}
                         onChange={handleLexicalChange}
                         onBlocksChange={onPasteBlocksChange}
+                        showFullPastes={showFullPastes}
                         onSend={fireComposer}
                         onUploadFiles={onUploadFiles}
                         controlRef={lexicalControlRef}
@@ -4826,7 +4878,7 @@ function ChatInput({
                       aria-describedby={pastePreviewPanelId ?? undefined}
                       data-composer-typo
                       className={
-                        /* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`
+                        /* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-hidden min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`
                       }
                       style={manualHeight !== null ? { height: '100%' } : undefined}
                       placeholder={
@@ -4884,6 +4936,14 @@ function ChatInput({
                         } else {
                           setSkillPickerOpen(false)
                           setSkillQuery('')
+                        }
+                        const pathQ = pathTokenAt(before)
+                        if (pathQ !== null) {
+                          setPathPickerOpen(true)
+                          setPathQuery(pathQ)
+                        } else {
+                          setPathPickerOpen(false)
+                          setPathQuery('')
                         }
                         recordCaret()
                       }}
@@ -5993,7 +6053,7 @@ function ChatInput({
                    anything (UX review finding). */
                     <span className="inline-flex items-center gap-0.5 px-1 py-px rounded bg-warn/15 text-warn">
                       <FileDiff size={11} className="shrink-0" />
-                      {projectGitDirty}
+                      {projectGitDirtyTruncated ? `${projectGitDirty}+` : projectGitDirty}
                     </span>
                   )}
                   {(!!projectGitAhead || !!projectGitBehind) && (

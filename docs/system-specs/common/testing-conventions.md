@@ -29,9 +29,13 @@ class TestAcpClientInit:
 
 Session-switch lock registries are reset per test. Reused fixture session keys
 must not retain a contended lock tied to another test's event loop.
+The test floor clears live session and run execution records between tests so a
+reused temporary home cannot inherit another test's routing or retention mode.
 Dispatch doubles provide a concrete `get_agent_selection()` tuple, including
 `("template", "")` for the default template. An unconstrained mock is not a
-valid member or template identity. Session-start collector tests declare their
+valid member or template identity. Session context doubles implement the async
+`memory_mode_for_session()` accessor and return a concrete retention mode.
+Session-start collector tests declare their
 MCP roster explicitly rather than inheriting the installed agent's tools.
 
 ```python
@@ -110,8 +114,12 @@ When stubbing the resolver itself, return `ResolvedBindings` with the intended
 member/template selection. A partial namespace can raise on a missing field
 before the dispatch guard under test is reached.
 Subagent session doubles must return a concrete string from `get_agent`,
-including `""` for the default template. Protected identity publication rejects
+including `""` for the default template. Execution identity publication rejects
 an unconfigured mock before allocating the provider.
+Direct `_run_inner` fixtures create a run record whose execution context matches
+`SubagentInfo.execution_context` before dispatch. Cancellation tests for model
+provenance wait for the `requested_model` write after execution identity has been
+published, so they interrupt the write they intend to exercise.
 
 The backend test floor gives each test an empty advertised-model cache.
 Capturing a session response updates this process-global cache, so a later
@@ -121,8 +129,8 @@ need advertised models seed the cache within their own fixture or body.
 ### Filesystem tests
 
 The subagent registry fixture nests `subagents/` beneath a per-test home.
-Protected run identities live beside the registry, so isolating only the
-registry leaf lets repeated run ids leak authority between tests.
+Session execution records also belong to that test home; isolating only the
+registry leaf lets repeated session keys leak routing state between tests.
 
 Member execution fixtures must provision their own V2 memory before resolving
 bindings. Use `provision_member_memory` inside the isolated test home; do not
@@ -165,6 +173,14 @@ silent until some assertion happens to expect a non-empty one.
 `test_mcp_gateway_pool_integ.test_every_consumer_of_the_fake_reads_it_through_recorded`
 pins the import for every module that spawns the fake, because co-location alone does
 not stop a second consumer from hand-rolling the read.
+
+### Host tool dialects
+
+A test double for a platform-specific CLI must not depend on another host's
+flags. The BSD `stat -f %Lp` fixture reads real permission bits with Python's
+`os.stat` and `stat.S_IMODE`, rather than delegating to GNU `stat -c %a`.
+Reject unsupported arguments and verify actual modes; never substitute a fixed
+successful response for the permission check. Quote paths and bound subprocesses.
 
 ### Links: use the conftest helpers, do not skip on Windows
 
@@ -280,6 +296,72 @@ Rules that decide whether one is worth having:
   (`context._memory_stores` / `_lesson_stores` behind `_stores_lock`), and reset those
   globals through `monkeypatch`, never raw assignment.
 
+### Channel wire fakes: borrow the library's read side, do not model it
+
+`kiro_crew.testing.fake_channel_wire` fakes a channel's `aiohttp` session one layer
+below the client, so the real client, transport, dispatcher and renderer run against
+canned vendor bytes. A fake at that seam has a standing hazard: a response object
+written by hand can disagree with `aiohttp` in ways that raise no `AttributeError`,
+so the suite verifies the client against *our model of `aiohttp`* rather than against
+`aiohttp`, and stays green while production refuses the same bytes.
+
+The rule that removes it: **the response read side is `aiohttp`'s own code.**
+`_FakeResponseCM` binds `ClientResponse.json`, `.text`, `.get_encoding`,
+`.raise_for_status` and `.ok` onto itself and inherits `HeadersMixin` for
+`content_type` / `charset`, supplying only the attributes those methods read
+(`_body`, `_headers`, `status`, `reason`, `request_info`, `history`, `release`).
+Content-type enforcement, the `+json` suffix match, the `content_type=None` bypass,
+empty-body-reads-as-`None`, charset decoding and the `status < 400` rule are then
+decided by the library, not by this repo. `test_fake_channel_wire.py` asserts that
+identity directly: a local re-implementation of any of those methods fails the suite
+regardless of what it returns.
+
+Do not construct a real `ClientResponse` to get this. Its `__init__` is private and
+churns across minor releases, which is the fragile surface; the read-side method
+bodies are not.
+
+Borrowing a method means supplying what it reads in the **type** it reads it in, not
+merely under the right name. `_headers` is a `multidict.CIMultiDict`, the mapping a
+real response carries, because `HeadersMixin` looks a header up by `aiohttp`'s own
+spelling: under a plain `dict` a fixture writing `content-type` is a second, separate
+field that the lookup walks past, so the default answers instead and `.json()`
+accepts a body production refuses. That is the very divergence the borrow removes, so
+`multidict` is a declared direct dependency rather than `aiohttp`'s transitive one.
+
+#### Third-party HTTP test doubles: declined for this harness
+
+`aioresponses` was evaluated as a replacement and **declined**. Recorded so the
+question is not reopened without new facts:
+
+- It does not run on the `aiohttp` this repo resolves to. `aioresponses` 0.7.9, the
+  latest release, declares `aiohttp<4.0,>=3.8` but constructs `ClientResponse`
+  directly with a `writer=` keyword; on `aiohttp` 3.14.x -- what `setup.cfg`'s
+  `aiohttp>=3.9,<4` resolves to, with no lockfile and no CI ceiling -- that raises
+  `TypeError: ClientResponse.__init__() missing 1 required keyword-only argument:
+  'stream_writer'`. Adopting it costs either a first-party `response_class` shim,
+  which restores the hand-written model it was meant to delete, or an
+  `aiohttp<3.14` ceiling on a **runtime** dependency to serve a test-only concern.
+- It reaches no further than the rule above. Both patch at the session boundary, so
+  both inherit the same response semantics; the delegation does it without a
+  dependency and without coupling to a private constructor.
+- It cannot replace the harness outright. `FakeWireWebSocket` scripts frames for the
+  WeCom streaming reply, and `aioresponses` is HTTP-only, so the best available
+  outcome was a split harness rather than one deleted file.
+
+Outbound **encoding** fidelity is out of reach for either option and remains an
+accepted limit: `aiohttp` encodes a body inside `ClientRequest`, which is built below
+the `client._session` seam this harness replaces, so a body recorded here is the
+value the client passed, not the bytes a real request would carry. Assert on
+`RecordedRequest.form` / `.json_body` with that in mind.
+
+#### Path hardening in test utilities is not a precedent
+
+`channel_fixtures.py` resolves fixture paths with `O_NOFOLLOW` containment and an
+atomic replace. That is shipped and correct, but its inputs are test-authored strings
+inside a single-user trust boundary, so it sets no expectation that test utilities
+carry attacker-grade path containment. Spend that review effort on the governance and
+keystone paths instead.
+
 ## Which conftest you are standing on
 
 There are **two** testpaths (`setup.cfg`'s `testpaths = test
@@ -378,10 +460,11 @@ pod state must set `pod_root`, `pods_dir` and `artifacts_dir` under `tmp_path` o
 their configuration object. Keep the real publisher and reader so the fixture
 proves persistence without depending on an existing directory in the host home.
 
-Provider-stub tests of member routing may stub the host capability check at
-`member_memory_auth.private_memory_execution_supported`. They must retain actual
-member provisioning, ownership and store-binding checks. Tests of native Windows
-refusal or the OS sandbox boundary must use the real capability check instead.
+Provider-stub tests of member routing must retain real member provisioning and
+canonical member/store validation in an isolated test home. Memory version adds
+no platform-capability admission. Tests of ordinary host sandbox behavior must
+exercise the real sandbox capability checks rather than substituting member-memory
+policy.
 
 When you add isolation, put it in the rootdir conftest **only** if a test in any
 testpath could damage the host, poison a process global for every later test, or
@@ -1116,8 +1199,10 @@ tests; the classes below are what the rest was made of.
   `KIROCREW_TELEMETRY=0` for the whole PROCESS, so even an emitter nobody has named
   yet builds a no-op recorder; and `pytest_make_collect_report` records every module
   whose collection flipped `metrics.provider._ever_built` into
-  `IMPORT_TIME_METRIC_EMITTERS`, asserted empty by
-  `TestNoMetricIsEmittedAtImport`. Build such values inside the test or fixture.
+  `IMPORT_TIME_METRIC_EMITTERS`, resets the recorder for the next module, and fails
+  that module's collection report. Pytest/xdist therefore fails the job on every
+  file shard, independently of where `TestNoMetricIsEmittedAtImport` runs. That
+  test also asserts the record is empty. Build such values inside the test or fixture.
 - **A maintenance-pool job resolved its path when it RAN.** `cleanup_stale_sandbox_profiles`
   ran on the `mc-maint` executor and called `config_dir()` there; the test that queued
   it had torn down its pin by the time the thread was scheduled, so the sweep `mkdir`ed
@@ -2000,11 +2085,13 @@ The knobs, tightest-wins:
 If the suite is slow on your machine, the answer is usually not a bigger `-n`: run
 the slice you are working on. A full-suite checkpoint is what CI is for.
 
-**Narrow by FILE, not by `--splits`.** `--splits/--group` — pytest-split, which CI
-uses to spread the suite across runners — deselects *after* the session has collected
-everything, so a 1-of-4 shard still pays the whole floor in every worker while running
-a quarter of the tests. Measured: 14,237 of 56,946 items selected, 744 MiB peak, which
-is the unsharded floor. It buys wall time across runners, never memory on one machine.
+**Narrow by FILE, not by `--splits`.** `--splits/--group` — pytest-split, retained
+for macOS — deselects *after* the session has collected everything, so a 1-of-4
+item shard still pays the whole floor in every worker while running a quarter of
+the tests. Measured: 14,237 of 56,946 items selected, 744 MiB peak, which is the
+unsharded floor. Linux and Windows CI instead use `scripts.ci_file_shards` to
+assign whole files before import; each worker collects only its shard's files.
+For local work, pass the specific files relevant to the change.
 
 What the floor actually tracks is the FILES a process is given. Measured on one
 worker: 1,540 files → ~745 MiB, 770 → 477, 385 → 332, 193 → 226–252. So at equal
@@ -2327,7 +2414,7 @@ More shapes this class hides, all Windows-only and all green on every Linux run:
   `test_many_producers_one_session_all_entries_land` ran 5.9 s green on `main` and
   16.1 s red one head later on the SAME shard, where the 943 tests common to both runs
   came in 2.2x slower end to end — the runner, not the diff. Reproduced on Linux by
-  pricing `Ledger.append` at 100 ms and changing nothing else. The give-up condition has
+  pricing `CrewLog.append` at 100 ms and changing nothing else. The give-up condition has
   to be a writer that STOPPED rather than one that is slow: poll `flush` in windows and
   fail when a whole window lands nothing new, measuring the first window from BEFORE the
   first wait so a real wedge is still reported one window in, and cap the total at half
@@ -2424,8 +2511,9 @@ Mutate process globals through `monkeypatch`, which reverts on teardown even whe
 test fails. Raw assignment does not.
 
 **Sharding does not just scatter this class, it hides it — so a full-suite run is the wrong
-place to be finding it.** `ci.yml` slices the suite into duration-balanced `pytest-split`
-groups, and a leaker only damages tests that land in the *same process*, so a leak whose
+place to be finding it.** `ci.yml` assigns whole files to Linux/Windows shards
+before import (macOS retains `pytest-split` groups), and a leaker only damages tests
+that land in the *same process*, so a leak whose
 victim sits in another shard is not observable in PR CI at all. The release job runs the
 suite whole and is therefore the first place it appears — as failures in files that have
 nothing to do with the cause, at a point where the diff that introduced it is long merged.
@@ -2749,31 +2837,32 @@ the comparison must keep one test harness.
 
 ### Shard balance
 
-`ci.yml` splits the backend suite into 4 `pytest-split` groups on Linux and Windows,
-and 3 on macOS. Splitting is balanced by
-recorded runtime **only when a `.test_durations` file is committed**; without one
-pytest-split falls back to an even split by test *count*. No such file is committed here:
-`test-durations.yml` would generate one weekly but has failed on a transient `git push`
-502 both times it ran, so it has never landed. So every OS splits by count today, and
-there is no Linux-recorded duration file that could mis-balance the Windows or macOS
-shards. If one is ever committed, note that it is recorded on Linux: check the macOS
-shard spread afterwards rather than assuming it improved.
+`ci.yml` assigns the backend suite to eight whole-file shards on Linux and Windows
+using `scripts.ci_file_shards`. Ownership is SHA-256 of the root-relative POSIX
+path, not a duration or test-count balance. Other shards skip the file before
+import, while discovery patterns and platform ignores remain pytest's own.
 
-**Measure a shard by running it, not by summing durations.** Each shard runs its own
-tests at `-n 4`, so per-test times from a `--store-durations` run include worker
-contention and do not add up to a shard's wall clock. Summing them predicted a 3× spread
-here. Running the four shards the way CI does,
+macOS retains three `pytest-split` groups. That plugin uses recorded runtime only
+when `.test_durations` is available, otherwise it falls back to test count.
+`test-durations.yml` remains the optional duration-recording workflow; its output
+does not affect Linux/Windows file ownership. Linux-recorded durations must not be
+assumed to balance macOS.
+
+**Measure a shard by running it, not by summing durations.** Per-test times from
+`--store-durations` include worker contention and do not add up to shard wall time.
+A bounded local reproduction of file shard `<N>` is:
 
 ```bash
-pytest -q -n 4 --no-cov --splits 4 --group <N>
+python -m pytest -q -n 2 --dist loadgroup --no-cov \
+  -p scripts.ci_file_shards --file-shards 8 --file-shard <N>
 ```
 
-measures **54.8 / 59.9 / 81.1 / 62.4s**, a 1.5× spread. Count-based splitting is
-already close enough that committing `.test_durations` would save on the order of
-seconds, so it is not the lever it looks like. The lever is the outliers: a single file
-paying a 2s production poll 119 times moves a shard far more than the split ever does,
-and it was the two files carrying that kind of cost that sat on the shards which failed
-most.
+Keep CI's selectors, ignores and coverage settings when comparing actual CI runs.
+A hash partition does not promise equal runtime: one slow file is indivisible,
+and shared conftest/package imports still cost every worker. Use collection-phase
+progress and completed shard timings; measurements from item-split runs do not
+establish the balance of file shards. Fix measured test outliers rather than
+assuming a duration file changes this partition.
 
 ## Exploratory Testing via Manual Command Execution
 

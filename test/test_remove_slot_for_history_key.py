@@ -1727,22 +1727,24 @@ class TestAChildCannotBeBornUnderADeadParent:
         assert cron_owner_matches(owner, "cron:76ef369f") is False
 
     @pytest.mark.parametrize("append_path", ["add", "add-if-absent"])
-    def test_dead_parent_keeps_private_memory_binding_before_owner_release(
+    def test_dead_parent_keeps_captured_member_memory_before_owner_release(
         self, tmp_path, monkeypatch, append_path
     ):
-        """A late child keeps its creator's private memory after becoming ownerless."""
-        from kiro_crew import member_memory_auth
+        """A late child keeps its creator's captured memory after becoming ownerless."""
         from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+        from kiro_crew.execution_context import bind_session_execution, execution_from_record
         from kiro_crew.memory_stores import provision_member_memory
 
         config = KiroCrewConfig()
         config.agents["writer"] = KiroCrewAgentConfig(kiro_agent="kirocrew")
         store = provision_member_memory(config, "writer")
         monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: config))
-        monkeypatch.setattr(member_memory_auth, "read_private_session_store", lambda _key: store)
 
         crons = CronService(base_dir=tmp_path)
-        parent = crons.add_job("nightly", "sweep", every_secs=3600)
+        member_id = config.agents["writer"].member_id
+        parent = crons.add_job("nightly", "sweep", every_secs=3600, member_id=member_id)
+        execution = execution_from_record({"execution_context": parent.execution_context})
+        bind_session_execution(f"cron:{parent.id}", execution)
         live = crons.add_job(
             "live-follow-up",
             "ping",
@@ -1750,7 +1752,7 @@ class TestAChildCannotBeBornUnderADeadParent:
             session_key=f"cron:{parent.id}",
         )
         live_binding = (live.memory_store, live.member_id)
-        assert live_binding == (store, "writer")
+        assert live_binding == (store, member_id)
         assert crons.remove_job(parent.id, actor="cli", source="cli") is True
 
         kwargs = {
@@ -1770,6 +1772,7 @@ class TestAChildCannotBeBornUnderADeadParent:
         # The binding is asserted first: releasing the dead owner must not turn
         # the creator's private schedule into a Global Memory V1 schedule.
         assert (persisted.memory_store, persisted.member_id) == live_binding
+        assert persisted.execution_context == execution.to_record()
         assert persisted.session_key == ""
 
 
@@ -3203,7 +3206,7 @@ class TestSessionLedgerOnPermanentDelete:
         """
         from kiro_crew import crew_log as lg
 
-        return lg.Ledger.create(
+        return lg.CrewLog.create(
             lg.KIND_SESSION, session_id, owner="default", agent="kirocrew", slot=slot
         )
 
@@ -3211,7 +3214,7 @@ class TestSessionLedgerOnPermanentDelete:
     def _exists(session_id: str) -> bool:
         from kiro_crew import crew_log as lg
 
-        return lg.Ledger.exists(lg.KIND_SESSION, session_id)
+        return lg.CrewLog.exists(lg.KIND_SESSION, session_id)
 
     @pytest.mark.asyncio
     async def test_the_deleted_sessions_ledger_is_removed(self, monkeypatch):
@@ -3250,7 +3253,7 @@ class TestSessionLedgerOnPermanentDelete:
     async def test_a_ledger_the_emitter_itself_opened_is_still_removed(self, monkeypatch):
         """The PRODUCTION shape: the gateway that deletes is also the writer.
 
-        ``Ledger.create`` in the other tests leaves nothing holding the unit, but
+        ``CrewLog.create`` in the other tests leaves nothing holding the unit, but
         the real gateway does -- the emitter keeps a per-session handle, and that
         handle carries the unit's write lease. The removal claims the lease
         ``sole``, which refuses a handle held anywhere in this process, so the
@@ -3322,12 +3325,12 @@ class TestSessionLedgerOnPermanentDelete:
         where the two diverge.
         """
         from kiro_crew.crew_log import emit
-        from kiro_crew.crew_log import store as ledger_store
+        from kiro_crew.crew_log import store as crew_log_store
 
         _guard_work_ledger_cleanup(monkeypatch)
         monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
         monkeypatch.setattr(
-            ledger_store, "remove_unit", lambda *_a, **_k: ledger_store.REMOVE_OWNED
+            crew_log_store, "remove_unit", lambda *_a, **_k: crew_log_store.REMOVE_OWNED
         )
         emit.reset_caches()
         try:
@@ -3379,7 +3382,7 @@ class TestSessionLedgerOnPermanentDelete:
         _guard_work_ledger_cleanup(monkeypatch)
         from kiro_crew import crew_log as lg
 
-        lg.Ledger.create(lg.KIND_SESSION, "acp-slotless", owner="default", agent="kirocrew")
+        lg.CrewLog.create(lg.KIND_SESSION, "acp-slotless", owner="default", agent="kirocrew")
         slot = _make_slot("dashboard_chat-1-100")
         state = _make_state({"dashboard_chat-1-100": slot})
         state.sessions.resumable_sid = MagicMock(return_value="acp-slotless")
@@ -3563,12 +3566,12 @@ class TestSessionLedgerOnPermanentDelete:
         state = _make_state({"dashboard_chat-1-100": slot})
         state.sessions.resumable_sid = MagicMock(return_value="acp-explodes")
 
-        from kiro_crew.crew_log import store as ledger_store
+        from kiro_crew.crew_log import store as crew_log_store
 
         def _boom(*_args, **_kwargs):
             raise RuntimeError("ledger tree unreadable")
 
-        monkeypatch.setattr(ledger_store, "remove_unit", _boom)
+        monkeypatch.setattr(crew_log_store, "remove_unit", _boom)
 
         await _remove_slot_for_history_key(state, "dashboard_chat-1-100")
 

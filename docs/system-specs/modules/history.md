@@ -14,6 +14,12 @@ binding as interactive turns, before starting an extraction provider. A named
 member store must be declared, readable and prepared; malformed or unavailable
 identity aborts the pass without writing to Global Memory V1. Sessions with no
 memory binding retain the V1 consolidation path.
+The async consolidation pass reads that execution record in a worker thread,
+before applying privacy policy or allocating the extraction provider.
+An execution record marked temporary or incognito refuses consolidation before
+reading transcript metadata, including its progress offset.
+All automatic completion callbacks leave offsets and idle throttles unchanged
+when that privacy check refuses a pass.
 
 Owned V2 consolidation never publishes or refines shared auto-skills and does
 not run the global skill lifecycle. Member experience remains in that member's
@@ -34,13 +40,14 @@ consumers refuse the operation; the legacy `get_metadata()` projection still
 returns an empty dictionary for callers that only display history.
 
 Template-versus-member selection survives recent-session restore, explicit
-resume and dormant-slot rehydration through the protected, exact-session record
-owned by `session_agent_selection.py`; transcript fields cannot manufacture that
-provenance. Restoring a template conversation after discovery imports a member
-with the same name keeps its original namespace. This record is separate from
-the protected private-store assignment and cannot authorize V2 memory. Old
-conversations without it keep strict legacy resolution rather than guessing
-from missing private bindings. See [session](session.md#agent-selection-provenance).
+resume and dormant-slot rehydration through the canonical execution context in
+the owning session metadata. `session_agent_selection.py` preserves that record
+instead of inferring selection from display fields. Restoring a template
+conversation after discovery imports a member with the same name keeps its
+original namespace. The same record carries member/store identity; ordinary
+authorization remains independent. Old V1 conversations retain legacy resolution,
+while missing member identity refuses routing.
+See [session](session.md#agent-selection-provenance).
 
 Bulk clear excludes transcripts whose metadata cannot be read, including Global
 V1 transcripts. Their owner and pinned state cannot safely be inferred. An exact
@@ -226,12 +233,12 @@ the same provenance ledger entry.
 
 ## Dashboard History Persistence — Frozen Prefix + Live Window (`dashboard/chat_persistence.py`)
 
-Dashboard restoration reads an existing protected agent selection before applying
+Dashboard restoration reads an existing canonical execution context before applying
 the transcript's agent field. A provisional history write left by an interrupted
 switch therefore cannot replace the committed choice, even if its rollback could
 not acquire the history lock. Missing selection records retain legacy resolution;
-unreadable records remain execution refusals. Private-store authority is still
-checked independently. Async restore prefetches this record off-loop alongside
+unreadable records remain execution refusals. Member/store integrity and ordinary
+authorization are still checked. Async restore prefetches this record off-loop alongside
 the transcript and applies the resulting name on the event loop.
 
 `_save_slot_to_history` persists dashboard chat slots. It models the session
@@ -310,17 +317,19 @@ no longer destroy older turns.
   value outside the allowlist on a live parent, and passing it through would
   raise out of the slot constructor as a 500. The fork instead answers 409
   `fork_source_memory_mode_invalid` (SEL `denied`), and no child exists.
-- **Private-member fork identity**: a V2 fork also inherits the parent's
-  protected memory assignment before the child receives copied history. The
-  parent assignment must match the currently configured member and store;
-  missing, damaged or mismatched evidence refuses. Transcript metadata cannot
-  authorize that inheritance. Persistent, incognito and temporary forks keep
+  This refusal precedes execution-identity and database lookup, preserving the
+  named mode error even when the source's other metadata is unavailable.
+- **Member fork identity**: a V2 fork also inherits the parent's canonical
+  execution context before the child receives copied history. The captured
+  member/store identity must be valid; missing, damaged or mismatched identity
+  refuses routing. Ordinary owner/app authorization is checked independently.
+  Persistent, incognito and temporary forks keep
   their existing mode guarantees, and Global or named V1 history is never
   relabeled as private V2 by forking it.
   Cancellation waits for an in-flight binding publication before removing the
   empty child. Any published assignment remains attached to that unique key,
-  including after a later save failure, so partial private history cannot become
-  unprotected. This can leave an unused protected identity record.
+  including after a later save failure, so partial history cannot lose its
+  recorded owner. This can leave an unused session identity record.
 - **Concurrency**: `_flush_dirty_slots` runs the save in an executor thread while
   `_run_chat` mutates `slot.messages` on the event loop. `slot._lock` is an
   asyncio lock (unusable from the thread), so the save instead takes a
@@ -702,7 +711,7 @@ archived instead of being permanently deleted:
   `_cleanup_old_archives()` reads the value from config when called with no
   explicit `retention_days`, and is rate-limited to once per hour.
 - **The same pass expires closed SESSION LEDGERS**, on that same setting and
-  inside that same throttle: `_cleanup_expired_ledgers()` hands the resolved
+  inside that same throttle: `_cleanup_expired_crew_logs()` hands the resolved
   window to `ledger.store.sweep_expired()`. One switch governs both halves
   because a session's message bodies live in its ledger — expiring the transcript
   archive while the ledger it points into grew forever would keep the larger half
@@ -838,9 +847,18 @@ failure outcome and admission cooldown then govern a later retry.
 message-aligned prefix no larger than 64 KiB of rendered transcript. Each
 successful prefix commits its own absolute message offset, and reports a
 partial outcome until the snapshot is fully consumed. A single message larger
-than that window fails safely without advancing the offset. Preferences-only
+than 8 KiB of rendered text is truncated with an explicit marker before it enters
+the bounded prefix. Preferences-only
 passes retain their existing whole-tail behavior because they do not advance
 the durable history offset.
+
+Member SQLite receipts retain the processed prefix's count, absolute end offset
+and digest of the same bounded messages used for extraction. Recovery verifies
+all three before acknowledging a prior write, including the truncation of large
+messages; it neither repeats the model call nor advances across an unprocessed
+tail. A receipt acknowledgement reports the offset actually persisted. If a
+concurrent transcript rewrite invalidates its generation, the result is skipped
+and the replacement transcript remains pending.
 
 **Loop safety:** the task body runs on the event loop thread, so any blocking
 work inside it must be offloaded. `_write_structured_memory` and `_save_lessons`
@@ -860,6 +878,18 @@ read-modify-write and the FAISS add + id-map append with `_db_lock` (a `RLock`);
 `write_lesson`'s dedup scan and backfill UPDATEs rely on sqlite's serialized-mode
 statement atomicity (WAL + `busy_timeout`) rather than application-level locking
 — the lock is never held across a blocking embed.
+
+**Embed budget:** the offload bounds the loop, not the cost. One pass writes up
+to `_MAX_SEMANTIC_PER_CONSOLIDATION` + `_MAX_EPISODIC_PER_CONSOLIDATION` rows and
+each embeds inline, so a degraded embedder made the pass cost N times one call's
+latency on an embed-pool worker every other embed consumer shares.
+`_write_structured_memory` therefore charges both tiers' store writes against
+`_EMBED_BUDGET_SECS_PER_PASS`. The first overrun latches for the rest of that
+pass: every remaining row is written with `defer_embedding=True`, which stores the
+same NULL-vectored row a failed embed already produces and leaves the vector to
+`backfill_missing_embeddings`. On the semantic side the same flag also takes the
+stale-episodic retirement down its text-only arm, the arm it already takes when an
+embed returns nothing. The deferral is logged once per pass, never once per row.
 
 ## Stop Events
 

@@ -9,7 +9,7 @@ Tools:
     spawn_status    — retrieve full subagent output
     resource_status — check host resource headroom before heavy work
     learn_add       — save a learned correction
-    learn_list      — list all lessons
+    learn_list      — list one window of lessons, with the total
     learn_remove    — remove lessons by substring
     task_run        — start the autonomous task runner
 """
@@ -57,7 +57,6 @@ from kiro_crew.mcp_caller import CallerContext, current_caller, set_current_call
 from kiro_crew.mcp_shared import (
     call_tool_with_logging,
     internal_caller,
-    member_proof_header_value,
     run_mcp_stdio_loop,
 )
 from kiro_crew.mcp_tools import build_tool_list, dispatch
@@ -961,8 +960,6 @@ def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
 #: attributed channel sends, crew/app state, cron ownership). These operations
 #: resolve the caller STRICTLY through :func:`require_strict_session_key`, never
 #: the lenient resolver whose ``/proc`` ancestor walk can return a parent slot.
-#: Shared protocol-log access is conditional: private memory boundaries require
-#: strict Global identity; pure V1 keeps read-only diagnostics attribution.
 #: The registry includes every module with a strict operation. This is data:
 #: ``test/test_identity_topology.py`` scans the source tree and fails when a
 #: module calls the strict resolver directly (bypassing the gate) or calls the
@@ -971,6 +968,7 @@ def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
 REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
     {
         "mcp_computer.py",
+        "mcp_crew_log.py",
         "mcp_cron.py",
         "mcp_dashboard.py",
         "mcp_work.py",
@@ -981,6 +979,7 @@ REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
         "mcp_tools/logs.py",
         "mcp_tools/messaging.py",
         "mcp_tools/sessions.py",
+        "mcp_tools/skills.py",
         "mcp_tools/workflows.py",
     }
 )
@@ -1343,7 +1342,7 @@ def _session_key_header_error(sk: str) -> str | None:
 
 
 def _caller_header() -> dict[str, str]:
-    """Component attribution plus this invocation's private-member authority.
+    """Component attribution for independently authenticated internal requests.
 
     MCP stdio servers declare their component name via
     ``mcp_shared.set_internal_caller`` (done centrally in
@@ -1355,24 +1354,29 @@ def _caller_header() -> dict[str, str]:
     known set before trusting it into an audit line. Processes that never
     declared an identity (CLI, tests) send no header rather than a guess.
 
-    A pooled backend additionally forwards the current caller's short-lived
-    member proof. It is independent of component attribution and is verified
-    against the live runtime binding by the private-memory HTTP authorizer.
     """
-    from kiro_crew.mcp_caller import current_caller
-    from kiro_crew.member_memory_auth import PROOF_HEADER
-
     name = internal_caller()
-    headers = {"X-Internal-Caller": name} if name else {}
-    caller = current_caller()
-    if caller is not None and caller.from_gateway and caller.member_memory_proof:
-        # Only this invocation's gateway-minted proof may cross the pooled
-        # backend boundary. Environment and process-lifetime identity caches do
-        # not establish member authority. Malformed metadata earns no header.
-        proof = member_proof_header_value(caller.member_memory_proof)
-        if proof:
-            headers[PROOF_HEADER] = proof
-    return headers
+    return {"X-Internal-Caller": name} if name else {}
+
+
+def _session_token_header() -> dict[str, str]:
+    """Attach the signed per-session token to internal gateway requests.
+
+    The token is already injected into each MCP server's environment.  Sending
+    it alongside ``X-Session-Key`` lets the gateway bind a loopback TCP request
+    to the session that launched this MCP process; the gateway verifies the
+    signature and the key match.  It is a transport identity proof, not a
+    member-memory capability.
+    """
+    from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
+
+    # A pooled backend is spawned from gatewayd's own environment, so the
+    # per-session token is not in ``os.environ``; gatewayd forwards it inside
+    # the per-call caller block for Kiro Crew's control-plane servers instead.
+    ctx = current_caller()
+    token = ctx.session_token if ctx is not None and ctx.from_gateway else ""
+    token = token or os.environ.get(STUB_SESSION_TOKEN_ENV, "")
+    return {"X-Session-Token": token} if token else {}
 
 
 def _transport_failure(message: str, mark: bool) -> dict:
@@ -1531,7 +1535,9 @@ def _send(
                 refusal = exc
             except Exception as exc:
                 return _transport_failure(str(exc), mark_transport_error)
-        return {"error": _refused_message(refused[0], refusal)}
+        # ``refused`` is the one failure that proves nothing reached a gateway,
+        # so a caller may fall back to a local path without risking a replay.
+        return {"error": _refused_message(refused[0], refusal), "refused": True}
 
     # ONE resolution for this attempt; both transports derive from it.
     target = _resolve_api_target()
@@ -1607,6 +1613,7 @@ def _post(
         "Content-Type": "application/json",
         "X-Internal-Secret": _internal_secret(),
         **_caller_header(),
+        **_session_token_header(),
     }
     sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
@@ -1936,7 +1943,7 @@ def _validate_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     schema = MCP_CORE_SCHEMAS.get(name)
     if schema:
         return validate_tool_args(args, schema)
-    return args  # tools without schemas (learn_list) pass through
+    return args  # tools without schemas pass through
 
 
 def _current_session_thread_ts() -> str | None:
@@ -2049,6 +2056,26 @@ def capture_directive(kind: str, args: dict[str, Any]) -> bool:
         return False
     sink.append((kind, dict(args)))
     return True
+
+
+def directive_capture_active() -> bool:
+    """True while this call is a GATEWAY-SIDE replay under :func:`derive_directive`.
+
+    A directive tool's handler runs TWICE for one arming call: once in the MCP
+    server, where its return text answers the model, and once here, where
+    :func:`derive_directive` re-runs it only to intercept the directive it
+    publishes and DISCARDS the returned text (see :func:`_call_tool_body`).
+
+    The two runs differ in one way that matters for I/O: this one executes on the
+    gateway's OWN event loop, called synchronously from the aiohttp handler, so a
+    blocking loopback request back to this same gateway cannot be serviced while
+    it waits -- every session stalls until that request times out.
+
+    A handler that reads gateway state only to shape its REFUSAL TEXT must
+    therefore skip the read here: the text is discarded, and the turn boundary
+    re-decides authoritatively either way.
+    """
+    return _DIRECTIVE_CAPTURE.get() is not None
 
 
 def derive_directive(

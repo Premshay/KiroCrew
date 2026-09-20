@@ -1874,7 +1874,10 @@ class TestDependencyInstall:
         assert '"sibling": 1' in proc.stdout, proc.stdout
 
     def test_a_python_backend_with_deps_launches_through_the_shim(
-        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_with_user_site,
     ) -> None:
         """A provisioned backend spawns via deps_boot (which addsitedir()s
         the deps dir, processing .pth) rather than a raw interpreter+entry
@@ -1894,9 +1897,10 @@ class TestDependencyInstall:
         assert argv[0] == sys.executable, argv
         # absolute-path spelling: an app-root kiro_crew.py must not be able
         # to shadow the shim for -m resolution under cwd=app root
-        assert argv[1].endswith("deps_boot.py"), argv
-        assert argv[2] == str(deps_dir), argv
-        assert argv[3].endswith("server.py"), argv
+        assert argv[1] == "-s", argv
+        assert argv[2].endswith("deps_boot.py"), argv
+        assert argv[3] == str(deps_dir), argv
+        assert argv[4].endswith("server.py"), argv
 
     def test_non_volatile_requirements_install_from_a_snapshot(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
@@ -2410,7 +2414,10 @@ class TestDependencyInstall:
         assert any(str(a).endswith("deps_boot.py") for a in seen["argv"]), seen["argv"]
 
     def test_the_installer_never_shells_out_to_a_bare_interpreter(
-        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_without_user_site,
     ) -> None:
         """pip must run as `sys.executable -m pip` - a bare `python3` relies
         on PATH (absent on some hosts, a Store stub on Windows), and any
@@ -2429,7 +2436,7 @@ class TestDependencyInstall:
         # exactly the hosts it is meant to pass on.
         assert pip_argv[0] == sys.executable, pip_argv
         assert pip_argv[0] != "python3", pip_argv
-        assert pip_argv[1:3] == ["-m", "pip"], pip_argv
+        assert pip_argv[1:4] == ["-s", "-m", "pip"], pip_argv
         # `.venv/bin/pip` is POSIX-only; the interpreter must run pip as a module.
         assert not pip_argv[0].replace("\\", "/").endswith("/bin/pip"), pip_argv
 
@@ -2961,20 +2968,69 @@ class TestNodeDispatch:
 class TestAsgiDispatch:
     _ASGI_SRC = "from fastapi import FastAPI\napp = FastAPI()\nimport uvicorn\n"
 
+    def test_ambient_pythonpath_keeps_user_site_for_uvicorn(
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_with_user_site,
+    ) -> None:
+        """An inherited PYTHONPATH is not proof that this launcher supplied
+        uvicorn's import path. A user-site-only uvicorn must remain reachable."""
+        (spawn_root / "app.py").write_text(self._ASGI_SRC)
+        monkeypatch.setenv("PYTHONPATH", "/operator/own")
+        seen = _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body(
+                "asgi-ambient-path", _manifest("app.py", backend_type="asgi")
+            )
+        assert seen["argv"][:3] == [sys.executable, "-m", "uvicorn"]
+        assert seen["kwargs"]["env"]["PYTHONPATH"] == "/operator/own"
+
+    @pytest.mark.parametrize(
+        ("entry_name", "backend_type", "contents"),
+        [
+            pytest.param("app.py", "asgi", _ASGI_SRC, id="asgi"),
+            pytest.param("server.py", "", "x = 1\n", id="plain"),
+        ],
+    )
+    def test_bundled_interpreter_disables_user_site_for_python_backends(
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        bundled_python_with_user_site,
+        entry_name: str,
+        backend_type: str,
+        contents: str,
+    ) -> None:
+        (spawn_root / entry_name).write_text(contents)
+        seen = _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body(
+                f"bundled-{entry_name}",
+                _manifest(entry_name, backend_type=backend_type),
+            )
+        assert seen["argv"][:2] == [sys.executable, "-s"]
+
     def test_a_sniffed_asgi_entry_is_served_by_uvicorn(
-        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_without_user_site,
     ) -> None:
         (spawn_root / "backend").mkdir()
         (spawn_root / "backend" / "app.py").write_text(self._ASGI_SRC)
         seen = _capture_popen(monkeypatch)
         with pytest.raises(_StopSpawn):
             bmod._start_app_backend_body("asgi", _manifest("backend/app.py"))
-        assert seen["argv"][1:3] == ["-m", "uvicorn"]
-        assert seen["argv"][3] == "backend.app:app"
+        assert seen["argv"][1:4] == ["-s", "-m", "uvicorn"]
+        assert seen["argv"][4] == "backend.app:app"
         assert seen["kwargs"]["cwd"] == str(spawn_root)
 
     def test_a_src_layout_asgi_entry_runs_from_the_src_root(
-        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_without_user_site,
     ) -> None:
         """Without the src/ rewrite uvicorn cannot import the declared module."""
 
@@ -2986,7 +3042,7 @@ class TestAsgiDispatch:
             bmod._start_app_backend_body(
                 "asgi-src", _manifest("src/pkg/app.py", backend_type="asgi")
             )
-        assert seen["argv"][3] == "pkg.app:app"
+        assert seen["argv"][4] == "pkg.app:app"
         assert seen["kwargs"]["cwd"] == str(spawn_root / "src")
 
     def test_the_app_venv_interpreter_is_preferred_when_present(
@@ -3006,8 +3062,11 @@ class TestAsgiDispatch:
             bmod._start_app_backend_body("asgi-venv", _manifest("app.py"))
         assert seen["argv"][0] == str(venv_py)
 
-    def test_a_module_builtin_never_provisions_or_injects_app_deps(
-        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    def test_nonbundled_module_builtin_keeps_user_site_and_rejects_app_deps(
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_with_user_site,
     ) -> None:
         """A module-style builtin (entry is None) runs TRUSTED package code.
         A requirements.txt or .kirocrew-deps sitting in its writable app dir
@@ -3025,6 +3084,11 @@ class TestAsgiDispatch:
         # no such file under the app root.
         with pytest.raises(_StopSpawn):
             bmod._start_app_backend_body("mod-builtin", _manifest("kiro_crew.apps.builtins.demo"))
+        assert seen["argv"] == [
+            sys.executable,
+            "-m",
+            "kiro_crew.apps.builtins.demo",
+        ]
         # No pip install ran, and the deps dir is NOT on the child PYTHONPATH.
         assert not any("install" in argv for argv in runs), runs
         child_pp = seen["kwargs"]["env"].get("PYTHONPATH", "")
@@ -4575,7 +4639,9 @@ class TestRestartExitedBackend:
         with bmod._lock:
             bmod._processes["app"] = ap
             bmod._restart_attempts["app"] = 2
-        monkeypatch.setattr(bmod, "_health_probe", lambda *_args: True)
+        monkeypatch.setattr(
+            bmod, "_health_probe", lambda *_args: bmod.HealthProbeOutcome.answered(200)
+        )
 
         def _sleep(_delay: float) -> None:
             nonlocal sweeps
@@ -5053,7 +5119,8 @@ class TestReapDefensiveBranches:
     def test_a_pid_that_exits_before_the_signal_is_dropped(
         self, matched_orphan: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def _gone(_pid: int, _expected: str, _sig: int) -> bool:
+
+        def _gone(_pid: int, _expected: str, _sig: int, **kwargs: Any) -> bool:
             raise ProcessLookupError
 
         # Patched at the PINNED entry point, which is what the reap calls now.
@@ -5061,7 +5128,12 @@ class TestReapDefensiveBranches:
         # work in front of it and make the case host-dependent.
         monkeypatch.setattr(bmod.platform_compat, "kill_process_tree_pinned", _gone)
         assert bmod._reap_stale_app_backends() == 0
-        assert bmod._read_pidfile() == {}
+        if bmod.platform_compat.IS_WINDOWS:
+            assert bmod._read_pidfile() == {
+                "app": {"pid": 4321, "start_time": "ST-1", "port": 9100}
+            }, "a Windows drain exception does not prove the descendant tree absent"
+        else:
+            assert bmod._read_pidfile() == {}
 
     def test_the_reap_survives_an_audit_sink_failure_on_both_signals(
         self, matched_orphan: None, monkeypatch: pytest.MonkeyPatch
@@ -5074,18 +5146,19 @@ class TestReapDefensiveBranches:
         monkeypatch.setattr(
             bmod.platform_compat,
             "kill_process_tree_pinned",
-            lambda _pid, _expected, sig: bool(signals.append(sig)) or True,
+            lambda _pid, _expected, sig, **kwargs: bool(signals.append(sig)) or True,
         )
         assert bmod._reap_stale_app_backends() == 1
-        assert signals == [
-            bmod.platform_compat.SIGTERM,
-            bmod.platform_compat.SIGKILL,
-        ]
+        expected = [bmod.platform_compat.SIGTERM]
+        if not bmod.platform_compat.IS_WINDOWS:
+            expected.append(bmod.platform_compat.SIGKILL)
+        assert signals == expected
 
     def test_a_pid_that_exits_before_the_escalation_is_not_an_error(
         self, matched_orphan: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def _kill(_pid: int, _expected: str, sig: int) -> bool:
+
+        def _kill(_pid: int, _expected: str, sig: int, **kwargs: Any) -> bool:
             if sig == bmod.platform_compat.SIGKILL:
                 raise ProcessLookupError
             return True

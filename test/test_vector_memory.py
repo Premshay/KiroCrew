@@ -303,6 +303,41 @@ class TestValidateSemantic:
         assert store.set_semantic("pref.os", None, 1.0, "user_explicit") is not None
         assert store.get_semantic("pref.os")["value_json"] == '"macos"'
 
+    def test_whitespace_only_value_rejected(self, tmp_path: Path) -> None:
+        # The envelope of a blank string is '"  "', which is neither empty nor a
+        # member of _EMPTY_VALUE_JSON, so an envelope-only gate stores it as a value.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        for value in ("  ", "\t", "\n", " \u00a0 "):
+            result = store.validate_semantic("pref.os", value, 1.0, "user_explicit")
+            assert result is not None, value
+            assert result[0] is SemanticRejectCode.VALUE_EMPTY, value
+
+    def test_pre_serialized_whitespace_rejected(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        result = store.validate_semantic(
+            "pref.os", "ignored", 1.0, "user_explicit", value_json='"  "'
+        )
+        assert result is not None
+        assert result[0] is SemanticRejectCode.VALUE_EMPTY
+
+    def test_padded_value_still_accepted(self, tmp_path: Path) -> None:
+        # The control for the check above: content surrounded by whitespace is a value,
+        # so the gate must read the padding and not trim the meaning out of it.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.validate_semantic("pref.os", " x ", 1.0, "user_explicit") is None
+        assert store.set_semantic("pref.os", " x ", 1.0, "user_explicit") is None
+        assert store.get_semantic("pref.os")["value_json"] == '" x "'
+
+    def test_whitespace_write_does_not_clobber_existing_row(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.os", "macos", 1.0, "user_explicit") is None
+        assert store.set_semantic("pref.os", "   ", 1.0, "user_explicit") is not None
+        assert store.get_semantic("pref.os")["value_json"] == '"macos"'
+
     def test_value_empty_is_auditable(self, tmp_path: Path) -> None:
         from unittest.mock import patch
 
@@ -537,6 +572,67 @@ class TestConflictResolution:
         code, msg = result
         assert code == SemanticRejectCode.CONFLICT
         assert "user" in msg.lower()
+
+    def _plant_degenerate(self, store: VectorMemoryStore, key: str, value_json: str) -> None:
+        """Leave *key* holding *value_json* under user_explicit, as a legacy row does.
+
+        The write gate refuses these values now, so the only way such a row exists is
+        to have been written before the gate did -- which is exactly the row that has
+        to be repairable.
+        """
+        assert store.set_semantic(key, "macos", 1.0, "user_explicit") is None
+        store.db.execute(
+            "UPDATE semantic_memory SET value_json = ? WHERE key = ?", (value_json, key)
+        )
+        store.db.commit()
+
+    @pytest.mark.parametrize("value_json", ["null", '""', '"   "'])
+    def test_degenerate_user_row_is_repaired_by_an_automated_write(
+        self, tmp_path: Path, value_json: str
+    ) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        self._plant_degenerate(store, "pref.os", value_json)
+        assert store.set_semantic("pref.os", "linux", 0.9, "consolidation:b") is None
+        assert store.get_semantic("pref.os")["value_json"] == '"linux"'
+
+    def test_repairing_a_degenerate_row_retires_no_episodic_memory(self, tmp_path: Path) -> None:
+        # The V1 retirement heuristic embeds "<key suffix>: <old value>", so a blank old
+        # value degenerates to the bare key suffix and tombstones every episode on that
+        # subject. The repair must not pay for itself in lost episodic memories.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        self._plant_degenerate(store, "pref.os", '"   "')
+        calls: list[tuple[str, str]] = []
+        with mock.patch.object(
+            store, "_retire_stale_episodic", side_effect=lambda k, v, **kw: calls.append((k, v))
+        ):
+            assert store.set_semantic("pref.os", "linux", 0.9, "consolidation:b") is None
+        assert calls == []
+
+    def test_replacing_a_real_value_still_retires_episodic_memory(self, tmp_path: Path) -> None:
+        # The control for the guard above: a superseded value that says something still
+        # supersedes the episodes that assert it.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.os", "macos", 1.0, "user_explicit") is None
+        calls: list[tuple[str, str]] = []
+        with mock.patch.object(
+            store, "_retire_stale_episodic", side_effect=lambda k, v, **kw: calls.append((k, v))
+        ):
+            assert store.set_semantic("pref.os", "linux", 1.0, "user_explicit") is None
+        assert calls == [("pref.os", "macos")]
+
+    def test_healthy_user_row_still_refuses_an_automated_write(self, tmp_path: Path) -> None:
+        # The control for the repair above: the carve-out reads the stored VALUE, so a row
+        # that holds one keeps the source precedence it always had.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.os", "macos", 1.0, "user_explicit") is None
+        result = store.set_semantic("pref.os", "linux", 0.95, "consolidation:b")
+        assert result is not None
+        assert result[0] is SemanticRejectCode.CONFLICT
+        assert store.get_semantic("pref.os")["value_json"] == '"macos"'
 
 
 class TestInjectionDetection:
@@ -976,7 +1072,14 @@ class TestSchemaInit:
         monkeypatch.setattr(
             vm.sqlite3,
             "connect",
-            lambda *a, **k: (events.append("connect"), real_connect(*a, **k))[1],
+            lambda *a, **k: (
+                events.append(
+                    "probe_readonly"
+                    if k.get("uri") and str(a[0]).endswith("?mode=ro")
+                    else "connect"
+                ),
+                real_connect(*a, **k),
+            )[1],
         )
         store = VectorMemoryStore(db_path=db_path)
         try:
@@ -984,7 +1087,8 @@ class TestSchemaInit:
         finally:
             store.close()
 
-        assert "connect" in events, events
+        assert events.count("probe_readonly") == 1, events
+        assert events.count("connect") == 1, events
         restricted_db_before = events.index("restrict:mem.db") < events.index("connect")
         assert restricted_db_before, events
 
@@ -1384,6 +1488,52 @@ class TestStemWords:
         assert after_first.misses == 1
         assert after_second.misses == 1, "second call must not re-stem"
         assert after_second.hits == after_first.hits + 1
+
+
+class TestEmbedLogsCarryNoMemoryText:
+    """The embed diagnostics log sizes, never the memory text itself.
+
+    ``text`` is user memory content. A DEBUG line that echoes even a 50-char
+    prefix puts that content into the log; the three branches (success, None,
+    exception) must all stay content-free.
+    """
+
+    _SENTINEL = "SENTINEL-MEMORY-CONTENT-do-not-log"
+
+    def _store(self, tmp_path: Path) -> VectorMemoryStore:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        return store
+
+    def _assert_not_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        for record in caplog.records:
+            assert self._SENTINEL not in record.getMessage()
+            assert self._SENTINEL not in (record.exc_text or "")
+
+    def test_success_branch(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        store = self._store(tmp_path)
+        store.embed_fn = lambda _t: [0.1, 0.2]
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.vector_memory"):
+            assert store._try_embed(self._SENTINEL) == [0.1, 0.2]
+        self._assert_not_logged(caplog)
+
+    def test_none_branch(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        store = self._store(tmp_path)
+        store.embed_fn = lambda _t: None
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.vector_memory"):
+            assert store._try_embed(self._SENTINEL) is None
+        self._assert_not_logged(caplog)
+
+    def test_exception_branch(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        store = self._store(tmp_path)
+
+        def boom(_t: str) -> list[float]:
+            raise RuntimeError("embedder down")
+
+        store.embed_fn = boom
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.vector_memory"):
+            assert store._try_embed(self._SENTINEL) is None
+        self._assert_not_logged(caplog)
 
 
 class TestEmbedFnLazyRebind:
@@ -3250,7 +3400,7 @@ class TestSharedConnectionLockDiscipline:
         store.init()
         assert store.set_semantic("pref.editor", "vim", 0.9, "consolidation") is None
 
-        def _boom(key: str, old_value: str) -> None:
+        def _boom(key: str, old_value: str, **kw: object) -> None:
             raise RuntimeError("cannot start a transaction within a transaction")
 
         store._retire_stale_episodic = _boom  # type: ignore[assignment]

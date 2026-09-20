@@ -23,7 +23,6 @@ src/kiro_crew/apps/builtins/auto_improvement/spine/bug_gate.py 20.7   # 12/58
 src/kiro_crew/apps/builtins/auto_improvement/spine/gate.py 19.1   # 22/115
 src/kiro_crew/apps/builtins/auto_improvement/spine/git_safety.py 46.4   # 45/97
 src/kiro_crew/apps/builtins/auto_improvement/spine/pr_pipeline.py 28.7   # 35/122
-src/kiro_crew/apps/builtins/code_review_sage/tests/fixtures.py 0.0   # 0/6
 src/kiro_crew/apps/builtins/crew_companion/backend/routes.py 62.9   # 112/178
 src/kiro_crew/apps/builtins/file_explorer/server.py 71.9   # 396/551
 src/kiro_crew/apps/builtins/mochi/backend/routes.py 71.5   # 391/547
@@ -77,7 +76,6 @@ src/kiro_crew/knowledge/readers.py 61.7   # 74/120
 src/kiro_crew/mcp_gateway/manager.py 28.7   # 96/335
 src/kiro_crew/mcp_gateway/stub.py 66.6   # 353/530
 src/kiro_crew/mcp_gateway/transport.py 73.1   # 163/223
-src/kiro_crew/skill_providers/skillsh.py 64.0   # 137/214
 src/kiro_crew/slack/allowlist.py 57.1   # 68/119
 src/kiro_crew/slack/client.py 67.2   # 246/366
 src/kiro_crew/suggestions.py 18.7   # 31/166

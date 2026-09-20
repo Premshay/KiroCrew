@@ -40,11 +40,13 @@ from kiro_crew.config.loader import (
 from kiro_crew.constants import CHANNEL_SEND_NAMESPACES
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.dashboard.channel_folders import (
+    CHANNEL_CONFIG_SECTIONS,
     channel_restart_required,
     clean_session_folder,
     ensure_channel_folder,
     stored_folder_name,
 )
+from kiro_crew.dashboard.channel_slots import backfill_channel_folder
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_utils import (
     CRON_NOTIFICATION_KIND,
@@ -88,6 +90,11 @@ from kiro_crew.platform_compat import IS_MACOS
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.slack.format import build_options_blocks, extract_options
 from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
+from kiro_crew.solo_spawn import (
+    SOLO_SPAWN_REFUSED_CODE,
+    solo_spawn_difference,
+    solo_spawn_question,
+)
 from kiro_crew.spawn_warm import warm_project_agents_for_spawn
 from kiro_crew.subagent import effort_applied_note, effort_drop_reason
 from kiro_crew.subagent_persistence import _agent_dir, read_state
@@ -177,32 +184,28 @@ _SPAWN_REJECTED_CODE = "spawn_rejected"
 async def _spawn_scope_refusal(
     request: web.Request, *, claimed_session: str | None = None
 ) -> web.Response | None:
-    """Refuse a private member's access to a run outside its own memory store.
-
-    The run is the route's ``{agent_id}``; owner and non-private callers pass.
-    Applied to the per-run ``api_spawn_*`` routes by the guard table at the
-    bottom of this module, and called directly where the caller's claimed
-    parent session has to be checked as well.
-    """
+    """Keep run controls with their originating session, regardless of target member."""
     scope, refusal = await internal_memory_scope(
         request, "spawn.access", claimed_session=claimed_session
     )
     if refusal is not None or scope is None:
         return refusal
+    caller = request.headers.get("X-Session-Key", "")
     state = request.app["state"]
-    try:
-        if state.subagents and scope == await asyncio.to_thread(
-            state.subagents._inherited_memory_store, request.match_info["agent_id"]
-        ):
-            return None
-    except (OSError, ValueError):
-        pass
+    run_id = request.match_info["agent_id"]
+    info = state.subagents.get(run_id) if state.subagents else None
+    record = None if info is not None else await asyncio.to_thread(read_state, run_id)
+    parent = (
+        info.parent_session_key if info is not None else (record or {}).get("parent_session_key")
+    )
+    if parent == caller or caller == f"subagent:{run_id}":
+        return None
     _sel().log_api_access(
         caller="internal",
         operation="spawn.access",
         outcome="denied",
-        source="member_memory",
-        error="The requested run is outside the member's private memory.",
+        source="subagent",
+        error="The run belongs to another originating session.",
     )
     return web.json_response({"error": "not found", "code": "task_scope_denied"}, status=404)
 
@@ -254,6 +257,10 @@ async def api_spawn(request: web.Request) -> web.Response:
                 # below unreachable: the block, its unknown_crew refusal and its
                 # store resolution all ran off a value that was always None.
                 "crew": body.get("crew", ""),
+                # Why one task is spawned alone (solo gate). Listed for the same
+                # reason as ``crew``: an unlisted field is dropped, not refused.
+                "solo_reason": body.get("solo_reason", ""),
+                "target_member": body.get("target_member", ""),
             },
             SPAWN_RUN_SCHEMA,
         )
@@ -268,7 +275,7 @@ async def api_spawn(request: web.Request) -> web.Response:
             {"error": "parent_session must be a string", "code": "invalid_parent_session"},
             status=400,
         )
-    caller_store, refusal = await internal_memory_scope(
+    _, refusal = await internal_memory_scope(
         request, "spawn.create", claimed_session=parent_session
     )
     if refusal is not None:
@@ -305,96 +312,104 @@ async def api_spawn(request: web.Request) -> web.Response:
     if not isinstance(keep, bool):
         keep = str(keep).lower() in ("true", "1", "yes")
     agent = cleaned.get("agent") or ""
-    # DELEGATION TO A NAMED CREW. Resolved once, here, through the shared
-    # binding resolver -- the store must never be derived from `agent`, which
-    # holds a kiro-cli template id and would answer `default` for exactly the
-    # crew that configured otherwise, silently, toward the operator's own memory.
-    #
-    # An unknown crew is REFUSED rather than degraded. Everywhere else an
-    # unresolvable store falls back to the global one, which is the safe
-    # direction; here it is the unsafe one: the caller's whole reason for naming
-    # a crew is to keep this task inside that crew's memory, so quietly running
-    # it against the operator's store is the leak the parameter exists to
-    # prevent. Fail loudly and let the caller pick a real crew.
-    crew = cleaned.get("crew") or ""
-    child_memory_store = ""
-    if crew:
-        from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
+    from kiro_crew.dashboard.handlers._shared import member_request_scope
+    from kiro_crew.execution_context import (
+        ExecutionContext,
+        MemoryStoreRef,
+        derive_execution,
+        read_session_execution,
+    )
 
-        try:
-            _cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        except Exception:
-            return web.json_response(
-                {"error": "cannot read the crew roster", "code": "crew_unresolvable"}, status=503
-            )
-        if crew not in _cfg.agents:
-            return web.json_response(
-                {
-                    "error": f"unknown crew '{crew}'",
-                    "code": "unknown_crew",
-                    "available": ", ".join(sorted(_cfg.agents)) or "(none)",
-                },
-                status=400,
-            )
-        try:
-            _b = await asyncio.to_thread(resolve_agent_bindings, _cfg, crew)
-        except (OSError, ValueError) as exc:
-            return web.json_response({"error": str(exc), "code": "memory_unavailable"}, status=409)
-        child_memory_store = _b.memory_store_name
-        if crew != "default" and not _cfg.agents[crew].triggers.strip():
-            return web.json_response(
-                {
-                    "error": f"Crew Member '{crew}' has not enabled delegated tasks.",
-                    "code": "crew_delegation_disabled",
-                },
-                status=409,
-            )
-        # Keep the member name until provider allocation. An explicit template
-        # overrides this turn only; it does not replace the conversation owner.
-    elif parent_session:
-        from kiro_crew.context import store_of_session
-
-        try:
-            child_memory_store = await asyncio.to_thread(
-                store_of_session, state.conversation_log, parent_session
-            )
-            if parent_session.startswith("subagent:"):
-                child_memory_store = await asyncio.to_thread(
-                    state.subagents._inherited_memory_store,
-                    parent_session.removeprefix("subagent:"),
-                )
-        except (OSError, ValueError) as exc:
-            return web.json_response({"error": str(exc), "code": "memory_unavailable"}, status=409)
-    from kiro_crew.context import require_memory_delegation
-
-    if caller_store is not None and child_memory_store != caller_store:
-        _sel().log_api_access(
-            caller="internal",
-            operation="spawn.create",
-            outcome="denied",
-            source="member_memory",
-            error="The requested delegation changes the member's private memory.",
-        )
+    crew = cleaned.get("target_member") or cleaned.get("crew") or ""
+    if (
+        cleaned.get("target_member")
+        and cleaned.get("crew")
+        and cleaned["target_member"] != cleaned["crew"]
+    ):
         return web.json_response(
-            {
-                "error": "A Crew Member can delegate only within its own private memory.",
-                "code": "memory_unavailable",
-            },
-            status=409,
+            {"error": "Conflicting target members", "code": "invalid_target_member"}, status=400
         )
     try:
-        await asyncio.to_thread(
-            require_memory_delegation,
-            state.conversation_log,
-            parent_session,
-            child_memory_store,
+        caller = await member_request_scope(request)
+        parent_execution = caller.execution
+        if parent_execution is None and parent_session:
+            parent_execution = await asyncio.to_thread(read_session_execution, parent_session)
+        if parent_execution is None:
+            parent_execution = ExecutionContext(
+                None, MemoryStoreRef("default"), "template", agent or "kirocrew"
+            )
+        config = await asyncio.to_thread(KiroCrewConfig.load) if crew else None
+        if crew and config is not None and crew not in config.agents:
+            return web.json_response(
+                {"error": "The target member does not exist.", "code": "unknown_member"},
+                status=404,
+            )
+        if crew and config is not None and not config.agents[crew].triggers.strip():
+            return web.json_response(
+                {
+                    "error": "The target member has not enabled delegated tasks.",
+                    "code": "crew_delegation_disabled",
+                },
+                status=403,
+            )
+        admitted_execution = derive_execution(
+            parent_execution,
+            target_member=crew or None,
+            config=config,
+            requested_mode=admitted_mode,
         )
+        child_memory_store = admitted_execution.store.legacy_name
     except (OSError, ValueError) as exc:
-        return web.json_response({"error": str(exc), "code": "memory_unavailable"}, status=409)
+        return web.json_response(
+            {"error": str(exc), "code": "member_identity_unavailable"}, status=409
+        )
     max_turns = cleaned.get("max_turns") or 0
     cwd = cleaned.get("cwd") or ""
     model = cleaned.get("model") or ""
     reasoning_effort = cleaned.get("reasoning_effort") or ""
+    # SOLO GATE, gateway half. ``solo`` is a transport-layer marker only the
+    # MCP spawn tools send for a one-task call (the SDK and apps never do, so
+    # they are never gated). The tool side already refused a solo call that
+    # named nothing; this half catches the one that named the parent's OWN
+    # agent / model / crew to get past it. Pre-spawn, so never ``counted``.
+    solo = body.get("solo", False)
+    if not isinstance(solo, bool):
+        solo = str(solo).lower() in ("true", "1", "yes")
+    solo_reason = cleaned.get("solo_reason") or ""
+    if solo and not solo_reason:
+        ground = solo_spawn_difference(state, parent_session, agent=agent, model=model, crew=crew)
+        if not ground:
+            _sel().log_api_access(
+                caller="internal",
+                operation="spawn.solo",
+                outcome="denied",
+                source="solo_gate",
+                resources=parent_session,
+                error="names only the parent's own agent/model/crew",
+            )
+            return web.json_response(
+                {"error": solo_spawn_question(), "code": SOLO_SPAWN_REFUSED_CODE},
+                status=400,
+            )
+        # Let through on a difference: audited like the reason arm, with the
+        # ground, so no gate outcome is invisible after the fact.
+        _sel().log_api_access(
+            caller="internal",
+            operation="spawn.solo",
+            outcome="allowed",
+            source="solo_gate",
+            resources=f"{parent_session} differs={ground}",
+        )
+    elif solo:
+        # The reason is the caller's own claim; recording it is what makes a
+        # habit of lone spawns visible after the fact.
+        _sel().log_api_access(
+            caller="internal",
+            operation="spawn.solo",
+            outcome="allowed",
+            source="solo_gate",
+            resources=f"{parent_session} reason={solo_reason}",
+        )
     # Batch/wave identity (transport-layer params from spawn_run MCP, like
     # approval_mode/silent above): validated inline, bounded, never LLM-schema.
     batch_id = str(body.get("batch_id", "") or "")[:32]
@@ -428,6 +443,7 @@ async def api_spawn(request: web.Request) -> web.Response:
         memory_store=child_memory_store,
         crew=crew,
         _memory_mode=admitted_mode,
+        _execution_context=admitted_execution.to_record(),
     )
     if not info:
         # Reached mgr.spawn (submission COUNTED at the top of spawn()) but
@@ -987,8 +1003,13 @@ async def api_spawn_list(request: web.Request) -> web.Response:
     if refusal is not None:
         return refusal
     agents = []
+    caller = request.headers.get("X-Session-Key", "")
     for info in state.subagents.all_agents:
-        if scope is not None and info.memory_store != scope:
+        if (
+            scope is not None
+            and info.parent_session_key != caller
+            and caller != f"subagent:{info.id}"
+        ):
             continue
         entry: dict[str, object] = {
             "id": info.id,
@@ -1061,6 +1082,16 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
             {"error": f"only failed agents can be retried (outcome={old.outcome})"},
             status=409,
         )
+    execution = old.execution_context
+    if execution is None:
+        from kiro_crew.subagent_persistence import read_run_execution
+
+        try:
+            execution = await asyncio.to_thread(read_run_execution, old.id)
+        except (OSError, ValueError) as exc:
+            return web.json_response(
+                {"error": f"memory_unavailable: {exc}", "code": "memory_unavailable"}, status=400
+            )
     # Same validated warm as the primary spawn handler. old.cwd was validated
     # at the ORIGINAL spawn, but the allowlist may have changed since (and a
     # gateway restart leaves the cache cold), so it is re-checked against the
@@ -1090,6 +1121,9 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         # it" -- and a retry is exactly when nobody re-reads the scope.
         memory_store=old.memory_store,
         crew=old.crew,
+        app=execution.app,
+        _memory_mode=execution.memory_mode,
+        _execution_context=execution.to_record(),
     )
     if not info:
         return web.json_response(
@@ -4123,6 +4157,87 @@ async def api_slack_manifest(request: web.Request) -> web.Response:
     )
 
 
+async def api_channel_folder_backfill(request: web.Request) -> web.Response:
+    """POST /api/channel-folders/backfill - file a channel's EXISTING conversations.
+
+    One endpoint for all channels rather than one per channel: the namespace
+    arrives in the body and the work is byte-identical for every one of them, so
+    ten copies would be ten places for the eligibility guard to drift apart.
+
+    Loopback-only, matching the config saves it sits beside. It writes no
+    credential and no config, so that is not inherited reasoning: it bulk-moves
+    conversations with no collective undo, and a remote caller can neither see
+    the sidebar it rearranges nor put anything back.
+
+    Answers 200 with the report even when nothing moved, because "nothing to do"
+    is a normal outcome the panel has to render (and ``reason`` says which kind
+    it was). A 4xx is reserved for a request that was never actionable.
+    """
+    caller = request.get("user", "dashboard")
+
+    def _deny(msg: str, code: str, status: int = 400) -> web.Response:
+        # The ``code`` rides in the dict LITERAL beside the message, which is what
+        # makes the body machine-readable at any status: the panel renders `error`,
+        # while a caller that needs to branch reads `code` rather than matching on
+        # prose that translation or rewording can change under it.
+        _sel().log_api_access(
+            caller=caller,
+            operation="channel.folder.backfill",
+            outcome="denied",
+            source="dashboard",
+            error=msg,
+        )
+        return web.json_response({"error": msg, "code": code}, status=status)
+
+    if not is_direct_local_request(request):
+        # Deliberately NOT the neighbouring panels' wording ("read-only from
+        # remote sessions"). This endpoint's own button says "File existing
+        # sessions", meaning chat conversations, so a refusal that says
+        # "sessions" meaning LOGIN sessions puts one word for two different
+        # things on one card -- a blind reader could not tell which was meant.
+        #
+        # It is also a whole sentence naming the remedy, not a fragment: a
+        # reader who does not already know what "the local machine" is has
+        # nothing to act on, which is a dead end rather than a refusal.
+        # The `code` is unchanged, so nothing machine-readable moves with this.
+        return _deny(
+            "Filing runs only on the computer that hosts this dashboard. "
+            "Open the dashboard there and click again.",
+            "read_only_remote",
+            status=403,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return _deny("invalid JSON", "invalid_json")
+    if not isinstance(body, dict):
+        return _deny("body must be an object", "invalid_body")
+    raw_namespace = body.get("namespace")
+    if not isinstance(raw_namespace, str):
+        return _deny("namespace must be text", "namespace_invalid")
+    namespace = raw_namespace.strip().lower()
+    # Closed set, checked here rather than left to the config read: the namespace
+    # selects a config section and stamps a folder, and an unrecognised one must
+    # be a refusal the caller can see, not a silently empty pass.
+    if namespace not in CHANNEL_CONFIG_SECTIONS:
+        return _deny("unknown channel", "unknown_channel")
+    state = request.app.get("state")
+    if state is None:
+        return _deny("dashboard state unavailable", "state_unavailable", status=503)
+
+    report = await backfill_channel_folder(state, namespace)
+    _sel().log_api_access(
+        caller=caller,
+        operation="channel.folder.backfill",
+        outcome="ok",
+        source="dashboard",
+        # The count, not the keys: a session key names a channel conversation and
+        # the audit log is not the place to enumerate which ones a user filed.
+        resources=f"{namespace}:{len(report['moved'])}",
+    )
+    return web.json_response(report)
+
+
 async def api_slack_config_get(request: web.Request) -> web.Response:
     """GET /api/slack/config — read Slack config + masked secret status."""
     from kiro_crew.config.loader import (  # noqa: F811
@@ -6301,13 +6416,10 @@ async def api_imessage_config_get(request: web.Request) -> web.Response:
 
 async def api_imessage_config_save(request: web.Request) -> web.Response:
     """PUT /api/imessage/config — persist the iMessage config (config.json)."""
-    # `_atomic_json_write` stays function-local, and NOT for the rule's
-    # circular-import reason -- there is no cycle here (verified by importing
-    # both orders). It is imported this way at seven sites in this module, six of
-    # them pre-existing, so hoisting only this one would turn those six into F811
-    # redefinitions of a module-scope name and drag six unrelated call sites into
-    # this PR. Hoisting all seven belongs in its own change.
-    from kiro_crew.agent import _atomic_json_write  # noqa: F811
+    from kiro_crew.config.loader import (  # noqa: F811
+        ConfigReadError,
+        update_config_locked,
+    )
 
     caller = request.get("user", "dashboard")
 
@@ -6389,57 +6501,79 @@ async def api_imessage_config_save(request: web.Request) -> web.Response:
     # under the repo-wide config lock (read fresh, merge only the imessage
     # section, write atomic), so a concurrent save by another settings handler
     # is never overwritten by a stale snapshot taken before the lock.
+    #
+    # Through ``update_config_locked``, not ``_atomic_json_write``: it holds an
+    # advisory lock on the sidecar ``<path>.lock`` for the entire read-modify-write,
+    # so a concurrent ``kirocrew config set`` in ANOTHER PROCESS cannot land between
+    # our read and our write. ``_get_config_lock()`` serializes writers inside this
+    # process only, and loader.py names that combination the required path for a
+    # config.json mutation.
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
     applied: list[str] = []
     async with _get_config_lock():
         path = config_path()
+        session_folder = ""
+
+        def _apply_staged(fresh: dict) -> dict | None:
+            """Merge the staged iMessage fields into the config read inside the lock.
+
+            Returns ``None`` when nothing changed, which tells
+            ``update_config_locked`` to skip the write -- preserving the previous
+            behaviour of not touching config.json on a no-op save.
+            """
+            nonlocal applied, session_folder
+            if not isinstance(fresh.get("imessage"), dict):
+                fresh["imessage"] = {}
+            imessage_cfg = fresh["imessage"]
+
+            # Reduce staged fields to actual changes against the fresh read so
+            # restart_required stays truthful on no-op saves.
+            changes: dict[str, object] = {}
+            if "enabled" in staged and staged["enabled"] != bool(
+                imessage_cfg.get("enabled", False)
+            ):
+                changes["enabled"] = staged["enabled"]
+            if "allowed_handles" in staged and staged["allowed_handles"] != imessage_cfg.get(
+                "allowed_handles", []
+            ):
+                changes["allowed_handles"] = staged["allowed_handles"]
+            for key, default in (("service", "imessage"), ("db_path", "")):
+                if key in staged and staged[key] != str(imessage_cfg.get(key, default) or default):
+                    changes[key] = staged[key]
+            if "session_folder" in staged and staged["session_folder"] != str(
+                imessage_cfg.get("session_folder", "") or ""
+            ):
+                changes["session_folder"] = staged["session_folder"]
+            applied = list(changes.keys())
+
+            imessage_cfg.update(changes)
+            # Read AFTER the merge and inside the lock: the folder below must be
+            # created for the value that was actually committed, not for a
+            # pre-merge snapshot.
+            session_folder = str(imessage_cfg.get("session_folder", "") or "")
+            return fresh if changes else None
+
+        # Shield + drain so a cancellation arriving mid-write cannot
+        # release the config lock while the worker thread is still
+        # replacing the file (interleaved-write race).
+        _cfg_write_task_im: asyncio.Task[dict] = asyncio.ensure_future(
+            asyncio.to_thread(functools.partial(update_config_locked, path, mutate=_apply_staged))
+        )
         try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except Exception:
+            await asyncio.shield(_cfg_write_task_im)
+        except asyncio.CancelledError:
+            await asyncio.gather(_cfg_write_task_im, return_exceptions=True)
+            raise
+        except ConfigReadError:
             message = "config.json is corrupt"
             _audit_denial(message)
             return web.json_response({"error": message, "code": "config_corrupt"}, status=500)
-        if not isinstance(data.get("imessage"), dict):
-            data["imessage"] = {}
-        imessage_cfg = data["imessage"]
-
-        # Reduce staged fields to actual changes against the fresh read so
-        # restart_required stays truthful on no-op saves.
-        changes: dict[str, object] = {}
-        if "enabled" in staged and staged["enabled"] != bool(imessage_cfg.get("enabled", False)):
-            changes["enabled"] = staged["enabled"]
-        if "allowed_handles" in staged and staged["allowed_handles"] != imessage_cfg.get(
-            "allowed_handles", []
-        ):
-            changes["allowed_handles"] = staged["allowed_handles"]
-        for key, default in (("service", "imessage"), ("db_path", "")):
-            if key in staged and staged[key] != str(imessage_cfg.get(key, default) or default):
-                changes[key] = staged[key]
-        if "session_folder" in staged and staged["session_folder"] != str(
-            imessage_cfg.get("session_folder", "") or ""
-        ):
-            changes["session_folder"] = staged["session_folder"]
-        applied = list(changes.keys())
-
-        if changes:
-            imessage_cfg.update(changes)
-            # Shield + drain so a cancellation arriving mid-write cannot
-            # release the config lock while the worker thread is still
-            # replacing the file (interleaved-write race).
-            _cfg_write_task_im: asyncio.Task[None] = asyncio.ensure_future(
-                asyncio.to_thread(_atomic_json_write, path, data)
-            )
-            try:
-                await asyncio.shield(_cfg_write_task_im)
-            except asyncio.CancelledError:
-                await asyncio.gather(_cfg_write_task_im, return_exceptions=True)
-                raise
 
         # Create the configured session folder now, on this user-initiated save,
         # so the reconcile path never has to write the folder store. Best-effort:
         # a failure leaves conversations unfiled until the next save.
-        _folder_name = stored_folder_name(imessage_cfg.get("session_folder"))
+        _folder_name = stored_folder_name(session_folder)
         if _folder_name:
             _state = request.app.get("state")
             if _state is not None:
@@ -6447,7 +6581,7 @@ async def api_imessage_config_save(request: web.Request) -> web.Response:
                     _state,
                     "imessage",
                     _folder_name,
-                    relabel="session_folder" in changes,
+                    relabel="session_folder" in applied,
                 )
 
     _sel().log_api_access(

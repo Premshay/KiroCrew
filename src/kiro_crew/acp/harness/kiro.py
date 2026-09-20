@@ -107,7 +107,7 @@ class KiroHarness(MembershipHarness):
             raise AcpRuntimeError(str(exc)) from exc
 
         overlap = await asyncio.to_thread(
-            sandbox_mod.delegated_workspace_exposes_agents_dir, ctx.work_dir
+            sandbox_mod.delegated_workspace_exposes_sealed_target, ctx.work_dir
         )
         if overlap:
             raise AcpRuntimeError(overlap)
@@ -119,7 +119,7 @@ class KiroHarness(MembershipHarness):
             # boundaries, and an agent config may pin one of its own.
             argv += ["--model", ctx.model]
         native_documents: tuple[tuple[str, str], ...] = ()
-        if ctx.private_memory:
+        if ctx.member_context:
             from kiro_crew.member_essential_context import kiro_launch_documents
 
             native_documents = tuple(

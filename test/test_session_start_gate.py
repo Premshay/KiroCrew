@@ -31,6 +31,11 @@ pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
 # ── harness ───────────────────────────────────────────────────────────────────
 
+# Upper bound for a wait that is otherwise pinned to a real signal. It exists so
+# a genuine hang fails as this test rather than as pytest's own --timeout; it is
+# never the thing a passing run measures.
+_SETTLE_BACKSTOP = 30.0
+
 
 @pytest.fixture(autouse=True)
 def _fast_paths(monkeypatch):
@@ -131,6 +136,27 @@ async def _gate() -> SessionStartGate:
     return await runtime_mod.session_start_gate()
 
 
+class _SteppedClock:
+    """``time`` stand-in whose ``monotonic`` only moves when the test says so.
+
+    Every other attribute is the real module's. asyncio keeps its own import
+    of ``time``, so the loop's timers are untouched.
+    """
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self._now = 1000.0
+
+    def monotonic(self) -> float:
+        return self._now
+
+    def advance(self, secs: float) -> None:
+        self._now += secs
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
 # ── the gate ──────────────────────────────────────────────────────────────────
 
 
@@ -186,6 +212,10 @@ async def test_gate_exit_callback_reports_queue_wait_not_start_time(monkeypatch)
         return {}
 
     monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+    # The gate reads ``time.monotonic`` through the runtime module; hand it a
+    # clock the test advances, so the wait it reports is the hold the test
+    # chose, not what a runner's sleep happened to deliver.
+    monkeypatch.setattr(runtime_mod, "time", _SteppedClock(runtime_mod.time))
     gate = await _gate()
     # Fill the gate so the observed start has to queue.
     permits = [await gate.acquire() for _ in range(gate.limit)]
@@ -195,12 +225,13 @@ async def test_gate_exit_callback_reports_queue_wait_not_start_time(monkeypatch)
     for _ in range(10):
         await asyncio.sleep(0)
     assert waits == [], "callback must not fire while queued"
-    await asyncio.sleep(0.02)
+    runtime_mod.time.advance(0.02)  # the start sits queued for 20ms
     for p in permits:
         p.release()
     release.set()
     await observed
-    assert len(waits) == 1 and waits[0] >= 15.0, waits  # ms; at least the 20ms we held it
+    assert len(waits) == 1, waits
+    assert waits[0] == pytest.approx(20.0), waits  # ms: exactly the hold
 
 
 # ── the collector ─────────────────────────────────────────────────────────────
@@ -244,16 +275,30 @@ async def test_timeout_then_late_response_is_adopted(backend):
             _feed(reader, {"id": req_id, "result": {"sessionId": "late-sid"}})
             # KAS activates the injected agent with set_mode after session/new;
             # answer whatever control-plane request the tail issues.
-            deadline = asyncio.get_event_loop().time() + 2.0
             answered: set[int] = set()
-            while not collector.settled.is_set():
-                if asyncio.get_event_loop().time() > deadline:
-                    raise AssertionError("collector never settled")
-                for rid in list(rt._pending_requests):
-                    if rid != req_id and rid not in answered:
-                        answered.add(rid)
-                        _feed(reader, {"id": rid, "result": {}})
-                await asyncio.sleep(0)
+
+            async def _answer_control_plane() -> None:
+                while not collector.settled.is_set():
+                    for rid in list(rt._pending_requests):
+                        if rid != req_id and rid not in answered:
+                            answered.add(rid)
+                            _feed(reader, {"id": rid, "result": {}})
+                    await asyncio.sleep(0)
+
+            # The settle is awaited on the collector's own signal, not measured
+            # against a wall-clock budget: a loaded runner can spend seconds
+            # inside a handful of loop passes, and a deadline here reads that as
+            # a hang. ``_SETTLE_BACKSTOP`` only keeps a genuine hang from
+            # running to pytest's own --timeout.
+            responder = asyncio.ensure_future(_answer_control_plane())
+            try:
+                await asyncio.wait_for(collector.settled.wait(), timeout=_SETTLE_BACKSTOP)
+            finally:
+                responder.cancel()
+                try:
+                    await responder
+                except asyncio.CancelledError:
+                    pass
             term.assert_not_awaited()
         assert collector.outcome == START_OUTCOME_ADOPTED
         assert [h.session_id for h in adopted] == ["late-sid"]
@@ -392,7 +437,8 @@ async def test_two_live_collectors_do_not_claim_each_others_frames():
 
 
 @pytest.mark.asyncio
-async def test_timeout_then_late_response_without_adopter_is_torn_down():
+@pytest.mark.parametrize("memory_mode", ["persistent", "incognito", "temporary"])
+async def test_timeout_then_late_response_without_adopter_is_torn_down(memory_mode):
     """No adopter registered: the late session is closed through the runtime's
     per-session teardown -- never by killing the shared runtime -- and the gate
     is released exactly once."""
@@ -401,16 +447,21 @@ async def test_timeout_then_late_response_without_adopter_is_torn_down():
     gate = await _gate()
     try:
         with pytest.raises(AcpSessionStartTimeout) as ei:
-            await rt.create_session(cwd="/w", mcp_servers=[])
+            await rt.create_session(cwd="/w", mcp_servers=[], memory_mode=memory_mode)
         collector = ei.value.collector
         with (
             patch.object(rt, "terminate_session", AsyncMock()) as term,
             patch.object(rt, "kill", AsyncMock()) as kill,
+            patch.object(runtime_mod.AcpSessionHandle, "cleanup_transcript_files") as cleanup,
         ):
             _feed(reader, {"id": collector.req_id, "result": {"sessionId": "late-sid"}})
             await asyncio.wait_for(collector.settled.wait(), timeout=2.0)
             term.assert_awaited_once_with("late-sid")
             kill.assert_not_awaited()
+            if memory_mode == "persistent":
+                cleanup.assert_not_called()
+            else:
+                cleanup.assert_called_once_with("late-sid")
         assert collector.outcome == START_OUTCOME_TORN_DOWN
         assert not rt._dead
         assert gate.releases == 1 and gate.active == 0

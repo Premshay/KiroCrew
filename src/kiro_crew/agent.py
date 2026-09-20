@@ -45,6 +45,7 @@ from typing import Any, Iterator, Literal, MutableMapping, NamedTuple
 
 from kiro_crew import agent_state, platform_compat
 from kiro_crew.agent_discovery import (
+    _declared_project_agent_name,
     _read_agent_spec,
     project_agent_files,
     project_agent_name,
@@ -102,7 +103,7 @@ from kiro_crew.env import (
     sanitize_spec_env,
     spec_path_key,
 )
-from kiro_crew.mcp_cleanup import purge_deleted_proxy_from_config
+from kiro_crew.mcp_cleanup import prune_dangling_tool_refs, purge_deleted_proxy_from_config
 from kiro_crew.mcp_provenance import (
     DERIVED_KEY,
     command_is_ours,
@@ -261,11 +262,48 @@ def agents_spec_lock(agents_dir: Path) -> Iterator[None]:
     (not the spec's own fd) for the same reason update_config_locked uses one:
     atomic replace swaps the inode, so a lock on the spec fd would not
     serialize across the rename.
+
+    Both failure modes are REPORTED here before they propagate, because several
+    callers catch this as best-effort work at ``logger.debug``. Without a report
+    at a level an operator sees, a gateway that skipped its agent-spec install
+    reads in the log exactly like one that completed it. An unwritable lock path
+    (a read-only ``~/.kiro/agents`` mount) refuses at ``os.open``, before any lock
+    is attempted; ``platform_compat.file_lock`` bounds the acquire itself.
     """
     lock_path = agents_dir / ".kirocrew-agents.lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        with platform_compat.file_lock(fd, exclusive=True, wait=True):
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        # Naming the path AND the errno is the point: "Read-only file system" on
+        # this specific path is what tells the operator to move KIRO_HOME, and it
+        # is not something retrying can recover.
+        logger.warning(
+            "cannot open the agent-spec lock %s (%s) — agent-spec writes cannot be "
+            "serialized, so this install is being skipped; point KIRO_HOME at a "
+            "writable directory if the filesystem is read-only",
+            lock_path,
+            exc.strerror or exc,
+        )
+        raise
+    try:
+        with contextlib.ExitStack() as stack:
+            # ``enter_context`` rather than a ``with`` around the yield, so this
+            # ``except`` covers the ACQUIRE ALONE. A caller-body OSError (an
+            # atomic spec write hitting ENOSPC, an unlink hitting EACCES) reaches
+            # the same handler if the yield sits inside it, and would then be
+            # logged as a lock problem -- sending an operator after a stuck holder
+            # while the real fault is the disk or the permission.
+            try:
+                stack.enter_context(platform_compat.file_lock(fd, exclusive=True, wait=True))
+            except OSError as exc:
+                # The bounded-acquire refusal. A stuck holder calls for a
+                # DIFFERENT operator action (find the process still holding it)
+                # than an unwritable path, so it must not be reported with the
+                # same remedy as above. BlockingIOError is a caller's own
+                # non-waiting choice, not a fault to report.
+                if not isinstance(exc, BlockingIOError):
+                    logger.warning("agent-spec lock %s: %s", lock_path, exc)
+                raise
             yield
     finally:
         os.close(fd)
@@ -916,7 +954,7 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     MCP server (``kirocrew-cron`` / ``kirocrew-core``).
 
     Prefers a standalone ``kirocrew`` binary when one resolves. Falls back
-    to ``<interpreter> -m kiro_crew <subcommand>`` when
+    to ``<interpreter> [-s] -m kiro_crew <subcommand>`` when
     :func:`_resolve_kirocrew_bin` cannot find a usable standalone binary --
     e.g. an install whose launcher is not on the service PATH (the gateway
     running as a systemd user service is the common case): there
@@ -943,7 +981,8 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     """
     bin_path = _resolve_kirocrew_bin()
     if bin_path == "kirocrew":  # unresolved sentinel from _resolve_kirocrew_bin
-        return sys.executable, ["-m", "kiro_crew", subcommand]
+        argv = platform_compat.isolated_python_argv("-m", "kiro_crew", subcommand)
+        return argv[0], argv[1:]
     if bin_path.endswith(".cmd"):
         interpreter = Path(bin_path).parent.parent / "python.exe"
         if _interpreter_runnable(interpreter):
@@ -956,8 +995,12 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
             # generic ``sys.executable`` fallbacks below and above stay
             # ``-P``-free because the project still supports Python 3.10,
             # which lacks the flag.
-            return str(interpreter), ["-P", "-s", "-m", "kiro_crew", subcommand]
-        return sys.executable, ["-m", "kiro_crew", subcommand]
+            argv = platform_compat.isolated_python_argv(
+                "-P", "-s", "-m", "kiro_crew", subcommand, executable=interpreter
+            )
+            return argv[0], argv[1:]
+        argv = platform_compat.isolated_python_argv("-m", "kiro_crew", subcommand)
+        return argv[0], argv[1:]
     return bin_path, [subcommand]
 
 
@@ -1194,6 +1237,25 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
     # governance ceiling on the way in.
     "kirocrew-work": {
         "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-work"),
+        "opt_in": True,
+    },
+    # Read-only reads over the crew log (list the logs, page one, read a fold).
+    # ``opt_in`` for the same reason as the two above: the crew log is an optional
+    # subsystem behind a flag, and for a session that is not verifying or auditing
+    # it the only reachable answer is ``crew_log_disabled`` or its own unit -- so
+    # both spec-writing loops skip it and a session that never references the
+    # server spends no context on three schemas it has no use for. An agent that
+    # should read the log is granted the set in its own spec.
+    #
+    # No ``autoApprove`` key, and none may ever be added -- the same prohibition
+    # the three servers above carry, for the same mechanism: kiro-cli approves an
+    # autoApproved MCP tool locally and emits no permission request, so
+    # ``hooks.on_tool_call`` (the always-on deny floor, the sensitive-path check,
+    # the governance ceiling) is NEVER reached for it. These tools read a record
+    # that carries the session's own message bodies; that is not the place to
+    # break it.
+    "kirocrew-crew-log": {
+        "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-crew-log"),
         "opt_in": True,
     },
 }
@@ -1800,7 +1862,7 @@ def _sel_hook_rejected(event: str, command: str, reason: str) -> None:
                 source="cli",
                 operation="kiro_hooks_rejected",
                 outcome="rejected",
-                resources=redact(f"event={event} command={command[:200]}"),
+                resources=redact(f"event={event} command={redact(command)[:200]}"),
                 error=reason,
             )
         )
@@ -3225,6 +3287,20 @@ def _apply_connection_tool_aliases(
     return target
 
 
+def _is_alias_family(key: str, base: str) -> bool:
+    """True if ``key`` is ``base`` or a ``base-<n>`` numeric-suffixed sibling.
+
+    ``mcp_server_alias`` is many-to-one, so :func:`_normalize_mcp_server_keys`
+    gives the loser of a collision the lowest free ``base-<n>`` rather than
+    dropping a distinct server. One base alias therefore stands for a FAMILY of
+    concrete keys, and anything reasoning about a server's identity from its base
+    alias has to include the suffixed siblings or it misses exactly the keys the
+    collision minted. Module level so the emitter and the ownership reconcile
+    cannot drift to two spellings of this rule.
+    """
+    return key == base or (key.startswith(f"{base}-") and key[len(base) + 1 :].isdigit())
+
+
 def _normalize_mcp_server_keys(config: dict) -> None:
     """Rewrite any slash-containing ``mcpServers`` key to its slash-free alias.
 
@@ -3253,7 +3329,7 @@ def _normalize_mcp_server_keys(config: dict) -> None:
 
     def _is_family(key: str, base: str) -> bool:
         """True if ``key`` is ``base`` or a ``base-<n>`` numeric-suffixed sibling."""
-        return key == base or (key.startswith(f"{base}-") and key[len(base) + 1 :].isdigit())
+        return _is_alias_family(key, base)
 
     def _rewrite_ref(old_ref: str, new_ref: str) -> None:
         for key in ("tools", "allowedTools"):
@@ -4246,6 +4322,175 @@ def _apply_operator_oauth_client(name: str, entry: dict, *, managed: bool) -> di
     return apply_preregistered_oauth_client(entry, resolved)
 
 
+class _AppOwnership(NamedTuple):
+    """What the app manifests claim, and whether this read saw every claim."""
+
+    #: Base alias -> whether every app claiming it is switched on.
+    owned: dict[str, bool]
+    #: False when ANY app's claim went unread -- an unreadable manifest, an
+    #: unreadable enablement, a record ``list_apps`` skipped. An alias missing from
+    #: ``owned`` then carries no information, so it cannot be read either as "no app
+    #: owns this name" or as positive removal.
+    fully_read: bool
+
+
+def _app_owned_mcp_keys() -> _AppOwnership:
+    """Every ALIAS an INSTALLED app declares mapped to its enablement, and whether that is complete.
+
+    Read from the manifests that mint the keys, because a colon prefix is not
+    ownership. ``mcp_server_alias`` returns a slash-free name unchanged, so a
+    global ``mcp.json`` server keyed ``npm:foo`` reaches the agent config with its
+    colon intact, and an installed app may also be called ``npm`` without ever
+    declaring a server called ``foo``. Attributing by prefix hands that unrelated
+    server the app's enablement answer.
+
+    Keyed by the ALIAS of the composite, because that is the identity the emitted
+    ``@ref`` carries and the one a candidate is spelled with. A manifest may
+    declare a slashed name -- the npm-scoped ``@playwright/mcp``, or the registry
+    ``namespace/name`` form -- and ``{app}:@playwright/mcp`` then reaches the
+    config as ``playwright-mcp``. A raw composite key matches no candidate at all,
+    so the owner of exactly the names that NEED aliasing would read as unowned.
+
+    Each key is a base alias standing for the whole :func:`_is_alias_family`, and
+    a colliding pair collapses to one entry whose value is the AND of their
+    enablements. The concrete ``base-<n>`` a collision mints is assigned against
+    the live server map, so it cannot be reproduced from manifests here; reading
+    the family with the conservative answer covers the sibling without guessing
+    which claimant it came from.
+
+    Covers DISABLED apps deliberately: "an app owns this name and is switched off"
+    is the case whose grant must not linger on the name, and a collection that
+    stops at enabled apps cannot see it. The manifest is the right reader here
+    even though :func:`_collect_app_mcp_servers` prefers the live registered map
+    for the SPEC, because this needs only the names and a disabled app has no live
+    registration to read.
+
+    ``fully_read`` is False whenever ANY claim went unread: an unreadable manifest,
+    an unreadable enablement, or a record ``list_apps`` skipped. None of those is the
+    answer "no app owns this name". A previous rebuild wrote that app's server into
+    the rendered config and :func:`_load_existing_config` carries the entry forward,
+    so the name still holds a grant after its owner stops being readable.
+    ``get_app_manifest`` returns None for an absent file, a parse failure and a
+    permission error alike, and ``list_apps`` drops an app whose installed record
+    does not read without raising, so these are the ORDINARY shapes of the failure
+    rather than exotic ones.
+
+    Enablement is read through :func:`app_enabled_state`, not
+    :func:`is_app_enabled`. That function exists to keep "unreadable" apart from
+    "switched off", and this caller needs them apart for the reason its docstring
+    gives: the two are indistinguishable in ``is_app_enabled``'s single False, and
+    acting on the wrong one here revokes a grant that nothing re-derives.
+
+    Never raises.
+    """
+    owned: dict[str, bool] = {}
+    fully_read = True
+    try:
+        # Imported lazily for the reason _collect_app_mcp_servers documents:
+        # kiro_crew.apps imports back into agent/security, so a module-level
+        # import here would close a cycle.
+        from kiro_crew.apps.manager import (
+            INSTALLED_META_FILENAME,
+            app_enabled_state,
+            apps_dir,
+            get_app_manifest,
+            list_apps,
+        )
+    except Exception:  # noqa: BLE001 — apps subsystem unavailable
+        return _AppOwnership(owned, False)
+    try:
+        apps = list_apps()
+    except Exception:  # noqa: BLE001 — an unreadable registry claims nothing KNOWABLE
+        return _AppOwnership(owned, False)
+    _named = {app.get("name") for app in apps if isinstance(app, dict)}
+    try:
+        # ``list_apps`` drops an app whose installed record does not read, and
+        # drops it SILENTLY rather than raising, so the returned list on its own
+        # cannot separate "no such app" from "that app's claim went missing". A
+        # directory still holding the record file it reads, under a name the list
+        # does not carry, is the second case.
+        #
+        # Presence is judged WITHOUT resolving the path. ``Path.exists`` follows a
+        # symlink, so a dangling ``installed.json`` link reads absent while
+        # ``list_apps`` still drops that app for failing to read it -- and the two
+        # answers together say "no such app" about an app that is on disk.
+        # ``is_symlink`` does not close it either: it is False for a Windows
+        # directory junction, so a dangling junction stays invisible to every
+        # predicate that resolves its target. Anything uninspectable counts as
+        # present, the same fail-to-unknown direction :func:`_absence_is_genuine`
+        # takes in ``apps.manager``.
+        def _occupied(_p: Path) -> bool:
+            try:
+                return _p.exists() or _p.is_symlink() or platform_compat.is_link_or_junction(_p)
+            except OSError:
+                return True
+
+        # ``list_apps`` skips a root entry that is not a readable DIRECTORY, so the
+        # same blindness exists one level up: an app root replaced by a dangling
+        # junction is not a dir, is not listed, and its record is unreachable, so
+        # the app would read as absent. A link-ish or uninspectable entry therefore
+        # counts as an unread claim on its own.
+        #
+        # An entry that inspects cleanly as a plain FILE is deliberately NOT counted.
+        # It cannot be told apart from an ordinary non-app file in this directory,
+        # and treating every such file as an unread claim would leave ownership
+        # permanently incomplete -- which narrows the exemption for every unclaimed
+        # name on every rebuild. An app root overwritten by a plain file is the
+        # residue that leaves.
+        def _entry_hides_a_claim(_e: Path) -> bool:
+            try:
+                if _e.is_dir():
+                    return _occupied(_e / INSTALLED_META_FILENAME)
+                return _e.is_symlink() or platform_compat.is_link_or_junction(_e)
+            except OSError:
+                return True
+
+        _root = apps_dir()
+        _skipped = _root.is_dir() and any(
+            _e.name not in _named and _entry_hides_a_claim(_e) for _e in _root.iterdir()
+        )
+    except Exception:  # noqa: BLE001 — an unreadable root cannot vouch for the list
+        _skipped = True
+    if _skipped:
+        fully_read = False
+    for app in apps:
+        name = app.get("name") if isinstance(app, dict) else None
+        if not name:
+            # The keys are minted FROM the name, so a nameless row owns no
+            # addressable key and its silence costs nothing. Deliberately not an
+            # unreadable claim: flagging it would let one malformed row narrow
+            # every rebuild's exemption, for no name it could ever have held.
+            continue
+        try:
+            _state = app_enabled_state(name)
+        except Exception:  # noqa: BLE001 — an unreadable switch is not a switch-off
+            _state = None
+        if _state is None:
+            # None is "could not read", NOT "disabled": the two are exactly what
+            # app_enabled_state was written to keep apart. Its claim is unread, so
+            # it names no owner here rather than naming a switched-off one.
+            fully_read = False
+            continue
+        enabled = _state
+        try:
+            manifest = get_app_manifest(name)
+        except Exception:  # noqa: BLE001 — same answer as the None return below
+            manifest = None
+        if manifest is None:
+            fully_read = False
+            continue
+        for server_name in manifest.mcpServers or {}:
+            _alias = mcp_server_alias(f"{name}:{server_name}")
+            # AND the answers on a collision. The alias is many-to-one and
+            # _normalize_mcp_server_keys hands the loser a `base-<n>` sibling, so
+            # one base can stand for several declared servers, across one app or
+            # two. The sibling carries no record of WHICH claimant minted it, so
+            # the family is treated as switched on only while every app claiming
+            # the base is -- the direction that denies rather than grants.
+            owned[_alias] = enabled and owned.get(_alias, True)
+    return _AppOwnership(owned, fully_read)
+
+
 def rebuild_agent_config(
     *, clean: bool = False, refresh_forks: bool | Literal["defer"] = True
 ) -> Path:
@@ -4289,6 +4534,14 @@ def rebuild_agent_config(
     # withhold audit near the end describe the SAME decision (see
     # _gated_off_servers).
     gated_off = _gated_off_servers()
+
+    # App MCP-key ownership as it stands BEFORE any of this rebuild's work, so a
+    # key whose app is uninstalled while the rebuild runs is still known to have
+    # been app-owned. The reconcile at the end reads ownership again and requires
+    # a POSITIVE enablement answer for any key either read claims: an app that
+    # vanished answers nothing, and defaulting that to "exempt" would leave its
+    # auto-approve grant on the name for whatever is bound there next.
+    _app_owned_at_start, _ownership_full_at_start = _app_owned_mcp_keys()
 
     if not clean and path.exists():
         # Existing config — preserve user customizations, only refresh
@@ -4448,6 +4701,13 @@ def rebuild_agent_config(
         return shutil.which(cmd, path=_search), _search
 
     valid_servers: dict[str, Any] = {}
+    # Servers this pass declines to emit ONLY because a declared command did not
+    # resolve here. The ref reconcile at the end exempts exactly these: the
+    # absence is one a later pass reverses, and an existing config never re-adds
+    # a template ref. Every other way a declared server fails to be emitted --
+    # no command at all, a spec that is not a dict -- is a real absence whose
+    # refs must go, so it is kept out of this set.
+    _unresolved_this_pass: set[str] = set()
     # URL servers whose operator OAuth client is bound at write time, by name ->
     # whether the store owns the entry (see `_apply_operator_oauth_client`).
     _oauth_client_targets: dict[str, bool] = {}
@@ -4712,8 +4972,19 @@ def rebuild_agent_config(
         elif not had_any_command:
             # No candidate defined a command at all — distinct from a command
             # that was defined but couldn't be resolved.
+            #
+            # Deliberately NOT added to _unresolved_this_pass: there is nothing
+            # here for a later pass to resolve, so the ref reconcile below treats
+            # this as a real absence and drops the refs. Keeping them would leave
+            # an allowedTools grant sitting on a name that any later server can
+            # be bound to, and that list never reaches the PreToolUse gate.
             logger.warning("Dropping MCP server %r: no command", name)
         else:
+            # A command WAS declared and did not resolve here, which a later pass
+            # can reverse once the binary is installed -- so the ref reconcile
+            # below keeps this server's refs (see prune_dangling_tool_refs for why
+            # a per-tool grant cannot be re-derived).
+            _unresolved_this_pass.add(name)
             # The searched directories belong in the WARNING, not only at DEBUG:
             # a default-level reader is exactly who needs to tell "installed
             # somewhere this path does not cover" from "not installed at all".
@@ -4730,6 +5001,19 @@ def rebuild_agent_config(
                 MCP_PATH_HINT,
             )
             logger.debug("MCP %r resolution failed; tried %s", name, "; ".join(tried))
+    # The names THIS pass declines to emit because a declared command did not
+    # resolve, alias-spelled because that is the identity an emitted @ref carries
+    # (the alias rewrite runs just below). Handed to the dangling-ref reconcile at
+    # the end so a server that merely failed to resolve THIS time keeps its refs
+    # -- see prune_dangling_tool_refs for why a per-tool grant cannot be
+    # re-derived.
+    #
+    # Built from that one branch, NEVER from "declared but not in the final map":
+    # a commandless stub has nothing to resolve later, and a server that resolved
+    # here and is removed further down -- the locked app reconcile deletes an app
+    # entry once it cannot confirm that app is enabled -- is a real removal. Both
+    # would otherwise keep exactly the ref this reconcile exists to drop.
+    _narrowed_away = {mcp_server_alias(_n) for _n in _unresolved_this_pass}
     config["mcpServers"] = valid_servers
 
     # Rewrite slash-containing server keys to kiro-safe aliases (also migrates
@@ -5042,6 +5326,188 @@ def rebuild_agent_config(
                     servers_map[_oauth_name] = _apply_operator_oauth_client(
                         _oauth_name, _entry, managed=_managed
                     )
+        # Reconcile the ref lists against the FINAL server map, at the one funnel
+        # every write goes through. Placed here because the map is only final now:
+        # the resolution pass narrowed it by omission far above, and the locked app
+        # re-merge just above DELETES app entries whose app is not confirmed
+        # enabled -- neither touches `tools`/`allowedTools`. Before
+        # _seed_kas_permissions, for the same reason that call documents: it reads
+        # `allowedTools` to build the KAS policy, so a policy seeded before this
+        # would describe refs this then removes.
+        #
+        # Both exempt sets are absences this rebuild EXPECTS and a later one
+        # reverses, so neither is a leftover: a server whose declared command did
+        # not resolve on this pass, and a gated-off shipped server whose entry is
+        # withheld while "its tools ref is retained" by the decision the withhold
+        # audit above records. Dropping either would be unrecoverable on an
+        # existing config, which deliberately never re-adds a template ref.
+        #
+        # A commandless declaration and a server deleted by the locked app
+        # reconcile are in NEITHER set: nothing reverses those, so their refs go.
+        #
+        # An app-scoped name survives in the exempt set only while its app is
+        # still enabled. A server can fail to resolve here AND have its app
+        # switched off, and then the unresolved exemption would keep a grant for a
+        # name whose owner is not coming back to re-add the entry. Ownership comes
+        # from the manifests that MINT these keys, never from the presence of a
+        # colon: a global mcp.json server keyed `npm:foo` keeps its colon through
+        # the copy, and an app called `npm` that declares no `foo` does not own it.
+        #
+        # A key EITHER read claims needs a positive enablement answer here. An app
+        # uninstalled mid-rebuild has left both list_apps and its manifest, so a
+        # late read alone cannot tell "its app is gone" from "no app ever owned
+        # this", and the second of those is the permissive answer. The snapshot
+        # taken before this rebuild's work is what keeps the difference readable.
+        _app_owned_now, _ownership_full_now = _app_owned_mcp_keys()
+        _ever_app_owned = set(_app_owned_at_start) | set(_app_owned_now)
+        # An app claim that could not be READ is not a claim of nothing. The
+        # rendered config carries a prior rebuild's app entry forward, so the name
+        # still holds a grant after the manifest stops being readable, and the
+        # "nobody owns this" branch would hand it the permissive answer on the one
+        # list that never reaches the PreToolUse gate.
+        #
+        # Narrowed to what no readable source vouches for. ``gated_off`` comes from
+        # the managed table and the three scopes from files this rebuild read, so an
+        # app read coming back blind cannot make any of them app-owned. Their
+        # exemption must not narrow with it: dropping a gated-off server's ref
+        # UNMOUNTS it for good, because an existing config never re-adds a template
+        # ref once the gate reopens. What is left is an entry only the carried-over
+        # config still declares -- exactly the grant with no owner to re-add it.
+        _gated_aliases = {mcp_server_alias(_n) for _n in gated_off}
+        _vouched_sources = {
+            mcp_server_alias(_n)
+            for scope in (extra_shared_mcp, shared_mcp, kirocrew_mcp)
+            for _n in scope
+        }
+        _vouched = _gated_aliases | _vouched_sources
+        # Matched by alias FAMILY, not equality. The ownership map is keyed by the
+        # base alias a manifest mints, while the config can hold the suffixed
+        # sibling, and an equality test reads that sibling as owned by nobody --
+        # leaving its auto-approval on the name once its app is switched off. Which
+        # claimant a suffix came from is not recoverable, so a candidate matching
+        # several claimed bases needs ALL of them switched on.
+
+        def _base_still_grants(_b: str) -> bool:
+            """Whether a claimed base is POSITIVELY still owned and switched on."""
+            return _app_owned_now.get(_b) is True
+
+        def _base_may_still_mount(_b: str) -> bool:
+            """Whether a claimed base might still be owned, counting an unread claim."""
+            if _b in _app_owned_now:
+                # The final read reached this app, so its answer is the answer.
+                return _app_owned_now[_b] is True
+            # Missing from the final read. That is positive REMOVAL only when the
+            # read saw every claim; otherwise the claim may merely have gone
+            # unread, which this module calls the ordinary shape of the failure.
+            # Dropping a MOUNT ref on that doubt can unmount a server for good, so
+            # the pre-rebuild answer stands here -- and only here. The grant side
+            # above requires the positive answer instead, because a grant kept on
+            # the same doubt is an auto-approval left on a name.
+            return not _ownership_full_now and _app_owned_at_start.get(_b) is True
+
+        # Built TWICE, because the two lists fail in opposite directions and one set
+        # cannot serve both. `_exempt_mounts` keeps a name whose ownership merely
+        # went unread, since dropping a mount ref can unmount a server for good.
+        # `_exempt_grants` requires a positive answer, since keeping a grant on the
+        # same doubt leaves an auto-approval on a name any later server inherits --
+        # and `allowedTools` is the path that never reaches the PreToolUse gate.
+        _exempt_mounts: set[str] = set()
+        _exempt_grants: set[str] = set()
+        for _n in _narrowed_away | _gated_aliases:
+            _bases = [_b for _b in _ever_app_owned if _is_alias_family(_n, _b)]
+            if _bases:
+                # A readable non-app SOURCE that declares this exact name outranks
+                # app attribution, because pruning its refs does not merely narrow
+                # them. The shared sync re-adds the BARE `@alias` to `allowedTools`
+                # once the command resolves again, so a user's per-tool grant comes
+                # back as a WHOLE-SERVER one -- widening the very grant this
+                # reconcile exists to keep from widening.
+                #
+                # The managed GATE does not vouch that way. `gated_off` says a
+                # shipped server is withheld right now, not that anything still
+                # declares the name, so an app whose alias lands exactly on a gated
+                # managed name must still lose its grant: otherwise reopening the
+                # gate hands the managed server an approval nobody granted for it.
+                #
+                # A SUFFIXED sibling stays ambiguous either way. The suffix is
+                # assigned against the live map and the slashed key it came from is
+                # gone by the next rebuild, so nothing here can tell a minted
+                # sibling from a name a source chose that way, and any vouching
+                # outranks the guess.
+                if _n in _vouched_sources or (_n not in _ever_app_owned and _n in _vouched):
+                    _exempt_mounts.add(_n)
+                    _exempt_grants.add(_n)
+                    continue
+                # When the candidate is ITSELF a claimed alias, its own owner decides.
+                # Widening to the family lets a sibling's switched-off owner delete a
+                # name whose own app is switched on, and it does that to both lists
+                # because the AND below gates each of them. Family matching is for a
+                # name nothing claims exactly, where the suffix is the only evidence
+                # there is.
+                _deciding = [_n] if _n in _ever_app_owned else _bases
+                if all(_base_may_still_mount(_b) for _b in _deciding):
+                    _exempt_mounts.add(_n)
+                if _n in _ever_app_owned and all(_base_still_grants(_b) for _b in _deciding):
+                    # The GRANT needs the name to be a claimed base ITSELF, not
+                    # merely a family match. A suffix is minted against the live map
+                    # and the slashed key it came from is gone by the next rebuild,
+                    # so a `base-2` candidate cannot be told from a name a source
+                    # chose that way -- and attributing it to an ENABLED owner of
+                    # `base` would keep an auto-approval on a server that owner
+                    # never declared, for whatever binds to the name next. The mount
+                    # above stays on the family answer because that guess costs a
+                    # mount attempt against an empty name, while dropping it cannot
+                    # be undone. Exactness only ever narrows: a family sibling whose
+                    # base is switched off still loses its grant, which is the case
+                    # the family match was added for.
+                    _exempt_grants.add(_n)
+            else:
+                # No app claims this name or its family. The MOUNT is exempt
+                # unconditionally, matching the `if _bases:` branch above and this
+                # helper's own cost model: an unsure caller keeps the mount and
+                # drops only the grant. Gating it on the ownership read would let an
+                # unrelated app's unreadable manifest -- which that read calls an
+                # ordinary shape of failure -- permanently strip the `tools` refs of
+                # a server that merely has its binary off PATH this pass, and no
+                # later pass re-adds them.
+                _exempt_mounts.add(_n)
+                if _n in _vouched:
+                    # The GRANT is the side that needs a positive answer. An
+                    # unclaimed name whose command did not resolve has no source
+                    # declaring it, so keeping the auto-approval leaves it on the
+                    # NAME for whatever binds there next, and `allowedTools` never
+                    # reaches the PreToolUse gate. Dropping it costs one approval a
+                    # human can grant again, where the mount above cannot be undone.
+                    # The gate DOES vouch here, unlike in the app branch above:
+                    # there the grant belonged to a switched-off app, so reopening
+                    # the gate would hand the managed server an approval nobody
+                    # granted it, while here the grant is the withheld server's own
+                    # and revoking it strands a shipped default.
+                    _exempt_grants.add(_n)
+        # Snapshot the grant list, because only this side is a permission
+        # decision: `tools` mounts, `allowedTools` auto-approves.
+        _grants_before = [_r for _r in (config.get("allowedTools") or []) if isinstance(_r, str)]
+        prune_dangling_tool_refs(config, declared=_exempt_mounts, declared_grants=_exempt_grants)
+        _grants_after = set(config.get("allowedTools") or [])
+        _revoked = [_r for _r in _grants_before if _r not in _grants_after]
+        if _revoked:
+            # Dropping a ref out of `allowedTools` REVOKES an auto-approval, which
+            # is a permission decision and belongs in the same feed as the
+            # withhold above rather than only in a log line. Auditing must never
+            # fail the rebuild.
+            try:
+                sel().log_api_access(
+                    caller="system",
+                    operation="mcp_auto_approve_revoked",
+                    outcome="ok",
+                    source="rebuild_agent_config",
+                    resources=(
+                        f"{', '.join(_revoked)} auto-approval removed "
+                        "(no such server in mcpServers)"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — auditing never fails the rebuild
+                logger.debug("SEL audit for revoked MCP auto-approvals failed", exc_info=True)
         # Runs here, at the single funnel every write path goes through, and AFTER
         # the passes that mutate `allowedTools` (managed/shared MCP sync) — a policy
         # seeded before them would describe a list those passes then replace.
@@ -7627,16 +8093,46 @@ def _file_identity(path: Path) -> str | None:
     return f"{st.st_mtime_ns}-{st.st_size}-{st.st_ino}"
 
 
-def _project_shadow_of(agent: str, work_dir: str | Path | None) -> Path | None:
+def _project_shadow_of(
+    agent: str,
+    work_dir: str | Path | None,
+    *,
+    markdown_specs: bool = True,
+    dispatchable_only: bool = False,
+) -> Path | None:
     """A checkout's own spec for *agent*, or ``None``.
 
-    ``<work_dir>/.kiro/agents/*.json`` is the ONLY project location kiro-cli resolves
+    ``<work_dir>/.kiro/agents/`` is the ONLY project location kiro-cli resolves
     ``--agent`` against (see ``docs/reference/kiro-cli/custom-agents``, and
     :func:`agent_discovery.project_agent_files`, which states the same rule for every
     other consumer). There is no parent walk to match: a spec one directory up is not
     dispatchable, so it is not a shadow. The declared ``name`` beats the filename, which
     is why the comparison goes through :func:`agent_discovery.project_agent_name` rather
     than the stem -- a file called anything at all can declare ``kirocrew-worker``.
+
+    Two keywords narrow WHICH project files count, and the default of each is the
+    behaviour this function had before they existed. Both matter to a caller asking
+    "would the host dispatch this", and neither matters to one asking "does the
+    checkout make any claim on this name" -- a governance refusal, say, for which a
+    file in any form and any state is a claim.
+
+    ``markdown_specs=False`` narrows to the JSON form, for a host that dispatches
+    that alone. The narrowing happens INSIDE the scan, not to its result:
+    ``project_agent_files`` sorts by stem and this returns the first declared-name
+    match, so a differing-stem pair (``a.md`` and ``z.json``, both declaring ``foo``)
+    yields the markdown file first. Filtering afterwards would answer "no shadow"
+    while a dispatchable ``z.json`` sat right there. The same-stem pair needs no such
+    care: ``iter_agent_spec_files`` already drops ``<stem>.md`` when ``<stem>.json``
+    exists.
+
+    ``dispatchable_only=True`` additionally skips a spec that does not PARSE.
+    :func:`agent_discovery.project_agent_name` falls back to the filename stem for a
+    malformed file, so a broken ``foo.json`` otherwise matches ``foo`` and shadows a
+    perfectly good user-level agent of that name -- while kiro-cli, which reports it
+    as an error and offers no such mode, runs the user-level one. The distinction is
+    :func:`agent_discovery._declared_project_agent_name`, whose ``None`` means exactly
+    "does not parse" and which already applies the filename fallback for a spec that
+    parses without a ``name`` field.
 
     Never raises: an unreadable checkout answers "no shadow", and the caller's own
     fail-closed rule covers what it cannot see.
@@ -7645,6 +8141,12 @@ def _project_shadow_of(agent: str, work_dir: str | Path | None) -> Path | None:
         return None
     try:
         for spec in project_agent_files(work_dir):
+            if not markdown_specs and is_markdown_spec(spec):
+                continue
+            if dispatchable_only:
+                if _declared_project_agent_name(spec) == agent:
+                    return spec
+                continue
             if project_agent_name(spec) == agent:
                 return spec
     except OSError:

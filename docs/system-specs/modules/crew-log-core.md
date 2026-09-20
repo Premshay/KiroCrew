@@ -25,9 +25,9 @@ A fact with no unit to belong to still has a home: a script cron, or gateway lif
 .lease                                               # sibling, per crew log
 ```
 
-`<store name>` is `session_ledger._store_name()` -- a readable fold plus a digest of the exact id -- and the raw id lives in the header. The id is deliberately not the directory name: a channel session key legitimately carries a colon (`slack:1712793600.123`), which POSIX accepts and Windows refuses, so the raw id as a filename turns a sanctioned id into an `OSError` on a supported platform. Identity is the digest, so `Foo` and `foo` get distinct directories on a case-insensitive filesystem. `store.ledger_dir()` refuses a separator or NUL in the raw id and requires the resolved path to stay below the root, so a folded name cannot traverse. `Ledger.open()` proves it reached the right unit by checking the id the header stores.
+`<store name>` is `session_ledger._store_name()` -- a readable fold plus a digest of the exact id -- and the raw id lives in the header. The id is deliberately not the directory name: a channel session key legitimately carries a colon (`slack:1712793600.123`), which POSIX accepts and Windows refuses, so the raw id as a filename turns a sanctioned id into an `OSError` on a supported platform. Identity is the digest, so `Foo` and `foo` get distinct directories on a case-insensitive filesystem. `store.crew_log_dir()` refuses a separator or NUL in the raw id and requires the resolved path to stay below the root, so a folded name cannot traverse. `CrewLog.open()` proves it reached the right unit by checking the id the header stores.
 
-Every segment repeats that header. Before `Ledger._iter_segments()` yields any entry from a segment, it requires the header's unit id, kind and schema version to match the opened crew log, and requires the filename's first sequence to match the physical first entry when that record is readable. A provenance failure refuses the segment and names it; an unreadable record retains the per-record skip behavior.
+Every segment repeats that header. Before `CrewLog._iter_segments()` yields any entry from a segment, it requires the header's unit id, kind and schema version to match the opened crew log, and requires the filename's first sequence to match the physical first entry when that record is readable. A provenance failure refuses the segment and names it; an unreadable record retains the per-record skip behavior.
 
 Every kind lives under ONE `crew-log` leaf, and that leaf is what carries the protection. It is an entry in `security.paths._CREW_SECRET_LEAVES`, so the agent's own file tools are refused, and an entry in `sandbox._CREW_HIDDEN_LEAVES`, so the OS hides it from every sandboxed spawn. Both are needed and neither substitutes for the other: the write-side rules below bind only callers who go through the library, the file-tool floor answers only the agent's tools, and a spawned subprocess that calls `open()` is answered by neither. Without all three an agent could forge an entry attributed to `src:"gateway"` or rewrite the history a conductor is designed to trust.
 
@@ -163,7 +163,7 @@ source were removed (see the emitter spec's "Removed types").
 ### Session, turn
 | Type | `data` | Emitter |
 |---|---|---|
-| `session/opened` | header echo + `resumed`; `parent {slot, sid?}` on a session another session made through `session_create` | yes |
+| `session/opened` | header echo + `resumed`; `model_requested` when a tier resolved one; `parent {slot, sid?}` on a session another session made through `session_create` | yes |
 | `session/closed` | `{reason}` | yes |
 | `turn/started` | `{turn, actor, depth, message_seq?, attempt?}` | yes |
 | `turn/refused` | `{turn, actor, reason, depth}` | yes |
@@ -211,8 +211,8 @@ every block put in front of the model — `system`, `memory`, `lessons`, `skills
 |---|---|---|
 | `tool/called` | `{turn, step, call_id, name, server, kind, args_hash?, args_bytes?}` | yes |
 | `tool/completed` | `{turn, step, call_id, status, is_error?, elapsed_ms, result_hash?, result_bytes?}` | yes |
-| `approval/requested` | `{turn, id, tool, reason}` | — |
-| `approval/decided` | `{turn, id, decision, by}` | — |
+| `approval/requested` | `{turn, approval_id, tool?, reason?}` | yes |
+| `approval/decided` | `{turn, approval_id, decision, by?, cause?}` — `decision: "unknown"` is written only by the interrupted-tail repair | yes |
 
 Arguments and results are DIGESTED, never recorded: `args_hash` / `result_hash` are the sha256 of
 the serialized payload and `args_bytes` / `result_bytes` its length. That answers "same arguments as
@@ -222,8 +222,13 @@ absent rather than zeroed when there is nothing to digest, since 0 is a real siz
 tri-state and absent when the caller did not say, because "nobody asserted this worked" is not the
 same claim as "it worked".
 
-Approvals have no emitter yet for a reason rather than a schedule: the approval coordinator carries
-a slot key, not a session id, so there is nothing to key an entry by.
+Approvals ARE emitted. An earlier revision said they could not be, because "the approval coordinator
+carries a slot key, not a session id" -- true of that class, and false of the site that actually
+raises the prompt, which sits inside the runner's turn where the session id and the turn ordinal have
+been in scope since the turn began. `reason` is the redacted title the human is shown. `by` and
+`cause` are written only for a decline the HOST made, which is the one decision this site can
+attribute: an answer that came back from a person could have arrived at the dashboard or in Slack,
+and naming a guess is worse than naming nobody.
 
 ### Model, compaction, plan
 
@@ -231,23 +236,36 @@ a slot key, not a session id, so there is nothing to key an entry by.
 |---|---|---|
 | `model/selected` | `{turn?, model, source}` | yes |
 | `compaction/applied` | `{turn, pct_before, pct_after, freed_pct}` | yes |
-| `plan/updated` | `{turn, items:[{id, text, state}]}` — the session's own task list | — |
+| `plan/updated` | `{turn, items:[{id, text, state: done \| open}], total?}` — the session's own task list | yes |
 
 ### Background and children
 
 | Type | `data` | Emitter |
 |---|---|---|
-| `background/completed` | `{kind: title \| memory_consolidation \| summary, model, tokens, credits, ms, result_ref}` | — |
-| `subagent/spawned` | `{turn, agent_id, agent, model, scope:{memory, lessons, project}}` + `ref` into the child's log | — |
-| `subagent/steered` | `{agent_id, mode}` | — |
-| `subagent/completed` | `{agent_id, tokens, credits, ms}` | — |
-| `subagent/failed` | `{agent_id, reason}` | — |
+| `background/completed` | `{kind: title \| memory_consolidation \| summary, model?, provider?, tokens?, credits?, ms?}` | yes |
+| `subagent/spawned` | `{turn?, agent_id, agent?, model?, scope:{memory, lessons, project}}` — no `ref` yet, see below | yes |
+| `subagent/steered` | `{agent_id, mode: interrupt \| follow_up}` | yes |
+| `subagent/completed` | `{agent_id, ms?}` — no `tokens`/`credits`, see below | yes |
+| `subagent/failed` | `{agent_id, reason?, outcome: failed \| stopped \| unknown, ms?}` — `unknown` is written only by the interrupted-tail repair | yes |
 
 These are the families a single-agent runtime never needs and a gateway does: every token spent on a
 session's behalf, whether a person asked for it or not, is a fact in that session's log attributed to
-what caused it. A subagent is itself a session with its own crew log, whose header `thread` points at
-the parent's `subagent/spawned` entry while that entry carries a `ref` into the child's log — the
-same pair as a crew dispatch, one level down.
+what caused it.
+
+A subagent WOULD be a session with its own crew log, whose header `thread` points at the parent's
+`subagent/spawned` entry while that entry carries a `ref` into the child's log -- the same pair as a
+crew dispatch, one level down. It is not one yet: the only site that creates a session log is the
+dashboard turn path, and a subagent run does not go through it. So the child's facts are written into
+the PARENT's log, `subagent/spawned` carries no `ref`, and the pair above becomes writable, unchanged,
+the day subagent sessions get logs of their own. Citing a child file that does not exist would be
+indistinguishable, to a reader, from citing one that was deleted.
+
+The child's spend is likewise absent rather than zeroed. Nothing in the subagent runtime measures
+tokens or credits -- a run's record carries elapsed time and peak resource use, and the child never
+reports its spend back to the parent -- so `subagent/completed` writes neither. Background calls are
+the opposite case and DO carry both, because the two background entry points already measure them for
+the usage store. `digest` is not among their kinds: the design named it, and the digest path turned
+out to be a filesystem read with no model call in it.
 
 The edge that IS written today is the `session_create` one, and it takes the child's side of that
 pair only: a created session's `session/opened` carries `parent {slot, sid?}` -- the creator's slot
@@ -262,12 +280,13 @@ those tools precisely so nothing in it can be forged as gateway-authored, so `_c
 from transcript metadata is restored for authorization but never promoted to lineage, and the sid is
 not persisted at all. A child whose gateway restarted between mint and its first turn therefore
 writes no `parent`. `sid` is a citation of the creator's unit, not the tree key -- a slot outlives its ACP
-session, so a fold that builds the session tree keys it by `slot` and reads one `session/opened` per
-crew log.
+session, so the fold that builds the session tree (`crew_log/tree.py`, `crew-log-projection.md` section 6)
+keys it by `slot`, reads the first `session/opened` of each crew log, takes the parent from any log of
+the slot that carries one, and never lets a log without one retract it.
 
 ## 6. Rules
 
-Every refusal is a `LedgerError` carrying a stable `code`; the codes are API surface and are additive-only.
+Every refusal is a `CrewLogError` carrying a stable `code`; the codes are API surface and are additive-only.
 
 **Ownership** answers whether a kind of unit has such events at all. `schema.TYPE_OWNERSHIP` maps kind to owned `type` domains -- crew: `member` `activity` `slot` `patrol` `message` `crew` `item` `memory`; session: `session` `turn` `step` `tool` `approval` `model` `compaction` `plan` `message` `request` `context` `background` `subagent` `write` -- and anything else is `event_type_not_owned`. It is prefix-based, so a new action under an owned domain needs no change: `crew/dispatch` and `crew/report` are owned by the `crew` domain the registry already lists. `message` appears in both registries, which is what ownership means: a crew forwards messages and a session records its own bodies, so both kinds have such events and neither name is a collision.
 
@@ -298,7 +317,7 @@ That truncation is not a second exception to the never-rewrite rule. The bytes r
 
 If the rollback ALSO fails -- likely, since whatever broke the write is often still broken -- the file may hold bytes no entry claims, and `IndeterminateAppend` reports exactly that. The residue is an unterminated or unparseable tail, which is the shape the next `open` truncates, so the recovery already exists; the distinct type is so a caller can tell "nothing happened" from "something may have".
 
-The header is the exception, and only at creation: `Ledger.create()` publishes it with `atomic_write` (temp file, fsync, rename), so the file is either complete or absent and a crash or ENOSPC mid-header cannot leave a fragment. Without that, a fragment would be read as a torn tail, truncated to an empty file, and then refused by `open` while `create` refused the very file it had produced -- a unit wedged with no automated recovery. For the same reason all three of `create`, `open` and `exists` read a **zero-byte file as absent**: it carries no header and no entries, so there is nothing to protect and one shared meaning is what keeps the paths from disagreeing. After the rename the file is append-only for the rest of its life.
+The header is the exception, and only at creation: `CrewLog.create()` publishes it with `atomic_write` (temp file, fsync, rename), so the file is either complete or absent and a crash or ENOSPC mid-header cannot leave a fragment. Without that, a fragment would be read as a torn tail, truncated to an empty file, and then refused by `open` while `create` refused the very file it had produced -- a unit wedged with no automated recovery. For the same reason all three of `create`, `open` and `exists` read a **zero-byte file as absent**: it carries no header and no entries, so there is nothing to protect and one shared meaning is what keeps the paths from disagreeing. After the rename the file is append-only for the rest of its life.
 
 Decoding is **strict and per line**, on bytes read in binary mode. Replacement-decoding would be the wrong tolerance: invalid bytes inside a JSON string can decode into still-valid JSON, so a damaged line would be yielded with `U+FFFD` substituted into its values rather than skipped -- handing a consumer altered data as authority, which a record that calls itself the authority must never do. Byte damage is this machinery's expected input, so an undecodable line is damage and is skipped exactly like unparseable JSON; an undecodable header is `bad_header`.
 
@@ -308,7 +327,13 @@ Both reads are FRAMED by `jsonl_util`, so one planted line cannot cost more memo
 
 A header naming a format version this build does not read is refused BEFORE the rest of the header is checked and before any row is decoded, with its own code (`unsupported_version`) and a message telling the reader to upgrade and stating the file is not damaged. The ordering is the point: a newer format need not satisfy any of this build's structural checks, so its new required type would surface as `unknown_entry_type` and its header shape as `bad_header` -- both of which accuse the file of corruption when the truth is that the reader is old, and someone acting on that diagnosis deletes a healthy log. Refusing NEWER only; an older version opens as it stands, which is what a future migration is for. Nothing else in this module reads `version`, so without this check carrying it buys nothing.
 
-A session's log's newest turn can be left open by a crash, a `SIGKILL` or a pod eviction. `Ledger.open(kind, id, repair=True)` -- or `ledger.repair_interrupted_turn()` on a handle already held -- closes it, appending deterministic closers: a `tool/completed` with `status: "unknown"` for each unmatched `tool/called` inside that turn, in first-seen order, then `turn/completed` with `stop_reason: "interrupted"`. Calls first, because a turn cannot close while a call inside it is open, and closing them the other way would produce a record no live writer could have produced.
+A session log can be left holding an opener open by a crash, a `SIGKILL` or a pod eviction. `CrewLog.open(kind, id, repair=True)` -- or `log.repair_interrupted_turn()` on a handle already held -- closes what is unbalanced, appending deterministic closers: an `approval/decided` with `decision: "unknown"` for each unmatched `approval/requested` inside the open turn, then a `tool/completed` with `status: "unknown"` for each unmatched `tool/called` inside it, then a `subagent/failed` with `outcome: "unknown"` for each unmatched `subagent/spawned`, each group in first-seen order, and finally `turn/completed` with `stop_reason: "interrupted"`. That order is the only one a live writer could have produced: an approval is decided before the call it gates completes, and a turn cannot close while a call inside it is open.
+
+Two of those three are TURN-SCOPED and the third deliberately is not. A call completes within its turn, and an approval is decided in the same `finally` the turn's own path runs through, so an unmatched one is collected only from inside the open turn -- an unmatched call or approval in a turn that DID complete is a different anomaly, and inventing an outcome for it here would be the repair editing history it was not asked about. A child is the opposite: `subagent/spawned` is matched across the WHOLE file, because a subagent's whole point is that it starts, steers and reports long after its asking turn ended. Scoping its closer to the open turn would close only the rare child that died inside its own turn and leave every ordinary one open forever. It follows that closing a child can fire on a file whose newest turn completed normally, and in that case NO `turn/completed` is appended -- that turn closed itself, and a second closer would be a turn closing twice.
+
+The child closer needs a STRONGER precondition than the other two, and it is the caller's live subagent registry rather than any fact about the file. What a repair knows is that the WRITER is gone, which settles a turn-scoped opener because the turn died with its writer. It does not settle a child: a child outlives its asking turn by design, so a writer torn down inside a live process can leave one still running and still able to file its own real terminal, and a closer written here would put two outcomes for one `agent_id` in a file nothing rewrites. An unmatched opener is what a finished-but-unreported child and a still-running one both look like, so no flag can stand in for the answer -- including "a resume", which is raised for an in-process `session/load` too and therefore does not even imply a different writer. `CrewLog.open` and `repair_interrupted_turn` take `child_gone`, a predicate over `agent_id` that the gateway backs with its subagent manager; omitted, or raising, no child is closed. What backs it has to live for the PROCESS, not for a session: the manager's run map is pruned only when a run COMPLETES, so it still lists a running child across the idle teardown and session reset that clear the emitter's own per-session maps -- which is the case that makes a session-scoped source report a live child as finished. A source that is also bounded, and so can evict a live entry under load, is wrong for the same reason. The registry answers whether a child is still RUNNING, which is not the question of whether its outcome is RECORDED: a terminal outcome reaches the file through the writer and the emitter's submit returns before the entry lands, so a child that has just reported leaves the running set while its own closer is still owed -- and being done, its run record is by then inside the reach of the completed-run bound as well. So the emitter refuses to report any child of a session gone while it still owes an entry for THAT session. The debt set answers this exactly and carries no such bound: it holds a queued entry, one the writer has CLAIMED out of the queue and not yet attempted, a retained one, and an owed loss marker alike. The claimed case is the one a reader would miss on their own, because claiming a session's entries takes them out of the queue while they are still owed. The entry being appended at this instant is deliberately NOT among them: the caller asking is itself a job of that batch, and a job that counted itself would refuse every child on the resume path this repair exists for. An entry a hard ceiling refuses is absent from it, which is the wanted answer, because that closer is never coming and the opener is the repair's to close. That default is the direction that loses nothing: a reader treating an open child as unknown is behind, while a fabricated outcome in an append-only file cannot be corrected.
+
+`"unknown"` is the same word in all three, and it is written by the repair alone. A live writer always knows what a human decided and how a child ended, so a reader that sees it knows it is reading a reconstruction rather than an observation.
 
 A group whose members are meaningless apart is written by `append_many`, which takes the file lock once, allocates a contiguous seq run from one read of the tail, and writes every line with one `write()` and one `fsync`. The one caller today is a body too large for a single line: the `message/chunk` entries plus the entry that CITES their seqs. The citation is built INSIDE the lock, by a `cite(seqs)` callable the caller passes alongside the chunks and which receives the run the call has just allocated, so a citation cannot disagree with the allocation it names. Allocating outside the lock and citing the result cannot be made correct, because the lock is a cross-process one: between that read and the write another handle can append and shift the run, after which `chunks` name the intruder's entries -- seqs that exist and parse, so no later read can tell the body apart from the right one. Appending the members separately leaves a different window, in which a hard kill puts the body on disk with nothing pointing at it -- stored and unreachable, with no record of the message at all. Every refusal still happens before any byte is written, including validation of what `cite` returns, so a rejected group leaves the file identical, and `thread` is not accepted because a group is self-contained and an anchor check would have to re-read the tail it is being allocated from.
 
@@ -421,7 +446,7 @@ survived. Segments go FIRST, so the ordinary partial removal is history already 
 else left standing, and the log line distinguishes that from a removal that got nowhere. Claiming the
 segments were kept would send a reader looking for a record the pass had destroyed.
 
-A unit directory that is a LINK is refused, and the check is on the name as WRITTEN. `ledger_dir`
+A unit directory that is a LINK is refused, and the check is on the name as WRITTEN. `crew_log_dir`
 returns the RESOLVED path, so a link pointing at another unit stays inside the root, satisfies
 containment, and hands the removal its target -- which is not itself a link, so checking the resolved
 path would prove nothing and one unit's id would delete another unit's history.

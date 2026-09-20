@@ -15,6 +15,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO
+from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.dashboard.chat_utils import (
     _BLOCKED_SLASH_COMMANDS,
     _SLASH_COMMANDS,
@@ -37,10 +39,11 @@ def _make_app() -> web.Application:
 async def _get(provider: str, *, state=None, claude_providers=()):
     """Fetch the menu, optionally against a fake live session.
 
-    *claude_providers* names which of ``state``'s providers the Claude-backend
-    check should accept, so a test can put a kiro session and a Claude session
-    in the same map and pin which one the handler reads.
+    *claude_providers* declares the live Claude sessions through the same SDK
+    record real providers expose; the remaining doubles use Kiro capabilities.
     """
+    for live_provider in claude_providers:
+        live_provider.capabilities = capabilities_for(ACP_BACKEND_CLAUDE)
     app = _make_app()
     if state is not None:
         app["state"] = state
@@ -48,10 +51,6 @@ async def _get(provider: str, *, state=None, claude_providers=()):
         patch(
             "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
             return_value=_fake_config(provider),
-        ),
-        patch(
-            "kiro_crew.providers.acp.is_claude_backend",
-            side_effect=lambda p: p in claude_providers,
         ),
     ):
         async with TestClient(TestServer(app)) as client:
@@ -61,7 +60,9 @@ async def _get(provider: str, *, state=None, claude_providers=()):
 
 
 def _fake_provider(commands):
-    return SimpleNamespace(slash_commands=list(commands))
+    return SimpleNamespace(
+        slash_commands=list(commands), capabilities=capabilities_for(ACP_BACKEND_KIRO)
+    )
 
 
 def _fake_state(providers, by_key=None):
@@ -170,6 +171,7 @@ class TestAdvertisedCommands:
     async def test_slot_query_picks_that_slots_backend(self):
         kiro = _fake_provider([{"name": "wrong", "description": ""}])
         claude = _fake_provider([{"name": "design", "description": "d"}])
+        claude.capabilities = capabilities_for(ACP_BACKEND_CLAUDE)
         state = _fake_state([kiro], by_key={"dashboard:slot-b": claude})
         app = _make_app()
         app["state"] = state
@@ -177,10 +179,6 @@ class TestAdvertisedCommands:
             patch(
                 "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
                 return_value=_fake_config("acp"),
-            ),
-            patch(
-                "kiro_crew.providers.acp.is_claude_backend",
-                side_effect=lambda p: p is claude,
             ),
         ):
             async with TestClient(TestServer(app)) as client:

@@ -24,6 +24,7 @@ import pytest
 from test_subagent_continuable import continuation_runtime as _continuation_runtime
 
 from kiro_crew.effort import EFFORT_LEVELS
+from kiro_crew.execution_context import execution_for_store
 from kiro_crew.validation import SPAWN_RUN_SCHEMA, ValidationError, validate_tool_args
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
@@ -55,6 +56,20 @@ def _hermetic_cfg(role_models=None, agent_pins=None):
         yield cfg
 
 
+def _through_solo_gate(args: dict[str, Any]) -> dict[str, Any]:
+    """Give a one-task call the reason the solo gate requires.
+
+    These tests exercise effort FORWARDING, not the gate: a lone ``task`` with
+    no model/agent/crew would otherwise be refused before any POST (see
+    ``test_spawn_solo_gate``). The reason is added only where the gate would
+    fire, so a call that names a model still travels exactly as written.
+    """
+    single = bool(args.get("task")) and not args.get("tasks")
+    if single and not (args.get("model") or args.get("agent") or args.get("crew")):
+        return {**args, "solo_reason": args.get("solo_reason") or "bulk_data"}
+    return args
+
+
 def _run_tool(args: dict[str, Any]) -> tuple[list[dict], str]:
     """Run spawn_run and return (POSTed bodies, returned text)."""
     from kiro_crew import mcp_core
@@ -71,7 +86,7 @@ def _run_tool(args: dict[str, Any]) -> tuple[list[dict], str]:
         patch.object(mcp_core, "_resolve_session_key", return_value="dashboard:chat-1"),
         patch.object(mcp_core, "sel", MagicMock()),
     ):
-        result = mcp_core._call_tool_inner("spawn_run", args)
+        result = mcp_core._call_tool_inner("spawn_run", _through_solo_gate(args))
     return bodies, result
 
 
@@ -140,7 +155,7 @@ def _run_tool_with_server_verdicts(
         patch.object(mcp_core, "_resolve_session_key", return_value="dashboard:chat-1"),
         patch.object(mcp_core, "sel", MagicMock()),
     ):
-        result = mcp_core._call_tool_inner("spawn_run", args)
+        result = mcp_core._call_tool_inner("spawn_run", _through_solo_gate(args))
     return bodies, result
 
 
@@ -424,6 +439,7 @@ class TestRecordAndRetry:
     @pytest.mark.parametrize("crew", ["", "coding"])
     async def test_retry_re_spawns_at_the_same_effort(self, crew):
         from kiro_crew.dashboard.handlers.messaging import api_spawn_retry
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
 
         old = SimpleNamespace(
             id="a1",
@@ -446,6 +462,12 @@ class TestRecordAndRetry:
             crew=crew,
             done=True,
             outcome="failed",
+            execution_context=ExecutionContext(
+                "coding-id" if crew else None,
+                MemoryStoreRef("member-coding", "coding-id") if crew else MemoryStoreRef("default"),
+                "member" if crew else "template",
+                "kirocrew",
+            ),
         )
         mgr = MagicMock()
         mgr.get.return_value = old
@@ -500,11 +522,13 @@ class TestResolutionPrecedence:
             side_effect=AssertionError("shared path taken despite an effort override")
         )
         info = SubagentInfo(
+            execution_context=execution_for_store(""),
             id="sub1",
             task="test",
             parent_session_key="parent-key",
             reasoning_effort=info_effort,
         )
+        runner._log_spawned(info)
         with (
             patch.object(runner, "_create_shared_session", shared),
             patch.object(runner, "_should_use_session_sharing", return_value=True),
@@ -661,12 +685,14 @@ class TestNoSpawnSiteDropWarning:
         )
         runner = SubagentManager(sessions=sessions, ctx_builder=ctx_builder)
         info = SubagentInfo(
+            execution_context=execution_for_store(""),
             id="sub1",
             task="test",
             parent_session_key="parent-key",
             model=info_model,
             reasoning_effort=info_effort,
         )
+        runner._log_spawned(info)
         with (
             patch.object(runner, "_should_use_session_sharing", return_value=False),
             patch("kiro_crew.config.loader.KiroCrewConfig.load", classmethod(lambda c: cfg)),
@@ -1339,6 +1365,31 @@ class TestAllocatedEffortReceipt:
                         await asyncio.to_thread(bind_private_session_store, parent, store)
                         await asyncio.to_thread(
                             world.history.update_metadata, parent, {"memory_store": store}
+                        )
+                    else:
+                        from dataclasses import replace
+
+                        from kiro_crew.execution_context import (
+                            bind_session_execution,
+                            read_session_execution,
+                        )
+
+                        # This fixture models a template-selected parent with the
+                        # same member memory. Runtime selection alone does not
+                        # rewrite its canonical persona selection.
+                        execution = await asyncio.to_thread(
+                            read_session_execution, parent, required=True
+                        )
+                        await asyncio.to_thread(
+                            bind_session_execution,
+                            parent,
+                            replace(
+                                execution,
+                                selection_kind="template",
+                                selection_name="worker",
+                                template_id="worker",
+                            ),
+                            replace_existing=True,
                         )
                     await asyncio.wait_for(
                         sessions.get_or_create(

@@ -400,7 +400,6 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``workspace/`` was itself replaceable with one ``ln -s``, and the app opens the
     # path directly (as keystone writers must), so it would have followed the link.
     "trust",
-    "member-memory-bindings",
     "security_events.jsonl",
     # Rotated SEL segments. sel.py closes the live log at a size cap and renames
     # it into this directory, so a segment holds exactly the same audit records
@@ -589,6 +588,14 @@ _CREW_SECRET_LEAVES: list[str] = [
     # and the ``kirocrew aws-consent`` CLI are the only writers and open the
     # path directly, not through this gate, so both keep working.
     "aws_service_consent.json",
+    # Recorded consent to send conversation state to the external decision
+    # provider (Jev). Same class of control as ``aws_service_consent.json``
+    # above: the record is what AUTHORIZES message text and skill descriptions
+    # to leave the machine, so an agent that could write it would consent on the
+    # owner's behalf to its own egress. The authenticated, browser-only dashboard
+    # ``/api/decisions/consent`` handler is the only writer and opens the path
+    # directly, not through this gate.
+    "decisions_consent.json",
     # Recorded consent to deliver a file whose contents the credential scanner
     # flagged. Same class of control as ``aws_service_consent.json`` above: the
     # record is what AUTHORIZES a flagged file past four independent content
@@ -601,15 +608,21 @@ _CREW_SECRET_LEAVES: list[str] = [
     # writer and opens the path directly, not through this gate, so it keeps
     # working; there is deliberately no CLI verb to fence.
     "file_delivery_consent.json",
-    # Recorded consent to forward SSH_AUTH_SOCK into the sandbox. Same class of
-    # control as ``aws_service_consent.json`` and ``file_delivery_consent.json``
-    # above: the record is what keeps the operator's ssh-agent socket in the
-    # agent environment, granting USE of the operator's keys for the session, so
-    # an agent that could write it would flip its own forwarding on and a subagent
-    # it spawns would authenticate as the operator. The authenticated, owner-gated
-    # dashboard handler is the ONLY writer and opens the path directly, not through
-    # this gate; there is deliberately no CLI verb to fence.
     "ssh_auth_sock_consent.json",
+    # The single-use step-up nonce that authorizes RECORDING a flagged-file
+    # delivery grant. A whole DIRECTORY, not a leaf file, because arming writes a
+    # sibling ``.tmp`` and renames it into place. It lives in its OWN top-level
+    # leaf rather than under ``trust/`` on purpose: ``trust/`` is sandbox-VISIBLE
+    # (it holds SEL append targets an in-sandbox MCP server writes), so a
+    # prompt-injected agent could FORGE a nonce there with a runtime-constructed
+    # shell path (the acknowledged evadable tier) and then drive the owner's
+    # loopback browser to POST that chosen nonce -- recording a grant with no
+    # human present. This leaf has NO in-sandbox reader (the gateway writes it on
+    # arm, the host ``kirocrew file-delivery approve`` reads it), so it is also
+    # bind-masked in ``sandbox._CREW_HIDDEN_LEAVES``; masking is what actually
+    # closes the forge path, since the text/argv file gate alone does not stop a
+    # runtime-constructed shell write.
+    "file-delivery-consent-pending",
     "token_signing.key",
     "refresh_chains.json",
     ".local_secret",
@@ -684,6 +697,11 @@ _CREW_SECRET_LEAVES: list[str] = [
     # gateway's own writers open these paths directly and do NOT route through this
     # gate, so legitimate startup/spawn writes still work.
     "run",
+    # Pi gate artifacts have asymmetric readers. The OS mask deliberately excludes
+    # this directory from an enforced harness's credential mask so its child can exec
+    # the launcher and read the sealed extension. This floor still keeps the agent's
+    # own file tools out; the controls cover different readers rather than cancelling.
+    "pi-gate",
     # Encrypted secret vault directory — denylists the entire subdirectory so
     # the key file, ciphertext store, lock, and atomic-write temp files are all
     # unreadable to the agent through any Kiro Crew-mediated channel.
@@ -730,32 +748,12 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``identity_stores`` and opens it directly, not through this gate.
     AUTH_SQLITE_DB,
     *(f"{AUTH_SQLITE_DB}{suffix}" for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES),
-    # Named memory stores. Each subdirectory is ONE crew's private memory silo --
-    # its markdown tree, its FTS index and its vector-store SQLite file -- and the
-    # whole point of a named store is that a crew reaches only its own. Agent file
-    # tools run as the same UID as every store on disk, so owner-only modes decide
-    # nothing here: without this entry any crew's agent could read another crew's
-    # preferences and lessons straight off disk, or rewrite them, which is the
-    # boundary the split exists to draw. Read AND write, because reading another
-    # crew's memory is the primary harm and writing it is steering that crew's
-    # future turns.
-    #
-    # A DIRECTORY entry, for the reason ``routing`` and ``webhooks`` above are:
-    # markdown files are published through ``atomic_write``'s ``mkstemp`` sibling,
-    # so fencing final names only would leave a writable path to the same bytes
-    # under a random temp name.
-    #
-    # DELIBERATE ASYMMETRY, do not "tidy" it: the DEFAULT store's own ``memory.db``
-    # and ``workspace/memory/`` stay readable, because that is the agent's own
-    # memory and reading it is the product working. Fencing them would be a
-    # default-path behaviour change, which the coexistence constraint forbids. So
-    # ``is_sensitive_path(<home>/memory.db)`` is False and
-    # ``is_sensitive_path(<home>/memory_stores/work/memory.db)`` is True, on
-    # purpose. Full reasoning: docs/system-specs/modules/security.md.
-    #
-    # Every legitimate reader opens a store path DIRECTLY rather than through this
-    # gate -- the established keystone-reader pattern -- so the memory subsystem is
-    # unaffected.
+    # Managed memory uses bound tools. This directory guard keeps ordinary raw
+    # file operations away from DB/WAL/SHM and manual context publication files;
+    # glob-based project guidance skips it. It is a best-effort path guard, not
+    # confidentiality against arbitrary code run by the same OS user. Memory
+    # services open their captured store directly. Global V1 retains its existing
+    # file access behavior. See docs/system-specs/modules/security.md.
     MEMORY_STORES_DIR_NAME,
 ]
 _SENSITIVE_HOME_DIRS += [
@@ -851,7 +849,16 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
     # turn the browser sandbox OFF for every later browse, and the change persists
     # until the next gateway start re-converges the file. Kiro Crew generates it
     # directly and does NOT route through this gate, so its own write still works.
-    for leaf in ("config.json", "config.local.json", "playwright-cli-config.json")
+    # Cold continuation restores app ownership from canonical run records, or
+    # the retained V1 sidecar. Gateway writers bypass this tool gate; agents
+    # may read results but cannot turn an app-owned run into a personal run.
+    for leaf in (
+        "config.json",
+        "config.local.json",
+        "playwright-cli-config.json",
+        "subagents",
+        "member-memory-bindings",
+    )
 ] + [
     # Ops Mission Control's on-call schedule. WRITE-protected, not read+write
     # sensitive: it holds no secret and every teammate's instance must READ it to
@@ -870,6 +877,42 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
     # a direct `git checkout` on the merge path, not through this gate, so team
     # sync still converges.
     f"{prefix}/apps/ops-mission-control/data/rotation.yaml"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The cloud launcher's config. WRITE-protected for the same reason as
+    # ``playwright-cli-config.json`` above and by the same placement-not-logic fix:
+    # it holds no credential (its own module docstring is explicit that it stores a
+    # profile NAME, and the Fargate block stores secret names and ARNs, never
+    # values), and the gateway must READ it on every request to build the remote
+    # provisioner list, so sealing it against reads would break the Set-up tab.
+    #
+    # But it is an INPUT TO A SECURITY DECISION. ``fargate.image`` chooses the
+    # container image a launch runs, and the task's execution role delivers the
+    # model credential into that container before it starts. An agent that could
+    # rewrite this file could name a digest-pinned image of its own -- the digest
+    # rule constrains the FORM of the reference, not who owns the registry -- and
+    # leave every other field the owner wrote intact, so the owner's next launch
+    # hands the credential to an image the owner never chose.
+    #
+    # Nothing in the product writes it: the launch path's own profile, region and tag
+    # live in ``cloud.launch_state``, so this leaf has no product writer to exempt.
+    f"{prefix}/cloud.json"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The cloud launcher's LAUNCH RECORD (``cloud/launch_state.py``): the profile, region
+    # and tag the last launch decided. WRITE-protected on the same footing as
+    # ``cloud.json`` above, and for a reason that is specific rather than inherited: the
+    # tag in it is what ``kirocrew cloud destroy`` resolves when no ``--tag`` is given, so
+    # an agent that could write this file could choose which of the owner's CloudFormation
+    # stacks a ``destroy --yes`` deletes. Interactive ``destroy`` describes the instance
+    # and asks first, but ``--yes`` is exactly the path that does not.
+    #
+    # Readable, like ``cloud.json``: every ``cloud`` subcommand resolves the tag from it,
+    # and sealing it against reads would break them all. The gateway and the CLI write it
+    # outside the agent's file-edit gate, so the launch path is unaffected.
+    f"{prefix}/cloud_launch_state.json"
     for prefix in _CREW_HOME_PREFIXES
 ]
 _WRITE_PROTECTED_HOME_PATHS += [
@@ -914,6 +957,27 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # gate, so first-run fetches, re-downloads after a failed check and the embedding
     # model install all keep working; only the agent's file-edit tool is refused.
     f"{prefix}/models"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The decision log (``decisions/decisions-YYYYMMDD.jsonl``, written by
+    # ``decisions.log``). Another instance of the input-to-an-authorization-decision
+    # class, reached through the record rather than through the grant: the day-file
+    # carries `kind="feedback"` rows, which are the OWNER's verdicts on what the skills
+    # decision chose. An agent that can append there can put a verdict nobody gave into
+    # the record, which is the one reading the feature exists to produce. The keystone next to it
+    # (``decisions_consent.json``) is already read+write sensitive, and sealing the
+    # grant while leaving the record writable would be half a control.
+    #
+    # WRITE-protected, not read+write sensitive: the rows are the machine's own
+    # measurements and reading them is the point -- an owner or an agent asked to
+    # explain a decision should be able to. There is no legitimate agent WRITE:
+    # ``platform_log_append`` opens the file directly and does not route through this
+    # gate, so the gateway keeps recording. The directory is separately mounted
+    # read-only in the sandbox (``sandbox._CREW_READONLY_LEAVES``); that layer covers a
+    # shell, and this one covers the file-edit tool, which is present on every host
+    # whether or not the OS sandbox is.
+    f"{prefix}/decisions"
     for prefix in _CREW_HOME_PREFIXES
 ]
 _WRITE_PROTECTED_HOME_PATHS += [

@@ -8,7 +8,7 @@ import, so pod isolation and test isolation both keep working)::
 
 ``<store name>`` is the readable-plus-digest fold of the unit id that
 ``session_ledger`` and ``work_ledger`` already use, and the raw id lives in the
-header (see :func:`ledger_dir` for why the id is not the directory name). Both
+header (see :func:`crew_log_dir` for why the id is not the directory name). Both
 files carry a ``.lock`` sibling in the same directory.
 
 One dedicated ``crew-log`` root, holding every kind, is what carries the
@@ -77,8 +77,8 @@ from kiro_crew.crew_log.errors import (
     CODE_NO_LEDGER,
     CODE_SEGMENT_GAP,
     CODE_UNKNOWN_ENTRY_TYPE,
+    CrewLogError,
     IndeterminateAppend,
-    LedgerError,
 )
 from kiro_crew.crew_log.lease import LEASE_FILE
 from kiro_crew.crew_log.lease import acquire as acquire_lease
@@ -145,7 +145,7 @@ MAX_PAGE_LIMIT = 500
 DEFAULT_PAGE_LIMIT = 50
 
 #: ``resolve`` outcomes. There is no ``forbidden``: this layer claims no
-#: authorization, so it has none to deny (see :meth:`Ledger.resolve`).
+#: authorization, so it has none to deny (see :meth:`CrewLog.resolve`).
 STATUS_OK = "ok"
 STATUS_GONE = "gone"
 #: The cited span reaches BELOW the oldest surviving segment: retention removed
@@ -168,13 +168,13 @@ def now_ms() -> int:
 # --------------------------------------------------------------------------- #
 
 
-def ledger_root(kind: str) -> Path:
+def crew_log_root(kind: str) -> Path:
     """Root directory holding every crew log of *kind*."""
     return data_home() / _ROOT_LEAF / _ROOT_DIR[require_kind(kind)]
 
 
-def _checked_ledger_root(kind: str) -> Path:
-    """:func:`ledger_root` for *kind*, refused when the directory is not the real one.
+def _checked_crew_log_root(kind: str) -> Path:
+    """:func:`crew_log_root` for *kind*, refused when the directory is not the real one.
 
     Containment (:func:`resolved_within`) resolves its BASE first and then checks
     only that the child stays under the resolved base. That is the right rule for
@@ -198,16 +198,16 @@ def _checked_ledger_root(kind: str) -> Path:
     create it, and the ones that read report their own absence. Only a directory
     that EXISTS and is wrong is refused.
     """
-    root = ledger_root(kind)
+    root = crew_log_root(kind)
     try:
         is_link = root.is_symlink()
     except OSError as exc:  # pragma: no cover -- a stat fault on the parent
-        raise LedgerError(
+        raise CrewLogError(
             f"cannot establish the crew log root {root}: {exc}",
             code=CODE_BAD_ROOT,
         ) from exc
     if is_link:
-        raise LedgerError(
+        raise CrewLogError(
             f"refusing a linked crew log root: {root} is a symbolic link",
             code=CODE_BAD_ROOT,
         )
@@ -220,19 +220,19 @@ def _checked_ledger_root(kind: str) -> Path:
         # spell the link's target and agree, which is the same escape one level up.
         canonical = data_home().resolve() / _ROOT_LEAF / _ROOT_DIR[require_kind(kind)]
     except (OSError, RuntimeError) as exc:
-        raise LedgerError(
+        raise CrewLogError(
             f"cannot resolve the crew log root {root}: {exc}",
             code=CODE_BAD_ROOT,
         ) from exc
     if resolved != canonical:
-        raise LedgerError(
+        raise CrewLogError(
             f"refusing a crew log root outside the data home: {root} resolves to {resolved}",
             code=CODE_BAD_ROOT,
         )
     return root
 
 
-def ledger_dir(kind: str, unit_id: str) -> Path:
+def crew_log_dir(kind: str, unit_id: str) -> Path:
     """The validated directory for one unit's crew log. Does not create it.
 
     The directory is named with the readable-plus-digest fold
@@ -257,9 +257,9 @@ def ledger_dir(kind: str, unit_id: str) -> Path:
     symlink-safely that the resolved path stays under the root.
     """
     require_unit_id(unit_id)
-    resolved = resolved_within(_checked_ledger_root(kind), _store_name(unit_id))
+    resolved = resolved_within(_checked_crew_log_root(kind), _store_name(unit_id))
     if resolved is None:
-        raise LedgerError(
+        raise CrewLogError(
             f"path traversal blocked for crew log id: {unit_id!r}",
             code=CODE_INVALID_ID,
             field="id",
@@ -267,9 +267,9 @@ def ledger_dir(kind: str, unit_id: str) -> Path:
     return resolved
 
 
-def ledger_path(kind: str, unit_id: str) -> Path:
+def crew_log_path(kind: str, unit_id: str) -> Path:
     """The crew log file for one unit."""
-    return ledger_dir(kind, unit_id) / LOG_FILE
+    return crew_log_dir(kind, unit_id) / LOG_FILE
 
 
 def _segment_first_seq(path: Path) -> int | None:
@@ -300,7 +300,7 @@ def segment_paths(kind: str, unit_id: str) -> list[Path]:
     first-seq is IN the name so ordering needs no file read, and so a reader can
     tell a gap at the front (retention) from a gap in the middle (damage).
     """
-    directory = ledger_dir(kind, unit_id)
+    directory = crew_log_dir(kind, unit_id)
     found: list[tuple[int, Path]] = []
     head = directory / LOG_FILE
     if head.is_file():
@@ -333,7 +333,7 @@ def segment_first_seqs(kind: str, unit_id: str) -> list[int]:
 
 
 def _lock_path(kind: str, unit_id: str) -> Path:
-    return ledger_dir(kind, unit_id) / _LOCK_FILE
+    return crew_log_dir(kind, unit_id) / _LOCK_FILE
 
 
 # --------------------------------------------------------------------------- #
@@ -413,16 +413,16 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
     """
     require_kind(kind)
     # The name as WRITTEN, checked before the resolution below follows it.
-    # ``ledger_dir`` returns the RESOLVED path, so a unit directory that is a link
+    # ``crew_log_dir`` returns the RESOLVED path, so a unit directory that is a link
     # to another unit resolves inside the root, passes containment, and hands this
     # function the TARGET -- which is not a link, so checking the resolved path
     # would prove nothing and the removal would delete the other unit's history
     # while reporting this one's id. Refused rather than followed, the same stance
     # ``session_ledger.purge_matching`` takes on a linked store. The CHECKED root,
-    # so this and the ``ledger_dir`` below read the same directory: a linked kind
+    # so this and the ``crew_log_dir`` below read the same directory: a linked kind
     # root would otherwise be refused only on the second read, after this one had
     # already followed it.
-    named = _checked_ledger_root(kind) / _store_name(unit_id)
+    named = _checked_crew_log_root(kind) / _store_name(unit_id)
     if is_link(named):
         logger.warning(
             "crew log retention: %s log %r is a link; refusing to remove what it names",
@@ -430,13 +430,13 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
             unit_id,
         )
         return REMOVE_ABSENT
-    directory = ledger_dir(kind, unit_id)
+    directory = crew_log_dir(kind, unit_id)
     if not directory.is_dir():
         return REMOVE_ABSENT
     lease_path = directory / LEASE_FILE
     try:
         lease_key = acquire_lease(lease_path, kind=kind, unit_id=unit_id, sole=True)
-    except LedgerError as exc:
+    except CrewLogError as exc:
         if exc.code == CODE_ALREADY_OWNED:
             return REMOVE_OWNED
         raise
@@ -515,16 +515,16 @@ def unit_header_slot(kind: str, unit_id: str) -> "str | None":
     """
     require_kind(kind)
     try:
-        named = _checked_ledger_root(kind) / _store_name(unit_id)
+        named = _checked_crew_log_root(kind) / _store_name(unit_id)
         if is_link(named):
             return None
-        directory = ledger_dir(kind, unit_id)
+        directory = crew_log_dir(kind, unit_id)
         segments = [
             (first, child)
             for child in directory.iterdir()
             if (first := _segment_first_seq(child)) is not None
         ]
-    except (LedgerError, OSError):
+    except (CrewLogError, OSError):
         return None
     if not segments:
         return None
@@ -543,6 +543,144 @@ def unit_header_slot(kind: str, unit_id: str) -> "str | None":
         return None
     slot = parsed.get("slot")
     return slot if isinstance(slot, str) and slot else None
+
+
+def unit_dir_for(kind: str, unit_id: str) -> "Path | None":
+    """The unit directory for *unit_id* under *kind*'s root, or None.
+
+    One ``stat``, no read. For the one reader that must find NAMED units ahead
+    of the store's order (the session tree admits the live sessions' logs first,
+    :mod:`kiro_crew.crew_log.tree`). None for an absent directory, a linked entry
+    (it answers for a directory outside the tree), a root the store refuses
+    (:func:`_checked_crew_log_root`) and an id that cannot be named; a caller
+    reads None as "nothing to read here", never as an error.
+    """
+    require_kind(kind)
+    try:
+        named = _checked_crew_log_root(kind) / _store_name(unit_id)
+        if is_link(named) or not named.is_dir():
+            return None
+        return named
+    except (CrewLogError, OSError):
+        return None
+
+
+def unit_dirs(kind: str, *, limit: int, exclude: "Collection[str]" = ()) -> tuple[list[Path], bool]:
+    """Up to *limit* unit directories under *kind*'s root, in the directory's own
+    order, and whether at least one more exists; ``([], False)`` when none. A
+    directory whose name is in *exclude* is neither listed nor counted: the
+    caller already holds it.
+
+    The enumeration for the one reader that looks ACROSS units (the session
+    tree, :mod:`kiro_crew.crew_log.tree`). Bounded in WORK, not only in what it
+    retains: the listing stops as soon as *limit* candidates are in hand and one
+    more has been seen, so a root holding a million unit directories costs the
+    caller *limit* + 1 candidate checks and never a walk of the million. The
+    price is that nothing is said about how many more there are -- only THAT
+    there are -- and that the admitted set follows the directory's iteration
+    order rather than the names: for the tree that is the right trade, since
+    the live sessions' logs are admitted by name ahead of this listing and the
+    closed sessions' logs it lists do not decide anything a row on screen shows.
+    ``([], False)`` alike for an absent root, for a root the store refuses
+    (:func:`_checked_crew_log_root`) and for one that cannot be listed: a reader
+    of many units reports the units it can prove, and a root it cannot vouch
+    for proves none. A linked entry is skipped for the reason
+    :func:`unit_header_slot` skips one -- it answers for a directory outside
+    the tree.
+    """
+    excluded = frozenset(exclude)
+    kept: list[Path] = []
+    try:
+        root = _checked_crew_log_root(kind)
+        if not root.is_dir():
+            return [], False
+        for child in root.iterdir():
+            if child.name in excluded or is_link(child) or not child.is_dir():
+                continue
+            if len(kept) >= max(0, limit):
+                # One past the limit is all the caller needs to know.
+                return kept, True
+            kept.append(child)
+    except (CrewLogError, OSError):
+        return [], False
+    return kept, False
+
+
+def oldest_segment(directory: Path) -> Path | None:
+    """The surviving segment of *directory* with the lowest first seq, or ``None``.
+
+    Where a unit's history starts TODAY: ``log.jsonl`` while it survives,
+    otherwise the lowest-numbered later segment retention left behind. One
+    ``stat`` in the common case: the head segment is checked by name before the
+    directory is listed.
+    """
+    head = directory / LOG_FILE
+    try:
+        if head.is_file():
+            return head
+        found = [
+            (first, child)
+            for child in directory.iterdir()
+            if (first := _segment_first_seq(child)) is not None
+        ]
+    except OSError:
+        return None
+    if not found:
+        return None
+    found.sort(key=lambda pair: pair[0])
+    return found[0][1]
+
+
+def read_head(path: Path) -> "tuple[dict[str, Any] | None, Entry | None, bool]":
+    """Line 1 of *path* parsed as its header object, line 2 as its first entry,
+    and whether a line 2 EXISTS at all.
+
+    Header and entry are ``None`` when absent or when they cannot be delivered
+    intact -- the abort posture of :func:`_read_header_line`, for the same
+    reason: skipping a damaged line 1 would hand back an ENTRY as the header, a
+    wrong answer rather than a missing one. The third value is what lets a
+    caller tell two ``None`` entries apart: a header with NO line behind it is a
+    normal transient (the emitter creates the file and appends
+    ``session/opened`` in two writes, and a read can land between them), while
+    a line that is there and does not parse is damage, and a caller that cached
+    nothing for it would read it again forever.
+
+    A line 2 with no terminator that does not parse is the transient, not the
+    damage: the read landed inside the append, and the same bytes complete on
+    the same inode a moment later. Reporting it as "no line behind the header
+    yet" keeps a caller from caching a refusal it would otherwise hold for as
+    long as the file exists. A terminated line that does not parse, and an
+    unterminated one that does parse (the write landed short of its newline),
+    are both final and reported as such.
+
+    A file that cannot be opened or read raises the :class:`OSError` as is.
+    Every ``None`` above is a verdict on bytes this function saw; a read that
+    failed saw none, and reporting it as damage would let a caller cache a
+    permanent refusal for a moment's I/O fault (or for a unit retention removed
+    between the caller's ``stat`` and this open). The caller decides whether
+    that is a retry next pass or a unit that is gone.
+    """
+    with open(path, "rb") as source:
+        records = iter(strict_raw_records(source, path, cap=MAX_ENTRY_BYTES))
+        try:
+            raw_header = next(records, b"").strip()
+        except UnreadableRecord:
+            return None, None, False
+        header = _parses_to_object(raw_header) if raw_header else None
+        if not header:
+            return None, None, False
+        try:
+            raw_entry = next(records, None)
+        except UnreadableRecord:
+            return header, None, True
+    if raw_entry is None:
+        return header, None, False
+    parsed = _parses_to_object(raw_entry.strip())
+    if parsed is None and not raw_entry.endswith((b"\n", b"\r")):
+        # Mid-append: nothing final to report yet.
+        return header, None, False
+    entry = None if parsed is None else Entry.from_dict(parsed)
+    return header, entry, True
 
 
 def _remove_unit_contents(directory: Path) -> "tuple[int, int]":
@@ -699,13 +837,13 @@ def sweep_expired(retention_days: int, *, now: float | None = None) -> "tuple[in
     if retention_days < 0:
         return (0, 0)
     try:
-        # The CHECKED root, the same one ``ledger_dir`` resolves under. A linked or
+        # The CHECKED root, the same one ``crew_log_dir`` resolves under. A linked or
         # out-of-home kind directory is refused here rather than one unit at a
         # time: the removal itself is already refused downstream, but only after
         # this walk had read a header and a tail from every file under whatever the
         # link named. One refusal reads nothing.
-        children = list(_checked_ledger_root(KIND_SESSION).iterdir())
-    except LedgerError:
+        children = list(_checked_crew_log_root(KIND_SESSION).iterdir())
+    except CrewLogError:
         # A root that EXISTS and is wrong. Not a unit failure -- there is no
         # legitimate unit here to have failed -- so it is reported and the pass
         # ends rather than being counted as work.
@@ -733,7 +871,7 @@ def sweep_expired(retention_days: int, *, now: float | None = None) -> "tuple[in
             status = remove_unit(
                 KIND_SESSION, unit_id, guard=partial(_still_expired, cutoff_ms, unit_id)
             )
-        except (LedgerError, OSError):
+        except (CrewLogError, OSError):
             # One unreadable unit must not stop the pass over the others, and it
             # is not a removal: the unit keeps its history and the next pass sees
             # it again.
@@ -771,7 +909,7 @@ def _expired_unit_id(directory: Path, cutoff_ms: int) -> "str | None":
     ``None`` means leave it alone, and every path to ``None`` is deliberate:
 
     * **No segment, or a header this directory does not answer to.** The id is
-      read from the OLDEST surviving segment, which is where ``Ledger.open``
+      read from the OLDEST surviving segment, which is where ``CrewLog.open``
       resolves it, and it is accepted only if it folds BACK to this directory's
       own name. A directory no id addresses is not removed, because the removal
       would be aimed by id and would resolve somewhere else.
@@ -1221,7 +1359,7 @@ def _covers_span(found: tuple[Entry, ...], from_seq: int, last_seq: int) -> bool
 # --------------------------------------------------------------------------- #
 
 
-class Ledger:
+class CrewLog:
     """One unit's append-only crew log.
 
     Construct through :meth:`create` or :meth:`open`, never directly: both do
@@ -1291,7 +1429,7 @@ class Ledger:
         return self._last_seq
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return f"Ledger(kind={self._kind!r}, id={self._id!r}, last_seq={self._last_seq})"
+        return f"CrewLog(kind={self._kind!r}, id={self._id!r}, last_seq={self._last_seq})"
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -1305,7 +1443,7 @@ class Ledger:
         return any(_has_content(p) for p in segment_paths(kind, unit_id))
 
     @classmethod
-    def create(cls, kind: str, unit_id: str, **header_fields: Any) -> Ledger:
+    def create(cls, kind: str, unit_id: str, **header_fields: Any) -> CrewLog:
         """Write a new crew log's header. Refuses if the file already exists.
 
         The header is PUBLISHED atomically -- temp file, fsync, rename -- while
@@ -1327,16 +1465,16 @@ class Ledger:
         makes "create refuses an existing crew log" true when two processes race.
         """
         kind = require_kind(kind)
-        path = ledger_path(kind, unit_id)
+        path = crew_log_path(kind, unit_id)
         if _has_content(path):
-            raise LedgerError(
+            raise CrewLogError(
                 f"{kind} crew log {unit_id!r} already exists", code=CODE_ALREADY_EXISTS, field="id"
             )
         header = build_header(kind, unit_id, now_ms(), header_fields)
         line = require_entry_line(serialize(header.to_dict()))
         with _open_lock(_lock_path(kind, unit_id)):
             if _has_content(path):
-                raise LedgerError(
+                raise CrewLogError(
                     f"{kind} crew log {unit_id!r} already exists",
                     code=CODE_ALREADY_EXISTS,
                     field="id",
@@ -1353,8 +1491,27 @@ class Ledger:
         )
 
     @classmethod
-    def open(cls, kind: str, unit_id: str, *, repair: bool = False) -> Ledger:
+    def open(
+        cls,
+        kind: str,
+        unit_id: str,
+        *,
+        repair: bool = False,
+        child_gone: "Callable[[str], bool] | None" = None,
+    ) -> CrewLog:
         """Open an existing crew log, repairing a torn tail if there is one.
+
+        ``child_gone`` narrows what ``repair`` is allowed to conclude, and is the
+        only thing that lets it close an unmatched ``subagent/spawned``. A child
+        outlives its asking turn by design, so an unmatched opener does NOT mean
+        the child is finished -- a writer torn down inside a live process can leave
+        one still running and still able to file its own real terminal, which would
+        put two outcomes for one ``agent_id`` in a file nothing rewrites. No fact
+        derivable from the file answers this, and no flag does either: what settles
+        it is the live subagent registry of the process doing the repair, so the
+        caller that holds one passes a predicate over ``agent_id``. Omitted, no
+        child is closed -- the direction that leaves a reader behind rather than
+        wrong.
 
         A zero-byte file answers ``no_ledger``, the same answer ``create`` gives
         it. One meaning for an empty file across both paths is what keeps them
@@ -1386,7 +1543,7 @@ class Ledger:
             candidate for candidate in segment_paths(kind, unit_id) if _has_content(candidate)
         ]
         if not segments:
-            raise LedgerError(
+            raise CrewLogError(
                 f"no {kind} crew log for {unit_id!r}", code=CODE_NO_LEDGER, field="id"
             )
         path = segments[-1]
@@ -1405,7 +1562,7 @@ class Ledger:
             raw = _read_header_line(header_path)
         parsed = None if not raw else _parses_to_object(raw)
         if parsed is None:
-            raise LedgerError(
+            raise CrewLogError(
                 f"{kind} crew log {unit_id!r} has no readable header line",
                 code=CODE_BAD_HEADER,
                 field="type",
@@ -1422,7 +1579,7 @@ class Ledger:
             _mkdir_private(path.parent)
             lease_key = acquire_lease(path.parent / LEASE_FILE, kind=kind, unit_id=unit_id)
             try:
-                if _close_interrupted_tail(kind, unit_id, path):
+                if _close_interrupted_tail(kind, unit_id, path, child_gone=child_gone):
                     # The closers moved the tail, so this object's cached seq has to
                     # be re-read or its first append would collide with them.
                     tail = _scan_tail(path)
@@ -1439,16 +1596,19 @@ class Ledger:
             lease_key=lease_key,
         )
 
-    def repair_interrupted_turn(self) -> int:
+    def repair_interrupted_turn(self, *, child_gone: "Callable[[str], bool] | None" = None) -> int:
         """Close an open turn on this crew log. Returns how many closers landed.
 
         The method form of ``open(repair=True)``, for a caller that already holds
-        a handle. Same rule: only a resume calls it, never a live writer.
+        a handle. Same rule: only a resume calls it, never a live writer. And the
+        same ``child_gone`` meaning: without a predicate an unmatched
+        ``subagent/spawned`` is left open, because nothing else can rule out a live
+        child that is still about to report its own outcome.
         """
         # The closers are appends, so this takes write ownership exactly as one
         # does, and is refused the same way when another process holds the log.
         self._claim()
-        written = _close_interrupted_tail(self._kind, self._id, self._path)
+        written = _close_interrupted_tail(self._kind, self._id, self._path, child_gone=child_gone)
         # Refreshed unconditionally: the repair also TRUNCATES an unreachable chunk
         # group, which changes the tail without writing a closer, and a cached
         # ``last_seq`` past the end of the file would be served to a reader that only
@@ -1535,7 +1695,7 @@ class Ledger:
         if thread is not None and (
             not isinstance(thread, int) or isinstance(thread, bool) or thread < 1
         ):
-            raise LedgerError(
+            raise CrewLogError(
                 f"thread must be a positive seq in this crew log: {thread!r}",
                 code=CODE_BAD_THREAD,
                 field="thread",
@@ -1547,7 +1707,7 @@ class Ledger:
         with _open_lock(_lock_path(self._kind, self._id)):
             tail = _scan_tail(self._path)
             if tail.empty:
-                raise LedgerError(
+                raise CrewLogError(
                     f"no {self._kind} crew log for {self._id!r}",
                     code=CODE_NO_LEDGER,
                     field="id",
@@ -1557,7 +1717,7 @@ class Ledger:
             if thread is not None and (
                 thread > tail.last_seq or not _anchor_exists(self._path, thread, tail)
             ):
-                raise LedgerError(
+                raise CrewLogError(
                     f"thread {thread} names no parseable entry in this crew log "
                     f"(newest seq is {tail.last_seq})",
                     code=CODE_BAD_THREAD,
@@ -1630,7 +1790,7 @@ class Ledger:
         with _open_lock(_lock_path(self._kind, self._id)):
             tail = _scan_tail(self._path)
             if tail.empty:
-                raise LedgerError(
+                raise CrewLogError(
                     f"no {self._kind} crew log for {self._id!r}",
                     code=CODE_NO_LEDGER,
                     field="id",
@@ -1653,7 +1813,7 @@ class Ledger:
                 # that cannot change. A refusal is a loss now, which is the honest
                 # outcome and the one the retention policy already handles.
                 if not isinstance(citing, dict):
-                    raise LedgerError(
+                    raise CrewLogError(
                         f"cite must return an entry mapping, got {type(citing).__name__}",
                         code=CODE_BAD_DATA,
                         field="cite",
@@ -1717,7 +1877,7 @@ class Ledger:
                 continue
             if known is not None and entry.type not in known:
                 if not entry.ignorable:
-                    raise LedgerError(
+                    raise CrewLogError(
                         f"entry {entry.seq} has type {entry.type!r}, which this reader "
                         "does not know and which is not marked ignorable; "
                         "reconstruction stops here",
@@ -1752,14 +1912,14 @@ class Ledger:
                     kind=self._kind,
                     unit_id=self._id,
                 )
-            except LedgerError as exc:
-                raise LedgerError(
+            except CrewLogError as exc:
+                raise CrewLogError(
                     f"segment {path.name} has an invalid header: {exc}",
                     code=CODE_BAD_SEGMENT,
                     field=exc.field,
                 ) from exc
             if segment_header.version != self._header.version:
-                raise LedgerError(
+                raise CrewLogError(
                     f"segment {path.name} has schema version {segment_header.version}, "
                     f"but this crew log uses {self._header.version}",
                     code=CODE_BAD_SEGMENT,
@@ -1769,7 +1929,7 @@ class Ledger:
             declared_first = _segment_first_seq(path)
             actual_first = _read_first_entry_seq(path)
             if actual_first is not None and actual_first != declared_first:
-                raise LedgerError(
+                raise CrewLogError(
                     f"segment {path.name} declares first seq {declared_first} in its filename, "
                     f"but its first entry is seq {actual_first}",
                     code=CODE_BAD_SEGMENT,
@@ -1779,7 +1939,7 @@ class Ledger:
             at_boundary = bool(index) and expected > 0
             for entry in _iter_entries(path):
                 if at_boundary and entry.seq != expected:
-                    raise LedgerError(
+                    raise CrewLogError(
                         f"segment {path.name} starts at seq {entry.seq}, but the "
                         f"previous segment ended at {expected - 1}: the log is not "
                         "contiguous across the boundary",
@@ -1885,11 +2045,11 @@ class Ledger:
         """
         pointer = _as_ref(ref)
         if pointer.unit == self._kind and pointer.id == self._id:
-            target: Ledger | None = self
+            target: CrewLog | None = self
         else:
             try:
-                target = Ledger.open(pointer.unit, pointer.id)
-            except LedgerError as exc:
+                target = CrewLog.open(pointer.unit, pointer.id)
+            except CrewLogError as exc:
                 # Only "there is no such crew log" is `gone`. A crew log that EXISTS
                 # but will not open -- a damaged header, an unreadable segment --
                 # is damage, and answering `gone` for it tells the reader to stop
@@ -1904,7 +2064,7 @@ class Ledger:
             found = tuple(
                 entry for entry in target.iter_from(pointer.from_seq) if entry.seq <= last
             )
-        except LedgerError:
+        except CrewLogError:
             # A missing middle segment or a torn line RAISES out of the read. That
             # is the very condition this method promises to report, so it is
             # answered rather than propagated -- a caller resolving a citation
@@ -2224,24 +2384,69 @@ def _truncate(path: Path, offset: int) -> None:
 STOP_REASON_INTERRUPTED = "interrupted"
 TOOL_STATUS_UNKNOWN = "unknown"
 
+#: The same "not knowable from the record" word, for the two other openers a
+#: session's crew log can be left holding. Only the repair ever writes them: a live
+#: writer always knows what a human decided and how a child ended, so a reader
+#: seeing either value knows it is reading a reconstruction rather than an
+#: observation. Spelled as separate constants because they name different fields
+#: on different types, and a future change to one must not silently move the other.
+APPROVAL_DECISION_UNKNOWN = "unknown"
+SUBAGENT_OUTCOME_UNKNOWN = "unknown"
+
 
 @dataclass(frozen=True)
 class _OpenTail:
-    """What a session log's last turn left open, in first-seen order."""
+    """What a session log was left holding open, in first-seen order.
+
+    ``turn`` is None when the newest turn DID complete and the only thing still
+    open is a child that outlived it -- which is the ordinary shape for a subagent,
+    since a child routinely finishes turns after the one that spawned it.
+
+    ``calls`` and ``approvals`` are turn-scoped: both belong to the turn that
+    opened them and cannot outlive it, so they are collected only from inside an
+    open turn. ``children`` is FILE-scoped for the opposite reason -- a child's
+    whole point is that it runs past its asking turn, so scoping its closer to the
+    open turn would leave exactly the common case unclosed.
+    """
 
     turn: Any
     calls: tuple[dict[str, Any], ...]
     last_time: int
+    approvals: tuple[dict[str, Any], ...] = ()
+    children: tuple[dict[str, Any], ...] = ()
 
 
-def _open_tail(path: Path) -> "tuple[_OpenTail | None, str | None]":
+def _open_tail(
+    path: Path, *, child_gone: "Callable[[str], bool] | None" = None
+) -> "tuple[_OpenTail | None, str | None]":
     """The unbalanced tail and why a repair fold skipped a record, if it did.
 
-    Unbalanced means the newest ``turn/started`` has no ``turn/completed`` after
-    it: the writer stopped mid-turn. Unmatched ``tool/called`` entries are
-    collected only from INSIDE that turn -- an unmatched call in a turn that did
-    complete is a different anomaly, and inventing a result for it here would be
-    this reader editing history it was not asked about.
+    Three kinds of opener can be left unbalanced, and they are NOT scoped alike.
+
+    A ``turn/started`` with no later ``turn/completed`` means the writer stopped
+    mid-turn. Unmatched ``tool/called`` and ``approval/requested`` entries are
+    collected only from INSIDE that turn: both are turn-scoped by construction --
+    a call completes within its turn, and an approval is decided in the same
+    ``finally`` that the turn's own path runs through -- so an unmatched one in a
+    turn that DID complete is a different anomaly, and inventing an outcome for it
+    here would be this reader editing history it was not asked about.
+
+    An unmatched ``subagent/spawned`` is collected across the WHOLE file instead,
+    because a child is deliberately not turn-scoped: it starts, steers and reports
+    long after its asking turn ended, so the ordinary dangling case is a child
+    whose turn completed normally. Scoping it to the open turn would close only the
+    rare child that died inside its own turn and leave every common one open
+    forever.
+
+    Children are kept only when *child_gone* says so, and that asymmetry is the
+    point. "The writer is gone" is what a repair knows, and for a turn-scoped
+    opener that settles it -- the turn died with its writer. It does NOT settle a
+    child: a child outlives the turn that asked for it BY DESIGN, so a writer
+    torn down inside a live process can leave a child still running, still able to
+    file its own real terminal. Closing it from here would put two outcomes for one
+    ``agent_id`` in a file nothing rewrites. Nothing in the file distinguishes the
+    two, so the question goes to the caller's live subagent registry; with no
+    predicate the answer is "still running" and the opener stands.
 
     This fold feeds a mutation, so it reports every record the ordinary reader
     would skip. A repair cannot distinguish a truly open turn from one whose real
@@ -2251,6 +2456,8 @@ def _open_tail(path: Path) -> "tuple[_OpenTail | None, str | None]":
     open_turn: Any = None
     last_time = 0
     calls: dict[str, dict[str, Any]] = {}
+    approvals: dict[str, dict[str, Any]] = {}
+    children: dict[str, dict[str, Any]] = {}
     skipped: str | None = None
     try:
         with open(path, "rb") as source:
@@ -2266,9 +2473,11 @@ def _open_tail(path: Path) -> "tuple[_OpenTail | None, str | None]":
                 if entry.type == "turn/started":
                     open_turn = data.get("turn")
                     calls = {}
+                    approvals = {}
                 elif entry.type == "turn/completed":
                     open_turn = None
                     calls = {}
+                    approvals = {}
                 elif entry.type == "tool/called" and open_turn is not None:
                     call_id = data.get("call_id")
                     if isinstance(call_id, str) and call_id and call_id not in calls:
@@ -2281,14 +2490,56 @@ def _open_tail(path: Path) -> "tuple[_OpenTail | None, str | None]":
                     call_id = data.get("call_id")
                     if isinstance(call_id, str):
                         calls.pop(call_id, None)
+                elif entry.type == "approval/requested" and open_turn is not None:
+                    approval_id = data.get("approval_id")
+                    if (
+                        isinstance(approval_id, str)
+                        and approval_id
+                        and approval_id not in approvals
+                    ):
+                        approvals[approval_id] = {"approval_id": approval_id}
+                elif entry.type == "approval/decided" and open_turn is not None:
+                    approval_id = data.get("approval_id")
+                    if isinstance(approval_id, str):
+                        approvals.pop(approval_id, None)
+                elif entry.type == "subagent/spawned":
+                    agent_id = data.get("agent_id")
+                    if isinstance(agent_id, str) and agent_id and agent_id not in children:
+                        children[agent_id] = {"agent_id": agent_id}
+                elif entry.type in ("subagent/completed", "subagent/failed"):
+                    agent_id = data.get("agent_id")
+                    if isinstance(agent_id, str):
+                        children.pop(agent_id, None)
     except FileNotFoundError:
         return None, None
     except UnreadableRecord as exc:
         skipped = skipped or str(exc)
-    if open_turn is None:
+    # An unmatched opener says the file never recorded an outcome; only the caller
+    # can say whether one is still COMING. Without a predicate nothing is closed,
+    # and a predicate that raises is read as "still running" -- both leave the
+    # opener standing, which is the direction that loses nothing a reader cannot
+    # recover. Asking per surviving opener rather than per entry keeps the question
+    # to the children that are actually unbalanced.
+    if child_gone is None:
+        children.clear()
+    else:
+        for agent_id in list(children):
+            try:
+                gone = child_gone(agent_id)
+            except Exception:
+                gone = False
+            if not gone:
+                children.pop(agent_id, None)
+    if open_turn is None and not children:
         return None, skipped
     return (
-        _OpenTail(turn=open_turn, calls=tuple(calls.values()), last_time=last_time),
+        _OpenTail(
+            turn=open_turn,
+            calls=tuple(calls.values()),
+            last_time=last_time,
+            approvals=tuple(approvals.values()),
+            children=tuple(children.values()),
+        ),
         skipped,
     )
 
@@ -2296,9 +2547,16 @@ def _open_tail(path: Path) -> "tuple[_OpenTail | None, str | None]":
 def _closer_entries(tail: _OpenTail, first_seq: int) -> list[Entry]:
     """The closers for *tail*, in the order they are appended.
 
-    Unmatched calls first, then the turn -- a turn cannot be closed while a call
-    inside it is still open, so closing them the other way round would produce a
-    record no live writer could ever have produced.
+    Approvals, then unmatched calls, then children, then the turn. The order is
+    the one a LIVE writer could have produced: an approval is decided before the
+    call it gates completes, and a turn cannot be closed while a call inside it is
+    still open, so closing them the other way round would produce a record no live
+    writer could ever have produced.
+
+    The turn closer is written only when a turn was actually open. A child that
+    outlived a completed turn leaves this function with children and no turn, and
+    appending a ``turn/completed`` there would close a turn that already closed
+    itself.
 
     Every closer reuses the LAST REAL entry's ``time``. A closer describes
     something that happened when the writer stopped, not when a later process
@@ -2309,6 +2567,21 @@ def _closer_entries(tail: _OpenTail, first_seq: int) -> list[Entry]:
     """
     entries: list[Entry] = []
     seq = first_seq
+    for approval in tail.approvals:
+        entries.append(
+            Entry(
+                type="approval/decided",
+                seq=seq,
+                time=tail.last_time,
+                src="gateway",
+                data={
+                    "turn": tail.turn,
+                    "approval_id": approval["approval_id"],
+                    "decision": APPROVAL_DECISION_UNKNOWN,
+                },
+            )
+        )
+        seq += 1
     for call in tail.calls:
         entries.append(
             Entry(
@@ -2326,26 +2599,64 @@ def _closer_entries(tail: _OpenTail, first_seq: int) -> list[Entry]:
             )
         )
         seq += 1
-    entries.append(
-        Entry(
-            type="turn/completed",
-            seq=seq,
-            time=tail.last_time,
-            src="gateway",
-            data={"turn": tail.turn, "stop_reason": STOP_REASON_INTERRUPTED},
+    for child in tail.children:
+        # No `turn`: `subagent/failed` carries none, because a child's outcome is
+        # not an event of any one turn -- which is the same reason its opener is
+        # matched across the whole file rather than inside the open turn.
+        entries.append(
+            Entry(
+                type="subagent/failed",
+                seq=seq,
+                time=tail.last_time,
+                src="gateway",
+                data={
+                    "agent_id": child["agent_id"],
+                    "outcome": SUBAGENT_OUTCOME_UNKNOWN,
+                },
+            )
         )
-    )
+        seq += 1
+    if tail.turn is not None:
+        entries.append(
+            Entry(
+                type="turn/completed",
+                seq=seq,
+                time=tail.last_time,
+                src="gateway",
+                data={"turn": tail.turn, "stop_reason": STOP_REASON_INTERRUPTED},
+            )
+        )
     return entries
 
 
-def _close_interrupted_tail(kind: str, unit_id: str, path: Path) -> int:
-    """Append closers for an interrupted turn. Returns how many were written.
+def _close_interrupted_tail(
+    kind: str,
+    unit_id: str,
+    path: Path,
+    *,
+    child_gone: "Callable[[str], bool] | None" = None,
+) -> int:
+    """Append closers for an interrupted tail. Returns how many were written.
 
     Session logs only, and RESUME ONLY. A crash, a SIGKILL or a pod eviction
-    leaves the newest turn open, and every later reader then has to carry the same
-    special case: is this turn still running, or did its writer die? Closing the
-    tail when the crew log is LOADED after an interruption answers that once, in the
+    leaves openers unbalanced, and every later reader then has to carry the same
+    special case: is this still running, or did its writer die? Closing the tail
+    when the crew log is LOADED after an interruption answers that once, in the
     record, instead of in each reader.
+
+    Two openers are closed on any repair, each with the "not knowable from the
+    record" word its own type already uses: an unmatched ``tool/called`` and an
+    unmatched ``approval/requested``, both turn-scoped, both settled by the one
+    thing a repair knows -- that the writer is gone.
+
+    A third, ``subagent/spawned``, is closed only for an ``agent_id`` the caller's
+    *child_gone* predicate reports finished. A child is not turn-scoped, so a
+    writer torn down inside a LIVE process can leave a child still running and
+    still able to file its own real terminal; closing it from here would put two
+    outcomes for one ``agent_id`` in a file nothing rewrites. Only the repairing
+    process's own registry of running children can rule that out. This can
+    therefore fire on a file whose newest turn completed normally and whose only
+    open thing is a child that outlived it.
 
     "Loaded after an interruption" is the whole precondition, which is why this is
     never reached from a plain ``open``. An open turn is indistinguishable from a
@@ -2373,7 +2684,7 @@ def _close_interrupted_tail(kind: str, unit_id: str, path: Path) -> int:
         # Check the fold before any content-aware repair. A damaged completion can
         # look exactly like an open turn once the ordinary reader skips it, and a
         # closer appended from that fold would state an outcome no writer observed.
-        opened, skipped = _open_tail(path)
+        opened, skipped = _open_tail(path, child_gone=child_gone)
         if skipped is not None:
             _refuse_content_repair(unit_id, skipped)
             return 0
@@ -2393,7 +2704,7 @@ def _close_interrupted_tail(kind: str, unit_id: str, path: Path) -> int:
                 first_seq,
                 last_seq,
             )
-            opened, skipped = _open_tail(path)
+            opened, skipped = _open_tail(path, child_gone=child_gone)
             if skipped is not None:
                 _refuse_content_repair(unit_id, skipped)
                 return 0
@@ -2407,7 +2718,7 @@ def _close_interrupted_tail(kind: str, unit_id: str, path: Path) -> int:
             needs_newline = False
             written += 1
     logger.info(
-        "closed an interrupted turn in session log %r: %d closer(s) appended",
+        "closed an interrupted tail in session log %r: %d closer(s) appended",
         unit_id,
         written,
     )

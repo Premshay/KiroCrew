@@ -915,8 +915,15 @@ def test_the_work_server_is_exempt_from_that_exclusion(worker_from_installed_def
 
 def test_the_unassignable_set_is_derived_from_the_registry(monkeypatch):
     """Derived rather than listed, so an opt-in server added tomorrow is withheld by
-    default instead of reaching the worker until somebody notices."""
-    assert agent._worker_unassignable_servers() == frozenset({"kirocrew-dashboard"})
+    default instead of reaching the worker until somebody notices.
+
+    ``kirocrew-crew-log`` is the case that exercised it: a read-only opt-in server
+    added later, withheld from the mirror with no edit here beyond widening this
+    assertion. A worker has no use for another session's crew log -- its own channel
+    to its conductor is the work ledger."""
+    assert agent._worker_unassignable_servers() == frozenset(
+        {"kirocrew-dashboard", "kirocrew-crew-log"}
+    )
     monkeypatch.setitem(
         agent._MANAGED_MCP_SERVERS,
         "kirocrew-hypothetical",
@@ -1924,7 +1931,7 @@ def test_a_re_derive_during_the_hosts_own_pre_spawn_work_does_not_kill_the_sessi
     rt._work_dir = tmp_path / "wd"
     rt._model = None
     rt._sandbox_mode = "auto"
-    rt._private_memory = False
+    rt._member_context = False
     # ``_harness`` is a cached property over the backend, so the stub is installed
     # through the cache slot the runtime itself fills.
     rt._harness_resolved = _EditingHarness()
@@ -3030,7 +3037,7 @@ def _runtime_for_create_session(monkeypatch, tmp_path, sent, terminated):
     rt._agent = "kirocrew"
     rt._crew_agent = "kirocrew"
     rt._work_dir = tmp_path / "wd"
-    rt._private_memory = False
+    rt._member_context = False
     rt._native_launch_sources = {}
     rt._mcp_gateway_overlay = None
     rt._agent_capabilities = {}

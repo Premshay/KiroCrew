@@ -32,7 +32,8 @@ import threading
 import time
 import uuid
 import webbrowser
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -141,6 +142,7 @@ from kiro_crew.dashboard.handlers.usage import (
     read_context_tokens,
     read_effective_agent,
 )
+from kiro_crew.dashboard.listener_guard import listener_guard_exit_code
 from kiro_crew.dashboard.origin import (
     build_dashboard_url,
     format_dashboard_urls,
@@ -182,6 +184,7 @@ from kiro_crew.executors import (
     subprocess_executor,
 )
 from kiro_crew.frontend import build_frontend_async
+from kiro_crew.gateway_restart import resolve_restart_launcher
 from kiro_crew.gateway_shutdown_budget import GRACEFUL_SHUTDOWN_SECS
 from kiro_crew.heartbeat import (
     HEARTBEAT_TASK_TIMEOUT_SECS,
@@ -544,6 +547,39 @@ def _delivery_result(
     if wake_message is not None:
         return result
     return result is MonitorDispatchResult.DISPATCHED
+
+
+@dataclass(frozen=True)
+class _DmDispatchAdapter:
+    """What ONE dispatcher-routed DM channel supplies to the shared fire path.
+
+    A channel whose nudge is delivered by synthesizing an inbound message and
+    handing it to that channel's real dispatcher differs from its siblings in
+    five places and nowhere else. Everything around those five -- the guard
+    ladder, the envelope, the turn timeout, when a loop is retired, and how a
+    result is spelled -- is the same reasoning for every such channel, so it
+    lives once in :meth:`GatewayOrchestrator._fire_dm_nudge` instead of being
+    re-derived per channel.
+
+    ``channel`` keys ``dashboard_state.channel_transports`` and names the
+    channel in logs. ``supports_monitor`` says whether the channel can carry a
+    structured monitor wake: a channel without one is only ever asked for a
+    plain nudge, so it never sees a ``wake_message``. ``authorize`` is the
+    fire-time allow-list re-check, which each channel spells against a
+    different object. ``resolve_conversation`` answers where the synthetic turn
+    lands. ``build_inbound`` mints that channel's own inbound type.
+
+    The three callables take the transport and dispatcher rather than closing
+    over them because a channel's transport is resolved per fire, not once at
+    construction: a gateway can start, stop and restart one channel while a
+    loop stays armed across all of it.
+    """
+
+    channel: str
+    supports_monitor: bool
+    authorize: Callable[[Any, Any, str], bool]
+    resolve_conversation: Callable[[Any, Any, str, str], Awaitable[str]]
+    build_inbound: Callable[[str, str, str], Any]
 
 
 # Budget for awaiting the in-flight run-marker write during shutdown. Bounded
@@ -1112,6 +1148,71 @@ async def _await_cron_fire_time_gate(
     # was never made.
     job.run_never_started = False
     return reason, False
+
+
+#: Env-var names a cron job's own ``env`` map may never deliver to the spawned
+#: session, stripped in :func:`cron_job_env_without_reserved`. Reserved names
+#: match case-insensitively while allowed keys keep their declared case.
+#:
+#: ``job.env`` comes from an app manifest's ``crons[].env`` block, which
+#: ``apps.manifest.CronEntry.from_dict`` copies verbatim -- keys are stringified,
+#: never screened -- so every name here is one whose VALUE decides how the run is
+#: governed rather than what it does:
+#:
+#: * ``KIROCREW_APPROVAL_MODE`` is re-injected by the caller when the job's own
+#:   VALIDATED ``approval_mode`` is "auto"; delivered through ``job.env`` instead,
+#:   it auto-approves an interactive cron's ``spawn_run`` subagents.
+#: * ``KIROCREW_SECURITY_POLICY`` and ``KIROCREW_ADMISSION_POLICY`` name the FILE
+#:   the governance and admission ceilings are read from.
+#:   ``platform.governance`` resolves that env path as a tier ABOVE the operator's
+#:   own ``security_policy.json`` and the two are mutually exclusive
+#:   (first-present-wins), so a job-supplied path replaces the operator's ceiling
+#:   for the scheduled agent and every MCP server it starts, rather than
+#:   tightening it.
+#: * ``KIROCREW_HOME`` picks the same ceiling one level up: ``config.paths`` reads
+#:   it to resolve the data home, and ``governance._policy_home_path`` resolves
+#:   ``security_policy.json`` under that home, so a job-supplied home points the
+#:   ceiling read at a directory the job controls. It reaches the child even
+#:   though the policy-path pair would not, because ``KIROCREW_HOME`` is absent
+#:   from ``sandbox._AGENT_DENIED_ENV_KEYS`` while the
+#:   ``KIROCREW_POLICY_*`` fetch family is in it.
+#: * ``KIROCREW_PROFILE`` picks WHICH ceiling is composed at all:
+#:   ``platform.resolve_profile`` reads it, and a job-supplied ``standalone``
+#:   drops the companion edition's overlay, so an operation the enterprise
+#:   ceiling denies resolves as permitted. It is forwarded to first-party app
+#:   backends on purpose (``apps/backend.py``), which is the gateway's own value
+#:   and untouched here.
+#:
+#: Stripped HERE, at the untrusted-input seam, and deliberately not in the agent
+#: spawn's own env scrub: the gateway's ``os.environ`` copy of each of these is
+#: the OPERATOR's value, and a child that inherits nothing at all resolves the
+#: standalone ungoverned ceiling, which is open where deny-by-default is open.
+#: Removing them from every child would therefore drop a real operator ceiling;
+#: removing them from ``job.env`` drops only what an app asked for.
+#:
+#: Reserved names match case-insensitively: ``CronEntry.from_dict`` keeps a
+#: manifest key's case verbatim, and a Windows child resolves ``kirocrew_home``
+#: and ``KIROCREW_HOME`` as one variable.
+_CRON_RESERVED_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "KIROCREW_APPROVAL_MODE",
+        "KIROCREW_SECURITY_POLICY",
+        "KIROCREW_ADMISSION_POLICY",
+        "KIROCREW_HOME",
+        "KIROCREW_PROFILE",
+    }
+)
+
+
+def cron_job_env_without_reserved(job_env: dict[str, str] | None) -> dict[str, str]:
+    """Return *job_env* minus :data:`_CRON_RESERVED_ENV_KEYS`.
+
+    A module-level function rather than a comprehension inside the caller's
+    closure so the seam has a name a test can drive: the property it carries is
+    about an untrusted map reaching a spawned session, and a closure is reachable
+    only by standing a whole gateway up.
+    """
+    return {k: v for k, v in (job_env or {}).items() if k.upper() not in _CRON_RESERVED_ENV_KEYS}
 
 
 async def _pre_create_cron_slot(dashboard_state: "DashboardState", job: CronJob) -> None:
@@ -2897,12 +2998,13 @@ class GatewayOrchestrator:
         logger.warning("Missing deps %s — installing directly", missing)
         print(f"👻 Installing missing dependencies: {', '.join(missing)}")
         proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--quiet",
-            *missing,
+            *platform_compat.isolated_python_argv(
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                *missing,
+            ),
             cwd=proj,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -2999,13 +3101,13 @@ class GatewayOrchestrator:
         # carve-out outside the sealed runtime parent would be refused anyway.
         try:
             argv, env, cleanup = await sandboxed_spawn_argv_async(
-                [
-                    sys.executable,
+                platform_compat.isolated_python_argv(
                     str(Path(dep_sync_file).resolve()),
                     "--repair-missing-package",
                     str(proj),
                     str(venv_py),
-                ],
+                    force_isolation=True,
+                ),
                 mode="strict",
                 env=os.environ.copy(),
                 strip_python_env=True,
@@ -3419,6 +3521,15 @@ class GatewayOrchestrator:
 
         # Trigger skill extraction when sessions expire (idle/orphan)
         self.sessions.on_session_expire = self.consolidator.consolidate_session
+
+        # Same expiry paths, the other direction: a parent with a completion
+        # injection in flight must not be expired under it. This counter is the
+        # only witness in the window between committing the injected turn and
+        # acquiring the session, which is why the three reset sites in this file
+        # consult it too.
+        self.sessions.set_injection_probe(
+            lambda key: self._cron_injecting.get(key, 0) > 0,
+        )
 
         # Channel history buffer. data_home(), not config_dir(): this method is
         # async and config_dir() re-runs start-of-process maintenance (mkdir,
@@ -4273,8 +4384,36 @@ class GatewayOrchestrator:
             session_key, msg = build_cron_session_context(job)
 
             from kiro_crew.cron import resolve_cron_memory
+            from kiro_crew.execution_context import execution_for_store, execution_from_record
 
-            cron_memory_store, cron_agent = await asyncio.to_thread(resolve_cron_memory, job)
+            # Snapshot the job before yielding; reloading a cron cannot rebind it.
+            cron_agents = list(job.agent_sequence)
+            if job.execution_context is not None:
+                cron_execution = execution_from_record({"execution_context": job.execution_context})
+            else:
+                legacy_selection = CronJob(
+                    id=job.id,
+                    name=job.name,
+                    message=job.message,
+                    member_id=job.member_id,
+                    memory_store=job.memory_store,
+                    agent_id=job.agent_id,
+                )
+
+                def resolve_legacy_execution():
+                    # Both calls can load configuration. The worker sees only
+                    # captured selectors, never the scheduler's mutable job.
+                    resolve_cron_memory(legacy_selection, validate_memory_files=False)
+                    return execution_for_store(
+                        legacy_selection.memory_store,
+                        template_id=legacy_selection.agent_id or "kirocrew",
+                    )
+
+                cron_execution = await asyncio.to_thread(resolve_legacy_execution)
+            cron_memory_store, cron_agent = (
+                cron_execution.store.legacy_name,
+                cron_execution.template_id,
+            )
 
             # ── Concurrent execution guard ──
             if (job.script or job.command) and job.id in self._running_script_ids:
@@ -5117,8 +5256,11 @@ class GatewayOrchestrator:
                 "auto". Otherwise an app manifest could set it directly in
                 ``job.env`` and have an interactive cron's spawn_run subagents
                 silently auto-approved -- an authorization bypass.
+
+                The two governance policy-path vars are reserved for the same
+                reason, and the strip set is ``_CRON_RESERVED_ENV_KEYS``.
                 """
-                env = {k: v for k, v in (job.env or {}).items() if k != "KIROCREW_APPROVAL_MODE"}
+                env = cron_job_env_without_reserved(job.env)
                 if job.approval_mode == "auto":
                     env["KIROCREW_APPROVAL_MODE"] = "auto"
                 return env or None
@@ -5131,42 +5273,23 @@ class GatewayOrchestrator:
                 Returns (client, is_new, resumed, downgraded)."""
 
                 assert self.sessions is not None
+                from kiro_crew.execution_context import bind_session_execution
+
+                await asyncio.to_thread(bind_session_execution, key, cron_execution)
                 modes = getattr(self.ctx_builder, "_session_memory_modes", None)
                 if isinstance(modes, dict):
+                    # A separately scheduled run is durable work, not a child
+                    # conversation. Only this trusted dispatch admits its key.
                     from kiro_crew.messaging.privacy_mode import strictest
                     from kiro_crew.subagent_persistence import bind_session_memory_mode
                     from kiro_crew.workflows.registry import _await_owned
 
-                    # A separately scheduled run is durable work, not a child
-                    # conversation. Only this trusted dispatch admits its key.
                     publication = asyncio.create_task(
-                        asyncio.to_thread(bind_session_memory_mode, key, "persistent")
+                        asyncio.to_thread(bind_session_memory_mode, key, cron_execution.memory_mode)
                     )
                     admitted_mode = await _await_owned(publication)
                     modes[key] = (
                         strictest((admitted_mode, modes.get(key, "persistent"))) or "persistent"
-                    )
-                if cron_memory_store:
-                    from kiro_crew.context import prepare_store_vectors
-                    from kiro_crew.member_memory_auth import bind_private_session_store
-                    from kiro_crew.memory_stores import memory_store_version
-
-                    log = getattr(self.ctx_builder, "conversation_log", None)
-                    if log is None:
-                        raise RuntimeError(
-                            "memory_unavailable: cannot persist scheduled member identity"
-                        )
-                    # resolve_cron_memory validated the persisted member task;
-                    # the transcript only mirrors this trusted assignment.
-                    if await asyncio.to_thread(memory_store_version, cron_memory_store) == 2:
-                        await asyncio.to_thread(bind_private_session_store, key, cron_memory_store)
-                    await asyncio.to_thread(
-                        log.update_metadata,
-                        key,
-                        {"memory_store": cron_memory_store, "agent": job.member_id},
-                    )
-                    await prepare_store_vectors(
-                        self.ctx_builder, cron_memory_store, session_key=key
                     )
                 try:
                     client, is_new, resumed = await self.sessions.get_or_create(
@@ -5212,7 +5335,7 @@ class GatewayOrchestrator:
             # ── Sequential agent execution ──
             # When agent_sequence has multiple agents, run them sequentially
             # with per-agent session keys and per-job env vars.
-            agents = job.agent_sequence if job.agent_sequence else []
+            agents = cron_agents
             if agent_sequence_dispatches(agents):
                 assert self.sessions is not None
                 assert self.ctx_builder is not None
@@ -5273,6 +5396,7 @@ class GatewayOrchestrator:
                             interactive=False,
                             agent=agent,
                             memory_store=cron_memory_store or None,
+                            execution_context=cron_execution,
                             context_provider=client,
                             resumed=_resumed,
                             needs_reinjection=_seq_reinjection,
@@ -5451,6 +5575,7 @@ class GatewayOrchestrator:
                     interactive=False,
                     agent=cron_agent or None,
                     memory_store=cron_memory_store or None,
+                    execution_context=cron_execution,
                     context_provider=client,
                     resumed=_resumed,
                     needs_reinjection=_needs_reinjection,
@@ -5529,7 +5654,7 @@ class GatewayOrchestrator:
                         _turn_usage,
                         provider=_provider,
                         surface="cron",
-                        agent=read_effective_agent(client) or job.agent_id or "",
+                        agent=read_effective_agent(client) or cron_agent or "",
                         context_used=_used,
                         context_window=_window,
                         elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
@@ -6710,61 +6835,97 @@ class GatewayOrchestrator:
                 logger.warning("AutoNudge: failed to persist nudge turn for %s", key, exc_info=True)
         return _delivery_result(wake_message, MonitorDispatchResult.DISPATCHED)
 
-    async def _fire_discord_nudge(
-        self, loop: NudgeLoop, wake_message: str | None = None
+    async def _fire_dm_nudge(
+        self,
+        loop: NudgeLoop,
+        adapter: _DmDispatchAdapter,
+        wake_message: str | None = None,
     ) -> bool | MonitorDispatchResult:
-        """Drive one unattended nudge turn in a Discord DM session.
+        """Drive one unattended nudge turn in a dispatcher-routed DM session.
 
-        Synthesizes an ``InboundMessage`` and routes it through the Discord
-        dispatcher — the exact path a real DM takes — so busy/steer/queue
-        handling, rendering, chunking, and persistence behave like a user
-        turn. ``interpret_commands=False`` keeps the nudge from being parsed
-        as a ``!command``.
+        Shared by every channel that delivers a nudge the way a real DM arrives:
+        synthesize that channel's inbound type and hand it to the channel's own
+        dispatcher, so busy/steer/queue handling, rendering, chunking and
+        persistence behave like a user turn. ``interpret_commands=False`` keeps
+        the nudge text from being read as a command.
+
+        Four guards run before anything is delivered, and they are this caller's
+        responsibility rather than the transport's precisely because a synthetic
+        injection never passes through ``transport.receive``:
+
+        1. The channel's transport and dispatcher are running. A gateway can
+           have the channel disabled or still starting, which is a SKIP: the
+           loop is fine and the next cycle may find the transport up.
+        2. The binding key has the direct-message shape
+           ``<channel>:{agent}:direct:{principal}[:genN]``. Any other shape
+           cannot name a principal, so the loop can never fire and is retired.
+        3. The principal is still on the inbound allow-list. The create
+           endpoint checks it too, but an allow-list can SHRINK after a loop is
+           armed, so the check is repeated here at fire time.
+        4. The session generation still matches. A ``new``-style command mints a
+           fresh key; firing into the rotated one would run in a session with
+           none of the loop's context, and a stop issued from there could never
+           find this loop. Retire instead of firing into the wrong generation.
+
+        Then a busy session is a SKIP rather than a queue, so a cycle is not
+        counted while the human's own turn is running.
+
+        A retirement only happens for a plain nudge (``wake_message is None``).
+        A structured monitor wake reports ``UNAVAILABLE`` and leaves the
+        monitor's own lifecycle to decide, since the controller owns that
+        record. Every outcome returns through :func:`_delivery_result`, so a
+        caller asking for a plain nudge reads a bool and a caller carrying a
+        wake reads the typed result.
         """
         key = loop.slot_key
-        transports = getattr(self.dashboard_state, "channel_transports", None) or {}
-        transport = transports.get("discord")
-        dispatcher = transport.dispatcher if transport is not None else None
-        if transport is None or dispatcher is None:
-            logger.info("AutoNudge skip: discord transport not running (loop %s)", loop.id)
-            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
-        # Key shape: discord:{agent}:direct:{user_id}[:genN]
-        parts = key.split(":")
-        if len(parts) < 4 or parts[2] != "direct":
-            logger.warning("AutoNudge: unsupported discord key %s — removing loop %s", key, loop.id)
-            if self.autonudge_svc and wake_message is None:
-                await self.autonudge_svc.remove(loop.id)
-            return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
-        user_id = parts[3]
-        # Defense-in-depth: re-check the inbound allowlist at fire time (the
-        # create endpoint enforces it too, but the allowlist can shrink after
-        # a loop was created). Synthetic injection bypasses transport.receive,
-        # so authorization is this caller's responsibility — mirrors
-        # on_interaction's _authorized re-check. Uses the dispatcher's public
-        # injection surface; a missing method raises loudly instead of
-        # silently retiring the loop.
-        if not dispatcher.is_authorized(user_id):
-            logger.warning(
-                "AutoNudge: discord user %s not authorized — removing loop %s",
-                user_id,
+        channel = adapter.channel
+        if wake_message is not None and not adapter.supports_monitor:
+            # Fail closed BEFORE delivering. A channel with no structured
+            # dispatch cannot report whether the wake landed, so delivering it
+            # and then answering UNAVAILABLE would show the text to the reader
+            # while the controller treats the wake as undelivered and sends it
+            # again. Refusing first keeps the two in agreement.
+            logger.info(
+                "AutoNudge: %s carries no monitor dispatch, refusing wake for loop %s",
+                channel,
                 loop.id,
             )
+            return MonitorDispatchResult.UNAVAILABLE
+        transports = getattr(self.dashboard_state, "channel_transports", None) or {}
+        transport = transports.get(channel)
+        dispatcher = transport.dispatcher if transport is not None else None
+        if transport is None or dispatcher is None:
+            logger.info(
+                "AutoNudge skip: %s transport not running (loop %s)",
+                channel,
+                loop.id,
+            )
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+
+        async def _retire(reason: str, *args: Any) -> bool | MonitorDispatchResult:
+            logger.warning("AutoNudge: " + reason, *args)
             if self.autonudge_svc and wake_message is None:
                 await self.autonudge_svc.remove(loop.id)
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
-        # Generation guard: the dispatcher derives the CURRENT key for this
-        # user (dm_scope + `!new` generation). If it no longer matches the
-        # loop's stored key, the monitored conversation is gone — a synthetic
-        # turn would run in a fresh session with none of the loop's context,
-        # and autonudge_stop from that new session could never find this
-        # loop. Retire it instead of firing into the wrong generation.
+
+        parts = key.split(":")
+        if len(parts) < 4 or parts[2] != "direct":
+            return await _retire("unsupported %s key %s, removing loop %s", channel, key, loop.id)
+        principal = parts[3]
+        if not adapter.authorize(transport, dispatcher, principal):
+            return await _retire("%s user not authorized, removing loop %s", channel, loop.id)
         try:
-            current_key = dispatcher.current_session_key(user_id)
+            current_key = dispatcher.current_session_key(principal)
         except Exception:
+            # A dispatcher that cannot answer is not evidence of rotation, so
+            # treat the key as current and let the busy check and the dispatch
+            # itself decide. Failing closed here would retire a healthy loop on
+            # a transient lookup error.
             current_key = key
         if current_key != key:
             logger.info(
-                "AutoNudge: discord session rotated (%s -> %s) — removing loop %s",
+                "AutoNudge: %s session rotated (%s -> %s), removing loop %s",
+                channel,
                 key,
                 current_key,
                 loop.id,
@@ -6774,8 +6935,14 @@ class GatewayOrchestrator:
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         sessions = getattr(dispatcher, "sessions", None)
         if sessions is not None and sessions.is_busy(key):
-            logger.info("AutoNudge skip: discord session %s busy (loop %s)", key, loop.id)
+            logger.info(
+                "AutoNudge skip: %s session %s busy (loop %s)",
+                channel,
+                key,
+                loop.id,
+            )
             return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+
         if wake_message is None:
             msg_body = await compose_nudge_body(
                 loop.message, loop.stop_sentinel_path, loop.slot_key
@@ -6783,33 +6950,33 @@ class GatewayOrchestrator:
             tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
         else:
             tagged = wake_message
+
         try:
-            conversation_id = await transport.resolve_conversation(user_id)
+            conversation_id = await adapter.resolve_conversation(
+                transport, sessions, key, principal
+            )
         except Exception:
             logger.exception(
-                "AutoNudge: discord conversation lookup failed for %s (loop %s)",
+                "AutoNudge: %s conversation lookup failed for %s (loop %s)",
+                channel,
                 key,
                 loop.id,
             )
             return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+
         completion_hook: MonitorCompletionHook | None = None
         try:
-            synthetic = InboundMessage(
-                channel_type="discord",
-                user_id=user_id,
-                conversation_id=conversation_id,
-                text=tagged,
-            )
+            synthetic = adapter.build_inbound(principal, conversation_id, tagged)
             dispatch_kwargs: dict[str, Any] = {"interpret_commands": False}
-            completion_hook = self._monitor_completion_hook(loop)
-            if wake_message is not None and completion_hook is None:
-                return MonitorDispatchResult.UNAVAILABLE
-            if completion_hook is not None:
-                dispatch_kwargs["monitor_completion"] = completion_hook
-                dispatch_kwargs["monitor_session_key"] = key
-            dispatch = dispatcher.handle_message(synthetic, **dispatch_kwargs)
+            if adapter.supports_monitor:
+                completion_hook = self._monitor_completion_hook(loop)
+                if wake_message is not None and completion_hook is None:
+                    return MonitorDispatchResult.UNAVAILABLE
+                if completion_hook is not None:
+                    dispatch_kwargs["monitor_completion"] = completion_hook
+                    dispatch_kwargs["monitor_session_key"] = key
             dispatch_result = await asyncio.wait_for(
-                dispatch,
+                dispatcher.handle_message(synthetic, **dispatch_kwargs),
                 timeout=_NUDGE_TURN_TIMEOUT,
             )
             if wake_message is not None:
@@ -6822,108 +6989,111 @@ class GatewayOrchestrator:
                 return dispatch_result is MonitorDispatchResult.DISPATCHED
             return True
         except Exception:
-            logger.exception("AutoNudge: discord nudge failed for %s (loop %s)", key, loop.id)
+            logger.exception(
+                "AutoNudge: %s nudge failed for %s (loop %s)",
+                channel,
+                key,
+                loop.id,
+            )
             if wake_message is None:
                 return False
             if completion_hook is not None and completion_hook.accepted:
                 return MonitorDispatchResult.DISPATCHED
             return MonitorDispatchResult.UNAVAILABLE
 
+    async def _fire_discord_nudge(
+        self, loop: NudgeLoop, wake_message: str | None = None
+    ) -> bool | MonitorDispatchResult:
+        """Drive one unattended nudge turn in a Discord DM session.
+
+        The guard ladder and the delivery live in :meth:`_fire_dm_nudge`; this
+        supplies only what is specific to Discord. Authorization is asked of the
+        DISPATCHER here, which is the object holding Discord's inbound
+        allow-list, and it mirrors the re-check ``on_interaction`` performs.
+        """
+        return await self._fire_dm_nudge(
+            loop,
+            _DmDispatchAdapter(
+                channel="discord",
+                supports_monitor=True,
+                authorize=lambda _transport, dispatcher, principal: bool(
+                    dispatcher.is_authorized(principal)
+                ),
+                resolve_conversation=(
+                    lambda transport, _sessions, _key, principal: transport.resolve_conversation(
+                        principal
+                    )
+                ),
+                build_inbound=lambda principal, conversation_id, text: InboundMessage(
+                    channel_type="discord",
+                    user_id=principal,
+                    conversation_id=conversation_id,
+                    text=text,
+                ),
+            ),
+            wake_message,
+        )
+
     async def _fire_webex_nudge(self, loop: NudgeLoop) -> bool:
         """Drive one unattended nudge turn in a Webex DM session.
 
-        Sibling of :meth:`_fire_discord_nudge`, with the same four guards and for
-        the same reasons: a synthetic injection bypasses ``transport.receive``, so
-        authorization, the generation check and the busy check are this caller's
-        responsibility rather than the transport's.
+        The guard ladder and the delivery live in :meth:`_fire_dm_nudge`; this
+        supplies only what is specific to Webex. Two of those three pieces carry
+        a reason worth keeping beside them.
 
-        The nudge is routed through the dispatcher — the exact path a real DM
-        takes — so queue/steer handling, rendering, byte-safe chunking and
-        persistence all behave like a user turn. ``interpret_commands=False``
-        keeps the nudge text from being parsed as a ``/command``.
+        Authorization is asked of the TRANSPORT, not the dispatcher, because the
+        Webex allow-list is held there.
+
+        The room is read from the persisted origin link when there is one.
+        Webex's ``resolve_conversation`` answers with the EMAIL, which its send
+        path maps onto ``toPersonEmail``, so it delivers correctly but is a
+        SECOND spelling of the same room. An origin bind is matched by VALUE
+        (see ``_origin_mirror_link``), so a nudge that writes the link in that
+        other spelling makes a later ``/unlink`` miss the binding. The persisted
+        link therefore wins, and the email is the first-turn fallback, where no
+        binding exists to disagree with yet.
+
+        Webex carries no structured-monitor dispatch, so ``supports_monitor`` is
+        False and this path is only ever asked for a plain nudge.
         """
-        key = loop.slot_key
-        transports = getattr(self.dashboard_state, "channel_transports", None) or {}
-        transport = transports.get("webex")
-        dispatcher = transport.dispatcher if transport is not None else None
-        if transport is None or dispatcher is None:
-            logger.info("AutoNudge skip: webex transport not running (loop %s)", loop.id)
-            return False
-        # Key shape: webex:{agent}:direct:{email}[:genN]
-        parts = key.split(":")
-        if len(parts) < 4 or parts[2] != "direct":
-            logger.warning("AutoNudge: unsupported webex key %s — removing loop %s", key, loop.id)
-            if self.autonudge_svc:
-                await self.autonudge_svc.remove(loop.id)
-            return False
-        email = parts[3]
-        # Defence in depth: the create endpoint checks the allow-list too, but it
-        # can shrink after a loop was created, and a synthetic turn never passes
-        # through the transport's own gate.
-        if not transport.is_authorized(email):
-            logger.warning("AutoNudge: webex user not authorized — removing loop %s", loop.id)
-            if self.autonudge_svc:
-                await self.autonudge_svc.remove(loop.id)
-            return False
-        # Generation guard: a `/new` mints a new key, and firing into the rotated
-        # one would run in a fresh session with none of the loop's context — and
-        # an `autonudge_stop` from that session could never find this loop.
-        try:
-            current_key = dispatcher.current_session_key(email)
-        except Exception:
-            current_key = key
-        if current_key != key:
-            logger.info("AutoNudge: webex session rotated — removing loop %s", loop.id)
-            if self.autonudge_svc:
-                await self.autonudge_svc.remove(loop.id)
-            return False
-        sessions = getattr(dispatcher, "sessions", None)
-        if sessions is not None and sessions.is_busy(key):
-            logger.info("AutoNudge skip: webex session busy (loop %s)", loop.id)
-            return False
-        # The SHARED fire-path composer, same as the slack/discord/dashboard
-        # adapters: it applies the {{STOP_FILE}} substitution and prefixes the
-        # session's durable work-ledger snapshot, so a Webex loop starts each cycle
-        # from that state rather than from transcript memory. Calling the bare
-        # template substitution instead would silently opt this channel out of the
-        # ledger — the one feature whose whole point is surviving context loss.
-        msg_body = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
-        tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
-        # Imported HERE, not at module scope: this file is on the gateway boot
-        # path, and it deliberately keeps every channel client behind
-        # TYPE_CHECKING so enabling one channel does not cost every launch the
-        # import of all of them. Reached only when a Webex loop actually fires.
-        from kiro_crew.webex.client import WebexInbound
-        from kiro_crew.webex.transport import ROOM_DIRECT
 
-        try:
-            # The room this conversation is actually being read in, so the synthetic
-            # turn rebinds the SAME origin location a real message would. Webex's
-            # ``resolve_conversation`` answers with the EMAIL — its send path maps an
-            # email-shaped id onto ``toPersonEmail`` — which delivers correctly but is
-            # a SECOND spelling of "this room", and the origin bind is matched by
-            # value (see ``_origin_mirror_link``): a nudge-written link in that
-            # spelling makes a later ``/unlink`` miss the binding. So the persisted
-            # link wins when there is one, and the email is only the first-turn
-            # fallback, where no binding exists to disagree with yet.
+        async def _resolve(transport: Any, sessions: Any, key: str, principal: str) -> str:
             existing = sessions.get_origin_link(key) if sessions is not None else None
-            room_id = getattr(existing, "channel_id", "") or await transport.resolve_conversation(
-                email
-            )
-            synthetic = WebexInbound(
-                person_email=email,
-                room_id=room_id,
-                text=tagged,
+            room = getattr(existing, "channel_id", "")
+            if room:
+                return str(room)
+            return str(await transport.resolve_conversation(principal))
+
+        def _build(principal: str, conversation_id: str, text: str) -> Any:
+            # Imported HERE, not at module scope: this file is on the gateway
+            # boot path, and it deliberately keeps every channel client behind
+            # TYPE_CHECKING so enabling one channel does not cost every launch
+            # the import of all of them. Reached only when a Webex loop fires.
+            from kiro_crew.webex.client import WebexInbound
+            from kiro_crew.webex.transport import ROOM_DIRECT
+
+            return WebexInbound(
+                person_email=principal,
+                room_id=conversation_id,
+                text=text,
                 room_type=ROOM_DIRECT,
             )
-            await asyncio.wait_for(
-                dispatcher.handle_message(synthetic, interpret_commands=False),
-                timeout=_NUDGE_TURN_TIMEOUT,
-            )
-            return True
-        except Exception:
-            logger.exception("AutoNudge: webex nudge failed (loop %s)", loop.id)
-            return False
+
+        result = await self._fire_dm_nudge(
+            loop,
+            _DmDispatchAdapter(
+                channel="webex",
+                supports_monitor=False,
+                authorize=lambda transport, _dispatcher, principal: bool(
+                    transport.is_authorized(principal)
+                ),
+                resolve_conversation=_resolve,
+                build_inbound=_build,
+            ),
+        )
+        # A plain nudge always normalizes to a bool through _delivery_result.
+        assert isinstance(result, bool)
+        return result
 
     async def _stop_message_loop_if_structural_terminal(
         self,
@@ -8525,6 +8695,15 @@ class GatewayOrchestrator:
 
             if not _flush_only:
                 await _broadcast_subagent_status(info, "done")
+                # Wake anything waiting on this parent's wave (the autopilot
+                # stage loop) BEFORE the injection below, which can take
+                # minutes: ``info.done`` is already True by here — the terminal
+                # report sets it ahead of this announce — so the waiter's own
+                # re-read of the running set sees the same state a poll would
+                # have, just without the wait. Pulsing after the injection would
+                # reintroduce exactly the latency this removes.
+                if self.subagent_mgr:
+                    self.subagent_mgr.signal_completion(info.parent_session_key)
             # Three-way outcome: a user stop is neutral — neither a success nor
             # a failure. The record contract keeps ``error`` unset for stops, so
             # every consumer below must branch on ``user_stopped`` explicitly
@@ -9923,8 +10102,66 @@ class GatewayOrchestrator:
             on_orphan_dm=_orphan_dm,
             completion_keep=self._cfg.agent.completion_keep,
             completion_keep_chars=self._cfg.agent.completion_keep_chars,
+            # Rows that survived the restart are claimed by the manager's pump,
+            # which the reaper start below kicks as soon as the loop yields --
+            # that yield is ``run()``'s memory barrier. Hold the pump until
+            # ``_start_subagent_dispatch_after_memory_ready`` opens it.
+            defer_queue_dispatch=True,
         )
         self.subagent_mgr.start_reaper()
+
+    async def _start_subagent_dispatch_after_memory_ready(self) -> None:
+        """Open the durable subagent queue only after the memory fence completes.
+
+        A recovered run prepares its memory store first, so admitting it during
+        the barrier either fails it on ``MemoryStartupUnavailable`` or starts it
+        without its learned memory. Same shape as the cron and heartbeat guards:
+        an unprepared fence is a programming error here, not a wait.
+        """
+        if self.subagent_mgr is None:
+            return
+        startup = getattr(self, "_memory_startup", None)
+        if startup is not None and (startup.stopped or not startup.ready):
+            raise RuntimeError(
+                "Subagent queue dispatch cannot start before memory preparation completes"
+            )
+        self.subagent_mgr.release_queue_dispatch()
+
+    def _register_child_liveness(self) -> None:
+        """Give the crew log's repair a way to ask whether a child still runs.
+
+        The repair may close an unmatched ``subagent/spawned`` only for a child
+        with no outcome still coming, and this manager is the only thing that
+        knows which children are still running. It is registered from here rather
+        than inside the emitter, which cannot reach the manager -- the dependency
+        already runs in this direction, since the subagent side is what calls the
+        emitters.
+
+        Called AFTER the ``KIROCREW_READY`` print and never from an ``_init_*`` on
+        the boot path. Importing the emitter pulls the crew log store in with it, and
+        the ``no-new-work-on-gateway-boot-path`` rule counts an optional, flag-off
+        subsystem's import as boot work whatever the handler checks later; gating
+        the import behind the flag would satisfy the rule only while the flag is
+        off. Nothing needs the probe before this point: the repair runs when a
+        session opens its crew log, which is after readiness.
+
+        Registered UNCONDITIONALLY once here, because the flag is read at emit time
+        and a probe installed while the crew log is off costs nothing, while making
+        the registration itself conditional would leave a later flag flip with no
+        probe and a repair free to close a live child.
+        """
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        def _child_still_running(agent_id: str) -> bool:
+            mgr = self.subagent_mgr
+            if mgr is None:
+                # No registry to consult, so this cannot report a child finished.
+                # "Nothing is running" would be the same answer as a genuinely
+                # empty registry and would let the repair close a live child.
+                return True
+            return any(info.id == agent_id for info in mgr.running)
+
+        crew_log_emit.set_child_liveness(_child_still_running)
 
     def _start_adaptive_controller(self, cfg: KiroCrewConfig | None = None) -> None:
         """Run the adaptive concurrency controller beside the subagent manager.
@@ -10414,6 +10651,7 @@ class GatewayOrchestrator:
         """Restore and open the already-wired memory objects after readiness."""
         from kiro_crew.context import reset_memory_caches
         from kiro_crew.memory_backup import apply_pending_member_restores
+        from kiro_crew.memory_stores import repair_legacy_member_stores
 
         startup = self._memory_startup
         if startup is None:
@@ -10424,6 +10662,17 @@ class GatewayOrchestrator:
                     assert self.ctx_builder is not None
                     memory = self.ctx_builder.memory
                     reset_memory_caches(memory)
+                    # The gateway's one run of the pre-identity member store
+                    # upgrade. The CLI prologue skips `gateway` because the boot
+                    # path admits no new work before the dashboard socket accepts
+                    # requests; this worker runs after readiness, before pending
+                    # restores and before any consumer resolves a member. A no-op
+                    # when nothing needs repair; never raises.
+                    upgraded = repair_legacy_member_stores()
+                    if upgraded:
+                        logger.info("Upgraded member memory stores: %s", ", ".join(upgraded))
+                    if startup.stopped:
+                        return False
                     restored = apply_pending_member_restores(
                         should_stop=lambda: startup.stopped, on_error=startup.fail_store
                     )
@@ -11520,6 +11769,8 @@ class GatewayOrchestrator:
         """
         logger.info("Update applied, preparing a callback-safe gateway restart")
         self._pending_update_respawn = respawn
+        launcher = await asyncio.to_thread(resolve_restart_launcher)
+        exe = await asyncio.to_thread(respawn) if launcher is None else None
         if self.dashboard_state:
             self.dashboard_state.push_update_progress("restarting", "Preparing safe restart…")
             from kiro_crew.dashboard.chat import save_all_slots_to_history
@@ -11539,13 +11790,11 @@ class GatewayOrchestrator:
                     exc_info=True,
                 )
         # Same reason as the dashboard restart path: os.execv does not drain the
-        # safety-override writer. Resolve the successor executable before the
-        # final fence too; no await is permitted between the final drain and exec.
+        # safety-override writer. No await is permitted between final drain and exec.
         try:
             await asyncio.to_thread(flush_breadcrumb_writes, 2.0)
         except Exception:
             logger.debug("Breadcrumb flush before update restart failed", exc_info=True)
-        exe = await asyncio.to_thread(respawn)
 
         if not await self._drain_update_callback_work(timeout=self._UPDATE_DRAIN_TIMEOUT_SECS):
             self._update_apply_deferred = True
@@ -11576,7 +11825,10 @@ class GatewayOrchestrator:
         await self._drain_update_callback_work(timeout=None)
         logger.info("Update callback drain complete, restarting gateway")
         self._pending_update_respawn = None
-        platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
+        if launcher is not None:
+            platform_compat.reexec_launcher(launcher, sys.argv[1:])
+        else:
+            platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
 
     async def _check_for_updates_legacy(self) -> None:
         """Legacy update check — the existing layout-aware logic."""
@@ -12474,12 +12726,13 @@ class GatewayOrchestrator:
                 # internal-index dependency.
                 core_deps = [pip for _mod, pip in self._REQUIRED_DEPS]
                 fallback = await asyncio.create_subprocess_exec(
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--quiet",
-                    *core_deps,
+                    *platform_compat.isolated_python_argv(
+                        "-m",
+                        "pip",
+                        "install",
+                        "--quiet",
+                        *core_deps,
+                    ),
                     cwd=proj,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -13037,7 +13290,8 @@ class GatewayOrchestrator:
         # built by the dashboard server). AFTER the READY print, not before it:
         # the coordinator's first build runs `rebuild()` over every waiting row,
         # and `test_memory_startup` pins that no such work precedes readiness.
-        # Nothing dispatches in between -- the dashboard workers and cron start
+        # Nothing dispatches in between -- the subagent pump is held closed
+        # (``defer_queue_dispatch``) and the dashboard workers and cron start
         # further down, after the memory barrier.
         await self._ensure_subagent_coordinator()
         self._wire_runner_admission()
@@ -13054,7 +13308,16 @@ class GatewayOrchestrator:
             # Also off-loop for the health wiring the controller start does: the
             # pass above binds no coordinator when it wired no admission.
             await self._ensure_subagent_coordinator()
+            # Memory is prepared and the store is bound: the durable rows that
+            # survived the restart may start now.
+            await self._start_subagent_dispatch_after_memory_ready()
             self._start_adaptive_controller()
+            # The manager exists and readiness is past, so the session ledger's
+            # repair can be given its child-liveness probe. Before the dashboard
+            # workers and cron start, so no session can open a ledger and repair
+            # it while the probe is missing -- which would let the repair close a
+            # child that is still running.
+            self._register_child_liveness()
 
         # Persisted Crew work and legacy channel agents can dispatch providers
         # immediately when resumed, so start them only after the shared memory
@@ -13396,7 +13659,14 @@ class GatewayOrchestrator:
         # gateway for hours on exactly this path. The watchdog has already
         # returned (True on the vanish path) by the time it sets the event, so
         # its task result is the signal; see shutdown_exit_code.
-        exit_code = shutdown_exit_code(watchdog)
+        #
+        # The listener guard is the other self-initiated shutdown: it set the
+        # event because the TCP listener died and could not be rebound, so the
+        # process was alive but unreachable. That state must never be an
+        # exit 0 either -- the supervisor has to relaunch it.
+        exit_code = shutdown_exit_code(watchdog) or listener_guard_exit_code(
+            getattr(self.dashboard_state, "_listener_guard", None)
+        )
 
         # Drop this gateway's run-marker BEFORE _shutdown() releases the
         # listener: once the port is free a replacement gateway can bind it
@@ -14286,6 +14556,8 @@ _SLICE_LIMITS_TASK: "asyncio.Task[None] | None" = None
 _AGENTS_JANITOR_TASK: "asyncio.Task[None] | None" = None
 #: Strong ref for the liveness-keyed agent-scratch sweep loop.
 _AGENT_SCRATCH_SWEEP_TASK: "asyncio.Task[None] | None" = None
+#: Strong ref for the kiro-cli log cap loop.
+_KIRO_CLI_LOG_CAP_TASK: "asyncio.Task[None] | None" = None
 
 
 async def run_gateway(
@@ -14414,6 +14686,28 @@ async def run_gateway(
 
         _AGENT_SCRATCH_SWEEP_TASK = asyncio.create_task(
             _run_agent_scratch_sweep(), name="agent-scratch-sweep"
+        )
+
+    # ── kiro-cli log cap (fire-and-forget, every 5 minutes) ──
+    # Each spawned kiro-cli logs into its own scratch dir (agent_scratch
+    # .scratch_env pins KIRO_CHAT_LOG_FILE there) and never bounds that log
+    # while running; at KIRO_LOG_LEVEL=debug one process writes ~40 MiB a
+    # minute for as long as it lives. The hourly sweep above is too slow for
+    # that rate, so this loop rotates any oversized log in place. Same
+    # posture: offloaded, fail-open, sleep-first, skipped in test_mode.
+    global _KIRO_CLI_LOG_CAP_TASK
+    if not test_mode:
+
+        async def _run_kiro_cli_log_cap() -> None:
+            while True:
+                await asyncio.sleep(agent_scratch.KIRO_CLI_LOG_CAP_INTERVAL_SECONDS)
+                try:
+                    await asyncio.to_thread(agent_scratch.cap_kiro_cli_logs)
+                except Exception:
+                    logging.getLogger(__name__).debug("kiro-cli log cap failed", exc_info=True)
+
+        _KIRO_CLI_LOG_CAP_TASK = asyncio.create_task(
+            _run_kiro_cli_log_cap(), name="kiro-cli-log-cap"
         )
 
     # ── Anonymous usage beacon (at most one HTTP GET per day) ──

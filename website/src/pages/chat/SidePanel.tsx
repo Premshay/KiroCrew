@@ -4,34 +4,7 @@ import { useDevMode } from '../../hooks/useDevMode'
 import { usePointerDrag } from '../../hooks/usePointerDrag'
 import { useLongPressReorder } from '../../hooks/useLongPressReorder'
 import { Reorder } from 'framer-motion'
-import {
-  FileText,
-  Bot,
-  Workflow,
-  ScrollText,
-  MessageCircleQuestionMark,
-  TerminalSquare,
-  GitCompare,
-  GitPullRequest,
-  GitBranch,
-  Plus,
-  MoreHorizontal,
-  X,
-  Hash,
-  Pen,
-  Columns2,
-  Component,
-  Globe,
-  CircleDot,
-  Folder,
-  Folders,
-  Link as LinkIcon,
-  PanelRight,
-  PanelBottom,
-  Layers,
-  ListTree,
-  Pin,
-} from 'lucide-react'
+import { FileText, Bot, Workflow, ScrollText, MessageCircleQuestionMark, TerminalSquare, GitCompare, GitPullRequest, GitBranch, History, Plus, MoreHorizontal, X, Hash, Pen, Columns2, Component, Globe, CircleDot, Folder, Folders, Link as LinkIcon, PanelRight, PanelBottom, Layers, ListTree, Pin } from 'lucide-react'
 import { PanelRightLight } from '../../components/icons/panels'
 import ActivityViewer from './ActivityViewer'
 import DiffPanel from '../../components/DiffPanel'
@@ -47,20 +20,12 @@ import CliPanel, {
   useDeleteTerminalSession,
 } from '../../components/CliPanel'
 import { countLines } from '../../components/FileChangeChips'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { useTerminalEnabled, useTerminalTitle } from '../../utils/terminalRegistry'
 import type { usePanelTabs, ViewKind, PanelTab, TabKind } from '../../hooks/usePanelTabs'
 import { PINNED_VIEWS, useAllAppTabs } from '../../hooks/usePanelTabs'
-import {
-  usePanelTabDescriptors,
-  useInstalledApps,
-  panelTabDescriptor,
-  isPanelTabKind,
-  type PanelTabDescriptor,
-} from '../../hooks/panelTabRegistry'
-import ErrorNotice from '../../components/ErrorNotice'
-import { errMessage } from '../../utils/thunkError'
+import { usePanelTabDescriptors, useInstalledApps, panelTabDescriptor, isPanelTabKind, type PanelTabDescriptor } from '../../hooks/panelTabRegistry'
 import AppHost from '../../components/AppHost'
 import { appIcon } from '../../apps/appIcons'
 import { scrollMemoryKeyFor } from '../../hooks/useScrollMemory'
@@ -75,6 +40,10 @@ import {
   DropdownMenuSeparator,
 } from '../../components/ui/dropdown-menu'
 import { safeSetItem } from '../../utils/safeStorage'
+import { ContentSkeleton } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
+import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS } from '../../utils/fileReadQuery'
+import { errMessage } from '../../utils/thunkError'
 import { useAppSelector } from '../../store'
 import { selectSlotSubagents, selectSlotToolLog } from '../../store/chatSlice'
 import { mcpAppKey } from '../../store/chatSlice'
@@ -89,18 +58,8 @@ import { i18nT } from '../../i18n/t'
 // — their icon comes from the manifest descriptor via `iconForKind` instead.
 type BuiltinTabKind = Exclude<TabKind, `app:${string}`>
 const KIND_ICON: Record<BuiltinTabKind, ReactNode> = {
-  changes: <GitPullRequest size={16} />,
-  issues: <CircleDot size={16} />,
-  files: <Folders size={16} />,
-  links: <LinkIcon size={16} />,
-  artifacts: <Component size={16} />,
-  subagents: <Bot size={16} />,
-  workflows: <Workflow size={16} />,
-  logs: <ScrollText size={16} />,
-  context: <Layers size={16} />,
-  side: <MessageCircleQuestionMark size={16} />,
-  terminal: <TerminalSquare size={16} />,
-  browser: <Globe size={16} />,
+  changes: <GitPullRequest size={16} />, issues: <CircleDot size={16} />, files: <Folders size={16} />, links: <LinkIcon size={16} />, artifacts: <Component size={16} />, subagents: <Bot size={16} />, workflows: <Workflow size={16} />,
+  logs: <ScrollText size={16} />, crewlog: <History size={16} />, context: <Layers size={16} />, side: <MessageCircleQuestionMark size={16} />, terminal: <TerminalSquare size={16} />, browser: <Globe size={16} />,
   summary: <ListTree size={16} />,
   pins: <Pin size={16} />,
   file: <FileText size={16} />,
@@ -146,6 +105,7 @@ export const NEW_MENU_LABEL_KEY: Record<ViewKind | 'terminal', string> = {
   subagents: 'pages.chat.sidePanel.menu_subagents',
   workflows: 'pages.chat.sidePanel.menu_workflows',
   logs: 'pages.chat.sidePanel.menu_logs',
+  crewlog: 'pages.chat.sidePanel.menu_crewlog',
   context: 'pages.chat.sidePanel.menu_context',
   side: 'pages.chat.sidePanel.menu_side',
   browser: 'pages.chat.sidePanel.menu_browser',
@@ -164,6 +124,7 @@ export const NEW_MENU_DESC_KEY: Record<ViewKind | 'terminal', string> = {
   subagents: 'pages.chat.sidePanel.menu_subagents_desc',
   workflows: 'pages.chat.sidePanel.menu_workflows_desc',
   logs: 'pages.chat.sidePanel.menu_logs_desc',
+  crewlog: 'pages.chat.sidePanel.menu_crewlog_desc',
   context: 'pages.chat.sidePanel.menu_context_desc',
   side: 'pages.chat.sidePanel.menu_side_desc',
   browser: 'pages.chat.sidePanel.menu_browser_desc',
@@ -194,71 +155,58 @@ export const NEW_MENU_DESC_KEY: Record<ViewKind | 'terminal', string> = {
  *  Every key of `NEW_MENU_LABEL_KEY` must appear exactly once across the
  *  groups — `sidePanelAddMenu.test.tsx` pins that partition, so adding a view
  *  without placing it in a group fails rather than silently dropping it. */
-const NEW_MENU_GROUPS: { id: string; items: { kind: ViewKind | 'terminal'; icon: ReactNode }[] }[] =
-  [
-    // Session output — what this chat referenced or produced. (Changes / Files /
-    // Artifacts are auto-pinned and filtered out below; they are listed here so
-    // this table stays the complete catalog of views.)
-    {
-      id: 'session-output',
-      items: [
-        { kind: 'summary', icon: <ListTree size={15} /> },
-        { kind: 'pins', icon: <Pin size={15} /> },
-        { kind: 'changes', icon: <GitPullRequest size={15} /> },
-        { kind: 'issues', icon: <CircleDot size={15} /> },
-        { kind: 'files', icon: <Folders size={15} /> },
-        { kind: 'links', icon: <LinkIcon size={15} /> },
-        { kind: 'artifacts', icon: <Component size={15} /> },
-        { kind: 'subagents', icon: <Bot size={15} /> },
-        { kind: 'workflows', icon: <Workflow size={15} /> },
-        { kind: 'git', icon: <GitBranch size={15} /> },
-      ],
-    },
-    // Interactive workspaces — the surfaces the user types into. Terminal is a
-    // per-chat shell: its tab lives in this chat's panel state, so it comes and
-    // goes with the session, unlike the app-wide dock terminal in the nav rail.
-    {
-      id: 'workspaces',
-      items: [
-        { kind: 'side', icon: <MessageCircleQuestionMark size={15} /> },
-        { kind: 'browser', icon: <Globe size={15} /> },
-        { kind: 'terminal', icon: <TerminalSquare size={15} /> },
-      ],
-    },
-    // Diagnostics.
-    {
-      id: 'diagnostics',
-      items: [
-        { kind: 'logs', icon: <ScrollText size={15} /> },
-        { kind: 'context', icon: <Layers size={15} /> },
-      ],
-    },
-  ]
+const NEW_MENU_GROUPS: { id: string; items: { kind: ViewKind | 'terminal'; icon: ReactNode }[] }[] = [
+  // Session output — what this chat referenced or produced. (Changes / Files /
+  // Artifacts are auto-pinned and filtered out below; they are listed here so
+  // this table stays the complete catalog of views.)
+  {
+    id: 'session-output',
+    items: [
+      { kind: 'summary', icon: <ListTree size={15} /> },
+      { kind: 'pins', icon: <Pin size={15} /> },
+      { kind: 'changes', icon: <GitPullRequest size={15} /> },
+      { kind: 'issues', icon: <CircleDot size={15} /> },
+      { kind: 'files', icon: <Folders size={15} /> },
+      { kind: 'links', icon: <LinkIcon size={15} /> },
+      { kind: 'artifacts', icon: <Component size={15} /> },
+      { kind: 'subagents', icon: <Bot size={15} /> },
+      { kind: 'workflows', icon: <Workflow size={15} /> },
+      { kind: 'git', icon: <GitBranch size={15} /> },
+    ],
+  },
+  // Interactive workspaces — the surfaces the user types into. Terminal is a
+  // per-chat shell: its tab lives in this chat's panel state, so it comes and
+  // goes with the session, unlike the app-wide dock terminal in the nav rail.
+  {
+    id: 'workspaces',
+    items: [
+      { kind: 'side', icon: <MessageCircleQuestionMark size={15} /> },
+      { kind: 'browser', icon: <Globe size={15} /> },
+      { kind: 'terminal', icon: <TerminalSquare size={15} /> },
+    ],
+  },
+  // Diagnostics.
+  {
+    id: 'diagnostics',
+    items: [
+      { kind: 'logs', icon: <ScrollText size={15} /> },
+      { kind: 'context', icon: <Layers size={15} /> },
+      { kind: 'crewlog', icon: <History size={15} /> },
+    ],
+  },
+]
 
-const VIEW_KINDS = new Set<TabKind>([
-  'changes',
-  'issues',
-  'links',
-  'files',
-  'artifacts',
-  'subagents',
-  'workflows',
-  'logs',
-  'context',
-  'side',
-  'git',
-  'summary',
-  'pins',
-])
+const VIEW_KINDS = new Set<TabKind>(['changes', 'issues', 'links', 'files', 'artifacts', 'subagents', 'workflows', 'logs', 'crewlog', 'context', 'side', 'git', 'summary', 'pins'])
 
 /** Views behind the Developer Mode consent gate (Settings > Developer) — the
- *  same gate the standalone Developer page uses. Both are raw instrumentation
- *  of the agent's own execution (the session's tool-call log, and the context
- *  window's composition) rather than anything the session produced, so neither
- *  belongs in a non-developer's menu. Gating BOTH empties the diagnostics group
+ *  same gate the standalone Developer page uses. All three are raw
+ *  instrumentation of the agent's own execution (the session's tool-call log,
+ *  the context window's composition, and the folds over the session's crew log)
+ *  rather than anything the session produced, so none belongs in a
+ *  non-developer's menu. Gating all of them empties the diagnostics group
  *  outright when Developer Mode is off — which is exactly the empty-group case
  *  `newMenuSections` drops. */
-const DEV_ONLY_VIEWS = new Set<ViewKind | 'terminal'>(['logs', 'context'])
+const DEV_ONLY_VIEWS = new Set<ViewKind | 'terminal'>(['logs', 'context', 'crewlog'])
 
 /** Which `+`-menu entries are offered, given the gates that hide entries:
  *  Terminal is hidden when the feature is disabled server-side, the
@@ -720,13 +668,15 @@ export default function SidePanel({
   )
   // Terminal opens a NEW tab (its own PTY session) starting in the chat's
   // working dir; every other menu item is a singleton view.
-  const openMenuItem = useCallback(
-    (kind: ViewKind | 'terminal') => {
-      if (kind === 'terminal') openTerminal({ cwd: projectDir })
-      else openView(kind)
-    },
-    [openTerminal, openView, projectDir],
-  )
+  // Spawn a terminal whose cwd is the chat's project directory. Shared with the
+  // Files header's per-project quick action (issue #1142) so the two entry
+  // points cannot drift on WHERE the shell starts — that cwd is the whole point
+  // of the affordance.
+  const openProjectTerminal = useCallback(() => { openTerminal({ cwd: projectDir }) }, [openTerminal, projectDir])
+  const openMenuItem = useCallback((kind: ViewKind | 'terminal') => {
+    if (kind === 'terminal') openProjectTerminal()
+    else openView(kind)
+  }, [openProjectTerminal, openView])
   // Closing a terminal tab kills its PTY (server) and disposes local state. The
   // server delete goes through a React Query mutation (use-react-query
   // guideline); the synchronous WS + xterm teardown stays in disposeTerminalSession.
@@ -1220,6 +1170,12 @@ export default function SidePanel({
                     onFileOpen?.(abs, { diffMode: diff, line: opts?.line })
                   }
                   onAddToContext={onAddToContext}
+                  // Withheld, not disabled, when the terminal feature is off or
+                  // the host withdraws the terminal view — the same withdrawal
+                  // that removes Terminal from the + menu must remove its
+                  // per-project shortcut, or the button promises a shell this
+                  // panel will not open.
+                  onOpenTerminal={terminalEnabled && !isWithheld('terminal') ? openProjectTerminal : undefined}
                 />
               </div>
             )
@@ -1229,26 +1185,9 @@ export default function SidePanel({
             return (
               <div key={t.id} className="absolute inset-0">
                 <ActivityViewer
-                  view={
-                    t.kind as
-                      | 'changes'
-                      | 'issues'
-                      | 'links'
-                      | 'artifacts'
-                      | 'subagents'
-                      | 'workflows'
-                      | 'logs'
-                      | 'context'
-                      | 'side'
-                      | 'git'
-                      | 'summary'
-                      | 'pins'
-                  }
-                  open
-                  onToggle={closePanel}
-                  slot={slot}
-                  subagents={subagents}
-                  toolLog={toolLog}
+                  view={t.kind as 'changes' | 'issues' | 'links' | 'artifacts' | 'subagents' | 'workflows' | 'logs' | 'crewlog' | 'context' | 'side' | 'git' | 'summary' | 'pins'}
+                  open onToggle={closePanel} slot={slot}
+                  subagents={subagents} toolLog={toolLog}
                   sources={sources}
                   selectedSourceUrl={selectedSourceUrl}
                   onSelectSource={onSelectSource}
@@ -1295,7 +1234,7 @@ export default function SidePanel({
                 slot={slot}
                 onClose={() => handleCloseTab(t.id)}
                 onContentChange={(c) => patchTab(t.id, { content: c })}
-                onDiskContent={(c) => patchTab(t.id, { content: c, savedContent: c })}
+                onDiskContent={(c, binary) => patchTab(t.id, { content: c, savedContent: c, ...(binary === undefined ? {} : { binary }) })}
                 onDiffModeChange={(diffMode) => patchTab(t.id, { diffMode })}
                 onRevealConsumed={() => patchTab(t.id, { revealLine: undefined })}
                 onPathChange={(p) =>
@@ -1483,8 +1422,9 @@ function FileTabBody({
   scrollMemoryKey?: string
   onContentChange: (c: string) => void
   /** Disk-originated content (file watch / Refresh): the panel routes it here
-   *  so the tab's saved baseline moves with the buffer it just replaced. */
-  onDiskContent: (c: string) => void
+   *  so the tab's saved baseline moves with the buffer it just replaced, and the
+   *  binary verdict of that read moves with both. */
+  onDiskContent: (c: string, binary?: boolean) => void
   onDiffModeChange: (diffMode: boolean) => void
   onFileSave: (fp: string, c: string) => Promise<void>
   onFileOpen?: (
@@ -1512,6 +1452,7 @@ function FileTabBody({
       active={active}
       filePath={tab.path || ''}
       content={tab.content || ''}
+      binary={tab.binary}
       scrollMemoryKey={scrollMemoryKey}
       onContentChange={onContentChange}
       onDiskContent={onDiskContent}
@@ -1559,38 +1500,97 @@ function FileTabBody({
   )
 }
 
-function TabBody({
-  tab,
-  active,
-  slot,
-  projectDir,
-  onClose,
-  onContentChange,
-  onDiskContent,
-  onDiffModeChange,
-  onRevealConsumed,
-  onPathChange,
-  onFileSave,
-  onFileOpen,
-  onAddToContext,
-  onSubmitComments,
-  connected = true,
-  onTerminalSendToChat,
-  diffLineNumbers,
-  setDiffLineNumbers,
-  diffSideBySide,
-  setDiffSideBySide,
-}: {
-  tab: PanelTab
-  active: boolean
-  slot: string
+/**
+ * The body of a RESTORED file tab, before anything has read the file.
+ *
+ * A persisted tab carries only metadata -- its buffer and its `binary` verdict
+ * are both stripped on save -- so until a read lands, nothing about the file is
+ * known. Mounting the editor on that empty buffer is not merely blank: a
+ * restored `.zip` tab would offer a live editor over bytes that cannot be
+ * decoded, and typing then saving would write text over the file. So this
+ * placeholder renders instead, and it performs the read ITSELF rather than
+ * leaning on one page's effect -- every host that mounts `SidePanel` (the chat
+ * page and the members page) restores file tabs, and only a read that lives
+ * here resolves on both. `onDiskContent` patches the buffer, the saved baseline
+ * and the verdict together, which is what swaps this placeholder for the panel.
+ *
+ * A read that fails is shown AS a failure, not left on the skeleton: a skeleton
+ * that never resolves reads as "still loading". Both strings it needs already
+ * exist -- the notice's title is the panel's own `cannot_read_file`, and a 404
+ * reuses the placeholder sentence `openFile` writes for a moved file.
+ *
+ * The read goes through `['file-read', path]`, the same React Query entry the
+ * chip click and ChatPage's cold-tab hydration use, so a restored tab that BOTH
+ * this placeholder and that page ask for costs one GET and yields one answer
+ * rather than two racing reads of the same file.
+ */
+function HydratingFileTab({ path, onDiskContent }: { path: string; onDiskContent: (c: string, binary?: boolean) => void }) {
+  const [error, setError] = useState<string | null>(null)
+  const qc = useQueryClient()
+  // Held in a ref so a new callback identity from the parent's render does not
+  // re-trigger the read; only the path does.
+  const applyRef = useRef(onDiskContent)
+  useEffect(() => { applyRef.current = onDiskContent })
+  useEffect(() => {
+    const ac = new AbortController()
+    setError(null)
+    void (async () => {
+      try {
+        // `fetchQuery` on the shared key: a read already in flight for this path
+        // (ChatPage's cold-tab query, a chip click) is JOINED rather than raced,
+        // and a fresh entry is reused. The signal still belongs to this tab, so
+        // unmounting stops this consumer without cancelling the shared read.
+        const r = await qc.fetchQuery({
+          queryKey: fileReadQueryKey(path),
+          queryFn: ({ signal }) => fetchFileRead(path, signal),
+          staleTime: FILE_READ_STALE_MS,
+        })
+        if (ac.signal.aborted) return
+        if (r.ok) { applyRef.current(r.text, r.binary); return }
+        if (r.status === 404) {
+          applyRef.current(i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or'), false)
+          return
+        }
+        // The same sentence the chip click reports for a failed read: a human
+        // line naming the file, with the status as the detail -- a bare "HTTP
+        // 500" is a code machines produce, not something a reader can act on.
+        setError(i18nT('pages.chatPage.could_not_read_file_reason', {
+          path, reason: i18nT('pages.chatPage.http_status', { status: r.status }),
+        }))
+      } catch (e) {
+        if (!ac.signal.aborted) {
+          setError(i18nT('pages.chatPage.could_not_read_file_reason', {
+            path, reason: errMessage(e) || i18nT('pages.chatPage.unknown_error'),
+          }))
+        }
+      }
+    })()
+    return () => ac.abort()
+  }, [path, qc])
+  if (error !== null) {
+    return (
+      <div data-testid="file-tab-hydration-failed" className="h-full p-4">
+        <ErrorNotice
+          title={i18nT('components.markdownPanel.cannot_read_file')}
+          message={error}
+          askAgent
+          testId="file-tab-hydration-error"
+        />
+      </div>
+    )
+  }
+  return <div data-testid="file-tab-hydrating" className="h-full p-4"><ContentSkeleton rows={8} /></div>
+}
+
+function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDiskContent, onDiffModeChange, onRevealConsumed, onPathChange, onFileSave, onFileOpen, onAddToContext, onSubmitComments, connected = true, onTerminalSendToChat, diffLineNumbers, setDiffLineNumbers, diffSideBySide, setDiffSideBySide }: {
+  tab: PanelTab; active: boolean; slot: string
   /** The chat's project directory — the file-browser rail's tree root. */
   projectDir?: string
   onClose: () => void
   onContentChange: (c: string) => void
   /** Disk-originated content (file watch / Refresh): restamps the tab's saved
    *  baseline alongside the buffer, so a re-open still treats the tab clean. */
-  onDiskContent: (c: string) => void
+  onDiskContent: (c: string, binary?: boolean) => void
   onDiffModeChange: (diffMode: boolean) => void
   /** Drop the tab's one-shot line-reveal target once the panel has acted on it. */
   onRevealConsumed: () => void
@@ -1632,6 +1632,11 @@ function TabBody({
   // same key.
   const scrollMemoryKey = scrollMemoryKeyFor(slot, tab.id)
   if (tab.kind === 'file') {
+    // Nothing is known about a restored tab until a read lands, so it gets the
+    // self-hydrating placeholder rather than an editor over an empty buffer.
+    if (tab.content === undefined) {
+      return <HydratingFileTab path={tab.path || ''} onDiskContent={onDiskContent} />
+    }
     return (
       <FileTabBody
         tab={tab}

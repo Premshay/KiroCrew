@@ -129,6 +129,8 @@ class SessionLifecycleOwner(Protocol):
 
     def _fold_key(self, key: str) -> str: ...
 
+    def _has_pending_injection(self, key: str) -> bool: ...
+
     def _has_allocation_reservation(self, key: str) -> bool: ...
 
     def session_generation(self, key: str) -> int: ...
@@ -155,6 +157,8 @@ class SessionLifecycleOwner(Protocol):
 
     async def _retire_kiro_warm_pool(self) -> bool: ...
 
+    def _mark_identity_epoch(self) -> None: ...
+
     async def _retire_kiro_subagent_runtimes(self) -> bool: ...
 
     async def _retire_kiro_bg_runtime(self) -> bool: ...
@@ -169,6 +173,7 @@ class SessionLifecycleOwner(Protocol):
         *,
         expect_session: _SessionEntry | None = None,
         skip_if_busy: bool = False,
+        skip_if_injecting: bool = False,
         clear_conversation: bool = False,
     ) -> bool: ...
 
@@ -231,6 +236,10 @@ class SessionLifecycleState:
     """Mutable state exclusively owned by :class:`SessionLifecycleService`."""
 
     identity_sweep_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # The fingerprint of an identity change whose sweep has not completed. Set
+    # while the sweep runs and cleared only by the sweep that completes it, so an
+    # outstanding change stays its own trigger for the next turn.
+    identity_sweep_fingerprint: str = ""
     recycling: dict[str, _SessionEntry] = field(default_factory=dict)
     suppress_replay: set[str] = field(default_factory=set)
     origin_links: dict[str, Any] = field(default_factory=dict)
@@ -468,6 +477,7 @@ class SessionLifecycleService:
         *,
         expect_session: _SessionEntry | None = None,
         skip_if_busy: bool = False,
+        skip_if_injecting: bool = False,
         clear_conversation: bool = False,
     ) -> bool:
         """Kill a live session while preserving the exact reset semantics."""
@@ -480,6 +490,28 @@ class SessionLifecycleService:
                 return False
             if skip_if_busy and current is not None and current.semaphore.locked():
                 return False
+            # A completion injection commits a turn to this session BEFORE it
+            # acquires the semaphore, so the check above cannot see one. A caller
+            # that asks the counter itself still races this lock: acquiring it
+            # suspends, and an injection beginning in that gap is invisible to
+            # any read taken earlier. Asking again HERE is what makes the answer
+            # atomic with the pop, which is why identity and the semaphore are
+            # re-validated under this lock too. Opt-in, so a user-initiated reset
+            # still wins over an injection. Fail closed and locally, so an
+            # unreadable counter declines this reset rather than raising through
+            # a sweep that has other candidates to visit.
+            if skip_if_injecting:
+                try:
+                    injecting = owner._has_pending_injection(key)
+                except Exception:
+                    logger.debug(
+                        "Injection probe failed for session %s; keeping it",
+                        key,
+                        exc_info=True,
+                    )
+                    injecting = True
+                if injecting:
+                    return False
             session = owner._sessions.pop(key, None)
             owner._advance_session_generation(key)
             owner._compact_cooldown_until.pop(key, None)
@@ -663,7 +695,7 @@ class SessionLifecycleService:
             await owner.release_subagent_runtime(key)
             self._deps.logger.info("Removed session (map preserved): %s", key)
 
-    async def retire_kiro_identity_sessions(self) -> tuple[list[str], bool]:
+    async def retire_kiro_identity_sessions(self, fingerprint: str = "") -> tuple[list[str], bool]:
         """Retire idle Kiro-backed processes after an identity-store change.
 
         The start-permit barrier is acquired before the registry scan, making
@@ -671,6 +703,12 @@ class SessionLifecycleService:
         change. Busy sessions are marked for retirement on their next turn and
         keep the sweep incomplete; the session map and pending compaction
         verdicts intentionally survive.
+
+        *fingerprint* is the live identity the caller observed. It keys the
+        generation fence below, so a retry for the same pending change skips
+        successors that already restarted under the new account, while a sweep
+        under a different fingerprint captures afresh. Empty means the store
+        could not be read; see the comment at the fence.
         """
         owner = self._owner
         logger = self._deps.logger
@@ -681,21 +719,50 @@ class SessionLifecycleService:
         # hold a partial barrier forever, preventing both finally blocks from
         # restoring cold-start capacity.
         async with self._identity_sweep_lock:
+            # Before the barrier, and before any key becomes claimable: every
+            # provider already queued in the warm pool authenticated as the
+            # previous account, and a pool claim takes no cold-start permit, so
+            # the barrier below cannot hold one back. Stamping the pool here is
+            # what stops a cleared key from being handed one of those providers
+            # while ``_retire_kiro_warm_pool`` (which must run outside the
+            # barrier -- see ``mark_identity_epoch``) is still pending.
+            owner._mark_identity_epoch()
             held = 0
             try:
                 for _ in range(constants.max_concurrent_cold_starts):
                     await owner._start_sem.acquire()
                     held += 1
                 async with owner._lock:
+                    # An outstanding sweep is its own retirement trigger, so the
+                    # pending fingerprint is recorded before anything is retired
+                    # and survives until a sweep COMPLETES. Without it, a switch
+                    # back to the reconciled account compares equal and the
+                    # holders started under the interim one keep serving turns on
+                    # its credential.
+                    self.state.identity_sweep_fingerprint = fingerprint
                     # Selection and unregistering share one lock hold so a
                     # chosen idle object cannot start a turn before its pop.
+                    #
+                    # Every session backed by the Kiro identity store is retired,
+                    # with no attempt to spare one that registered after the
+                    # pending change. Telling a new-account successor from an
+                    # old-account holder needs the identity each session
+                    # authenticated under, and registration order does not carry
+                    # it: a cold start that began before the switch registers
+                    # after it, so an order-based test hands the old account a
+                    # session it was asked to retire. Retiring one extra idle
+                    # session costs a fresh native conversation; sparing the
+                    # wrong one is the signature rejection this sweep exists to
+                    # prevent.
                     retired_keys: list[str] = []
+                    invalidated_keys: list[str] = []
                     for key in list(owner._sessions):
                         sess = owner._sessions[key]
                         if not self._deps.provider_uses_kiro_identity_store(sess.provider):
                             continue
                         if sess.semaphore.locked():
                             sess.retire_on_identity_change = True
+                            invalidated_keys.append(key)
                             skipped = True
                             continue
                         del owner._sessions[key]
@@ -705,6 +772,7 @@ class SessionLifecycleService:
                         self._origin_links.pop(key, None)
                         self.state.stop_requests.pop(key, None)
                         retired_keys.append(key)
+                        invalidated_keys.append(key)
                         # Do not clear _compact_pending_verdict: the identity
                         # recycle preserves that deferred verdict.
                         doomed.append((key, sess.provider))
@@ -714,6 +782,25 @@ class SessionLifecycleService:
                     # set so the awaited unlink cannot be cancelled between two
                     # keys and leave the rest behind as fabricated crashes.
                     await record_sessions_ended(retired_keys, end_reason=END_REASON_RETIRED)
+                # Drop the pointer to each identity-changed session's NATIVE
+                # conversation, the same reason a provider switch drops it: the
+                # account that minted it is not the account that would reload it.
+                # An extended-thinking model's stored thinking blocks carry a
+                # provider signature bound to the conversation they were minted
+                # in, so replaying them under the new account is rejected whole
+                # ("Invalid `signature` in `thinking` block") and every later turn
+                # on that key fails the same way -- the recycle replaces the
+                # process but the successor's ``session/load`` walks straight back
+                # into the previous account's history. Only the pointer goes; the
+                # conversation stays on disk under ``discarded_sid``, and the
+                # dashboard transcript is a separate record that survives.
+                #
+                # Inside the permit barrier and after ``owner._lock`` is released:
+                # every cold-start permit is still held here, so no successor can
+                # publish a sid for these keys, while ``clear_sid`` persists to
+                # disk and must not run under the registry lock.
+                for key in invalidated_keys:
+                    owner._session_map.clear_sid(key)
             finally:
                 for _ in range(held):
                     owner._start_sem.release()
@@ -744,7 +831,20 @@ class SessionLifecycleService:
             # With every cold-start permit held above, residue here means a
             # producer bypassed the barrier; fail toward another sweep.
             skipped = True
-        return retired, not skipped
+        complete = not skipped
+        if complete:
+            # Only the sweep that OWNS the pending fingerprint may retire it. The
+            # shutdowns above run outside ``identity_sweep_lock``, so a second
+            # account change can acquire that lock meanwhile and record its own.
+            # This sweep finishing its own work says nothing about that newer
+            # change: clearing the marker would leave the caller free to advance
+            # its baseline while the newer sweep's busy holders still serve turns
+            # on the account it is retiring, with nothing left to retry from.
+            if self.state.identity_sweep_fingerprint == fingerprint:
+                self.state.identity_sweep_fingerprint = ""
+            else:
+                complete = False
+        return retired, complete
 
     async def _retire_kiro_subagent_runtimes(self) -> bool:
         """Retire idle Kiro-backed companion runtimes."""
@@ -794,7 +894,7 @@ class SessionLifecycleService:
             if runtime.has_active_or_initializing_sessions():
                 return False
             try:
-                await runtime.kill(expected=True)  # deliberate logout teardown
+                await runtime.kill(expected=True, reason="deliberate logout teardown")
             except Exception:
                 logger.warning(
                     "Failed to retire the background runtime after an identity change",
@@ -959,11 +1059,11 @@ class SessionLifecycleService:
                 # rule asks for a flag-gated subsystem's IMPORT to be gated too.
                 from kiro_crew.crew_log import emit as crew_log_emit
 
-                ledger_sid = crew_log_emit.session_id_of(session.provider)
+                crew_log_sid = crew_log_emit.session_id_of(session.provider)
                 retained_key: str | None = None
-                if ledger_sid:
+                if crew_log_sid:
                     try:
-                        retained_key = owner._session_map.find_key_by_sid(ledger_sid)
+                        retained_key = owner._session_map.find_key_by_sid(crew_log_sid)
                     except Exception:
                         # An unreadable map is not evidence that the id is revoked.
                         retained_key = _SID_RETENTION_UNKNOWN
@@ -975,7 +1075,7 @@ class SessionLifecycleService:
                         key,
                     )
                 crew_log_emit.on_session_closed(
-                    ledger_sid,
+                    crew_log_sid,
                     END_REASON_DESTROYED if retained_key is None else _END_REASON_SID_RETAINED,
                 )
                 # Still under the same lock as the pop; a manager successor cannot
@@ -1198,7 +1298,7 @@ class SessionLifecycleService:
             owner._draining_bg_runtimes = []
         for bg_runtime in bg_doomed:
             try:
-                await bg_runtime.kill(expected=True)  # graceful shutdown
+                await bg_runtime.kill(expected=True, reason="graceful shutdown")
             except Exception:
                 logger.debug("close_all: _bg runtime kill failed", exc_info=True)
         for key in list(owner._subagent_runtimes):
@@ -1224,6 +1324,8 @@ class SessionLifecycleService:
 
         async with owner._lock:
             for key, sess in owner._sessions.items():
+                if sess.retire_on_identity_change:
+                    continue
                 if (
                     not sess.provider_switch_replay
                     and key != constants.background_key

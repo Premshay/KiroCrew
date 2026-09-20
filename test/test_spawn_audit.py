@@ -1343,6 +1343,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "imessage/rpc.py::start",
         "mcp_core.py::_get_ppid",
         "mcp_gateway/backend.py::spawn_backend",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``), used here only to drive the one-shot
+        # ``_ping_async`` coroutine from a synchronous CLI path -- ``kirocrew
+        # doctor`` and ``kirocrew stop`` have no event loop of their own. The
+        # coroutine opens a local endpoint (``AF_UNIX`` socket or named pipe) and
+        # exchanges two frames with a daemon that is already running; no child
+        # process is created and there is no argv to sandbox. Same classification
+        # as the other ``asyncio.run`` sites in this list.
+        "mcp_gateway/daemon_control.py::_ping",
         "mcp_gateway/gatewayd.py::main",
         "mcp_gateway/manager.py::_spawn_once",
         "mcp_gateway/stub.py::main",
@@ -2453,8 +2462,9 @@ def test_harness_preflight_seed_is_fixed_argv():
     ]
     assert len(calls) == 1
     expected = ast.parse(
-        "subprocess.run([sys.executable, '-c', "
-        "'from kiro_crew.seed import seed; import sys; seed(sys.argv[1])', fixture], "
+        "subprocess.run(platform_compat.isolated_python_argv('-c', "
+        "'from kiro_crew.seed import seed; import sys; seed(sys.argv[1])', fixture, "
+        "force_isolation=True), "
         "cwd=str(spawn_cwd), env=env, capture_output=True, text=True, "
         "encoding='utf-8', errors='replace', timeout=30)",
         mode="eval",

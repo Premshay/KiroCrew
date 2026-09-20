@@ -33,6 +33,7 @@ from typing import Any
 from kiro_crew.computer_use import types as _cu_types
 from kiro_crew.config.sections import SUBAGENT_MAX_TURNS_CEILING
 from kiro_crew.constants import (
+    ARTIFACT_MAX_CONTENT_BYTES,
     AWS_PROFILE_NAME_RE,
     CHANNEL_OWNER_DM_NAMESPACES,
     MAX_BANNER_CHARS,
@@ -57,6 +58,7 @@ from kiro_crew.monitoring.models import (
 )
 from kiro_crew.monitoring.registry import publicly_armable_kinds, publicly_armable_objectives
 from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
+from kiro_crew.solo_spawn import SOLO_SPAWN_REASONS
 
 # ── Constants ──
 
@@ -124,6 +126,22 @@ def normalize_lesson_category(value: object, *, strict: bool) -> str:
 
 # Allowed scopes for lessons (mirrors the learn_add MCP inputSchema enum).
 ALLOWED_LESSON_SCOPES = frozenset({"global", "workspace"})
+
+# The ``GET /api/lessons`` window: how many lessons one call returns when the
+# caller names no ``limit``, and the most it may ask for. Both the route and the
+# ``learn_list`` tool schema read these, so the advertised bound and the
+# enforced one cannot drift apart. The read stays bounded whatever the query
+# says; a caller that needs the whole population pages with ``offset`` and the
+# ``total`` the body carries.
+LESSON_LIST_LIMIT = 50
+LESSON_LIST_LIMIT_MAX = 500
+# The furthest ``offset`` either surface accepts. The vector tier hands the
+# offset to SQLite as a bound parameter, and a value past the 64-bit range
+# raises ``OverflowError`` there rather than returning an empty page, so the
+# route clamps to this ceiling (and echoes the clamp) and the tool schema
+# refuses past it. Far beyond any real population: past ``total`` every page is
+# empty anyway.
+LESSON_LIST_OFFSET_MAX = 100_000_000
 
 # Allowed cron schedule kinds
 ALLOWED_SCHEDULE_KINDS = frozenset({"every", "cron", "at"})
@@ -1062,6 +1080,11 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # persists (hibernated on disk) after completion, and spawn_continue
         # can dispatch follow-up turns into it with full prior context.
         FieldSpec("keep", bool),
+        # Why ONE task is being spawned alone. Closed vocabulary from
+        # ``solo_spawn.SOLO_SPAWN_REASONS``; ``""`` is "not given". The gate
+        # that requires it lives in ``mcp_tools.spawn`` (task count) and
+        # ``handlers.messaging.api_spawn`` (roster check); this only bounds it.
+        FieldSpec("solo_reason", str, allowed=SOLO_SPAWN_REASONS),
         # Switchable context groups the sub-agent inherits. Explicit
         # ``default=True`` rather than the implicit ``None``: the semantic
         # default is "on", and without it an explicit JSON ``null`` cleans to
@@ -1085,6 +1108,7 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # cfg.agents` membership check at the endpoint, which answers 400 with an
         # `unknown_crew` code rather than degrading to the global store.
         FieldSpec("crew", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("target_member", str, max_len=MAX_SHORT_STRING),
     ],
 )
 
@@ -1127,6 +1151,9 @@ SPAWN_SUB_AGENTS_SCHEMA = ToolSchema(
         FieldSpec("include_memory", bool, default=True),
         FieldSpec("include_lessons", bool, default=True),
         FieldSpec("include_project", bool, default=True),
+        # Same solo-spawn reason as spawn_run: required when ``agents`` holds
+        # exactly one entry that names no agent_or_mode.
+        FieldSpec("solo_reason", str, allowed=SOLO_SPAWN_REASONS),
     ],
 )
 
@@ -1176,6 +1203,19 @@ LEARN_REMOVE_SCHEMA = ToolSchema(
     ],
 )
 
+# The ``learn_list`` window. The bounds are the route's own (``LESSON_LIST_LIMIT``
+# / ``LESSON_LIST_LIMIT_MAX``), so a value the route would clamp is refused here
+# by name instead of quietly answering a different page than the one asked for.
+# No defaults: an absent field keeps the route's default rather than asserting
+# one here, and the body echoes the effective window either way.
+LEARN_LIST_SCHEMA = ToolSchema(
+    tool_name="learn_list",
+    fields=[
+        FieldSpec("limit", int, min_val=1, max_val=LESSON_LIST_LIMIT_MAX),
+        FieldSpec("offset", int, min_val=0, max_val=LESSON_LIST_OFFSET_MAX),
+    ],
+)
+
 # Session work ledger (session_ledger.py). Field caps mirror the core module's
 # own clamps so the route refuses loudly what the primitive would otherwise
 # truncate silently. ``artifacts`` inner shape (str->str, bounded) is enforced
@@ -1196,7 +1236,7 @@ SESSION_LEDGER_RECORD_SCHEMA = ToolSchema(
 )
 # Empty on purpose, and REGISTERED on purpose: with no schema in
 # MCP_CORE_SCHEMAS an unexpected argument passes through unvalidated
-# (the learn_list gap), while an empty registered schema rejects it
+# (a tool with no schema at all), while an empty registered schema rejects it
 # (the spawn_list / resource_status precedent). The tool takes no
 # arguments; the schema's job is to enforce exactly that.
 SESSION_LEDGER_READ_SCHEMA = ToolSchema(tool_name="session_ledger_read")
@@ -2045,8 +2085,10 @@ MODEL_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._\[\]-]{0,127}$")
 _ARTIFACT_SOURCE_RE = re.compile(r"^(chat|cron|subagent|manual|import)$")
 # Single source of truth: the MCP save/update field cap MUST equal the store's
 # own content cap, else the tool path rejects content the store would accept
-# (or vice-versa). Import the store constant rather than re-declaring it.
-from kiro_crew.artifacts import MAX_CONTENT_BYTES as ARTIFACT_CONTENT_MAX  # noqa: E402
+# (or vice-versa). Both read ``constants.ARTIFACT_MAX_CONTENT_BYTES`` -- a leaf,
+# so this module never imports ``artifacts`` (that edge closed the cycle
+# ``artifacts -> hooks -> webhooks -> validation -> artifacts``).
+ARTIFACT_CONTENT_MAX = ARTIFACT_MAX_CONTENT_BYTES
 
 ARTIFACT_WEBAPP_METADATA_MAX_BYTES = 16_384
 
@@ -3519,6 +3561,12 @@ SESSION_SEND_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("message", str, required=True, max_len=MAX_LONG_STRING),
+        # Delivery MODE, not a permission: a true value asks for the message to be
+        # injected into the target's running turn instead of waiting for the next
+        # one. Strictly typed (``bool`` is an allowed type here, so the int-guard
+        # in ``validate_field`` does not apply) and defaulted false, so a caller
+        # that omits it keeps the queue-or-run behaviour it has today.
+        FieldSpec("steer", bool, default=False),
     ],
 )
 
@@ -3541,6 +3589,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "resource_status": RESOURCE_STATUS_SCHEMA,
     "spawn_status": SPAWN_STATUS_SCHEMA,
     "learn_add": LEARN_ADD_SCHEMA,
+    "learn_list": LEARN_LIST_SCHEMA,
     "learn_remove": LEARN_REMOVE_SCHEMA,
     "session_ledger_read": SESSION_LEDGER_READ_SCHEMA,
     "session_ledger_record": SESSION_LEDGER_RECORD_SCHEMA,
@@ -3803,6 +3852,65 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "chat_tag_update": CHAT_TAG_UPDATE_SCHEMA,
     "chat_tag_assign": CHAT_TAG_ASSIGN_SCHEMA,
 }
+
+# ── Tool Schemas (MCP crew log — server ``kirocrew-crew-log``) ──
+#
+# Its own registry for the same reason the dashboard and work ones are separate:
+# the three crew-log tools ship on an opt-in server, so their schemas do not
+# belong in the always-on core registry. The registry must exist at all because
+# ``call_tool_with_logging`` routes validation through it, and a tool absent from
+# its server's registry has its arguments passed through raw.
+#
+# Every bound here is the TOOL's promise; the endpoint clamps independently. Two
+# layers on purpose: a caller that asks for more than a tool will give learns so
+# from the schema, and a caller that reaches the route another way still cannot
+# ask the store for an unbounded read.
+
+#: A unit argument: a raw unit id, a session/slot key, or ``self``. Sized for a
+#: namespaced channel key, which is the longest legitimate form.
+_CREW_LOG_UNIT_MAX = 256
+
+CREW_LOG_LIST_SCHEMA = ToolSchema(
+    tool_name="crew_log_list",
+    fields=[
+        FieldSpec("slot_contains", str, max_len=_CREW_LOG_UNIT_MAX),
+        FieldSpec("active_within_secs", int, min_val=1, max_val=31_536_000),
+        FieldSpec("with_type_counts", bool),
+        FieldSpec("limit", int, min_val=1, max_val=200, default=50),
+    ],
+)
+
+CREW_LOG_READ_SCHEMA = ToolSchema(
+    tool_name="crew_log_read",
+    fields=[
+        FieldSpec("unit", str, required=True, max_len=_CREW_LOG_UNIT_MAX),
+        FieldSpec("from_seq", int, min_val=1, default=1),
+        FieldSpec("limit", int, min_val=1, max_val=200, default=100),
+        FieldSpec("types", list, max_items=32, item_type=str, item_max_len=64),
+        FieldSpec("since_ts", int, min_val=0),
+        FieldSpec("full", bool),
+    ],
+)
+
+CREW_LOG_PROJECTION_SCHEMA = ToolSchema(
+    tool_name="crew_log_projection",
+    fields=[
+        FieldSpec("unit", str, required=True, max_len=_CREW_LOG_UNIT_MAX),
+        FieldSpec(
+            "name",
+            str,
+            required=True,
+            allowed=frozenset({"status", "usage", "timeline", "tools", "approvals"}),
+        ),
+    ],
+)
+
+MCP_CREW_LOG_SCHEMAS: dict[str, ToolSchema] = {
+    "crew_log_list": CREW_LOG_LIST_SCHEMA,
+    "crew_log_read": CREW_LOG_READ_SCHEMA,
+    "crew_log_projection": CREW_LOG_PROJECTION_SCHEMA,
+}
+
 
 # ── Tool Schemas (MCP Work ledger — server ``kirocrew-work``) ──
 #
