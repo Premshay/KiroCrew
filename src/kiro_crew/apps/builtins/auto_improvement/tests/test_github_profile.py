@@ -818,3 +818,16 @@ class TestGateRunsInStrictSandboxMode:
             inspect.getsource(AgentRunner._spawn_sandboxed_agent),
         ):
             assert 'mode="strict"' in src
+
+
+@pytest.mark.parametrize("kind", ["gateway", "python"])
+def test_direct_environment_boot_does_not_launch(kind, tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    launch = Mock(side_effect=AssertionError("direct environments have no lifecycle"))
+    monkeypatch.setattr(gp, "_run", launch)
+    config = {"kind": kind}
+    if kind == "python":
+        config["pythonExecutable"] = str(tmp_path / "python")
+    assert _profile(tmp_path, test_environment=config).isolation.measurement_boot()() is None
+    launch.assert_not_called()

@@ -2050,3 +2050,12 @@ lock, using a strict read and checked atomic write. Read/write failure retains t
 pin and capacity for ordinary maintenance retry; unrelated or newer identities
 survive. The manual-overflow contract and operator recovery procedure are in
 [platform-compat](../common/platform-compat.md#windows-session-tree-teardown).
+
+## Auto Improvement repository runners
+
+Auto Improvement reuses an operator-selected repository runner through its bounded
+strict sandbox executor. Authenticated app provenance and existing app-bound
+policy admission are required. Runner identity is recorded and checked across
+measurements. The app owns no Docker controller or Compose services; downstream
+isolation and cleanup belong to the operator's runner. See the
+[Auto Improvement spec](auto-improvement.md#repository-test-environments).

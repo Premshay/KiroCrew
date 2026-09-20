@@ -16261,5 +16261,29 @@
     "resolve_explanation": "Mantieni il valore attuale. Applica registra questa decisione e chiude le proposte in sospeso.",
     "forget_count": "Dimentica i ricordi selezionati: {{count}}",
     "retry_preview_page": "Riprova la pagina di anteprima"
+  },
+  "testEnvironment": {
+    "absolutePath": "Inserisci un percorso assoluto per l’eseguibile Python.",
+    "blocked": "Bloccato",
+    "check": "Verifica ambiente",
+    "checking": "Verifica in corso…",
+    "executable": "Eseguibile Python (percorso assoluto)",
+    "failed": "Richiesta non riuscita (HTTP {{status}}).",
+    "gateway": "Python del gateway (precedente)",
+    "isolation": "I controlli usano copie di lavoro isolate. L’ambiente selezionato determina dove vengono eseguiti i test.",
+    "python": "Ambiente Python",
+    "ready": "Pronto",
+    "save": "Salva ambiente",
+    "saved": "La verifica convalida questa scelta senza salvare né avviare un’esecuzione.",
+    "title": "Ambiente di test",
+    "unchecked": "Non verificato",
+    "unsaved": "Modifiche non salvate. Salva prima di avviare un’esecuzione.",
+    "variables": "Variabili non segrete (NAME=value, una per riga)",
+    "variablesInvalid": "Usa un NAME=value per riga con nomi univoci. Non includere segreti.",
+    "runner": "Esecutore del repository",
+    "runnerExecutable": "Eseguibile dell’esecutore (percorso assoluto)",
+    "runnerPython": "Eseguibile Python (facoltativo; predefinito: python)",
+    "runnerPath": "Inserisci il percorso assoluto dell’eseguibile dell’esecutore.",
+    "runnerHint": "L’esecutore selezionato esegue i controlli su ogni copia di lavoro isolata e deve fornire l’ambiente di test del repository, incluse la preparazione e la pulizia dei servizi. L’isolamento dei container dipende dall’esecutore."
   }
 }

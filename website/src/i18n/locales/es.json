@@ -16262,5 +16262,29 @@
     "resolve_explanation": "Conserva el valor actual. Aplicar registra esta decisión y cierra sus propuestas pendientes.",
     "forget_count": "Olvidar recuerdos seleccionados: {{count}}",
     "retry_preview_page": "Reintentar página de vista previa"
+  },
+  "testEnvironment": {
+    "absolutePath": "Introduzca una ruta absoluta al ejecutable de Python.",
+    "blocked": "Bloqueado",
+    "check": "Comprobar entorno",
+    "checking": "Comprobando…",
+    "executable": "Ejecutable de Python (ruta absoluta)",
+    "failed": "La solicitud falló (HTTP {{status}}).",
+    "gateway": "Python de la pasarela (heredado)",
+    "isolation": "Las comprobaciones usan copias de trabajo aisladas. El entorno seleccionado determina dónde se ejecutan las pruebas.",
+    "python": "Entorno Python",
+    "ready": "Listo",
+    "save": "Guardar entorno",
+    "saved": "La comprobación valida esta selección sin guardar ni iniciar una ejecución.",
+    "title": "Entorno de pruebas",
+    "unchecked": "Sin comprobar",
+    "unsaved": "Cambios sin guardar. Guarde antes de iniciar una ejecución.",
+    "variables": "Variables no secretas (NAME=value, una por línea)",
+    "variablesInvalid": "Use un NAME=value por línea con nombres únicos. No incluya secretos.",
+    "runner": "Ejecutor del repositorio",
+    "runnerExecutable": "Ejecutable del ejecutor (ruta absoluta)",
+    "runnerPython": "Ejecutable de Python (opcional; predeterminado: python)",
+    "runnerPath": "Introduce una ruta absoluta al ejecutable del ejecutor.",
+    "runnerHint": "El ejecutor seleccionado realiza las comprobaciones en cada copia de trabajo aislada y debe proporcionar el entorno de pruebas del repositorio, incluida la preparación y limpieza de servicios. El aislamiento en contenedores depende del ejecutor."
   }
 }

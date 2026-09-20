@@ -241,6 +241,12 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
         "acp/runtime.py::_get_rss_mb",
+        # Fixed fixture Git operations and a test-owned executable under tmp_path;
+        # no repository or agent input. authenticated_run calls asyncio.run only.
+        "apps/builtins/auto_improvement/tests/test_environment.py::repository_runner",
+        "apps/builtins/auto_improvement/tests/test_environment.py::sandbox_run",
+        "apps/builtins/auto_improvement/tests/test_environment.py::authenticated_run",
+        "apps/builtins/auto_improvement/tests/test_environment.py::test_runner_forwards_literal_argv_and_exact_linked_checkout",
         # Eight pre-existing spawns in one app's own test module, invisible to this
         # audit until receivers were derived from each file's imports: they are
         # reached through a function-local ``import subprocess as sp``. Every one is

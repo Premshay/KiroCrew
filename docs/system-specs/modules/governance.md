@@ -3321,3 +3321,18 @@ a runtime ceiling install deliberately does not re-derive the set, the
 host-session binding, the both-directions audit, the fail-closed disposition, and
 that no second gate exists), and `test_computer_use_gate.py` (that the
 computer-use gate is audit-only and permits — see the section above).
+
+## Repository runner admission
+
+Auto Improvement requires authenticated app execution and the saved clone identity
+for repository runners. Each launch checks app, outer runner command, inner Python
+command, source and runner read permission with `fail_closed=True` and synchronous
+critical SEL audit. Policy and app profile compose the strict sandbox minimum.
+Missing provenance, denied permissions and audit failure prevent launch.
+
+A runner may delegate outside its sandbox, including to a Docker daemon. The app
+cannot enforce descendant filesystem or network destination restrictions across
+that boundary; configured filesystem read/write or network egress controls refuse
+runner execution with the specific unsupported scope. No policy is removed or
+relaxed. With these scopes absent, the operator's trusted runner owns downstream
+isolation, services and cleanup; the client sandbox proves no daemon confinement.

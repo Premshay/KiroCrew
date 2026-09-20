@@ -15862,5 +15862,29 @@
     "resolve_explanation": "現在の値を保持します。適用すると判断を記録し、保留中の提案を終了します。",
     "forget_count": "選択したメモリを忘れる: {{count}}",
     "retry_preview_page": "プレビューページを再試行"
+  },
+  "testEnvironment": {
+    "absolutePath": "Python 実行ファイルの絶対パスを入力してください。",
+    "blocked": "ブロック中",
+    "check": "環境を確認",
+    "checking": "確認中…",
+    "executable": "Python 実行ファイル（絶対パス）",
+    "failed": "リクエストに失敗しました（HTTP {{status}}）。",
+    "gateway": "ゲートウェイの Python（従来）",
+    "isolation": "チェックには独立したチェックアウトを使用します。選択した環境によってテストの実行場所が決まります。",
+    "python": "Python 環境",
+    "ready": "準備完了",
+    "save": "環境を保存",
+    "saved": "確認では選択内容を検証するだけで、保存や実行の開始は行いません。",
+    "title": "テスト環境",
+    "unchecked": "未確認",
+    "unsaved": "未保存の変更があります。実行を開始する前に保存してください。",
+    "variables": "機密情報を含まない変数（1行に1つの NAME=value）",
+    "variablesInvalid": "各行に一意の変数名で NAME=value を入力してください。秘密情報は含めないでください。",
+    "runner": "リポジトリランナー",
+    "runnerExecutable": "ランナー実行ファイル（絶対パス）",
+    "runnerPython": "Python 実行ファイル（任意、既定：python）",
+    "runnerPath": "ランナー実行ファイルの絶対パスを入力してください。",
+    "runnerHint": "選択したランナーは各独立チェックアウトでチェックを実行し、サービスの準備と後片付けを含む対象リポジトリのテスト環境を提供する必要があります。コンテナーによる分離はランナーに依存します。"
   }
 }

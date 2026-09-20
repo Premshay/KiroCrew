@@ -15841,5 +15841,29 @@
     "resolve_explanation": "현재 값을 유지합니다. 적용하면 결정을 기록하고 대기 중인 제안을 닫습니다.",
     "forget_count": "선택한 기억 잊기: {{count}}",
     "retry_preview_page": "미리 보기 페이지 다시 시도"
+  },
+  "testEnvironment": {
+    "absolutePath": "Python 실행 파일의 절대 경로를 입력하세요.",
+    "blocked": "차단됨",
+    "check": "환경 확인",
+    "checking": "확인 중…",
+    "executable": "Python 실행 파일(절대 경로)",
+    "failed": "요청 실패(HTTP {{status}}).",
+    "gateway": "게이트웨이 Python(기존 방식)",
+    "isolation": "검사는 독립 체크아웃을 사용합니다. 선택한 환경에 따라 테스트 실행 위치가 결정됩니다.",
+    "python": "Python 환경",
+    "ready": "준비됨",
+    "save": "환경 저장",
+    "saved": "확인은 선택 사항을 검증하며 저장하거나 실행을 시작하지 않습니다.",
+    "title": "테스트 환경",
+    "unchecked": "확인 안 됨",
+    "unsaved": "저장하지 않은 변경 사항이 있습니다. 실행을 시작하기 전에 저장하세요.",
+    "variables": "비밀이 아닌 변수(한 줄에 하나씩 NAME=value)",
+    "variablesInvalid": "한 줄에 하나씩 고유한 이름으로 NAME=value를 입력하세요. 비밀 정보를 포함하지 마세요.",
+    "runner": "저장소 러너",
+    "runnerExecutable": "러너 실행 파일 (절대 경로)",
+    "runnerPython": "Python 실행 파일 (선택 사항; 기본값: python)",
+    "runnerPath": "러너 실행 파일의 절대 경로를 입력하세요.",
+    "runnerHint": "선택한 러너는 각 독립 체크아웃에서 검사를 실행하며 서비스 준비와 정리를 포함한 대상 저장소의 테스트 환경을 제공해야 합니다. 컨테이너 격리는 러너에 따라 달라집니다."
   }
 }

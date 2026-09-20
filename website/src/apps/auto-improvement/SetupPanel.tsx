@@ -18,6 +18,9 @@ import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { FolderGit2, GitBranch, Loader2, Play, Square } from 'lucide-react'
 
+import ErrorNotice from '../../components/ErrorNotice'
+import TestEnvironmentPanel, { requestJson } from './TestEnvironmentPanel'
+
 import SimpleSelect from '../../components/SimpleSelect'
 import { Badge, Btn, Card, CardTitle, Input } from '../../components/ui'
 import { fmtDateFields } from '../../i18n/format'
@@ -98,19 +101,15 @@ export function activityLine(a: ActivityItem): string {
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body ?? {}),
-  })
-  // Read the body even on a non-2xx: the backend returns a structured
-  // {error: ...} that the user needs to see, not a bare status code.
-  const data = (await res.json().catch(() => ({}))) as T & { error?: string }
-  if (!res.ok && !data?.error) throw new Error(`HTTP ${res.status}`)
-  return data
+  return requestJson<T>(path, body)
 }
 
 export default function SetupPanel({ config }: { config?: Record<string, unknown> }) {
+  const repo = String(config?.target_url || config?.clone || '')
+  return <RepositorySetup key={repo} config={config} repo={repo} />
+}
+
+function RepositorySetup({ config, repo }: { config?: Record<string, unknown>; repo: string }) {
   const ime = useImeGuard()
   const qc = useQueryClient()
   const configured = Boolean(config?.clone)
@@ -119,12 +118,6 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
   const [url, setUrl] = useState('')
   const [branch, setBranch] = useState(String(config?.branch || ''))
 
-  // Config loads ASYNC — on first render it is undefined, so the initial useState
-  // above locks `branch` to '' and the dropdown shows "default" even when a branch
-  // is configured. Re-sync whenever the persisted value changes (config arrives, or
-  // the active repo/branch is switched) so the dropdown always reflects the branch
-  // the run will actually use. Only follows the SERVER value — a local edit sets
-  // `branch` AND persists via saveConfig, so this effect then no-ops on the echo.
   const configBranch = String(config?.branch || '')
   useEffect(() => {
     setBranch(configBranch)
@@ -132,7 +125,7 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
 
   // Branch list only makes sense once a clone exists; the query is gated on it.
   const { data: branchResp } = useQuery({
-    queryKey: ['auto-improvement-branches', configured],
+    queryKey: ['auto-improvement-branches', repo],
     queryFn: () => fetch(`${API}/branches`).then((r) => (r.ok ? r.json() : { branches: [] })),
     enabled: configured,
   })
@@ -153,22 +146,20 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
   // this cannot be used to retarget the repository.
   const saveConfig = useMutation({
     mutationFn: (patch: Record<string, unknown>) =>
-      fetch(`${API}/config`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch),
-      }).then((r) => r.json()),
+      requestJson('/config', patch, 'PUT'),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['auto-improvement-config'] }),
   })
 
   const directCommit = Boolean(config?.directCommit)
 
-  const { data: run } = useQuery({
+  const { data: run, error: runError } = useQuery({
     queryKey: ['auto-improvement-run'],
-    queryFn: () => fetch(`${API}/run`).then((r) => r.json() as Promise<RunStatus>),
-    refetchInterval: (q) => (q.state.data?.status === 'running' ? 3000 : 15000),
+    queryFn: () => requestJson<RunStatus>('/run', undefined, 'GET'),
+    refetchInterval: (q) => (['running', 'calibrating', 'stopping'].includes(q.state.data?.status ?? '') ? 3000 : 15000),
   })
   const running = run?.status === 'running'
+  const active = ['running', 'calibrating', 'stopping'].includes(run?.status ?? '')
+  const [environmentBusy, setEnvironmentBusy] = useState(false)
 
   const startRun = useMutation({
     mutationFn: () => postJson<RunStatus>('/run', {}),
@@ -178,6 +169,9 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
     mutationFn: () => postJson<RunStatus>('/run/stop', {}),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['auto-improvement-run'] }),
   })
+
+  const locked = active || !run || Boolean(runError) || startRun.isPending || stopRun.isPending
+  const setupBusy = locked || clone.isPending || saveConfig.isPending
 
   return (
     <Card>
@@ -196,12 +190,12 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
             placeholder={i18nT('apps.autoImprovement.setupPanel.https_github_com_owner_repo')}
             className="flex-1"
             aria-label={i18nT('autoImprovement.repoLabel')}
-            {...ime.bindEnter({ onEnter: () => { if (url.trim()) clone.mutate(url.trim()) } })}
+            {...ime.bindEnter({ onEnter: () => { if (url.trim() && !setupBusy && !environmentBusy) clone.mutate(url.trim()) } })}
           />
           <Btn
             primary
             aria-label={i18nT('autoImprovement.cloneBtn')}
-            disabled={!url.trim() || clone.isPending}
+            disabled={!url.trim() || setupBusy || environmentBusy}
             onClick={() => clone.mutate(url.trim())}
           >
             {clone.isPending ? (
@@ -211,9 +205,8 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
             )}
           </Btn>
         </div>
-        {clone.data?.error ? (
-          <p className="text-[12px] text-warn">{clone.data.error}</p>
-        ) : null}
+        {/* No hand-off: the repository URL and environment draft are unsaved. */}
+        <ErrorNotice message={clone.error?.message || saveConfig.error?.message || startRun.error?.message || stopRun.error?.message || runError?.message} messageClassName="max-h-40 overflow-auto whitespace-pre-wrap break-words select-text" />
         {configured ? (
           <p className="text-[12px] text-muted">
             {i18nT('autoImprovement.currentRepo')} <span className="text-accent">{display}</span>
@@ -240,9 +233,9 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
           <SimpleSelect
             options={branch && !branches.includes(branch) ? [branch, ...branches] : branches}
             value={branch}
+            disabled={setupBusy || environmentBusy}
             onChange={(v) => {
-              setBranch(v)
-              saveConfig.mutate({ branch: v })
+              saveConfig.mutate({ branch: v }, { onSuccess: () => setBranch(v) })
             }}
             clearLabel={i18nT('autoImprovement.branchDefault')}
             className="h-7 text-[13px]"
@@ -257,6 +250,7 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
             <input
               type="checkbox"
               checked={directCommit}
+              disabled={setupBusy || environmentBusy}
               onChange={(e) => saveConfig.mutate({ directCommit: e.target.checked })}
               className="mt-0.5"
               aria-label={i18nT('autoImprovement.autocommitLabel')}
@@ -271,15 +265,24 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
         </div>
       ) : null}
 
+      {configured ? (
+        <TestEnvironmentPanel
+          config={config!}
+          branch={branch}
+          disabled={setupBusy}
+          onBusyChange={setEnvironmentBusy}
+        />
+      ) : null}
+
       {/* Step 3 — run control */}
       {configured ? (
         <div className="mt-4 flex items-center gap-3 border-t border-border pt-3">
-          {running ? (
-            <Btn danger onClick={() => stopRun.mutate()} disabled={stopRun.isPending}>
+          {active ? (
+            <Btn danger onClick={() => stopRun.mutate()} disabled={stopRun.isPending || run?.status === 'stopping'}>
               <Square className="lucide-inline" size={14} /> {i18nT('autoImprovement.stopBtn')}
             </Btn>
           ) : (
-            <Btn primary onClick={() => startRun.mutate()} disabled={startRun.isPending}>
+            <Btn primary onClick={() => startRun.mutate()} disabled={setupBusy || environmentBusy}>
               <Play className="lucide-inline" size={14} /> {i18nT('autoImprovement.runBtn')}
             </Btn>
           )}

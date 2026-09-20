@@ -38,6 +38,7 @@ This module shells out to NOTHING target-specific — it calls only the
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -129,10 +130,15 @@ class BugGate:
         the candidate cleared/failed: triage T0/T1/T2 → RED → GREEN → STAYGREEN) so a run
         can be analyzed from logs alone — bug fixes most often die here and the reason is
         the key effectiveness signal."""
+        if isinstance(getattr(runner, "diagnostic", None), dict):
+            setattr(runner, "diagnostic", None)
         tgt = getattr(candidate, "target", None) or "?"
         res = self._run_inner(
             runner=runner, candidate=candidate, base_src=base_src, cand_src=cand_src
         )
+        diagnostic = getattr(runner, "diagnostic", None)
+        if not res.passed and isinstance(diagnostic, dict) and diagnostic:
+            res.detail += "; " + json.dumps(diagnostic)
         _log.info(
             "bug_gate: %s reason=%s | target=%s build_ok=%s lint_ok=%s collected=%s detail=%s",
             "PASS" if getattr(res, "passed", False) else "FAIL",
@@ -238,6 +244,7 @@ class BugGate:
             # the full fix applied. Any test that fails under the fix but passes on base →
             # the fix regressed something → discard.
             suite_ok, failing = runner.run_suite(src=cand_src)
+            suite_diagnostic = getattr(runner, "diagnostic", None)
             if not suite_ok:
                 # BASE-RELATIVE regression check: a test that ALSO fails on the base tree
                 # is a PRE-EXISTING failure (slow real-LLM/sandbox-fork integration test,
@@ -280,6 +287,8 @@ class BugGate:
                         Exception
                     ):  # noqa: BLE001 — if the base re-check errors, stay conservative
                         real_regressions = list(failing)
+                if isinstance(suite_diagnostic, dict):
+                    setattr(runner, "diagnostic", suite_diagnostic)
                 if real_regressions:
                     return BugGateResult(
                         passed=False,

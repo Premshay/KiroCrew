@@ -15859,5 +15859,29 @@
     "resolve_explanation": "保留当前值。应用后记录此决定，并关闭其待处理提案。",
     "forget_count": "忘记所选记忆：{{count}}",
     "retry_preview_page": "重试预览页面"
+  },
+  "testEnvironment": {
+    "absolutePath": "请输入 Python 可执行文件的绝对路径。",
+    "blocked": "受阻",
+    "check": "检查环境",
+    "checking": "检查中…",
+    "executable": "Python 可执行文件（绝对路径）",
+    "failed": "请求失败（HTTP {{status}}）。",
+    "gateway": "网关 Python（旧版）",
+    "isolation": "检查使用独立检出目录。所选环境决定测试的执行位置。",
+    "python": "Python 环境",
+    "ready": "就绪",
+    "save": "保存环境",
+    "saved": "检查仅验证此选择，不会保存或启动运行。",
+    "title": "测试环境",
+    "unchecked": "未检查",
+    "unsaved": "更改尚未保存。请先保存再启动运行。",
+    "variables": "非敏感变量（每行一个 NAME=value）",
+    "variablesInvalid": "每行填写一个 NAME=value，变量名不能重复。请勿包含密钥。",
+    "runner": "仓库运行器",
+    "runnerExecutable": "运行器可执行文件（绝对路径）",
+    "runnerPython": "Python 可执行文件（可选；默认：python）",
+    "runnerPath": "请输入运行器可执行文件的绝对路径。",
+    "runnerHint": "所选运行器会在每个独立检出目录中运行检查，并须提供目标仓库的测试环境，包括服务的启动和清理。容器隔离取决于运行器。"
   }
 }
