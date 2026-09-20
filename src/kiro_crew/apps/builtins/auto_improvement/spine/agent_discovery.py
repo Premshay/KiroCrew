@@ -239,14 +239,12 @@ def _module_name_for(rel: str) -> str:
 def dependents_of(clone: Path, changed: list[str], *, limit: int = 24) -> dict[str, list[str]]:
     """Map each changed file → the OTHER source files that import/reference its module
     (the "surrounding code that uses the new functionality"). A cheap dependency probe:
-    grep the src tree for the changed file's module leaf used in an ``import``/``from`` line.
+    grep tracked Python files for the changed file's module leaf used in an
+    ``import``/``from`` line.
 
     Not a precise import graph (no AST) — a deliberately cheap, dependency-direction hint so
     the agent knows which callers to read when judging whether a change broke a CONTRACT its
     users rely on. Capped so a hot module (imported everywhere) doesn't flood the prompt."""
-    src_dir = Path(clone) / "src"
-    if not src_dir.exists():
-        return {}
     out: dict[str, list[str]] = {}
     for rel in changed:
         leaf = _module_name_for(rel)
@@ -268,7 +266,7 @@ def _git_grep_imports(clone: Path, leaf: str) -> list[str]:
     ``git grep`` (fast, respects tracked files); returns [] on any failure."""
     # Match: `import leaf`, `import leaf as`, `from x import leaf`, `from x.leaf import`
     pattern = rf"(import|from).*\b{re.escape(leaf)}\b"
-    out = _git(["grep", "-lE", pattern, "--", "src/"], clone, timeout=60.0)
+    out = _git(["grep", "-lE", pattern, "--", "*.py"], clone, timeout=60.0)
     return [ln.strip() for ln in out.splitlines() if ln.strip().endswith(".py")]
 
 
@@ -397,7 +395,11 @@ DEFAULT_PRIORITY_SLICE = 12
 
 
 def _render_focus_list(
-    changed: list[str], dependents: dict[str, list[str]], *, slice_n: int = DEFAULT_PRIORITY_SLICE
+    changed: list[str],
+    dependents: dict[str, list[str]],
+    *,
+    slice_n: int = DEFAULT_PRIORITY_SLICE,
+    remainder_label: str = "ALSO CHANGED",
 ) -> str:
     """Render the changed-file list as a PRIORITY SLICE (this cycle's reading focus, bounded
     so the agent converges within its turn budget) followed by the REST (still fully visible —
@@ -415,7 +417,7 @@ def _render_focus_list(
     lines += [fmt(r) for r in head]
     lines.append("")
     lines.append(
-        f"ALSO CHANGED ({len(rest)} more — the full surface; a LATER cycle rotates these into "
+        f"{remainder_label} ({len(rest)} more — the full surface; a LATER cycle rotates these into "
         "the priority slice, so you need NOT read them now — only dip in if the slice is clean):"
     )
     lines += [fmt(r) for r in rest]
@@ -468,15 +470,22 @@ def _build_prompt(
             "Then EMIT.\n\n"
             f"{_render_focus_list(changed, dependents)}\n"
         )
-    elif scoped and changed:
-        focus = (
+    elif changed:
+        introduction = (
             "This branch introduces/changes the files below (the FOCUS LIST — the COMPLETE "
-            "changed-file surface, ordered most-promising-first; it rotates each cycle so "
+            "changed-file surface, "
+            if scoped
+            else "You are reviewing a Python codebase. The files below are the COMPLETE "
+            "tracked product Python surface of this repository (the FOCUS LIST, "
+        )
+        remainder_label = "ALSO CHANGED" if scoped else "ALSO TRACKED"
+        focus = (
+            introduction + "ordered most-promising-first; it rotates each cycle so "
             "different files lead on different cycles). For each, the files that USE it (its "
             "callers/dependents) are in parentheses.\n\n"
             "BUDGET — read this FIRST: read ONLY from the PRIORITY SLICE below this cycle "
             "(~12 files), open UP TO 8 of them, ONE read each; do NOT re-read a file. The full "
-            "surface is listed under 'ALSO CHANGED' for context, but a LATER cycle rotates "
+            f"surface is listed under '{remainder_label}' for context, but a LATER cycle rotates "
             "those into the slice — you do NOT need to read them now. The moment you have 2-3 "
             "solid findings OR have used 8 reads (whichever comes FIRST), STOP and reply with "
             "ONLY the JSON array. Reading is INSTRUMENTAL — it is NOT the task. An answer with "
@@ -487,7 +496,7 @@ def _build_prompt(
             "__main__/config/wiring), read promising files ONCE, and the moment you spot a "
             "testable defect, record it. Favor contract breaks (a function returns a shape/"
             "status/0-value its callers don't expect). Then EMIT.\n\n"
-            f"{_render_focus_list(changed, dependents)}\n"
+            f"{_render_focus_list(changed, dependents, remainder_label=remainder_label)}\n"
         )
     else:
         focus = (
@@ -643,6 +652,8 @@ def discover_surfaces_via_agent(
         if allowlisted:
             all_changed = allowlisted
             allowlist_focus = True
+    if not scoped and not edit_globs:
+        all_changed = allowlisted_py_files(Path(clone), ["*.py"])
     # ORDER the FULL set high-value-logic-first, then ROTATE within each tier by the cycle
     # index so the read budget samples a different slice each cycle (operator directive
     # do NOT limit the search space — a cap hides the engine modules behind
@@ -651,7 +662,7 @@ def discover_surfaces_via_agent(
     changed = prioritize_focus(all_changed, rotate=rotate)
     dependents = dependents_of(Path(clone), changed) if changed else {}
     src_dir = Path(clone) / "src" / "kiro_crew"
-    src_label = "src/kiro_crew" if src_dir.exists() else "src"
+    src_label = "src/kiro_crew" if src_dir.exists() else "."
     prompt = _build_prompt(
         src_label=src_label,
         changed=changed,

@@ -146,6 +146,10 @@ class _FakeProvider:
         self.shutdown_error: Exception | None = None
         self.start_error: Exception | None = None
 
+    def restrict_tools(self, allowed_tools: list[str]) -> None:
+        assert not self.started
+        self.allowed_tools = list(allowed_tools)
+
     async def start(self) -> None:
         self.started += 1
         if self.start_error is not None:

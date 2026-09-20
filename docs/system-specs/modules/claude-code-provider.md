@@ -352,3 +352,20 @@ uses the resulting allowlist when an automatic selection omits an explicit
 model. `TestModelRegistry.test_fable_5_not_default` and
 `TestModelRegistry.test_available_models_is_default_first` pin the default and
 ordering behavior.
+
+### Restricted headless sessions
+
+Caller tool whitelists use the existing `_meta.claudeCode.options` channel on
+both `session/new` and `session/load`. `tools` selects the exact built-in tool
+surface, including `[]` for no built-ins. It is not `allowedTools`, which is an
+approval preference and does not remove tools under `bypassPermissions`.
+Restricted sessions send no MCP servers and set `strictMcpConfig: true` plus
+`disallowedTools: ["mcp__*"]`, excluding ambient and adapter-provided MCP tools.
+Settings sources, permission mode, sandboxing and governance rules stay intact.
+The model-substitution retry reuses the same constrained session parameters.
+
+Only the six file/shell tool names documented in [providers](providers.md) are
+accepted. Unknown names, wildcards and the SDK's `default` preset are refused
+before startup. This relies on the Claude adapter forwarding SDK `tools`,
+`strictMcpConfig` and `disallowedTools` options; it is not an ACP-wide guarantee.
+Wire-level tests cover the runner-to-provider-to-client path without a model run.
