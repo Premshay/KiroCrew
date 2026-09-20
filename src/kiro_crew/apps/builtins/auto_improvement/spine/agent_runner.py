@@ -1384,11 +1384,15 @@ class SessionAgentRunner:
             try:
                 provider = factory(session_key, agent=self.agent_name, cwd=cwd)
             except TypeError:
+                if allowed_tools is not None:
+                    raise
                 # Older/other factories may not accept cwd / agent kwargs.
                 try:
                     provider = factory(session_key, agent=self.agent_name)
                 except TypeError:
                     provider = factory(session_key)
+            if allowed_tools is not None:
+                provider.restrict_tools(list(allowed_tools))
             await provider.start()
             text_parts: list[str] = []
             # Streamed assistant text arrives as MANY tiny provider chunks (often sub-word

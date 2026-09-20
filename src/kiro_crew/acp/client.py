@@ -4810,6 +4810,7 @@ class AcpClient:
         # what _write_claude_local_settings leaves in place when nothing asked
         # for a mode.
         self._permission_mode = permission_mode
+        self._allowed_tools: tuple[str, ...] | None = None
         # True once this session has CREATED <work_dir>/.claude/settings.local.json
         # itself. Only then does reset remove it, and only then does a re-seed
         # overwrite it. The writer refuses a path that already holds a file it did
@@ -5751,9 +5752,33 @@ class AcpClient:
             self._channel_id,
         )
 
+    def restrict_tools(self, allowed_tools: list[str]) -> None:
+        """Install a native tool whitelist before the Claude session starts."""
+        if self._process is not None or self._session_id:
+            raise RuntimeError("Tool restrictions must be set before provider startup")
+        if self.backend == ACP_BACKEND_CLAUDE:
+            supported = {"Bash", "Read", "Edit", "Write", "Grep", "Glob"}
+            if not isinstance(allowed_tools, list) or any(
+                not isinstance(tool, str) or tool not in supported for tool in allowed_tools
+            ):
+                raise ValueError("Claude tool whitelist requires exact file/shell tool names")
+            self._allowed_tools = tuple(allowed_tools)
+            return
+        raise NotImplementedError(
+            f"Backend {self.backend!r} cannot enforce a tool whitelist before execution"
+        )
+
     def _claude_session_meta(self) -> dict[str, Any]:
         """Return the adapter extension requested on every Claude session bind."""
         options: dict[str, Any] = {}
+        if self._allowed_tools is not None:
+            # SDK `tools` removes built-ins before execution; `allowedTools`
+            # only pre-approves them and cannot constrain bypassPermissions.
+            options.update(
+                tools=list(self._allowed_tools),
+                strictMcpConfig=True,
+                disallowedTools=["mcp__*"],
+            )
         # Asks for the roster the adapter will actually be handed, which is the
         # thing this decision is about. The former test read the TRANSLATION twice
         # -- ``_claude_session_mcp_servers`` returns exactly what
@@ -5797,6 +5822,8 @@ class AcpClient:
         Blocking for a mirror-less backend (the pooled read opens the gateway
         overlay), so the session/new and session/load sites call it off the loop.
         """
+        if self._allowed_tools is not None:
+            return []
         if self.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY:
             # kiro-cli reads the agent spec itself via --agent, so nothing is
             # translated here -- but the pooled broker stubs can arrive on NO other

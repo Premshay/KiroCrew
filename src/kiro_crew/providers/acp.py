@@ -522,6 +522,9 @@ class AcpProvider(LLMProvider):
         """
         return str(self._client._work_dir)
 
+    def restrict_tools(self, allowed_tools: list[str]) -> None:
+        self._client.restrict_tools(allowed_tools)
+
     @property
     def is_claude_backend(self) -> bool:
         """True when this ACP provider talks to claude-agent-acp (vs kiro-cli).

@@ -117,6 +117,14 @@ class LLMProvider(ABC):
         """Exact documents supplied at native startup, empty without evidence."""
         return {}
 
+    def restrict_tools(self, allowed_tools: list[str]) -> None:
+        """Restrict tools before startup, or refuse if enforcement is unavailable.
+
+        An empty list forbids every tool. This is an execution restriction,
+        not an approval preference; permission events alone do not satisfy it.
+        """
+        raise NotImplementedError("This provider cannot enforce a tool whitelist before execution")
+
     @abstractmethod
     async def start(self) -> None:
         """Initialize the provider (spawn process, create client, etc.)."""

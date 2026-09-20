@@ -611,3 +611,17 @@ shared subagent would strand `spawn_continue` on `conversation_gone`. A differen
 gap, owned by whoever gives KAS a non-destroying teardown. The invariants governing what an
 added harness may and may not change are in
 [harness-parity.md](harness-parity.md).
+
+### Caller tool whitelists
+
+`LLMProvider.restrict_tools(allowed_tools)` is a pre-start execution constraint.
+An empty list forbids every tool; callers that omit the method retain the ordinary
+provider behavior. The base implementation refuses unsupported providers before
+startup. `AcpProvider` delegates to its client; Claude supports exact `Bash`, `Read`,
+`Edit`, `Write`, `Grep`, and `Glob` names. Other ACP backends refuse a restricted
+run until they implement an equivalent native constraint.
+
+Auto Improvement installs every explicit whitelist before starting its provider.
+It retains the permission-event governance gate as an additional check and does
+not retry a restricted factory call with reduced arguments. Unsupported providers
+and rejected restrictions return a failed runner result without a model turn.
