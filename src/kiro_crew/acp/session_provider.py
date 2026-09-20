@@ -37,7 +37,14 @@ from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead, AcpRuntimeError, A
 from kiro_crew.acp.session_handle import WatchdogSettings
 from kiro_crew.acp.types import (
     ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_CONTEXT_RECYCLE,
+)
+from kiro_crew.acp.types import (
+    ACP_BACKENDS_HARNESS_MANAGED_COMPACTION as ACP_BACKENDS_HARNESS_MANAGED,
+)
+from kiro_crew.acp.types import (
     ACP_BACKENDS_MEMBER_CAPABILITIES,
+    ACP_BACKENDS_SESSION_EVICTION,
     STOP_REASON_END_TURN,
 )
 from kiro_crew.agent_sdk import host_auth
@@ -46,6 +53,7 @@ from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.mcp_gateway.claim import schedule_claim
 from kiro_crew.providers.base import CancelOutcome, LLMEvent, LLMProvider
 from kiro_crew.recovery.ladder import InfraError
+from kiro_crew.session_token_sig import schedule_session_token_publish
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +120,35 @@ class AcpSessionProvider(LLMProvider):
         detects that via ``is_alive()``/``is_process_alive()`` and replaces the
         worker, so this raises rather than silently respawning a new process here
         (the runtime is owned by this provider's lifecycle, not recreated in place).
+
+        Reuse is only cheap where the old session actually GOES AWAY, so this is
+        gated on ``ACP_BACKENDS_SESSION_EVICTION``. The whole primitive rests on
+        the ``old.destroy()`` below reclaiming the previous session's context and
+        MCP children on the shared process; on a backend whose teardown does not
+        evict, that call returns having freed nothing and each reset leaves one
+        more resident session behind. Nothing downstream collects them: such a
+        backend is off the eviction path by construction, and a recycle rule that
+        measures a narrower scope than where the sessions live never sees the
+        growth, so only the age ceiling ever reaps it. Refusing BEFORE creating
+        anything is what makes this safe --
+        ``WorkerPool.reset`` already treats an exception here as "no cheap path"
+        and falls back to a hard ``SessionManager.reset``, which is slower but
+        correct for every backend.
         """
+        # A plain membership test, with no sentinel handling: kiro's own backend
+        # id IS the empty string (``ACP_BACKEND_KIRO = ""``), so an unset
+        # ``acp_backend`` is not a value awaiting resolution -- it already reads as
+        # the member this set admits. Every other value, including one no harness
+        # registered, is refused, which is the fail-closed direction.
+        if self.backend not in ACP_BACKENDS_SESSION_EVICTION:
+            # Raise before the fresh session/new: the caller's hard-reset
+            # fallback is the correct path, and creating a session first would
+            # leak the very session this refusal exists to prevent.
+            raise AcpError(
+                f"backend {self.backend!r} does not evict sessions on teardown, so "
+                "warm conversation reuse would accumulate resident sessions -- "
+                "use the hard-reset path instead"
+            )
         if not self._runtime.is_alive():
             raise AcpProcessDied("Runtime is not alive — cannot start a new conversation")
         old = self._handle
@@ -122,6 +158,7 @@ class AcpSessionProvider(LLMProvider):
         new_handle = await self._runtime.create_session(
             cwd=self._runtime._work_dir,
             agent=self._runtime._agent or None,
+            memory_mode=self.memory_mode,
         )
         # Re-apply the configured non-default model to the fresh session. A new
         # session/new reverts to the agent-config default model, so a warm worker
@@ -169,6 +206,19 @@ class AcpSessionProvider(LLMProvider):
         except Exception:
             logger.debug("new_conversation: old session destroy failed", exc_info=True)
 
+    @property
+    def memory_mode(self) -> str:
+        return self._handle.memory_mode
+
+    @memory_mode.setter
+    def memory_mode(self, value: str) -> None:
+        from kiro_crew.execution_context import stricter_memory_mode
+
+        self._handle.memory_mode = stricter_memory_mode(self._handle.memory_mode, value)
+        if self.memory_mode != "persistent":
+            self._handle.keep_transcript = False
+            self._runtime.recording_allowed = False
+
     def set_keep_transcript(self, value: bool) -> None:
         """Mark the underlying session handle to keep (or delete) its
         transcript files at destroy(). Set True by SubagentManager before
@@ -176,7 +226,7 @@ class AcpSessionProvider(LLMProvider):
         material; the tombstone pruner / conversation TTL sweep owns its
         eventual deletion."""
         try:
-            self._handle.keep_transcript = value
+            self._handle.keep_transcript = value and self.memory_mode == "persistent"
         except Exception:  # pragma: no cover - handle types without the attr
             logger.debug("set_keep_transcript: handle rejected attribute", exc_info=True)
 
@@ -199,7 +249,15 @@ class AcpSessionProvider(LLMProvider):
         """
         if self._owns_runtime:
             try:
-                await self._runtime.kill(expected=True)  # deliberate session teardown
+                if self.memory_mode != "persistent":
+                    try:
+                        await self._handle.destroy()
+                    finally:
+                        await self._runtime.kill(
+                            expected=True, reason="provider shutdown (non-persistent)"
+                        )
+                else:
+                    await self._runtime.kill(expected=True, reason="provider shutdown")
             except Exception:
                 logger.debug("AcpSessionProvider.shutdown: runtime kill failed", exc_info=True)
         else:
@@ -572,6 +630,12 @@ class AcpSessionProvider(LLMProvider):
             channel_id,
             getattr(self._handle, "stub_session_token", ""),
         )
+        # Re-point this session's SIGNED token mapping at the claiming session, for
+        # the reason AcpClient.rekey states: the token survives the rekey so the
+        # file is what moves. It matters more here — this runtime hosts several
+        # sessions at once, so the mapping is the only channel that can tell them
+        # apart without a daemon. Fire-and-forget; offloads its own file I/O.
+        schedule_session_token_publish(getattr(self._handle, "stub_session_token", ""), session_key)
 
     def reclaim(self) -> None:
         """Re-push this session's claim (parity with AcpClient.reclaim).
@@ -592,6 +656,19 @@ class AcpSessionProvider(LLMProvider):
             self._channel_id,
             token,
         )
+
+    @property
+    def session_identity_token(self) -> str:
+        """This session's per-session identity token, or ``""``.
+
+        The uniform name the shared per-turn publisher reads
+        (``messaging.identity._publish_session_token``), parity with
+        :attr:`AcpClient.session_identity_token`. On this provider the token lives
+        on the session HANDLE rather than on the runtime, because the runtime is
+        shared by every session on it and the token names exactly one.
+        """
+        token = getattr(self._handle, "stub_session_token", "")
+        return token if isinstance(token, str) else ""
 
     @property
     def _agent(self) -> str:
@@ -636,6 +713,29 @@ class AcpSessionProvider(LLMProvider):
         """
         backend = self.backend
         if not isinstance(backend, str) or backend in ACP_BACKENDS_COMPACT:
+            return None
+        return backend
+
+    @property
+    def compaction_self_managed(self) -> bool:
+        """Same membership answer as ``AcpProvider.compaction_self_managed``, for
+        the bare shared-subagent shape handed out without the wrapper."""
+        backend = self.backend
+        if not isinstance(backend, str):
+            return True
+        return backend in ACP_BACKENDS_COMPACT or backend in ACP_BACKENDS_HARNESS_MANAGED
+
+    @property
+    def compaction_unmanaged_backend(self) -> str | None:
+        """Backend id when neither Crew nor the harness compacts, else ``None``.
+
+        Same ``ACP_BACKENDS_CONTEXT_RECYCLE`` membership answer as
+        ``AcpProvider.compaction_unmanaged_backend``, for the bare
+        shared-subagent shape that is handed out without the ``AcpProvider``
+        wrapper.
+        """
+        backend = self.backend
+        if not isinstance(backend, str) or backend not in ACP_BACKENDS_CONTEXT_RECYCLE:
             return None
         return backend
 

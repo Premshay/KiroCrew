@@ -5,11 +5,13 @@
 The Slack integration (`kiro_crew/slack/`) connects KiroCrew to Slack via Socket Mode. DMs are routed through ACP to kiro-cli with real-time streaming and interactive tool approval.
 
 Independently scheduled agent runs admit their exact execution key as durable
-work before provider allocation, publishing its privacy mode in the existing
-protected runtime-policy tree. Single and sequential-agent paths share that
+work before provider allocation, publishing its privacy mode in the canonical
+session execution record. Single and sequential-agent paths share that
 admission, so first-turn child creation does not require a dashboard slot or a
 previous transcript. A damaged committed mode refuses allocation; a key prefix
 alone never grants a mode. Origin-chat injection keeps the chat's own policy.
+Cron execution binding is published off the event loop before mode admission
+and provider allocation, using the run's already captured execution context.
 
 Startup wires memory objects behind one gateway-lifetime in-process barrier.
 Both dashboard and API-only servers receive the orchestrator's existing context
@@ -90,9 +92,9 @@ file timestamps do not establish completed recovery or safe deletion order.
 During operation, member cron jobs, linked DMs, nudges and completion injections validate
 their own recorded memory identity before acquiring a provider. Completion
 injections use the parent conversation's memory; delegates keep their target's
-private memory for the delegated run and retries.
+member-scoped memory for the delegated run and retries.
 
-Private-memory refusals retain their named recovery reason in channel replies,
+Memory-operation refusals retain their named recovery reason in channel replies,
 but pass through the shared credential/exfiltration and local-path redactors
 before truncation. Both native Slack and its transport dispatcher apply the same
 protection as Discord and Telegram. Native Slack sanitizes the accumulated reply
@@ -163,6 +165,15 @@ or store the user token.
 
 ### `run_gateway(cfg: KiroCrewConfig, *, no_dashboard=False, no_crons=False) -> None`
 Starts the Socket Mode listener. Blocks until SIGINT/SIGTERM. When `no_crons=True`, the `CronService` is instantiated but not started — cron jobs are visible in the dashboard but not executed. Use for multi-instance setups where a single primary instance handles cron execution. On shutdown, calls `dashboard_state.close_all_ws()` before `AppRunner.cleanup()` to prevent 30s hang from blocked WebSocket `async for msg` loops.
+
+### Restart after update
+
+Automatic-update restarts select and validate the composed gateway launcher before
+saving state or draining callbacks/sessions. Without a launcher they retain the
+core-managed interpreter resolver loaded before apply. Launcher selection and the
+companion integration contract are defined in
+[platform-context](platform-context.md#gateway-restart-launcher); the callback
+fence and final yield-free drain-to-exec handoff apply to both launch paths.
 
 ### Shutdown Sequence
 
@@ -430,7 +441,7 @@ Shared data-collection and Block Kit rendering for recent sessions, used by thre
 
 The collector and renderer live in `kiro_crew/slack/sessions_view.py` so both `events.py` and `handler.py` can import them at module top-level without forming a circular import. `sessions_view.py` depends only on `kiro_crew.slack.blocks` and `kiro_crew.security` — it knows nothing about `events` or `handler`, which is what keeps the import graph acyclic.
 
-All three surfaces call `await _collect_recent_sessions_off_loop(sessions, *, limit, kind)` — the required entry point for async callers, which runs the synchronous collector `_collect_recent_sessions` in a worker thread via `asyncio.to_thread` — to read JSONL files under `~/.kiro/crew/sessions/`, classify them as `dashboard` (main chat slots), `taskrunner` (autopilot/task runner steps), or `other`, and `_build_sessions_blocks(rows, *, for_home_tab=False)` to render them. The sync collector does unbounded-size transcript reads and is worker-thread-only: never call it directly from an `async def`. It pre-scans the directory (kind from the filename stem, mtime from `stat`) and reads only the newest `limit` matching transcripts.
+All three surfaces call `await _collect_recent_sessions_off_loop(sessions, *, limit, kind, include_ended=False)` — the required entry point for async callers, which runs the synchronous collector `_collect_recent_sessions` in a worker thread via `asyncio.to_thread` — to read JSONL files under `~/.kiro/crew/sessions/`, classify them as `dashboard` (main chat slots), `taskrunner` (autopilot/task runner steps), or `other`, and `_build_sessions_blocks(rows, *, for_home_tab=False)` to render them. The sync collector does unbounded-size transcript reads and is worker-thread-only: never call it directly from an `async def`. It pre-scans the directory (kind from the filename stem, mtime from `stat`) and reads `limit` matching transcripts plus one per skipped candidate met on the way down the mtime order, so the read count does not grow with the directory. `include_ended` and the third skip reason are covered under "Ended rows leave the list" below.
 
 The slash command and keyword (which post via `chat.postMessage`) use the shared `blocks.session_task_card` builder. The Home Tab calls with `for_home_tab=True` and uses `section` blocks instead — Slack's `views.publish` API rejects `task_card` with `unsupported type: task_card`. Both paths keep the canonical `mc_session_resume_{key}` action ID handled by `interactions.py:_handle_session_resume`.
 
@@ -445,6 +456,22 @@ Each surface emits a SEL audit event for the data-access via `sel.log_api_access
 - Home Tab: `slack.home_tab_sessions_data_access` (caller = Slack user id)
 
 Sharing the builder also means the `sessions` keyword now displays the same 🟢 active / ⚫ inactive marker as the slash command. Previously the keyword path rendered every card as inactive regardless of session state.
+
+### Ended rows leave the list
+
+`⏹️ End` (`mc_session_end_{key}`, handled by `interactions.py:_handle_session_end`) records a **dismissal** on the row's transcript: `closed: True` plus a `closed_at` epoch on the metadata line, written through `ConversationLog.update_metadata_if` and therefore mtime-preserving. `messaging/sessions_view._row_is_ended` reads that flag back and the collector leaves such rows out unless the caller passes `include_ended=True`.
+
+Three details are load-bearing:
+
+- **The record is written whether or not a session is live.** The soft remove above it only kills a process, and a cluttered list is mostly idle rows — for those the removal branch resolves no key and does nothing, which is why End used to have no observable effect at all.
+- **The skipped row frees its slot.** Dismissed rows are skipped inside the read loop the same way empty and unreadable files are, so the list still fills to `limit` with live sessions instead of shrinking. The cost is one read per skipped row: with the *n* newest rows dismissed, *n* transcripts are read and discarded before the first kept row. Unlike the corrupt-file skips this is an ordinary state, so it is reachable in normal use; it is bounded by the directory, and `with_messages=False` reduces each such read to line 0.
+- **`closed_at` is stamped after the teardown**, because consolidation and skill extraction write the transcript on the way out of an End. Nothing in this list compares it (see below); it is written because the dashboard's reader does, and a flag with no instant makes every close there permanent.
+
+A live session outranks the flag, so a resumed conversation is listed immediately. `▶️ Resume` also clears the flag outright (`ConversationLog.clear_closed`), so the row stays listed once that process exits.
+
+This is deliberately **not** the rule `dashboard/channel_slots._close_stands` applies to the same field. That one asks whether a channel conversation outran a closed tab and compares the close against the channel's last write. This one asks whether the user still wants the row, and background housekeeping — consolidation, skill extraction, an auto-title — writes the file without the user doing anything, so any write-based rule would put a dismissed row straight back at the top.
+
+The opt-in is `sessions all` / `sessions ended` (DM keyword) and `/<command> sessions all` (slash). `sessions_view.SESSIONS_INCLUDE_ENDED_ARGS` is the one vocabulary, read both by `sessions_view.sessions_include_ended` and by `handler._is_sessions_keyword` — the matcher has to admit the argument or the message is never routed to the sessions handler at all. Opted-in rows render 🛑 in both the task card and the Home Tab layout so they are distinguishable from merely idle ones. The Home Tab has no argument surface and always uses the default.
 
 ## `!compact` Command (`handler.py`)
 
@@ -802,8 +829,7 @@ Owner command in `handler.py` that generates a time-limited token URL for dashbo
 
 `token_auth_middleware(local_only)` in `token_auth.py` — aiohttp middleware in the explicit middleware chain:
 
-- **Auth required when**: not local-only (i.e. bound to all interfaces)
-- **Loopback trusted when**: local-only mode (SSH tunnel access)
+- **Auth required**: on every gated request, loopback included — local-only mode no longer trusts loopback (local port forwarders make remote traffic appear as 127.0.0.1)
 - **Bypassed for**: static assets (`/assets/`, `/static/`, `/logo.png`, `/manifest.json`, `/sw.js`, `/icon-*.png`)
 - **Token sources**: `?token=` query param (first use) or `mc_token_{port}` cookie (subsequent requests)
 - **First query-param use**: binds token to client IP, marks consumed, sets `HttpOnly; SameSite=Strict; Path=/` cookie

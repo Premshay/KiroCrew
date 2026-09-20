@@ -1014,6 +1014,7 @@ _MANAGED_SERVER_SUBCOMMANDS = {
     "kirocrew-computer": "mcp-computer",
     "kirocrew-dashboard": "mcp-dashboard",
     "kirocrew-work": "mcp-work",
+    "kirocrew-crew-log": "mcp-crew-log",
 }
 _MANAGED_SERVER_NAMES = set(_MANAGED_SERVER_SUBCOMMANDS)
 
@@ -1026,6 +1027,7 @@ _MANAGED_SERVER_TOOL_MODULES = {
     "kirocrew-computer": "kiro_crew.mcp_computer",
     "kirocrew-dashboard": "kiro_crew.mcp_dashboard",
     "kirocrew-work": "kiro_crew.mcp_work",
+    "kirocrew-crew-log": "kiro_crew.mcp_crew_log",
 }
 
 
@@ -1052,7 +1054,13 @@ _MANAGED_SERVER_TOOL_MODULES = {
 #: argument actually handed to the shim. That check imports the modules in the
 #: TEST process, where running package code is the point rather than a hazard.
 _MANAGED_SERVERS_CALLER_AWARE: frozenset[str] = frozenset(
-    {"kirocrew-core", "kirocrew-cron", "kirocrew-dashboard", "kirocrew-work"}
+    {
+        "kirocrew-core",
+        "kirocrew-cron",
+        "kirocrew-dashboard",
+        "kirocrew-work",
+        "kirocrew-crew-log",
+    }
 )
 
 #: Managed servers that ADVERTISE the capability but are deliberately withheld
@@ -1158,12 +1166,13 @@ def _fix_stale_managed_command(name: str, spec: dict) -> None:
     a standalone ``bin/kirocrew`` (POSIX) / ``Scripts\\kirocrew.exe`` (Windows
     pip install) console script when one resolves, the Windows bundle's
     ``bin\\kirocrew.cmd`` shim (unwrapped to ``<root>\\python.exe -P -s -m
-    kiro_crew <sub>``), and otherwise the ``<interpreter> -m kiro_crew <sub>``
-    fallback. Both ``command`` AND ``args``
-    are rewritten — the fallback needs ``["-m", "kiro_crew", <sub>]``, so
-    re-resolving the command alone (the old behavior) silently dropped the args
-    and spawned a bare ``kirocrew`` that isn't on PATH (Windows: ``command not
-    found: kirocrew``; the built-in cron/core tools then never load).
+    kiro_crew <sub>``), and otherwise the ``<interpreter> [-s] -m kiro_crew
+    <sub>`` fallback. Both ``command`` AND ``args`` are rewritten — the fallback
+    needs its optional isolation prefix plus ``["-m", "kiro_crew", <sub>]``,
+    so re-resolving the command
+    alone (the old behavior) silently dropped the args and spawned a bare
+    ``kirocrew`` that isn't on PATH (Windows: ``command not found: kirocrew``;
+    the built-in cron/core tools then never load).
     """
     subcommand = _MANAGED_SERVER_SUBCOMMANDS.get(name)
     if subcommand is None:
@@ -1233,13 +1242,17 @@ def _is_first_party_managed_argv(
         logger.debug("managed MCP invocation resolution failed", exc_info=True)
         return False
     expected_command, expected_args = invocation
-    # Refuse the interpreter fallback (`<python> -m kiro_crew <sub>`): `python
-    # -m` prepends the child's CWD to sys.path (this package supports 3.10, so
-    # `-P`/PYTHONSAFEPATH cannot be assumed), and the probe child inherits the
-    # gateway's cwd — a planted `kiro_crew/` tree there would shadow the
-    # installed package and run unconfined. Only a resolved console-script
-    # binary, whose entrypoint imports from its own install, qualifies.
-    if expected_args[:2] == ["-m", "kiro_crew"]:
+    # Refuse the interpreter fallback with or without its conditional ``-s``:
+    # neither form removes the child's CWD from sys.path, so a planted
+    # ``kiro_crew/`` tree in the gateway's cwd could still shadow the installed
+    # package and run unconfined. Only a resolved console-script binary, whose
+    # entrypoint imports from its own install, qualifies. Keep recognizing both
+    # fallback forms defensively.
+    if expected_args[:2] == ["-m", "kiro_crew"] or expected_args[:3] == [
+        "-s",
+        "-m",
+        "kiro_crew",
+    ]:
         return False
     return (
         command == expected_command

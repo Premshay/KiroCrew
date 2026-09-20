@@ -49,7 +49,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -331,8 +331,43 @@ def _fetch_instruction(link: str) -> str:
     return pipeline.fetch_spec(platform, host=host)
 
 
+def _consolidation_selection_lines(
+    selection: Sequence[dict], blocked_promotions: Sequence[str]
+) -> str:
+    """One ``- <id> — <title>`` line per selected candidate.
+
+    The id is what a decision must name verbatim, and a legacy candidate block
+    carries none on disk: the id the preview demands is derived from title and
+    scope at read time, so the worker has no way to name one from the markdown.
+    """
+    blocked = {str(item) for item in blocked_promotions}
+    lines: list[str] = []
+    for item in selection:
+        candidate_id = str(item.get("id") or "")
+        if not candidate_id:
+            continue
+        title = " ".join(str(item.get("title") or "").split())
+        if len(title) > 120:
+            title = title[:117] + "..."
+        marker = (
+            "  [cannot be promoted or merged — a rule must recur before it may govern]"
+            if candidate_id in blocked
+            else ""
+        )
+        label = f"     - {candidate_id}"
+        if title:
+            label += f" — {title}"
+        lines.append(label + marker + "\n")
+    return "".join(lines)
+
+
 def build_consolidation_task(
-    namespace: str, live_path: str, candidate_path: str, out_path: str
+    namespace: str,
+    live_path: str,
+    candidate_path: str,
+    out_path: str,
+    selection: list[dict] | None = None,
+    blocked_promotions: list[str] | None = None,
 ) -> str:
     """Prompt for the one-shot merge that turns staged candidates into the ruleset.
 
@@ -340,35 +375,59 @@ def build_consolidation_task(
     two rules should collapse into one, and how to phrase the survivor. The
     mechanics are not — the worker writes a proposal artifact and a human confirms
     the deterministic apply. That split is why a bad merge cannot silently wipe
-    the ruleset.
+    the ruleset. ``selection`` and ``blocked_promotions`` are the mechanics: the
+    exact ids to decide on, and the ones the sidecar will refuse to promote.
     """
+    rules = [
+        "Rules for the merge:\n",
+        "  1. Keep every current pattern unless a candidate genuinely supersedes "
+        "it — this file IS the reviewer's memory, so dropping a rule loses a "
+        "lesson permanently. Deletion needs a reason you could defend.\n",
+        "  2. Collapse duplicates and near-duplicates into ONE sharper rule. "
+        "Several candidates often come from the same incident.\n",
+        "  3. Each pattern is a single high-level, code-agnostic heuristic: a "
+        "title plus one paragraph of guidance. Strip the incident anecdote, the "
+        "repo name, the PR number and any code sample — if a rule needs an "
+        "example to be understood it is underspecified, so sharpen the wording "
+        "instead.\n",
+        "  4. A candidate that only makes sense for the change it came from — one "
+        "contract, schema, screen or file — is an observation, not a rule. Give it "
+        "`action` `archive`; do not promote it into the ruleset.\n",
+        "  5. `ruleset_markdown` preserves the exact on-disk format, one block per pattern:\n"
+        "     ### <title> <!-- scope:common --> <!-- impact:high|medium|low --> "
+        "<!-- added:<ISO8601Z> -->\n"
+        "     <one paragraph of guidance on a single line>\n",
+    ]
+    number = 6
+    if selection:
+        rules.append(
+            f"  {number}. `decisions` has exactly one object for EVERY id below, and its "
+            "`candidate_id` is that id verbatim. Each object also carries `action` "
+            "(`promote`, `merge`, `archive`, or `retain`) and a snake_case "
+            "`reason_code`. A rule must be learned in two separate reviews before it "
+            "may govern the ruleset, so for an id marked as un-promotable use "
+            "`retain` (keep it staged for a later merge) or `archive` (it is not a "
+            "general rule):\n"
+            + _consolidation_selection_lines(selection, blocked_promotions or [])
+        )
+    else:
+        rules.append(
+            f"  {number}. `decisions` has exactly one object for every selected candidate "
+            "id, with `candidate_id`, `action` (`promote`, `merge`, `archive`, or "
+            "`retain`) and a snake_case `reason_code`.\n"
+        )
+    number += 1
+    rules.append(
+        f"  {number}. Keep the markdown header. Write no commentary or fences. The "
+        'complete file shape is {"ruleset_markdown": "...", "decisions": [...]}.'
+    )
     return (
         "You are consolidating Code Review Sage's learned-pattern ruleset for the "
         f"namespace {namespace!r}. This is a one-shot merge, not a review.\n"
         f"  * CURRENT ruleset (what reviews load today): {live_path}\n"
         f"  * PENDING candidates (staged, not yet used):  {candidate_path}\n"
         "Read both, then write ONE JSON object to "
-        f"{out_path}.\n"
-        "Rules for the merge:\n"
-        "  1. Keep every current pattern unless a candidate genuinely supersedes "
-        "it — this file IS the reviewer's memory, so dropping a rule loses a "
-        "lesson permanently. Deletion needs a reason you could defend.\n"
-        "  2. Collapse duplicates and near-duplicates into ONE sharper rule. "
-        "Several candidates often come from the same incident.\n"
-        "  3. Each pattern is a single high-level, code-agnostic heuristic: a "
-        "title plus one paragraph of guidance. Strip the incident anecdote, the "
-        "repo name, the PR number and any code sample — if a rule needs an "
-        "example to be understood it is underspecified, so sharpen the wording "
-        "instead.\n"
-        "  4. `ruleset_markdown` preserves the exact on-disk format, one block per pattern:\n"
-        "     ### <title> <!-- scope:common --> <!-- impact:high|medium|low --> "
-        "<!-- added:<ISO8601Z> -->\n"
-        "     <one paragraph of guidance on a single line>\n"
-        "  5. `decisions` has exactly one object for every selected candidate id, "
-        "with `candidate_id`, `action` (`promote`, `merge`, `archive`, or `retain`) "
-        "and a snake_case `reason_code`.\n"
-        "  6. Keep the markdown header. Write no commentary or fences. The complete "
-        'file shape is {"ruleset_markdown": "...", "decisions": [...]}.'
+        f"{out_path}.\n" + "".join(rules)
     )
 
 

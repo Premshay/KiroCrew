@@ -1430,8 +1430,7 @@ export default function ChatPane({
     openSideChat,
   })
 
-  const ddInputCls =
-    'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-none focus-visible:border-accent'
+  const ddInputCls = 'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-hidden focus-visible:border-accent'
 
   return (
     <SlotProvider slotId={slotKey}>
@@ -1586,8 +1585,11 @@ export default function ChatPane({
                 pushUp={pinnedState.push}
                 bannerH={pinnedState.bannerH}
                 expanded={pin.pinExpanded}
-                onToggleExpanded={() => setPinExpanded((p) => !p)}
-                onJump={() => pin.jumpToPinnedPromptInPlace(pinnedState.idx)}
+                onToggleExpanded={() => setPinExpanded(p => !p)}
+                onJump={() => pin.jumpToPinnedPromptInPlace(pinnedState.idx, {
+                  mountIndex: (index, opts) => listRef.current?.mountIndex(index, opts) ?? false,
+                  estimateRowTop: (index) => listRef.current?.estimateRowTop(index) ?? null,
+                })}
                 cardRef={pin.pinCardRef}
                 onCollapsedHeight={pin.onPinCollapsedHeight}
               />

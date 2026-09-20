@@ -103,7 +103,9 @@ class DashboardPersistenceCoordinator:
             return False
         if not owner.conversation_log:
             return False
-        if not slot._dirty or not slot.messages:
+        if not slot._dirty and not getattr(slot, "queue_persist_pending", False):
+            return True
+        if not slot.messages and not getattr(slot, "queue_persist_pending", False):
             return True
         save_slot_to_history = self._slot_saver_provider()
 

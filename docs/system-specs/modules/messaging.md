@@ -8,22 +8,17 @@
 
 Slack's transport path is gated behind the `messaging.use_transport` config flag (default `true` in Kiro Crew, so the abstraction is the canonical path); when off, Slack's native `handle_message` path runs instead.
 
-A resumed or linked member conversation retains its recorded private memory
-identity on every channel. The shared pipeline and Slack, Discord and Telegram
-dispatchers validate and prepare that memory before provider acquisition. A
-missing, corrupt or unreadable member store displays its refusal reason; it
-cannot turn into a Global Memory V1 conversation. Unowned legacy conversations
-retain V1. Provider template names do not identify Crew Members.
-The channel-neutral `spawn` and `bg` command path resolves the parent's recorded
-store off-loop before dispatch and passes it to spawn admission. A protected
-binding mismatch or unreadable history stops delegation rather than selecting
-global memory.
-
-When dashboard metadata records a member alias as `agent`, resumed channels
-translate it through the private store's declared owner to the member's provider
-template. A recorded channel template override remains an override. An unowned
-V1 conversation with an identically spelled agent name keeps its existing
-template semantics.
+A resumed or linked member conversation retains its canonical execution record
+on every channel: immutable member/store identity, captured provider template and
+privacy mode. The shared pipeline resolves that record before asynchronous work.
+Missing or malformed identity refuses routing without choosing Global. Learned
+database unavailability does not prevent persona/project context; an explicit
+memory operation reports that the captured store is unavailable. Unowned legacy
+conversations retain V1. Provider template names do not select member memory.
+Channel `spawn` and `bg` commands pass the captured execution to admission. The
+child keeps that member/store even if the parent closes or changes selection.
+Channel resume reads the recorded template directly; editable member labels and
+legacy metadata do not override a canonical execution.
 
 ## Architecture — the three layers
 
@@ -307,10 +302,14 @@ point — the one place shared by every channel's gate, chosen because each
 channel's `_tool_gate` is synchronous and loop-bound while the check does
 filesystem work — and on a refusal DOWNGRADES to the ladder below (never a hard
 block), logging `outcome=auto_approve_declined` with `reason=name_grant`, the
-refusal code, and `tier=hook_auto_approve`. On Windows the check cannot model
-the shell's lookup at all, so it declines every name-based shell grant there —
-a channel turn without a decider then falls to deny-by-default for shell tools
-its `auto_approve_tools` used to grant. Non-shell verdicts and the two
+refusal code, and `tier=hook_auto_approve`. On Windows the check models the
+shell's lookup and returns per-command verdicts as it does on POSIX, except in
+two host states that still decline every name grant:
+`windows_lookup_not_modelled` when Windows cannot report where the user's
+Documents folder is, and `ambiguous_env` when a per-user PowerShell profile sits
+at one of the paths derived from it. In those two states a channel turn without
+a decider falls to deny-by-default for shell tools its `auto_approve_tools`
+would otherwise grant. Non-shell verdicts and the two
 full-trust predicates above are not name-based grants and are unchanged. The
 `APPROVAL_TRUST_READS` rung is also unchanged and deliberately out of this
 check's scope: it keys on `event.tool_kind`, never on a program name — a
@@ -1629,9 +1628,9 @@ is known.
 that had just promised not to. Telegram's `_handle_title` now gates on
 `is_restricted` and says so in its reply, matching `_persist_turn` and Slack's own
 `/title`. The predicate is the channel's in-process tracker and NOT the transcript's
-`memory_mode` header, because the dashboard deliberately writes an incognito
-transcript and marks it, discarding on close: a gate down in `ConversationLog`
-would refuse a write that path is entitled to make. `test_telegram_parity.py`
+`memory_mode` header alone. Both dashboard and channel Incognito/Temporary
+sessions suppress Crew transcript/body persistence; the canonical execution
+carrier supplies privacy to child work before dispatch. `test_telegram_parity.py`
 enumerates the title writes in every dispatcher that reaches `privacy_mode` and
 requires each to consult the predicate — scoped that way because the eight channels
 that do not offer the modes have no session that can BE restricted.
@@ -1964,8 +1963,9 @@ answer is not permission: a raised evaluation and a `Decision` without
 - **A reconnect cannot hot-loop on an accept-then-close edge**: a connection must live at least `_MIN_HEALTHY_CONN_SECS` for its CLEAN close to reset the backoff counter, so a repeating immediate close stays on the exponential curve. Webex, WeCom and Discord all carry this guard. Without it a clean-disconnect branch that resets the attempt count makes the backoff curve unreachable and nothing bounds the request rate, and Discord bans an identity for 10 minutes after 10,000 invalid requests, so the cost is the channel, not just CPU.
 - **Session keys are namespaced**: every key is `channel_type:conversation_id`; only bare legacy Slack `thread_ts` keys are shimmed, via `canonical_key`/`legacy_key`.
 - **Runtime identity follows the current turn**: every channel dispatcher passes its trusted transport name as `runtime_source` to `ContextBuilder.build_message`; the shared `drive_turn` pipeline uses `ChannelTurn.channel_type`. A cross-surface resume keeps its original stable session key for conversation continuity, but `[RUNTIME]` names the interface carrying the current message. Follow-up turns refresh the marker because the one-time session context may describe an earlier surface.
-- **A turn reads the SESSION's memory silo, never the one its `agent` name suggests**: every channel turn resolves `memory_store=` through `context.session_store_for_turn(ctx_builder, session_key)`, which reads the session's own recorded binding and stands up that silo's vector tier before the build is offloaded. `drive_turn` does it on the shared seam for the same reason it owns `minimal_context`: every channel on the pipeline has the identical exposure, and one that forgot would read the operator's private memory for a crew bound elsewhere. **The store must not be derived from `agent`** — on every channel that field is a kiro-cli agent name, a namespace disjoint from `cfg.agents`, so a derivation resolves to `default` for exactly the crew that configured otherwise. A session with no recorded binding resolves `""` and runs the global path unchanged, which is nearly every channel conversation; one reaches a silo when it was taken over from, or resumed into, a crew-bound dashboard session. `scripts/check_memory_store_seam.py` gates the omission on any line a change touches; see [memory-skills-hooks](memory-skills-hooks.md#how-a-turn-running-surface-names-its-store).
+- **A turn uses its captured execution record, never an agent-name lookup**: channel turns resolve `memory_store=` through `context.session_store_for_turn(ctx_builder, session_key)`. The canonical record fixes member/store before provider work; a template or display alias cannot choose memory. Optional learned-memory preparation runs off the event loop. A missing member database leaves manual essentials and the task usable while explicit memory tools report the unavailable store. Temporary mode never opens memory. An ordinary V1 session without member metadata retains its Global path; malformed or missing member identity refuses instead of selecting Global. `scripts/check_memory_store_seam.py` gates omitted routing on changed turn-running call sites; see [memory-skills-hooks](memory-skills-hooks.md#how-a-turn-running-surface-names-its-store).
 - **Channel dashboard visibility is immediate**: after the first successful turn of a Discord, Telegram, Webex, Teams, WeCom, Weixin, or Feishu-owned session is persisted, the dispatcher triggers the channel-slot reconciler immediately when `dashboard.surface_channel_sessions` is enabled. `DashboardState.register_channel_transport` injects the dashboard state into the bound dispatcher; the lifetime 30-second reconciler remains the recovery path, but the normal first-turn path does not wait for it. Turns that resume an existing `dashboard:` session skip this step because that session already owns a slot.
+- **Filing an EXISTING conversation takes an explicit click, and a different guard from the automatic one**: turning `session_folder` on files conversations from that point forward, and by construction leaves every conversation that already existed where it was — `channel_slots.needs_default_filing` refuses any record carrying `channel_origin`, which every conversation the dashboard has ever saved carries. That refusal is correct for a background pass: from the record alone it cannot tell "never filed" from "filed, then moved to the top level by the user", and the safe reading of an ambiguous record is to leave the placement alone. So the catch-up path is a separate, user-initiated one. `POST /api/channel-folders/backfill` (body `{namespace}`, one literal route shared by all ten channel panels, loopback-only) runs `channel_slots.backfill_channel_folder`, which reuses the whole filing mechanism — `update_metadata_if` compare-and-set, folder tags read fresh inside `tags_write_lock` and written atomically with the `channel_folder_filed` marker, live slots re-placed and one `slots` push — under `needs_backfill_filing`: `needs_default_filing` minus the `channel_origin` clause, so the two records that mean the USER placed this (`folder_id`, and `channel_folder_filed` with no folder beside it) still refuse, and the one that only means the conversation predates the setting no longer does. It is NOT wired into the settings save: those endpoints fire on every unrelated field, so a token-only save would silently bulk-move conversations. A conversation whose OPEN TAB already shows a folder is skipped too, because a drag sets the slot before its save lands and the record the guard reads is momentarily behind the user. Ephemeral conversations are never given a placement. One click is bounded by `channel_slots.BACKFILL_MOVE_LIMIT`, newest first, and the response reports `remaining` (both the capped-out conversations and the failed writes) and `failed` (the failed writes alone, so the panel can tell a capped run from a failing one) so a partial pass is visible as partial rather than as a refusal; filing is idempotent, so a second click continues. The response NAMES every conversation it moved, redacted through the transcript read boundary, because there is no bulk undo and that list is the only record of what happened. The panel shows the first eight and puts the rest behind an expander rather than a "N more are not listed" note: the run that moves the most is a first run over months of history, which is the case this exists for, so the receipt that must be complete is exactly the one a cap would gut. The report carries ONLY what that panel renders (`folder_name`, `moved`, `reason`, `remaining`, `failed`) -- it IS the response body, so a field no reader consumes is a claim every path through the function still has to keep true.
 - **An owner notification is not Slack-only**: `dashboard/server.py::_dm_owner` prefers the owner's Slack DM and falls back to registered channel transports (`_notify_owner_channels`). It used to no-op entirely without Slack, so an expiring unattended grant was invisible on a Teams-only, Discord-only or Telegram-only install — silence about a security grant lapsing is exactly what the notice exists to prevent. Fallback, not addition: an operator with Slack gets one notice, not one per channel. Reachability is the transport's OWN answer, so this can only reach a destination that channel already authorized. **And a channel must be able to NAME the owner: exactly one configured target, or nothing.** The notice carries the operator's own security state, while an allow-list is a list of people permitted to talk to the agent — not a claim that any one of them is the operator. With several configured targets there is no unambiguous owner, and sending to the first reachable one hands one allow-listed human another's auto-approve state; the count is over ALL configured targets, because a three-person allow-list with one learned route is still a guess. Same premise as `/sessions`' owner-only rule. Per-identity authority within an allow-list would let this deliver on a multi-person install; it does not exist yet on any channel.
 - **The proactive PRODUCERS started Slack-shaped, and the parity claim tracks how far that has moved**: `api_send_message` (the LLM-facing `send_message` tool) began with exactly two legs — the origin dashboard slot and `state.slack_client` — and `file_send` still posts to the Slack upload route. The tool's own explicit addressing now exists for every registered channel and does consult `state.channel_transports`: `channel_type` (+ optional `target_id`) for the conversation the session belongs to, and `session="<channel>"` for that channel's configured owner. See § Proactive sends. What remains Slack-only is the shape of `channel`/`user`/`thread_ts`/`unfurl_*`, whose allow-list, threading and unfurl semantics are Slack concepts, and `file_send`'s upload route. A cron result also still reaches a non-Slack channel when its origin slot is MIRRORED there (`/link`).
 - **Configured outbound targets are transport-owned**: `MessagingTransport.configured_targets()` returns opaque `ConfiguredChannelTarget` records for the user-configured destinations a dashboard session may link to, including an explicit unavailable reason when a protocol needs prior inbound state or cannot send proactively. `resolve_configured_target()` revalidates the selected opaque id at the side-effect boundary and resolves it to `(conversation_id, thread_id)`; the browser never supplies an unchecked platform conversation id. Discord exposes configured users and threads, and fail-closes thread resolution unless Discord still reports the allow-listed id as an actual thread rather than a normal shared guild channel; Telegram exposes configured DMs; Webex exposes configured DMs plus, when `webex.allow_group_rooms` is on, each space in `webex.allowed_room_ids` as a `room:` target — and `resolve_configured_target` re-validates a `room:` id against BOTH the switch and the list, because an advertised target id travels through the browser and the LLM (it is the `target_id` an MCP send may name) and the config can narrow after one was minted; Weixin exposes allow-listed DMs plus authorized peers learned under its open policy; Teams destinations become available after an authorized inbound activity supplies a conversation/service URL; and WeCom advertises its allow-listed userids plus, under its allow-all policy, the peers it has learned — each either offered or listed with a reason, because `aibot_send_msg` needs no token but the platform only delivers into a conversation the user has already written to. Feishu destinations are visible but unavailable because replies are anchored to an inbound message (no proactive DM in v1).

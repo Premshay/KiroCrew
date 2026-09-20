@@ -44,6 +44,7 @@ def _mock_provider_factory():
     def factory(session_key=None, agent=None, channel_id=None, **kwargs):
         m = AsyncMock()
         m.start = AsyncMock()
+        m.memory_mode = kwargs.get("memory_mode", "persistent")
         m.shutdown = AsyncMock()
         # Explicit, not AsyncMock-generated: the post-semaphore re-validate calls
         # this synchronously, and an auto-generated coroutine would read as
@@ -80,6 +81,7 @@ def _alive_provider_factory():
     def factory(session_key=None, agent=None, channel_id=None, **kwargs):
         m = AsyncMock()
         m.start = AsyncMock()
+        m.memory_mode = kwargs.get("memory_mode", "persistent")
         m.shutdown = AsyncMock()
         m.is_process_alive = lambda: True
         m.is_alive = lambda: True
@@ -1421,7 +1423,10 @@ class TestCompactCallback:
 
         await mgr._compact_session("dashboard:chat-1", 92.0)
 
-        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True)
+        # This fixture's provider serves no native compaction, so the in-place
+        # attempt falls through to the recycle. The callback reports the arm that
+        # ran; the key/pct/success threading this case exists for is unchanged.
+        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True, outcome="recycled")
         assert "dashboard:chat-1" not in mgr._sessions
         await mgr.close_all()
 
@@ -1458,7 +1463,10 @@ class TestCompactCallback:
         mgr.release("dashboard:chat-1")
         await asyncio.wait_for(task, timeout=2)
         assert "dashboard:chat-1" not in mgr._sessions
-        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True)
+        # This fixture's provider serves no native compaction, so the in-place
+        # attempt falls through to the recycle. The callback reports the arm that
+        # ran; the key/pct/success threading this case exists for is unchanged.
+        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True, outcome="recycled")
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -1515,7 +1523,7 @@ class TestCompactCallback:
         mgr.release("dashboard:chat-2")
         captured: list[tuple[str, float, bool]] = []
 
-        async def cb(key, pct, *, success):
+        async def cb(key, pct, *, success, outcome="compacted"):
             captured.append((key, pct, success))
 
         mgr.set_compact_callback(cb)
@@ -1537,7 +1545,7 @@ class TestCompactCallback:
         provider.context_usage_pct = lambda: 93.0
         captured: list[tuple[str, float, bool]] = []
 
-        async def cb(key, pct, *, success):
+        async def cb(key, pct, *, success, outcome="compacted"):
             captured.append((key, pct, success))
 
         mgr.set_compact_callback(cb)
@@ -3600,7 +3608,7 @@ class TestCompaction:
         mgr.release("k1")
         callback_args: list[tuple[str, float, bool]] = []
 
-        async def cb(key, pct, *, success):
+        async def cb(key, pct, *, success, outcome="compacted"):
             callback_args.append((key, pct, success))
 
         mgr.set_compact_callback(cb)
@@ -3628,7 +3636,7 @@ class TestClaudeBackendCompaction:
         provider.compact = AsyncMock()
         callback_args: list[tuple[str, float, bool]] = []
 
-        async def cb(key, pct, *, success):
+        async def cb(key, pct, *, success, outcome="compacted"):
             callback_args.append((key, pct, success))
 
         mgr.set_compact_callback(cb)
@@ -3661,7 +3669,7 @@ class TestClaudeBackendCompaction:
         provider.shutdown.assert_not_awaited()
         # Failure callback fires with success=False so the dashboard can
         # show a "compact failed" banner. (Behavior changed in the I2 fix.)
-        cb.assert_awaited_once_with("k1", 92.0, success=False)
+        cb.assert_awaited_once_with("k1", 92.0, success=False, outcome="compacted")
         assert "k1" not in mgr._compacting
         assert any("Compact failed" in r.message for r in caplog.records)
 
@@ -3743,6 +3751,7 @@ class TestClaudeBackendCompaction:
         # already registered a fresh replacement under the same key.
         replacement_provider = AsyncMock()
         replacement_provider.shutdown = AsyncMock()
+        replacement_provider.memory_mode = "persistent"
         replacement_provider.is_process_alive = lambda: True
         replacement = _Session(
             provider=replacement_provider, first_turn=FirstTurnState.NOTHING_ARMED
@@ -3845,7 +3854,7 @@ class TestKiroInPlaceCompaction:
         assert mgr._sessions["dashboard:chat-1"].provider is provider
         provider.stream_command.assert_called_once_with("/compact")
         provider.shutdown.assert_not_awaited()
-        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True)
+        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True, outcome="compacted")
         # Semaphore released: the next turn can proceed immediately.
         assert not mgr._sessions["dashboard:chat-1"].semaphore.locked()
         await mgr.close_all()
@@ -3866,7 +3875,9 @@ class TestKiroInPlaceCompaction:
         # to clear on the next (re-seeded) message.
         assert "dashboard:chat-1" not in mgr._sessions
         provider.shutdown.assert_awaited_once()
-        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True)
+        # The provider was REPLACED, not summarized, so the callback
+        # reports that arm -- what the notice needs to tell the user.
+        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True, outcome="recycled")
         assert "dashboard:chat-1" not in mgr._recycling
         await mgr.close_all()
 
@@ -3886,7 +3897,9 @@ class TestKiroInPlaceCompaction:
 
         assert "dashboard:chat-1" not in mgr._sessions
         provider.shutdown.assert_awaited_once()
-        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True)
+        # The provider was REPLACED, not summarized, so the callback
+        # reports that arm -- what the notice needs to tell the user.
+        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True, outcome="recycled")
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -3930,7 +3943,7 @@ class TestKiroInPlaceCompaction:
         assert "dashboard:chat-1" in mgr._sessions
         provider.wait_for_compaction.assert_not_awaited()
         provider.shutdown.assert_not_awaited()
-        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True)
+        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True, outcome="compacted")
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -4118,7 +4131,9 @@ class TestKiroInPlaceCompaction:
         assert mgr._sessions["k1"].provider is new_provider
         new_provider.shutdown.assert_not_awaited()
         old_provider.shutdown.assert_awaited_once()
-        cb.assert_awaited_once_with("k1", 92.0, success=True)
+        # The provider was REPLACED, not summarized, so the callback
+        # reports that arm -- what the notice needs to tell the user.
+        cb.assert_awaited_once_with("k1", 92.0, success=True, outcome="recycled")
         await mgr.close_all()
 
 
@@ -4201,7 +4216,7 @@ class TestCompactTimeout:
         provider.compact = _hang
         callback_calls: list[tuple[str, float, bool]] = []
 
-        async def cb(key, pct, *, success):
+        async def cb(key, pct, *, success, outcome="compacted"):
             callback_calls.append((key, pct, success))
 
         mgr.set_compact_callback(cb)
@@ -4233,7 +4248,7 @@ class TestCompactCallbackSuccessFlag:
 
         calls: list[tuple[str, float, bool]] = []
 
-        async def cb(key, pct, *, success):
+        async def cb(key, pct, *, success, outcome="compacted"):
             calls.append((key, pct, success))
 
         mgr.set_compact_callback(cb)
@@ -4943,6 +4958,11 @@ class TestDirectRuntimeBindings:
 
     @pytest.mark.asyncio
     async def test_background_runtime_receives_its_agent_binding(self, cfg):
+        from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
+
+        cfg.agent.tool_search = False
+        cfg.agent.tool_search_min_pct = 17
+        cfg.agent.tool_search_min_tokens = 1200
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         runtime = AsyncMock()
         runtime.spawn = AsyncMock()
@@ -4962,6 +4982,7 @@ class TestDirectRuntimeBindings:
             "extra_env": {"ANTHROPIC_MODEL": "fast"},
             "expect_mcp_reports": False,
             "sandbox_mode": cfg.agent.sandbox,
+            "tool_search": ToolSearchSettings(enabled=False, min_pct=17, min_tokens=1200),
         }
         await mgr.close_all()
 
@@ -5448,7 +5469,9 @@ def _run_runtime_factory(created_runtimes: list):
         runtime.is_alive = MagicMock(return_value=True)
         runtime.pid = 4321
         runtime.create_session = AsyncMock(
-            side_effect=lambda **kw: MagicMock(session_id="step-session")
+            side_effect=lambda **kw: MagicMock(
+                session_id="step-session", memory_mode=kw.get("memory_mode", "persistent")
+            )
         )
         runtime.terminate_session = AsyncMock()
         runtime.kill = AsyncMock()
@@ -5630,9 +5653,6 @@ class TestLoadRecoveryHistoryReplay:
         def factory(session_key=None, agent=None, channel_id=None, **kwargs):
             provider = object.__new__(AcpProvider)
             provider._session_provider_label = ""
-            provider._private_memory = False
-            provider._private_memory_session_key = session_key
-            provider._private_memory_prepared = False
             provider._client = MagicMock()
             provider._client._session_id = "fresh-replayed-sid"
             provider._client._work_dir = "/new-workspace"
@@ -5704,9 +5724,6 @@ class TestLoadRecoveryHistoryReplay:
         def factory(session_key=None, agent=None, channel_id=None, **kwargs):
             provider = object.__new__(AcpProvider)
             provider._session_provider_label = ""
-            provider._private_memory = False
-            provider._private_memory_session_key = session_key
-            provider._private_memory_prepared = False
             provider._client = MagicMock()
             provider._client._session_id = "fresh-recovery-sid"
             provider._client._work_dir = "/new-workspace"
@@ -5981,7 +5998,7 @@ class TestIneffectiveCompactionCooldown:
         # The compaction DID complete and rewrote the conversation: the
         # callback stays success=True (reinjection must run; the failure
         # notice would misdescribe a completed attempt).
-        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True)
+        cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True, outcome="compacted")
         # The immediate next trigger is suppressed by the cooldown.
         assert mgr._trigger_compaction("dashboard:chat-1", "context 92%", 92.0, provider) == (
             "cooldown"
@@ -6008,7 +6025,7 @@ class TestIneffectiveCompactionCooldown:
 
         assert mgr._compact_cooldown_until.get("k1", 0.0) > time.monotonic()
         assert any("ineffective" in r.message for r in caplog.records)
-        cb.assert_awaited_once_with("k1", 92.0, success=True)
+        cb.assert_awaited_once_with("k1", 92.0, success=True, outcome="compacted")
         assert mgr.has_session("k1")  # in place: the session survives
         await mgr.close_all()
 

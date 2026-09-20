@@ -44,7 +44,7 @@ assign ``seq`` and ``fsync``s the appended line -- a waiting ``flock`` and a
 kernel ``fsync`` once per tool frame and once per turn, on the one loop that
 also drives the liveness heartbeat. So an entry point does only what must be
 measured where it is called and hands the storage call to
-:func:`kiro_crew.executors.ledger_executor`, whose single worker drains the work
+:func:`kiro_crew.executors.crew_log_executor`, whose single worker drains the work
 in the order the call sites produced it.
 
 **Which turn an entry belongs to is carried IN the entry, not looked up.** Every
@@ -76,7 +76,7 @@ writer retries with a short doubling backoff. Bounded, because entries live in
 memory until they are written: past :data:`_MAX_WRITE_ATTEMPTS` consecutive failed
 passes the batch is dropped and counted in :func:`dropped_writes`, so a wedged
 disk becomes a reported loss instead of a wait no bounded caller can finish. A
-REFUSAL -- a ``LedgerError``, decided before any byte is written -- is not retried
+REFUSAL -- a ``CrewLogError``, decided before any byte is written -- is not retried
 at all: it would be refused identically every time, and retrying it would hold
 that session's whole log behind one entry that can never land.
 
@@ -103,7 +103,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kiro_crew.constants import env_flag_enabled
-from kiro_crew.executors import ledger_executor
+from kiro_crew.executors import crew_log_executor
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -162,8 +162,26 @@ _UNCLASSIFIED_LABELS = frozenset({"unclassified", ""})
 ACTORS = frozenset({"user", "app", "crew", "cron", "autonudge", "subagent", "gateway", "other"})
 
 #: Bounded so a long-lived gateway cannot grow any map without limit.
-_MAX_OPEN_LEDGERS = 128
+_MAX_OPEN_CREW_LOGS = 128
 _MAX_PENDING_TOOLS = 512
+
+#: Ceiling for a SHORT field -- an approval's shown reason, a plan item's text, a
+#: child's failure reason. These are not bodies: a body goes through
+#: :func:`_append_body_entry`, which slices an oversize one into ``message/chunk``
+#: entries so nothing is lost. A short field has no such path, so the choice is
+#: between clipping it and letting one long value push the whole entry past
+#: ``MAX_ENTRY_BYTES`` -- where the append is REFUSED and the fact disappears with
+#: it. Clipping loses a tail; refusing loses the record.
+_MAX_SHORT_TEXT = 512
+
+#: Ceiling for an identifier the agent chose (a plan item's id). Short because a
+#: value longer than this is not an identifier.
+_MAX_ID_TEXT = 64
+
+#: How many plan items one ``plan/updated`` entry carries. The agent re-sends its
+#: whole list on every change, so a long plan is re-serialized on each update; the
+#: entry keeps the real count in ``total`` when it clips.
+_MAX_PLAN_ITEMS = 100
 
 #: A last-resort ceiling on live-turn records, set far above any plausible number
 #: of concurrent turns. Reaching it does not mean the gateway is busy; it means
@@ -427,6 +445,15 @@ _overflow_count = 0
 #: named once rather than once per rejected entry. Cleared by that session's next
 #: successful append.
 _overflow_reported: "set[str]" = set()
+#: How many child origins were dropped while their child was still running, so
+#: the entries that pin would have carried are absent from that session's log.
+#: Counted rather than only logged: a hole an append-only reader cannot see is the
+#: one loss this module refuses, and this sits beside the other counts a shutdown
+#: report shows. Reaching it takes the whole cap's worth of children live at once.
+_lost_child_origins = 0
+#: Whether a lost origin is named in the log already, so the state is reported
+#: once rather than once per eviction.
+_lost_origin_reported = False
 #: Approximate serialized size of each session's unwritten entries.
 _pending_bytes: "dict[str, int]" = {}
 #: The write currently in progress: when it started, and what it was. A job that
@@ -435,6 +462,14 @@ _pending_bytes: "dict[str, int]" = {}
 _inflight_since: float = 0.0
 _inflight_what: str = ""
 _stall_reported = False
+#: How many CLAIMED entries each session still owes: the ones the writer took out
+#: of ``_pending`` and has not attempted yet. A claimed batch is absent from
+#: ``_pending``, so a caller asking whether this process still owes a session
+#: anything cannot learn it there. The entry being attempted right NOW is not
+#: counted, because the only caller that asks is a job of this batch asking about
+#: its own session, and a job that counted itself would answer that it must wait
+#: for itself. Every exit from ``_write_batch`` releases what it did not attempt.
+_claimed_sessions: "dict[str, int]" = {}
 #: True while a drain pass is scheduled or running, so a producer wakes the
 #: writer once rather than per entry. Never read directly: read
 #: :func:`_writer_busy_locked`, which also answers the case where the pass this
@@ -481,6 +516,24 @@ _last_config: "OrderedDict[str, tuple[Any, ...]]" = OrderedDict()
 #: duplicate write. Seeded from the file on resume, so a restart between two
 #: retries does not reset the count and claim attempt 1 twice.
 _attempts: "OrderedDict[str, dict[int, int]]" = OrderedDict()
+#: dispatched child id -> (parent session id, the parent turn that asked, opened).
+#: A child's spawn entry, steer and terminal outcome are all produced after the
+#: asking turn has ended, so the ordinal cannot be re-derived when they land; it is
+#: captured at the dispatch and read back here. ``opened`` says whether the run
+#: actually STARTED: a spawn is pinned when accepted and promoted only at the site
+#: that begins the run, so a spawn declined at the approval gate closes nothing.
+#: NOT trimmed by turn liveness like the maps above -- an entry deliberately
+#: OUTLIVES the turn that created it, which is the whole reason it exists -- so it
+#: is bounded FIFO and released by the child's own terminal entry.
+_child_origin: "OrderedDict[str, tuple[str, int, bool]]" = OrderedDict()
+#: Answers "is this ``agent_id`` still running IN THIS PROCESS", registered by the
+#: gateway because it owns the subagent manager and this module cannot reach it.
+#: Consulted only by the resume repair, to decide whether an unmatched
+#: ``subagent/spawned`` may be closed. It is deliberately NOT ``_child_origin``:
+#: that map is this module's own bookkeeping and ``reset_caches`` clears it, which
+#: is exactly the idle-teardown path where a child keeps running -- reading it
+#: would report a live child as finished. Unset means no repair closes a child.
+_child_liveness: "Callable[[str], bool] | None" = None
 _warned = False
 _warned_high_water = False
 #: True once the live-turn cap overage has been reported, so a genuinely busy
@@ -489,11 +542,16 @@ _warned_high_water = False
 #: again -- and by ``reset_caches``.
 _live_overage_reported = False
 
+#: Consumers to wake when a session's log grows. Registered by
+#: :func:`add_growth_listener`, held here rather than imported so this writer
+#: names no reader.
+_growth_listeners: "list[Callable[[str], None]]" = []
+
 
 _subsystem: Any = None
 
 
-def _ledger() -> Any:
+def _crew_log() -> Any:
     """The storage package, imported the first time a call actually needs it.
 
     This module is reachable from the gateway boot path, and AUTOSDE's
@@ -602,6 +660,30 @@ def overflow_writes() -> int:
         return _overflow_count
 
 
+def lost_child_origins() -> int:
+    """How many children lost their pinned origin while they were still running.
+
+    A pin carries the parent session and asking turn every later entry about that
+    child reuses, and it is released by the child's own terminal entry. Dropping a
+    live one costs that child its remaining entries: its opener when the pin goes
+    before the run starts, its outcome when the pin goes after. Distinct from
+    :func:`dropped_writes` and :func:`overflow_writes`, which count entries the
+    writer refused; this counts attribution the map could not keep, so the entries
+    are never composed at all.
+
+    Normally 0, and reaching it needs the pin cap's worth of children running at
+    once: a pin whose child has finished is dropped in preference, which is what
+    keeps children lost to a crash from filling the map over long uptime.
+
+    The same count also covers a pin REFUSED because its session id is longer than
+    :data:`_MAX_SESSION_ID_CHARS`. One count for both, because the consequence a
+    reader cares about is identical -- that child's entries are absent -- and the
+    log line names which cause fired.
+    """
+    with _lock:
+        return _lost_child_origins
+
+
 def buffered_writes() -> int:
     """How many appends are waiting on the writer right now."""
     with _lock:
@@ -650,6 +732,7 @@ def reset_caches() -> None:
     global _inflight_since, _inflight_what, _stall_reported
     global _pending_count, _pending_total_bytes, _dropped_count, _draining, _drain_future
     global _overflow_count
+    global _lost_child_origins, _lost_origin_reported
     global _live_overage_reported
     # Bounded well below the default: this wait exists so a job holding a stale
     # handle cannot write after the reset, and it returns the instant the writer is
@@ -664,11 +747,13 @@ def reset_caches() -> None:
         _tool_started.clear()
         _last_config.clear()
         _attempts.clear()
+        _child_origin.clear()
         _pending.clear()
         _pending_loss.clear()
         _pending_count = 0
         _pending_total_bytes = 0
         _retry.clear()
+        _claimed_sessions.clear()
         _inline.clear()
         _dropped_reported.clear()
         _overflow_reported.clear()
@@ -679,6 +764,8 @@ def reset_caches() -> None:
         _stall_reported = False
         _dropped_count = 0
         _overflow_count = 0
+        _lost_child_origins = 0
+        _lost_origin_reported = False
         _pending_high_water = 0
         _draining = False
         _drain_future = None
@@ -727,6 +814,39 @@ def _report(what: str, exc: BaseException) -> None:
         logger.debug("session log %s failed", what, exc_info=True)
 
 
+def add_growth_listener(listener: "Callable[[str], None]") -> None:
+    """Call *listener* with a session id after that session's log GROWS.
+
+    The one signal a consumer of this stream needs and cannot get from the file:
+    that there is something new to read. It fires once per drained batch rather
+    than once per entry, because the write-behind already groups a turn's burst
+    into one pass, and a listener woken per entry would do the same work several
+    times over the same read.
+
+    Registered rather than imported: this module is imported BY the dashboard, so
+    calling into a dashboard publisher from here would close an import cycle and
+    would put a consumer's name in the writer's own code. A listener that raises
+    is reported like a failed write and cannot stop the drain.
+
+    It runs on the WRITER thread, so a listener that does real work must hand it
+    to its own loop. Registering the same callable twice registers it twice; the
+    gateway installs its publisher once, at startup.
+    """
+    with _lock:
+        _growth_listeners.append(listener)
+
+
+def _notify_growth(session_id: str) -> None:
+    """Tell every listener *session_id* has new entries. Never raises."""
+    with _lock:
+        listeners = list(_growth_listeners)
+    for listener in listeners:
+        try:
+            listener(session_id)
+        except Exception as exc:  # pragma: no cover - a listener's own failure
+            _report("growth listener", exc)
+
+
 def _on_event_loop() -> bool:
     """True when this thread is running an asyncio event loop."""
     try:
@@ -739,7 +859,7 @@ def _on_event_loop() -> bool:
 def _permanent(exc: BaseException) -> bool:
     """Whether retrying *exc* is pointless because it will be refused again.
 
-    A :class:`~kiro_crew.crew_log.LedgerError` is a REFUSAL, not a failure: the
+    A :class:`~kiro_crew.crew_log.CrewLogError` is a REFUSAL, not a failure: the
     storage layer declines the entry before any byte is written, so the file is
     byte-identical and nothing about this process's next attempt is different.
     Either the entry does not fit the format, in which case the same verdict comes
@@ -757,7 +877,7 @@ def _permanent(exc: BaseException) -> bool:
     intended trade: the entries this process cannot write are counted, while the
     log keeps ONE writer's account of the turn instead of two interleaved ones.
     """
-    return isinstance(exc, _ledger().LedgerError)
+    return isinstance(exc, _crew_log().CrewLogError)
 
 
 def _run_job(job: Callable[[], None], what: str) -> BaseException | None:
@@ -909,9 +1029,38 @@ def _submit(
 
 
 def _owes_entries(session_id: str) -> bool:
-    """Whether this session already has entries queued or retained. Takes ``_lock``."""
+    """Whether this session has entries queued, claimed or retained. Takes ``_lock``.
+
+    ``_claimed_sessions`` is the one of the four a reader would not think to ask
+    for: the writer pops a session's bucket before it writes it, so a batch in
+    flight is in none of the other three while its entries are still owed. It
+    counts what has not been ATTEMPTED, so the job running right now -- the one
+    doing the asking -- is not among them.
+    """
     with _lock:
-        return session_id in _pending or session_id in _retry or session_id in _pending_loss
+        return (
+            session_id in _pending
+            or session_id in _retry
+            or session_id in _pending_loss
+            or session_id in _claimed_sessions
+        )
+
+
+def _release_claim(session_id: str, count: int) -> None:
+    """Stop counting *count* of *session_id*'s claimed entries. Takes ``_lock``.
+
+    Called for a job as it is attempted and for whatever a pass never reached. By
+    then each one is written, dropped with a loss marker, or back in the queue, so
+    releasing it here removes a count that another source now carries.
+    """
+    if count <= 0:
+        return
+    with _lock:
+        held = _claimed_sessions.get(session_id, 0) - count
+        if held > 0:
+            _claimed_sessions[session_id] = held
+        else:
+            _claimed_sessions.pop(session_id, None)
 
 
 def _inline_ready(session_id: str) -> bool:
@@ -1155,6 +1304,34 @@ def _record_loss_locked(session_id: str, jobs: "list[_PendingJob]", mark: bool) 
         loss.dropped_bytes += max(0, job.nbytes)
 
 
+def _owed_loss_markers_locked() -> int:
+    """How many sessions are owed a ``write/dropped`` marker. ``_lock`` held.
+
+    A session's loss debt lives in one of two places and a count that names it has
+    to read both. It sits in :data:`_pending_loss` while no marker job exists for
+    it. Once one is built it TRAVELS IN THE JOB: :func:`_loss_marker_job` takes the
+    debt out of the map to serialize it, and an append that raises hands the job --
+    debt and all -- to :func:`_retain`, which puts it at the front of that
+    session's bucket in :data:`_pending`.
+
+    So a marker waiting to be retried is owed while the map is empty, and reading
+    only the map reports nothing owed at exactly that moment. That moment is not an
+    edge case for a bounded shutdown: a marker whose filesystem is still failing is
+    retained by every attempt the budget allows, and the budget is spent only if
+    enough paced attempts fit inside the caller's timeout.
+
+    Counted per SESSION, because one marker covers a session's whole interval --
+    the same grain the map's own length carries.
+    """
+    owed = set(_pending_loss)
+    owed.update(
+        session_id
+        for session_id, jobs in _pending.items()
+        if any(job.loss is not None for job in jobs)
+    )
+    return len(owed)
+
+
 def _loss_marker_job(session_id: str, loss: _PendingLoss) -> _PendingJob:
     """Build the marker that must lead this session's next drain."""
 
@@ -1166,10 +1343,10 @@ def _loss_marker_job(session_id: str, loss: _PendingLoss) -> _PendingJob:
             newer = _pending_loss.pop(session_id, None)
             if newer is not None:
                 loss.merge(newer)
-        ledger = _handle(session_id)
-        if ledger is None:
+        log = _handle(session_id)
+        if log is None:
             return
-        ledger.append("write/dropped", loss.data(), src=_SRC_GATEWAY)
+        log.append("write/dropped", loss.data(), src=_SRC_GATEWAY)
 
     return _PendingJob(
         job=_job,
@@ -1250,7 +1427,7 @@ def _start_drain() -> None:
     global _draining, _drain_future
     _ensure_shutdown_hook()
     try:
-        future = ledger_executor().submit(_drain_loop)
+        future = crew_log_executor().submit(_drain_loop)
     except Exception as exc:  # pool shut down, or thread creation refused
         with _lock:
             _draining = False
@@ -1426,6 +1603,7 @@ def _drain_once(deferred_loss: "set[str] | None" = None) -> "set[str]":
                 else:
                     jobs.insert(0, _loss_marker_job(session_id, loss))
             claimed.append((session_id, jobs))
+            _claimed_sessions[session_id] = _claimed_sessions.get(session_id, 0) + len(jobs)
     defer_until_next_drain: "set[str]" = set()
     for session_id, jobs in claimed:
         marker_attempted = bool(jobs and jobs[0].loss is not None)
@@ -1463,42 +1641,67 @@ def _write_batch(session_id: str, jobs: "list[_PendingJob]") -> bool:
     global _pending_total_bytes
     landed = False
     loss_marker_landed = False
-    for index, job in enumerate(jobs):
-        if job.loss is None:
-            with _lock:
-                loss_waiting = session_id in _pending_loss
-            if loss_waiting:
-                if landed:
-                    _note_progress(session_id)
-                _retain_without_failure(session_id, jobs[index:])
-                return loss_marker_landed
-        failure = _run_job(job.job, job.what)
-        if failure is None:
-            with _lock:
-                if job.counted:
-                    _pending_total_bytes -= job.nbytes
-                    job.counted = False
-            _finish(job)
-            landed = True
-            loss_marker_landed = loss_marker_landed or job.loss is not None
-            continue
-        if _permanent(failure):
-            if job.loss is not None:
-                _drop(session_id, jobs[index:], mark=True)
-                return False
-            # A permanent refusal owes a marker like any other loss. `_permanent`
-            # cannot split a LedgerError into its two causes -- a malformed entry
-            # the format rejected, or a well-formed entry refused because another
-            # process owns this log -- and the second is a genuine hole. Marking
-            # unconditionally is what makes the distinction unnecessary.
-            _drop(session_id, [job], mark=True)
-            continue
-        if landed:
-            _note_progress(session_id)
-        _retain(session_id, jobs[index:])
+    # Each job releases its own claim as it is ATTEMPTED, so a job asking
+    # what its session still owes is never told to wait for itself, and
+    # whatever this pass does not reach is released on the way out --
+    # retained, dropped-and-marked or requeued by then, and countable there.
+    unattempted = len(jobs)
+    # One notification per pass, on whichever way this returns. The four exits
+    # each mean something different to the buffer and nothing different to a
+    # reader, whose only question is whether there is anything new on disk -- so
+    # the signal belongs where every exit passes through rather than repeated at
+    # each of them, where an exit added later would silently miss it.
+    try:
+        for index, job in enumerate(jobs):
+            unattempted -= 1
+            _release_claim(session_id, 1)
+            if job.loss is None:
+                with _lock:
+                    loss_waiting = session_id in _pending_loss
+                if loss_waiting:
+                    if landed:
+                        _note_progress(session_id)
+                    _retain_without_failure(session_id, jobs[index:])
+                    return loss_marker_landed
+            failure = _run_job(job.job, job.what)
+            if failure is None:
+                with _lock:
+                    if job.counted:
+                        _pending_total_bytes -= job.nbytes
+                        job.counted = False
+                _finish(job)
+                landed = True
+                loss_marker_landed = loss_marker_landed or job.loss is not None
+                continue
+            if _permanent(failure):
+                if job.loss is not None:
+                    _drop(session_id, jobs[index:], mark=True)
+                    return False
+                # A permanent refusal owes a marker like any other loss.
+                # `_permanent` cannot split a CrewLogError into its two causes -- a
+                # malformed entry the format rejected, or a well-formed entry
+                # refused because another process owns this log -- and the second
+                # is a genuine hole. Marking unconditionally is what makes the
+                # distinction unnecessary.
+                _drop(session_id, [job], mark=True)
+                continue
+            if landed:
+                _note_progress(session_id)
+            _retain(session_id, jobs[index:])
+            return loss_marker_landed
+        _note_progress(session_id)
         return loss_marker_landed
-    _note_progress(session_id)
-    return loss_marker_landed
+    finally:
+        # The release goes first so this pass finishes its own bookkeeping before
+        # handing the thread to a listener, which `_notify_growth` calls inline.
+        # The order is not load-bearing today: whatever this pass did not reach is
+        # in `_pending` or `_pending_loss` by the time it returns, and
+        # `_owes_entries` reads those too, so a listener asking what the session
+        # owes gets the same answer either way. It is the order that stays correct
+        # if a listener ever reads the claim count itself.
+        _release_claim(session_id, unattempted)
+        if landed:
+            _notify_growth(session_id)
 
 
 def _retain_without_failure(session_id: str, jobs: "list[_PendingJob]") -> None:
@@ -1682,7 +1885,7 @@ def drain_for_shutdown(timeout: float = _SHUTDOWN_DRAIN_SECONDS) -> bool:
     if not drained:
         with _lock:
             held = _pending_count
-            loss_markers = len(_pending_loss)
+            loss_markers = _owed_loss_markers_locked()
             running = _writer_busy_locked()
         logger.warning(
             "session log did not finish writing within %.1fs of shutdown; "
@@ -1844,12 +2047,12 @@ def _release_live(session_id: str, turn: int) -> None:
 
 def _bound_open() -> None:
     """Trim the handle cache. See :func:`_bound_unpinned` for the rule."""
-    _bound_unpinned(_open, _MAX_OPEN_LEDGERS, lambda k: k, "open handles")
+    _bound_unpinned(_open, _MAX_OPEN_CREW_LOGS, lambda k: k, "open handles")
 
 
-def _remember(session_id: str, ledger: Any) -> None:
+def _remember(session_id: str, log: Any) -> None:
     with _lock:
-        _open[session_id] = ledger
+        _open[session_id] = log
         _open.move_to_end(session_id)
         _bound_open()
 
@@ -1887,27 +2090,27 @@ def _handle(session_id: str) -> Any:
             _open.move_to_end(session_id)
             return cached
         creation_failed = session_id in _creation_failed
-    if not _ledger().Ledger.exists(_KIND, session_id):
+    if not _crew_log().CrewLog.exists(_KIND, session_id):
         if creation_failed:
             # The file-creating record died permanently, so this session's crew log
             # will never exist -- but it was OPENED, so its later entries are a real
             # loss, not the silent no-op an unopened session gets. Raise a refusal
             # rather than return None: the exception reaches _run_job, _permanent is
-            # true (a LedgerError is never retried), and the entry is dropped AND
+            # true (a CrewLogError is never retried), and the entry is dropped AND
             # counted in dropped_writes, with a write/dropped marker owed, instead
             # of vanishing uncounted.
-            raise _ledger().LedgerError(
+            raise _crew_log().CrewLogError(
                 "session log creation failed permanently; entry cannot be recorded",
-                code=_ledger().CODE_NO_LEDGER,
+                code=_crew_log().CODE_NO_LEDGER,
             )
         return None
     # RECONNECT, never a resume: this path is reached when a handle is missing
     # from the cache, which says nothing about the writer's health -- an
     # eviction is enough. So it opens WITHOUT repair; closing a turn here
     # would close one that is still running.
-    ledger = _ledger().Ledger.open(_KIND, session_id)
-    _remember(session_id, ledger)
-    return ledger
+    log = _crew_log().CrewLog.open(_KIND, session_id)
+    _remember(session_id, log)
+    return log
 
 
 def _bound_unpinned(
@@ -2007,11 +2210,11 @@ def _next_attempt(session_id: str, turn: int) -> int:
         attempt = seen.get(int(turn), 0) + 1
         seen[int(turn)] = attempt
         _attempts.move_to_end(session_id)
-        _bound_unpinned(_attempts, _MAX_OPEN_LEDGERS, lambda k: k, "turn attempts")
+        _bound_unpinned(_attempts, _MAX_OPEN_CREW_LOGS, lambda k: k, "turn attempts")
         return attempt
 
 
-def _seed_attempts(session_id: str, ledger: Any) -> None:
+def _seed_attempts(session_id: str, log: Any) -> None:
     """Rebuild *session_id*'s attempt map from the entries already in its file.
 
     Runs on the writer thread, and only when memory cannot answer instead: a
@@ -2030,7 +2233,7 @@ def _seed_attempts(session_id: str, ledger: Any) -> None:
     """
     highest: dict[int, int] = {}
     try:
-        for entry in ledger.iter_from(1):
+        for entry in log.iter_from(1):
             if entry.type != "turn/started":
                 continue
             turn = entry.data.get("turn")
@@ -2052,7 +2255,7 @@ def _seed_attempts(session_id: str, ledger: Any) -> None:
             if attempt > seen.get(turn, 0):
                 seen[turn] = attempt
         _attempts.move_to_end(session_id)
-        _bound_unpinned(_attempts, _MAX_OPEN_LEDGERS, lambda k: k, "turn attempts")
+        _bound_unpinned(_attempts, _MAX_OPEN_CREW_LOGS, lambda k: k, "turn attempts")
 
 
 def close_open_tool_calls(
@@ -2179,6 +2382,23 @@ def _safe_text(text: Any) -> str:
         return ""
 
 
+def _clip(text: str, limit: int) -> str:
+    """*text* bounded to *limit* characters, marked when it was cut.
+
+    For SHORT fields only -- see :data:`_MAX_SHORT_TEXT` for why they are clipped
+    rather than sliced. The ellipsis is part of the value on purpose: a reader must
+    be able to tell a value that ends here from one that was cut, because the two
+    support different conclusions and nothing else in the entry says which it is.
+
+    Characters, not bytes. The byte ceiling is enforced by the append itself; this
+    bound exists to keep one field from dominating a line, and a character count is
+    what a call site can reason about.
+    """
+    if not text or limit <= 0 or len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)] + "\u2026"
+
+
 def _text_slices(text: str) -> list[str]:
     """*text* cut into pieces that each MEASURE small enough for one crew log line.
 
@@ -2221,7 +2441,7 @@ def _fits_one_line(text: str, extra: "dict[str, Any] | None" = None) -> bool:
     escaped = len(json.dumps(text, ensure_ascii=True).encode("utf-8"))
     if extra:
         escaped += len(json.dumps(extra, ensure_ascii=True, default=str).encode("utf-8"))
-    return escaped + _ENVELOPE_HEADROOM <= _ledger().MAX_ENTRY_BYTES
+    return escaped + _ENVELOPE_HEADROOM <= _crew_log().MAX_ENTRY_BYTES
 
 
 def _write(
@@ -2256,10 +2476,10 @@ def _write(
         return
 
     def _job() -> None:
-        ledger = _handle(session_id)
-        if ledger is None:
+        log = _handle(session_id)
+        if log is None:
             return
-        ledger.append(entry_type, data, src=src, ignorable=ignorable)
+        log.append(entry_type, data, src=src, ignorable=ignorable)
 
     _submit(_job, f"appending {entry_type}", session_id, after=after)
 
@@ -2270,6 +2490,7 @@ def on_session_opened(
     agent: str = "",
     slot: str = "",
     model: str = "",
+    model_requested: str = "",
     cwd: str = "",
     owner: str = "default",
     resumed: bool = False,
@@ -2289,6 +2510,32 @@ def on_session_opened(
     appends, so an agent or model switch that kept the conversation continues
     one log rather than starting a second one. ``model`` is not a header field
     in the storage schema, so it is carried on this entry instead.
+
+    ``model`` is the id the backend CONFIRMED, and it is empty whenever that id
+    is not known. It alone cannot say what the gateway chose: no tier resolved
+    anything above the backend's own default, a chosen model was applied, or a
+    chosen one never took effect and the backend's choice serves instead (a model
+    this account cannot run is withheld before it is sent, and a ``set_model``
+    that raises is logged and left alone). Each of the last two can end with an id
+    here or without one.
+
+    So ``model_requested`` records what the gateway SELECTED for the ALLOCATION
+    that produced this session, and its presence is not conditioned on ``model``.
+    The caller resolves that value once, hands it to the provider and retains it
+    with the slot, because the turn that observes a session is not always the one
+    that allocated it: an eager allocation can outlive a config change, and
+    re-resolving at the first turn would record a model that session never used.
+    Selection is not transmission either: the withhold happens inside the
+    provider, so this field names the choice rather than a message the backend
+    received. The pair is the record -- ``model`` states what serves the session,
+    ``model_requested`` what was chosen -- and the entry infers nothing from the
+    two. A difference between them is not by itself a refusal, because the backend
+    serves the spelling it resolved; whether a choice was APPLIED is not something
+    this entry knows, and a reader that needs it reads the provider's own outcome
+    rather than comparing these strings. Absent ``model_requested`` means no tier
+    resolved one, OR that this process did not observe the allocation (a re-attach
+    carries provenance from a process that is gone) -- and on an entry written
+    before the field existed it means nothing at all.
 
     ``parent_slot`` names the session that made this one through
     ``session_create`` (the slot's ``_created_by``), and ``parent_sid`` the
@@ -2323,7 +2570,7 @@ def on_session_opened(
 
     def _job() -> None:
         created = False
-        if _ledger().Ledger.exists(_KIND, session_id):
+        if _crew_log().CrewLog.exists(_KIND, session_id):
             # THE resume path, and the only caller that may repair. ``resumed``
             # means this claim re-attached to a conversation a DIFFERENT gateway
             # process was writing, so a turn left open in that file belongs to a
@@ -2356,7 +2603,16 @@ def on_session_opened(
                     session_id,
                     live_at_claim,
                 )
-            ledger = _ledger().Ledger.open(_KIND, session_id, repair=may_repair)
+            # A repair may close an unmatched `subagent/spawned` only for a child
+            # with no outcome still coming, and `resumed` cannot answer that: it is
+            # raised for an IN-PROCESS `session/load` too, so it does not even imply
+            # a different process wrote this file, let alone that the children that
+            # process spawned have stopped. The registry of running children is the
+            # only thing that knows, and a process with none registered closes no
+            # child at all.
+            log = _crew_log().CrewLog.open(
+                _KIND, session_id, repair=may_repair, child_gone=_child_gone_probe(session_id)
+            )
             # Rebuild the attempt counts from what is already in the file, for
             # the two cases where memory cannot answer: a resume, whose counts
             # belong to a process that is gone, and a session whose map was
@@ -2367,9 +2623,9 @@ def on_session_opened(
             with _lock:
                 needs_seed = bool(resumed) or session_id not in _attempts
             if needs_seed:
-                _seed_attempts(session_id, ledger)
+                _seed_attempts(session_id, log)
         else:
-            ledger = _ledger().Ledger.create(
+            log = _crew_log().CrewLog.create(
                 _KIND,
                 session_id,
                 owner=owner or "default",
@@ -2378,7 +2634,7 @@ def on_session_opened(
                 cwd=cwd or None,
             )
             created = True
-        _remember(session_id, ledger)
+        _remember(session_id, log)
         if not announce.setdefault("owed", created or bool(resumed)):
             return
         data: dict[str, Any] = {
@@ -2389,6 +2645,18 @@ def on_session_opened(
             "owner": owner or "default",
             "resumed": bool(resumed),
         }
+        if model_requested:
+            # Written whenever the gateway resolved one, and never conditioned on
+            # ``model``. Both guards tried before this inferred the application
+            # outcome from the two ids and both lost the record: suppressing on a
+            # DIFFERENCE reported an honoured request as unconfirmed, because the
+            # backend serves the spelling it resolved; suppressing on a KNOWN
+            # ``model`` dropped the request whenever a refused pin left the session
+            # on a concrete backend default rather than the auto sentinel, which is
+            # ordinary operation. Recording the request outright costs one short
+            # string and cannot lose the requested/served pair. The entry states two
+            # facts and infers nothing: what the gateway asked for, and what serves.
+            data["model_requested"] = model_requested
         if parent_slot:
             # Written only when there IS a creator, and ``sid`` only when the
             # creator still had a live handle: an empty string in either place
@@ -2397,7 +2665,7 @@ def on_session_opened(
             if parent_sid:
                 parent["sid"] = parent_sid
             data["parent"] = parent
-        ledger.append("session/opened", data, src=_SRC_GATEWAY)
+        log.append("session/opened", data, src=_SRC_GATEWAY)
 
     def _flag_creation_failed() -> None:
         # The creating record died with no crew log file behind it: no later append
@@ -2455,8 +2723,8 @@ def on_turn_started(
         return
 
     def _job() -> None:
-        ledger = _handle(session_id)
-        if ledger is None:
+        log = _handle(session_id)
+        if log is None:
             return
         # Derived HERE, on the writer thread, NOT on the caller's. Resume seeding
         # runs as an earlier job for this same session, and the writer executes a
@@ -2473,7 +2741,7 @@ def on_turn_started(
         # the rare one.
         if n > 1:
             payload["attempt"] = int(n)
-        ledger.append("turn/started", payload, src=_SRC_GATEWAY)
+        log.append("turn/started", payload, src=_SRC_GATEWAY)
 
     _submit(_job, "appending turn/started", session_id)
 
@@ -2653,13 +2921,13 @@ def _entry_line_fits(entry_type: str, data: dict[str, Any], *, src: str) -> bool
         "data": data,
     }
     try:
-        line = _ledger().schema.serialize(envelope)
-    except _ledger().LedgerError:
+        line = _crew_log().schema.serialize(envelope)
+    except _crew_log().CrewLogError:
         # Not serializable at all. The append will refuse it for the same reason,
         # with the code that names it, so this reports "does not fit" rather than
         # deciding the outcome here.
         return False
-    return len(line.encode("utf-8")) <= _ledger().MAX_ENTRY_BYTES
+    return len(line.encode("utf-8")) <= _crew_log().MAX_ENTRY_BYTES
 
 
 def _bounded_attachment_data(
@@ -2713,7 +2981,7 @@ def _bounded_attachment_data(
 
 
 def _append_body_entry(
-    ledger: Any,
+    log: Any,
     entry_type: str,
     turn: int,
     *,
@@ -2747,7 +3015,7 @@ def _append_body_entry(
         key: value for key, value in inline_data.items() if key not in {"turn", "step", "text"}
     }
     if _fits_one_line(text, inline_extra or None):
-        ledger.append(entry_type, inline_data, src=src)
+        log.append(entry_type, inline_data, src=src)
         return
     # A chunk group is written as ONE batch, not entry by entry. The chunks are
     # meaningless without the entry that cites their seqs: appending them
@@ -2782,7 +3050,7 @@ def _append_body_entry(
         )
         return {"type": entry_type, "data": citing_data}
 
-    ledger.append_many(group, src=src, cite=_cite)
+    log.append_many(group, src=src, cite=_cite)
 
 
 def on_message_received(
@@ -2828,11 +3096,11 @@ def on_message_received(
         extra["attachments"] = names
 
     def _job() -> None:
-        ledger = _handle(session_id)
-        if ledger is None:
+        log = _handle(session_id)
+        if log is None:
             return
         _append_body_entry(
-            ledger,
+            log,
             "message/received",
             turn,
             text=body,
@@ -2884,11 +3152,11 @@ def on_message_sent(
     ordinal = int(step) if step else _current_step(session_id, turn)
 
     def _job() -> None:
-        ledger = _handle(session_id)
-        if ledger is None:
+        log = _handle(session_id)
+        if log is None:
             return
         _append_body_entry(
-            ledger,
+            log,
             "message/sent",
             turn,
             step=ordinal,
@@ -2944,10 +3212,10 @@ def on_request_configured(
         data["system_bytes"] = system_bytes
 
     def _job() -> None:
-        ledger = _handle(session_id)
-        if ledger is None:
+        log = _handle(session_id)
+        if log is None:
             return
-        ledger.append("request/configured", data, src=_SRC_GATEWAY)
+        log.append("request/configured", data, src=_SRC_GATEWAY)
         # Remembered only AFTER the line is on disk. Committing the fingerprint
         # before the append would let one transient failure suppress every later
         # identical configuration, leaving the session permanently without the
@@ -2957,7 +3225,7 @@ def on_request_configured(
         with _lock:
             _last_config[session_id] = fingerprint
             _last_config.move_to_end(session_id)
-            _bound_unpinned(_last_config, _MAX_OPEN_LEDGERS, lambda k: k, "request configs")
+            _bound_unpinned(_last_config, _MAX_OPEN_CREW_LOGS, lambda k: k, "request configs")
 
     _submit(_job, "appending request/configured", session_id)
 
@@ -3223,14 +3491,35 @@ def on_approval_requested(
     *,
     approval_id: str,
     tool: str = "",
+    reason: str = "",
 ) -> None:
-    """Record that a tool call is waiting on a human."""
-    _write(
-        session_id,
-        "approval/requested",
-        {"turn": int(turn), "approval_id": approval_id, "tool": tool},
-        src=_SRC_GATEWAY,
-    )
+    """Record that a tool call is waiting on a human.
+
+    ``reason`` is what the human is being shown -- the card's title, or the
+    command for a shell request. It arrives already display-redacted by the ACP
+    transport and is redacted again here, because this module redacts at its own
+    boundary rather than trusting a call site, and clipped so a long command
+    cannot push the entry past the line ceiling and lose the whole fact.
+
+    ``tool`` and ``reason`` are each absent rather than empty when the site had
+    nothing to name. A permission frame can arrive without a resolvable tool name,
+    and writing ``""`` there would record "the tool is the empty string" -- a value
+    a reader cannot tell from a real one, in a log whose entire worth is that it
+    only says what was observed.
+
+    Guarded on the flag here for the same reason :func:`on_plan_updated` is: the
+    redaction below runs before :func:`_write` gets its own chance to no-op, and the
+    runner calls this unconditionally.
+    """
+    if not session_id or not enabled():
+        return
+    data: dict[str, Any] = {"turn": int(turn), "approval_id": approval_id}
+    if tool:
+        data["tool"] = tool
+    shown = _clip(_safe_text(reason), _MAX_SHORT_TEXT)
+    if shown:
+        data["reason"] = shown
+    _write(session_id, "approval/requested", data, src=_SRC_GATEWAY)
 
 
 def on_approval_decided(
@@ -3239,18 +3528,536 @@ def on_approval_decided(
     *,
     approval_id: str,
     decision: str,
+    by: str = "",
+    cause: str = "",
 ) -> None:
     """Record how an approval resolved, including a timeout.
 
     This runs on the task that handled the click, not the task running the
     turn, which is why it must never raise.
+
+    ``by`` names WHO decided, and only the host itself can be named with
+    certainty: an auto-decline the gateway made is attributable, so it says
+    ``host``. A decision that came back through the approval future was made by a
+    person at one of several surfaces -- dashboard click, Slack button -- and the
+    site cannot see which, so it omits the field rather than asserting ``user``
+    for something it did not observe.
+
+    ``cause`` is WHY, and only a host decline has one: the gateway's own reason
+    code for declining without a human (the window expired, the turn had no
+    budget left, the prompt could not be delivered). It rides in its own field
+    instead of replacing ``decision``, so a reader still learns what was decided
+    and does not have to know the reason vocabulary to find out.
     """
-    _write(
-        session_id,
-        "approval/decided",
-        {"turn": int(turn), "approval_id": approval_id, "decision": decision},
-        src=_SRC_GATEWAY,
-    )
+    data: dict[str, Any] = {
+        "turn": int(turn),
+        "approval_id": approval_id,
+        "decision": decision,
+    }
+    if by:
+        data["by"] = by
+    if cause:
+        data["cause"] = cause
+    _write(session_id, "approval/decided", data, src=_SRC_GATEWAY)
+
+
+#: How many dispatched children this module remembers an origin for. A child's
+#: origin is released by its own terminal entry, so this cap is only reached by
+#: children that never reach one -- a queued member cancelled before it starts,
+#: a run lost to a crash. Generous, because the cost of holding one is two small
+#: values and the cost of evicting one is a closer that cannot be filed.
+_MAX_CHILD_ORIGINS = 2048
+#: How many of the OLDEST pins are examined for a finished child before the cap
+#: falls back to dropping the oldest outright. A pin is released by its child's
+#: terminal entry, so one still held while its neighbours have gone belongs to a
+#: child that never reported, and those collect at the old end -- which is why a
+#: window there is where they are found. Bounded because answering takes a call
+#: into the subagent side per pin, and scanning the whole map would charge one
+#: caller the entire cap's worth of them.
+_ORIGIN_REAP_SCAN = 64
+#: The longest session id a pin will retain. The count cap above bounds memory
+#: only if every field of a pin is bounded too, and this one is authored by the
+#: provider rather than by this process. Far above any id this codebase produces
+#: -- a provider session id is UUID-shaped and a channel session key is shorter
+#: still -- so it rejects nothing legitimate and exists only so a broken or
+#: hostile provider cannot make the count cap meaningless. An id past it is
+#: refused, never shortened: an identity that has been cut down names a
+#: different unit or none.
+_MAX_SESSION_ID_CHARS = 512
+
+
+def set_child_liveness(probe: "Callable[[str], bool] | None") -> None:
+    """Register the process's own answer to "is this subagent still running".
+
+    Called once by the gateway, which constructs the subagent manager; this module
+    has no route to it and must not grow one, since the emitters are called FROM
+    that side. *probe* takes an ``agent_id`` and returns True while the child can
+    still report its own outcome.
+
+    Only the resume repair reads it, and only to decide whether an unmatched
+    ``subagent/spawned`` may be closed. Nothing in the crew log file can answer
+    that: an unbalanced opener is what a finished-but-unreported child and a
+    still-running one both look like. Leaving it unset is safe and is what tests
+    and any embedder without subagents get -- no child is ever closed, so a reader
+    sees an open child rather than a fabricated outcome.
+    """
+    global _child_liveness
+    _child_liveness = probe
+
+
+def _child_gone_probe(session_id: str) -> "Callable[[str], bool] | None":
+    """``child_gone`` for the store, or None when this process cannot answer.
+
+    Inverted here rather than at the registration site so the gateway registers
+    the fact it actually holds -- its manager lists what is RUNNING -- instead of
+    a negation that reads backwards at the call site.
+
+    A child is reported present while this process owes ANY entry for
+    *session_id*, on top of what the registry says. A terminal outcome reaches
+    the file through the writer and :func:`_submit` returns before it lands, so a
+    child leaves the running set while its own closer is still queued: the file
+    then shows an opener with no match while the registry omits the child. Closing on that reading puts a synthesised ``unknown`` ahead of the
+    real outcome and leaves both standing in a file nothing rewrites. The debt
+    set is the exact record of what is still owed -- queued, claimed by the
+    writer, retained, and owed loss markers alike -- and it is the one source
+    here carrying no bound that
+    could shed a pending child, which the manager's completed-run retention does
+    carry. An entry a hard ceiling refuses is absent from the debt set, which is
+    the wanted answer: that closer is never coming, so the opener is the
+    repair's to close.
+
+    The two reads live in different lock domains, so they are sampled at
+    different instants and their ORDER decides whether the gap between them can
+    lie. Liveness is read first for that reason.
+
+    Neither read is enough on its own, because the normal completion path flips
+    ``done`` long BEFORE the closer is recorded: the manager's running set is
+    everything not done, so the child leaves it at the flip, and the terminal
+    entry is handed over later from the report task. Between those two the child
+    is absent from the running set and owes nothing, and a repair reading exactly
+    there synthesises an ``unknown`` that then stands beside the real outcome. So
+    the child's OWN origin pin is consulted too: it is opened when the spawn is
+    recorded and released only once the closer has been handed to the writer, an
+    interval that contains that whole gap, and it is per-child rather than
+    per-session. What remains is the pin the FIFO drops under its own ceiling,
+    which is counted rather than silent.
+    """
+    probe = _child_liveness
+    if probe is None:
+        return None
+
+    def _gone(agent_id: str) -> bool:
+        if probe(agent_id):
+            return False
+        if child_origin(agent_id)[0]:
+            return False
+        return not _owes_entries(session_id)
+
+    return _gone
+
+
+def remember_child_origin(agent_id: str, session_id: str, turn: int) -> None:
+    """Pin the parent session and turn that dispatched *agent_id*, unopened.
+
+    A child's later facts -- its ``subagent/spawned`` entry, a steer, its terminal
+    outcome -- are produced after the parent's turn has ended, often while the
+    parent is on a different turn entirely. Reading the parent's CURRENT turn at
+    any of those points would file the child under a turn that did not ask for it,
+    so the ordinal is captured once, where the dispatch was accepted and the asking
+    turn is still live, and every later entry about this child reuses it.
+
+    The pin starts UNOPENED, because being accepted is not being started: a spawn
+    still has to clear the approval gate, and a decline returns without ever
+    running. :func:`open_child_origin` is what promotes it, at the one site that
+    means "this run is really starting" -- so a declined spawn leaves no opener,
+    and the closer helpers below refuse to close what was never opened.
+
+    Idempotent: a queued member is accepted, waits behind the stagger gate, and
+    re-enters the spawn path under the SAME id, which must not move the origin it
+    was accepted with, nor un-open it.
+
+    An over-long *session_id* is REFUSED rather than stored. A cap on how many
+    pins are held bounds memory only if every field of a pin is bounded too, and
+    the session id is authored by the provider, not by this process. It is refused
+    rather than shortened because it is an IDENTITY: a truncated id names a
+    different unit or none at all, so storing a cut-down copy would file this
+    child's entries against the wrong crew log. The refusal is counted like any
+    other lost origin, since the consequence is the same -- that child's entries
+    are absent.
+    """
+    global _lost_child_origins, _lost_origin_reported
+
+    if not agent_id or not session_id:
+        return
+    if len(session_id) > _MAX_SESSION_ID_CHARS:
+        with _lock:
+            _lost_child_origins += 1
+            report = not _lost_origin_reported
+            _lost_origin_reported = True
+        if report:
+            logger.warning(
+                "crew log: a child's session id exceeds %d characters, so its "
+                "origin is refused and its entries will be absent; counted in "
+                "lost_child_origins()",
+                _MAX_SESSION_ID_CHARS,
+            )
+        return
+    with _lock:
+        if agent_id in _child_origin:
+            return
+        _child_origin[agent_id] = (session_id, int(turn), False)
+        if len(_child_origin) <= _MAX_CHILD_ORIGINS:
+            return
+        oldest = list(_child_origin)[:_ORIGIN_REAP_SCAN]
+    _reap_child_origin(oldest)
+
+
+def _reap_child_origin(oldest: "list[str]") -> None:
+    """Make room in the pin map, dropping a finished child's pin before a live one.
+
+    Called with ``_lock`` RELEASED. Choosing which pin to drop means asking the
+    liveness probe, and that probe belongs to the subagent side; holding this
+    module's non-reentrant lock across a foreign call is how a deadlock is built.
+    The map is re-checked under the lock before anything is removed, so a release
+    that happens in between simply leaves nothing to do.
+
+    A pin is released by its child's terminal entry, so a pin held while its
+    neighbours have gone belongs to a child that never reported one -- a run lost
+    to a crash, a member cancelled before it started. Those are free to drop: the
+    entries they could still carry are never coming. Dropping them is also what
+    keeps this cap from being reached by accumulation over long uptime, rather than
+    only by that many children genuinely running at once.
+
+    When every candidate is still running, the oldest goes and the loss is COUNTED
+    in :func:`lost_child_origins` and named in the log once. That child's opener or
+    outcome will be absent, and an absence a reader cannot see is the one loss this
+    module refuses to allow silently. Nothing is WRITTEN for it: the registry
+    declares no type for a lost pin, and inventing one here would be a shape change
+    made to describe a bug rather than a fact of the session.
+
+    The scan is bounded, so a finished pin sitting past the window is missed and
+    the oldest live pin is dropped instead. That trades an exact choice for a
+    bounded cost in a state that is already pathological, and the trade is visible
+    because the drop is counted either way.
+    """
+    global _lost_child_origins, _lost_origin_reported
+
+    probe = _child_liveness
+    finished: list[str] = []
+    if probe is not None:
+        for candidate in oldest:
+            try:
+                running = probe(candidate)
+            except Exception:
+                # An unanswerable probe is not an answer. Treat the child as
+                # running, so a pin is never dropped on a failed read.
+                logger.debug("crew log: child liveness probe failed", exc_info=True)
+                continue
+            if not running:
+                finished.append(candidate)
+
+    with _lock:
+        if len(_child_origin) <= _MAX_CHILD_ORIGINS:
+            return
+        for candidate in finished:
+            if _child_origin.pop(candidate, None) is not None:
+                return
+        _child_origin.popitem(last=False)
+        _lost_child_origins += 1
+        report = not _lost_origin_reported
+        _lost_origin_reported = True
+    if report:
+        logger.warning(
+            "crew log: the child-origin map is full of running children, so a "
+            "live child's origin was dropped and its remaining entries will be "
+            "absent; counted in lost_child_origins()"
+        )
+
+
+def open_child_origin(agent_id: str) -> "tuple[str, int]":
+    """Mark *agent_id*'s pin OPENED and return it, or ``("", 0)`` if unknown.
+
+    Called where the run actually begins. Returning the pinned pair rather than
+    reading the parent's live turn is the whole point: this site can be reached a
+    long human approval later, by which time the parent is on another turn.
+
+    Idempotent, so a second call cannot produce a second opener.
+    """
+    if not agent_id:
+        return ("", 0)
+    with _lock:
+        found = _child_origin.get(agent_id)
+        if found is None:
+            return ("", 0)
+        session_id, turn, _opened = found
+        _child_origin[agent_id] = (session_id, turn, True)
+        return (session_id, turn)
+
+
+def child_origin(agent_id: str) -> "tuple[str, int]":
+    """*agent_id*'s pinned origin if its spawn was recorded, else ``("", 0)``.
+
+    Gated on opened: an entry about a child that has no ``subagent/spawned`` line
+    would be a fact with no cause, which is worse than the fact being missing.
+    """
+    if not agent_id:
+        return ("", 0)
+    with _lock:
+        found = _child_origin.get(agent_id)
+        if found is None or not found[2]:
+            return ("", 0)
+        return (found[0], found[1])
+
+
+def forget_child_origin(agent_id: str) -> "tuple[str, int]":
+    """Release *agent_id*'s origin and return it, or ``("", 0)``.
+
+    Called from the child's terminal report, which is exclusive and one-shot, so
+    the release happens exactly once and a second terminal cannot write a second
+    closer with a resolved origin.
+
+    Also gated on opened, and the release happens either way: a spawn declined at
+    the approval gate is pinned but never opened, and its terminal report must
+    close nothing while still dropping the pin rather than leaving it for the FIFO
+    to evict.
+    """
+    if not agent_id:
+        return ("", 0)
+    with _lock:
+        found = _child_origin.pop(agent_id, None)
+        if found is None or not found[2]:
+            return ("", 0)
+        return (found[0], found[1])
+
+
+def on_plan_updated(session_id: str, turn: int, *, items: Any) -> None:
+    """Record the agent's own task list as the agent just restated it.
+
+    A TODO update is a WHOLE list, not a delta: the agent re-sends every task on
+    every change, so the entry is the list as of this update and a reader diffs
+    consecutive entries itself. ``items`` is the stream's own ``tasks`` array of
+    ``{id, text, completed}``. ``None`` means the event said nothing about the
+    plan and no entry is written; an empty LIST means the agent cleared its plan,
+    which is a change and is recorded as one.
+
+    ``state`` is two-valued -- ``done`` / ``open`` -- because that is all the
+    stream carries. The backend's todo model is a plain ``completed`` boolean with
+    no in-progress state, as the slot's own snapshot code documents, so a
+    three-state vocabulary would be invented here and is not written.
+
+    The list is bounded twice, by COUNT and by BYTES, and both bounds keep the real
+    count in ``total`` so a clipped record still says how much it is not showing.
+    Count alone is not enough: ``_clip`` bounds each ``text`` in characters while the
+    store serializes with ``ensure_ascii``, which spends six bytes on a BMP character
+    and twelve on a surrogate pair -- so a hundred separately-legal rows of emoji
+    serialize past the entry ceiling, where the append is REFUSED and the whole
+    update disappears. Measured through the store's own serializer, because that is
+    what the writer will measure.
+
+    Guarded on the flag HERE rather than relying on :func:`_write`'s own guard,
+    because this function does real work before it reaches one: a redaction per task
+    and a serialize probe per admitted row, on the chat loop, for a feature that is
+    off by default. The subagent and background emitters are guarded at their callers
+    instead; this and :func:`on_approval_requested` are the two the runner calls
+    unconditionally, so they carry their own.
+    """
+    if not session_id or not enabled():
+        return
+    rows: list[dict[str, Any]] = []
+    total = 0
+    #: Set by the first row the line cannot hold. Every later row is then counted
+    #: and not admitted, because ``items`` is read as the FRONT of the plan: a
+    #: shorter row admitted past a dropped one would make it a subsequence, and a
+    #: reader diffing consecutive entries would see tasks reorder and vanish.
+    full = False
+    if items is None:
+        # Not the same as a plan of zero tasks. The event carried no task list at
+        # all, so nothing was observed about the plan, and an entry claiming it is
+        # now empty would be an invention. An event that DOES carry an empty list
+        # is a cleared plan and is recorded as one.
+        return
+    for task in items:
+        if not isinstance(task, dict):
+            continue
+        total += 1
+        if full or len(rows) >= _MAX_PLAN_ITEMS:
+            continue
+        row = {
+            "id": _clip(_safe_text(str(task.get("id") or len(rows) + 1)), _MAX_ID_TEXT),
+            "text": _clip(_safe_text(task.get("text")), _MAX_SHORT_TEXT),
+            "state": "done" if task.get("completed") else "open",
+        }
+        # Measured against the entry it is about to join, and the widest form of
+        # that entry: `total` is included so admitting this row cannot be what
+        # pushes the finished line over once the count field appears.
+        probe = {"turn": int(turn), "items": rows + [row], "total": total}
+        if rows and not _entry_line_fits("plan/updated", probe, src=_SRC_ACP):
+            full = True
+            continue
+        rows.append(row)
+    data: dict[str, Any] = {"turn": int(turn), "items": rows}
+    if total > len(rows):
+        data["total"] = total
+    # A sampled stream: the agent overwrites its plan freely and nothing later in
+    # the file depends on any single update having been read.
+    _write(session_id, "plan/updated", data, src=_SRC_ACP, ignorable=True)
+
+
+def on_background_completed(
+    session_id: str,
+    *,
+    kind: str,
+    model: str = "",
+    provider: str = "",
+    credits: float = 0.0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    duration_ms: int = 0,
+) -> None:
+    """Record a model call the gateway made ON this session's behalf.
+
+    Titling, summarizing and memory consolidation spend the user's budget without
+    the user asking, and until now that spend appeared in the usage store with no
+    trace in the session it was charged to. This is that trace.
+
+    No ``turn``. The call is not part of one -- it runs after a turn ends, on a
+    separate background session -- and naming the turn that happened to be last
+    would attribute the cost to work that did not cause it.
+
+    ``tokens`` and ``credits`` are written only when a dimension was actually
+    billed, following ``turn/completed``: a provider fills the dimensions it bills
+    in and leaves the rest at 0, so a zero is "this provider does not bill here",
+    not a measurement. ``duration_ms`` is the wall clock the background helper
+    measured around the call itself, and it is likewise omitted at 0.
+    """
+    data: dict[str, Any] = {"kind": kind}
+    if model:
+        data["model"] = model
+    if provider:
+        data["provider"] = provider
+    if credits:
+        data["credits"] = float(credits)
+    tokens = {
+        "input": int(input_tokens),
+        "output": int(output_tokens),
+        "cache_read": int(cache_read_tokens),
+        "cache_write": int(cache_write_tokens),
+    }
+    if any(tokens.values()):
+        data["tokens"] = {name: count for name, count in tokens.items() if count}
+    if duration_ms > 0:
+        data["ms"] = int(duration_ms)
+    _write(session_id, "background/completed", data, src=_SRC_GATEWAY)
+
+
+def on_subagent_spawned(
+    session_id: str,
+    turn: int,
+    *,
+    agent_id: str,
+    agent: str = "",
+    model: str = "",
+    scope: Any = None,
+) -> None:
+    """Record a child this session dispatched.
+
+    ``turn`` is the turn that ASKED, captured where the spawn was accepted --
+    which runs inside the parent's turn, since a spawn arrives as one of its tool
+    calls. It is passed in rather than read here on purpose: the child starts,
+    steers and finishes long after that turn has ended, and every later entry
+    about this child reuses the captured ordinal instead of asking what turn the
+    parent is on now.
+
+    No ``ref`` into the child's log. The schema describes one, and a child that
+    had a crew log would deserve it, but no subagent code path opens one: the only
+    site that creates a session's crew log is the dashboard turn path, and a subagent
+    run does not go through it. A ``ref`` written now would cite a file that does
+    not exist, which a reader cannot distinguish from one that was deleted. It
+    becomes writable, unchanged, the day subagent sessions get crew logs of their
+    own.
+
+    ``turn`` is ABSENT when no turn asked, the same way :func:`on_model_selected`
+    omits its own. A spawn does not always arrive inside a model turn -- a slash
+    command, a cron and a hook all dispatch children of a session with nothing
+    running -- and turns are numbered from one, so a literal ``0`` would name a
+    turn that never existed and match no ``turn/started``. The child is still
+    recorded: it is a real child of that session, and losing it to keep a field
+    populated would be the worse trade.
+    """
+    data: dict[str, Any] = {"agent_id": agent_id}
+    if turn:
+        data["turn"] = int(turn)
+    if agent:
+        data["agent"] = agent
+    if model:
+        data["model"] = model
+    if isinstance(scope, dict):
+        data["scope"] = {
+            "memory": bool(scope.get("memory")),
+            "lessons": bool(scope.get("lessons")),
+            "project": bool(scope.get("project")),
+        }
+    _write(session_id, "subagent/spawned", data, src=_SRC_GATEWAY)
+
+
+def on_subagent_steered(session_id: str, *, agent_id: str, mode: str = "") -> None:
+    """Record a correction sent into a running child.
+
+    Written into the PARENT's log: the parent is what sent it, and the child has
+    no crew log to receive it.
+    """
+    data: dict[str, Any] = {"agent_id": agent_id}
+    if mode:
+        data["mode"] = mode
+    _write(session_id, "subagent/steered", data, src=_SRC_GATEWAY)
+
+
+def on_subagent_completed(session_id: str, *, agent_id: str, duration_ms: int = 0) -> None:
+    """Close a child that finished its work.
+
+    Only for the ``completed`` outcome. A stopped or failed child closes through
+    :func:`on_subagent_failed`, because the runtime's own three-way outcome exists
+    precisely to stop consumers reading "no error" as success.
+
+    No ``tokens`` and no ``credits``, and their absence is the record. The schema
+    has both fields, but nothing in the subagent runtime measures either: a run's
+    record carries elapsed time and peak resource use, and the child's spend is
+    never reported back to the parent. Writing zeros would present the absence of
+    a measurement as a measurement of zero.
+    """
+    data: dict[str, Any] = {"agent_id": agent_id}
+    if duration_ms > 0:
+        data["ms"] = int(duration_ms)
+    _write(session_id, "subagent/completed", data, src=_SRC_GATEWAY)
+
+
+def on_subagent_failed(
+    session_id: str,
+    *,
+    agent_id: str,
+    reason: str = "",
+    outcome: str = "failed",
+    duration_ms: int = 0,
+) -> None:
+    """Close a child that did NOT finish its work.
+
+    Covers both non-success outcomes, and says which in ``outcome``: a run the
+    user stopped is not a failure and must not read as one, but it is also not a
+    completion, and the schema offers no third closer. Carrying the runtime's own
+    outcome verbatim keeps the two distinguishable without renaming a frozen type
+    or leaving the ``subagent/spawned`` entry open forever.
+    """
+    data: dict[str, Any] = {"agent_id": agent_id}
+    shown = _clip(_safe_text(reason), _MAX_SHORT_TEXT)
+    if shown:
+        data["reason"] = shown
+    if outcome:
+        data["outcome"] = outcome
+    if duration_ms > 0:
+        data["ms"] = int(duration_ms)
+    _write(session_id, "subagent/failed", data, src=_SRC_GATEWAY)
 
 
 def on_model_selected(session_id: str, model: str, source: str = "", *, turn: int = 0) -> None:

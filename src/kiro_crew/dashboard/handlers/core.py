@@ -55,13 +55,18 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_path,
 )
-from kiro_crew.config.sections import STT_LANGUAGE_AUTO
+from kiro_crew.config.sections import (
+    DECISION_BUCKET_MAX,
+    DECISION_BUCKET_MIN,
+    STT_LANGUAGE_AUTO,
+)
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
     guard_owner_surface_routes,
     owner_surface_guard,
     pip_extra_install_command,
+    require_owner_dashboard_request,
 )
 from kiro_crew.dashboard.origin import check_host, is_direct_local_request
 from kiro_crew.dashboard.state import DashboardState
@@ -143,6 +148,7 @@ _SENSITIVE_MASK = "••••••••"
 # does not refuse a credential-shaped name, so this view cannot assume one never
 # arrives.
 _AGENT_UNTRUSTED_TEXT_FIELDS = (
+    "member_id",
     "description",
     "triggers",
     "kiro_agent",
@@ -1915,7 +1921,6 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.sandbox": {"type": "enum", "values": ["auto", "off"]},
     "agent.sandbox_allow_no_isolation": {"type": "bool"},
     "agent.tool_search": {"type": "bool"},
-    "memory.private_provisioning_enabled": {"type": "bool"},
     "agent.completion_keep": {"type": "enum", "values": ["head", "tail", "both"]},
     "agent.completion_keep_chars": {
         "type": "int",
@@ -1944,6 +1949,12 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # opt-in. The cadence/cap fields (min_user_turns, max_intents, …) stay
     # config-file-only — they are power-user knobs, not first-run choices.
     "session_summary.enabled": {"type": "bool"},
+    # Which monitoring path a session arms by default. Safe on this generic
+    # route for the reason ``computer_use.enabled`` is NOT: this key grants no
+    # capability. Both monitoring paths are armable with it off, so flipping it
+    # cannot open an unattended path -- it only changes which of the two the
+    # monitor tool descriptions name as the default.
+    "monitoring.prefer_structured_arming": {"type": "bool"},
     "auto_update": {"type": "bool"},
     "dashboard.mcp_probe_timeout_secs": {
         "type": "int",
@@ -1990,6 +2001,15 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # behavior (not a display pref), read by the prevent-sleep poll in
     # dashboard/server.py; off by default.
     "dashboard.prevent_sleep": {"type": "bool"},
+    # Whether the credit pill may fall back to a BILLED `kiro-cli /usage` chat
+    # turn when the free usage API returns no plan. Read by
+    # ``handlers/sessions._text_scrape_enabled`` (fail-closed) and off by
+    # default, and the default is unchanged by being editable here: this entry
+    # only makes the value REACHABLE from the dashboard. Without it the schema
+    # published a label and help text for a setting whose PATCH was refused
+    # ``field not editable``, so the only way to opt in was to know the key
+    # name and edit config.json by hand.
+    "dashboard.usage_text_scrape_enabled": {"type": "bool"},
     # User profile (onboarding step 2 + Settings > General > About You).
     # Structured slugs, not free text: context.py maps them to prompt-ready
     # descriptions in its [USER PROFILE] block. "" = unspecified/cleared.
@@ -2100,6 +2120,25 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "type": "int",
         "min": _CU_MIN_SCREENSHOT_MAX_PX,
         "max": _CU_MAX_SCREENSHOT_MAX_PX,
+    },
+    # Decision seam (src/kiro_crew/decisions/). The sampling rate is the one
+    # value this route writes for it. The ENABLE is not a config path at all: it
+    # is the keystone `decisions_consent.json`, written only by the browser-only
+    # `PUT /api/decisions/consent` (handlers/decisions.py), because config.json
+    # is agent-writable and consent to egress must not be. `provider.*` is
+    # deliberately NOT here either. The endpoint would let a dashboard caller
+    # choose where the state a decision point collects is sent, and `api_key` is
+    # schema-`sensitive`, so the masked GET returns the sentinel for it — a PATCH
+    # offered next to that would let a caller overwrite a key it cannot read
+    # back. Both stay config-file-only, the same split telemetry.beacon_endpoint
+    # already has.
+    #
+    # Bounds come from the config section itself, so this write gate and the
+    # load-time clamp in `DecisionsConfig.from_raw` cannot drift.
+    "decisions.bucket": {
+        "type": "int",
+        "min": DECISION_BUCKET_MIN,
+        "max": DECISION_BUCKET_MAX,
     },
 }
 
@@ -2319,6 +2358,26 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                 status=400,
             )
 
+    # ── Enabling the billed credit-meter fallback is owner-only ──
+    # Every other path in the allowlist is a preference, so the route's "any
+    # authenticated caller" bar is the right one for them. It is not the right bar
+    # for this one: enabling it makes the credit pill fall back to a REAL billed
+    # `kiro-cli /usage` turn, and repeat it every refresh interval for as long as
+    # any tab is open. A dashboard token does not imply ownership -- an
+    # allow-listed messaging user holds one -- so without this gate a non-owner
+    # could start recurring spend on the owner's account, and nothing
+    # self-corrects an enabled state.
+    #
+    # Only the ENABLE is gated, exactly like the two telemetry writes below:
+    # turning billing OFF must never require authorization. Refusing that would
+    # leave someone able to see spend they cannot stop, and the narrower choice
+    # always composes.
+    if path_key == "dashboard.usage_text_scrape_enabled" and value is True:
+        denial = await require_owner_dashboard_request(request, "config.patch.usage_text_scrape")
+        if denial is not None:
+            _log_sel("denied", f"{path_key}={value}")
+            return denial
+
     # ── Governance: refuse a write an enterprise ceiling has pinned ──
     # Only re-ENABLING is refused. Writing `false` is always allowed even under a
     # ceiling that already forbids the beacon: the ceiling is a floor on privacy,
@@ -2465,7 +2524,26 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 
 
 def _unix_peer_is_self(request: web.Request) -> bool:
-    """True iff the request's Unix peer is this process's own principal."""
+    """True iff *request* arrived on an ``AF_UNIX`` socket AND the kernel
+    positively confirms the peer runs as this process's own principal.
+
+    Transport-admission twin of ``is_loopback`` for the local-secret endpoints:
+    an ``AF_UNIX`` request has an EMPTY ``request.remote``, so the
+    loopback test alone 403s the transport that is strictly HARDER to reach
+    than loopback TCP — the dashboard's socket sits ``0600`` inside a ``0700``
+    owner-only directory, and the kernel reports who connected, which loopback
+    TCP cannot. Because ``/api/token/local`` is ``token_auth``-bypassed, this
+    admission is deny-by-default via ``check_peer_is_self``: ``MISMATCH``
+    (another principal reached our socket — exactly when the directory gate
+    has failed and refusing matters most) and ``UNVERIFIABLE`` (no mechanism,
+    failed syscall) are BOTH refused, so a platform without peer credentials
+    never silently widens the gate. This admits a TRANSPORT, never a caller —
+    the ``X-Local-Secret`` check downstream is unchanged.
+
+    Transport discrimination is delegated to ``token_auth._unix_request_socket``,
+    the one shared definition of "arrived on the dashboard's unix socket" for
+    the CSRF and token-auth layers.
+    """
     sock = _unix_request_socket(request)
     return sock is not None and check_peer_is_self(sock) is PeerCredResult.MATCH
 

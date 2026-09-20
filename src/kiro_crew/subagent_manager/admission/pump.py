@@ -36,6 +36,8 @@ class _PumpMixin(ManagerComponent):
         # Sibling-mixin methods this module reaches through ``self``; typing only.
         def taskq_store(self) -> "_taskq.TaskStore | None": ...
 
+        def _record_crew_log_spawn_started(self, info: "SubagentInfo") -> None: ...
+
     def _should_stagger_queue_impl(self, now: float) -> tuple[bool, bool]:
         """Decide whether a spawn arriving at *now* must be queued.
 
@@ -75,6 +77,31 @@ class _PumpMixin(ManagerComponent):
         store = self._manager._admission.taskq_store()
         if not self._manager._queue and store is None:
             return
+        # The gateway holds the pump closed between the durable store's open
+        # and the memory barrier (``defer_queue_dispatch``): rows that survived
+        # a restart are claimed by this pump, and a run started before memory
+        # is prepared either fails on ``MemoryStartupUnavailable`` or runs
+        # without its learned memory. ``release_queue_dispatch`` opens the hold
+        # and drains once, so nothing that asked in between is lost. Read with
+        # a default so a minimal facade without the attribute still pumps.
+        if getattr(self._manager, "_queue_dispatch_held", False):
+            # One line, not one per pass: a hold that is never opened would
+            # otherwise look exactly like the silent "accepted, never claimed"
+            # queue this hold exists to prevent. Only a real manager reaches
+            # here (a facade without the flag pumped above), so the companion
+            # flag is always present.
+            if not self._manager._queue_dispatch_hold_logged:
+                self._manager._queue_dispatch_hold_logged = True
+                # ``logger``, not ``_glue_logger``: an ``*_impl`` runs on
+                # ``subagent``'s globals (``bind_component_globals``), where
+                # this module's own logger name does not exist.
+                logger.debug(
+                    "taskq pump refusing passes: dispatch held until the memory "
+                    "barrier releases it (in-memory queue=%d, durable store=%s)",
+                    len(self._manager._queue),
+                    "attached" if store is not None else "none",
+                )
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -112,6 +139,7 @@ class _PumpMixin(ManagerComponent):
 
     async def _drain_queue_pass_impl(self) -> None:
         admission = self._manager._admission
+        retain_error_detail = True
         try:
             store = admission.taskq_store()
             if store is not None:
@@ -149,10 +177,11 @@ class _PumpMixin(ManagerComponent):
                     # may have work for it now.
                     self._manager._drain_queue()
             for params in picked:
+                retain_error_detail = params.get("_memory_mode", "persistent") == "persistent"
                 drained = await self._dispatch_async_impl(params)
                 self._after_dispatch_impl(params, drained, refill=lambda **_kw: 0)
         except Exception:
-            logger.exception("drain pump failed")
+            logger.error("drain pump failed", exc_info=retain_error_detail)
 
     async def _dispatch_async_impl(self, params: dict[str, Any]) -> "SubagentInfo | None":
         """Start a picked window row with its claim (``store.claim``) on the
@@ -321,7 +350,11 @@ class _PumpMixin(ManagerComponent):
                 return
         logger.info(
             "Draining queue: spawning '%s' (%d left)",
-            str(params.get("task", ""))[:40],
+            (
+                str(params.get("task", ""))[:40]
+                if params.get("_memory_mode", "persistent") == "persistent"
+                else queued_id
+            ),
             len(self._manager._queue),
         )
         # The popped item's parent just lost one waiting agent — re-emit its
@@ -474,7 +507,9 @@ class _PumpMixin(ManagerComponent):
             # The raiser names the missing SURFACE; the rungs are this gate's own
             # cascade. Keeping the split means the sentence does not go stale
             # when a channel learns to deliver the prompt itself.
-            detail = str(unreachable).strip() or "no interactive surface is attached"
+            detail = (
+                str(unreachable).strip() if info.memory_mode == "persistent" else ""
+            ) or "no interactive surface is attached"
             # TWO AUDIENCES, and which text each gets is a security decision, not
             # a formatting one. The rung list is the OPERATOR's: it names two
             # `config.json` keys, and `security.py` records that `config.json` is
@@ -507,7 +542,9 @@ class _PumpMixin(ManagerComponent):
                 "auto-approval."
             )
         except Exception:
-            logger.exception("Spawn approval failed for %s", info.id)
+            logger.error(
+                "Spawn approval failed for %s", info.id, exc_info=info.memory_mode == "persistent"
+            )
             approved = False
 
         if not approved:
@@ -571,16 +608,27 @@ class _PumpMixin(ManagerComponent):
                 max_turns=info.max_turns,
                 context_groups=_context_groups_field(info),
                 memory_store=info.memory_store,
+                execution_context=info.execution_context,
                 memory_mode=info.memory_mode,
                 app=info.app,
             )
         except Exception:
-            logger.warning("Failed to create agent folder for %s", info.id, exc_info=True)
+            logger.warning(
+                "Failed to create agent folder for %s",
+                info.id,
+                exc_info=info.memory_mode == "persistent",
+            )
             # The run task may already be registered. Its normal terminal path
             # settles the failure before allocating a provider, for every store.
             info.error = "memory_unavailable: could not persist this run's memory binding"
             return
 
+        # Written HERE, past the folder write, for the reason the stat below is:
+        # this is the point a start is confirmed. A run whose memory binding
+        # could not be persisted settles as a failure without ever allocating a
+        # provider, and its pin was never opened, so nothing closes an opener
+        # that was never written.
+        self._record_crew_log_spawn_started(info)
         Stats().inc_subagent_spawned()
         # Beside that stat, and for the same reason: this is the confirmed-start
         # funnel. Every path reaches it only AFTER the spawn is approved -- the
@@ -606,19 +654,24 @@ class _PumpMixin(ManagerComponent):
                 },
             )
         except Exception:
-            logger.debug("subagent spawned counter failed", exc_info=True)
+            logger.debug(
+                "subagent spawned counter failed", exc_info=info.memory_mode == "persistent"
+            )
         sel().log_tool_invocation(
             session_key=info.parent_session_key,
             source="subagent",
             tool_name="spawn_run",
             outcome="spawned",
-            metadata={
-                "subagent_id": info.id,
-                "agent": info.agent or "kirocrew",
-                "cwd": info.cwd,
-            },
+            metadata=(
+                {"subagent_id": info.id, "agent": info.agent or "kirocrew", "cwd": info.cwd}
+                if info.memory_mode == "persistent"
+                else {"subagent_id": info.id}
+            ),
         )
-        logger.info("Subagent %s spawned: %s", info.id, info.task[:80])
+        if info.memory_mode == "persistent":
+            logger.info("Subagent %s spawned: %s", info.id, info.task[:80])
+        else:
+            logger.info("Subagent %s spawned", info.id)
 
     #: ``taskq_claim`` reason: the store exists but could not be reached for
     #: the claim. The row is NOT started -- an unclaimed start would run at

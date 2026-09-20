@@ -1673,6 +1673,64 @@ def _matching_candidate_record_ids(records: Sequence[dict], pattern: dict) -> li
     ]
 
 
+def _below_promotion_floor(record: dict) -> bool:
+    """Whether promoting this record is what the lifecycle preview refuses.
+
+    A rule the reviewer has met only once would let a single incident govern every
+    later review, so the floor keeps the ruleset to heuristics that recurred. The
+    preview and the merge prompt both read it here, so the worker is never handed a
+    promotion the apply will reject.
+    """
+    return (
+        record.get("lifecycle") == "candidate"
+        and int((record.get("recurrence") or {}).get("count") or 0) < _PROMOTION_RECURRENCE_COUNT
+    )
+
+
+def promotion_ineligible_candidate_ids(
+    snapshot: Sequence[dict],
+    candidate_ids: Sequence[str],
+    *,
+    root: Path | None = None,
+    namespace: str | None = None,
+) -> list[str]:
+    """Selected candidates whose promote/merge decision the sidecar gate rejects.
+
+    The merge worker cannot see the governed sidecar, so without this list it
+    proposes a promotion that raises inside the preview and surfaces only as
+    "malformed_worker_output" — an unfixable error with no cause attached.
+    """
+    ns = namespace or DEFAULT_NAMESPACE
+    document, _raw = _read_learning_records_document(
+        learning_records_file(root, ns), _namespace_dir(ns, root)
+    )
+    records = list(document.get("records") or [])
+    selected = {str(item) for item in candidate_ids}
+    blocked: list[str] = []
+    for entry in snapshot:
+        if not isinstance(entry, dict):
+            continue
+        pattern = entry.get("pattern")
+        entry_id = str(entry.get("id") or "")
+        if not isinstance(pattern, dict) or entry_id not in selected:
+            continue
+        # Mirrors the two loops in _preview_sidecar_document: an id match gates on
+        # its own, a rule-text match only when it identifies one record.
+        by_id = [record for record in records if str(record.get("id")) == str(pattern.get("id"))]
+        if by_id:
+            gated = by_id
+        else:
+            matched = _matching_candidate_record_ids(records, pattern)
+            gated = (
+                [record for record in records if str(record.get("id")) == matched[0]]
+                if len(matched) == 1
+                else []
+            )
+        if any(_below_promotion_floor(record) for record in gated):
+            blocked.append(entry_id)
+    return blocked
+
+
 def _preview_sidecar_document(
     document: dict | None,
     decisions: Sequence[dict],
@@ -1697,7 +1755,7 @@ def _preview_sidecar_document(
                 continue
             action = decision["action"]
             if action in {"merge", "promote"} and record["lifecycle"] == "candidate":
-                if record["recurrence"]["count"] < _PROMOTION_RECURRENCE_COUNT:
+                if _below_promotion_floor(record):
                     raise ValueError("candidate_promotion_not_eligible")
                 record["lifecycle"] = "active"
                 record["timestamps"] = {
@@ -1721,7 +1779,7 @@ def _preview_sidecar_document(
             continue
         record = next(item for item in proposed["records"] if item["id"] == matches[0])
         if decision["action"] in {"merge", "promote"}:
-            if record["recurrence"]["count"] < _PROMOTION_RECURRENCE_COUNT:
+            if _below_promotion_floor(record):
                 raise ValueError("candidate_promotion_not_eligible")
             record["lifecycle"] = "active"
             record["timestamps"] = {**record["timestamps"], "updated_at": now, "archived_at": None}

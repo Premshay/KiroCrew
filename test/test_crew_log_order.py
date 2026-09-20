@@ -25,14 +25,14 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_RESULT,
     AcpEvent,
 )
-from kiro_crew.crew_log import emit, ledger_path
+from kiro_crew.crew_log import crew_log_path, emit
 from kiro_crew.dashboard.chat_runner import _run_chat
 
 SESSION = "acp-order-0001"
 
 
 @pytest.fixture(autouse=True)
-def _ledger_home(tmp_path, monkeypatch):
+def _log_home(tmp_path, monkeypatch):
     """Own data home, emitter on, and no state carried between tests."""
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
     monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
@@ -43,7 +43,7 @@ def _ledger_home(tmp_path, monkeypatch):
 
 def _entries() -> list[dict]:
     """Every crew log line after the header, in file order."""
-    path = ledger_path("session", SESSION)
+    path = crew_log_path("session", SESSION)
     if not path.is_file():
         return []
     with path.open("r", encoding="utf-8") as handle:
@@ -214,6 +214,30 @@ async def test_a_recovery_path_records_the_partial_reply_it_persists(tmp_path, e
 
 
 @pytest.mark.asyncio
+async def test_a_recovery_path_persists_a_glued_option_marker_reflowed(tmp_path):
+    """The interrupted body is rendered by the same grammar as a finished one.
+
+    ``_flush_segment`` reflows a glued ``[OPTIONS: ...]`` marker before persisting;
+    a turn that dies right after gluing one goes through ``_persist_partial_reply``
+    instead, and must not be the one path that stores the marker unrepaired.
+    """
+    from kiro_crew.acp.client import AcpProcessDied
+
+    state, slot = _state_and_slot(
+        tmp_path,
+        [AcpEvent(kind=EVENT_TEXT_CHUNK, text="Pick.\n[OPTIONS: A | B]Anytime.")],
+        raises=AcpProcessDied("backend failed mid-stream"),
+    )
+
+    await _run_chat(state, slot, "do the thing")
+
+    stored = [m["content"] for m in slot.messages if m.get("role") == "assistant"]
+    from kiro_crew.constants import GLUED_FOOTER_TEXT_LABEL
+
+    assert stored == [f"Pick.\n[OPTIONS: A | B]\n{GLUED_FOOTER_TEXT_LABEL}\nAnytime."]
+
+
+@pytest.mark.asyncio
 async def test_a_failed_turn_closer_follows_the_text_it_closes_over(tmp_path):
     """The closer is the turn's boundary, so partial output belongs above it.
 
@@ -327,7 +351,7 @@ def test_the_model_recorded_is_the_one_the_session_runs_on():
 
     Mutation guard: reading `slot.model` at either site reddens this.
     """
-    from kiro_crew.dashboard.chat_runner import _ledger_model
+    from kiro_crew.dashboard.chat_runner import _crew_log_model
 
     class _Withheld:
         model = "some-pinned-model"
@@ -340,9 +364,9 @@ def test_the_model_recorded_is_the_one_the_session_runs_on():
     class _Double:  # a test double that cannot report the fact at all
         model = "some-pinned-model"
 
-    assert _ledger_model(_Withheld()) == "", "a withheld pin was recorded as served"
-    assert _ledger_model(_Pinned()) == "some-pinned-model"
-    assert _ledger_model(_Double(), "fallback") == "fallback"
+    assert _crew_log_model(_Withheld()) == "", "a withheld pin was recorded as served"
+    assert _crew_log_model(_Pinned()) == "some-pinned-model"
+    assert _crew_log_model(_Double(), "fallback") == "fallback"
 
 
 @pytest.mark.asyncio

@@ -42,10 +42,12 @@ def _ctx(tmp_path, *, model: str | None = None) -> SpawnContext:
 
 
 def _pin_binary(monkeypatch, value):
-    """Pin the resolver AND drop its cache: the client caches the first real
-    resolution, so a patch aimed at the function alone is unreachable."""
-    monkeypatch.setattr(client_mod, "_deepseek_bin_cache", client_mod._UNRESOLVED)
-    monkeypatch.setattr(client_mod, "_resolve_deepseek_bin", value)
+    """Pin the resolver AND empty its cache: the client caches the first real
+    resolution, so a patch aimed at the resolver alone is unreachable. The real
+    resolver takes the backend, so the zero-argument fixtures are adapted here
+    rather than at every call site."""
+    monkeypatch.setattr(client_mod, "_self_served_bin_caches", {})
+    monkeypatch.setattr(client_mod, "_resolve_self_served_bin", lambda _backend: value())
 
 
 # ── Seam 1: spawn ──

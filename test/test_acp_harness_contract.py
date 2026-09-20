@@ -17,6 +17,7 @@ patched a local name would leave the real filesystem work running.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import inspect
 import json
@@ -35,7 +36,6 @@ from kiro_crew.acp.harness import (
     HarnessAdapter,
     KasHarness,
     KiroHarness,
-    ReclaimPolicy,
     SessionExtras,
     SpawnContext,
     harness_for,
@@ -102,7 +102,9 @@ def kiro_gates_pass(monkeypatch):
     """All three of the kiro spawn's pre-spawn gates answer "go"."""
     monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda agent: None)
     monkeypatch.setattr(agent_mod, "require_fork_governance", lambda agent, work_dir: None)
-    monkeypatch.setattr(sandbox_mod, "delegated_workspace_exposes_agents_dir", lambda work_dir: "")
+    monkeypatch.setattr(
+        sandbox_mod, "delegated_workspace_exposes_sealed_target", lambda work_dir: ""
+    )
 
 
 @pytest.fixture
@@ -197,6 +199,7 @@ def test_the_contract_declares_every_seam_this_suite_covers():
         "internal_sandbox",
         "pod_home_remap",
         "reads_markdown_agent_specs",
+        "client_meta_settings",
         "verifies_agent_activation",
         "protocol_version",
         "client_capabilities",
@@ -294,7 +297,7 @@ async def test_kiro_spawn_refuses_a_workspace_overlapping_the_agents_tree(
 
     monkeypatch.setattr(
         sandbox_mod,
-        "delegated_workspace_exposes_agents_dir",
+        "delegated_workspace_exposes_sealed_target",
         lambda work_dir: "overlaps agents dir",
     )
     with pytest.raises(AcpRuntimeError, match="overlaps agents dir"):
@@ -364,9 +367,47 @@ async def test_a_missing_binary_aborts_the_spawn(monkeypatch, tmp_path, backend)
     # it to one family would leave the next host's spawn unasserted.
     monkeypatch.setattr(client_mod, "_resolve_codex_acp_bin", lambda: (None, "/nowhere"))
     monkeypatch.setattr(client_mod, "_resolve_claude_acp_bin", lambda: (None, "/nowhere"))
-    monkeypatch.setattr(client_mod, "_resolve_deepseek_bin", lambda: (None, "/nowhere"))
+    # The self-served family resolves through the cached module-level helper, so
+    # the cache is emptied too: a hit would answer with a real earlier verdict and
+    # the patch would never be reached.
+    monkeypatch.setattr(client_mod, "_self_served_bin_caches", {})
+    monkeypatch.setattr(
+        client_mod, "_resolve_self_served_bin", lambda _backend: (None, "/nowhere")
+    )
     with pytest.raises(AcpRuntimeError, match="not found"):
         await harness_for(backend).resolve_spawn(_ctx(tmp_path))
+
+
+def test_every_client_helper_a_harness_calls_exists():
+    """A harness reads the client module's own helpers, so a rename there must
+    fail HERE rather than at the first spawn.
+
+    The coupling is invisible by construction: a harness imports
+    ``kiro_crew.acp.client`` inside the method and calls ``client_mod.<helper>``,
+    which is an AttributeError only once that path runs -- and the stubs in this
+    file patch such names onto the module, so a test can create the very
+    attribute production lacks. Walking the harness sources keeps the two in step
+    without executing a spawn.
+    """
+    harness_dir = Path(inspect.getsourcefile(client_mod)).parent / "harness"
+    missing: list[str] = []
+    for path in sorted(harness_dir.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        aliases = {
+            alias.asname
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "kiro_crew.acp"
+            for alias in node.names
+            if alias.name == "client"
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+                continue
+            if node.value.id in aliases and not hasattr(client_mod, node.attr):
+                missing.append(f"{path.name}: client_mod.{node.attr}")
+    assert not missing, (
+        "a harness calls a helper the client module no longer defines: " + ", ".join(missing)
+    )
 
 
 def test_kiro_injects_the_api_key_and_kas_strips_it(monkeypatch):
@@ -417,7 +458,10 @@ def test_kas_capabilities_open_only_the_settings_channel():
     """KAS's extra capability is the settings channel and nothing else.
 
     Every other ``_meta.kiro`` capability is a callback Crew does not implement,
-    so declaring one would invite a request with no handler.
+    so declaring one would invite a request with no handler. The channel is
+    declared EMPTY here: the runtime fills it at spawn from the operator's
+    settings (``client_meta_settings``), so the constant stays the pristine shape
+    every host's handshake is compared against.
     """
     kas = harness_for(ACP_BACKEND_KAS).client_capabilities
     assert kas["_meta"] == {"kiro": {"settings": {}}}
@@ -427,6 +471,20 @@ def test_kas_capabilities_open_only_the_settings_channel():
     assert {k: v for k, v in kas.items() if k != "_meta"} == {
         k: v for k, v in ACP_CLIENT_CAPABILITIES.items() if k != "_meta"
     }
+
+
+def test_only_the_host_with_a_settings_channel_has_it_filled():
+    """H6: whether ``initialize`` carries settings is a membership answer.
+
+    KAS opened ``_meta.kiro.settings`` and reads Tool Search from it; kiro-cli has
+    no such channel and takes the same setting from the cli.json overlay. A host
+    answering yes here without the channel would have its handshake rejected;
+    one answering no while it HAS the channel runs with every setting at the
+    engine's default -- which for Tool Search on KAS is the silent "loader never
+    mounted" the runtime's gate exists to prevent.
+    """
+    assert harness_for(ACP_BACKEND_KAS).client_meta_settings is True
+    assert harness_for(ACP_BACKEND_KIRO).client_meta_settings is False
 
 
 # ── Seam 3: session extras ──
@@ -765,11 +823,52 @@ def test_no_host_is_left_unverified(backend):
 # ── Seam 9: reclaim ──
 
 
+_RECLAIM_PROBES = (
+    (123.0, 45.0),
+    (321.0, 4500.0),
+)
+
+
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_reclaim_thresholds_pass_the_operator_configuration_through(backend):
-    """A harness narrows these for a leaky host; nothing in the kiro family does."""
-    policy = harness_for(backend).reclaim_policy(max_age_secs=123.0, max_rss_mb=45.0)
-    assert policy == ReclaimPolicy(max_age_secs=123.0, max_rss_mb=45.0)
+    """Every harness passes the operator's thresholds through, in their own unit.
+
+    Universal, and asserted for every harness alike. Age passes through unchanged:
+    nothing about age depends on what a harness measures. RSS passes through
+    unchanged too -- UNLESS the harness measures a different SET of processes, in
+    which case the incoming number is in a unit it does not measure and the harness
+    states its own. The two shapes are told apart by what the harness declares on
+    itself, never by its identity: a bounded scope (``CORE_RSS_DEPTH``) and the
+    ceiling for that scope (``CORE_RSS_CEILING_MB``) travel together, and a harness
+    declaring neither is held to pass-through. The second probe is what makes a
+    stated ceiling distinguishable from a reinterpreted one: the answer must be the
+    SAME for two different inputs, and must be the declared constant, so a harness
+    scaling or clamping the operator's number fails on one probe or the other.
+    Quietly reinterpreting an operator's configured ceiling for one host is the
+    failure this ratchet catches, whichever host it is.
+    """
+    harness = harness_for(backend)
+    depth = getattr(type(harness), "CORE_RSS_DEPTH", None)
+    ceiling = getattr(type(harness), "CORE_RSS_CEILING_MB", None)
+    assert (depth is None) == (ceiling is None), (
+        f"{backend!r} declares a bounded RSS scope and a ceiling for it together or not at "
+        f"all (CORE_RSS_DEPTH={depth!r}, CORE_RSS_CEILING_MB={ceiling!r})"
+    )
+    for age, rss in _RECLAIM_PROBES:
+        policy = harness.reclaim_policy(max_age_secs=age, max_rss_mb=rss)
+        assert policy.max_age_secs == age, f"{backend!r} changed the age ceiling"
+        if depth is None:
+            assert policy.max_rss_mb == rss, (
+                f"{backend!r} measures the whole subtree and must pass the operator's RSS "
+                f"ceiling through; got {policy.max_rss_mb!r} for {rss!r}"
+            )
+        else:
+            assert isinstance(depth, int) and depth >= 1
+            assert policy.max_rss_mb == ceiling, (
+                f"{backend!r} measures a bounded scope (depth {depth}) and must state its "
+                f"declared ceiling {ceiling!r} in that unit; got {policy.max_rss_mb!r} for "
+                f"input {rss!r}"
+            )
 
 
 # ── The Kiro path gains no failure mode (harness-parity H13) ──
@@ -937,9 +1036,12 @@ def test_the_kiro_family_ignores_the_advertised_capabilities(backend):
 def test_codex_narrows_the_array_against_what_the_handshake_advertised():
     """The counterexample the two family assertions above must not swallow.
 
-    codex reads no agent spec, so this array IS the session's tool surface, and one
-    element whose transport the adapter never advertised fails the WHOLE
-    ``session/new`` with ``-32600``.
+    codex reads no agent spec, so this array IS the session's tool surface -- and an
+    element whose transport the adapter never advertised is ACCEPTED rather than
+    refused: ``session/new`` answers with a ``sessionId`` and that server is never
+    wired. The narrowing here is the only guard that the array Crew sends is the
+    array the adapter honours, because a session carrying an unwired server reports
+    nothing.
     """
     harness = harness_for(ACP_BACKEND_CODEX)
     requested = [{"name": "keep", "url": "http://keep"}, {"name": "drop", "type": "sse"}]
@@ -1001,9 +1103,9 @@ def test_the_mcp_seam_is_a_transform_not_an_addition():
     """The seam takes the caller's list IN, which is what lets a host narrow it.
 
     A host with no agent spec has nothing but this array describing its tool
-    surface, and one element whose transport it never advertised can cost the
-    whole session rather than that one server. A field on SessionExtras could
-    only ADD, so such a host could not be served at all.
+    surface, and it may ACCEPT an element whose transport it never advertised and
+    then wire nothing for it, so only the client can keep the two in step. A field
+    on SessionExtras could only ADD, so such a host could not be served at all.
     """
     sig = inspect.signature(HarnessAdapter.session_mcp_servers)
     assert list(sig.parameters) == ["self", "requested", "agent_capabilities"]

@@ -1,4 +1,4 @@
-"""Failed member publication preserves data without blocking a safe retry."""
+"""Failed member creation removes only the allocation it never published."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
-from member_memory_helpers import patch_private_memory_supported
 
 from kiro_crew import cli_commands
 from kiro_crew.agent_discovery import AgentInfo
@@ -22,12 +21,22 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.dashboard.handlers import agents as handlers
 from kiro_crew.memory_stores import (
-    UnknownMemoryStore,
     _named_store_dir,
+    persist_member_config,
     provision_member_memory,
-    require_member_memory_not_archived,
     require_member_memory_store,
+    retire_unpublished_allocation,
 )
+
+#: Ceiling on one handshake with the publication worker, in either direction.
+#: A lost-run guard, never the barrier: every wait below returns the moment its
+#: event is set, so only a worker that never arrives pays this. Generous because
+#: the worker's step before the handshake is a REAL allocation -- a SQLite
+#: database created, initialised and fsynced under ``tmp_path`` -- and on a
+#: loaded Windows CI worker that alone takes several seconds. Kept under
+#: pytest's per-test timeout so a genuinely lost handshake still fails as this
+#: assertion, not as a killed worker.
+_HANDSHAKE_CEILING_SECS = 60.0
 
 
 @pytest.fixture
@@ -35,7 +44,7 @@ def owner_gateway(monkeypatch):
     monkeypatch.setattr(
         "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request", lambda _: True
     )
-    patch_private_memory_supported(monkeypatch)
+    pass  # Member routing does not depend on OS isolation.
     monkeypatch.setattr(handlers, "list_agents", lambda: [])
     cfg = KiroCrewConfig.load()
     cfg.agents["legacy"] = KiroCrewAgentConfig()
@@ -67,15 +76,26 @@ async def _dispatch(request, action):
     return await handler(request)
 
 
-def _retained_and_archived(store, owner):
+def _removed_allocation(store, owner):
+    # The unpublished allocation is gone; nothing in the namespace names it.
+    assert not _named_store_dir(store).exists()
+    loaded = KiroCrewConfig.load()
+    assert store not in loaded.memory_stores
+    assert all(agent.memory_store != store for agent in loaded.agents.values())
+
+
+def _retained_allocation(store, owner):
     assert (_named_store_dir(store) / "evidence.txt").read_bytes() == b"retained allocation"
-    with pytest.raises(UnknownMemoryStore, match="archived"):
-        require_member_memory_not_archived(store, expected_owner=owner)
+    from kiro_crew.vector_memory import read_member_database_identity
+
+    member_id, stored = read_member_database_identity(_named_store_dir(store) / "memory.db")
+    assert stored == store
+    assert member_id
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["create", "opt_in"])
-async def test_dashboard_publication_failure_retires_only_new_allocation_and_allows_retry(
+@pytest.mark.parametrize("action", ["create"])
+async def test_dashboard_publication_failure_removes_new_allocation_and_allows_retry(
     owner_gateway, monkeypatch, action
 ):
     request = _request(monkeypatch, action)
@@ -98,7 +118,7 @@ async def test_dashboard_publication_failure_retires_only_new_allocation_and_all
             await _dispatch(request, action)
     owner = "new-member" if action == "create" else "legacy"
     assert len(failed_stores) == 1
-    await asyncio.to_thread(_retained_and_archived, failed_stores[0], owner)
+    await asyncio.to_thread(_removed_allocation, failed_stores[0], owner)
     loaded = await asyncio.to_thread(KiroCrewConfig.load)
     assert await asyncio.to_thread(require_member_memory_store, loaded, "legacy") == "default"
     monkeypatch.setattr(handlers, "persist_member_config", original)
@@ -107,12 +127,37 @@ async def test_dashboard_publication_failure_retires_only_new_allocation_and_all
     assert json.loads(response.text)["memory_store"] != failed_stores[0]
 
 
+@pytest.mark.asyncio
+async def test_dashboard_failure_after_landed_publication_keeps_the_store(
+    owner_gateway, monkeypatch
+):
+    # The failure surfaces AFTER update_config_locked wrote the member: the
+    # retire step must find the store referenced on disk and leave it alone.
+    request = _request(monkeypatch, "create")
+    original = handlers.persist_member_config
+    published = []
+
+    def publish_then_fail(cfg, name, **kwargs):
+        original(cfg, name, **kwargs)
+        published.append(cfg.agents[name].memory_store)
+        raise OSError("post-publication failure")
+
+    monkeypatch.setattr(handlers, "persist_member_config", publish_then_fail)
+    response = await _dispatch(request, "create")
+    assert response.status == 409
+    assert len(published) == 1
+    store = published[0]
+    assert (_named_store_dir(store) / "memory.db").is_file()
+    loaded = await asyncio.to_thread(KiroCrewConfig.load)
+    assert await asyncio.to_thread(require_member_memory_store, loaded, "new-member") == store
+
+
 async def _wait_for_publication_worker(task, entered):
     """Wait for the tested worker phase, surfacing an earlier response or error."""
     ready = asyncio.create_task(entered.wait())
     try:
         settled, _ = await asyncio.wait(
-            {task, ready}, timeout=5.0, return_when=asyncio.FIRST_COMPLETED
+            {task, ready}, timeout=_HANDSHAKE_CEILING_SECS, return_when=asyncio.FIRST_COMPLETED
         )
         if task in settled:
             response = task.result()
@@ -126,9 +171,9 @@ async def _wait_for_publication_worker(task, entered):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["create", "opt_in"])
+@pytest.mark.parametrize("action", ["create"])
 @pytest.mark.parametrize("phase", ["provision", "published"])
-async def test_cancelled_dashboard_request_drains_worker_before_deciding_retirement(
+async def test_cancelled_dashboard_request_drains_worker_before_observing_publication(
     owner_gateway, monkeypatch, action, phase
 ):
     loop = asyncio.get_running_loop()
@@ -144,14 +189,14 @@ async def test_cancelled_dashboard_request_drains_worker_before_deciding_retirem
         (_named_store_dir(store) / "evidence.txt").write_bytes(b"retained allocation")
         if phase == "provision":
             loop.call_soon_threadsafe(entered.set)
-            assert release.wait(5), "test did not release allocation worker"
+            assert release.wait(_HANDSHAKE_CEILING_SECS), "test did not release allocation worker"
         return store
 
     def publish(*args, **kwargs):
         original_publish(*args, **kwargs)
         if phase == "published":
             loop.call_soon_threadsafe(entered.set)
-            assert release.wait(5), "test did not release publication worker"
+            assert release.wait(_HANDSHAKE_CEILING_SECS), "test did not release publication worker"
 
     monkeypatch.setattr(handlers, "provision_member_memory", provision)
     monkeypatch.setattr(handlers, "persist_member_config", publish)
@@ -167,46 +212,36 @@ async def test_cancelled_dashboard_request_drains_worker_before_deciding_retirem
     store, owner = allocated[0]
     loaded = await asyncio.to_thread(KiroCrewConfig.load)
     if phase == "provision":
-        await asyncio.to_thread(_retained_and_archived, store, owner)
+        # Cancelled before publication: the drained worker still finished the
+        # allocation, and the retire step removed it because nothing on disk
+        # names it.
+        await asyncio.to_thread(_removed_allocation, store, owner)
         assert await asyncio.to_thread(require_member_memory_store, loaded, "legacy") == "default"
     else:
+        # Cancelled after publication landed: the retire step reads the store
+        # from config.json and keeps it.
         assert await asyncio.to_thread(require_member_memory_store, loaded, owner) == store
-        await asyncio.to_thread(require_member_memory_not_archived, store, expected_owner=owner)
+        assert (_named_store_dir(store) / "memory.db").is_file()
+        await asyncio.to_thread(_retained_allocation, store, owner)
 
 
 @pytest.mark.asyncio
-async def test_failed_idempotent_opt_in_does_not_offer_existing_v2_to_cleanup(
-    owner_gateway, monkeypatch
-):
+async def test_rejected_provisioning_update_preserves_existing_v2(owner_gateway, monkeypatch):
     cfg = owner_gateway
     store = await asyncio.to_thread(provision_member_memory, cfg, "legacy")
     await asyncio.to_thread(cfg.save)
-    cleanup = Mock()
-    monkeypatch.setattr(handlers, "retire_unpublished_member_memory_store", cleanup)
     monkeypatch.setattr(
         handlers, "persist_member_config", Mock(side_effect=OSError("publication refused"))
     )
-    with pytest.raises(OSError, match="publication refused"):
-        await _dispatch(_request(monkeypatch, "opt_in"), "opt_in")
-    cleanup.assert_not_called()
+    response = await _dispatch(_request(monkeypatch, "opt_in"), "opt_in")
+    assert response.status == 400
+    handlers.persist_member_config.assert_not_called()
     loaded = await asyncio.to_thread(KiroCrewConfig.load)
     assert await asyncio.to_thread(require_member_memory_store, loaded, "legacy") == store
 
 
-@pytest.mark.asyncio
-async def test_cleanup_failure_does_not_replace_the_publication_failure(owner_gateway, monkeypatch):
-    monkeypatch.setattr(
-        handlers, "persist_member_config", Mock(side_effect=OSError("primary write failure"))
-    )
-    cleanup = Mock(side_effect=OSError("secondary cleanup failure"))
-    monkeypatch.setattr(handlers, "retire_unpublished_member_memory_store", cleanup)
-    with pytest.raises(OSError, match="primary write failure"):
-        await _dispatch(_request(monkeypatch, "opt_in"), "opt_in")
-    cleanup.assert_called_once()
-
-
-@pytest.mark.parametrize("action", ["create", "update"])
-def test_cli_publication_failure_keeps_legacy_binding_and_retires_new_store(
+@pytest.mark.parametrize("action", ["create"])
+def test_cli_publication_failure_keeps_legacy_binding_and_preserves_new_store(
     owner_gateway, monkeypatch, capsys, action
 ):
     failed_stores = []
@@ -232,8 +267,37 @@ def test_cli_publication_failure_keeps_legacy_binding_and_retires_new_store(
     assert exc.value.code == 1
     assert "publication refused" in capsys.readouterr().err
     assert len(failed_stores) == 1
-    _retained_and_archived(failed_stores[0], "new-member" if action == "create" else "legacy")
+    _removed_allocation(failed_stores[0], "new-member" if action == "create" else "legacy")
     assert require_member_memory_store(KiroCrewConfig.load(), "legacy") == "default"
+
+
+def test_retire_keeps_a_store_the_disk_config_still_references(owner_gateway):
+    # Direct contract of the retire helper: a store that config.json names is
+    # never removed, and the in-memory binding is still restored for a retry.
+    cfg = owner_gateway
+    cfg.agents["new-member"] = KiroCrewAgentConfig()
+    store = provision_member_memory(cfg, "new-member")
+    persist_member_config(cfg, "new-member", create=True)
+    removed = retire_unpublished_allocation(
+        cfg, "new-member", store, previous_store="default", previous_member_id=""
+    )
+    assert removed is False
+    assert (_named_store_dir(store) / "memory.db").is_file()
+    assert require_member_memory_store(KiroCrewConfig.load(), "new-member") == store
+
+
+def test_retire_never_touches_a_pre_existing_binding(owner_gateway):
+    cfg = owner_gateway
+    store = provision_member_memory(cfg, "legacy")
+    persist_member_config(cfg, "legacy", create=False, expected_store="default")
+    # The idempotent provisioning result equals the previous binding: no-op.
+    assert (
+        retire_unpublished_allocation(
+            cfg, "legacy", store, previous_store=store, previous_member_id="legacy"
+        )
+        is False
+    )
+    assert (_named_store_dir(store) / "memory.db").is_file()
 
 
 @pytest.mark.asyncio

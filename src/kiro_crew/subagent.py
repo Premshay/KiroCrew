@@ -43,6 +43,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401 - STOP_* resol
 from kiro_crew.executors import run_in_embed_pool
 
 if TYPE_CHECKING:
+    from kiro_crew.execution_context import ExecutionContext
     from kiro_crew.acp.runtime import AcpRuntime
     from kiro_crew.providers.base import LLMProvider
 
@@ -1423,6 +1424,7 @@ class SubagentInfo:
     # crew reads the global store, which is what every spawn did before crews
     # had silos.
     memory_store: str = ""
+    execution_context: ExecutionContext | None = field(default=None, kw_only=True)
     # A named member remains the conversation owner during a template override.
     crew: str = field(default="", kw_only=True)
     # Session key override for continuation runs: a spawn_continue run reuses
@@ -1678,6 +1680,12 @@ class SpawnApprovalCallback(Protocol):
         pass
 
 
+#: Hard ceiling on :attr:`SubagentManager._completion_waiters`. Entries are
+#: created only by an explicit :meth:`SubagentManager.completion_event` call and
+#: removed by its release, so this is a leak fuse rather than a working limit.
+_MAX_COMPLETION_WAITERS = 64
+
+
 class SubagentManager:
     """Spawn and track isolated background agents."""
 
@@ -1723,11 +1731,22 @@ class SubagentManager:
         completion_keep: str = "head",
         completion_keep_chars: int = COMPLETION_KEEP_DEFAULT_CHARS,
         memory_mode_for_session: Callable[[str], str] | None = None,
+        defer_queue_dispatch: bool = False,
     ):
         self._sessions = sessions
         self._memory_mode_for_session = memory_mode_for_session
         self._ctx_builder = ctx_builder
         self._on_done = on_done
+        #: While True the staggered pump admits nothing: the durable rows that
+        #: survived a restart wait for :meth:`release_queue_dispatch`. The
+        #: gateway sets it so the boot drain (``start_reaper`` /
+        #: ``_initialize_taskq``) cannot claim a row during the memory barrier;
+        #: a manager built without it (tests, tools) pumps as soon as it can.
+        self._queue_dispatch_held = bool(defer_queue_dispatch)
+        #: Set by the pump the first time it refuses a pass under the hold, so
+        #: a hold that is never released leaves one debug line behind instead
+        #: of the silent "accepted, never claimed" queue this fix diagnoses.
+        self._queue_dispatch_hold_logged = False
         # ``_max_concurrent`` is the EFFECTIVE cap every admission read site
         # consults: ``min(user cap, adaptive cap)``. The user's resolved cap
         # (``agent.max_subagents`` / auto-size) is the ceiling in
@@ -1761,13 +1780,14 @@ class SubagentManager:
         self._completion_keep = completion_keep
         self._completion_keep_chars = completion_keep_chars
         self._running_count = 0
+        self._max_per_parent_by_agent: dict[str, int]
         try:
             agent_config = KiroCrewConfig.load().agent
             self._max_per_parent = max(0, int(agent_config.subagent_max_per_parent))
             self._max_per_parent_by_agent = dict(agent_config.subagent_max_per_parent_by_agent)
         except Exception:
             self._max_per_parent = 0
-            self._max_per_parent_by_agent: dict[str, int] = {}
+            self._max_per_parent_by_agent = {}
         # Strong refs to in-flight shielded terminal reports (see
         # `_spawn_terminal_report`); drained in `cancel_all`.
         self._report_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
@@ -1824,6 +1844,11 @@ class SubagentManager:
         # makes that inference unnecessary. Removed by the same ``finally`` that sets
         # the event, so a missing entry always means "nothing left to wait for".
         self._teardown_gates: dict[str, asyncio.Event] = {}
+        #: parent session key -> event pulsed whenever one of its runs reaches a
+        #: terminal report. Created on demand by :meth:`completion_event` and
+        #: dropped by :meth:`release_completion_event`, so the only entries are
+        #: the ones a waiter asked for (today: the autopilot stage loop).
+        self._completion_waiters: dict[str, asyncio.Event] = {}
         # Queued spawns store the FULL spawn() kwarg set (not just a 5-tuple), so a
         # drained spawn preserves approval_mode / silent / model / allowed_tools / bare —
         # dropping them made a queued headless/auto spawn hit the deny-by-default gate and
@@ -2205,6 +2230,21 @@ class SubagentManager:
     def start_reaper(self) -> None:
         return self._monitor.start_reaper_impl()
 
+    def release_queue_dispatch(self) -> None:
+        """Open the pump held by ``defer_queue_dispatch`` and drain once.
+
+        Called by the gateway after the memory barrier. Every drain request
+        that landed while the hold stood (the boot dispatch's ``call_later``,
+        the store attach, a dependency wake) returned without a pass, so this
+        one pass is what picks up the rows they would have. Idempotent: a
+        manager that was never held, or was already released, drains nothing
+        extra here.
+        """
+        if not self._queue_dispatch_held:
+            return
+        self._queue_dispatch_held = False
+        self._drain_queue()
+
     async def _reconcile_orphans(self) -> None:
         return await self._monitor._reconcile_orphans_impl()
 
@@ -2561,6 +2601,52 @@ class SubagentManager:
     def running_agents_for(self, parent_key: str) -> list[dict]:
         return self._run_events.running_agents_for_impl(parent_key)
 
+    def completion_event(self, parent_key: str) -> "asyncio.Event":
+        """Event pulsed each time a run belonging to *parent_key* finishes.
+
+        For a caller that would otherwise poll :meth:`running_agents_for` — an
+        O(n) scan over every retained agent — on a timer. The event is a PULSE,
+        not a state: a waiter clears it, re-reads the running set, and waits
+        again, so a completion landing between the clear and the read is still
+        observed on the next wait rather than lost.
+
+        It is not a guarantee. A run can reach a terminal state on a path that
+        never announces (``cancel_all`` at shutdown), so every waiter must keep
+        a timeout of its own; that is why this returns a bare event rather than
+        a helper that waits. Release it with
+        :meth:`release_completion_event` when the wait is over.
+        """
+        evt = self._completion_waiters.get(parent_key)
+        if evt is not None:
+            return evt
+        if len(self._completion_waiters) >= _MAX_COMPLETION_WAITERS:
+            # A detached event nothing ever sets: the caller degrades to its own
+            # fallback timeout instead of this growing without bound. Reachable
+            # only if callers leak registrations, which is why it is logged.
+            logger.warning(
+                "Subagent completion-waiter table is full (%d); %s gets no pulse",
+                _MAX_COMPLETION_WAITERS,
+                parent_key,
+            )
+            return asyncio.Event()
+        evt = asyncio.Event()
+        self._completion_waiters[parent_key] = evt
+        return evt
+
+    def release_completion_event(self, parent_key: str) -> None:
+        """Drop *parent_key*'s completion event. Idempotent."""
+        self._completion_waiters.pop(parent_key, None)
+
+    def signal_completion(self, parent_key: str) -> None:
+        """Pulse *parent_key*'s completion event, if anything is waiting on it.
+
+        Deliberately creates nothing: a parent with no waiter must not leave an
+        entry behind, so the announce path stays free of bookkeeping.
+        """
+        evt = self._completion_waiters.get(parent_key)
+        if evt is not None:
+            evt.set()
+
     def task_memory_rows(self) -> list[dict[str, object]]:
         return self._monitor.task_memory_rows_impl()
 
@@ -2589,6 +2675,7 @@ class SubagentManager:
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
+        _crew_log_asked: "tuple[str, int] | None" = None,
         _memory_mode: str | None = None,
         _store_accepted: bool = False,
         _stop_before_claim: bool = False,
@@ -2597,6 +2684,8 @@ class SubagentManager:
         _child_registration: bool = True,
         *,
         crew: str = "",
+        target_member: str | None = None,
+        _execution_context: dict | None = None,
     ) -> SubagentInfo | None:
         result = self._admission.spawn_impl(
             task,
@@ -2622,6 +2711,7 @@ class SubagentManager:
             _agent_prevalidated,
             _from_queue,
             _preassigned_id,
+            _crew_log_asked=_crew_log_asked,
             _memory_mode=_memory_mode,
             _store_accepted=_store_accepted,
             _stop_before_claim=_stop_before_claim,
@@ -2629,6 +2719,8 @@ class SubagentManager:
             _window_hint=_window_hint,
             _child_registration=_child_registration,
             crew=crew,
+            target_member=target_member,
+            _execution_context=_execution_context,
         )
         assert not isinstance(result, PreparedSpawn)
         # ``ClaimPoint`` comes back ONLY for ``_stop_before_claim=True``, whose
@@ -2657,6 +2749,81 @@ class SubagentManager:
         lock wait never blocks the loop, and the caller is still acked only
         once the row exists. Without a durable store this is plain ``spawn``.
         """
+        # Snapshot loop-owned policy inputs before reading a missing durable
+        # carrier. The admission gate below still runs on-loop after the await.
+        if (
+            not isinstance(task, str)
+            or not task.strip()
+            or getattr(self._sessions, "admission_closed", False) is True
+        ):
+            return self.spawn(task, **kwargs)
+        if kwargs.get("_execution_context") is None:
+            from kiro_crew.execution_context import read_session_execution
+            from kiro_crew.subagent_persistence import read_run_execution
+
+            parent = str(kwargs.get("parent_session_key") or "")
+            conversation = str(kwargs.get("conversation_key") or "")
+            mode = kwargs.get("_memory_mode")
+            inherited = None
+            try:
+                if mode is None:
+                    resolver = self._memory_mode_for_session
+                    mode = resolver(parent) if resolver is not None else "persistent"
+                if not isinstance(mode, str) or mode not in {
+                    "persistent",
+                    "incognito",
+                    "temporary",
+                }:
+                    raise ValueError("unknown memory mode")
+                if parent and not kwargs.get("agent") and not conversation:
+                    inherited = self._sessions.get_agent_selection(parent)
+                record_id = (conversation or parent).removeprefix("subagent:")
+                live = (
+                    self._agents.get(record_id)
+                    if (conversation or parent).startswith("subagent:")
+                    else None
+                )
+                record = live.execution_context if live is not None else None
+                if record is None:
+                    record = (
+                        await asyncio.to_thread(read_run_execution, record_id)
+                        if conversation
+                        else await asyncio.to_thread(read_session_execution, parent)
+                    )
+                execution = self._admission.resolve_spawn_execution(
+                    parent_session_key=parent,
+                    conversation_key=conversation,
+                    agent=kwargs.get("agent", ""),
+                    memory_store=kwargs.get("memory_store", ""),
+                    app=kwargs.get("app", ""),
+                    crew=kwargs.get("crew", ""),
+                    target_member=kwargs.get("target_member"),
+                    _memory_mode=mode,
+                    _record=record,
+                    _inherited_selection=inherited,
+                )
+                kwargs["_execution_context"] = execution.to_record()
+                kwargs["_memory_mode"] = execution.memory_mode
+            except (OSError, ValueError) as exc:
+                batch_id = str(kwargs.get("batch_id") or "")
+                batch_total = max(0, int(kwargs.get("batch_total") or 0))
+                if batch_id and not kwargs.get("_from_queue") and not kwargs.get("_store_accepted"):
+                    submitted = self._batch_submitted.setdefault(batch_id, [0, batch_total])
+                    submitted[0] += 1
+                    self._batch_progress_ts[batch_id] = time.time()
+                return self._announce_rejection(
+                    SubagentInfo(
+                        id=kwargs.get("_preassigned_id") or uuid.uuid4().hex[:8],
+                        task=_redact(task),
+                        parent_session_key=parent,
+                        agent=str(kwargs.get("agent") or ""),
+                        memory_mode=mode if isinstance(mode, str) else "persistent",
+                        done=True,
+                        error=f"memory_unavailable: {exc}",
+                        batch_id=batch_id,
+                        batch_total=batch_total,
+                    )
+                )
         store = self._admission.taskq_store()
         if store is None:
             return self.spawn(task, **kwargs)
@@ -2823,6 +2990,7 @@ class SubagentManager:
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _crew_log_asked: "tuple[str, int] | None" = None,
     ) -> SubagentInfo | None:
         return self._continuation.continue_conversation_impl(
             conv_id,
@@ -2834,6 +3002,7 @@ class SubagentManager:
             cwd,
             _preassigned_id,
             _memory_mode=_memory_mode,
+            _crew_log_asked=_crew_log_asked,
         )
 
     async def continue_conversation_async(
@@ -2847,6 +3016,7 @@ class SubagentManager:
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _crew_log_asked: "tuple[str, int] | None" = None,
     ) -> SubagentInfo | None:
         return await self._continuation.continue_conversation_async_impl(
             conv_id,
@@ -2858,6 +3028,7 @@ class SubagentManager:
             cwd,
             _preassigned_id,
             _memory_mode,
+            _crew_log_asked,
         )
 
     def _continue_prelude(
@@ -2871,6 +3042,10 @@ class SubagentManager:
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _crew_log_asked: "tuple[str, int] | None" = None,
+        *,
+        _execution_context=None,
+        _captured_state=...,
     ) -> "SubagentInfo | dict[str, Any] | None":
         return self._continuation._continue_prelude_impl(
             conv_id,
@@ -2882,6 +3057,9 @@ class SubagentManager:
             cwd,
             _preassigned_id,
             _memory_mode,
+            _crew_log_asked,
+            _execution_context=_execution_context,
+            _captured_state=_captured_state,
         )
 
     def recorded_cwd(self, conv_id: str) -> str:

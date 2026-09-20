@@ -489,3 +489,250 @@ class TestConcurrentStagingKeepsEveryLearning(unittest.TestCase):
         staged = sorted(p["title"] for p in learning.list_candidate(self.root))
         self.assertEqual(staged, sorted(titles),
                          "a concurrently staged learning was overwritten")
+
+
+class TestCandidateDeleteEndpoint(_Base):
+    """Deleting staged candidates: one, a bulk selection, and while a merge runs."""
+
+    async def test_deletes_a_single_candidate(self):
+        learning.stage_learning(_pattern("Keep me"), "fix_introduce")
+        learning.stage_learning(_pattern("Drop me"), "fix_introduce")
+        victim = [c for c in learning.list_candidate() if c["title"] == "Drop me"][0]
+        resp = await routes._handle_candidates_delete(
+            _FakeRequest({"namespace": "default", "candidate_ids": [victim["id"]]})
+        )  # type: ignore[arg-type]
+        self.assertEqual(resp.status, 200)
+        body = json.loads(_text(resp))
+        self.assertEqual((body["requested"], body["removed"], body["remaining"]), (1, 1, 1))
+        self.assertEqual([c["title"] for c in learning.list_candidate()], ["Keep me"])
+
+    async def test_deletes_a_bulk_selection_in_one_call(self):
+        for index in range(4):
+            learning.stage_learning(_pattern(f"Lesson {index}"), "fix_introduce")
+        doomed = [c["id"] for c in learning.list_candidate()][:3]
+        resp = await routes._handle_candidates_delete(
+            _FakeRequest({"namespace": "default", "candidate_ids": doomed})
+        )  # type: ignore[arg-type]
+        self.assertEqual(json.loads(_text(resp))["removed"], 3)
+        self.assertEqual(learning.candidate_count(), 1)
+
+    async def test_deleting_a_candidate_leaves_the_ruleset_alone(self):
+        learning.stage_learning(_pattern("Only staged"), "fix_introduce")
+        before = learning.load_learning_records(namespace="default")
+        victim = learning.list_candidate()[0]
+        await routes._handle_candidates_delete(
+            _FakeRequest({"namespace": "default", "candidate_ids": [victim["id"]]})
+        )  # type: ignore[arg-type]
+        # Discarding a staged learning is not a review decision: no rule is
+        # unlearned and no governed record is rewritten.
+        self.assertEqual(learning.list_patterns_for_review(), [])
+        self.assertEqual(learning.load_learning_records(namespace="default"), before)
+
+    async def test_refuses_ids_that_are_not_staged(self):
+        learning.stage_learning(_pattern("Staged"), "fix_introduce")
+        resp = await routes._handle_candidates_delete(
+            _FakeRequest({"namespace": "default", "candidate_ids": ["nope"]})
+        )  # type: ignore[arg-type]
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(learning.candidate_count(), 1)
+
+    async def test_refuses_an_empty_selection(self):
+        resp = await routes._handle_candidates_delete(
+            _FakeRequest({"namespace": "default", "candidate_ids": []})
+        )  # type: ignore[arg-type]
+        self.assertEqual(resp.status, 400)
+
+    async def test_refuses_while_a_merge_is_running(self):
+        learning.stage_learning(_pattern("Staged"), "fix_introduce")
+        victim = learning.list_candidate()[0]
+        routes._CONSOLIDATING.add("default")
+        resp = await routes._handle_candidates_delete(
+            _FakeRequest({"namespace": "default", "candidate_ids": [victim["id"]]})
+        )  # type: ignore[arg-type]
+        # The running merge snapped this catalog; removing an entry it saw would
+        # make the apply land against a listing the worker never read.
+        self.assertEqual(resp.status, 409)
+        self.assertEqual(learning.candidate_count(), 1)
+
+
+def _governed_candidate(count: int = 1, namespace: str = "default"):
+    """One staged candidate plus the sidecar record that governs it.
+
+    Staging alone never creates a record: a namespace becomes governed only once
+    its sidecar already holds records, so the record is written here explicitly —
+    with the rule text the candidate renders, which is how the preview matches the
+    two.
+    """
+    learning.stage_learning(_pattern("Governed lesson"), "fix_introduce", namespace=namespace)
+    candidates = learning.list_candidate(namespace=namespace)
+    evidence = [
+        {
+            "review": f"review-{index}",
+            "change": f"change-{index}",
+            "observed_at": f"2026-01-0{index + 1}T00:00:00Z",
+        }
+        for index in range(count)
+    ]
+    record = {
+        "id": "governed-record",
+        "text": "Governed lesson",
+        "rule": candidates[0]["guidance"],
+        "namespace": namespace,
+        "scope": "common",
+        "lifecycle": "candidate",
+        "origin": {"source": "fix_introduce", "reference": "review-1"},
+        "repository_identity": None,
+        "timestamps": {
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": None,
+            "archived_at": None,
+        },
+        "recurrence": {"count": count, "evidence": evidence},
+        "legacy": False,
+    }
+    learning._write_learning_records(
+        {
+            "schema": learning.LEARNING_RECORDS_SCHEMA,
+            "version": learning.LEARNING_RECORDS_VERSION,
+            "records": [record],
+        },
+        None,
+        namespace,
+    )
+    snapshot = [learning._candidate_snapshot_entry(item) for item in candidates]
+    return candidates, snapshot
+
+
+class TestPromotionEligibility(_Base):
+    """The recurrence floor that refuses a first-occurrence promotion."""
+
+    def test_a_first_occurrence_candidate_is_ineligible(self):
+        candidates, snapshot = _governed_candidate()
+        blocked = learning.promotion_ineligible_candidate_ids(
+            snapshot, [c["id"] for c in candidates], namespace="default"
+        )
+        # The governed record sits at recurrence 1, so promoting it would let a
+        # single incident govern every later review.
+        self.assertEqual(blocked, [candidates[0]["id"]])
+
+    def test_a_recurring_candidate_clears_the_gate(self):
+        candidates, snapshot = _governed_candidate(count=2)
+        self.assertEqual(
+            learning.promotion_ineligible_candidate_ids(
+                snapshot, [c["id"] for c in candidates], namespace="default"
+            ),
+            [],
+        )
+
+    def test_a_candidate_without_a_governed_record_is_not_gated(self):
+        # A markdown-only namespace has no sidecar, so nothing can be refused.
+        learning.stage_learning(_pattern("Legacy only"), "fix_introduce", namespace="legacy-ns")
+        candidates = learning.list_candidate(namespace="legacy-ns")
+        self.assertEqual(len(candidates), 1)
+        snapshot = [learning._candidate_snapshot_entry(item) for item in candidates]
+        self.assertEqual(
+            learning.promotion_ineligible_candidate_ids(
+                snapshot, [c["id"] for c in candidates], namespace="legacy-ns"
+            ),
+            [],
+        )
+
+    async def test_the_merge_task_is_given_every_id_and_the_blocked_ones(self):
+        candidates, snapshot = _governed_candidate()
+        ids = [c["id"] for c in candidates]
+
+        def dispatch(task, timeout=0, on_activity=None):
+            return {"ok": True, "output": "done", "error": ""}
+
+        pool = AsyncMock()
+        pool.begin_batch = AsyncMock()
+        pool.end_batch = AsyncMock()
+        seen: dict = {}
+        real = routes.review_driver.build_consolidation_task
+
+        def capture(*args, **kwargs):
+            seen.update(kwargs)
+            return real(*args, **kwargs)
+
+        with patch.object(routes.review_pool, "get_pool", return_value=pool), \
+                patch.object(routes.review_pool, "make_sync_dispatch",
+                             return_value=dispatch), \
+                patch.object(routes.review_driver, "build_consolidation_task",
+                             side_effect=capture):
+            await routes._consolidate_bg("default", ids, snapshot)
+
+        self.assertEqual([item["id"] for item in seen["selection"]], ids)
+        self.assertEqual(seen["blocked_promotions"], ids)
+        prompt = real("default", "a", "b", "c", selection=seen["selection"],
+                      blocked_promotions=seen["blocked_promotions"])
+        # A legacy block carries no id on disk, so the prompt is the only place the
+        # worker can learn the ids its decisions must name.
+        for candidate_id in ids:
+            self.assertIn(candidate_id, prompt)
+        self.assertIn("cannot be promoted or merged", prompt)
+        self.assertIn("retain", prompt)
+
+
+class TestConsolidationFailureIsNamed(_Base):
+    """A refused proposal reports why, instead of one sentence for every cause."""
+
+    async def _state(self, error: str):
+        routes._CONSOLIDATE_STATE.clear()
+        routes._CONSOLIDATE_STATE["default"] = {
+            "running": False,
+            "code": "malformed_worker_output",
+            "error_code": error,
+            "error": "malformed_worker_output",
+        }
+        try:
+            with patch.object(routes.learning, "list_rule_entries", return_value=[]), \
+                    patch.object(routes.learning, "list_candidate", return_value=[]):
+                resp = await routes._handle_learnings(_LearningsRequest("default"))
+        finally:
+            routes._CONSOLIDATE_STATE.clear()
+        return json.loads(_text(resp))
+
+    async def test_the_view_reports_the_machine_readable_cause(self):
+        body = await self._state("candidate_promotion_not_eligible")
+        self.assertEqual(body["consolidate_error_code"], "candidate_promotion_not_eligible")
+
+    async def test_the_rejected_proposal_is_logged_with_its_reason(self):
+        candidates, snapshot = _governed_candidate()
+        ids = [c["id"] for c in candidates]
+
+        def dispatch(task, timeout=0, on_activity=None):
+            out = Path(learning._namespace_dir("default")) / "consolidation-proposal.json"
+            out.write_text(json.dumps({
+                "ruleset_markdown": "### Promoted <!-- scope:common -->"
+                                    " <!-- impact:high --> <!-- added:2026-09-18T00:00:00Z -->\nG.\n",
+                "decisions": [
+                    {"candidate_id": item["id"], "action": "promote",
+                     "reason_code": "candidate_merged"}
+                    for item in candidates
+                ],
+            }), encoding="utf-8")
+            return {"ok": True, "output": "done", "error": ""}
+
+        pool = AsyncMock()
+        pool.begin_batch = AsyncMock()
+        pool.end_batch = AsyncMock()
+        with patch.object(routes.review_pool, "get_pool", return_value=pool), \
+                patch.object(routes.review_pool, "make_sync_dispatch",
+                             return_value=dispatch), \
+                self.assertLogs("kirocrew.app.code-review-sage", level="WARNING") as logs:
+            await routes._consolidate_bg("default", ids, snapshot)
+        self.assertTrue(
+            any("consolidation proposal rejected" in line for line in logs.output),
+            logs.output,
+        )
+        self.assertEqual(
+            routes._CONSOLIDATE_STATE["default"]["error_code"],
+            "candidate_promotion_not_eligible",
+        )
+
+
+class _LearningsRequest:
+    """The learnings view reads only the namespace query parameter."""
+
+    def __init__(self, namespace: str):
+        self.query = {"namespace": namespace}

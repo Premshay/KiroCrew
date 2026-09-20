@@ -29,11 +29,13 @@ from typing import Any, Protocol
 from kiro_crew import acp_tool_gate, model_registry
 from kiro_crew.acp import kas_wire
 from kiro_crew.acp._dispatch import (
+    DRAIN_YIELD_AFTER_S,
     build_permission_event,
     classify_notification,
     error_is_refusal_terminal,
     identified_mcp_call,
     is_mcp_tool_approval,
+    parse_codex_compaction_update,
     parse_metadata,
     parse_prompt_token_usage,
     parse_refusal,
@@ -100,9 +102,11 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STRUCTURED_REFUSAL,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -117,6 +121,7 @@ from kiro_crew.acp.types import (
     EVENT_SUBAGENT_ACTIVITY,
     EVENT_SUBAGENT_LIST,
     EVENT_TEXT_CHUNK,
+    EVENT_TODO_UPDATE,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
     JSONRPC_METHOD_NOT_FOUND,
@@ -152,8 +157,8 @@ from kiro_crew.acp.types import (
     AcpPromptStats,
     JsonRpcMessage,
     StructuredStatus,
-    effort_config_option_id,
 )
+from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import subprocess_executor
@@ -768,6 +773,7 @@ class AcpSessionHandle:
         # When True, destroy() skips the transcript unlink (subagent
         # continuability: the transcript is spawn_continue's resume material).
         self.keep_transcript = False
+        self.memory_mode = "persistent"
         # Token carried by THIS session's injected broker-stub entries
         # (``mcp_gateway.claim.mint_stub_session_token``), set by the runtime
         # that created the session. It is what a later claim-push names so
@@ -833,6 +839,16 @@ class AcpSessionHandle:
         # BEFORE end_turn). wait_for_compaction() consumes it first so the
         # drain never strands a caller into a spurious 120s timeout.
         self._compact_result: dict[str, str] | None = None
+        # Set when a codex compaction's ``started`` frame is seen inside a turn,
+        # cleared by its terminal. It guards TWO directions. A LOADED session
+        # replays a past compaction as a ``tool_call`` that is already
+        # ``completed``, so only a terminal following a ``started`` seen in THIS
+        # turn describes work this turn did -- reading a replayed one as live would
+        # reset the context meter against a window nobody just summarized. And a
+        # compaction that ERRORS reports nothing at all: codex-acp's ``runCompact``
+        # never resolves, so the ``session/prompt`` request goes unanswered, which
+        # leaves this armed for ``_settle_codex_compaction`` at the turn's terminal.
+        self._codex_compaction_pending = False
         self._cancelled = False
         # Unresponsive-cancel tracking (mirrors AcpClient._cancel_ts /
         # _cancel_grace_secs). Set by cancel(); the dispatch loop uses them to
@@ -928,6 +944,9 @@ class AcpSessionHandle:
         # so the permission event can rebuild mcp__<server>__<tool> for per-tool
         # governance in the app-own-server auto-approve.
         self._tool_call_tool_name: dict[str, str] = {}
+        # Parent-scoped cache keys populated by tagged native-child tool calls.
+        # Cleared per turn beside the sibling per-call caches below.
+        self._native_child_tool_call_ids: set[str] = set()
         # Server names for which a mid-session MCP OAuth banner was already
         # emitted, so we don't spam duplicates. Discarded on the matching
         # server_initialized / server_init_failure so a later token-expiry
@@ -1213,6 +1232,7 @@ class AcpSessionHandle:
         self._tool_call_diff_path.clear()
         self._tool_call_mcp_server.clear()
         self._tool_call_tool_name.clear()
+        self._native_child_tool_call_ids.clear()
         self._permission_options.clear()
         # Per-turn reset (parity with kiro-cli's authoritative full subagent_list
         # each turn): otherwise a completed sub-agent from a prior turn stays in
@@ -1247,14 +1267,42 @@ class AcpSessionHandle:
         # stopReason, logged only as a closed protocol value (see
         # _DRAIN_CLOSED_STOP_REASONS). The count is bounded by the queue, and
         # the log line is one per turn regardless of how many frames drained.
+        #
+        # ONE class of leftover frame is NOT the abandoned turn's to destroy.
+        # The abandoned turn's own frames are owed to nobody: this method
+        # refuses to start while _turn_done is clear and sets it in its own
+        # finally, so that turn's generator has already exited by the time the
+        # drain runs — dropping them loses nothing a consumer was still waiting
+        # for. A command/config call is different. send_command / compact /
+        # set_config_option never touch _turn_done, so their _wait_for_response
+        # can be IN FLIGHT when the next turn starts, and for a oneshot the
+        # response IS the terminal. Destroying it strands that caller until its
+        # own timeout (60s for send_command, which then reports "" for a call
+        # the backend answered). _awaited_responses names exactly the req_ids
+        # still being waited on, which is the discriminator the dispatch loop
+        # already routes responses on; retain those and let everything else
+        # drain. Re-injected AFTER the loop, never inside it: putting a frame
+        # back into the queue being drained would loop forever (the same reason
+        # _wait_for_response re-injects from its finally).
         _stale_dropped = 0
         _stale_terminals = 0
         _stale_reasons: list[str] = []
+        _stale_owed: list[JsonRpcMessage] = []
         while True:
             try:
                 stale = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            if (
+                stale is not None
+                and stale.method is None
+                and stale.id is not None
+                and stale.id in self._awaited_responses
+            ):
+                # A live waiter is inside _wait_for_response for this id. Hand
+                # it back instead of counting it: it is not a lost frame.
+                _stale_owed.append(stale)
+                continue
             if (
                 stale is not None
                 and stale.id is not None
@@ -1276,6 +1324,26 @@ class AcpSessionHandle:
                 _stale_title = (
                     _stale_tc.get("title") if isinstance(_stale_tc, dict) else ""
                 ) or "<unknown tool>"
+                # Hand back everything retained so far BEFORE the await below,
+                # which is the ONE await in this loop. reject_tool writes to the
+                # child's stdin and that write is not bounded short: a backend
+                # that already delivered a command response but has stopped
+                # reading its own stdin applies backpressure that blocks it, and
+                # an owed waiter carries a 60s deadline it would burn while its
+                # frame sat in this list. The await is also the yield point at
+                # which that waiter gets scheduled, so handing the frame back
+                # here is what actually pays it. Cleared so the re-injection
+                # after the loop cannot put the same frame back twice; anything
+                # the waiter did not take is re-read by this loop and retained
+                # again, which terminates because the queue only shrinks.
+                #
+                # This is also why the re-injection after the loop needs no
+                # try/finally: _stale_owed is empty at the only interruption
+                # point, so the CancelledError below cannot strand a retained
+                # frame.
+                for _owed in _stale_owed:
+                    self._queue.put_nowait(_owed)
+                _stale_owed.clear()
                 try:
                     await self.reject_tool(stale.id)
                 except asyncio.CancelledError:
@@ -1357,6 +1425,13 @@ class AcpSessionHandle:
                             _stale_reasons.append("<non-standard>")
                     elif stale.error is not None:
                         _stale_terminals += 1
+
+        for _owed in _stale_owed:
+            # Order-preserving: the frames go back in the order they were read,
+            # and a waiter that has since given up is harmless — the dispatch
+            # loop drops a response with no entry in _awaited_responses, and the
+            # next drain would too.
+            self._queue.put_nowait(_owed)
 
         if _stale_dropped:
             # One line per turn; count + terminal tally only. The stopReason
@@ -1455,6 +1530,20 @@ class AcpSessionHandle:
                 # places and every one of them funnels through this `async for`.
                 self._parked_since = time.monotonic()
                 if event.kind == EVENT_COMPLETE:
+                    # A codex compaction that errors sends no terminal of its own,
+                    # so close it out HERE -- before the turn's terminal, so a
+                    # consumer that reads a compaction terminal to leave its
+                    # compacting state sees it inside the turn it belongs to.
+                    #
+                    # This site rather than the dispatch loop's own terminals:
+                    # ``_dispatch_events`` yields EVENT_COMPLETE from eight places
+                    # (including its timeout arm) and every one funnels through
+                    # this ``async for``, which is the same reason the park
+                    # accounting above is measured here. Settling at each producer
+                    # would be eight edits and one of them would be missed.
+                    _codex_settle = self._settle_codex_compaction(event.stop_reason)
+                    if _codex_settle is not None:
+                        yield _codex_settle
                     # Set BEFORE the yield: a consumer that closes the stream ON
                     # the terminal still received it, and marking it after would
                     # report a lost terminal that was in fact delivered.
@@ -2224,6 +2313,62 @@ class AcpSessionHandle:
                     "summary": event.title or "",
                 }
 
+    def _inline_turn_finished_cleanly(self) -> bool:
+        """Whether the last turn reached its own end boundary uncancelled.
+
+        A cancelled turn is NOT a completed compaction, and this is the arm where
+        getting that wrong is most expensive: a false ``completed`` resets the
+        context meter and arms the compaction cooldown, so the session stays full
+        AND stops retrying. The turn reaching its own end boundary is the whole
+        evidence an inline harness offers, so the absence of that boundary has to
+        withhold the answer.
+
+        The test is POSITIVE -- the stop reason must BE ``end_turn`` -- rather than
+        "not cancelled". Excluding cancels alone accepts every other way a turn can
+        fail to finish: a refusal, a token limit, a stop reason this build does not
+        recognise, or a turn that never reported one at all. Each of those means the
+        compaction did not run, and each would otherwise be reported as a success.
+
+        ``_cancelled`` is checked as well as the reason, because a cancel that never
+        got an ack leaves the reason empty while the flag is already set -- and an
+        unacked cancel is exactly the case where the compaction is least likely to
+        have run. Both are THIS class's own turn state, so they are read directly
+        here -- the sibling on ``AcpProvider`` asks
+        ``AcpClient.turn_finished_cleanly`` instead, because there the state belongs
+        to the client and reading it across that boundary would decide a
+        compaction's fate from a shape the provider does not own. Both reads keep
+        ``getattr`` defaults that fail CLOSED, so a handle built without a turn --
+        the ``__new__`` shape several suites use -- does not get the shortcut.
+        """
+        if getattr(self, "_cancelled", True):
+            return False
+        return getattr(self, "_last_stop_reason", "") == STOP_REASON_END_TURN
+
+    def _compacts_inline(self) -> bool:
+        """Whether this handle's backend finishes a compaction inside its turn.
+
+        ``ACP_BACKENDS_INLINE_COMPACTION`` membership, read through
+        ``capabilities_for`` so the answer comes from the same table every other
+        consumer reads.
+
+        Read off ``self._runtime.acp_backend``, the way every other capability on
+        this class reads it -- the handle has no backend of its own, it fronts a
+        runtime's.
+
+        Fails CLOSED, and that direction is the point rather than caution: a
+        handle built through ``__new__`` has no ``_runtime`` at all, which is the
+        shape several suites use to exercise the queue drain without spawning a
+        process. Returning False there leaves such a handle on the waiting arm,
+        the behaviour it had before this capability existed. Claiming the
+        capability instead would tell every one of those callers a compaction
+        completed that nothing ever ran.
+        """
+        runtime = getattr(self, "_runtime", None)
+        backend = getattr(runtime, "acp_backend", None)
+        if not isinstance(backend, str):
+            return False
+        return capabilities_for(backend).compacts_inline
+
     async def wait_for_compaction(
         self, timeout: float = COMPACT_WAIT_TIMEOUT_SECS
     ) -> dict[str, str]:
@@ -2245,6 +2390,15 @@ class AcpSessionHandle:
                 # fallback.
                 await self._drain_post_compaction_metadata()
             return cached
+        if self._compacts_inline() and self._inline_turn_finished_cleanly():
+            # The drained turn IS the result for a member of
+            # ``ACP_BACKENDS_INLINE_COMPACTION`` — the same record as on
+            # ``AcpProvider.wait_for_compaction``, including why it sits on the
+            # wait rather than on ``compact()``. Both classes carry it because
+            # both are reachable: this one fronts the shared-runtime sessions,
+            # and an answer given on only one of the two leaves the other
+            # stranding its callers for the full timeout.
+            return {"type": "completed", "summary": ""}
         deadline = time.monotonic() + timeout
         # ONE buffer for this call AND the nested grace drain, restored at ONE
         # point (the finally below) strictly BEFORE any re-poison. Separate
@@ -2705,7 +2859,7 @@ class AcpSessionHandle:
         try:
             await self._runtime.terminate_session(self._session_id)
         finally:
-            if not getattr(self, "keep_transcript", False):
+            if self.memory_mode != "persistent" or not getattr(self, "keep_transcript", False):
                 self._cleanup_transcript()
 
     def _cleanup_transcript(self) -> None:
@@ -2716,7 +2870,11 @@ class AcpSessionHandle:
         guard therefore protects nothing on KAS — that backend's session record is
         already gone, removed by the same verb that freed the session.
         """
-        sid = self._session_id
+        self.cleanup_transcript_files(self._session_id)
+
+    @staticmethod
+    def cleanup_transcript_files(sid: str) -> None:
+        """Remove only the native transcript belonging to a completed session."""
         if not sid:
             return
         sessions_dir = kiro_sessions_dir().resolve()
@@ -2822,8 +2980,12 @@ class AcpSessionHandle:
         # `failed` status, then read by the post-failure budget check at the
         # loop top (mirrors AcpClient._prompt_loop).
         self._compaction_failed_at = None
-        # A native switch notification is authoritative; command result data is
-        # only the fallback when no notification arrived during this turn.
+        # Turn-scoped for the same reason: a flag that leaked into the next turn
+        # would settle against an unrelated frame there.
+        self._codex_compaction_pending = False
+        # Whether a native agent-switch notification already reported the
+        # switch this turn; guards the result-extracted fallback below from
+        # double-emitting EVENT_AGENT_SWITCHED (mirrors AcpClient).
         saw_agent_switch = False
         # Consumer time already accounted for at the moment `last_data_ts` was
         # taken. The idle clocks below measure BACKEND silence, so any park that
@@ -2845,6 +3007,7 @@ class AcpSessionHandle:
         parked_at_own_data = parked_at_data
 
         _buffered: list[JsonRpcMessage] = []
+        _last_yield = time.monotonic()
         try:
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
@@ -2939,6 +3102,22 @@ class AcpSessionHandle:
                         usage=self.last_prompt_stats.to_turn_usage(),
                     )
                     return
+
+                # Cooperative yield, placed where the previous frame is fully
+                # handled and the next one is not yet dequeued: every branch
+                # below either runs to the bottom of the loop body or takes a
+                # `continue`, so no dequeued frame is held in a local here and
+                # both watchdog clocks are already updated. A cancellation
+                # landing on this yield therefore drops nothing -- a yield
+                # placed right after the dequeue instead would strand the frame
+                # in hand, terminal response and death sentinel included. The
+                # 5s TimeoutError branch below cannot serve as the yield point
+                # either: it fires only on an EMPTY queue, so it is dead during
+                # exactly the backlog it would need to guard.
+                _now = time.monotonic()
+                if _now - _last_yield >= DRAIN_YIELD_AFTER_S:
+                    await asyncio.sleep(0)
+                    _last_yield = time.monotonic()
 
                 try:
                     msg = await asyncio.wait_for(self._queue.get(), timeout=min(remaining, 5.0))
@@ -3946,14 +4125,17 @@ class AcpSessionHandle:
             self.last_prompt_stats.note_pct_reported()
             self._backfill_context_window(pct_f)
         self.last_prompt_stats.credits += credits
-        # Every handle on the shared runtime is kiro-cli or KAS -- both members
-        # of ACP_BACKENDS_STRUCTURED_REFUSAL (ACP_BACKENDS_ACP_RUNTIME is a
-        # subset of it, pinned by test_harness_parity) -- so the refusal
-        # envelope is read unconditionally here. Folded onto the terminal by
-        # ``terminal_refusal``; a frame without the envelope leaves it alone.
-        _refusal = parse_refusal(params)
-        if _refusal is not None:
-            self.last_prompt_stats.refusal = _refusal
+        # Gated on membership, exactly as the AcpClient path gates the same read.
+        # The shared runtime carries hosts outside ACP_BACKENDS_STRUCTURED_REFUSAL,
+        # so an unconditional read here hands a parser written for one vocabulary
+        # another host's notification -- and its answer would be attached to the turn
+        # as a refusal category that host never sent. Folded onto the terminal by
+        # ``terminal_refusal``; a frame without the envelope, and a host outside the
+        # set, both leave it alone.
+        if self._runtime.acp_backend in ACP_BACKENDS_STRUCTURED_REFUSAL:
+            _refusal = parse_refusal(params)
+            if _refusal is not None:
+                self.last_prompt_stats.refusal = _refusal
 
     def _backfill_context_window(self, pct: float) -> None:
         """Derive window/used tokens from a percentage-only reading.
@@ -4699,6 +4881,10 @@ class AcpSessionHandle:
                     return kas_sub_events
                 _child_prefix = self._build_child_tool_activity_prefix(update)
                 if _child_prefix:
+                    child_tool_call_id = _child_prefix[0].tool_call_id
+                    self._native_child_tool_call_ids.add(
+                        scoped_tool_cache_key(self._session_id, child_tool_call_id)
+                    )
                     # Child nested tool: run the shared parser for its cache
                     # SIDE EFFECTS ONLY — the trusted _tool_call_is_shell signal
                     # + redacted input that a later permission/result reads — but
@@ -4739,7 +4925,22 @@ class AcpSessionHandle:
             tool_name_cache=self._tool_call_tool_name,
             cache_scope=self._session_id,
         )
+        filtered_events: list[AcpEvent] = []
         for ev in events:
+            if ev.kind == EVENT_TODO_UPDATE and ev.tool_call_id:
+                # Ownership is a standing fact about the call id, not a token to
+                # spend: one tool_call can be followed by SEVERAL
+                # tool_call_update frames (the captured corpus in
+                # test/fixtures/acp_frames/kiro/session.jsonl has two for one
+                # call), so consuming the entry on the first snapshot would let
+                # a second result frame for the same child call through. The
+                # per-turn clear beside the sibling per-call caches is what
+                # bounds the set.
+                if scoped_tool_cache_key(self._session_id, ev.tool_call_id) in (
+                    self._native_child_tool_call_ids
+                ):
+                    continue
+            filtered_events.append(ev)
             if ev.kind == EVENT_TEXT_CHUNK:
                 self.last_prompt_stats.text_chunks += 1
                 self._stale_eligible = True
@@ -4831,10 +5032,129 @@ class AcpSessionHandle:
                 # result -- including one that merely quotes a marker inside a
                 # long document -- leaves it None. Never a security input.
                 self.last_infra_error = classify_infra_error(ev.tool_output)
+        events = filtered_events
+        compaction_event = self._codex_compaction_event(update)
+        if compaction_event is not None:
+            # APPENDED, not substituted, and appended to the FILTERED list so the
+            # status rides with the rows the frame actually surfaced. The frame is
+            # also a real tool call this turn made, and the transcript row for it
+            # is one the user watched appear -- dropping it to surface the status
+            # instead would delete a row to report the thing the row was
+            # reporting.
+            events.append(compaction_event)
         status_event = self._structured_status_event(msg, params, update)
         if status_event is not None:
             events.append(status_event)
         return events
+
+    def _settle_codex_compaction(self, reason: str) -> AcpEvent | None:
+        """Close out a codex compaction whose terminal never arrived, or None.
+
+        Called at the turn's terminal. ``None`` -- the ordinary case -- means no
+        codex compaction was in flight, or one was and it already reported.
+
+        The verdict is ``failed``, and that is the opposite of what the claude
+        twin synthesizes. The two harnesses differ in what a MISSING terminal
+        means. claude-agent-acp sends its ``Compacting completed.`` text only for
+        a MANUAL ``/compact``; an automatic mid-turn compaction takes a different
+        path and emits no text at all, so for claude a turn that ends naturally
+        after a ``started`` is evidence the compaction finished. codex-acp sends
+        its terminal for BOTH -- the capture shows the marked
+        ``tool_call_update`` on a manual ``/compact`` and on a native
+        ``model_auto_compact_token_limit`` compaction alike -- so here a missing
+        terminal is evidence the compaction did NOT finish. Reporting
+        ``completed`` would reset the context meter against a window nobody
+        summarized.
+
+        One arm for every *reason*, unlike the claude twin, and for the same
+        reason the verdict differs: this is not an inference from how the turn
+        ended, it is the absence of a frame codex always sends on success. A turn
+        cancelled mid-compaction did not compact either.
+
+        Three things it deliberately does NOT do:
+
+        * reset the context counts -- nothing was summarized, so the pre-compaction
+          numbers are still the true ones;
+        * arm the post-failure budget (``_compaction_failed_at``) -- that budget
+          exists to bound a wait for a turn that may never end, and this runs AT
+          the end of the turn, so arming it would charge the NEXT turn's idle
+          clock for this one's failure;
+        * claim the failure is retryable. ``last_compaction_transient`` is set
+          False because an inferred failure carries no reason to classify, and
+          False is the value that does not promise a user a retry will help.
+
+        The title is text this module authors, not text a backend echoed, so it
+        needs no redaction -- and it is there so the surfaces that render a
+        failure reason stop collapsing this case to "unknown error".
+        """
+        if not self._codex_compaction_pending:
+            return None
+        self._codex_compaction_pending = False
+        logger.warning(
+            "Compaction status (codex): started with no terminal, turn ended %r",
+            reason or "unknown",
+        )
+        self.last_compaction_transient = False
+        return AcpEvent(
+            kind=EVENT_COMPACTION_STATUS,
+            text="failed",
+            title="the turn ended without a compaction result",
+            synthesized=True,
+        )
+
+    def _codex_compaction_event(self, update: dict[str, Any]) -> AcpEvent | None:
+        """Reclassify a codex-acp context-compaction frame as an event, or None.
+
+        The runtime-side twin of ``AcpClient._codex_compaction_event``, and the
+        one that runs for a live codex session: codex is a member of
+        ``ACP_BACKENDS_ACP_RUNTIME``, so its frames arrive here. Both
+        implementations answer rather than one, because a capability the two
+        transports disagree about is a capability that works on whichever one a
+        reader did not test (harness-parity H6).
+
+        It applies the same state mutation the compaction branch above applies on
+        a kiro-cli ``completed`` -- drop the stale context counts so the meter
+        resets -- and returns the ``EVENT_COMPACTION_STATUS`` every consumer
+        already handles. That is what lets ``compact()`` capture a terminal while
+        draining its own prompt turn, so ``wait_for_compaction()`` answers from
+        the cache instead of waiting for a notification codex never sends.
+
+        Takes the already-extracted *update* rather than the message, because the
+        caller has validated it is a mapping and belongs to THIS session -- a
+        child-routed frame returns earlier, so a native subagent's compaction can
+        never reset the parent's meter.
+
+        Gated on ``ACP_BACKENDS_INLINE_COMPACTION`` rather than on codex's identity,
+        which is the sanctioned spelling on this path and also the useful one: the
+        set names the harnesses whose compaction lands INSIDE the prompt turn, and
+        a frame like this is what landing inside the turn looks like. A harness
+        that earns that membership inherits the translation by joining the set,
+        with no edit here. claude is a member and is unaffected -- it reports
+        compaction as prose and stamps no marker, so the parser declines its
+        frames -- which is the point: the MARKER decides, and the set only bounds
+        who is asked.
+
+        No ``failed`` arm exists because codex-acp sends no such status: a
+        compaction that errors leaves the ``session/prompt`` request unanswered,
+        which the turn deadline owns, so nothing here arms the post-failure budget
+        on a guess.
+        """
+        if self._runtime.acp_backend not in ACP_BACKENDS_INLINE_COMPACTION:
+            return None
+        status_type = parse_codex_compaction_update(update)
+        if status_type is None:
+            return None
+        if status_type != "started" and not self._codex_compaction_pending:
+            return None
+        logger.info("Compaction status (codex): %s", status_type)
+        self._codex_compaction_pending = status_type == "started"
+        if status_type == "completed":
+            self._compaction_failed_at = None
+            self.last_prompt_stats.reset_after_compaction()
+        # No title: the adapter ships no summary with either frame, and an empty
+        # string is what every consumer already renders for "compacted, no summary
+        # offered".
+        return AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title="")
 
     # ── Structured status protocol (``kirocrew/status``, version 1) ──
 

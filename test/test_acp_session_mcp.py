@@ -24,7 +24,6 @@ from kiro_crew.acp import session_mcp
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
-    ACP_BACKEND_CODEX,
     ACP_BACKEND_DEEPSEEK,
 )
 from kiro_crew.providers.mirrors import claude_code as claude_mirror
@@ -596,12 +595,12 @@ class TestClientSeam:
         client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
         assert "foo" in _by_name(client._session_mcp_servers())
 
-    @pytest.mark.parametrize("private", [False, True])
-    def test_private_claude_keeps_the_original_server_in_its_projection(
+    @pytest.mark.parametrize("pooled", [False, True])
+    def test_claude_projects_the_admitted_direct_or_pooled_server(
         self,
         tmp_path,
         agents_dir,
-        private,
+        pooled,
     ):
         from kiro_crew.mcp_gateway.rewriter import _WRAPPER_MARKER
 
@@ -632,15 +631,12 @@ class TestClientSeam:
             tmp_path,
             agent="kirocrew",
             acp_backend=ACP_BACKEND_CLAUDE,
-            private_memory=private,
-            mcp_gateway_overlay=overlay,
+            mcp_gateway_overlay=overlay if pooled else None,
         )
         original = _by_name(client._session_mcp_servers()).get("foo")
-        # Present either way: privately as the spec's own entry, pooled as the
-        # broker stub the MIRROR appended (the spec's `tools` references foo, so
-        # the allowlist grants the stub).
+        # The mirror keeps the allowlisted entry in both supported transports.
         assert original is not None
-        if private:
+        if not pooled:
             assert original["command"] == "/bin/foo"
             assert original["args"] == ["serve"]
             assert original["env"] == [{"name": "K", "value": "V"}]
@@ -683,9 +679,7 @@ class TestClientSeam:
         client._write_claude_local_settings()
         assert "foo" in _by_name(client._session_mcp_servers())
 
-    def test_a_broker_only_backend_is_not_withheld(
-        self, tmp_path, agents_dir, monkeypatch
-    ):
+    def test_a_broker_only_backend_is_not_withheld(self, tmp_path, agents_dir, monkeypatch):
         """``no mirror`` is not ``refused``: a BROKER_ONLY backend still gets Crew's servers.
 
         deepseek declares a real channel and no spec translation, so the withheld
@@ -715,7 +709,12 @@ class TestClientSeam:
             tools=["@pooled", "@direct"],
         )
         monkeypatch.setattr(
-            client_mod, "injection_server_names", lambda _o, _a: frozenset({"pooled"})
+            # ``**_kw`` so the double keeps mirroring the real signature: the call
+            # site passes the session's checkout as ``work_dir``, and a double that
+            # refuses it turns this seam test into a test of the except branch.
+            client_mod,
+            "injection_server_names",
+            lambda _o, _a, **_kw: frozenset({"pooled"}),
         )
         client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
         names = _by_name(client._session_mcp_servers())
@@ -738,9 +737,10 @@ class TestClientSeam:
             servers={"pooled": {"command": "/bin/raw"}, "also": {"command": "/bin/also"}},
             tools=["@pooled", "@also"],
         )
-        monkeypatch.setattr(
-            client_mod, "injection_server_names", lambda _o, _a: frozenset({"pooled", "also"})
+        pooled_names = mock.create_autospec(
+            client_mod.injection_server_names, return_value=frozenset({"pooled", "also"})
         )
+        monkeypatch.setattr(client_mod, "injection_server_names", pooled_names)
         client = self._seeded(tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
         monkeypatch.setattr(
             client, "_session_capability_mcp_servers", lambda: [{"name": "kirocrew-core"}]
@@ -751,24 +751,18 @@ class TestClientSeam:
         assert client._translated_session_mcp_servers() == []
         assert client._session_mcp_withheld is False
         assert sorted(_by_name(client._session_mcp_servers())) == ["kirocrew-core", "pooled"]
+        assert pooled_names.call_args.kwargs["work_dir"] == tmp_path
 
     def test_a_projected_core_stub_beats_the_generic_capability_entry(
         self, tmp_path, agents_dir, monkeypatch
     ):
-        """Codex must reach pooled Core through the gateway, not its sandbox.
-
-        The generic capability entry launches ``mcp-core`` as a child of the
-        Codex adapter.  The broker stub has the same name but is deliberately
-        gateway-owned, so its Core process can read the Crew state that the adapter
-        sandbox masks.  First-wins deduplication therefore has to see the projected
-        stub before the generic fallback.
-        """
-        client = AcpClient(work_dir=tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CODEX)
+        """An explicit Claude profile keeps its pooled Core ahead of the fallback."""
+        client = AcpClient(work_dir=tmp_path, agent="kirocrew", acp_backend=ACP_BACKEND_CLAUDE)
         client._session_mcp_cache = []
         client._session_mcp_withheld = False
         monkeypatch.setattr(
             client,
-            "_codex_session_mcp_servers",
+            "_claude_session_mcp_servers",
             lambda: [{"name": "kirocrew-core", "command": "gateway-stub"}],
         )
         monkeypatch.setattr(
@@ -808,7 +802,7 @@ class TestClientSeam:
         # session with missing tools.
         _write_spec(agents_dir, servers={"foo": {"command": "/bin/foo"}}, tools=["@foo"])
 
-        def _boom(_o, _a):
+        def _boom(_o, _a, **_kw):
             raise RuntimeError("overlay unreadable")
 
         monkeypatch.setattr(client_mod, "injection_server_names", _boom)
@@ -939,6 +933,51 @@ class TestClientSeam:
         stub = {"name": "pooled", "command": "/stub", "args": [], "env": [], "type": "stdio"}
         client._pooled_broker_stubs = lambda: [dict(stub)]  # type: ignore[method-assign]
         assert client._pooled_mcp_servers() == [stub]
+
+    def _overlay_with_a_stub(self, root: Path) -> Path:
+        """A user-level overlay holding one broker stub for ``kirocrew``."""
+        from kiro_crew.mcp_gateway.rewriter import _WRAPPER_MARKER
+
+        overlay = root / "mcp-gateway" / "agents"
+        overlay.mkdir(parents=True)
+        (overlay / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "name": "kirocrew",
+                    "mcpServers": {
+                        "pooled": {
+                            _WRAPPER_MARKER: True,
+                            "command": "/stub",
+                            "args": ["--target-command=user-level-cmd"],
+                            "env": {},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return overlay
+
+    def test_a_project_agent_takes_no_stub_from_the_user_level_overlay(self, tmp_path, agents_dir):
+        """The client's own checkout reaches the overlay lookup.
+
+        Drives the real call chain rather than the module function, so a call site
+        that stops passing ``work_dir`` -- or is wrapped in a guard that is never
+        true -- fails here instead of silently resolving the overlay by name.
+        """
+        overlay = self._overlay_with_a_stub(tmp_path / "gw")
+        checkout = tmp_path / "checkout"
+        _write_project_spec(checkout, servers={"proj": {"command": "/bin/proj"}}, tools=None)
+
+        running_the_project_agent = AcpClient(work_dir=checkout, agent="kirocrew")
+        running_the_project_agent._mcp_gateway_overlay = overlay
+        assert running_the_project_agent._pooled_broker_stubs() == []
+
+        # Control: the same overlay and agent name, a checkout that declares
+        # neither, so the user-level stub is still this session's.
+        elsewhere = AcpClient(work_dir=tmp_path / "plain", agent="kirocrew")
+        elsewhere._mcp_gateway_overlay = overlay
+        assert [e["name"] for e in elsewhere._pooled_broker_stubs()] == ["pooled"]
 
 
 class TestPooledStubsOnTheClaudeMirror:

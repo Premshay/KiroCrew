@@ -69,8 +69,11 @@ async def test_close_all_keeps_cross_boundary_teardown_order(cfg: KiroCrewConfig
     await worker_started.wait()
     manager._background_tasks.add(owned_task)
 
-    async def kill_bg(*, expected: bool) -> None:
+    async def kill_bg(*, expected: bool, reason: str = "") -> None:
         assert expected is True
+        # Mirrors AcpRuntime.kill(): close_all attributes its teardown, and a
+        # double that refuses ``reason`` swallows the call as a TypeError.
+        assert reason == "graceful shutdown"
         events.append("background-runtime-killed")
 
     manager._bg_runtime = SimpleNamespace(kill=kill_bg)
@@ -239,7 +242,11 @@ async def test_identity_retirement_preserves_map_and_drops_transient_state(
     assert "key" in manager._compact_pending_verdict
     assert "key" not in manager._suppress_replay
     assert "key" not in manager._origin_links
-    manager._session_map.clear_sid.assert_not_called()
+    # The pointer to the previous account's native conversation goes, because
+    # the account that minted it is not the account that would reload it. The
+    # ENTRY itself is what "preserves map" means: `delete` is still not called,
+    # so the mapping survives to carry the successor's own sid.
+    manager._session_map.clear_sid.assert_called_once_with("key")
     manager._session_map.delete.assert_not_called()
     provider.shutdown.assert_awaited_once()
 

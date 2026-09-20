@@ -50,8 +50,9 @@ extra model run per round *and* real Presenter effort. A deliberate, occasional 
 1. **Reconstruct** — explain the topic in your own words: objective, key observations,
    the mechanism/claim, the eliminations you ran, and the honest status. Compress to
    the load-bearing claims (see constraints).
-2. **Spawn the Listener** — ONE `spawn_run`, `model=` a large-window model from a
-   **different vendor** than your own family. `task` = the Listener charter (below)
+2. **Spawn the Listener** — ONE `spawn_run`, `agent=` a crew seat from a
+   **different vendor** than your own family (see "Cross-vendor is the point"); no
+   `model=` override. `task` = the Listener charter (below)
    with your explanation *and the original user request* (the *ask*, for grounding)
    filled in. State the topic **neutrally** — do NOT signal which claims you think are
    weak or what you expect it to find; a led listener just mirrors you.
@@ -82,7 +83,7 @@ extra model run per round *and* real Presenter effort. A deliberate, occasional 
 - **Listener must be LEAN + LARGE-WINDOW.** Subagents inherit the full injected KiroCrew
   context (skill *descriptions*, memory, lessons — not full skill bodies, but still
   large). A small-window model **overflows its context window before it can read your
-  task** (a real prototype failure), so pin the Listener to a large-window model from a
+  task** (a real prototype failure), so pin the Listener to a large-window seat from a
   different vendor than your Presenter's family. Trim the inheritance with
   `spawn_run`'s three flags: spawn the Listener with `include_memory=false` and
   `include_lessons=false`, because the Presenter's memory and saved lessons are exactly
@@ -91,13 +92,20 @@ extra model run per round *and* real Presenter effort. A deliberate, occasional 
   so it flags a gap rather than inventing context.
 - **Keep the charter + explanation compact.** If the topic is large, **compress** the
   explanation to its essential claims — do NOT paste the whole artifact, and for a
-  genuinely large topic write it to a file and hand the Listener the path. Compression
-  is a feature: stating the argument in a few hundred words *is* the rubber-duck
-  effect.
+  genuinely large topic write it to a file and hand the Listener the path. The file
+  must sit where a subagent can read it — the active project tree (an ignored `tmp/`
+  is fine), not `$KIROCREW_SCRATCH`, which is per-process and invisible to the spawn.
+  Compression is a feature: stating the argument in a few hundred words *is* the
+  rubber-duck effect.
 - **Cross-vendor is the point.** A same-family Listener *tends to* rationalize the way
   the Presenter does (same-family models often diverge too, but cross-vendor maximizes
-  failure-mode diversity). Discover the live menu with `kiro-cli chat --list-models --format
-  json`; prefer large `context_window_tokens`, pick a different vendor than yours.
+  failure-mode diversity). The menu is the **crew seat roster** from `spawn_list`
+  (`crew-claude*` Anthropic, `crew-codex*` OpenAI, `crew-deepseek` / `crew-deepseek-pro`
+  DeepSeek, `crew-antigravity*` Google, `crew-local*` local); pin with `agent=` and
+  leave `model=` unset so the seat's own harness picks. Do NOT read
+  `kiro-cli chat --list-models`: that is the Kiro CLI's hosted catalogue (Kiro-credit
+  models such as `deepseek-3.2`), not a route this crew uses, and `model=` passes any
+  id from it through unverified.
 
 ## Listener charter (the `task`, `{TOPIC_EXPLANATION}` filled in)
 

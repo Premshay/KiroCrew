@@ -37,20 +37,24 @@ _ensure_ssl_certs()
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import errno
+import importlib.machinery
 import json
 import logging
 import os
 import shlex
 import signal
+import site
 import sys
 import time
 import traceback
 from collections import OrderedDict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Collection, Iterator, NoReturn, Optional
+from typing import Any, Callable, Collection, Iterator, Mapping, NoReturn, Optional
 
+import kiro_crew
 from kiro_crew.code_fingerprint import code_fingerprint, warm_code_fingerprint
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.loader import config_dir as _config_dir
@@ -122,13 +126,9 @@ from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX, resolve_secret_u
 from kiro_crew.mcp_gateway.shutdown_budget import DRAIN_SECS, POOL_SHUTDOWN_SECS
 from kiro_crew.mcp_gateway.spill import cleanup_old_spill_files
 from kiro_crew.mcp_gateway.stub import fallback_counts as stub_fallback_counts
-from kiro_crew.member_memory_auth import (
-    issue_member_session_proof,
-    protected_member_session_for_pid,
-)
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.peer_resolve import resolve_peer_identity
-from kiro_crew.platform_compat import IS_WINDOWS
+from kiro_crew.platform_compat import _UTF8_PROCESS_ENV, IS_WINDOWS
 from kiro_crew.platform_compat import count_open_fds as _shared_count_open_fds
 from kiro_crew.platform_compat import get_process_start_id as _get_process_start_id
 from kiro_crew.platform_compat import pid_exists as _pid_exists
@@ -146,6 +146,244 @@ from kiro_crew.security import redact
 from kiro_crew.sel import SecurityEventLog
 
 logger = logging.getLogger(__name__)
+
+#: Kiro Crew's own pooled control planes: the only backends handed the
+#: per-session token, because only they post back to the gateway for the
+#: session they act on behalf of. Mirrors ``acp.session_mcp.CONTROL_PLANE_SERVERS``
+#: rather than importing it (that module pulls ``kiro_crew.agent`` onto the
+#: daemon's boot path); a ratchet test pins the two equal.
+CONTROL_PLANE_BACKENDS = frozenset({"kirocrew-core", "kirocrew-cron"})
+
+# Python treats its environment namespace as an extensible interpreter control
+# surface. A prefix rule fails closed when a later Python release adds another
+# import hook or root instead of silently granting a bearer token around it.
+_CONTROL_PLANE_PYTHON_ENV_PREFIX = "PYTHON"
+
+
+def _spawns_own_control_plane(
+    server_name: str,
+    command: str,
+    args: Collection[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    work_dir: str | os.PathLike[str] | None = None,
+) -> bool:
+    """Whether spawning ``command args`` for *server_name* runs Kiro Crew's own control plane.
+
+    The server NAME is not proof: it arrives in the stub's register frame and
+    the spawn target resolves separately from the spec-derived
+    ``KIROCREW_MCP_TARGET_<NAME>`` mapping, so a spec that declares a
+    third-party command under a reserved name would otherwise be handed the
+    session's bearer token. The binary is compared by real path (a launcher
+    and its symlink are the same program) and the args exactly, against the
+    invocation the managed spec emits for that name -- the one source both the
+    spec writer and this check read. Anything unresolvable is not ours.
+
+    The invocation being ours is still not proof of what RUNS: the managed
+    spec falls back to ``<python> -m kiro_crew <sub>`` when no launcher
+    resolves, and the child's working directory can carry foreign code under
+    our name. Python's ``PYTHON*`` environment namespace is an extensible
+    interpreter control surface: entries can add roots, execute hooks, or move
+    user-site without changing the command. Any non-empty entry therefore
+    denies the token instead of enumerating current Python variables or
+    modelling their version-specific semantics. The managed resolver removes
+    that whole namespace from its inherited environment, so a value at this
+    point is a hand-declared overlay or a non-managed resolver. The remaining
+    fixed root -- the CWD for module form, or the launcher's directory for
+    script form -- must hold either nothing named ``kiro_crew`` or THIS
+    process's package (a dev checkout running from its own ``src/``).
+
+    A denial for a reserved name is logged once, at spawn, naming the condition
+    that failed: a legitimate install that trips it (a stray ``kiro_crew.py`` on
+    ``PYTHONPATH``, a spec edited by hand) otherwise presents only as every
+    cron tool answering 403 with nothing in the daemon log to point at.
+
+    Reads config and the filesystem: call it off the event loop, and BEFORE the
+    child is spawned. The spawn site still launches an accepted control plane
+    with ``PYTHONSAFEPATH`` as defense in depth and re-applies Kiro Crew's own
+    UTF-8 pinning (``platform_compat._UTF8_PROCESS_ENV``) to every pooled
+    backend once the verdict is fixed, but the verdict never depends on those
+    variables or on version-specific interpreter flags.
+    """
+    if server_name not in CONTROL_PLANE_BACKENDS:
+        return False
+    # Lazy: ``kiro_crew.agent`` is not on the daemon's boot path and this runs
+    # once per spawn, not per call.
+    from kiro_crew.agent import managed_mcp_spec_entry
+
+    expected = managed_mcp_spec_entry(server_name)
+    if not expected:
+        return _deny_control_plane(server_name, "no managed spec entry resolves for this name")
+    expected_command = str(expected.get("command") or "")
+    if not expected_command or not command:
+        return _deny_control_plane(server_name, "spec or spawn command is empty")
+    try:
+        same_binary = os.path.realpath(command) == os.path.realpath(expected_command)
+    except (OSError, ValueError):
+        return _deny_control_plane(server_name, f"command {command!r} is unresolvable")
+    if not same_binary:
+        return _deny_control_plane(
+            server_name, f"spawned {command!r} is not the spec's {expected_command!r}"
+        )
+    argv = [str(a) for a in args]
+    expected_argv = [str(a) for a in expected.get("args", [])]
+    if argv != expected_argv:
+        return _deny_control_plane(server_name, f"args {argv!r} differ from spec {expected_argv!r}")
+    child_env = env if env is not None else os.environ
+    import_env = next(
+        (
+            str(key).upper()
+            for key, value in child_env.items()
+            if str(key).upper().startswith(_CONTROL_PLANE_PYTHON_ENV_PREFIX) and value
+        ),
+        "",
+    )
+    if import_env:
+        return _deny_control_plane(server_name, f"child environment carries non-empty {import_env}")
+    shadow = _kiro_crew_import_is_shadowed(command, argv, work_dir)
+    if shadow:
+        return _deny_control_plane(server_name, f"import root {shadow!r} shadows kiro_crew")
+    return True
+
+
+def _deny_control_plane(server_name: str, reason: str) -> bool:
+    """Record why a reserved-name backend gets no session token; always False."""
+    logger.warning(
+        "mcp-gateway: backend %r spawned under a control-plane name but is denied the "
+        "session token: %s; its kirocrew-core/kirocrew-cron tools will answer 403",
+        server_name,
+        reason,
+    )
+    return False
+
+
+def _caller_for_backend(
+    backend: "Backend",
+    caller: Optional[CallerContext],
+    conn: Optional["_StubConn"],
+) -> Optional[CallerContext]:
+    """The caller to forward to ``backend``: ``caller`` plus the session token
+    only when ``backend`` is one of Kiro Crew's own control planes.
+
+    Those pooled control planes post back to the gateway over loopback and must
+    prove the session they act for with ``X-Session-Token``. gatewayd spawned
+    them from its own environment, so the per-session token is not in their
+    env; it is handed over per frame. The decision is read from the backend
+    that receives the frame -- ``control_plane`` was fixed at spawn from the
+    resolved command, never from the name the stub registered -- so the token
+    never reaches a third party, not even a replacement spawned under a
+    reserved name after the original died. ``caller`` is never mutated: every
+    call site re-derives from the tokenless base, so a token attached for one
+    backend cannot ride along to another.
+    """
+    if caller is None or conn is None or not conn.stub_session_token:
+        return caller
+    if not backend.control_plane:
+        return caller
+    return dataclasses.replace(caller, session_token=conn.stub_session_token)
+
+
+def _user_site_roots() -> list[str]:
+    """Per-user site-packages directories this interpreter would add, if enabled.
+
+    Raises when the location cannot be resolved, so a caller that must fail
+    closed can; an empty list means user-site is switched off entirely.
+    """
+    if not site.ENABLE_USER_SITE:
+        return []
+    user_site = site.getusersitepackages()
+    return [user_site] if isinstance(user_site, str) else list(user_site)
+
+
+def _user_site_holds_our_package() -> bool:
+    """Whether per-user site-packages holds the package this process is running.
+
+    True identifies a ``--user`` install, whose own ``kiro_crew`` lives there:
+    user-site must stay enabled for the control plane to import itself at all.
+    False means nothing there is load-bearing, so the child can be launched with
+    user-site off. Unresolvable counts as holding it, which keeps the child's
+    import behaviour unchanged rather than guessing.
+    """
+    try:
+        roots = _user_site_roots()
+    except Exception:
+        return True
+    if not roots:
+        return False
+    ours = os.path.realpath(os.path.dirname(kiro_crew.__file__))
+    for root in roots:
+        try:
+            if os.path.realpath(os.path.join(root, "kiro_crew")) == ours:
+                return True
+        except (OSError, ValueError):
+            return True
+    return False
+
+
+def _kiro_crew_import_is_shadowed(
+    command: str,
+    argv: list[str],
+    work_dir: str | os.PathLike[str] | None,
+) -> str:
+    """A root the child searches that holds a foreign ``kiro_crew``, else ``""``.
+
+    Control-plane spawns whose environment carries any non-empty ``PYTHON*``
+    variable are denied before this check, which removes every import root an
+    environment variable can introduce or relocate. Two roots survive that and
+    are inspected here.
+
+    The first is the fixed local root: the working directory for module form, or
+    the launcher's directory for script form.
+
+    The second is per-user site-packages, which needs no variable to take
+    effect -- the interpreter adds it from a default location, ahead of the
+    install's own site-packages, and neither ``PYTHONSAFEPATH`` nor the absence
+    of ``PYTHONUSERBASE`` disables it. It is read from THIS process because the
+    spawn is already pinned to the managed spec's own launcher by realpath, so
+    the child runs this install's interpreter. A ``--user`` install keeps
+    working: its user-site holds the very package this process is running, which
+    matches and therefore does not shadow. Disabling user-site instead would
+    break that install shape outright.
+
+    Interpreter flags do not relax this token fence; checking an inert root is a
+    safe false-deny, while modelling every Python path rule could become a
+    false-grant when those rules change.
+
+    A root shadows when it holds an importable regular ``kiro_crew`` package or
+    module file that is not the package this process is running. A namespace
+    directory without ``__init__.py`` does not shadow.
+    """
+    module_form = any(
+        arg == "-m" and i + 1 < len(argv) and argv[i + 1] == "kiro_crew"
+        for i, arg in enumerate(argv)
+    )
+    cwd = os.fspath(work_dir) if work_dir else os.getcwd()
+    if module_form:
+        root = cwd
+    else:
+        try:
+            root = os.path.dirname(os.path.realpath(command))
+        except (OSError, ValueError):
+            return command
+    roots = [root]
+    try:
+        roots.extend(_user_site_roots())
+    except Exception:
+        return "per-user site-packages (unresolvable)"
+    ours = os.path.realpath(os.path.dirname(kiro_crew.__file__))
+    for candidate in roots:
+        try:
+            package = os.path.join(candidate, "kiro_crew")
+            if os.path.isfile(os.path.join(package, "__init__.py")):
+                if os.path.realpath(package) != ours:
+                    return candidate
+            elif any(
+                os.path.isfile(package + suffix) for suffix in importlib.machinery.all_suffixes()
+            ):
+                return candidate
+        except (OSError, ValueError):
+            return candidate
+    return ""
 
 
 def _emit_backend_acquire_metric(acquire_ms: float, *, warm: bool) -> None:
@@ -1133,18 +1371,40 @@ async def _owner_liveness_sweeper(
     recycled by the kernel, so ``pid_exists`` alone would let a daemon keep
     running for whatever unrelated process later took its owner's number.
 
-    Fail-safe rules mirror :func:`_socket_liveness_sweeper`: an unreadable
-    start time at arm time disables the check (nothing to compare against,
-    and refusing to serve would be worse than serving one generation too
-    long); a probe that cannot read the start time is inconclusive and
-    neither counts nor resets; :data:`_OWNER_LIVENESS_MISSES` consecutive
-    conclusive misses set ``stop_event``, which is the graceful drain path.
+    Fail-safe rules mirror :func:`_socket_liveness_sweeper`: a start time that
+    is unreadable *while the owner still exists* disables the check (nothing to
+    compare against, and refusing to serve would be worse than serving one
+    generation too long); an owner that is conclusively **gone** at arm time
+    takes the graceful drain path immediately, because "unreadable" then means
+    gone rather than unknown; a probe that cannot read the start time is
+    inconclusive and neither counts nor resets;
+    :data:`_OWNER_LIVENESS_MISSES` consecutive conclusive misses set
+    ``stop_event``, which is the graceful drain path.
     """
     baseline = await asyncio.to_thread(_process_start_time, owner_pid)
     if baseline is None:
+        # No baseline has two causes that need OPPOSITE answers, and treating
+        # them alike is what let a daemon outlive its owner. The listening
+        # socket is bound and advertised before this task first runs, so on a
+        # contended host the owner can die inside the gap between the bind and
+        # this read. Disabling the check there retired the only mechanism that
+        # would ever have ended this daemon, so it served an owner that no
+        # longer existed until something killed it from outside.
+        # ``pid_exists`` separates the two: it reports False only on
+        # ProcessLookupError, and True when the process exists but cannot be
+        # signalled -- so False here is a conclusion, not a read failure.
+        if not await asyncio.to_thread(_pid_exists, owner_pid):
+            logger.warning(
+                "gatewayd: owning gateway pid %d was already gone when the "
+                "owner-liveness check armed; this daemon serves no live gateway "
+                "-- initiating graceful self-shutdown",
+                owner_pid,
+            )
+            stop_event.set()
+            return
         logger.warning(
-            "gatewayd: owner pid %d has no readable start time; the owner-liveness "
-            "check is disabled for this daemon",
+            "gatewayd: owner pid %d is alive but has no readable start time; the "
+            "owner-liveness check is disabled for this daemon",
             owner_pid,
         )
         return
@@ -1727,14 +1987,18 @@ def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dic
         return None
     command, *args = parts
     env = _scrub_sensitive_env(dict(os.environ))
-    # Strip the Kiro Crew process's own Python env vars so they don't leak into
-    # Python-based MCP backends: PYTHONPATH/PYTHONHOME cause import conflicts,
-    # and PYTHONPYCACHEPREFIX (desktop-app-only, see pycache_gc.py) would make
-    # a pooled backend mirror its stdlib into the shared bytecode cache. Reuses
-    # sandbox._PYTHON_ENV_PREFIXES instead of hand-listing keys, so this scrub
-    # site can't drift from the kiro-cli/agent spawn path's scrub again.
-    for key in _PYTHON_ENV_PREFIXES:
-        env.pop(key, None)
+    # A reserved control plane receives the session token only after the whole
+    # extensible Python namespace is gone. Third-party backends never receive
+    # that token and keep settings outside the four interpreter roots that can
+    # make them load Kiro Crew's Python packages instead of their own.
+    python_env_prefixes = (
+        (_CONTROL_PLANE_PYTHON_ENV_PREFIX,)
+        if pool_key.server_name in CONTROL_PLANE_BACKENDS
+        else tuple(_PYTHON_ENV_PREFIXES)
+    )
+    for key in tuple(env):
+        if any(key.upper().startswith(prefix) for prefix in python_env_prefixes):
+            env.pop(key, None)
     # No KIROCREW_CHANNEL_ID is exported into the backend env. Copying it from
     # PoolKey.channel_id would only make sense while a backend was owned by one
     # channel. A pooled backend serves several channels, so a
@@ -3086,7 +3350,6 @@ async def _handle_connection(
     # not evidence of member authority, and its ancestor_pids are untrusted.
     peer_pid = socketsec.get_peer_pid(writer)
     peer_uid_ok = socketsec.check_peer_is_self(writer)
-    member_peer_pid = peer_pid if peer_uid_ok is socketsec.PeerCredResult.MATCH else None
     needs_identity = caller is None or not caller.session_key
     if needs_identity or stub_session_token:
         if peer_pid is None or peer_uid_ok is not socketsec.PeerCredResult.MATCH:
@@ -3680,20 +3943,16 @@ async def _handle_connection(
             if msg.get("method") == "initialize":
                 captured_init = dict(msg)
 
+            # ``caller`` itself stays tokenless for the life of the connection:
+            # the token is attached to a per-forward copy, decided against the
+            # backend that receives THIS frame. A respawn hands the tokenless
+            # base on and re-decides for the replacement.
+            forward_caller = _caller_for_backend(backend, caller, conn)
+
             try:
-                call_caller = await _caller_with_member_proof(
-                    caller, member_peer_pid, msg.get("method")
-                )
                 await backend.forward_from_stub(
-                    stub_uuid, msg, caller=call_caller, tenant_nonce=conn.tenant_nonce
+                    stub_uuid, msg, caller=forward_caller, tenant_nonce=conn.tenant_nonce
                 )
-            except _MemberCallerRefused as exc:
-                # An incorrect/missing claimed session must not turn a member
-                # invocation into an unowned V1 tool call. Keep the connection
-                # available for a subsequent trusted claim repair, but execute
-                # none of this invocation in the shared backend.
-                await _write_json_line(writer, _jsonrpc_error(msg, str(exc)))
-                continue
             except BackendGone as exc:
                 # Transparent respawn: a shared backend dying must NOT brick
                 # this stub's transport (which would make kiro-cli mark the
@@ -4059,6 +4318,46 @@ async def _acquire_backend(
             spawn_env,
             Path(_config_dir()),
         )
+        # Decided BEFORE the child exists, from the command about to be exec'd
+        # plus the env and cwd it will run in, and never again: the connection
+        # handler reads this flag to decide whether the session token may ride
+        # in the caller block. The order is the guarantee: the verdict reads
+        # the child's final env and fixed local root before foreign code can
+        # run. Off the loop: the check imports ``kiro_crew.agent``, reads config
+        # and stats the filesystem, and a cold spawn must not stall gateway
+        # traffic or heartbeats.
+        control_plane = await asyncio.to_thread(
+            _spawns_own_control_plane,
+            pool_key.server_name,
+            command,
+            list(args),
+            env=spawn_env,
+            work_dir=work_dir,
+        )
+        if control_plane:
+            # Defense in depth after the verdict: the fence above already
+            # rejects declared Python import roots and checks the fixed CWD or
+            # launcher directory without relying on interpreter-version rules.
+            # Control planes only: a third-party backend may rely on the
+            # interpreter's default ``sys.path[0]``.
+            spawn_env["PYTHONSAFEPATH"] = "1"
+            # Per-user site-packages runs code at interpreter startup through
+            # its ``.pth`` entries, under any filename -- so inspecting it for a
+            # foreign ``kiro_crew`` cannot see a startup hook. Disabling it
+            # removes the whole surface, and is safe precisely when nothing
+            # legitimate is there to lose: a ``--user`` install keeps user-site
+            # enabled because that is where its own package lives, which the
+            # fence has already matched against this process's.
+            if not _user_site_holds_our_package():
+                spawn_env["PYTHONNOUSERSITE"] = "1"
+        # Kiro Crew's own UTF-8 pinning, applied after the verdict for every
+        # pooled backend. The classifier must see a PYTHON*-free environment,
+        # so these keys cannot be present earlier without every control plane
+        # denying its own token; and the child must still build its stdio from
+        # UTF-8 rather than a Windows ANSI codepage or a hostile inherited
+        # encoding. The one constant keeps this site and the gateway's own
+        # process environment in step.
+        spawn_env.update(_UTF8_PROCESS_ENV)
         backend = await spawn_backend(
             pool_key=pool_key,
             command=command,
@@ -4084,6 +4383,7 @@ async def _acquire_backend(
         # parent's Python heap once the child has inherited it at exec.
         for _sk in _secret_keys:
             spawn_env.pop(_sk, None)
+        backend.control_plane = control_plane
         # Start the stdout pump immediately so replies to the first
         # forwarded message can route back. The task is owned by the
         # Backend and cancelled at shutdown().
@@ -4428,7 +4728,11 @@ async def _respawn_backend_for_stub_unrecorded(
             drift = tool_surface.describe_surface_change(
                 old_surface,
                 await new_backend.probe_tool_surface(
-                    caller=caller,
+                    # Re-decided against the REPLACEMENT: ``caller`` arrives
+                    # tokenless, and a fresh process that failed the
+                    # control-plane check must not read the token the dead
+                    # one was entitled to.
+                    caller=_caller_for_backend(new_backend, caller, conn),
                     tenant_nonce=(conn.tenant_nonce if conn is not None else ""),
                 ),
             ) or _rekey_refusal_reason(conn, captured_key)
@@ -4468,7 +4772,7 @@ async def _respawn_backend_for_stub_unrecorded(
             # the caller tears the stub down and kiro-cli reconnects.
             try:
                 await new_backend.replay_resource_subscriptions(
-                    stub_uuid, replay_uris, caller=caller
+                    stub_uuid, replay_uris, caller=_caller_for_backend(new_backend, caller, conn)
                 )
             except BackendGone as exc:
                 logger.info(
@@ -4585,51 +4889,6 @@ async def _drain_inbox_to_stub(
                 return
     except asyncio.CancelledError:
         raise
-
-
-class _MemberCallerRefused(RuntimeError):
-    """Protected peer identity cannot safely authorize this tool invocation."""
-
-
-async def _caller_with_member_proof(
-    caller: Optional[CallerContext], peer_pid: Optional[int], method: Any
-) -> Optional[CallerContext]:
-    """Delegate private-memory authority for this call, never for a connection.
-
-    Resolve the protected peer even when the client supplies no caller. Omitting
-    a key or claiming a global session must not downgrade a protected member to
-    V1 in a shared backend whose own process cannot identify the original peer.
-    No proof is kept on the connection or replayed during backend recovery.
-    """
-    proof = ""
-    if method in ("tools/call", "tools/list") and peer_pid is not None:
-        try:
-            protected = await asyncio.get_running_loop().run_in_executor(
-                subprocess_executor(), protected_member_session_for_pid, peer_pid
-            )
-        except Exception:
-            raise _MemberCallerRefused(
-                "Cannot verify the protected runtime identity. Reopen the member conversation and retry."
-            ) from None
-        if protected is not None and (
-            not protected or caller is None or caller.session_key != protected
-        ):
-            raise _MemberCallerRefused(
-                "The caller does not match its protected runtime identity. Reopen the member conversation and retry."
-            )
-        if caller is not None and caller.session_key:
-            try:
-                proof = await asyncio.get_running_loop().run_in_executor(
-                    subprocess_executor(), issue_member_session_proof, caller.session_key, peer_pid
-                )
-            except Exception:
-                # Neither diagnostics nor tool results may expose token material.
-                logger.warning("member memory caller verification unavailable")
-            if protected is not None and not proof:
-                raise _MemberCallerRefused(
-                    "The protected runtime proof is unavailable. Reopen the member conversation and retry."
-                )
-    return replace(caller, member_memory_proof=proof) if caller is not None else None
 
 
 def _caller_from_register(register: dict[str, Any]) -> Optional[CallerContext]:

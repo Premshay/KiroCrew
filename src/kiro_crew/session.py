@@ -73,6 +73,19 @@ Four mechanisms clean up processes. They are complementary — not redundant.
    Kills sessions idle for >``timeout_secs`` (default 60 min) via
    ``reset()`` → ``provider.shutdown()`` → SIGKILL process tree.
    Protected keys: ``_PERSISTENT_KEYS`` (``_bg`` and ``_hb``).
+   Also expires on a second, clock-independent axis: the session's owning
+   dashboard slot is gone (``_owner_is_gone``). A ``dashboard:`` key is
+   slot-owned by construction; a key of any other shape counts as slot-owned
+   only if a published live set once carried it, which is what keeps a
+   ``cron:`` fire or a ``taskrunner:{id}:task{n}`` step that never had a tab
+   from being read as finished. That axis refuses a session with attached
+   sub-agent work, then re-asserts against the live set as the last read before
+   the reset, with no await in between. BOTH axes refuse a session with a
+   completion injection in flight: a turn already committed to a session is not
+   finished work, whichever test elected it. *Cannot be replaced by the idle clock* — a finished session holds its
+   runtime and its per-session MCP servers for the whole timeout, so the live
+   process count is the number of unreaped sessions times the servers each one
+   spawns.
    **Known limitation**: ``last_used`` is only bumped on ``get_or_create()``,
    not on every LLM round-trip. A task runner step doing continuous work for
    >60 min without a new ``get_or_create()`` call could be swept. This is
@@ -100,11 +113,12 @@ if TYPE_CHECKING:
     from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
     from kiro_crew.session_capabilities import LoadedCapabilities
 
-from kiro_crew import model_registry, platform_compat, shutdown_event
+from kiro_crew import model_registry, model_scope, platform_compat, shutdown_event
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
+    ACP_BACKENDS_SESSION_EVICTION,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
 )
@@ -112,6 +126,7 @@ from kiro_crew.acp_backends import selectable_backends
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
+from kiro_crew.agent_sdk.backends import model_registry_namespace
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.agent_spec_format import iter_agent_spec_files
 from kiro_crew.config import KiroCrewConfig, live
@@ -169,6 +184,7 @@ from kiro_crew.session_background import (
 )
 from kiro_crew.session_cleanup import CleanupDeps, CleanupState, SessionCleanup
 from kiro_crew.session_compaction import (
+    COMPACT_OUTCOME_COMPACTED,
     CompactionCoordinator,
     CompactionDeps,
     CompactionState,
@@ -478,7 +494,7 @@ POOL_DECISIONS: frozenset[str] = frozenset(
         "miss_empty",
         "bypass_resume",
         "bypass_stateless",
-        "bypass_private_memory",
+        "bypass_member_context",
         "bypass_cwd",
         "bypass_effort",
         "bypass_env",
@@ -540,19 +556,33 @@ BACKGROUND_AGENT = "kirocrew-lite"
 # module-level intersection would snapshot the baseline and permanently exclude
 # a backend the operator did register.
 #
-# The SET here, deliberately, and NOT ``acp_runtime_backends()``: the codex
-# preview switch does not reach the background path. Background handles are the
-# high-churn ones — title generation, suggestions, folders and nav each take their
-# own ephemeral sessionId, many per conversation — and codex's teardown verb is
-# ``session/cancel``, which ends the turn without evicting the session from the
-# adapter's own map. On a shared process that is unbounded growth in the adapter,
-# at a rate a user never controls, and nothing Crew can send reclaims it.
-# Foreground sessions leak the same way but at the rate a person opens chats, and
-# the runtime's age/RSS recycle eventually collects the process. So the preview is
-# scoped to the path whose exposure is bounded; making codex a member of this set
-# requires a real per-session eviction first.
+# Intersected with ``ACP_BACKENDS_SESSION_EVICTION`` as well, and that term is the
+# one carrying weight. Background handles are the high-churn ones — title
+# generation, suggestions, folders and nav each take their own ephemeral
+# sessionId, many per conversation, at a rate a user never controls. A harness
+# whose teardown verb does not dispose a session accumulates every one of them in
+# the adapter's own map, so a shared process serving this path grows without
+# bound. Foreground sessions accumulate the same way but at the rate a person
+# opens chats, and each one is disposed by the teardown of the conversation that
+# owns it, which is why the eviction term is required HERE and not there.
+#
+# The age/RSS recycle is NOT what bounds a foreground runtime: ``_is_stale`` is
+# consulted from one place, the reuse path in
+# ``session_background.get_bg_session``, so its 6 h / 500 MB ceilings govern the
+# ``_bg`` runtime this set gates and nothing else. A foreground runtime and a
+# per-parent companion runtime are bounded by their own teardown and by
+# ``_expire_idle``, and a harness added here on the belief that a ceiling will
+# catch what its teardown verb does not would have no such backstop.
+#
+# The two terms are separate memberships, earned separately. codex holds both:
+# it runs on the shared runtime, and its teardown is a ``session/close`` request,
+# which the adapter answers by dropping the session from its map -- measured,
+# and re-measured by the gated live test on every install that has the adapter.
+# ``session/cancel`` would NOT have earned the second membership: it leaves the
+# session addressable with its context resident. A harness reaches this path by
+# demonstrating BOTH properties in ``backends.py``, never by an edit here.
 def _bg_runtime_backends() -> frozenset[str]:
-    return ACP_BACKENDS_ACP_RUNTIME & selectable_backends()
+    return ACP_BACKENDS_ACP_RUNTIME & ACP_BACKENDS_SESSION_EVICTION & selectable_backends()
 
 
 def _load_bg_runtime_types() -> tuple[Any, type[BaseException]]:
@@ -654,7 +684,20 @@ _POST_COMPACT_RESET_PCT = 95.0
 
 
 class _CompactCallback(Protocol):
-    async def __call__(self, key: str, pct: float, *, success: bool) -> None: ...  # noqa: E704
+    # Mirrors ``session_compaction.CompactCallback`` exactly, including ``outcome``:
+    # this facade re-declares the shape so callers need not import the coordinator,
+    # and a narrower copy here makes the two disagree about what a registration must
+    # accept. ``outcome`` says WHICH arm ran -- compacted or recycled -- because a
+    # recycle is equally "successful" to a caller that only needs headroom, and a
+    # surface told only ``success`` announced a summary that never happened.
+    async def __call__(  # noqa: E704
+        self,
+        key: str,
+        pct: float,
+        *,
+        success: bool,
+        outcome: str = COMPACT_OUTCOME_COMPACTED,
+    ) -> None: ...
 
 
 class _RecycleCallback(Protocol):
@@ -947,6 +990,17 @@ class _Session:
     # Consumed one-shot by the next prompt builder to re-inject the skills
     # index so the model can still discover skills post-compaction.
     needs_context_reinjection: bool = False
+    # Set when this session's cold start consumed a replay suppression, so it
+    # started with NO conversation. Cleared by the compaction coordinator once
+    # the first confirmed reading is recorded below. Lives on the session so it
+    # dies with it: a successor that never reports leaves nothing behind.
+    floor_pending: bool = False
+    # First confirmed context reading of a session that started with no
+    # conversation: what a fresh session on this key reads before anyone has
+    # said anything. ``None`` until measured, and never for a session whose
+    # first turn replayed history. Read by the compaction coordinator to decide
+    # whether a reset could free anything at all.
+    floor_pct: float | None = None
 
     def adopt_provider(self, provider: LLMProvider) -> None:
         """Swap in a freshly-spawned *provider*, resetting conversation state.
@@ -969,6 +1023,10 @@ class _Session:
         self.consecutive_failures = 0
         self.prev_turn_cancelled = False
         self.needs_context_reinjection = False
+        # A recycled provider replays history on its first turn, so its first
+        # reading is not a floor; the measurement belongs to the old provider.
+        self.floor_pending = False
+        self.floor_pct = None
         self.created_at = time.time()
         self.last_used = time.monotonic()
 
@@ -1074,6 +1132,14 @@ class SessionManager:
             load_watchdog_settings=lambda crew: _load_allocation_watchdog_settings(crew),
             advertised_model_ids=lambda models: advertised_model_ids(models),
             model_is_unusable=lambda model, advertised: model_is_unusable(model, advertised),
+            model_pin_applies=lambda model, namespace, advertised: model_scope.pin_applies(
+                model,
+                namespace,
+                advertised=advertised,
+            ),
+            provider_model_namespace=lambda provider: model_registry_namespace(
+                getattr(getattr(provider, "client", provider), "backend", "") or ""
+            ),
             resolve_pin_spelling=lambda model, advertised: resolve_pin_spelling(model, advertised),
             to_provider_id=lambda model, provider: model_registry.to_provider_id(model, provider),
             to_acp_id=lambda model: model_registry.to_acp_id(model),
@@ -1212,6 +1278,8 @@ class SessionManager:
             # Resolved per call, not captured: the dashboard installs the probe
             # after this manager (and possibly its cleanup boundary) exists.
             has_attached_subagents=lambda key: self._has_attached_subagents(key),
+            # Same reason, different owner: the gateway installs this one.
+            has_pending_injection=lambda key: self._has_pending_injection(key),
         )
 
     def _cleanup_boundary(self) -> SessionCleanup:
@@ -1321,6 +1389,18 @@ class SessionManager:
     @_identity_sweep_lock.setter
     def _identity_sweep_lock(self, value: asyncio.Lock) -> None:
         self._lifecycle_state_boundary().identity_sweep_lock = value
+
+    @property
+    def pending_identity_sweep_fingerprint(self) -> str:
+        """The account a sweep is still trying to retire sessions FOR, or ``""``.
+
+        Non-empty exactly while an identity sweep stayed incomplete, and cleared
+        the moment one completes. Read-only on purpose: the lifecycle service
+        owns every write, and a consumer needs this only to answer "is a change
+        still outstanding", which the reconciled baseline alone cannot say --
+        that baseline deliberately does not advance on an incomplete sweep.
+        """
+        return self._lifecycle_state_boundary().identity_sweep_fingerprint
 
     @property
     def _recycling(self) -> dict[str, "_Session"]:
@@ -1665,6 +1745,9 @@ class SessionManager:
         # Installed by the dashboard once its state exists (set_subagent_probe);
         # None means "no dashboard, so no children can be attached".
         self._subagent_probe: "Callable[[str], bool | Awaitable[bool]] | None" = None
+        # Installed by the gateway once it owns this manager (set_injection_probe);
+        # None means "no gateway, so no completion injection can be in flight".
+        self._injection_probe: "Callable[[str], bool] | None" = None
         self._allocation_state = SessionRegistryState(
             start_sem=asyncio.Semaphore(_MAX_CONCURRENT_COLD_STARTS)
         )
@@ -2145,6 +2228,11 @@ class SessionManager:
 
     def _store_provider_mapping(self, key: str, provider: LLMProvider) -> bool:
         """Record a provider-native conversation when all resume fields exist."""
+        session = self._sessions.get(self._fold_key(key))
+        if session is None or session.provider is not provider:
+            return False
+        if session.retire_on_identity_change:
+            return False
         sid = provider.session_id
         label = provider.session_provider_label
         cwd = provider.cwd
@@ -2266,6 +2354,7 @@ class SessionManager:
         *,
         expect_session: _Session | None = None,
         skip_if_busy: bool = False,
+        skip_if_injecting: bool = False,
         clear_conversation: bool = False,
     ) -> bool:
         """Reset a live session while preserving its persistence entry."""
@@ -2273,6 +2362,7 @@ class SessionManager:
             key,
             expect_session=cast(Any, expect_session),
             skip_if_busy=skip_if_busy,
+            skip_if_injecting=skip_if_injecting,
             clear_conversation=clear_conversation,
         )
 
@@ -2350,6 +2440,9 @@ class SessionManager:
         session = self._sessions.get(folded)
         if session is None or not session.provider_switch_replay:
             return False
+        if session.retire_on_identity_change:
+            session.provider_switch_replay = False
+            return True
         if not _is_acp_provider(session.provider):
             session.provider_switch_replay = False
             return True
@@ -2376,14 +2469,21 @@ class SessionManager:
 
     def consume_replay_suppression(self, key: str) -> bool:
         """Read and clear whether *key*'s next cold start skips replay once."""
+        folded = self._fold_key(key)
         if key in self._suppress_replay:
             self._suppress_replay.discard(key)
-            return True
-        folded = self._fold_key(key)
-        if folded in self._suppress_replay:
+        elif folded in self._suppress_replay:
             self._suppress_replay.discard(folded)
-            return True
-        return False
+        else:
+            return False
+        # The session that consumed the suppression starts with no history, so
+        # its first confirmed reading is this key's floor. Marked here, on the
+        # session itself, because this is the one place that knows the replay
+        # was actually skipped -- and the flag then dies with the session.
+        session = self._sessions.get(folded) or self._sessions.get(key)
+        if session is not None:
+            session.floor_pending = True
+        return True
 
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register the lifecycle recycle callback."""
@@ -2416,6 +2516,32 @@ class SessionManager:
             return False
         return probe(key)
 
+    def set_injection_probe(self, fn: "Callable[[str], bool] | None") -> None:
+        """Install the "is a completion injection in flight for *key*?" predicate.
+
+        Cleanup consults it before expiring a session: the gateway commits a
+        turn to a parent session, then awaits that turn's store read before
+        acquiring the session, so for the length of that await the session looks
+        idle to every other signal. ``None`` uninstalls it (no gateway, nothing
+        injecting). Synchronous by contract -- the gateway answers from a
+        counter, and cleanup asks it in the last breath before ``reset``.
+        """
+        self._injection_probe = fn
+
+    def _has_pending_injection(self, key: str) -> bool:
+        """Answer the installed injection probe, or False when none is installed.
+
+        Coerced to ``bool`` here, unlike the sub-agent probe: this predicate is
+        synchronous by contract, so there is no awaitable to hand onward.
+
+        A raising probe propagates: the cleanup boundary treats that as
+        "attached" so the session is kept.
+        """
+        probe = self._injection_probe
+        if probe is None:
+            return False
+        return bool(probe(key))
+
     def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
         """Delegate the ordered compaction gate ladder."""
         # Adopt a newly published threshold before the ladder reads it: the
@@ -2434,9 +2560,15 @@ class SessionManager:
         """Delegate backend-specific compaction execution."""
         return await self._compaction._compact_session(key, pct)
 
-    async def _recycle_held(self, key: str, session: "_Session", pct: float) -> None:
+    async def _recycle_held(
+        self, key: str, session: "_Session", pct: float, *, uncompactable: bool = False
+    ) -> None:
         """Delegate exact-session recycle while its semaphore is held."""
-        await self._compaction._recycle_held(key, session, pct)
+        await self._compaction._recycle_held(key, session, pct, uncompactable=uncompactable)
+
+    async def _recycle_unmanaged(self, key: str, session: "_Session", pct: float) -> str:
+        """Delegate the recycle for a backend no compaction path can reach."""
+        return await self._compaction._recycle_unmanaged(key, session, pct)
 
     async def _compact_in_place(self, key: str, session: "_Session", pct: float) -> str:
         """Delegate in-place compaction under turn exclusion."""
@@ -2470,13 +2602,17 @@ class SessionManager:
         """Retire a session while preserving its resumable mapping."""
         await self._lifecycle_boundary().remove(key)
 
-    async def retire_kiro_identity_sessions(self) -> tuple[list[str], bool]:
+    async def retire_kiro_identity_sessions(self, fingerprint: str = "") -> tuple[list[str], bool]:
         """Retire idle processes that loaded a superseded Kiro identity."""
-        return await self._lifecycle_boundary().retire_kiro_identity_sessions()
+        return await self._lifecycle_boundary().retire_kiro_identity_sessions(fingerprint)
 
     async def _retire_kiro_warm_pool(self) -> bool:
         """Delegate pooled-provider retirement after identity change."""
         return await self._pool._retire_kiro_warm_pool()
+
+    def _mark_identity_epoch(self) -> None:
+        """Disqualify already-pooled providers from claims after an account change."""
+        self._pool.mark_identity_epoch()
 
     async def _retire_kiro_subagent_runtimes(self) -> bool:
         """Retire idle companion runtimes that use Kiro's identity store."""

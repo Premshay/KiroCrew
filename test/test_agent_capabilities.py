@@ -634,6 +634,68 @@ def test_derived_permissions_follow_owner_approval_edits(editor):
     assert spec_for(home, specs)["permissions"] == {"rules": []}
 
 
+def test_reset_reviews_the_parent_tools_settings_it_adopts(editor):
+    service, home, specs, parent = editor
+    save(
+        service,
+        [{"section": "prompt", "id": "prompt", "action": "set", "value": "mine"}],
+        enroll=True,
+    )
+    target = json.loads((home / "config.json").read_text())["agents"]["A"]["kiro_agent"]
+    parent["toolsSettings"] = {"execute_bash": {"allowedCommands": ["git status"]}}
+    (specs / "parent.json").write_text(json.dumps(parent), encoding="utf-8")
+    with pytest.raises(CapabilityError, match="alternate_permissions_require_review"):
+        service.reset("A", target)
+    assert spec_for(home, specs)["prompt"] == "mine"
+
+
+def test_reset_reviews_parent_permissions_the_derive_does_not_produce(editor):
+    service, home, specs, parent = editor
+    save(
+        service,
+        [{"section": "prompt", "id": "prompt", "action": "set", "value": "mine"}],
+        enroll=True,
+    )
+    target = json.loads((home / "config.json").read_text())["agents"]["A"]["kiro_agent"]
+    parent["permissions"] = {"rules": [{"capability": "fsWrite", "effect": "allow"}]}
+    (specs / "parent.json").write_text(json.dumps(parent), encoding="utf-8")
+    with pytest.raises(CapabilityError, match="alternate_permissions_require_review"):
+        service.reset("A", target)
+    assert spec_for(home, specs)["prompt"] == "mine"
+
+
+def test_reset_onto_reviewed_parent_keeps_derived_permissions(editor):
+    from kiro_crew.agent_sdk.drivers.acp import derived_agent_permissions
+
+    service, home, specs, parent = editor
+    parent["allowedTools"] = ["@search"]
+    parent["permissions"] = derived_agent_permissions(["@search"], "parent")
+    (specs / "parent.json").write_text(json.dumps(parent), encoding="utf-8")
+    save(
+        service,
+        [{"section": "prompt", "id": "prompt", "action": "set", "value": "mine"}],
+        enroll=True,
+    )
+    target = json.loads((home / "config.json").read_text())["agents"]["A"]["kiro_agent"]
+    service.reset("A", target)
+    spec = spec_for(home, specs)
+    assert spec["prompt"] == parent["prompt"]
+    assert spec["permissions"] == derived_agent_permissions(spec.get("allowedTools"), spec["name"])
+    assert service.get("A")["mode"] == "inherited"
+
+
+def test_ordinary_apply_leaves_untouched_approval_sections_alone(editor):
+    service, home, specs, parent = editor
+    parent["permissions"] = {"rules": [{"capability": "fsWrite", "effect": "allow"}]}
+    (specs / "parent.json").write_text(json.dumps(parent), encoding="utf-8")
+    save(
+        service,
+        [{"section": "prompt", "id": "prompt", "action": "set", "value": "mine"}],
+        enroll=True,
+    )
+    assert spec_for(home, specs)["prompt"] == "mine"
+
+
 def test_policy_withheld_approval_never_resurrects_on_relaxation(editor):
     from dataclasses import replace
 
@@ -1114,12 +1176,22 @@ def test_publish_respects_reserved_legacy_default_binding(editor):
     ["CON", "con", "Con.json", "PRN", "aux.txt", "NUL", "COM1", "com1.json", "lpt9", "LPT1.md"],
 )
 def test_publish_refuses_windows_device_names_in_any_case_or_extension(editor, name):
+    from unittest.mock import patch
+
+    from kiro_crew import agent_capabilities
+
     # One shared definition: constants.WINDOWS_DEVICE_STEMS, not an inline copy.
     service, home, specs, _ = editor
     save(service, enroll=True)
-    with pytest.raises(CapabilityError, match="invalid_template_name"):
-        service.publish("A", spec_for(home, specs)["name"], name)
-    assert not (specs / f"{name}.json").exists()
+    before = {p.name: p.read_bytes() for p in specs.iterdir()}
+    with patch.object(
+        agent_capabilities, "atomic_write", wraps=agent_capabilities.atomic_write
+    ) as writer:
+        with pytest.raises(CapabilityError, match="invalid_template_name"):
+            service.publish("A", spec_for(home, specs)["name"], name)
+    writer.assert_not_called()
+    # Device-name exists() is not evidence of a directory entry on Windows.
+    assert {p.name: p.read_bytes() for p in specs.iterdir()} == before
 
 
 @pytest.mark.parametrize("name", ["COM10", "lpt10", "console", "auxiliary"])

@@ -11,6 +11,7 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any, TypeGuard
 
+from kiro_crew import model_scope
 from kiro_crew.acp.client import (
     DEFAULT_MODEL,
     AcpAuthRequired,
@@ -32,25 +33,40 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_CONTEXT_RECYCLE,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+)
+from kiro_crew.acp.types import (
+    ACP_BACKENDS_HARNESS_MANAGED_COMPACTION as ACP_BACKENDS_HARNESS_MANAGED,
+)
+from kiro_crew.acp.types import (
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_SESSION_SHARING,
+    ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
     EVENT_COMPACTION_STATUS,
     PROVIDER_LABEL_BY_BACKEND,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
-    acp_runtime_backends,
 )
 from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
+from kiro_crew.agent_sdk.backends import model_registry_namespace
 from kiro_crew.agent_sdk.capabilities import SessionCapabilities, capabilities_for
+from kiro_crew.agent_sdk.tool_search import (
+    TOOL_SEARCH_DEFAULT_MIN_PCT,
+    TOOL_SEARCH_DEFAULT_MIN_TOKENS,
+    ToolSearchSettings,
+    clamp_min_pct,
+    clamp_min_tokens,
+)
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
@@ -126,30 +142,11 @@ def _write_cli_overlay(work_dir: Path, model: str, effort: str) -> None:
     )  # atomic: readers never see a partial file
 
 
-#: kiro-cli's own Tool Search activation thresholds. Mirrored as the defaults of
-#: ``AgentConfig.tool_search_min_pct`` / ``tool_search_min_tokens``; a test pins
-#: the two spellings together (config cannot import this module — it would be a
-#: circular import).
-TOOL_SEARCH_DEFAULT_MIN_PCT = 5
-TOOL_SEARCH_DEFAULT_MIN_TOKENS = 50_000
-
-
-def _clamp_min_pct(value: object) -> int:
-    """Coerce a configured percentage into 0..100, falling back to the default."""
-    try:
-        pct = int(value)  # type: ignore[call-overload]
-    except (TypeError, ValueError):
-        return TOOL_SEARCH_DEFAULT_MIN_PCT
-    return max(0, min(100, pct))
-
-
-def _clamp_min_tokens(value: object) -> int:
-    """Coerce a configured token count to >= 0, falling back to the default."""
-    try:
-        tokens = int(value)  # type: ignore[call-overload]
-    except (TypeError, ValueError):
-        return TOOL_SEARCH_DEFAULT_MIN_TOKENS
-    return max(0, tokens)
+# The thresholds and their clamps live in ``agent_sdk.tool_search`` so the
+# wire channel (KAS) and the overlay channel (kiro-cli) read one definition; the
+# names stay importable here because tests and the config mirror pin them.
+_clamp_min_pct = clamp_min_pct
+_clamp_min_tokens = clamp_min_tokens
 
 
 def _write_tool_search_overlay(
@@ -164,6 +161,12 @@ def _write_tool_search_overlay(
     used for effort. Workspace settings override the global
     ``~/.kiro/settings/cli.json`` so this only affects this slot's own kiro-cli
     session and never mutates the user's global kiro settings.
+
+    This file is the kiro-cli (Rust engine) channel only. KAS never opens it: its
+    Tool Search setting rides the ACP ``initialize`` request instead (see
+    :mod:`kiro_crew.agent_sdk.tool_search`), which is why the writer is
+    scoped to ``ACP_BACKENDS_TOOL_SEARCH_OVERLAY`` and not to every kiro-family
+    host.
 
     Tool Search (https://kiro.dev/docs/cli/mcp/tool-search/) loads MCP tool
     specs on demand ("search-and-call") instead of sending every spec each
@@ -345,7 +348,8 @@ class AcpProvider(LLMProvider):
         model_switch_method: str = "",
         crew_agent: str | None = None,
         session_provider_label: str = "",
-        private_memory: bool = False,
+        member_context: bool = False,
+        memory_mode: str = "persistent",
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -374,13 +378,8 @@ class AcpProvider(LLMProvider):
         }
         if agent:
             kwargs["agent"] = agent
-        self._private_memory = private_memory is True
-        # Retain the original identity when start() swaps the placeholder client
-        # for a runtime handle whose session key is not yet populated.
-        self._private_memory_session_key = session_key
-        self._private_memory_prepared = False
-        if self._private_memory:
-            kwargs["private_memory"] = True
+        self.member_context = member_context
+        self.memory_mode = memory_mode
         self._client = AcpClient(**kwargs)
         self.model_switch_method = model_switch_method
         self._session_provider_label = session_provider_label
@@ -430,10 +429,14 @@ class AcpProvider(LLMProvider):
             if tool_search_min_tokens is None
             else tool_search_min_tokens
         )
-        if self.is_acp_runtime_backend:
+        if self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
             # Recover overlay-persisted levels (server-restart resilience) and
             # write the overlay BEFORE the first spawn so kiro-cli reads it on
             # session/new. Caller-provided overrides win — only fill gaps.
+            #
+            # The overlay set, not the transport set: the file belongs to the kiro
+            # family, and a harness that shares the runtime without reading it
+            # would seed its effort map out of another harness's file.
             try:
                 for m, lvl in _read_cli_overlay(self._client._work_dir).items():
                     self._effort_per_model.setdefault(m, lvl)
@@ -596,24 +599,26 @@ class AcpProvider(LLMProvider):
 
     @property
     def is_acp_runtime_backend(self) -> bool:
-        """True when this provider is served by AcpRuntime (kiro-cli or KAS).
+        """True when this provider is served by AcpRuntime rather than AcpClient.
 
-        Membership in ``ACP_BACKENDS_ACP_RUNTIME`` (harness-parity H5). Names
-        the "kiro or kas" set positively so the shared-runtime start path, the
-        cli.json overlay recovery, and the skip-live-effort branch stop being
-        spelled ``not is_claude_backend`` — which would hand the kiro-family
-        path to every harness added later. The claude AcpClient is deliberately
-        not a member: it runs one process per session and shares no runtime.
+        Membership in ``ACP_BACKENDS_ACP_RUNTIME`` (harness-parity H5), read
+        straight off the frozenset. Names the set positively so the start path
+        stops being spelled ``not is_claude_backend`` — which would hand the
+        shared-runtime path to every harness added later. The claude AcpClient is
+        deliberately not a member: it runs one process per session and shares no
+        runtime.
 
-        Reads ``acp_runtime_backends()`` rather than the set directly, so the
-        codex preview switch (``KIROCREW_CODEX_ACP_RUNTIME``, off by default) has
-        one home instead of one per foreground call site. With the switch off the
-        function returns ``ACP_BACKENDS_ACP_RUNTIME`` verbatim and this property
-        answers exactly the frozenset. This is the switch's ONLY reader in ``src``:
-        ``session._bg_runtime_backends`` reads the set, so background handles stay
-        off a codex runtime even with the switch on.
+        This answers ONE question, the transport, and it is worth saying what it
+        does not answer. Membership does not imply the kiro-family spawn
+        conventions: the cli.json effort and Tool Search overlay is gated on
+        ``ACP_BACKENDS_KIRO_SLASH_COMMANDS`` at every site that reads, writes or
+        clears it, because codex runs here and reads no such file. Nor does it
+        imply that a session can be disposed — that is
+        ``ACP_BACKENDS_SESSION_EVICTION``, a separate claim earned by a measured
+        teardown verb, and the reason the background path asks its own question
+        rather than reading this one.
         """
-        return self._client.backend in acp_runtime_backends()
+        return self._client.backend in ACP_BACKENDS_ACP_RUNTIME
 
     @property
     def slash_commands(self) -> list[dict[str, str]]:
@@ -674,6 +679,38 @@ class AcpProvider(LLMProvider):
         return backend
 
     @property
+    def compaction_self_managed(self) -> bool:
+        """Whether this harness bounds its own context (harness-parity H6).
+
+        Membership in ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION``, OR membership
+        in ``ACP_BACKENDS_COMPACT`` — a backend Crew can compact is bounded
+        whoever does the bounding, so the question only discriminates among the
+        backends Crew cannot compact. A non-``str`` backend answers ``True``, the
+        ABC default, so a spec'd double never reads as the unclassified case.
+        """
+        backend = getattr(self._client, "backend", ACP_BACKEND_KIRO)
+        if not isinstance(backend, str):
+            return True
+        return backend in ACP_BACKENDS_COMPACT or backend in ACP_BACKENDS_HARNESS_MANAGED
+
+    @property
+    def compaction_unmanaged_backend(self) -> str | None:
+        """Backend id when neither Crew nor the harness compacts, else ``None``.
+
+        Membership in ``ACP_BACKENDS_CONTEXT_RECYCLE`` (harness-parity H6), read
+        POSITIVELY. Answering it by exclusion from the other two compaction sets
+        would hand the one session-destroying arm to every harness added later
+        without anyone deciding it. The same ``str`` caution
+        :attr:`manual_compact_unsupported_backend` takes applies here for a
+        sharper version of the same reason — a spec'd double must not read as a
+        positive claim, and here the claim ends a conversation.
+        """
+        backend = getattr(self._client, "backend", ACP_BACKEND_KIRO)
+        if not isinstance(backend, str) or backend not in ACP_BACKENDS_CONTEXT_RECYCLE:
+            return None
+        return backend
+
+    @property
     def uses_kiro_identity_store(self) -> bool:
         """True when this provider's child signs in from kiro-cli's own store.
 
@@ -719,7 +756,7 @@ class AcpProvider(LLMProvider):
         (kiro) backend's cold start is finally measured. ``AcpClient.ensure_ready``
         already emits ``kirocrew.session.startup.duration`` for the *claude* path
         only; the kiro path went through here with no duration metric. We reuse the
-        same histogram, tagged ``backend=kiro`` + ``phase=<...>`` so the phase split
+        same histogram, tagged ``backend=<host id>`` + ``phase=<...>`` so the phase split
         (spawn+initialize vs session/new-the-MCP-toolset-load vs set_model) is
         visible. Best-effort — a telemetry failure never affects startup.
         """
@@ -729,7 +766,12 @@ class AcpProvider(LLMProvider):
         # replaces self._client with an AcpSessionProvider whose _session_key
         # starts empty, so reading it at emit time would file every successful
         # cold start under channel=unknown — exactly the case being measured.
-        meta: dict[str, object] = {"session_key": getattr(self._client, "_session_key", None)}
+        # Same reason for the backend id: this path serves every runtime host, and
+        # the metric is filed under the one that actually started.
+        meta: dict[str, object] = {
+            "session_key": getattr(self._client, "_session_key", None),
+            "backend": getattr(self._client, "backend", None),
+        }
         outcome = "error"
         try:
             await self._start_kiro_runtime_impl(phases, meta)
@@ -775,8 +817,10 @@ class AcpProvider(LLMProvider):
                 getattr(self, "_client", None), "_session_key", None
             )
             channel = telemetry_channel_of(session_key if isinstance(session_key, str) else None)
+            backend = _meta.get("backend")
             base_attrs: dict[str, str | int | bool | float] = {
-                "backend": "kiro",
+                # The default host's id is the empty string, so it files as "kiro".
+                "backend": backend if isinstance(backend, str) and backend else "kiro",
                 "outcome": outcome,
                 "spawned": True,
                 "channel": channel,
@@ -965,9 +1009,6 @@ class AcpProvider(LLMProvider):
         extra_env = getattr(self._client, "_extra_env", None) or {}
         mcp_gateway_overlay = getattr(self._client, "_mcp_gateway_overlay", None)
         mcp_gateway_socket = getattr(self._client, "_mcp_gateway_socket", None)
-        mcp_gateway_claude_servers = getattr(self._client, "_mcp_gateway_claude_servers", None)
-        if self._private_memory:
-            mcp_gateway_socket = getattr(self._client, "_private_mcp_gateway_socket", "")
 
         # Check for session resume. A direct dashboard turn (dashboard session
         # key with no channel identity) can restore the transcript without
@@ -977,7 +1018,11 @@ class AcpProvider(LLMProvider):
         # ``_history_replay_needed`` preserves the Kiro Crew conversation. Linked
         # Slack and other channel dispatchers keep native resume until they own
         # the same replay-lease contract end to end.
-        resume_sid = getattr(self._client, "_resume_session_id", "")
+        resume_sid = (
+            getattr(self._client, "_resume_session_id", "")
+            if self.memory_mode == "persistent"
+            else ""
+        )
         session_key = getattr(self._client, "_session_key", None)
         channel_id = getattr(self._client, "_channel_id", None)
         if (
@@ -1004,7 +1049,6 @@ class AcpProvider(LLMProvider):
         # would silently run on the agent's default.
         configured_model = getattr(self._client, "_model", "") or ""
 
-        private_kwargs: dict[str, Any] = {"private_memory": True} if self._private_memory else {}
         runtime = AcpRuntime(
             work_dir=work_dir,
             agent=agent or "kirocrew",
@@ -1012,10 +1056,12 @@ class AcpProvider(LLMProvider):
             extra_env=extra_env,
             mcp_gateway_overlay=mcp_gateway_overlay,
             mcp_gateway_socket=mcp_gateway_socket,
-            mcp_gateway_claude_servers=mcp_gateway_claude_servers,
+            model_switch_method=self.model_switch_method,
             acp_backend=self._client.backend,
             crew_agent=self._crew_agent,
-            **private_kwargs,
+            tool_search=self._tool_search_settings(),
+            member_context=self.member_context,
+            memory_mode=self.memory_mode,
         )
         _t_spawn = time.monotonic()
         try:
@@ -1140,10 +1186,15 @@ class AcpProvider(LLMProvider):
                         extra_env=extra_env,
                         mcp_gateway_overlay=mcp_gateway_overlay,
                         mcp_gateway_socket=mcp_gateway_socket,
-                        mcp_gateway_claude_servers=mcp_gateway_claude_servers,
+                        model_switch_method=self.model_switch_method,
                         acp_backend=self._client.backend,
                         crew_agent=self._crew_agent,
-                        **private_kwargs,
+                        # Same wire settings as the first spawn: on a host that
+                        # takes Tool Search at initialize, a respawn without them
+                        # would run the replayed session with it silently off.
+                        tool_search=self._tool_search_settings(),
+                        member_context=self.member_context,
+                        memory_mode=self.memory_mode,
                     )
                     try:
                         await runtime.spawn()
@@ -1159,6 +1210,7 @@ class AcpProvider(LLMProvider):
                         cwd=work_dir,
                         agent=agent or None,
                         member_session_key=self._member_session_key(),
+                        memory_mode=self.memory_mode,
                         session_key=self._owning_session_key(),
                         channel_id=self._owning_channel_id() or "",
                     )
@@ -1193,21 +1245,37 @@ class AcpProvider(LLMProvider):
                 # default, so the turn succeeds.
                 _advertised = advertised_model_ids(handle.available_models)
                 _send_model = configured_model
-                if model_is_unusable(configured_model, _advertised):
+                _namespace = model_registry_namespace(self._client.backend)
+                _foreign_scope = not model_scope.pin_applies(
+                    configured_model,
+                    _namespace,
+                    advertised=_advertised,
+                )
+                if _foreign_scope:
+                    # Harness ownership and account entitlement are separate
+                    # decisions. A foreign pin inherits this harness's default.
+                    _send_model = ""
+                    logger.info(
+                        "Configured model %s belongs to another harness, not %s; "
+                        "leaving the session on the backend default",
+                        configured_model,
+                        _namespace,
+                    )
+                elif model_is_unusable(configured_model, _advertised):
                     # A literal miss can be a stale `<namespace>::` qualifier on
                     # a model the backend fully serves: resolve to the
                     # advertised spelling and send THAT — same fold the display
                     # verdict uses, so chip and wire agree. A pin absent under
                     # either spelling still takes the withhold.
                     _send_model = resolve_pin_spelling(configured_model, _advertised)
-                if not _send_model:
+                if not _send_model and not _foreign_scope:
                     logger.warning(
                         "Configured model %s is not available to this account; "
                         "leaving the session on the backend default (advertised: %s)",
                         configured_model,
                         ", ".join(_advertised),
                     )
-                else:
+                elif _send_model:
                     _t_model = time.monotonic()
                     try:
                         await handle.set_model(_send_model)
@@ -1232,6 +1300,7 @@ class AcpProvider(LLMProvider):
                 session_key=self._owning_session_key(),
                 channel_id=self._owning_channel_id(),
             )
+            provider.memory_mode = self.memory_mode
             if resumed:
                 provider.resumed = True
             # Re-apply the consumer's fidelity opt-in: it was set on THIS
@@ -1367,15 +1436,37 @@ class AcpProvider(LLMProvider):
         except Exception:
             logger.warning("ACP effort overlay write failed", exc_info=True)
 
+    @property
+    def tool_search_settings(self) -> ToolSearchSettings | None:
+        """The resolved Tool Search choice this provider spawns runtimes with (H14 capability)."""
+        return self._tool_search_settings()
+
+    def _tool_search_settings(self) -> ToolSearchSettings | None:
+        """The operator's Tool Search choice, for the runtime's wire channel.
+
+        ``None`` when no toggle value was threaded in, which leaves the wire
+        silent exactly as the overlay writer is a no-op. The runtime decides per
+        host whether its handshake carries the setting and gates it on the agent
+        spec's loader grant; this method only resolves the operator's side.
+        """
+        if self._tool_search is None:
+            return None
+        return ToolSearchSettings.from_config(
+            self._tool_search, self._tool_search_min_pct, self._tool_search_min_tokens
+        )
+
     def _apply_tool_search_overlay(self) -> None:
         """Write the kiro Tool Search setting into the workspace cli.json overlay.
 
-        Tool Search is a kiro-cli feature read from this file at spawn, so the
-        write is scoped to the harnesses that read it; a no-op as well when no
-        toggle value was supplied (``self._tool_search is None``). Called before
-        every (re)spawn so resume/restart keeps the same setting.
+        Tool Search is read from this file at spawn by kiro-cli's Rust engine
+        only, so the write is scoped to ``ACP_BACKENDS_TOOL_SEARCH_OVERLAY`` --
+        narrower than ``ACP_BACKENDS_KIRO_SLASH_COMMANDS``, because KAS shares
+        the slash-command dialect but takes this setting over the wire instead
+        (:meth:`_tool_search_settings`). A no-op as well when no toggle value was
+        supplied (``self._tool_search is None``). Called before every (re)spawn
+        so resume/restart keeps the same setting.
         """
-        if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
+        if self._client.backend not in ACP_BACKENDS_TOOL_SEARCH_OVERLAY:
             return
         if self._tool_search is None:
             return
@@ -1533,7 +1624,7 @@ class AcpProvider(LLMProvider):
             # Roll back to the prior state before propagating to the caller.
             if _prev is None:
                 self._effort_per_model.pop(model, None)
-                if self.is_acp_runtime_backend:
+                if self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
                     _clear_cli_overlay_effort(self._client._work_dir, model)
             else:
                 self._effort_per_model[model] = _prev
@@ -1599,39 +1690,12 @@ class AcpProvider(LLMProvider):
         logger.info("ACP effort cleared (kiro); session reset needed for built-in default")
         return False
 
-    async def prepare_private_memory(self) -> None:
-        """Resolve the trusted process fence before allocation or direct startup."""
-        if self._private_memory_prepared:
-            return
-        from kiro_crew.member_memory_auth import (
-            private_memory_store_for_session,
-            require_private_memory_mcp_backend,
-        )
-
-        store = (
-            await asyncio.to_thread(
-                private_memory_store_for_session, self._private_memory_session_key
-            )
-            if self._private_memory_session_key
-            else ""
-        )
-        # An explicitly trusted private constructor must never lose its fence.
-        # Factory extra kwargs cannot supply this decision; the factory ignores
-        # them and this read derives identity from protected session state.
-        private_memory = self._private_memory or bool(store)
-        if private_memory:
-            require_private_memory_mcp_backend(self._client.backend)
-        # The worker only reads. Publish flags and routing together on the loop,
-        # after validation, so cancellation cannot leave a partly prepared client.
-        self._private_memory = private_memory
-        self._client._private_memory = private_memory
-        if private_memory:
-            self._client._mcp_gateway_overlay = None
-            self._client._mcp_gateway_socket = None
-        self._private_memory_prepared = True
-
     async def start(self) -> None:
-        await self.prepare_private_memory()
+        if self.memory_mode not in {"persistent", "incognito", "temporary"}:
+            raise ValueError("Invalid session memory mode")
+        self._client.memory_mode = self.memory_mode
+        if self.memory_mode != "persistent":
+            self._client._resume_session_id = ""
         self.essential_delivery.invalidate()
         # Re-apply the overlay on every (re)start to cover resume / model swap.
         # (no-op for claude backend — that path applies effort live below.)
@@ -1696,7 +1760,12 @@ class AcpProvider(LLMProvider):
             )
 
     async def shutdown(self) -> None:
-        await self._client.shutdown()
+        session_id = self.session_id
+        try:
+            await self._client.shutdown()
+        finally:
+            if self.memory_mode != "persistent" and session_id:
+                await self.cleanup_session(session_id)
 
     @staticmethod
     def _to_llm_event(e: Any) -> LLMEvent:
@@ -1720,6 +1789,8 @@ class AcpProvider(LLMProvider):
             tool_output_digest=e.tool_output_digest,
             tool_output_bytes=e.tool_output_bytes,
             tool_final=e.tool_final,
+            # Dropping this clears the task panel and records an empty plan/updated.
+            todo=e.todo,
             # Forwarded beside `tool_final` because it is NOT derivable from it:
             # `tool_final` is true only for a completed call, so a consumer that
             # needs to know a tool FAILED has this field or nothing. Dropping it
@@ -1796,7 +1867,7 @@ class AcpProvider(LLMProvider):
     async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
         # The direct client can respawn in ensure_ready; resolve that BEFORE
         # comparing receipts so a recycled conversation receives the full text.
-        if isinstance(self._client, AcpClient) and self._private_memory:
+        if isinstance(self._client, AcpClient):
             await self._client.ensure_ready()
         async with aclosing(
             self.essential_delivery.stream(
@@ -1950,6 +2021,32 @@ class AcpProvider(LLMProvider):
         """True when the inner client supports mid-turn steer."""
         return bool(getattr(self._client, "supports_steer", False))
 
+    def _inline_turn_finished_cleanly(self) -> bool:
+        """Whether the last turn reached its own end boundary uncancelled.
+
+        A cancelled turn is NOT a completed compaction, and this is the arm where
+        getting that wrong is most expensive: a false ``completed`` resets the
+        context meter and arms the compaction cooldown, so the session stays full
+        AND stops retrying. The turn reaching its own end boundary is the whole
+        evidence an inline harness offers, so the absence of that boundary has to
+        withhold the answer.
+
+        The test is POSITIVE -- the stop reason must BE ``end_turn`` -- rather than
+        "not cancelled". Excluding cancels alone accepts every other way a turn can
+        fail to finish: a refusal, a token limit, a stop reason this build does not
+        recognise, or a turn that never reported one at all. Each of those means the
+        compaction did not run, and each would otherwise be reported as a success.
+
+        The turn state itself belongs to the client, which is where the question is
+        answered (``AcpClient.turn_finished_cleanly``) -- reading its private
+        ``_cancelled`` / ``_last_stop_reason`` from out here would decide a
+        compaction's fate from a shape this class does not own. Probed rather than
+        called outright, and fails CLOSED when the probe is absent: a placeholder or
+        double that cannot answer does not get the shortcut.
+        """
+        probe = getattr(self._client, "turn_finished_cleanly", None)
+        return bool(probe()) if callable(probe) else False
+
     async def wait_for_compaction(self, timeout: float = COMPACT_WAIT_TIMEOUT_SECS) -> dict:
         """Wait for compaction completed/failed after stream ends.
 
@@ -1968,6 +2065,30 @@ class AcpProvider(LLMProvider):
                 if drain is not None:
                     await drain()
             return cached
+        if self.capabilities.compacts_inline and self._inline_turn_finished_cleanly():
+            # A member of ``ACP_BACKENDS_INLINE_COMPACTION`` finished its
+            # compaction inside the ``session/prompt`` turn, and that turn is
+            # over by the time anyone reaches this method. claude-agent-acp
+            # compacts natively in-prompt; opencode serves ``/compact`` out of
+            # its prompt handler
+            # (``test/fixtures/acp_frames/opencode/compact-live.jsonl``). Neither
+            # emits a compaction status, so the queue wait below has nothing to
+            # receive and would spend the whole ``COMPACT_WAIT_TIMEOUT_SECS``
+            # proving it. The set has exactly those two members -- pi and goose
+            # look the same in their own source and are absent for want of a
+            # driven capture, which is recorded on ``ACP_BACKENDS_COMPACT``.
+            #
+            # HERE rather than in ``compact()``, because this is the one method
+            # BOTH routes to a compaction reach. ``compact()`` covers the
+            # seventeen call sites that pair it with this wait, but the session
+            # layer's autocompact drives the harness through
+            # ``stream_command("/compact")`` and never calls ``compact()`` at
+            # all -- so an arm placed there left the automatic path, the one no
+            # user action is needed to reach, still stranding.
+            #
+            # No ``summary``: an inline harness reports no summary text, and an
+            # invented one would be echoed to the user as the backend's own.
+            return {"type": "completed", "summary": ""}
         return await self._client.wait_for_compaction(timeout)
 
     async def new_conversation(self) -> None:

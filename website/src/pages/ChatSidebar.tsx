@@ -471,7 +471,7 @@ function ChatPaneDropZone({ refusal }: { refusal: SessionRefBlockReason | null }
         ? 'border-accent bg-bg-elevated/90 text-accent ring-2 ring-accent'
         : 'border-border bg-bg-elevated/90 text-muted'
   const pill = (
-    <div className={`inline-flex items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-[12px] shadow-lg backdrop-blur-sm ${tone}`}>
+    <div className={`inline-flex items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-[12px] shadow-lg backdrop-blur-xs ${tone}`}>
       {refusal === 'private'
         ? <EyeOff size={14} className="shrink-0" />
         : refusal === 'self'
@@ -681,7 +681,7 @@ function SortableColumnFolder({ folder, columnId, colSlotKeys, subtree, renderCo
 function FolderDragGhost({ folder }: { folder?: ChatFolder }) {
   return (
     <div data-testid="folder-drag-ghost" className="bg-bg-elevated border border-border rounded-md px-3 py-2 text-[13px] text-text shadow-lg max-w-[240px] truncate pointer-events-none flex items-center gap-2">
-      <FolderGlyph color={folder?.color} size={14} />{folder?.name ?? i18nT('pages.chatSidebar.folder')}
+      <FolderGlyph color={folder?.color} icon={folder?.icon} size={14} />{folder?.name ?? i18nT('pages.chatSidebar.folder')}
     </div>
   )
 }
@@ -2811,7 +2811,7 @@ const SessionRow = memo(function SessionRow({
                   onRename handler) so users can edit or drop it when they rename.
                   A separate ↳ glyph also double-stacked into "↳↳ Fork of …". */}
               {renamingHere ? (
-                <textarea ref={renameInputRef} rows={1} className={`w-full bg-transparent border border-accent rounded px-1 py-0 ${ROW_TITLE_CLS} text-text-strong outline-none select-text resize-none block overflow-hidden focus-ring`} value={renameValue} onChange={e => onRenameChange(e.target.value)} {...ime.bindEnter<HTMLTextAreaElement>({ onEnter: () => { (document.activeElement as HTMLTextAreaElement)?.blur() }, onEscape: onRenameCancel, onBlur: () => onRenameCommit(s.key, renameValue) })} onMouseDown={e => e.stopPropagation()} />
+                <textarea ref={renameInputRef} rows={1} className={`w-full bg-transparent border border-accent rounded px-1 py-0 ${ROW_TITLE_CLS} text-text-strong outline-hidden select-text resize-none block overflow-hidden focus-ring`} value={renameValue} onChange={e => onRenameChange(e.target.value)} {...ime.bindEnter<HTMLTextAreaElement>({ onEnter: () => { (document.activeElement as HTMLTextAreaElement)?.blur() }, onEscape: onRenameCancel, onBlur: () => onRenameCommit(s.key, renameValue) })} onMouseDown={e => e.stopPropagation()} />
               ) : (s.title && s.title !== s.key ? s.title : s.key)}
             </div>
             {/* Secondary line: one ordered resolver decides both the words and the
@@ -5487,11 +5487,12 @@ function ChatSidebar({
 
   // Folder mutations
   const createFolderMutation = useMutation({
-    mutationFn: (v: { name: string; parentId?: string; projectDir?: string; defaultAgent?: string; color?: string; tags?: string[] }) =>
+    mutationFn: (v: { name: string; parentId?: string; projectDir?: string; defaultAgent?: string; color?: string; icon?: string; tags?: string[] }) =>
       api.createChatFolder(v.name.trim(), v.parentId, {
         project_dir: v.projectDir || undefined,
         default_agent: v.defaultAgent || undefined,
         color: v.color || undefined,
+        icon: v.icon || undefined,
         tags: v.tags && v.tags.length > 0 ? v.tags : undefined,
       }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['chat-folders'] }),
@@ -6567,7 +6568,7 @@ function ChatSidebar({
         >
           {/* Dimmer and hover-inert on an empty row - same rule as the tree. */}
           {/* Always open on an inert row - same reason as the tree. */}
-          <FolderGlyph color={folder.color} size={11} open={!collapsed || emptyBody}
+          <FolderGlyph color={folder.color} icon={folder.icon} size={11} open={!collapsed || emptyBody}
             className={emptyBody ? 'shrink-0 text-muted/40 transition-colors' : undefined} />
           {editingId === folder.id && editScope === columnId ? (
             /* Inline rename input — board-view parity with renderFolderHeader.
@@ -7040,7 +7041,7 @@ function ChatSidebar({
         className={`folder-row group relative flex items-center gap-2 px-3.5 py-1.5 rounded-md text-sm text-muted transition-all${emptyRow ? '' : ' hover:text-text hover:bg-bg-hover'} ${draggable ? 'cursor-grab active:cursor-grabbing' : ''}${folderFlash ? ` session-reveal-flash${folderFlash === 'fade' ? ' session-reveal-flash-fade' : ''}` : ''}`}>
         {editingId === folder.id && editScope === 'list' ? (
           <>
-            <FolderGlyph color={folder.color} size={14} open={!collapsed} />
+            <FolderGlyph color={folder.color} icon={folder.icon} size={14} open={!collapsed} />
             <Input ref={folderEditInputRef} className="flex-1 py-0.5 text-[13px] min-w-0" value={editName} onChange={e => setEditName(e.target.value)} onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} {...ime.bindEnter<HTMLInputElement>({ onEnter: () => renameCommit(folder.id, editName), onEscape: () => setEditingId(null), onBlur: () => renameCommit(folder.id, editName) })} />
             <span className="text-[11px] text-muted tabular-nums shrink-0">{count}</span>
           </>
@@ -7092,7 +7093,7 @@ function ChatSidebar({
                *  binding the glyph to that alone would draw the closed shape on an
                *  inert row - this product's "click to expand" affordance on a row
                *  that cannot expand. An inert row is always drawn open. */}
-              <FolderGlyph color={folder.color} size={14} open={!collapsed || emptyRow}
+              <FolderGlyph color={folder.color} icon={folder.icon} size={14} open={!collapsed || emptyRow}
                 className={emptyRow ? 'shrink-0 text-muted/40 transition-colors' : undefined}
                 testId={`folder-collapse-${folder.id}`} />
               {/* Double-click rename is a mouse-only power shortcut; the accessible
@@ -7913,7 +7914,7 @@ function ChatSidebar({
         <div className="mx-2 mb-2 p-3 rounded-lg bg-bg border border-border shadow-md text-sm animate-rise">
           <div className="font-medium text-text-strong mb-2"><Cpu size={14} className="lucide-inline" /> {i18nT('pages.chatSidebar.switch_all_sessions')}</div>
           <div className="text-muted text-[12px] mb-2">{i18nT('pages.chatSidebar.pick_a_model_for_every_session_switching_a_sessi')} <span className="text-danger">{i18nT('pages.chatSidebar.resets_its_conversation')}</span>.</div>
-          <div ref={bulkListRef} role="listbox" aria-label={i18nT('pages.chatSidebar.model_list')} tabIndex={-1} onKeyDown={bulkOnListKeyDown} className="max-h-[220px] overflow-y-auto rounded-md border border-border bg-bg-elevated p-1 mb-2 outline-none">
+          <div ref={bulkListRef} role="listbox" aria-label={i18nT('pages.chatSidebar.model_list')} tabIndex={-1} onKeyDown={bulkOnListKeyDown} className="max-h-[220px] overflow-y-auto rounded-md border border-border bg-bg-elevated p-1 mb-2 outline-hidden">
             <ModelDropdownList models={bulkModelOptions} activeModel={bulkModel} onSelect={setBulkModel} />
           </div>
           {bulkRunningCount > 0 && (
@@ -8352,7 +8353,7 @@ function ChatSidebar({
                         >
                           {!hidden && !hiddenByAncestor && <Check size={10} className="text-accent-fg" strokeWidth={3} />}
                         </span>
-                        <FolderGlyph color={f.color} size={12} className="shrink-0 text-muted" />
+                        <FolderGlyph color={f.color} icon={f.icon} size={12} className="shrink-0 text-muted" />
                         <span className={`flex-1 truncate${hiddenByAncestor ? ' opacity-50' : ''}`}>{f.name}</span>
                         {count > 0 && <span className="text-muted text-[11px] shrink-0">{count}</span>}
                       </DropdownMenuItem>
@@ -8909,7 +8910,7 @@ function ChatSidebar({
                        the page is inert would mislead screen readers. */
                     // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- Escape-dismiss and the Tab trap ARE a dialog's documented keyboard operation, and they have to live on the dialog root because the trap reasons about first/last focusable inside it; the onClick only stopPropagation
                     <div ref={columnPopoverRef} role="dialog" aria-label={i18nT('pages.chatSidebar.filter_tags', { name: col.name || 'column' })} tabIndex={-1} data-column-popover={col.id}
-                      className="fixed z-[9100] bg-bg-elevated border border-border rounded-lg shadow-lg p-2 min-w-[240px] text-[13px] outline-none"
+                      className="fixed z-[9100] bg-bg-elevated border border-border rounded-lg shadow-lg p-2 min-w-[240px] text-[13px] outline-hidden"
                       style={{ top: popoverPos.top, left: popoverPos.left }}
                       onClick={e => e.stopPropagation()}
                       onKeyDown={e => {
@@ -9370,7 +9371,7 @@ function ChatSidebar({
                       <Fragment key={gid}>
                         <button type="button" aria-expanded={!collapsed} aria-label={collapsed ? i18nT('pages.chatSidebar.expand_group_results', { group: groupName }) : i18nT('pages.chatSidebar.collapse_group_results', { group: groupName })} className="w-full flex items-center gap-1.5 px-2 pt-3 pb-1 text-[11px] font-semibold text-muted select-none bg-transparent border-none cursor-pointer hover:text-text first:pt-1" onClick={() => setCollapsedHistoryGroups(prev => { const next = new Set(prev); if (next.has(gid)) next.delete(gid); else next.add(gid); return next })}>
                           <DisclosureChevron open={!collapsed} size={12} />
-                          {folder ? <FolderGlyph color={folder.color} size={12} open={!collapsed} /> : <Folder size={12} className="text-muted shrink-0" />}
+                          {folder ? <FolderGlyph color={folder.color} icon={folder.icon} size={12} open={!collapsed} /> : <Folder size={12} className="text-muted shrink-0" />}
                           <span className="truncate">{folder ? folder.name : i18nT('pages.chatSidebar.unfiled')}</span>
                           <span className="ml-0.5 text-muted font-normal tabular-nums">· {rows.length}</span>
                         </button>
@@ -9443,6 +9444,7 @@ function ChatSidebar({
                 projectDir: draft.projectDir,
                 defaultAgent: draft.defaultAgent,
                 color: draft.color,
+                icon: draft.icon,
                 tags: draft.tags,
               })
               // Creating a folder while flat view is on would otherwise appear
@@ -9465,6 +9467,15 @@ function ChatSidebar({
               if (touched.has('defaultAgent')) body.default_agent = draft.defaultAgent
               // '' is a legitimate color instruction: it clears back to gray.
               if (touched.has('color')) body.color = draft.color
+              // regenerate_icon and a manual icon are mutually exclusive on the
+              // backend; the modal keeps them exclusive in the draft, and this
+              // branch keeps them exclusive on the wire.
+              if (draft.regenerateIcon) {
+                body.regenerate_icon = true
+              } else if (touched.has('icon')) {
+                // '' clears back to the default glyph.
+                body.icon = draft.icon
+              }
               // An empty array is a legitimate instruction too: it clears the
               // folder's tags.
               if (touched.has('tags')) body.tags = draft.tags

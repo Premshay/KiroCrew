@@ -741,3 +741,347 @@ def test_complete_tracking_snapshot_proceeds(monkeypatch, tmp_path):
     assert seen["tracked_pids"] == {201}
     assert seen["active_pids"] == {301}
     assert seen["min_age_secs"] == r._REAP_MIN_AGE_SECS
+
+
+class _ModuleProxy:
+    def __init__(self, module, **overrides):
+        self._module = module
+        self._overrides = overrides
+
+    def __getattr__(self, name):
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._module, name)
+
+
+def test_gateway_boot_monotonic_us_matches_real_proc_start():
+    before_mono = r.time.clock_gettime(r.time.CLOCK_MONOTONIC)
+    boot_us = r.gateway_boot_monotonic_us()
+    after_mono = r.time.clock_gettime(r.time.CLOCK_MONOTONIC)
+    after_boot = r.time.clock_gettime(r.time.CLOCK_BOOTTIME)
+    stat = Path("/proc/self/stat").read_text(encoding="utf-8")
+    start_ticks = int(stat.rsplit(")", 1)[1].split()[19])
+    clk_tck = r.os.sysconf("SC_CLK_TCK")
+    expected_us = int((after_mono - (after_boot - start_ticks / clk_tck)) * 1_000_000)
+
+    assert isinstance(boot_us, int)
+    assert int(before_mono * 1_000_000) >= boot_us
+    assert abs(boot_us - expected_us) < 2_000_000
+
+
+def test_gateway_boot_monotonic_us_rejects_zero_clock_ticks(monkeypatch):
+    real_os = r.os
+
+    def zero_clock_ticks(name):
+        if name == "SC_CLK_TCK":
+            return 0
+        return real_os.sysconf(name)
+
+    monkeypatch.setattr(r, "os", _ModuleProxy(real_os, sysconf=zero_clock_ticks))
+
+    assert r.gateway_boot_monotonic_us() is None
+
+
+def test_gateway_boot_monotonic_us_returns_none_on_proc_read_error(monkeypatch):
+    class UnreadableProcStat:
+        def read_text(self, **_kwargs):
+            raise OSError(5, "unreadable")
+
+    monkeypatch.setattr(r, "Path", lambda _path: UnreadableProcStat())
+
+    assert r.gateway_boot_monotonic_us() is None
+
+
+def test_pid_age_secs_uses_proc_start_ticks(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    _make_proc(proc, 201, pgrp=200)
+    real_os = r.os
+    real_time = r.time
+    monkeypatch.setattr(
+        r,
+        "os",
+        _ModuleProxy(
+            real_os,
+            sysconf=lambda name: 100 if name == "SC_CLK_TCK" else real_os.sysconf(name),
+        ),
+    )
+    monkeypatch.setattr(
+        r,
+        "time",
+        _ModuleProxy(real_time, clock_gettime=lambda clock: 100.0),
+    )
+
+    assert r._pid_age_secs(201, proc) == pytest.approx(57.58)
+
+
+def test_pid_age_secs_returns_none_for_malformed_stat(tmp_path):
+    proc = tmp_path / "proc"
+    _make_proc(proc, 201, pgrp=200)
+    (proc / "201" / "stat").write_text("malformed")
+
+    assert r._pid_age_secs(201, proc) is None
+
+
+def test_pid_age_secs_rejects_zero_clock_ticks(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    _make_proc(proc, 201, pgrp=200)
+    real_os = r.os
+
+    def zero_clock_ticks(name):
+        if name == "SC_CLK_TCK":
+            return 0
+        return real_os.sysconf(name)
+
+    monkeypatch.setattr(r, "os", _ModuleProxy(real_os, sysconf=zero_clock_ticks))
+
+    assert r._pid_age_secs(201, proc) is None
+
+
+def test_scope_age_falls_back_to_youngest_readable_member(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    _make_proc(proc, 201, pgrp=200)
+    _make_proc(proc, 202, pgrp=200)
+    for pid, start_ticks in ((201, 1_000), (202, 9_000)):
+        stat_path = proc / str(pid) / "stat"
+        prefix, _old_ticks = stat_path.read_text().rsplit(" ", 1)
+        stat_path.write_text(f"{prefix} {start_ticks}")
+
+    real_os = r.os
+    real_time = r.time
+    monkeypatch.setattr(
+        r,
+        "os",
+        _ModuleProxy(
+            real_os,
+            sysconf=lambda name: 100 if name == "SC_CLK_TCK" else real_os.sysconf(name),
+        ),
+    )
+    monkeypatch.setattr(
+        r,
+        "time",
+        _ModuleProxy(real_time, clock_gettime=lambda clock: 100.0),
+    )
+
+    assert r._scope_age_secs(None, [201, 202], proc, _NOW) == pytest.approx(10.0)
+
+
+def test_scope_age_fallback_returns_none_without_readable_member(tmp_path):
+    proc = tmp_path / "proc"
+    _make_proc(proc, 201, pgrp=200)
+    _make_proc(proc, 202, pgrp=200)
+    (proc / "201" / "stat").unlink()
+    (proc / "202" / "stat").write_text("malformed")
+
+    assert r._scope_age_secs(None, [201, 202], proc, _NOW) is None
+
+
+def test_instance_dir_reports_missing_per_instance_cgroup(tmp_path, monkeypatch):
+    from kiro_crew import sandbox
+
+    parent = tmp_path / "agents.slice"
+    parent.mkdir()
+    monkeypatch.setattr(sandbox, "_agents_slice_cgroup_dir", lambda: parent)
+    monkeypatch.setattr(sandbox, "_agents_slice_name", lambda: "kirocrew-agents-test.slice")
+
+    slice_dir, why = r._instance_scope_dir()
+
+    assert slice_dir is None
+    assert why == "per-instance slice has no cgroup dir (no scopes)"
+
+
+def test_reap_scopes_reports_slice_listing_error(tmp_path):
+    slice_file = tmp_path / "slice"
+    slice_file.write_text("not a directory")
+    rec = _Recorder()
+
+    summary = _reap(slice_file, tmp_path / "proc", rec)
+
+    assert summary.scanned == 0
+    assert summary.reclaimed == 0
+    assert summary.skipped == 0
+    assert summary.reason.startswith("cannot list slice dir:")
+
+
+def test_pidfd_send_error_survives_close_error(monkeypatch, tmp_path):
+    proc = tmp_path / "proc"
+    _make_proc(proc, 201, pgrp=200)
+    scope = _make_scope(tmp_path / "slice", "run-u1.scope", [201])
+    closed = []
+    real_os = r.os
+
+    def send_error(_fd, _sig):
+        raise OSError(5, "send failed")
+
+    def close_error(fd):
+        closed.append(fd)
+        raise OSError(5, "close failed")
+
+    monkeypatch.setattr(
+        r,
+        "os",
+        _ModuleProxy(real_os, pidfd_open=lambda _pid: 71, close=close_error),
+    )
+    monkeypatch.setattr(r.signal, "pidfd_send_signal", send_error, raising=False)
+
+    sent, reason = r._pidfd_signal_owned(201, signal.SIGTERM, [201], scope, proc)
+
+    assert sent is False
+    assert reason == "pidfd_send_signal failed (5)"
+    assert closed == [71]
+
+
+def test_scope_active_enter_rejects_zero_and_invalid_output(monkeypatch):
+    monkeypatch.setattr(r.platform_compat, "trusted_system_bin", lambda _name: "/bin/systemctl")
+    outputs = iter(["0\n", "not-a-timestamp\n"])
+
+    class Result:
+        @property
+        def stdout(self):
+            return next(outputs)
+
+    monkeypatch.setattr(r.subprocess, "run", lambda *_args, **_kwargs: Result())
+
+    assert r._scope_active_enter_us("never-active.scope") is None
+    assert r._scope_active_enter_us("invalid.scope") is None
+
+
+def test_scope_active_enter_returns_none_on_subprocess_errors(monkeypatch):
+    monkeypatch.setattr(r.platform_compat, "trusted_system_bin", lambda _name: "/bin/systemctl")
+    errors = iter([OSError(5, "failed"), r.subprocess.SubprocessError("failed")])
+
+    def raise_next(*_args, **_kwargs):
+        raise next(errors)
+
+    monkeypatch.setattr(r.subprocess, "run", raise_next)
+
+    assert r._scope_active_enter_us("oserror.scope") is None
+    assert r._scope_active_enter_us("subprocess-error.scope") is None
+
+
+@pytest.mark.asyncio
+async def test_periodic_ticks_reclaim_successive_runtime_trees_without_gateway_restart(
+    tmp_path, monkeypatch
+):
+    """Real loop, watchdog registration and reaper; only the OS table is synthetic."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from kiro_crew import sandbox, session, session_pid
+    from kiro_crew.config import KiroCrewConfig
+
+    proc, slice_dir = tmp_path / "proc", tmp_path / "slice"
+    rec = _Recorder()
+    now = [_NOW]
+    boot = _enter_us_for_age(2000)
+    entered = {}
+    protected = {}
+    for pid in range(701, 708):
+        unit = f"run-protected-{pid}.scope"
+        _make_proc(proc, pid, pgrp=pid if pid == 707 else 700, marker=pid != 706)
+        scope = _make_scope(slice_dir, unit, [pid])
+        rec.register(unit, scope)
+        entered[unit] = _enter_us_for_age(1000)
+        protected[scope / "cgroup.procs"] = (scope / "cgroup.procs").read_bytes()
+
+    cfg = KiroCrewConfig()
+    cfg.session.pool_size = 0
+    cfg.session.timeout_secs = 60
+    cfg.session.watchdog_rss_max_mb = 0
+    manager = session.SessionManager(cfg, provider_factory=None)
+    cleanup = manager._cleanup_boundary()
+    client = SimpleNamespace(_pid=701)
+    manager._sessions["test:active"] = SimpleNamespace(provider=SimpleNamespace(client=client))
+    manager._warm_pool.put_nowait((SimpleNamespace(client=SimpleNamespace(_pid=702)), 0.0))
+    manager._starting_pids.add(703)
+    manager._subagent_runtimes["test:companion"] = SimpleNamespace(pid=704, is_alive=lambda: True)
+    monkeypatch.setattr(session_pid, "_protected_pids", lambda: set())
+    monkeypatch.setattr(session_pid, "_read_tracked_agent_pids", lambda: ({705}, True))
+    monkeypatch.setattr(sandbox, "_probe_cgroup_scope", lambda: (True, "fixture"))
+    monkeypatch.setattr(r, "_instance_scope_dir", lambda: (slice_dir, ""))
+    monkeypatch.setattr(r, "_cached_gateway_boot_us", lambda: boot)
+    monkeypatch.setattr(r, "time", _ModuleProxy(r.time, clock_gettime=lambda _: now[0]))
+    monkeypatch.setattr(r, "os", _ModuleProxy(r.os, getpid=lambda: 900))
+    monkeypatch.setattr(r, "_sel_scope_reap", lambda *args: None)
+    core = r.reap_scopes
+    summaries = []
+
+    def reap_fixture(path, **kwargs):
+        assert kwargs["gateway_boot_us"] == boot
+        result = core(
+            path,
+            **kwargs,
+            proc_root=proc,
+            stop_unit=rec.stop_unit,
+            signal_owned=rec.signal_owned,
+            sleep=rec.sleep,
+            active_enter_us=entered.get,
+        )
+        summaries.append(result.reclaimed)
+        return result
+
+    monkeypatch.setattr(r, "reap_scopes", reap_fixture)
+    # Keep the registered scope hook real; unrelated maintenance must never run.
+    for name in (
+        "_expire_idle_hook",
+        "_orphan_mcp_hook",
+        "_rss_threshold_check",
+        "_stuck_turn_check",
+        "_bg_drain_reap_hook",
+    ):
+        monkeypatch.setattr(cleanup, name, AsyncMock())
+    for name in (
+        "_sweep_session_roots",
+        "_sweep_sandbox_artifacts",
+        "_maybe_prune_pycache",
+        "_sweep_periodic_pids",
+    ):
+        monkeypatch.setattr(cleanup, name, AsyncMock())
+
+    ticks = []
+    round_state = {}
+
+    async def advance():
+        tick = len(ticks)
+        cycle, phase = divmod(tick, 5)
+        leader = 200 + cycle * 10
+        unit = f"run-cycle-{cycle}.scope"
+        client._pid = None if phase == 2 else 701  # incomplete active snapshot
+        if phase == 0:
+            _make_proc(proc, leader, pgrp=leader)
+            _make_proc(proc, leader + 1, pgrp=leader)
+            scope = _make_scope(slice_dir, unit, [leader, leader + 1])
+            rec.register(unit, scope)
+            entered[unit] = int(now[0] * 1_000_000)
+            round_state["scope"] = scope
+        elif phase == 1:
+            # The runtime leader exits before the grace floor, not the gateway.
+            now[0] += 1
+            for path in (proc / str(leader)).iterdir():
+                path.unlink()
+            (proc / str(leader)).rmdir()
+            (round_state["scope"] / "cgroup.procs").write_text(f"{leader + 1}\n")
+        elif phase == 2:
+            now[0] += r._REAP_MIN_AGE_SECS + 1
+        raise asyncio.TimeoutError
+
+    shutdown = SimpleNamespace(is_set=lambda: len(ticks) == 10, wait=advance)
+    monkeypatch.setattr(session, "shutdown_event", shutdown)
+
+    async def record_tick():
+        cycle, phase = divmod(len(ticks), 5)
+        expected = [f"run-cycle-{n}.scope" for n in range(cycle + int(phase >= 3))]
+        assert rec.stopped == expected
+        assert all(path.read_bytes() == body for path, body in protected.items())
+        if phase >= 3:
+            assert (round_state["scope"] / "cgroup.procs").read_bytes() == b""
+        ticks.append(phase)
+
+    monkeypatch.setattr(cleanup, "_sweep_untracked_mcps", record_tick)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(session, "maintenance_executor", lambda: executor)
+        await asyncio.wait_for(cleanup._run_cleanup_ticks(cleanup._adopt_idle_policy()), 10)
+    assert ticks == list(range(5)) * 2
+    assert summaries == [0, 0, 1, 0] * 2
+    assert rec.killed == rec.slept == []

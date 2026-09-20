@@ -13,6 +13,7 @@ import contextlib
 import ctypes.util
 import errno
 import functools
+import importlib
 import io
 import ipaddress
 import logging
@@ -22,13 +23,17 @@ import pathlib
 import platform
 import shutil
 import signal
+import site
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import types
 import zlib
+from asyncio import subprocess as aio_subprocess
 from ctypes import wintypes  # type aliases only; imports cleanly on every platform
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, NamedTuple, Optional, Sequence
@@ -66,6 +71,20 @@ def _ensure_utf8_process_environment() -> None:
     os.environ.update(_UTF8_PROCESS_ENV)
 
 
+def reexec_launcher(launcher: str, args: Sequence[str]) -> None:
+    """Re-enter a validated stable launcher, preserving its dispatch pathname.
+
+    The launcher, not the core, replaces version-specific environment values.
+    Windows execv joins its arguments without quoting, so quote each token for
+    the native CRT parser. POSIX receives the original argument vector directly.
+    """
+    _ensure_utf8_process_environment()
+    argv = [launcher, *args]
+    if IS_WINDOWS:
+        argv = [subprocess.list2cmdline([arg]) for arg in argv]
+    os.execv(launcher, argv)
+
+
 def reexec_python_module(module: str, args: Sequence[str], executable: str | None = None) -> None:
     """Replace this process with ``<executable> -m module``.
 
@@ -87,7 +106,9 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     _ensure_utf8_process_environment()
     resolved = executable or sys.executable
     argv0 = ntpath.basename(resolved) if IS_WINDOWS else resolved
-    os.execv(resolved, [argv0, "-m", module, *args])
+    argv = isolated_python_argv("-m", module, *args, executable=resolved)
+    argv[0] = argv0
+    os.execv(resolved, argv)
 
 
 # Python's os.rename() replaces an existing empty directory on POSIX. Directory
@@ -286,6 +307,44 @@ def is_bundled_interpreter() -> bool:
     at runtime; never re-inline the sentinel at a call site.
     """
     return BUNDLED_BACKEND_DIST_DIRNAME in Path(sys.executable).resolve().parts
+
+
+_PYTHON_OPTIONS_WITH_VALUES: frozenset[str] = frozenset({"-W", "-X", "--check-hash-based-pycs"})
+
+
+def isolated_python_argv(
+    *args: str,
+    executable: str | os.PathLike[str] | None = None,
+    force_isolation: bool = False,
+) -> list[str]:
+    """Argv for a Kiro Crew-owned Python child with bundle-safe user-site policy.
+
+    ``-s`` is the narrow control: it removes the user site while preserving
+    ``PYTHONPATH``, the working-directory import path, and every other
+    environment setting internal app and MCP launchers rely on. A caller that
+    already chose ``-I`` keeps that stronger contract unchanged. Non-bundled
+    parents that currently allow the user site preserve that policy because
+    Kiro Crew itself may have been installed there. Only callers that supply
+    the child's import path through ``PYTHONPATH`` or a script/entry path may
+    set ``force_isolation``. This helper is for Kiro Crew-owned processes and
+    installers, not user scripts or project tools.
+    """
+    resolved = os.fspath(executable or sys.executable)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--" or arg.startswith(("-m", "-c")) or not arg.startswith("-"):
+            break
+        if arg in ("-s", "-I") or (
+            arg.startswith("-")
+            and not arg.startswith(("--", "-W", "-X"))
+            and ("s" in arg[1:] or "I" in arg[1:])
+        ):
+            return [resolved, *args]
+        i += 2 if arg in _PYTHON_OPTIONS_WITH_VALUES else 1
+    if not force_isolation and not is_bundled_interpreter() and site.ENABLE_USER_SITE is True:
+        return [resolved, *args]
+    return [resolved, "-s", *args]
 
 
 # ── macOS TCC-protected home subdirectories ──
@@ -610,17 +669,112 @@ else:
 #  - OFF the loop (cron, app backends — threads/subprocesses): the wait must
 #    cover a legitimately long holder that can hold the lock across a
 #    multi-second operation, and a waiter there must NOT give up and race it. So
-#    use a generous ceiling that no real hold approaches, matching POSIX's "wait
-#    for the lock" as closely as a bounded spin can.
+#    use a generous ceiling that no real hold approaches.
 #  - ON the loop (e.g. bridges._mcp_lock during app enable): a spin-sleep would
 #    freeze chat/heartbeat, so that path never sleeps at all (single-shot).
-_WIN_LOCK_POLL_SECS = 0.01
+_LOCK_POLL_SECS = 0.01
+# Backoff cap for the POSIX poll. A kernel-blocking acquire sleeps at zero cost,
+# so a flat 10ms poll would add ~30k pointless wakeups across the full ceiling;
+# doubling up to this bound keeps the first polls tight (a holder finishing a
+# sub-second critical section is still seen at once) and makes a long wait cheap.
+_LOCK_POLL_MAX_SECS = 0.25
 # Generous off-loop ceiling: longer than any legitimate hold, short enough that
 # a truly stuck/permission-denied fd still fails.
-_WIN_LOCK_TIMEOUT_SECS = 300.0
+_LOCK_TIMEOUT_SECS = 300.0
+
+# The ceiling is not Windows-only. ``fcntl.flock`` has no timeout argument, so an
+# unbounded POSIX acquire waits on a stuck holder without limit -- and on the boot
+# path that is a gateway which never binds its port and logs nothing, which reads
+# as a slow start rather than a failure. Both platforms refuse past this same
+# ceiling, so the failure is reportable. ``_WIN_*`` are aliases of these names.
+_WIN_LOCK_POLL_SECS = _LOCK_POLL_SECS
+_WIN_LOCK_TIMEOUT_SECS = _LOCK_TIMEOUT_SECS
 
 
-def _win_acquire_blocking(fd: int, *, timeout: float = _WIN_LOCK_TIMEOUT_SECS) -> bool:
+def _lock_timeout_message(timeout: float, *, exclusive: bool = True) -> str:
+    """The one refusal string both platforms raise when the ceiling is hit.
+
+    Names the ceiling and the reason. A caller that catches this as best-effort
+    work has nothing else to report, so this message is the only evidence of WHY
+    the critical section was declined.
+    """
+    kind = "exclusive" if exclusive else "shared"
+    return (
+        f"could not acquire {kind} file lock within {timeout:g}s "
+        "(a holder is stuck); refusing to proceed unserialized"
+    )
+
+
+def _posix_acquire_blocking(
+    fd: int,
+    mode: int,
+    *,
+    timeout: float | None = None,
+) -> bool:
+    """POSIX bounded lock acquire: poll ``LOCK_NB`` until free or *timeout*.
+
+    Returns True if the lock was taken, False if the ceiling was reached.
+
+    ``fcntl.flock`` takes no timeout, so polling the non-blocking code is the only
+    way to bound the wait -- the same shape :func:`_win_acquire_blocking` uses, for
+    the same reason: a stuck holder must not be waited on without limit.
+
+    Retries cover contention ONLY. ``EAGAIN``/``EACCES``/``EWOULDBLOCK`` mean
+    another holder has it; any other errno is about this fd and propagates at
+    once, so a real defect is not reported as a stuck holder at the ceiling.
+
+    NEVER polls on the asyncio event-loop thread, matching
+    :func:`_win_acquire_blocking`: ``time.sleep`` there would freeze chat and
+    heartbeat for the whole wait, and a freeze long enough to miss a heartbeat is
+    a supervisor kill. On the loop the acquire is single-shot -- take it if free,
+    else refuse at once -- so a caller fails closed instead of stalling every
+    other session. Off the loop, which is where the lock is normally taken, it
+    polls to the ceiling as a real wait.
+
+    The sleep BACKS OFF from ``_LOCK_POLL_SECS`` to ``_LOCK_POLL_MAX_SECS``: a
+    flat 10ms poll would wake ~30k times across the full ceiling for no benefit,
+    while a kernel-blocking acquire wakes not at all. The first polls stay tight,
+    so a holder finishing its sub-second critical section is picked up promptly,
+    and a long wait settles into a cheap idle.
+    """
+    nb_mode = mode | fcntl.LOCK_NB
+
+    def _try_once() -> bool:
+        try:
+            fcntl.flock(fd, nb_mode)
+            return True
+        except OSError as exc:
+            # Only "someone holds it" is retryable. EBADF/EINVAL and friends are
+            # real errors about THIS fd and must surface now, not at the ceiling.
+            if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                raise
+            return False
+
+    try:
+        asyncio.get_running_loop()
+        on_loop = True
+    except RuntimeError:
+        on_loop = False
+    if on_loop:
+        # Single attempt only -- a poll-sleep here blocks the event loop.
+        return _try_once()
+
+    ceiling = _LOCK_TIMEOUT_SECS if timeout is None else timeout
+    deadline = time.monotonic() + ceiling
+    delay = _LOCK_POLL_SECS
+    while True:
+        if _try_once():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # Never sleep past the deadline, so the refusal lands at the ceiling
+        # rather than up to one backed-off interval after it.
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, _LOCK_POLL_MAX_SECS)
+
+
+def _win_acquire_blocking(fd: int, *, timeout: float = _LOCK_TIMEOUT_SECS) -> bool:
     """Windows blocking lock acquire: spin on LK_NBLCK until free or timeout.
 
     Returns True if the lock was taken, False if it could not be.
@@ -658,7 +812,7 @@ def _win_acquire_blocking(fd: int, *, timeout: float = _WIN_LOCK_TIMEOUT_SECS) -
             return True
         if time.monotonic() >= deadline:
             return False
-        time.sleep(_WIN_LOCK_POLL_SECS)
+        time.sleep(_LOCK_POLL_SECS)
 
 
 @contextlib.contextmanager
@@ -668,27 +822,43 @@ def file_lock(
     exclusive: bool = True,
     required: bool = False,
     wait: bool = True,
+    timeout: float | None = None,
 ) -> Iterator[None]:
     """Acquire an advisory lock on ``fd`` for the duration of the block.
 
-    POSIX: ``fcntl.flock(LOCK_EX|LOCK_SH)`` with ``LOCK_UN`` release.
+    POSIX: ``fcntl.flock(LOCK_EX|LOCK_SH)`` with ``LOCK_UN`` release, acquired by
+    polling the non-blocking code up to ``_LOCK_TIMEOUT_SECS``. ``flock`` itself
+    takes no timeout, and an unbounded wait on a stuck holder is not a wait but a
+    hang: on the boot path it leaves a gateway that binds no port and logs
+    nothing, which no supervisor or health check can act on.
     Windows: ``msvcrt.locking`` on the first byte, acquired by spinning on the
-    non-blocking code up to ``_WIN_LOCK_TIMEOUT_SECS`` — because msvcrt's own
+    non-blocking code up to ``_LOCK_TIMEOUT_SECS`` — because msvcrt's own
     "blocking" code gives up after ~10s with EDEADLOCK, which cannot be treated
     as a wait. ``msvcrt`` has no shared mode, so a shared request is satisfied
     with an exclusive lock (correctness over concurrency — readers genuinely
     serialize with the holder, but never see torn writes).
 
-    On Windows the acquire is single-shot when called on the asyncio event-loop
-    thread (a spin-sleep there would freeze chat/heartbeat) and a bounded poll
-    up to the timeout otherwise; either way, if the lock cannot be taken
+    On BOTH platforms, if the lock cannot be taken within the ceiling
     ``file_lock`` FAILS CLOSED — it raises rather than entering the critical
     section unserialized, since proceeding lock-less is the exact fail-open that
-    loses writes. The timeout is a safety ceiling against a stuck holder, not a
-    normal wait (every in-tree critical section is a sub-second read + atomic
-    rename). ``required`` is kept for call-site intent and does not change
-    the outcome (both paths refuse to proceed without the lock). On POSIX the
-    acquire blocks until the lock is free.
+    loses writes. On BOTH platforms the acquire is additionally single-shot when
+    called on the asyncio event-loop thread: a poll-sleep there would freeze chat
+    and heartbeat for the whole wait, and a freeze long enough to miss a heartbeat
+    is a supervisor kill, so a contended on-loop caller is refused at once and
+    fails closed rather than stalling every other session. The timeout is a safety
+    ceiling against a stuck holder, not a normal wait. ``required`` is kept for
+    call-site intent and does not change the outcome (both paths refuse to proceed
+    without the lock).
+
+    *timeout* overrides that ceiling for a caller whose critical section is
+    legitimately long, and must be set by any caller that can hold the lock past
+    ``_LOCK_TIMEOUT_SECS``. The default suits the common case — a sub-second read
+    plus an atomic rename — but it is NOT an upper bound on every in-tree holder:
+    ``frontend._staging_lock`` spans an ``npm run build`` plus an install, so a
+    default ceiling would refuse a contender while the holder is still working
+    rather than because it is stuck. A ceiling shorter than the holder's real
+    work turns a wait into a spurious refusal, which is the failure this
+    parameter exists to prevent.
 
     *wait* is for a caller whose work is OPTIONAL and retried later, and which
     may run on the event-loop thread: with ``wait=False`` the acquire is
@@ -711,8 +881,20 @@ def file_lock(
         if not wait:
             # BlockingIOError (an OSError) when held: same fail-closed contract
             # as the Windows branch, reported by the platform rather than by us.
-            mode |= fcntl.LOCK_NB
-        fcntl.flock(fd, mode)
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+        elif not _posix_acquire_blocking(fd, mode, timeout=timeout):
+            # Past the ceiling the holder is stuck, not busy. Refuse LOUDLY
+            # rather than wait on it without limit: an unbounded wait here leaves
+            # a boot with no port bound and no log line, while a raise is
+            # something the caller can report and recover from -- the gateway
+            # boot path logs it at ERROR, prints the repair command, and still
+            # binds its port.
+            raise OSError(
+                _lock_timeout_message(
+                    _LOCK_TIMEOUT_SECS if timeout is None else timeout,
+                    exclusive=exclusive,
+                )
+            )
         try:
             yield
         finally:
@@ -728,19 +910,21 @@ def file_lock(
         # strictly safer, and callers already run under `with`, so the fd is
         # cleaned up. `required` is kept for call-site intent and does not
         # change the outcome — both paths refuse to proceed lock-less.
-        timeout = _WIN_LOCK_TIMEOUT_SECS if wait else 0.0
-        # Called with no keyword on the waiting path, so the default-argument
-        # call shape existing tests stub out is preserved.
-        acquired = _win_acquire_blocking(fd) if wait else _win_acquire_blocking(fd, timeout=0.0)
+        ceiling = 0.0 if not wait else (_LOCK_TIMEOUT_SECS if timeout is None else timeout)
+        # The waiting path with no explicit ceiling is called with no keyword, so
+        # the default-argument call shape existing tests stub out is preserved.
+        if not wait:
+            acquired = _win_acquire_blocking(fd, timeout=0.0)
+        elif timeout is None:
+            acquired = _win_acquire_blocking(fd)
+        else:
+            acquired = _win_acquire_blocking(fd, timeout=timeout)
         if not acquired:
             if not wait:
                 # Held right now. BlockingIOError so the caller can tell this
                 # from the stuck-holder ceiling below, matching POSIX LOCK_NB.
                 raise BlockingIOError("file lock is held; not waiting for it")
-            raise OSError(
-                f"could not acquire exclusive file lock within {timeout:g}s "
-                "(a holder is stuck); refusing to proceed unserialized"
-            )
+            raise OSError(_lock_timeout_message(ceiling, exclusive=exclusive))
         try:
             yield
         finally:
@@ -785,22 +969,22 @@ def acquire_lock(fd: int, *, exclusive: bool = True) -> None:
     """Low-level lock acquire for the acquire-now / release-later fd-handoff
     pattern (where a context manager does not fit).
 
-    POSIX: ``fcntl.flock`` (blocks until free). Windows: single-shot on the
-    asyncio loop thread, else a bounded poll up to ``_WIN_LOCK_TIMEOUT_SECS``
-    (see :func:`_win_acquire_blocking`). If the lock cannot be taken it FAILS
+    POSIX and Windows both wait up to ``_LOCK_TIMEOUT_SECS`` off the asyncio loop
+    thread and are both single-shot on it: POSIX polls ``fcntl.flock`` with
+    ``LOCK_NB`` (:func:`_posix_acquire_blocking`), Windows polls ``msvcrt.locking``
+    (:func:`_win_acquire_blocking`). If the lock cannot be taken it FAILS
     CLOSED — raises rather than letting the caller proceed unserialized — since
     a stuck holder past the ceiling is an error, not a routine wait, and
     proceeding lock-less is the fail-open that loses writes. Pair every call
     with :func:`release_lock` on the same ``fd``.
     """
     if IS_POSIX:
-        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if not _posix_acquire_blocking(fd, mode):
+            raise OSError(_lock_timeout_message(_LOCK_TIMEOUT_SECS, exclusive=exclusive))
         return
     if not _win_acquire_blocking(fd):
-        raise OSError(
-            f"could not acquire file lock within {_WIN_LOCK_TIMEOUT_SECS:g}s "
-            "(a holder is stuck); refusing to proceed unserialized"
-        )
+        raise OSError(_lock_timeout_message(_LOCK_TIMEOUT_SECS))
 
 
 def release_lock(fd: int) -> None:
@@ -2116,7 +2300,9 @@ def get_tcp_peer_pid(
     return None
 
 
-def _descendants_from_parent_map(root_pid: int, parent_map: dict[int, int]) -> list[int]:
+def _descendants_from_parent_map(
+    root_pid: int, parent_map: dict[int, int], *, limit: int | None = None
+) -> list[int]:
     """Return a breadth-first descendant list from a PID -> PPID snapshot."""
 
     result: list[int] = []
@@ -2127,6 +2313,8 @@ def _descendants_from_parent_map(root_pid: int, parent_map: dict[int, int]) -> l
         frontier = []
         for child_pid, parent_pid in parent_map.items():
             if parent_pid in parents and child_pid not in seen:
+                if limit is not None and len(seen) >= limit:
+                    raise _WindowsTreeOverflow("Windows cleanup identity capacity exceeded")
                 seen.add(child_pid)
                 result.append(child_pid)
                 frontier.append(child_pid)
@@ -2223,6 +2411,85 @@ def _windows_system_dirs() -> tuple[str, ...]:
             seen.add(fallback.casefold())
             dirs.append(fallback)
     return tuple(dirs) + tuple(os.path.join(d, "WindowsPowerShell", "v1.0") for d in dirs)
+
+
+#: ``FOLDERID_Documents`` — the Known Folder PowerShell derives ``$PROFILE``
+#: from (``Environment.GetFolderPath(MyDocuments)``). Read through the shell API
+#: rather than ``%USERPROFILE%\Documents`` because the folder is redirectable
+#: (OneDrive, roaming profiles, group policy) and PowerShell follows the
+#: redirection, so a guess from the environment would check the wrong place.
+_FOLDERID_DOCUMENTS = "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}"
+
+#: ``(sub-directory, file)`` pairs under Documents that Windows PowerShell 5.1
+#: reads before running a ``-Command``. This is the shell kiro-cli spawns, so
+#: this is the profile set that matters here. The two files are the all-hosts
+#: ``profile.ps1`` and its host-specific companion. PowerShell 7 (``pwsh``) has
+#: its own profiles under ``Documents\PowerShell``; kiro-cli does not spawn it,
+#: so those files never run before the command and are deliberately not listed.
+_POWERSHELL_USER_PROFILES = (
+    ("WindowsPowerShell", "profile.ps1"),
+    ("WindowsPowerShell", "Microsoft.PowerShell_profile.ps1"),
+)
+
+
+def windows_documents_dir() -> str | None:
+    """The user's Documents Known Folder, or ``None`` when Windows cannot say.
+
+    ``None`` is the fail-closed answer for every caller: a check that needs to
+    know what is in Documents cannot proceed on a guess.
+    """
+
+    if not IS_WINDOWS:
+        return None
+    try:
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_uint32),
+                ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16),
+                ("Data4", ctypes.c_uint8 * 8),
+            ]
+
+        text = _FOLDERID_DOCUMENTS.strip("{}")
+        parts = text.split("-")
+        guid = _GUID()
+        guid.Data1 = int(parts[0], 16)
+        guid.Data2 = int(parts[1], 16)
+        guid.Data3 = int(parts[2], 16)
+        tail = bytes.fromhex(parts[3] + parts[4])
+        guid.Data4 = (ctypes.c_uint8 * 8)(*tail)
+        out = ctypes.c_wchar_p()
+        shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
+        ole32 = ctypes.windll.ole32  # type: ignore[attr-defined]
+        result = shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(out))
+        if result != 0 or not out.value:
+            return None
+        try:
+            return str(out.value)
+        finally:
+            ole32.CoTaskMemFree(out)
+    except Exception:
+        return None
+
+
+def windows_powershell_profile_paths() -> tuple[str, ...] | None:
+    """Every per-user PowerShell profile path, or ``None`` when Documents is unknown.
+
+    These are the scripts PowerShell runs BEFORE the command it was handed,
+    unless it was started with ``-NoProfile``. They live under the user's own
+    Documents folder, so whatever can write as the user -- an agent included --
+    can write them, and a function defined there shadows any program name. A
+    caller that vouches for a program by name has to know none of them exist.
+    Existence is the caller's question; this only names where to look.
+    """
+
+    documents = windows_documents_dir()
+    if documents is None:
+        return None
+    return tuple(
+        os.path.join(documents, subdir, filename) for subdir, filename in _POWERSHELL_USER_PROFILES
+    )
 
 
 # Names already probed for the diagnostic below, so the message costs one PATH
@@ -2329,6 +2596,268 @@ def trusted_system_bin(name: str) -> str | None:
                 return candidate
     _log_tool_outside_trusted_dirs(name, directories)
     return None
+
+
+#: The install prefix :data:`_TRUSTED_SYSTEM_BIN_DIRS` deliberately omits. It is
+#: the default ``--bin-dir`` of AWS's own CLI installers, so a tool resolved ONLY
+#: from here is common — but on an Intel macOS with Homebrew this same directory
+#: is owned by the console user, which is exactly the "a same-uid process can
+#: supply the binary" hole the trusted lookup exists to close. Membership alone
+#: therefore proves nothing; :func:`trusted_aws_bin` gates it on ownership.
+_LOCAL_SYSTEM_BIN_DIR = "/usr/local/bin"
+
+#: Set once the ``/usr/local/bin/aws`` copy has been declined and logged.
+_UNTRUSTED_AWS_BIN_LOGGED = False
+
+
+#: Hard stop on symlink expansion while resolving one path. Linux's own limit is
+#: 40; a path needing more than that is a loop or an attack rather than an install
+#: layout, and an unbounded walk would hang instead of answering.
+_MAX_SYMLINK_HOPS = 40
+
+
+def _root_owned_entry(path: str) -> bool:
+    """*path* is root-owned, and no non-root principal can write it.
+
+    Two instruments, because the mode bits alone are an incomplete answer.
+    ``st_uid`` plus the group and world write bits cover the POSIX permission
+    model; ``os.access(..., effective_ids=True)`` covers what that model cannot
+    express — a POSIX ACL's named-user entry (``user:me:w``) does not appear in
+    ``st_mode`` at all, since the group bits show the ACL *mask* rather than the
+    entry, so a mode-only check calls a root-owned ``0755`` path safe while the
+    account this gate defends against can rewrite it. ``faccessat(AT_EACCESS)``
+    evaluates the full ACL, which is why :data:`_ACCESS_HONOURS_EFFECTIVE_IDS`
+    gates that arm rather than a bare ``os.access``: without ``faccessat`` the
+    call would answer about the real ids only and the ACL arm would be silently
+    absent.
+
+    The ACL arm cannot run as root, and that is why running as root DECLINES rather
+    than accepts. As root ``os.access`` answers True for essentially everything, so
+    the arm has no signal — and the entry it would have caught is one granting a
+    NON-root user write, which is precisely the case root must not execute. Treating
+    "cannot establish" as "safe" on a path about to be exec'd as root would turn the
+    strongest caller into the least protected one. The cost is bounded and visible: a
+    root-run diagnostic loses only this ``/usr/local/bin`` fallback, since
+    :func:`trusted_system_bin` does not route through here, and its caller reports the
+    decline rather than silently resolving nothing.
+
+    Not to be confused with :func:`path_writable_by_current_user`, which answers
+    the opposite question ("could this account write it") over two LEXICAL chains
+    and rounds unknown to writable. That shape cannot see a mid-chain symlink hop,
+    which is why :func:`_is_root_owned_path` resolves component by component and
+    calls this per entry instead of delegating wholesale.
+
+    ``os.stat`` rather than ``os.lstat`` on purpose: every caller has already
+    established that *path* is not a symlink, so the two agree, and ``os.stat`` is
+    the call the rest of this module's ownership checks use.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False
+    if not IS_POSIX:
+        return True
+    if 0 in (os.getuid(), os.geteuid()):
+        return False
+    if _ACCESS_HONOURS_EFFECTIVE_IDS and os.access(path, os.W_OK, effective_ids=True):
+        return False
+    return True
+
+
+def _is_root_owned_path(path: str) -> bool:
+    """True when nothing on the way to *path*'s target is another uid's to change.
+
+    Resolves *path* one COMPONENT at a time and validates every directory the walk
+    actually passes through, expanding each symlink it meets — a component's as
+    much as the final name's — and then validating the directories on the target's
+    side too.
+
+    Two weaker shapes were tried here first and both were bypassable, which is why
+    it is written this way rather than more briefly:
+
+    * ``realpath`` and then walk the result collapses the chain, so
+      ``/usr/local/bin/aws -> /tmp/link -> /usr/bin/aws`` is accepted with ``/tmp``
+      — the one directory where the retarget happens — never looked at;
+    * walking ``os.path.dirname`` lexically misses a symlinked COMPONENT, because
+      ``os.stat`` follows symlinks while ``dirname`` does not: for
+      ``/usr/local/bin -> /opt/x/bin`` the target's own parent ``/opt/x``, which
+      can replace it wholesale, is never visited.
+
+    A directory has to be root-owned with no group or world write bit, because
+    replacing an entry needs write on its DIRECTORY rather than on the entry, and a
+    group-writable directory is writable by more than root whoever owns it. The
+    final target has to satisfy the same rule as a file, since a writable regular
+    file can be edited in place without touching any directory. Symlinks met on the
+    way are deliberately not checked themselves: their mode is meaningless (0777 on
+    Linux) and they cannot be edited in place, only replaced, which the directory
+    holding them already governs.
+
+    POSIX semantics. Windows callers do not reach it (:func:`trusted_aws_bin`
+    answers ``None`` there before the gate).
+
+    Any ``OSError``, and any path needing more than :data:`_MAX_SYMLINK_HOPS`
+    expansions, answers ``False``. The fail direction is "decline", never "assume".
+    """
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+    # Reversed, so `pop()` yields the next component and a symlink's own components
+    # can be pushed on to be consumed before the rest of the original path.
+    pending = path.split(os.sep)
+    pending.reverse()
+    resolved = os.sep
+    hops = 0
+    while pending:
+        name = pending.pop()
+        if name in ("", os.curdir):
+            continue
+        if name == os.pardir:
+            resolved = os.path.dirname(resolved)
+            continue
+        # About to read `resolved` as a directory, so it must be one nobody but
+        # root can change. Checked here rather than after descending, so the
+        # target side of an expanded symlink is covered by the same line.
+        if not _root_owned_entry(resolved):
+            return False
+        candidate = os.path.join(resolved, name)
+        try:
+            is_link = os.path.islink(candidate)
+        except OSError:
+            return False
+        if not is_link:
+            resolved = candidate
+            continue
+        hops += 1
+        if hops > _MAX_SYMLINK_HOPS:
+            return False
+        try:
+            target = os.readlink(candidate)
+        except OSError:
+            return False
+        if os.path.isabs(target):
+            resolved = os.sep
+        pending.extend(reversed(target.split(os.sep)))
+    return _root_owned_entry(resolved)
+
+
+def _local_aws_bin_candidate() -> str | None:
+    """The ``/usr/local/bin/aws`` file, if there is an executable one. No gate."""
+    if IS_WINDOWS:
+        return None
+    candidate = os.path.join(_LOCAL_SYSTEM_BIN_DIR, "aws")
+    if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+        return None
+    return candidate
+
+
+def _is_native_program(path: str) -> bool:
+    """*path*'s own bytes ARE the program: not a script naming an interpreter.
+
+    A ``#!`` line hands execution to a DIFFERENT file, and which file that is lives
+    in the script's CONTENT — so the ownership walk, which validates the path, says
+    nothing about it. A root-owned wrapper whose shebang points into a user-writable
+    tree is not exotic: ``sudo pip install awscli`` against a pyenv or
+    home-directory Python produces exactly that.
+
+    Rather than validate the interpreter — and then its libraries, and then its own
+    module search path, a set with no end — the fallback simply does not trust a
+    script. The case it exists for is unaffected: AWS CLI v2's installer ships a
+    native executable, reached through the symlink this resolver already follows.
+
+    A read failure answers ``False``: unreadable is not shown-to-be-safe.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(2) != b"#!"
+    except OSError:
+        return False
+
+
+def _local_aws_bin_is_trusted(candidate: str) -> bool:
+    """Every condition the ``/usr/local/bin`` fallback requires, in ONE place.
+
+    One predicate because two callers ask it — the resolver and the
+    decline-reporter — and a resolver that accepted what the reporter called
+    refused (or the reverse) would state two contradictory facts about one file.
+    That has already gone wrong once on this path, so the conditions live together
+    rather than being spelled out twice.
+    """
+    return _is_root_owned_path(candidate) and _is_native_program(candidate)
+
+
+def trusted_aws_bin() -> str | None:
+    """The ``aws`` executable to spawn, or ``None`` if there is none to trust.
+
+    :func:`trusted_system_bin` plus a ``/usr/local/bin`` fallback, the same shape
+    as :func:`trusted_git_bin` — one tool-specific resolver owning that tool's
+    install-location knowledge, so its callers state a tool and not a search
+    policy. The fallback exists because ``/usr/local/bin`` is the default
+    ``--bin-dir`` of AWS's own installers, and a lookup that missed it made the
+    doctor report "no AWS CLI" on a perfectly ordinary host.
+
+    It is NOT a loosening. The directory is not in
+    :data:`_TRUSTED_SYSTEM_BIN_DIRS` and must not be: on an Intel macOS the
+    Homebrew prefix IS ``/usr/local``, owned by the console user, so membership
+    alone would let a same-uid process supply every pinned tool. The copy is
+    accepted only when :func:`_is_root_owned_path` finds it, its realpath and
+    every directory above both owned by root and not group/world-writable.
+
+    ``None`` on Windows for the fallback half (the directory is a POSIX
+    convention), and ``None`` when the gate declines — the same "unavailable"
+    answer as an absent CLI, which callers already handle. A caller that must
+    tell the two apart asks :func:`aws_bin_declined_on_ownership`.
+    """
+    global _UNTRUSTED_AWS_BIN_LOGGED
+
+    system_copy = trusted_system_bin("aws")
+    if system_copy:
+        return system_copy
+    candidate = _local_aws_bin_candidate()
+    if candidate is None:
+        return None
+    if not _local_aws_bin_is_trusted(candidate):
+        if not _UNTRUSTED_AWS_BIN_LOGGED:
+            # Once per process, matching `_log_tool_outside_trusted_dirs`: a
+            # caller may probe several times in one run, and the verdict
+            # cannot change between them.
+            _UNTRUSTED_AWS_BIN_LOGGED = True
+            logger.warning(
+                "%s is not root-owned or sits under a writable directory — declining to run it",
+                candidate,
+            )
+        return None
+    return candidate
+
+
+def aws_bin_declined_on_ownership() -> str | None:
+    """The ``/usr/local/bin/aws`` that :func:`trusted_aws_bin` REFUSED, if any.
+
+    ``None`` when there is no such copy, and ``None`` when the gate accepts the
+    one there is. For a caller that must tell an operator "you have this tool,
+    and I will not run it" apart from "you do not have this tool" — two different
+    facts, where reporting the second while the first holds is a confident wrong
+    answer, not a cost of the gate.
+
+    Worth knowing how ordinary the decline is: Debian policy has directories
+    under ``/usr/local`` owned ``root:staff`` mode ``2775``, so on a stock Debian
+    or Ubuntu host the gate declines by DEFAULT and the fallback never fires.
+    That degradation is intended — a member of ``staff`` can replace the binary,
+    which is the hole the gate exists to close, and loosening it to accept a
+    group-writable directory would forfeit the property outright. What is not
+    acceptable is a diagnostic that reads the decline as absence.
+
+    ``None`` as well when :func:`trusted_system_bin` found a copy, because then no
+    decline explains anything: the resolver succeeded, and a caller reporting "the
+    local copy was refused" would be offering that as the reason for some later,
+    unrelated failure.
+    """
+    if trusted_system_bin("aws"):
+        return None
+    candidate = _local_aws_bin_candidate()
+    if candidate is None or _local_aws_bin_is_trusted(candidate):
+        return None
+    return candidate
 
 
 def trusted_system_path() -> str | None:
@@ -2627,6 +3156,47 @@ def created_after(child_token: str, parent_token: str) -> bool:
         return False
 
 
+def short_path_name(path: str) -> str:
+    """Return *path*'s Windows 8.3 short form via ``GetShortPathNameW``, or ``""``.
+
+    ``""`` covers every unavailable case alike: a non-Windows host, a path that
+    does not exist, a volume with 8.3 name generation disabled, or the API
+    erroring — this function never raises, and the failing error code goes to
+    DEBUG so an operator can tell those cases apart. The API can also succeed
+    by returning the input spelling unchanged (the volume keeps no separate
+    short alias); that is returned as-is, and whether the spelling is usable
+    is the caller's question.
+
+    Two-call size protocol: the first call (NULL buffer) answers the required
+    buffer length INCLUDING the terminating NUL; the second call writes the
+    string and answers its length EXCLUDING the NUL, so a second answer >= the
+    first means the buffer was too small (the path changed between calls) and
+    the result cannot be trusted.
+    """
+    try:
+        # getattr, not an attribute reference: ``ctypes.WinDLL`` is
+        # Windows-only in typeshed (see the mypy note above), and getattr is
+        # also the seam the cross-platform protocol test injects a fake
+        # kernel32 through.
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        needed = kernel32.GetShortPathNameW(path, None, 0)
+        if not needed:
+            get_last_error = getattr(ctypes, "get_last_error", None)
+            logger.debug(
+                "GetShortPathNameW(%r) failed: error %s",
+                path,
+                get_last_error() if callable(get_last_error) else "unknown",
+            )
+            return ""
+        buf = ctypes.create_unicode_buffer(needed)
+        written = kernel32.GetShortPathNameW(path, buf, needed)
+        if not written or written >= needed:
+            return ""
+        return buf.value
+    except Exception:
+        return ""
+
+
 def _windows_process_parent_map() -> dict[int, int]:
     """Return one Toolhelp PID -> PPID snapshot, raising if enumeration fails."""
 
@@ -2659,6 +3229,8 @@ def _windows_process_parent_map() -> dict[int, int]:
                 raise OSError("Windows first process enumeration failed")
             result: dict[int, int] = {}
             while True:
+                if len(result) >= _WINDOWS_CLEANUP_SNAPSHOT_LIMIT:
+                    raise _WindowsTreeOverflow("Windows cleanup process snapshot capacity exceeded")
                 result[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
                 if callable(set_last_error):
                     set_last_error(0)
@@ -2752,7 +3324,10 @@ def duplicate_asyncio_process_handle(process: object) -> int | None:
         transport = getattr(process, "_transport", None)
         get_extra_info = getattr(transport, "get_extra_info", None)
         popen = get_extra_info("subprocess") if callable(get_extra_info) else None
-        source_value = int(getattr(popen, "_handle", 0))
+        source = getattr(popen, "_handle", None)
+        if not isinstance(source, int):
+            return None
+        source_value = int(source)
         if source_value <= 0:
             return None
 
@@ -2802,8 +3377,17 @@ _WINDOWS_EXIT_FILETIME_TIMEOUT_SECS = 0.25
 _WINDOWS_EXIT_FILETIME_POLL_SECS = 0.002
 
 
-def _windows_process_handle_identity(handle: int) -> tuple[int, int, int | None] | None:
-    """Return ``(pid, creation_time, exit_time)`` for an exact process handle."""
+def _windows_process_handle_identity(
+    handle: int, *, await_exit_time: bool = True
+) -> tuple[int, int, int | None] | None:
+    """Return ``(pid, creation_time, exit_time)`` for an exact process handle.
+
+    ``await_exit_time=False`` answers with the creation half alone: liveness is
+    not decided, the exit FILETIME is neither awaited nor reported, and the third
+    element is ``None`` by construction. That mode performs no wait and no sleep,
+    so it is safe to call from the asyncio event loop; a caller that must certify
+    a process has exited needs the exit bound and keeps the default.
+    """
 
     if not IS_WINDOWS or type(handle) is not int or handle <= 0:
         return None
@@ -2852,16 +3436,43 @@ def _windows_process_handle_identity(handle: int) -> tuple[int, int, int | None]
             )
         ):
             return None
+
+        def _filetime_value(value: "wintypes.FILETIME") -> int:
+            return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+        if not await_exit_time:
+            # Creation-only: the caller asks which process object this pid names,
+            # and the creation FILETIME answers that on its own. Skipping the exit
+            # half keeps this read free of the wait and the poll below, which is
+            # what lets an event-loop caller use it directly.
+            creation_only = _filetime_value(creation)
+            return (pid, creation_only, None) if creation_only > 0 else None
+        # A process may exit with code 259, the value STILL_ACTIVE reserves, so
+        # GetExitCodeProcess alone cannot decide liveness: such a child reads back
+        # as running for as long as a handle to it is held, and a drain waiting for
+        # its exit never finishes while its reservation stays charged. A zero-timeout
+        # wait answers from the object's signal state, which carries no collision:
+        # a signalled process object is a terminated one. Handles opened for query
+        # alone lack SYNCHRONIZE and cannot be waited on; those callers read identity
+        # without draining anything, so they keep the exit-code reading rather than
+        # losing the answer, and every handle a drain retains is opened to wait.
         still_active = 259
-        active = exit_code.value == still_active
+        wait_object_0 = 0x00000000
+        wait_timeout = 0x00000102
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        waited = int(kernel32.WaitForSingleObject(process_handle, 0))
+        if waited == wait_object_0:
+            active = False
+        elif waited == wait_timeout:
+            active = True
+        else:
+            active = exit_code.value == still_active
         # The exit FILETIME is not defined for a live process. If the status
         # says the process exited, read the times again after that observation
         # so the returned exit bound belongs to the terminated object.
         if not active and not _read_times():
             return None
-
-        def _filetime_value(value: "wintypes.FILETIME") -> int:
-            return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
 
         creation_value = _filetime_value(creation)
         exit_value = _filetime_value(exit_)
@@ -3008,13 +3619,22 @@ def descendant_termination_handles(
         return {}
     if type(root_handle) is not int or root_handle <= 0:
         raise ValueError("descendant_termination_handles: exact root handle required")
+    if retained_handles is not None and len(retained_handles) > _WINDOWS_CLEANUP_IDENTITY_LIMIT:
+        raise _WindowsTreeOverflow("Windows cleanup retained identity capacity exceeded")
     retained = dict(retained_handles or {})
     root_identity = _windows_process_handle_identity(root_handle)
     if root_identity is None or root_identity[0] != pid:
         raise ValueError("descendant_termination_handles: root handle identity mismatch")
 
     first_map = _windows_process_parent_map()
-    first = set(_descendants_from_parent_map(pid, first_map))
+    first = set(_descendants_from_parent_map(pid, first_map, limit=_WINDOWS_CLEANUP_IDENTITY_LIMIT))
+    # Check the union without allocating an oversized union or opening a child.
+    count = len(retained) + (pid not in retained)
+    for child in first:
+        if child not in retained:
+            count += 1
+            if count > _WINDOWS_CLEANUP_IDENTITY_LIMIT:
+                raise _WindowsTreeOverflow("Windows cleanup identity capacity exceeded")
     opened: dict[int, int] = {}
     try:
         unopened: set[int] = set()
@@ -3208,14 +3828,541 @@ def close_process_handle(handle: int) -> None:
         kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
+_WINDOWS_TREE_REAP_TIMEOUT_SECS = 5.0
+_WINDOWS_TREE_REAP_POLL_SECS = 0.01
+_PENDING_WINDOWS_TREE_RETRY_LIMIT = 8
+
+
+# Separate cleanup bookkeeping budget, not a pool, RSS, or Job limit. Sixty-four
+# physical trees leave room beyond ordinary concurrent ACP starts; 4096 exact
+# identities per tree allow build/browser fan-out without unbounded retention.
+_WINDOWS_CLEANUP_ROOT_LIMIT = 64
+_WINDOWS_CLEANUP_IDENTITY_LIMIT = 4096
+# Toolhelp includes unrelated host processes. Bound that temporary input too,
+# before retention; an incomplete snapshot cannot prove a tree empty.
+_WINDOWS_CLEANUP_SNAPSHOT_LIMIT = 65536
+
+# The interpreters the capture bindings are measured against, quoted verbatim in
+# the refusals so the operator is told which ones work rather than only that
+# theirs does not.
+_WINDOWS_CAPTURE_MEASURED_VERSIONS = "CPython 3.12, 3.13 or 3.14"
+
+
+class WindowsCleanupCapacityError(OSError):
+    """Cleanup admission refused, or an owned tree needs manual handling."""
+
+
+class _WindowsTreeOverflow(WindowsCleanupCapacityError):
+    """A snapshot/identity bound prevented complete lineage observation."""
+
+
+class _PendingWindowsTreeCleanup:
+    """One reservation, from before physical spawn through verified retirement."""
+
+    __slots__ = (
+        "handles",
+        "key",
+        "lock",
+        "retired",
+        "root_pid",
+        "signalled",
+        "terminally_scanned",
+        "manual_required",
+        "raw_root_pin",
+        "retire_app_tracking",
+    )
+
+    def __init__(
+        self, root_handle: int = 0, identity: tuple[int, int, int | None] = (0, 0, None)
+    ) -> None:
+        self.root_pid = identity[0]
+        self.key = identity[:2]
+        self.handles = {self.root_pid: root_handle} if root_handle else {}
+        self.terminally_scanned: set[int] = set()
+        self.signalled: set[int] = set()
+        self.lock = threading.Lock()
+        self.retired = False
+        self.manual_required = False
+        # Only a subprocess.Handle (an int with Close/__del__), NEVER Popen or
+        # its transport. Keeps the original pin on duplicate/identity failure.
+        self.raw_root_pin: int | None = None
+        self.retire_app_tracking = False
+
+
+_PENDING_WINDOWS_TREE_CLEANUPS: dict[tuple[int, int], _PendingWindowsTreeCleanup] = {}
+_PENDING_WINDOWS_TREE_CLEANUPS_LOCK = threading.RLock()
+_WINDOWS_TREE_ADMISSIONS: set[_PendingWindowsTreeCleanup] = set()
+
+
+def reserve_windows_tree_cleanup(
+    key: tuple[int, int] | None = None,
+) -> _PendingWindowsTreeCleanup:
+    """Atomically admit a physical tree, or reuse its already charged identity."""
+    with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+        if key is not None:
+            for state in _WINDOWS_TREE_ADMISSIONS:
+                if state.key == key:
+                    return state
+                if state.root_pid == key[0] and state.key[1] == 0:
+                    raise OSError("Windows original root identity is pending verification")
+        manual = sorted(
+            state.root_pid for state in _WINDOWS_TREE_ADMISSIONS if state.manual_required
+        )
+        if manual:
+            # The refusal outlives the tree that caused it, so the text has to
+            # carry the cause and the remedy: an operator meeting it hours later
+            # sees only a failed session start, and the log line that named the
+            # root has scrolled away. Naming every quarantined root is bounded by
+            # the same root admission limit that bounds the registry.
+            roots = ", ".join(str(pid) for pid in manual)
+            raise WindowsCleanupCapacityError(
+                "Windows session start refused: cleanup of the process tree rooted at "
+                f"pid {roots} could not be accounted for, so its surviving processes must "
+                "be ended by hand; starts resume after this gateway restarts"
+            )
+        if len(_WINDOWS_TREE_ADMISSIONS) >= _WINDOWS_CLEANUP_ROOT_LIMIT:
+            raise WindowsCleanupCapacityError("Windows cleanup root capacity exhausted")
+        state = _PendingWindowsTreeCleanup()
+        if key is not None:
+            state.key = key
+        _WINDOWS_TREE_ADMISSIONS.add(state)
+        return state
+
+
+def release_windows_tree_reservation(state: _PendingWindowsTreeCleanup) -> None:
+    """Refund only an empty reservation. Pins/manual debt cannot be discarded."""
+    with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+        if state.handles or state.raw_root_pin is not None or state.manual_required:
+            return
+        _WINDOWS_TREE_ADMISSIONS.discard(state)
+        state.retired = True
+
+
+def _manual_windows_tree(state: _PendingWindowsTreeCleanup) -> None:
+    with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+        if not state.manual_required:
+            state.manual_required = True
+            logger.error(
+                "Windows cleanup manual-handling-required: root=%d retained=%d; "
+                "new physical starts refused; this is not OS isolation",
+                state.root_pid,
+                len(state.handles),
+            )
+
+
+async def _bind_windows_cleanup_process(
+    state: _PendingWindowsTreeCleanup, process: asyncio.subprocess.Process
+) -> None:
+    """Capture the original suspended child before any cancellable resume work.
+
+    The exact handle is pinned into ``state.handles`` synchronously, before the
+    single await, so a cancellation that lands while the identity is being read
+    still leaves this child retained for maintenance rather than dropped.
+
+    The identity read is the one step that goes off the loop. A child that has
+    already exited reads back as exited-with-no-exit-FILETIME until the kernel
+    publishes that value, and ``_windows_process_handle_identity`` polls for it
+    for up to ``_WINDOWS_EXIT_FILETIME_TIMEOUT_SECS``. This runs during session
+    start on a loop that is serving every other session, so a child that dies
+    the instant it resumes must not stall them: the wait belongs on
+    :func:`kiro_crew.executors.subprocess_executor`, the same pool the rest of
+    this module's spawn-adjacent waits use.
+    """
+    state.root_pid = process.pid
+    state.key = (process.pid, 0)
+    transport = getattr(process, "_transport", None)
+    popen = transport.get_extra_info("subprocess") if transport is not None else None
+    raw = getattr(popen, "_handle", None)
+    if isinstance(raw, int):
+        state.raw_root_pin = raw
+    handle = duplicate_asyncio_process_handle(process)
+    if handle is None and isinstance(raw, int):
+        # Borrow the original reference-counted Handle if duplication failed.
+        # It must never be explicitly closed while Popen can still use it.
+        handle = int(raw)
+    elif handle is not None:
+        state.raw_root_pin = None
+    setattr(process, "_windows_cleanup_state", state)
+    if handle is not None:
+        state.handles[process.pid] = handle
+        identity = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _windows_process_handle_identity, handle
+        )
+        if identity is not None and identity[0] == process.pid:
+            with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+                state.key = identity[:2]
+            return
+    else:
+        # An unsupported transport with no original pin has no retry authority.
+        _manual_windows_tree(state)
+    with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+        _PENDING_WINDOWS_TREE_CLEANUPS[state.key] = state
+    raise OSError("Windows original child pin/identity unavailable")
+
+
+async def create_windows_cleanup_owned_process(factory: Any) -> asyncio.subprocess.Process:
+    """Charge before spawning; cancellation waits for the child's ownership handoff.
+
+    The factory is invoked only after reservation and is never cancelled by its
+    waiter. An OS-spawn failure has no returned child; a returned child is pinned
+    before the factory task settles, even when the caller has been cancelled.
+    POSIX invokes the factory directly and has no cleanup admission policy.
+    """
+    if not IS_WINDOWS:
+        return await factory()
+    state = reserve_windows_tree_cleanup()
+
+    async def launch() -> asyncio.subprocess.Process:
+        process = await factory(windows_cleanup_owner=state)
+        await _bind_windows_cleanup_process(state, process)
+        return process
+
+    creation = launch()
+    try:
+        task = asyncio.ensure_future(creation)
+    except BaseException:
+        creation.close()
+        release_windows_tree_reservation(state)
+        raise
+    cancelled = False
+    try:
+        while True:
+            try:
+                process = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if task.done():
+                    process = task.result()
+                    break
+    except BaseException:
+        if state.handles:
+            # Creation capture precedes transport initialization. No returned
+            # Process is needed to retain this exact child for maintenance.
+            with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+                _PENDING_WINDOWS_TREE_CLEANUPS[state.key] = state
+        release_windows_tree_reservation(state)
+        raise
+    if cancelled:
+        # This child never reaches its caller; cleanup owns it independently.
+        with contextlib.suppress(OSError):
+            await terminate_windows_asyncio_tree(process)
+        raise asyncio.CancelledError
+    return process
+
+
+async def finish_windows_cleanup_owned_spawn(factory: Any) -> Any:
+    """Drain the resume worker before cancellation can race tree retirement."""
+    if not IS_WINDOWS:
+        return await factory()
+    task = asyncio.ensure_future(factory())
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+            if task.done():
+                result = task.result()
+                break
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+def _drain_windows_process_tree(state: _PendingWindowsTreeCleanup) -> bool:
+    """Advance one exact-handle tree; retain every handle when the pass fails."""
+
+    if state.manual_required:
+        raise WindowsCleanupCapacityError("Windows tree requires manual handling")
+    if state.key[1] == 0:
+        identity = _windows_process_handle_identity(state.handles[state.root_pid])
+        if identity is None or identity[0] != state.root_pid:
+            raise OSError("Windows process-tree root identity unavailable")
+        with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+            if _PENDING_WINDOWS_TREE_CLEANUPS.get(state.key) is state:
+                del _PENDING_WINDOWS_TREE_CLEANUPS[state.key]
+            state.key = identity[:2]
+            _PENDING_WINDOWS_TREE_CLEANUPS[state.key] = state
+    deadline = time.monotonic() + _WINDOWS_TREE_REAP_TIMEOUT_SECS
+    while True:
+        for pid, handle in tuple(state.handles.items()):
+            if pid in state.terminally_scanned:
+                continue
+            if time.monotonic() >= deadline:
+                raise OSError("Windows process tree did not drain before the deadline")
+            before = _windows_process_handle_identity(handle)
+            if before is None or before[0] != pid:
+                raise OSError(f"Windows process-tree identity unreadable: {pid}")
+            state.handles.update(descendant_termination_handles(pid, state.handles, handle))
+            after = _windows_process_handle_identity(handle)
+            if after is None or after[:2] != before[:2]:
+                raise OSError(f"Windows process-tree identity changed or unreadable: {pid}")
+            if before[2] is not None and after[2] is not None:
+                state.terminally_scanned.add(pid)
+            elif after[2] is None and pid not in state.signalled:
+                terminate_process_handle(handle)
+                state.signalled.add(pid)
+        if state.terminally_scanned == set(state.handles):
+            return True
+        time.sleep(_WINDOWS_TREE_REAP_POLL_SECS)
+
+
+def _advance_owned_windows_tree(
+    state: _PendingWindowsTreeCleanup,
+    *,
+    try_only: bool = False,
+) -> tuple[bool, bool]:
+    """Return ``(drained, completed_here)`` and retire a verified handle set.
+
+    A completed drain retires the tree's PID-file records and protected-PID
+    shield BEFORE any handle is closed and while ``state.lock`` is still held, so
+    the retirement runs while the root handle still pins the old incarnation — a
+    recycled pid cannot slip in between the close and the untrack. A retirement
+    that raises leaves the state un-retired and its handles open, so the receipt
+    survives for the next tick rather than being lost with the handles.
+
+    ``try_only`` acquires ``state.lock`` non-blockingly: a state already draining
+    on another caller returns ``(False, False)`` untouched so a maintenance sweep
+    rotates it behind its peers instead of blocking the whole pass on one busy
+    tree. Caller-initiated cleanup leaves it False and keeps its serialization.
+    """
+
+    handles_to_close: tuple[int, ...] = ()
+    completed_here = False
+    if try_only:
+        acquired = state.lock.acquire(blocking=False)
+        if not acquired:
+            return False, False
+    else:
+        state.lock.acquire()
+    try:
+        if state.retired:
+            return True, False
+        try:
+            result = _drain_windows_process_tree(state)
+        except _WindowsTreeOverflow:
+            _manual_windows_tree(state)
+            raise
+        if result:
+            try:
+                # circular import: session_pid imports this module at its own top,
+                # so the tracking retirement it owns can only be reached in-function.
+                from kiro_crew.session_pid import retire_windows_tree_tracking
+
+                retire_windows_tree_tracking(state.root_pid)
+                if state.retire_app_tracking:
+                    # circular import: apps.backend also imports this module at its top.
+                    from kiro_crew.apps.backend import retire_windows_app_tracking
+
+                    retire_windows_app_tracking(*state.key)
+            except Exception:
+                logger.warning(
+                    "Windows exact-handle tree retirement failed for PID %d; "
+                    "retaining pinned handles for retry",
+                    state.root_pid,
+                    exc_info=True,
+                )
+                return False, False
+            state.retired = True
+            completed_here = True
+            handles_to_close = tuple(state.handles.values())
+            # The state remains locked and charged until all pins close.
+            for handle in handles_to_close:
+                if state.raw_root_pin is None or handle != int(state.raw_root_pin):
+                    close_process_handle(handle)
+            state.handles.clear()
+            state.signalled.clear()
+            state.terminally_scanned.clear()
+            state.raw_root_pin = None
+            with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+                if _PENDING_WINDOWS_TREE_CLEANUPS.get(state.key) is state:
+                    del _PENDING_WINDOWS_TREE_CLEANUPS[state.key]
+                release_windows_tree_reservation(state)
+    finally:
+        state.lock.release()
+    return result, completed_here
+
+
+def terminate_windows_process_tree_owned(
+    root_handle: int,
+    *,
+    reservation: _PendingWindowsTreeCleanup | None = None,
+) -> bool:
+    """Drain an exact handle, retaining failed ownership for maintenance.
+
+    An unadmitted caller at capacity retains ownership of its input handle;
+    capacity refusal never closes it. PID-based callers reserve before opening.
+    """
+    if not IS_WINDOWS:
+        close_process_handle(root_handle)
+        raise ValueError("Windows process-tree termination requires Windows")
+    identity = _windows_process_handle_identity(root_handle)
+    if identity is None:
+        # Even an unidentifiable imported handle must not be consumed at full
+        # capacity. Its caller keeps ownership when admission is refused.
+        empty = reserve_windows_tree_cleanup() if reservation is None else reservation
+        if empty.handles:
+            raise OSError("Windows process-tree root identity unavailable")
+        close_process_handle(root_handle)
+        release_windows_tree_reservation(empty)
+        raise OSError("Windows process-tree root identity unavailable")
+    key = identity[:2]
+    with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+        existing = next((item for item in _WINDOWS_TREE_ADMISSIONS if item.key == key), None)
+        if existing is not None:
+            if reservation is not None and reservation is not existing:
+                release_windows_tree_reservation(reservation)
+            state = existing
+        else:
+            state = reserve_windows_tree_cleanup(key) if reservation is None else reservation
+        if state.key == (0, 0):
+            state.key = key
+    with state.lock:
+        if state.retired:
+            close_process_handle(root_handle)
+            return state.root_pid > 0
+        if not state.handles:
+            state.root_pid = identity[0]
+            state.key = key
+            state.handles[state.root_pid] = root_handle
+        elif state.key != key:
+            raise ValueError("Windows cleanup reservation identity mismatch")
+        elif state.handles[state.root_pid] != root_handle:
+            close_process_handle(root_handle)
+        with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+            _PENDING_WINDOWS_TREE_CLEANUPS[key] = state
+    drained, _ = _advance_owned_windows_tree(state)
+    return drained
+
+
+def retry_pending_windows_process_trees(
+    limit: int = _PENDING_WINDOWS_TREE_RETRY_LIMIT,
+) -> tuple[int, ...]:
+    """Advance a finite, fair snapshot of process-owned failed Windows drains.
+
+    Each selected tree gets one attempt. Failures remain visible and move behind
+    their peers, so a permanently denied tree cannot starve a healthy one. A tree
+    already draining on another caller is skipped non-blockingly and rotated
+    behind its peers, so one busy entry cannot hold up the whole sweep. This is
+    same-process maintenance, not crash recovery; it acquires no PID authority.
+    Returns the exact root PIDs whose handle-verified drains completed AND whose
+    tracking retirement succeeded.
+    """
+    if not IS_WINDOWS or type(limit) is not int or limit <= 0:
+        return ()
+    with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+        selected = [
+            (key, state)
+            for key, state in _PENDING_WINDOWS_TREE_CLEANUPS.items()
+            if not state.manual_required
+        ][:limit]
+    completed: list[int] = []
+    for key, state in selected:
+        try:
+            _, completed_here = _advance_owned_windows_tree(state, try_only=True)
+            if completed_here:
+                completed.append(state.root_pid)
+            else:
+                # Busy trees and failed metadata writes both yield to peers.
+                # Fully retired entries have already left the registry.
+                with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+                    if _PENDING_WINDOWS_TREE_CLEANUPS.get(key) is state:
+                        del _PENDING_WINDOWS_TREE_CLEANUPS[key]
+                        _PENDING_WINDOWS_TREE_CLEANUPS[key] = state
+        except Exception as exc:
+            logger.warning(
+                "Windows exact-handle tree cleanup remains pending for PID %d (%s)",
+                state.root_pid,
+                exc,
+            )
+            with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+                if _PENDING_WINDOWS_TREE_CLEANUPS.get(key) is state:
+                    del _PENDING_WINDOWS_TREE_CLEANUPS[key]
+                    _PENDING_WINDOWS_TREE_CLEANUPS[key] = state
+    return tuple(completed)
+
+
+async def terminate_windows_asyncio_tree(process: asyncio.subprocess.Process) -> bool:
+    """Drain the original asyncio Windows process tree even after root exit.
+
+    asyncio's transport retains the original Popen in its extra-info mapping.
+    Duplicate that handle and transfer its ownership to process-local cleanup
+    state before draining. The exact root and every observed intermediary then
+    outlive provider/client GC after a failed pass. Repeated caller cancellation
+    is re-delivered only after the current cleanup attempt settles.
+    """
+    candidate = getattr(process, "_windows_cleanup_state", None)
+    admitted = isinstance(candidate, _PendingWindowsTreeCleanup)
+    state: _PendingWindowsTreeCleanup
+    handle: int | None
+    if isinstance(candidate, _PendingWindowsTreeCleanup):
+        state = candidate
+        handle = None
+        # Publish cleanup debt before executor submission: a rejected worker
+        # must still leave the original pins reachable by maintenance after GC.
+        with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+            if not state.retired:
+                _PENDING_WINDOWS_TREE_CLEANUPS[state.key] = state
+    else:
+        state = reserve_windows_tree_cleanup()
+        handle = duplicate_asyncio_process_handle(process)
+        if handle is None:
+            release_windows_tree_reservation(state)
+            raise OSError("Cannot retain the original Windows runtime process handle")
+
+    def drain() -> bool:
+        if admitted:
+            result, _ = _advance_owned_windows_tree(state)
+        else:
+            assert handle is not None
+            result = terminate_windows_process_tree_owned(handle, reservation=state)
+        if not result:
+            raise OSError("Windows tree tracking retirement did not complete")
+        return result
+
+    async def cleanup() -> bool:
+        loop = asyncio.get_running_loop()
+        try:
+            worker = loop.run_in_executor(subprocess_executor(), drain)
+        except BaseException:
+            if handle is not None:
+                # Executor submission never transferred this duplicate.
+                close_process_handle(handle)
+                release_windows_tree_reservation(state)
+            raise
+        result = await asyncio.shield(worker)
+        await asyncio.wait_for(process.wait(), timeout=_WINDOWS_TREE_REAP_TIMEOUT_SECS)
+        return result
+
+    task = asyncio.ensure_future(cleanup())
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+            if task.done():
+                result = task.result()
+                break
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 def process_matches(pid: int, needles: tuple[str, ...]) -> bool:
     """Return True iff *pid*'s command line / image name contains any *needle*.
 
     Used to guard against PID recycling before killing a tracked process.
     Linux: ``/proc/<pid>/cmdline``. macOS: ``ps -o command=``.
-    Windows: the image name from ``CreateToolhelp32Snapshot`` (full command
-    line is not cheaply available; the ``.exe`` name suffices for matching
-    ``kiro-cli`` / ``claude``). Returns False on any failure.
+    Windows: the image name from ``CreateToolhelp32Snapshot`` (the full command
+    line is not cheaply available). A harness hosted by an interpreter reads as
+    that interpreter's image there — a Node-hosted ACP adapter is ``node.exe`` —
+    so a needle naming the adapter itself cannot match on Windows, and a caller
+    that needs a per-harness answer reads a recorded start identity instead
+    (``get_process_start_id``). Returns False on any failure.
     """
     try:
         if sys.platform == "linux":
@@ -3240,6 +4387,21 @@ def process_matches(pid: int, needles: tuple[str, ...]) -> bool:
     except Exception:
         return False
     return False
+
+
+def process_image_name(pid: int) -> str:
+    """The process image (exe) name for *pid* on Windows, ``""`` anywhere else.
+
+    Exposed because an image name is the only per-process identity Windows offers
+    cheaply, and a caller that wants to compare it EXACTLY cannot use
+    :func:`process_matches`, whose Windows arm is a substring test. Off Windows the
+    answer is ``""`` rather than a POSIX equivalent: the platforms that have a real
+    command line should read that instead of a name that would drop the interpreter
+    distinction.
+    """
+    if not IS_WINDOWS:
+        return ""
+    return _win_process_image_name(pid) or ""
 
 
 def _win_process_image_name(pid: int) -> str | None:
@@ -4023,11 +5185,13 @@ def process_start_time(pid: int) -> str | None:
         if handle is None:
             return None
         try:
-            identity = _windows_process_handle_identity(handle)
+            identity = _windows_process_handle_identity(handle, await_exit_time=False)
         finally:
             _close_process_handle(handle)
         # (pid, creation_time, exit_time) -- only the creation half is an
-        # identity; exit_time moves as the process dies.
+        # identity; exit_time moves as the process dies. Asking for the creation
+        # half alone keeps this read non-blocking, which is the contract
+        # :func:`get_process_start_id` publishes to its event-loop callers.
         return str(identity[1]) if identity is not None else None
     ps_bin = trusted_system_bin("ps")
     if ps_bin is None:
@@ -4413,51 +5577,44 @@ def _close_process_handle(handle: int) -> None:
         logger.debug("CloseHandle failed for process handle %d", handle, exc_info=True)
 
 
-def kill_process_tree_pinned(pid: int, expected_start_time: str, sig: int = SIGTERM) -> bool:
-    """Kill *pid*'s tree only while its verified identity is PINNED OPEN.
+def kill_process_tree_pinned(
+    pid: int, expected_start_time: str, sig: int = SIGTERM, *, app_tracking: bool = False
+) -> bool:
+    """Drain *pid*'s Windows tree only after pinning its creation identity.
 
-    :func:`kill_process_tree` addresses the target by PID, and on Windows it
-    does so from a separate ``taskkill`` process. A caller that merely read the
-    start time first has released every handle by then, so between the check and
-    the terminate the process can exit and Windows can recycle the PID onto an
-    unrelated process -- which ``taskkill /T /F /PID`` would then tear down with
-    its whole tree. The check is only as good as the window after it.
-
-    Windows keeps a process ID reserved for as long as ANY handle to the process
-    object remains open, so holding the query handle that verified the identity
-    across the terminate is what makes the PID still mean the same process when
-    ``taskkill`` resolves it. That is the guarantee this function adds, and the
-    only reason it exists.
-
-    Returns ``False`` -- WITHOUT invoking any kill -- when the handle cannot be
-    opened or the identity does not match *expected_start_time*. Callers must
-    treat that as "identity unconfirmed, do not reap", the same fail-safe the
-    start-time comparison already gives them. On a match it delegates to
-    :func:`kill_process_tree` and propagates its exceptions unchanged, so
-    ``except (ProcessLookupError, OSError)`` handlers keep firing as before.
-
-    POSIX is deliberately untouched: it delegates straight through, because
-    ``os.killpg`` is issued in-process by the same interpreter that did the
-    check and there is no handle to hold. The residual probe-to-signal window
-    there is the pre-existing one the callers already mitigate by re-confirming
-    identity before the destructive escalation.
+    Returns False without signalling when the original object cannot be opened
+    or its creation time does not match. On Windows an exited root may still
+    anchor surviving descendants; the exact-handle drain verifies their full
+    lifetime chains and confirms exit, raising on unknown or incomplete cleanup.
+    SIGTERM and SIGKILL both use Windows hard termination, as with taskkill /F.
+    POSIX continues to delegate to kill_process_tree unchanged.
     """
     if not IS_WINDOWS:
         return kill_process_tree(pid, sig)
-    handle = _open_process_query_handle(pid)
-    if handle is None:
-        return False
     try:
-        identity = _windows_process_handle_identity(handle)
-        # (pid, creation_time, exit_time) -- the creation half is the identity.
-        if identity is None or str(identity[1]) != expected_start_time:
-            return False
-        # The handle stays open for the whole call: taskkill resolves the PID
-        # while this process object is still referenced, so the PID cannot have
-        # been recycled onto a different process in between.
-        return kill_process_tree(pid, sig)
-    finally:
-        _close_process_handle(handle)
+        key = (pid, int(expected_start_time))
+    except (TypeError, ValueError):
+        return False
+    state = reserve_windows_tree_cleanup(key)
+    with state.lock:
+        if state.retired:
+            return state.root_pid > 0
+        if not state.handles:
+            try:
+                handle = open_process_termination_handle(pid, expected_start_time)
+            except BaseException:
+                release_windows_tree_reservation(state)
+                raise
+            if handle is None:
+                release_windows_tree_reservation(state)
+                return False
+            state.root_pid = pid
+            state.handles[pid] = handle
+        state.retire_app_tracking |= app_tracking
+        with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+            _PENDING_WINDOWS_TREE_CLEANUPS[key] = state
+    drained, _ = _advance_owned_windows_tree(state)
+    return drained
 
 
 def kill_pid_pinned(pid: int, expected_start_time: str, sig: int = SIGTERM) -> bool:
@@ -7344,3 +8501,143 @@ def ensure_owner_rwx_dirs(root: str | os.PathLike) -> None:
                 dirnames.remove(dname)
                 continue
             _add_owner_rwx(entry)
+
+
+def windows_tree_cleanup_pending(pid: int, start: str | None) -> bool:
+    """A pending pin outranks numeric liveness, including a dead root PID."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        key = (pid, int(start)) if start is not None else None
+    except (TypeError, ValueError):
+        return False
+    with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+        if key is None:
+            return any(state.root_pid == pid for state in _PENDING_WINDOWS_TREE_CLEANUPS.values())
+        return key in _PENDING_WINDOWS_TREE_CLEANUPS
+
+
+async def _create_windows_subprocess_owned(
+    owner: _PendingWindowsTreeCleanup, program: str, *args: str, limit: int = 2**16, **kwargs: Any
+) -> asyncio.subprocess.Process:
+    """Run CPython's subprocess implementation with per-call creation capture.
+
+    Only this call sees the substituted native API and transport constructors.
+    The interpreter's functions, globals, event loop and Popen stay untouched.
+    Capture happens at CreateProcess return, BEFORE _close_pipe_fds, Handle
+    publication, thread-handle close, proactor registration or pipe connection.
+    """
+    # Private Windows APIs have no Linux typeshed declarations. Runtime identity
+    # checks below refuse a different transport implementation before creation.
+    windows_events: Any = importlib.import_module("asyncio.windows_events")
+    windows_utils: Any = importlib.import_module("asyncio.windows_utils")
+    loop = asyncio.get_running_loop()
+    make_transport = getattr(getattr(loop, "_make_subprocess_transport"), "__func__", None)
+    subprocess_exec = getattr(loop.subprocess_exec, "__func__", None)
+    if (
+        make_transport is not windows_events.ProactorEventLoop._make_subprocess_transport
+        or subprocess_exec is not asyncio.BaseEventLoop.subprocess_exec
+    ):
+        raise RuntimeError(
+            "Windows session start refused: this interpreter does not expose the CPython "
+            "Proactor subprocess path the tree-cleanup capture binds to; run the gateway on "
+            f"a measured interpreter ({_WINDOWS_CAPTURE_MEASURED_VERSIONS})"
+        )
+    execute_child = getattr(subprocess.Popen, "_execute_child")
+    start_transport = windows_events._WindowsSubprocessTransport._start
+    if (
+        not {"_winapi", "CreateProcess", "Handle"}.issubset(execute_child.__code__.co_names)
+        or not {"windows_utils", "Popen"}.issubset(start_transport.__code__.co_names)
+        or "_WindowsSubprocessTransport" not in make_transport.__code__.co_names
+    ):
+        # Same reasoning as the quarantine refusal: an operator meeting this sees a
+        # failed session start and no context, and the remedy is not guessable from
+        # the shape names. The interpreter is the whole cause, so it is the remedy.
+        raise RuntimeError(
+            "Windows session start refused: this interpreter's private subprocess bindings "
+            "differ from the shapes the tree-cleanup capture is measured against; run the "
+            f"gateway on a measured interpreter ({_WINDOWS_CAPTURE_MEASURED_VERSIONS})"
+        )
+    with _PENDING_WINDOWS_TREE_CLEANUPS_LOCK:
+        if owner not in _WINDOWS_TREE_ADMISSIONS or owner.retired or owner.handles:
+            raise RuntimeError("Windows subprocess requires an unused cleanup reservation")
+
+    def clone(function: Any, **bindings: Any) -> Any:
+        cloned = types.FunctionType(
+            function.__code__,
+            dict(function.__globals__, **bindings),
+            function.__name__,
+            function.__defaults__,
+            function.__closure__,
+        )
+        cloned.__kwdefaults__ = function.__kwdefaults__
+        return cloned
+
+    native = getattr(subprocess, "_winapi")
+    handle_type = getattr(subprocess, "Handle")
+
+    class CreationAPI:
+        def __init__(self) -> None:
+            self.thread_pin: Any = None
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(native, name)
+
+        def CloseHandle(self, value: int) -> None:
+            if self.thread_pin is not None and int(self.thread_pin) == value:
+                self.thread_pin.Close()
+                self.thread_pin = None
+            else:
+                native.CloseHandle(value)
+
+        def CreateProcess(self, *values: Any, **options: Any) -> Any:
+            result = native.CreateProcess(*values, **options)
+            hp, ht, pid, _tid = result
+            # Record the raw exact process value before wrapping handles: even
+            # a later wrapper/setup exception must leave the reservation owed.
+            owner.root_pid = pid
+            owner.key = (pid, 0)
+            owner.handles[pid] = hp
+            # If pipe-fd cleanup raises before CPython closes ht, this local
+            # reference-counted pin closes it when the failed launch unwinds.
+            self.thread_pin = handle_type(ht)
+            # Keep the reference-counted object itself. Popen receives THIS
+            # object below, not a second Handle owning the same native value.
+            pin = handle_type(hp)
+            owner.raw_root_pin = pin
+            return result
+
+    def shared_handle(value: int) -> Any:
+        if owner.raw_root_pin is not None and int(owner.raw_root_pin) == value:
+            return owner.raw_root_pin
+        return handle_type(value)
+
+    class OwnedPopen(windows_utils.Popen):
+        _execute_child = clone(
+            getattr(subprocess.Popen, "_execute_child"), _winapi=CreationAPI(), Handle=shared_handle
+        )
+
+    class OwnedTransport(windows_events._WindowsSubprocessTransport):
+        _start = clone(
+            windows_events._WindowsSubprocessTransport._start,
+            windows_utils=types.SimpleNamespace(Popen=OwnedPopen),
+        )
+
+    class SpawnLoop:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(loop, name)
+
+        _make_subprocess_transport = staticmethod(
+            types.MethodType(
+                clone(make_transport, _WindowsSubprocessTransport=OwnedTransport),
+                loop,
+            )
+        )
+
+    def protocol_factory() -> Any:
+        return aio_subprocess.SubprocessStreamProtocol(limit=limit, loop=loop)
+
+    transport, protocol = await subprocess_exec(
+        SpawnLoop(), protocol_factory, program, *args, **kwargs
+    )
+    return aio_subprocess.Process(transport, protocol, loop)

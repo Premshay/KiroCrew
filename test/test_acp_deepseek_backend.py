@@ -71,7 +71,7 @@ def test_it_is_known_but_not_shipped_selectable() -> None:
         (ACP_BACKENDS_RESUME_WITHOUT_LOAD, True),
         (ACP_BACKENDS_SESSION_MCP_ARRAY, True),
         (ACP_BACKENDS_ADVERTISED_MODEL_SELECTION, True),
-        (ACP_BACKENDS_STEER, False),
+        (ACP_BACKENDS_STEER, True),
         (ACP_BACKENDS_COMPACT, False),
         (ACP_BACKENDS_INTERNAL_SANDBOX, False),
         (ACP_BACKENDS_MEMBER_DISPATCH, False),
@@ -89,6 +89,19 @@ def test_every_capability_is_an_explicit_decision(membership: frozenset, expecte
 def test_the_resume_set_is_the_only_member_and_says_why() -> None:
     """Sole membership is the claim: no other harness Crew carries lacks the verb."""
     assert ACP_BACKENDS_RESUME_WITHOUT_LOAD == frozenset({ACP_BACKEND_DEEPSEEK})
+
+
+def test_steer_membership_is_gated_on_the_handshake_advertisement() -> None:
+    """An installed dsh-acp without the verb must read unsteerable, not steered.
+
+    Membership in the transport set alone would send ``_session/steer`` to a
+    bridge that answers method-not-found, and the dashboard would report the
+    message as steered while the turn never saw it. The advertised set routes
+    this harness through the connection-level flag instead.
+    """
+    from kiro_crew.acp.types import ACP_BACKENDS_STEER_ADVERTISED
+
+    assert ACP_BACKEND_DEEPSEEK in ACP_BACKENDS_STEER_ADVERTISED
 
 
 def test_the_effort_option_id_is_this_harness_own_spelling() -> None:

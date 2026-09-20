@@ -21,7 +21,7 @@ import pytest
 
 from kiro_crew import crew_log as lg
 from kiro_crew import executors
-from kiro_crew.crew_log import emit, ledger_path, ledger_root
+from kiro_crew.crew_log import crew_log_path, crew_log_root, emit
 from kiro_crew.crew_log.lease import LEASE_FILE
 from kiro_crew.dashboard import server as server_module
 from kiro_crew.platform_compat import file_lock
@@ -88,18 +88,18 @@ def test_the_retry_schedule_doubles_from_its_floor_to_its_ceiling():
     assert spent < emit._SHUTDOWN_DRAIN_SECONDS
 
 
-def _ledger_path(session_id: str = SESSION) -> Path:
+def _log_path(session_id: str = SESSION) -> Path:
     """Ask the storage library where it puts things; never pin its layout."""
-    return ledger_path("session", session_id)
+    return crew_log_path("session", session_id)
 
 
 def _store_root() -> Path:
-    return ledger_root("session")
+    return crew_log_root("session")
 
 
 def _entries(session_id: str = SESSION) -> list[dict]:
     """Every line, header first, exactly as the emitter left it."""
-    path = _ledger_path(session_id)
+    path = _log_path(session_id)
     if not path.is_file():
         return []
     with path.open("r", encoding="utf-8") as handle:
@@ -125,10 +125,10 @@ def _open_session() -> None:
 # --- creation and header ---------------------------------------------------
 
 
-def test_first_open_creates_the_ledger_file():
-    assert not _ledger_path().exists()
+def test_first_open_creates_the_log_file():
+    assert not _log_path().exists()
     _open_session()
-    assert _ledger_path().is_file()
+    assert _log_path().is_file()
 
 
 def test_the_header_is_line_one_and_carries_owner_agent_slot_cwd():
@@ -163,6 +163,67 @@ def test_opened_entry_echoes_the_header_and_adds_the_model():
 def test_an_agentless_call_site_still_produces_a_valid_header():
     emit.on_session_opened(SESSION, slot="chat-1")
     assert _entries()[0]["agent"] == "kirocrew"
+
+
+# --- the model: what serves, and what was asked for ------------------------
+
+
+def test_the_request_is_recorded_when_the_backend_confirmed_nothing():
+    # The dispatched-worker shape: the gateway resolved a model (a crew pin) and
+    # the backend confirmed none. Without the request the entry is
+    # indistinguishable from a session deliberately left on the backend default.
+    emit.on_session_opened(
+        SESSION,
+        agent="kirocrew-worker",
+        slot="chat-42",
+        model="",
+        model_requested="claude-opus-5",
+    )
+    data = _opened_data()
+    assert data["model"] == ""
+    assert data["model_requested"] == "claude-opus-5"
+
+
+def test_a_concrete_served_default_does_not_hide_the_request():
+    # A refused pin does not have to leave `model` empty: the backend can report
+    # a concrete default of its own instead of the auto sentinel. Conditioning
+    # the request on an unknown `model` dropped exactly this case, and the entry
+    # is append-only, so the requested/served pair was lost with no way back.
+    emit.on_session_opened(
+        SESSION,
+        agent="kirocrew-worker",
+        slot="chat-42",
+        model="backend-default-7",
+        model_requested="claude-opus-5",
+    )
+    data = _opened_data()
+    assert data["model"] == "backend-default-7"
+    assert data["model_requested"] == "claude-opus-5"
+
+
+def test_a_request_served_under_another_spelling_keeps_both_ids():
+    # The backend serves the spelling IT resolved, so an APPLIED request can come
+    # back as a different string. The entry records both and claims nothing about
+    # which happened -- a reader must not read the difference as a refusal.
+    emit.on_session_opened(
+        SESSION,
+        agent="kirocrew",
+        slot="chat-7",
+        model="kiro::claude-opus-5-v1",
+        model_requested="claude-opus-5",
+    )
+    data = _opened_data()
+    assert data["model"] == "kiro::claude-opus-5-v1"
+    assert data["model_requested"] == "claude-opus-5"
+
+
+def test_asking_for_nothing_writes_no_request_field():
+    # Every tier deferred to the backend, so there is no request to record and an
+    # empty field would read as a resolved model of "".
+    emit.on_session_opened(SESSION, agent="kirocrew", slot="chat-7", model="")
+    data = _opened_data()
+    assert data["model"] == ""
+    assert "model_requested" not in data
 
 
 # --- lineage: who made this session ----------------------------------------
@@ -589,7 +650,7 @@ def test_every_split_line_is_inside_the_format_ceiling():
     # Non-ASCII is the case the slice size exists for: ensure_ascii turns one
     # character into six bytes, so a slice measured in characters alone would be
     # refused at append time and the body would vanish.
-    for line in _ledger_path().read_text(encoding="utf-8").splitlines():
+    for line in _log_path().read_text(encoding="utf-8").splitlines():
         assert len(line.encode("utf-8")) <= lg.MAX_ENTRY_BYTES
 
 
@@ -607,7 +668,7 @@ def test_an_astral_body_still_splits_inside_the_ceiling():
     assert sent, "the body was lost: no message/sent followed the chunks"
     assert "".join(c["data"]["delta"] for c in chunks) == body
     assert sent[-1]["data"]["chunks"] == [c["seq"] for c in chunks]
-    for line in _ledger_path().read_text(encoding="utf-8").splitlines():
+    for line in _log_path().read_text(encoding="utf-8").splitlines():
         assert len(line.encode("utf-8")) <= lg.MAX_ENTRY_BYTES
 
 
@@ -637,7 +698,7 @@ def test_an_oversize_received_body_is_split_like_a_sent_one():
     # The non-body fields still ride on the citing entry.
     assert got[-1]["data"]["role"] == "user"
     assert got[-1]["data"]["source"] == "dashboard"
-    for line in _ledger_path().read_text(encoding="utf-8").splitlines():
+    for line in _log_path().read_text(encoding="utf-8").splitlines():
         assert len(line.encode("utf-8")) <= lg.MAX_ENTRY_BYTES
 
 
@@ -676,7 +737,7 @@ def test_oversize_attachment_metadata_keeps_the_received_message():
             assert data["text"] == body
             assert "chunks" not in data
     assert emit.dropped_writes() == 0
-    for line in _ledger_path().read_text(encoding="utf-8").splitlines():
+    for line in _log_path().read_text(encoding="utf-8").splitlines():
         assert len(line.encode("utf-8")) <= lg.MAX_ENTRY_BYTES
 
 
@@ -802,16 +863,16 @@ def test_a_failed_configuration_append_is_retried_not_suppressed(monkeypatch):
     # what it ran as.
     _open_session()
     assert emit.flush()
-    original = lg.Ledger.append
+    original = lg.CrewLog.append
     failures = {"left": 1}
 
     def _fail_once(self, entry_type, *args, **kwargs):
         if entry_type == "request/configured" and failures["left"]:
             failures["left"] -= 1
-            raise lg.LedgerError("disk said no", code=lg.CODE_BAD_DATA)
+            raise lg.CrewLogError("disk said no", code=lg.CODE_BAD_DATA)
         return original(self, entry_type, *args, **kwargs)
 
-    monkeypatch.setattr(lg.Ledger, "append", _fail_once)
+    monkeypatch.setattr(lg.CrewLog, "append", _fail_once)
     emit.on_request_configured(SESSION, 1, model="m", provider="acp", context_window=7)
     assert emit.flush()
     assert not [e for e in _body() if e["type"] == "request/configured"]
@@ -1196,9 +1257,9 @@ def test_the_attempt_seed_reads_the_file_only_when_memory_cannot_answer():
     scans: list[str] = []
     real = emit._seed_attempts
 
-    def _spy(session_id, ledger):
+    def _spy(session_id, log):
         scans.append(session_id)
-        return real(session_id, ledger)
+        return real(session_id, log)
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(emit, "_seed_attempts", _spy)
@@ -1268,7 +1329,7 @@ def test_a_credential_cannot_survive_the_overflow_split_at_any_offset():
             text=filler_before + secret + "t" * 8000,
         )
         assert emit.flush()
-        blob = _ledger_path().read_text(encoding="utf-8")
+        blob = _log_path().read_text(encoding="utf-8")
         assert marker not in blob, f"the credential survived at offset {offset}"
         # And reassembling the cited chunks must not rebuild it either.
         chunks = [e for e in _body() if e["type"] == "message/chunk"]
@@ -1288,7 +1349,7 @@ def test_no_second_thread_appends_while_a_writer_batch_is_claimed(monkeypatch):
     release = threading.Event()
     holding = threading.Event()
     writers: list[str] = []
-    real_append = lg.Ledger.append
+    real_append = lg.CrewLog.append
 
     def _slow(self, *args, **kwargs):
         writers.append(threading.current_thread().name)
@@ -1304,7 +1365,7 @@ def test_no_second_thread_appends_while_a_writer_batch_is_claimed(monkeypatch):
         emit.on_turn_started(SESSION, 1, "user")
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(lg.Ledger, "append", _slow)
+        patch.setattr(lg.CrewLog, "append", _slow)
         asyncio.run(_emit())
         assert holding.wait(timeout=10.0), "the writer never claimed a batch"
         claimer = writers[0]
@@ -1336,7 +1397,7 @@ def test_no_second_thread_appends_while_a_writer_batch_is_claimed(monkeypatch):
     ), f"the file disagrees with emit order: {kinds}"
 
 
-def test_every_gateway_mode_drains_the_ledger_before_a_hard_exit():
+def test_every_gateway_mode_drains_the_log_before_a_hard_exit():
     # The dashboard registers its own cleanup hook, but a mode that builds no
     # dashboard app -- slack-only is the plain case -- never runs one, and the hard
     # exit skips atexit. So the drain has to sit on the exit path ITSELF, which is
@@ -1642,7 +1703,7 @@ def test_a_lost_marker_is_merged_into_one_later_marker():
     assert emit.flush()
     _leave_spent_retry_loss_owed(nbytes=17)
 
-    real_append = lg.Ledger.append
+    real_append = lg.CrewLog.append
 
     def _lose_marker(self, entry_type, *args, **kwargs):
         if entry_type == "write/dropped":
@@ -1650,7 +1711,7 @@ def test_a_lost_marker_is_merged_into_one_later_marker():
         return real_append(self, entry_type, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(lg.Ledger, "append", _lose_marker)
+        patch.setattr(lg.CrewLog, "append", _lose_marker)
         patch.setattr(emit, "_start_drain", lambda: None)
         deferred_loss: set[str] = set()
         for _ in range(emit._MAX_WRITE_ATTEMPTS):
@@ -1691,7 +1752,7 @@ def test_fold_reads_loss_marker_with_contiguous_sequence():
     assert emit.flush(timeout=20.0)
 
     known = {"session/opened", "write/dropped", "turn/completed"}
-    entries = list(lg.Ledger.open(lg.KIND_SESSION, SESSION).iter_from(1, known=known))
+    entries = list(lg.CrewLog.open(lg.KIND_SESSION, SESSION).iter_from(1, known=known))
     kinds = [entry.type for entry in entries]
     assert "write/dropped" in kinds, f"reader did not observe write/dropped: {kinds}"
     seqs = [entry.seq for entry in entries]
@@ -1702,17 +1763,17 @@ def test_a_permanent_refusal_midbatch_owes_a_loss_marker():
     _open_session()
     assert emit.flush()
 
-    real_append = lg.Ledger.append
+    real_append = lg.CrewLog.append
     refused_once = {"left": 1}
 
     def _refuse_turn_started(self, entry_type, *args, **kwargs):
         if entry_type == "turn/started" and refused_once["left"]:
             refused_once["left"] -= 1
-            raise lg.LedgerError("another process owns this log", code=lg.CODE_ALREADY_OWNED)
+            raise lg.CrewLogError("another process owns this log", code=lg.CODE_ALREADY_OWNED)
         return real_append(self, entry_type, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(lg.Ledger, "append", _refuse_turn_started)
+        patch.setattr(lg.CrewLog, "append", _refuse_turn_started)
 
         async def _batch() -> None:
             # Both land in one drain: the first is refused (permanent), the batch
@@ -1794,10 +1855,10 @@ def test_a_failed_turn_start_leaves_later_entries_unthreaded(monkeypatch):
     assert "thread" not in _body()[-1]
 
 
-def test_events_for_a_session_with_no_ledger_create_nothing():
+def test_events_for_a_session_with_no_log_create_nothing():
     emit.on_turn_started("never-opened", 1, "user")
     emit.on_tool_called("never-opened", 1, name="fs_read", call_id="tc-1")
-    assert not _ledger_path("never-opened").exists()
+    assert not _log_path("never-opened").exists()
 
 
 def test_a_missing_session_id_is_a_no_op():
@@ -1824,7 +1885,7 @@ def test_cache_pressure_never_closes_a_live_turn(monkeypatch):
     emit.on_tool_called(SESSION, 7, name="fs_read", call_id="tc-1")
 
     # Enough other sessions to overrun the cache several times over.
-    for n in range(emit._MAX_OPEN_LEDGERS + 1):
+    for n in range(emit._MAX_OPEN_CREW_LOGS + 1):
         other = f"filler-{n:04d}"
         emit.on_session_opened(other, agent="kirocrew")
         emit.on_turn_started(other, 1, "user")
@@ -1848,13 +1909,13 @@ def test_cache_pressure_never_closes_a_live_turn(monkeypatch):
 def test_a_finished_session_is_evicted_so_the_cache_stays_bounded():
     # Pinning must not turn the cap into a leak: a session whose turn ended is
     # evictable again, which is what keeps a long-lived gateway bounded.
-    for n in range(emit._MAX_OPEN_LEDGERS + 8):
+    for n in range(emit._MAX_OPEN_CREW_LOGS + 8):
         other = f"done-{n:04d}"
         emit.on_session_opened(other, agent="kirocrew")
         emit.on_turn_started(other, 1, "user")
         emit.on_turn_completed(other, 1, stop_reason="end_turn")
     assert emit.flush()
-    assert len(emit._open) <= emit._MAX_OPEN_LEDGERS
+    assert len(emit._open) <= emit._MAX_OPEN_CREW_LOGS
 
 
 def test_a_reconnect_after_an_eviction_does_not_repair(monkeypatch):
@@ -1871,6 +1932,145 @@ def test_a_reconnect_after_an_eviction_does_not_repair(monkeypatch):
     types = [e["type"] for e in _body()]
     assert "turn/completed" not in types
     assert types[-1] == "tool/completed"
+
+
+def test_a_resume_closes_a_child_the_registry_no_longer_lists():
+    # The reachability the registration exists for. A crashed gateway's successor
+    # has an empty registry, so a child that never reported is gone and its opener
+    # is closed. Without a registered probe the store closes nothing, which is what
+    # the next test pins -- so this asserts the wiring, not just the store.
+    emit.set_child_liveness(lambda agent_id: False)
+    try:
+        _open_session()
+        emit.on_turn_started(SESSION, 1, "user")
+        emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1")
+        assert emit.flush()
+        emit.reset_caches()
+        emit.on_session_opened(SESSION, agent="kirocrew", resumed=True)
+        assert emit.flush()
+        closers = [e for e in _body() if e["type"] == "subagent/failed"]
+        assert [e["data"]["agent_id"] for e in closers] == ["sub-1"]
+        assert closers[0]["data"]["outcome"] == "unknown"
+    finally:
+        emit.set_child_liveness(None)
+
+
+def test_a_resume_leaves_a_child_the_registry_still_lists_alone():
+    # The same-process case that made an earlier revision corrupt the file: idle
+    # teardown, reset, resume -- while the child is still running and will file its
+    # own terminal. The registry still lists it, so the repair must not invent one.
+    emit.set_child_liveness(lambda agent_id: agent_id == "sub-1")
+    try:
+        _open_session()
+        emit.on_turn_started(SESSION, 1, "user")
+        emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1")
+        assert emit.flush()
+        emit.reset_caches()
+        emit.on_session_opened(SESSION, agent="kirocrew", resumed=True)
+        assert emit.flush()
+        assert [e for e in _body() if e["type"] == "subagent/failed"] == []
+    finally:
+        emit.set_child_liveness(None)
+
+
+def test_the_child_probe_reports_present_while_this_session_owes_an_entry():
+    # The window the registry alone cannot answer. A child's terminal closer goes
+    # through the writer and `_submit` returns before it lands, so the child leaves
+    # the running set while its own outcome is still owed: the registry says gone
+    # and the file shows an unmatched opener. Closing then puts a synthesised
+    # `unknown` ahead of the real outcome, and both stand in a file nothing
+    # rewrites. The debt is keyed by session, so another session's backlog must not
+    # hold this one's children open.
+    emit.set_child_liveness(lambda agent_id: False)
+    try:
+        gone = emit._child_gone_probe(SESSION)
+        assert gone is not None
+        assert gone("sub-1") is True
+        with emit._lock:
+            emit._pending[SESSION] = [emit._PendingJob(job=lambda: None, what="debt")]
+        try:
+            assert gone("sub-1") is False
+        finally:
+            with emit._lock:
+                emit._pending.pop(SESSION, None)
+        with emit._lock:
+            emit._pending["other-session"] = [emit._PendingJob(job=lambda: None, what="debt")]
+        try:
+            assert gone("sub-1") is True
+        finally:
+            with emit._lock:
+                emit._pending.pop("other-session", None)
+    finally:
+        emit.set_child_liveness(None)
+
+
+def test_the_pin_cap_drops_a_finished_child_before_a_running_one():
+    # A pin is released by its child's terminal entry, so pins for children that
+    # never reported one collect at the old end -- and they are what makes this cap
+    # reachable by accumulation rather than by that many children genuinely running.
+    # The finished one goes first, and no running child's attribution pays for it.
+    emit.set_child_liveness(lambda agent_id: agent_id != "gone-1")
+    try:
+        emit.remember_child_origin("gone-1", SESSION, 1)
+        for i in range(2, emit._MAX_CHILD_ORIGINS + 2):
+            emit.remember_child_origin(f"live-{i}", SESSION, i)
+        assert "gone-1" not in emit._child_origin, "the finished child's pin is the one dropped"
+        assert "live-2" in emit._child_origin, "the oldest RUNNING child keeps its pin"
+        assert emit.lost_child_origins() == 0, "so nothing live was spent"
+    finally:
+        emit.set_child_liveness(None)
+
+
+def test_a_cap_full_of_running_children_drops_the_oldest_and_counts_the_loss():
+    # The residual this policy leaves: with every pin belonging to a child that is
+    # still running there is nothing free to drop, so the oldest goes. That child's
+    # remaining entries will be absent, which is exactly why the drop is counted
+    # instead of left for a reader to fail to notice.
+    emit.set_child_liveness(lambda agent_id: True)
+    try:
+        for i in range(emit._MAX_CHILD_ORIGINS + 1):
+            emit.remember_child_origin(f"live-{i}", SESSION, i + 1)
+        assert emit.lost_child_origins() == 1
+        assert "live-0" not in emit._child_origin
+        assert "live-1" in emit._child_origin
+    finally:
+        emit.set_child_liveness(None)
+
+
+def test_the_cap_counts_what_it_drops_even_with_no_probe_registered():
+    # With nothing able to say whether a child finished, the cap cannot prefer a
+    # dead pin. That is a reason to drop the oldest, not a reason to do it silently.
+    for i in range(emit._MAX_CHILD_ORIGINS + 1):
+        emit.remember_child_origin(f"c-{i}", SESSION, i + 1)
+    assert emit.lost_child_origins() == 1
+    assert "c-0" not in emit._child_origin
+
+
+def test_an_over_long_session_id_is_refused_and_counted():
+    # The count cap bounds memory only if a pin's own fields are bounded, and the
+    # session id comes from the provider. It is refused rather than shortened,
+    # because an identity that has been cut down names a different unit -- and the
+    # refusal is counted, because that child's entries are absent either way.
+    emit.remember_child_origin("huge-1", "s" * (emit._MAX_SESSION_ID_CHARS + 1), 1)
+    assert "huge-1" not in emit._child_origin, "an unbounded id is not retained"
+    assert emit.lost_child_origins() == 1, "and the refusal is not silent"
+    # Exactly at the bound is still retained, so it rejects nothing legitimate.
+    emit.remember_child_origin("ok-1", "s" * emit._MAX_SESSION_ID_CHARS, 1)
+    assert "ok-1" in emit._child_origin
+    assert emit.lost_child_origins() == 1
+
+
+def test_a_resume_with_no_registered_probe_closes_no_child():
+    # The default every embedder and test gets. Nothing answers "is this child
+    # alive", so the opener stands and a reader treats it as unknown.
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1")
+    assert emit.flush()
+    emit.reset_caches()
+    emit.on_session_opened(SESSION, agent="kirocrew", resumed=True)
+    assert emit.flush()
+    assert [e for e in _body() if e["type"] == "subagent/failed"] == []
 
 
 def test_a_resume_is_the_one_path_that_closes_an_open_turn():
@@ -1945,7 +2145,7 @@ def _owned_elsewhere(session_id: str = SESSION):
     own contends exactly as a second gateway's would. Non-blocking, so a lock this
     process already holds is reported here instead of becoming a wait.
     """
-    path = lg.ledger_dir(lg.KIND_SESSION, session_id) / LEASE_FILE
+    path = lg.crew_log_dir(lg.KIND_SESSION, session_id) / LEASE_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch(exist_ok=True)
     with path.open("r+") as handle:
@@ -2032,13 +2232,13 @@ def test_a_claim_does_not_take_back_a_pin_a_queued_closer_still_owes(monkeypatch
     assert emit.flush()
 
     release = threading.Event()
-    original = lg.Ledger.append
+    original = lg.CrewLog.append
 
     def _held(self, *args, **kwargs):
         assert release.wait(20.0)
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(lg.Ledger, "append", _held)
+    monkeypatch.setattr(lg.CrewLog, "append", _held)
 
     # The terminal is handed over and cannot reach disk; the claim lands in between.
     emit.on_turn_completed(SESSION, 1, stop_reason="end_turn", duration_ms=5)
@@ -2246,13 +2446,13 @@ def test_call_index_of_a_live_turn_survives_cache_pressure():
     emit.on_tool_called(SESSION, 3, name="fs_read", call_id="tc-1")
     emit.on_tool_called(SESSION, 3, name="fs_read", call_id="tc-2")
 
-    for n in range(emit._MAX_OPEN_LEDGERS + 1):
+    for n in range(emit._MAX_OPEN_CREW_LOGS + 1):
         other = f"stepfill-{n:04d}"
         emit.on_session_opened(other, agent="kirocrew")
         emit.on_turn_started(other, 1, "user")
         emit.on_tool_called(other, 1, name="fs_read", call_id="tc-x")
     assert emit.flush()
-    assert len(emit._live) > emit._MAX_OPEN_LEDGERS, "the map never came under pressure"
+    assert len(emit._live) > emit._MAX_OPEN_CREW_LOGS, "the map never came under pressure"
 
     assert (SESSION, 3) in emit._live
     emit.on_tool_called(SESSION, 3, name="fs_read", call_id="tc-3")
@@ -2276,7 +2476,7 @@ def test_call_index_stays_unique_when_many_turns_are_live_at_once():
         emit.on_tool_called(SESSION, 7, name="fs_read", call_id=f"early-{call}")
 
     # Every one of these stays live: no completion, no re-claim.
-    for n in range(emit._MAX_OPEN_LEDGERS * 2):
+    for n in range(emit._MAX_OPEN_CREW_LOGS * 2):
         other = f"livefill-{n:04d}"
         emit.on_session_opened(other, agent="kirocrew")
         emit.on_turn_started(other, 1, "user")
@@ -2601,7 +2801,7 @@ def test_the_flag_is_read_per_call_not_at_import(monkeypatch):
     assert not _store_root().exists()
     monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
     _open_session()
-    assert _ledger_path().is_file()
+    assert _log_path().is_file()
 
 
 # --- off the event loop ----------------------------------------------------
@@ -2609,13 +2809,13 @@ def test_the_flag_is_read_per_call_not_at_import(monkeypatch):
 
 def _spy_on_append(monkeypatch, seen: list[int]) -> None:
     """Record which thread each storage append actually runs on."""
-    original = lg.Ledger.append
+    original = lg.CrewLog.append
 
     def _spy(self, *args, **kwargs):
         seen.append(threading.get_ident())
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(lg.Ledger, "append", _spy)
+    monkeypatch.setattr(lg.CrewLog, "append", _spy)
 
 
 def test_an_append_never_runs_on_the_event_loop_thread(monkeypatch):
@@ -2698,7 +2898,7 @@ def test_a_slow_writer_costs_memory_not_a_record_and_not_the_loop(monkeypatch):
     """
     _open_session()
     assert emit.flush()
-    original = lg.Ledger.append
+    original = lg.CrewLog.append
     release = threading.Event()
 
     def _held(self, *args, **kwargs):
@@ -2707,7 +2907,7 @@ def test_a_slow_writer_costs_memory_not_a_record_and_not_the_loop(monkeypatch):
         assert release.wait(20.0)
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(lg.Ledger, "append", _held)
+    monkeypatch.setattr(lg.CrewLog, "append", _held)
 
     async def _flood() -> None:
         started = time.monotonic()
@@ -2741,14 +2941,14 @@ def test_the_backlog_is_reported_rather_than_shed(monkeypatch, caplog):
     _open_session()
     assert emit.flush()
     monkeypatch.setattr(emit, "_PENDING_HIGH_WATER", 4)
-    original = lg.Ledger.append
+    original = lg.CrewLog.append
     release = threading.Event()
 
     def _held(self, *args, **kwargs):
         assert release.wait(20.0)
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(lg.Ledger, "append", _held)
+    monkeypatch.setattr(lg.CrewLog, "append", _held)
 
     async def _flood() -> None:
         for n in range(12):
@@ -2843,7 +3043,7 @@ def test_shutdown_reports_owed_loss_when_its_marker_cannot_land(monkeypatch, cap
     def _fail_marker(self, *args, **kwargs):
         raise OSError("filesystem still unavailable")
 
-    monkeypatch.setattr(lg.Ledger, "append", _fail_marker)
+    monkeypatch.setattr(lg.CrewLog, "append", _fail_marker)
     # Patched AFTER the helper above, which spends a whole budget of its own.
     monkeypatch.setattr(emit, "_MAX_WRITE_ATTEMPTS", 1)
     with caplog.at_level(logging.WARNING, logger=emit.logger.name):
@@ -2858,6 +3058,47 @@ def test_shutdown_reports_owed_loss_when_its_marker_cannot_land(monkeypatch, cap
         loss = emit._pending_loss.get(SESSION)
         assert loss is not None, "the failed marker's debt disappeared"
         assert loss.dropped_count == 1, "the original counted loss was not folded forward"
+
+
+def test_shutdown_names_a_marker_still_waiting_to_be_retried(monkeypatch, caplog):
+    """A marker held for retry is owed, and the warning has to say so.
+
+    The other lifecycle point. A budget that is not spent leaves the marker JOB at
+    the front of its session's bucket, and the debt rides inside that job: the map
+    the count reads is empty while a marker is very much owed. The warning is the
+    only record of how short the log's tail is at exit, so a zero there tells an
+    operator nothing is missing when something is.
+
+    This is the state a bounded shutdown reaches whenever the retry budget outlasts
+    the window, which is a property of the host. Constructed here instead of raced
+    for: a budget of 10,000 attempts cannot be spent, so the marker is retained
+    however many passes the window buys.
+
+    Mutation guard: counting only ``_pending_loss`` reports ``0 loss marker(s)
+    owed`` and reddens the assertion below.
+    """
+    _open_session()
+    assert emit.flush()
+    _leave_spent_retry_loss_owed()
+
+    def _fail_marker(self, *args, **kwargs):
+        raise OSError("filesystem still unavailable")
+
+    monkeypatch.setattr(lg.CrewLog, "append", _fail_marker)
+    monkeypatch.setattr(emit, "_MAX_WRITE_ATTEMPTS", 10_000)
+    # Both windows bounded to a hair: the point is which state the warning
+    # describes, not how long the drain spins before describing it.
+    monkeypatch.setattr(emit, "_SECOND_CHANCE_DRAIN_SECONDS", 0.01)
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        drained = emit.drain_for_shutdown(timeout=0.01)
+
+    assert drained is False, "shutdown reported success with a marker still retained"
+    with emit._lock:
+        assert emit._pending_loss == {}, "the debt is meant to be riding in the retained job"
+        jobs = emit._pending.get(SESSION) or []
+        assert jobs and jobs[0].loss is not None, "the marker job was not retained"
+        assert jobs[0].loss.dropped_count == 1, "the retained marker lost its count"
+    assert "1 loss marker(s) owed" in caplog.text
 
 
 def test_a_close_under_a_live_turn_leaves_that_turn_its_open_calls():
@@ -2937,7 +3178,7 @@ def test_shutdown_drains_even_when_the_writer_pool_is_gone():
         occupied.set()
         assert release.wait(20.0)
 
-    executors.ledger_executor().submit(_occupy)
+    executors.crew_log_executor().submit(_occupy)
     # Waited on the worker's OWN signal, so the queue state below is a fact rather
     # than a guess about scheduling.
     assert occupied.wait(20.0), "the writer thread was never occupied"
@@ -2977,7 +3218,7 @@ def test_the_dashboard_cleanup_hook_actually_drains_off_the_loop():
 
     source = inspect.getsource(server_module)
     assert (
-        "app.on_cleanup.append(_session_ledger_drain)" in source
+        "app.on_cleanup.append(_crew_log_drain)" in source
     ), "the server no longer registers a crew log drain on cleanup"
 
     drained: list[str] = []
@@ -3026,14 +3267,14 @@ def test_a_dropped_turn_start_leaves_its_turn_unthreaded_not_folded_into_the_las
     asyncio.run(_first_turn())
     first_start = next(e for e in _body() if e["type"] == "turn/started")
 
-    original = lg.Ledger.append
+    original = lg.CrewLog.append
 
     def _refuse_turn_starts(self, entry_type, *args, **kwargs):
         if entry_type == "turn/started":
-            raise lg.LedgerError("too big", code=lg.CODE_ENTRY_TOO_LARGE)
+            raise lg.CrewLogError("too big", code=lg.CODE_ENTRY_TOO_LARGE)
         return original(self, entry_type, *args, **kwargs)
 
-    monkeypatch.setattr(lg.Ledger, "append", _refuse_turn_starts)
+    monkeypatch.setattr(lg.CrewLog, "append", _refuse_turn_starts)
 
     async def _second_turn() -> None:
         emit.on_turn_started(SESSION, 2, "user")
@@ -3048,7 +3289,7 @@ def test_a_dropped_turn_start_leaves_its_turn_unthreaded_not_folded_into_the_las
     assert emit.dropped_writes() == 1, "the refused start is the only loss"
 
 
-def test_a_ledger_failure_on_the_writer_never_reaches_the_caller(monkeypatch):
+def test_a_log_failure_on_the_writer_never_reaches_the_caller(monkeypatch):
     """Fail-soft holds across the thread boundary too, and the loss is admitted.
 
     The job runs where nothing is awaiting it, so an exception that escaped would
@@ -3063,7 +3304,7 @@ def test_a_ledger_failure_on_the_writer_never_reaches_the_caller(monkeypatch):
     def _boom(self, *args, **kwargs):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(lg.Ledger, "append", _boom)
+    monkeypatch.setattr(lg.CrewLog, "append", _boom)
 
     async def _turn() -> None:
         emit.on_turn_started(SESSION, 1, "user")
@@ -3093,7 +3334,7 @@ def test_a_failed_append_is_retained_and_lands_on_the_next_pass(monkeypatch):
     """
     _open_session()
     assert emit.flush()
-    original = lg.Ledger.append
+    original = lg.CrewLog.append
     failures = {"left": 1}
 
     def _fail_once(self, *args, **kwargs):
@@ -3102,7 +3343,7 @@ def test_a_failed_append_is_retained_and_lands_on_the_next_pass(monkeypatch):
             raise OSError("input/output error")
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(lg.Ledger, "append", _fail_once)
+    monkeypatch.setattr(lg.CrewLog, "append", _fail_once)
 
     async def _turn() -> None:
         emit.on_turn_started(SESSION, 1, "user")
@@ -3134,7 +3375,7 @@ def test_a_later_write_during_retention_queues_behind_the_retained_batch(monkeyp
     """
     _open_session()
     assert emit.flush()
-    original = lg.Ledger.append
+    original = lg.CrewLog.append
     refused = threading.Event()
     seen = {"starts": 0}
 
@@ -3146,7 +3387,7 @@ def test_a_later_write_during_retention_queues_behind_the_retained_batch(monkeyp
                 raise OSError("input/output error")
         return original(self, entry_type, *args, **kwargs)
 
-    monkeypatch.setattr(lg.Ledger, "append", _fail_the_first_starts)
+    monkeypatch.setattr(lg.CrewLog, "append", _fail_the_first_starts)
 
     async def _turn() -> None:
         emit.on_turn_started(SESSION, 1, "user")
@@ -3172,7 +3413,7 @@ def test_a_reopen_that_fails_is_retried_rather_than_discarding_the_entry():
     """
     _open_session()
     assert emit.flush()
-    original = lg.Ledger.open
+    original = lg.CrewLog.open
     failures = {"left": 1}
 
     def _fail_first_open(kind, unit_id, **kwargs):
@@ -3182,7 +3423,7 @@ def test_a_reopen_that_fails_is_retried_rather_than_discarding_the_entry():
         return original(kind, unit_id, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(lg.Ledger, "open", _fail_first_open)
+        patch.setattr(lg.CrewLog, "open", _fail_first_open)
         with emit._lock:
             emit._open.clear()  # the eviction the cap would have made
 
@@ -3206,7 +3447,7 @@ def test_a_retried_session_open_still_writes_the_entry_it_owes():
     ``session/opened`` for good, and not counting it either. The decision is
     latched on the first attempt for exactly that reason.
     """
-    original = lg.Ledger.append
+    original = lg.CrewLog.append
     failures = {"left": 1}
 
     def _fail_the_first_open_entry(self, entry_type, *args, **kwargs):
@@ -3216,7 +3457,7 @@ def test_a_retried_session_open_still_writes_the_entry_it_owes():
         return original(self, entry_type, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(lg.Ledger, "append", _fail_the_first_open_entry)
+        patch.setattr(lg.CrewLog, "append", _fail_the_first_open_entry)
         _open_session()
         assert emit.flush(timeout=20.0)
 
@@ -3252,7 +3493,7 @@ def test_a_wedged_writer_gives_up_after_the_cap_so_a_bounded_drain_finishes(capl
     # here would send the rest of the test at the real data home with the emitter
     # switched off.
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(lg.Ledger, "append", _wedged)
+        patch.setattr(lg.CrewLog, "append", _wedged)
         with caplog.at_level(logging.WARNING, logger=emit.logger.name):
             asyncio.run(_turn())
             assert not emit.flush(
@@ -3397,7 +3638,7 @@ def test_shutdown_is_not_reported_drained_while_a_batch_is_still_writing():
     assert emit.flush()
     holding = threading.Event()
     release = threading.Event()
-    original = lg.Ledger.append
+    original = lg.CrewLog.append
 
     def _slow(self, *args, **kwargs):
         holding.set()
@@ -3411,7 +3652,7 @@ def test_shutdown_is_not_reported_drained_while_a_batch_is_still_writing():
         emit.on_turn_started(SESSION, 1, "user")
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(lg.Ledger, "append", _slow)
+        patch.setattr(lg.CrewLog, "append", _slow)
         asyncio.run(_emit_then_shutdown())
         assert holding.wait(timeout=10.0), "the writer never claimed the batch"
         # Mid-batch: the buffer is empty, the batch is in flight. A short budget
@@ -3622,6 +3863,14 @@ def test_every_emitted_type_matches_the_documented_shape():
         "context/composed": {"turn", "sources", "chars", "tokens", "tokens_estimated"},
         "model/selected": {"model", "source"},
         "compaction/applied": {"pct_before", "pct_after", "freed_pct"},
+        "approval/requested": {"turn", "approval_id", "tool"},
+        "approval/decided": {"turn", "approval_id", "decision"},
+        "plan/updated": {"turn", "items"},
+        "background/completed": {"kind"},
+        "subagent/spawned": {"turn", "agent_id"},
+        "subagent/steered": {"agent_id"},
+        "subagent/completed": {"agent_id"},
+        "subagent/failed": {"agent_id"},
     }
     _open_session()
     emit.on_turn_started(SESSION, 1, "user")
@@ -3635,6 +3884,14 @@ def test_every_emitted_type_matches_the_documented_shape():
     emit.on_step_completed(SESSION, 1, step, ms=5)
     emit.on_model_selected(SESSION, "m", "fallback", turn=1)
     emit.on_compaction_applied(SESSION, pct_before=0.8, pct_after=0.4)
+    emit.on_approval_requested(SESSION, 1, approval_id="r1", tool="shell", reason="ls")
+    emit.on_approval_decided(SESSION, 1, approval_id="r1", decision="approved")
+    emit.on_plan_updated(SESSION, 1, items=[{"id": "a", "text": "t", "completed": False}])
+    emit.on_subagent_spawned(SESSION, 1, agent_id="ab12", agent="kirocrew", scope={"memory": True})
+    emit.on_subagent_steered(SESSION, agent_id="ab12", mode="interrupt")
+    emit.on_subagent_completed(SESSION, agent_id="ab12", duration_ms=7)
+    emit.on_subagent_failed(SESSION, agent_id="cd34", reason="boom", outcome="failed")
+    emit.on_background_completed(SESSION, kind="title", model="m", credits=0.1)
     emit.on_turn_completed(SESSION, 1, stop_reason="end_turn")
     emit.on_message_queued(SESSION, source="slack", size_bytes=3, queued_seq="q1")
     emit.on_turn_refused(SESSION, 2, "not_authorized")
@@ -3696,7 +3953,7 @@ def test_shutdown_writes_a_batch_that_had_been_failing():
     that makes a LONG backoff reachable is pinned above, without threads.
     """
     allow = threading.Event()
-    real_append = lg.Ledger.append
+    real_append = lg.CrewLog.append
 
     def _gated(self, *a, **kw):
         if not allow.is_set():
@@ -3710,7 +3967,7 @@ def test_shutdown_writes_a_batch_that_had_been_failing():
         # below run: with the fixture's flattened schedule it would burn its whole
         # attempt budget in microseconds and be dropped before the drain is asked.
         mp.setattr(emit, "_retry_delay", lambda _attempts: 5.0)
-        mp.setattr(lg.Ledger, "append", _gated)
+        mp.setattr(lg.CrewLog, "append", _gated)
         emit.on_turn_started(SESSION, 1, "user")
         # Refused, so the batch is retained rather than written. The wait only has to
         # be shorter than that backoff, which no machine speed changes.
@@ -3739,7 +3996,7 @@ def test_a_shutdown_wakes_a_writer_parked_on_a_backoff():
         passes.set()
         return real_drain_once(deferred_loss)
 
-    real_append = lg.Ledger.append
+    real_append = lg.CrewLog.append
     calls = {"n": 0}
 
     def _fail_first(self, *a, **kw):
@@ -3752,7 +4009,7 @@ def test_a_shutdown_wakes_a_writer_parked_on_a_backoff():
         _open_session()
         assert emit.flush()
         mp.setattr(emit, "_retry_delay", lambda _attempts: 3600.0)
-        mp.setattr(lg.Ledger, "append", _fail_first)
+        mp.setattr(lg.CrewLog, "append", _fail_first)
         emit.on_turn_started(SESSION, 1, "user")
         assert not emit.flush(timeout=2.0), "the injected failure did not park the writer"
         passes.clear()
@@ -3864,7 +4121,7 @@ def test_a_write_that_finishes_late_sheds_nothing():
     that was merely behind -- otherwise every busy disk would cost entries.
     """
     release = threading.Event()
-    real_append = lg.Ledger.append
+    real_append = lg.CrewLog.append
 
     def _slow(self, *a, **kw):
         release.wait(10.0)
@@ -3873,7 +4130,7 @@ def test_a_write_that_finishes_late_sheds_nothing():
     with pytest.MonkeyPatch.context() as mp:
         _open_session()
         assert emit.flush()
-        mp.setattr(lg.Ledger, "append", _slow)
+        mp.setattr(lg.CrewLog, "append", _slow)
         emit.on_turn_started(SESSION, 1, "user")
         emit.on_turn_completed(SESSION, 1, stop_reason="end_turn")
         release.set()
@@ -3887,7 +4144,7 @@ def test_a_write_that_finishes_late_sheds_nothing():
 def test_attachment_metadata_is_omitted_before_a_fitting_body_is_split():
     """Attachment detail yields before a fitting message body."""
     _open_session()
-    body = "x" * (emit._ledger().MAX_ENTRY_BYTES - emit._ENVELOPE_HEADROOM - 64)
+    body = "x" * (emit._crew_log().MAX_ENTRY_BYTES - emit._ENVELOPE_HEADROOM - 64)
     ids = [f"/tmp/attachment-{n:04d}-with-a-long-enough-name.bin" for n in range(200)]
     emit.on_message_received(SESSION, 1, role="user", text=body, attachments=ids)
     assert emit.flush()
@@ -3915,7 +4172,7 @@ def test_an_oversize_body_reaches_the_file_as_one_group():
     count; writing the citing entry FIRST reddens the ordering assertion.
     """
     calls = {"many": 0}
-    real_many = lg.Ledger.append_many
+    real_many = lg.CrewLog.append_many
 
     def _counting(self, items, **kw):
         calls["many"] += 1
@@ -3923,8 +4180,8 @@ def test_an_oversize_body_reaches_the_file_as_one_group():
 
     with pytest.MonkeyPatch.context() as mp:
         _open_session()
-        mp.setattr(lg.Ledger, "append_many", _counting)
-        body = "y" * (emit._ledger().MAX_ENTRY_BYTES * 2)
+        mp.setattr(lg.CrewLog, "append_many", _counting)
+        body = "y" * (emit._crew_log().MAX_ENTRY_BYTES * 2)
         emit.on_message_sent(SESSION, 1, step=1, text=body)
         assert emit.flush()
 
@@ -3980,7 +4237,7 @@ def test_a_wedged_session_neither_reorders_nor_loses_another_and_both_land():
 
     def _b_write(index: int):
         def _job() -> None:
-            handle = lg.Ledger.open(lg.KIND_SESSION, other)
+            handle = lg.CrewLog.open(lg.KIND_SESSION, other)
             handle.append("turn/started", {"turn": index, "actor": "user", "depth": 0}, src="acp")
 
         return _job
@@ -4031,7 +4288,7 @@ def test_queued_terminal_write_keeps_ownership_until_it_lands():
         asyncio.run(_queue_closer())
         assert "turn/completed" not in [e["type"] for e in _body()]
 
-        for index in range(emit._MAX_OPEN_LEDGERS + 1):
+        for index in range(emit._MAX_OPEN_CREW_LOGS + 1):
             emit._remember(f"pressure-{index}", object())
         gc.collect()
         assert (
@@ -4051,7 +4308,7 @@ def test_retryable_terminal_failure_keeps_the_turn_pinned():
     emit.on_turn_started(SESSION, 1, "user")
     assert emit.flush()
 
-    original_append = lg.Ledger.append
+    original_append = lg.CrewLog.append
     original_retain = emit._retain
     retained = threading.Event()
     failures = {"left": 1}
@@ -4068,7 +4325,7 @@ def test_retryable_terminal_failure_keeps_the_turn_pinned():
             retained.set()
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(lg.Ledger, "append", _fail_closer_once)
+        mp.setattr(lg.CrewLog, "append", _fail_closer_once)
         mp.setattr(emit, "_retry_delay", lambda _attempts: 30.0)
         mp.setattr(emit, "_retain", _observe_retain)
 
@@ -4094,7 +4351,7 @@ def test_every_terminal_path_releases_its_pin_after_a_definitive_drop(terminal):
     _open_session()
     emit._pin(SESSION, 1)
 
-    original_append = lg.Ledger.append
+    original_append = lg.CrewLog.append
 
     def _fail_closer(self, entry_type, *args, **kwargs):
         if entry_type in {"turn/refused", "turn/completed"}:
@@ -4102,7 +4359,7 @@ def test_every_terminal_path_releases_its_pin_after_a_definitive_drop(terminal):
         return original_append(self, entry_type, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(lg.Ledger, "append", _fail_closer)
+        mp.setattr(lg.CrewLog, "append", _fail_closer)
         if terminal == "refused":
             emit.on_turn_refused(SESSION, 1, "stopped_before_dispatch")
         elif terminal == "completed":
@@ -4237,7 +4494,7 @@ def test_the_shutdown_hook_is_registered_once_on_first_use(monkeypatch) -> None:
 # --- the log-creating record is exempt from the memory ceiling ----------
 
 
-def test_overflow_while_the_creating_record_is_queued_still_creates_the_ledger(monkeypatch):
+def test_overflow_while_the_creating_record_is_queued_still_creates_the_log(monkeypatch):
     """(a) A ceiling crossed as the file-creating record is queued must not erase it.
 
     The ceiling bounds PAYLOAD memory, and the record that creates the crew log is
@@ -4274,7 +4531,7 @@ def test_overflow_while_the_creating_record_is_queued_still_creates_the_ledger(m
     emit.on_turn_completed(SESSION, 1, stop_reason="end_turn")
     assert emit.flush(timeout=20.0)
 
-    assert _ledger_path().is_file(), "the ceiling refused the log-creating record"
+    assert _log_path().is_file(), "the ceiling refused the log-creating record"
     body_types = [e["type"] for e in _body()]
     assert "session/opened" in body_types, "the creating session/opened entry was refused"
 
@@ -4283,20 +4540,20 @@ def test_overflow_while_the_creating_record_is_queued_still_creates_the_ledger(m
 
 
 def _fail_creation_permanently() -> None:
-    """Open a session whose creating record is REFUSED (a permanent LedgerError).
+    """Open a session whose creating record is REFUSED (a permanent CrewLogError).
 
     Leaves ``SESSION`` flagged in ``_creation_failed`` with no log file, which
     is the state a later append must count as loss rather than silently no-op.
     """
-    real_create = lg.Ledger.create
+    real_create = lg.CrewLog.create
 
     def _refuse_create(kind, unit_id, *args, **kwargs):
         if unit_id == SESSION:
-            raise lg.LedgerError("refused at create", code=lg.CODE_ALREADY_OWNED)
+            raise lg.CrewLogError("refused at create", code=lg.CODE_ALREADY_OWNED)
         return real_create(kind, unit_id, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(lg.Ledger, "create", _refuse_create)
+        patch.setattr(lg.CrewLog, "create", _refuse_create)
         emit.on_session_opened(SESSION, agent="kirocrew", slot="chat-7")
         assert emit.flush(timeout=20.0)
 
@@ -4311,7 +4568,7 @@ def test_a_permanently_failed_creation_counts_later_discards_as_loss():
     """
     _fail_creation_permanently()
     assert SESSION in emit._creation_failed, "the failed creation was not flagged"
-    assert not _ledger_path().is_file(), "no log file should exist after a failed creation"
+    assert not _log_path().is_file(), "no log file should exist after a failed creation"
     dropped_before = emit.dropped_writes()
 
     emit.on_turn_started(SESSION, 1, "user")
@@ -4331,7 +4588,7 @@ def test_a_session_that_was_never_opened_stays_a_silent_no_op():
     dropped_before = emit.dropped_writes()
     emit.on_turn_started("never-opened-session", 1, "user")
     assert emit.flush(timeout=20.0)
-    assert not _ledger_path("never-opened-session").exists()
+    assert not _log_path("never-opened-session").exists()
     assert emit.dropped_writes() == dropped_before, "an unopened session was counted as a loss"
 
 
@@ -4371,7 +4628,7 @@ def test_loss_debt_survives_until_the_marker_actually_lands():
     _open_session()
     assert emit.flush()
 
-    real_append = lg.Ledger.append
+    real_append = lg.CrewLog.append
 
     def _lose_marker(self, entry_type, *args, **kwargs):
         if entry_type == "write/dropped":
@@ -4379,7 +4636,7 @@ def test_loss_debt_survives_until_the_marker_actually_lands():
         return real_append(self, entry_type, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(lg.Ledger, "append", _lose_marker)
+        patch.setattr(lg.CrewLog, "append", _lose_marker)
         patch.setattr(emit, "_start_drain", lambda: None)
         emit._buffer(
             SESSION,

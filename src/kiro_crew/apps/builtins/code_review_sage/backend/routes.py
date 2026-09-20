@@ -2074,6 +2074,9 @@ async def _handle_learnings(request: web.Request) -> web.Response:
             "candidate": candidate,
             "consolidating": bool(state.get("running")),
             "consolidate_error": state.get("error"),
+            # The machine-readable cause behind the prose: "malformed_worker_output"
+            # covers both a bad reason_code and a promotion the sidecar refused.
+            "consolidate_error_code": state.get("error_code"),
         }
 
     try:
@@ -2089,6 +2092,7 @@ async def _handle_learnings(request: web.Request) -> web.Response:
                 "candidate": [],
                 "consolidating": False,
                 "consolidate_error": None,
+                "consolidate_error_code": None,
             }
         )
 
@@ -2199,10 +2203,34 @@ async def _consolidate_bg(
         pool = review_pool.get_pool()
         dispatch = review_pool.make_sync_dispatch(loop, pool)
         await pool.begin_batch()
+        selection = [
+            {"id": str(item["id"]), "title": str(item["pattern"].get("title") or "")}
+            for item in snapshot
+            if str(item["id"]) in candidate_ids
+        ]
+        try:
+            blocked_promotions = await asyncio.to_thread(
+                learning.promotion_ineligible_candidate_ids,
+                snapshot,
+                candidate_ids,
+                namespace=ns,
+            )
+        except Exception:
+            # An eligibility hint the worker can do without: the preview still
+            # refuses an ineligible promotion on its own.
+            blocked_promotions = []
+            logger.debug("promotion eligibility probe failed for ns=%s", ns, exc_info=True)
         try:
             spawn = await asyncio.to_thread(
                 dispatch,
-                review_driver.build_consolidation_task(ns, str(live), input_path, out_path),
+                review_driver.build_consolidation_task(
+                    ns,
+                    str(live),
+                    input_path,
+                    out_path,
+                    selection=selection,
+                    blocked_promotions=blocked_promotions,
+                ),
             )
         finally:
             await pool.end_batch()
@@ -2233,6 +2261,16 @@ async def _consolidate_bg(
                 namespace=ns,
             )
         except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            # The worker finished and its proposal was refused, so this line is the
+            # only account of why: without it a rejected merge is indistinguishable
+            # from one that never ran.
+            logger.warning(
+                "consolidation proposal rejected for ns=%s selected=%d: %s: %s",
+                ns,
+                len(candidate_ids or []),
+                type(exc).__name__,
+                exc,
+            )
             _CONSOLIDATE_STATE[ns] = {
                 "running": False,
                 "code": "malformed_worker_output",
@@ -2343,6 +2381,89 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
             "namespace": ns,
             "candidate_ids": candidate_ids,
             "running": True,
+        }
+    )
+
+
+async def _handle_candidates_delete(request: web.Request) -> web.Response:
+    """DELETE .../learnings/candidates — drop staged candidates without a merge.
+
+    ``candidate_ids`` is a multiset, exactly as ``consolidate`` takes it: a legacy
+    candidate file can hold several entries under one id and each element is one
+    removal. Nothing here touches the ruleset or the governed sidecar, because
+    discarding a staged learning is not a review decision.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    ns = str(body.get("namespace") or learning.DEFAULT_NAMESPACE)
+    if not (ns == learning.DEFAULT_NAMESPACE or learning._is_valid_ns_name(ns)):
+        return web.json_response(
+            {"code": "invalid_namespace", "error": f"invalid namespace {ns!r}"}, status=400
+        )
+    requested = body.get("candidate_ids")
+    if (
+        not isinstance(requested, list)
+        or not requested
+        or any(not isinstance(item, str) or not item for item in requested)
+    ):
+        return web.json_response(
+            {"code": "invalid_candidate_ids", "error": "candidate_ids must be a non-empty list"},
+            status=400,
+        )
+
+    async def _audit(outcome: str) -> None:
+        def _emit() -> None:
+            from kiro_crew.sel import sel
+
+            sel().log_api_access(
+                caller="code-review-sage",
+                operation="delete_learned_candidates",
+                outcome=outcome,
+                resources=f"learnings/{ns}",
+            )
+
+        try:
+            await asyncio.to_thread(_emit)
+        except Exception:
+            logger.warning("SEL audit failed for delete_learned_candidates", exc_info=True)
+
+    async with _NS_OPS_LOCK:
+        # Held across the check and the rewrite: a merge that already snapshotted
+        # these entries would otherwise apply against a catalog the worker never read.
+        if ns in _CONSOLIDATING:
+            return web.json_response(
+                {
+                    "code": "consolidation_in_progress",
+                    "error": "a consolidation is already running for this namespace",
+                },
+                status=409,
+            )
+        candidates = await asyncio.to_thread(learning.list_candidate, None, ns)
+        before = len(candidates)
+        available = {str(item["id"]) for item in candidates}
+        unknown = sorted({item for item in requested if item not in available})
+        if unknown:
+            return web.json_response(
+                {
+                    "code": "invalid_candidate_ids",
+                    "error": f"unknown candidate ids: {', '.join(unknown[:5])}",
+                },
+                status=400,
+            )
+        await asyncio.to_thread(learning.clear_candidate, None, ns, list(requested))
+    remaining = len(await asyncio.to_thread(learning.list_candidate, None, ns))
+    await _audit("ok")
+    return web.json_response(
+        {
+            "ok": True,
+            "namespace": ns,
+            "requested": len(requested),
+            "removed": before - remaining,
+            "remaining": remaining,
         }
     )
 
@@ -2779,6 +2900,9 @@ def register_routes(app: web.Application) -> None:
         _handle_learning_rule_lifecycle,
     )
     app.router.add_post("/api/apps/code-review-sage/learnings/consolidate", _handle_consolidate)
+    app.router.add_delete(
+        "/api/apps/code-review-sage/learnings/candidates", _handle_candidates_delete
+    )
     app.router.add_get(
         "/api/apps/code-review-sage/learnings/consolidation-previews",
         _handle_consolidation_preview_list,

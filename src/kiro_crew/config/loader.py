@@ -33,7 +33,14 @@ from typing import Any, Literal
 # FROZEN pre-split alias snapshot (test_loader_reexports_historical_snapshot_by_identity),
 # so new resolution helpers are reached through the module, not re-exported.
 import kiro_crew.config.resolution as _resolution
-from kiro_crew import __version__, model_registry, pinned_fs, platform_compat, windows_acl
+from kiro_crew import (
+    __version__,
+    model_registry,
+    model_scope,
+    pinned_fs,
+    platform_compat,
+    windows_acl,
+)
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
 
@@ -212,6 +219,7 @@ from kiro_crew.config.sections import (  # noqa: F401
     ComputerUseConfig,
     CronHistoryConfig,
     DashboardConfig,
+    DecisionsConfig,
     DiscordConfig,
     ExternalRegistryConfig,
     FeishuConfig,
@@ -226,6 +234,7 @@ from kiro_crew.config.sections import (  # noqa: F401
     MemoryConfig,
     MemoryStoreConfig,
     MessagingConfig,
+    MonitoringConfig,
     OrchestratorConfig,
     PublishConfig,
     ResolvedBindings,
@@ -1151,6 +1160,30 @@ def aws_consent_path() -> Path:
     return config_dir() / "aws_service_consent.json"
 
 
+def decisions_consent_path() -> Path:
+    """Return path to decisions_consent.json — consent to send conversation state to Jev.
+
+    Same KEYSTONE reasoning as :func:`aws_consent_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: enabling the decision
+    seam sends message text and skill descriptions to an external, paid provider,
+    which is an egress authorization, not a preference. Kept out of the
+    agent-writable ``config.json`` so a prompt-injected shell cannot flip it and
+    have the live config watcher start the egress; ``is_sensitive_path`` blocks
+    the tool path and the OS sandbox mounts the keystone read-only for the shell.
+
+    Holds ``{"enabled": bool, "endpoint": str}`` -- the switch and the provider
+    address the owner consented to; every read fails soft to NOT CONSENTED (see
+    ``decisions.consent``). The only writer is the authenticated, browser-only
+    dashboard ``PUT /api/decisions/consent`` handler, which opens the path
+    directly rather than through this gate. Respects ``KIROCREW_HOME``.
+
+    The ``decisions`` section of ``config.json`` deliberately carries NO
+    ``enabled`` field: sampling share and provider knobs only, so there is exactly
+    one place the seam can be switched on and it is not one the agent can reach.
+    """
+    return config_dir() / "decisions_consent.json"
+
+
 def file_delivery_consent_path() -> Path:
     """Return path to file_delivery_consent.json -- flagged-file delivery consent.
 
@@ -1535,18 +1568,23 @@ def update_config_locked(
     a stale snapshot saved after a locked update overwrites it with older
     values.  The lock fixes interleaving, not staleness.
 
-    A SECOND family of writers still bypasses this lock, and the ratchet does
-    NOT reach it: writers that reach ``config_path()`` through
-    ``kiro_crew.agent._atomic_json_write`` (``messaging.py``'s per-channel
-    savers, ``core.py``'s STT PUT, ``mcp.py``'s gateway-enable). The ratchet
-    matches calls to :func:`write_config_atomically`, and these make none.
+    A SECOND family of writers still bypasses this lock: writers that reach
+    ``config_path()`` through ``kiro_crew.agent._atomic_json_write``
+    (``messaging.py``'s per-channel savers, ``core.py``'s STT PUT, ``mcp.py``'s
+    gateway-enable). ``TestEveryConfigWriterIsLocked`` does not reach them --
+    it matches calls to :func:`write_config_atomically`, and these make none --
+    so they have their own ratchet,
+    ``TestTheAtomicJsonWriteConfigFamilyIsRatcheted`` in the same file, which
+    pins that family to a baseline that may only SHRINK.
 
     That family relies on the in-process asyncio ``_get_config_lock()`` only,
     which serializes same-loop callers and nothing else, so it can still
-    interleave with a holder of this lock.  Converting it is follow-up work; do
-    not read the ratchet's green as covering it, and note that an ALIASED
-    import of :func:`write_config_atomically` would evade it for the same
-    matching reason.
+    interleave with a holder of this lock.  Converting the remaining members is
+    follow-up work (``api_feishu_config_save`` and ``api_imessage_config_save``
+    are already through here and are the shape to copy); do not read either
+    ratchet's green as meaning the family is converted, only that it cannot
+    grow, and note that an ALIASED import of :func:`write_config_atomically`
+    would evade the sibling ratchet for the same matching reason.
 
     Contract:
 
@@ -1837,10 +1875,8 @@ class _PinnedCreateRefusal(Exception):
 def materialize_workspace_dir(validated: Path, *, display: str) -> None:
     """Make *validated* exist as a directory: adopt one that is there, create one that is not.
 
-    One writer-side rule shared by the dashboard handler and the CLI, because the
-    V2 private-memory layout resolves EVERY declared workspace with ``strict=True``
-    and refuses every private member while one declared directory is missing -- an
-    entry without a directory is a fleet-wide outage, not an inert row.
+    One writer-side rule shared by the dashboard handler and the CLI: a published
+    workspace must name a usable directory for provider cwd and project documents.
 
     *validated* is the path AS THE CALLER'S VALIDATION RESOLVED IT (``Path.resolve()``
     at validation time). This function never resolves it again: resolving here would
@@ -2912,9 +2948,6 @@ def _build_memory_config(memory_data: dict) -> MemoryConfig:
         semantic_keys=memory_data.get("semantic_keys", []),
         history_idle_hours=memory_data.get("history_idle_hours", 3.0),
         history_max_days=_safe_nonnegative_int(memory_data.get("history_max_days", 365), 365),
-        private_provisioning_enabled=_safe_bool(
-            memory_data.get("private_provisioning_enabled", True), False
-        ),
         backup_enabled=_safe_bool(memory_data.get("backup_enabled", True), True),
         backup_keep=_safe_int(memory_data.get("backup_keep", 7), 7, 1, None),
         migrated=memory_data.get("migrated", False),
@@ -3741,6 +3774,26 @@ class KiroCrewConfig:
         default_factory=HeartbeatConfig,
         metadata=_meta("Heartbeat", "Heartbeat background task queue delivery defaults."),
     )
+    monitoring: MonitoringConfig = field(
+        default_factory=MonitoringConfig,
+        metadata=_meta(
+            "Monitoring",
+            "How a session's choice between the two monitoring paths is framed. "
+            "Neither path is gated by this section; both are armable with it at "
+            "its default.",
+        ),
+    )
+    decisions: DecisionsConfig = field(
+        default_factory=DecisionsConfig,
+        metadata=_meta(
+            "Decisions",
+            "Decision seam — typed decisions asked of a System One model at "
+            "named points. Off until the dashboard owner consents in Settings > "
+            "Developer > Feature Previews (the keystone decisions_consent.json, "
+            "not a key here); until then every point returns None with no "
+            "network call and no log write.",
+        ),
+    )
     watchdog: WatchdogConfig = field(
         default_factory=WatchdogConfig,
         metadata=_meta("Watchdog", "ACP per-session watchdog / liveness-oracle windows."),
@@ -4235,19 +4288,40 @@ class KiroCrewConfig:
                 data["resource_limits"] = asdict(
                     ResourceLimitsConfig.from_raw(data["resource_limits"])
                 )
-            # Same fail-closed-before-validation reason for the member-dispatch
-            # ceiling. `agent.member_dispatch` gates whether a crew member
-            # bypasses `session_control`; its safe direction is FALSE (bypass
-            # off). Schema validation pops a present-but-malformed value and the
-            # missing-field default is TRUE, so a quoted `"false"` — a routine
-            # operator quoting mistake — would silently ride that default back
-            # to an authorized bypass. Coerce a present non-bool to False HERE,
-            # so validation sees a valid bool and keeps it; a genuinely absent
-            # key is left absent and still defaults to true (today's behaviour).
+            # Same fail-closed-before-validation reason for the two agent
+            # switches whose safe direction is FALSE.
+            # `agent.session_control` is the operator's single withdrawal of
+            # cross-session control, and `agent.member_dispatch` gates whether
+            # a crew member bypasses that withdrawal. Schema validation pops a
+            # present-but-malformed value and the missing-field default is TRUE
+            # for both, so a quoted `"false"` — a routine operator quoting
+            # mistake — would silently ride that default back to the
+            # capability staying enabled. Coerce a present non-bool to False
+            # HERE, so validation sees a valid bool and keeps it; a genuinely
+            # absent key is left absent and still defaults to true (today's
+            # behaviour). One loop, so neither switch can keep the guard while
+            # the other loses it.
+            #
+            # Say so out loud. The coercion resolves a malformed value one way,
+            # and an operator who meant the other way has no other signal:
+            # validation sees the repaired bool and stays quiet. The line names
+            # the key, the type it found and the JSON it wanted, so the fix is
+            # the next thing the operator does rather than a capability they
+            # find missing later.
             _agent_section = data.get("agent")
-            if isinstance(_agent_section, dict) and "member_dispatch" in _agent_section:
-                if not isinstance(_agent_section["member_dispatch"], bool):
-                    _agent_section["member_dispatch"] = False
+            if isinstance(_agent_section, dict):
+                for _fail_closed_key in ("session_control", "member_dispatch"):
+                    if _fail_closed_key in _agent_section and not isinstance(
+                        _agent_section[_fail_closed_key], bool
+                    ):
+                        logger.warning(
+                            "agent.%s is %s, not a boolean; reading it as the safe "
+                            "value false (the capability is OFF). Write true or false "
+                            "without quotes to choose.",
+                            _fail_closed_key,
+                            type(_agent_section[_fail_closed_key]).__name__,
+                        )
+                        _agent_section[_fail_closed_key] = False
             # Keep a genuinely absent default backward-compatible with older
             # configs, but normalize a PRESENT malformed value before advisory
             # schema validation can delete it and turn corruption into the
@@ -4257,14 +4331,6 @@ class KiroCrewConfig:
                 _dashboard_section["default_memory_mode"] = _default_memory_mode_from(
                     _dashboard_section["default_memory_mode"]
                 )
-            # A malformed pause control must not be dropped back to its enabled default.
-            _memory_section = data.get("memory")
-            if (
-                isinstance(_memory_section, dict)
-                and "private_provisioning_enabled" in _memory_section
-            ):
-                if not isinstance(_memory_section["private_provisioning_enabled"], bool):
-                    _memory_section["private_provisioning_enabled"] = False
             # Validate against JSON Schema (advisory — never fatal)
             _validate_config_data(data)
             # Clamp security-relevant resource-limit knobs to their API ceilings
@@ -4372,6 +4438,19 @@ class KiroCrewConfig:
         )
         if heartbeat_default_deliver not in ("slack", "dashboard"):
             heartbeat_default_deliver = "slack"
+        # A stored document written before this key existed has no "monitoring"
+        # object at all, and that is the case that must keep working: the miss
+        # resolves to the dataclass default, which is the off position. So an
+        # already-installed gateway needs nothing written to be correct here --
+        # only a gateway that wants the key ON writes it, and Settings does
+        # that. (The hazard this avoids belongs to a SHIPPED DEFAULT that
+        # CHANGES: config.json materializes every key, so the stored value
+        # outranks the new default forever. Adding a key has no stored value to
+        # outrank it.)
+        monitoring_data = _coerced_section(data, "monitoring", _degraded)
+        monitoring_prefer_structured_arming = _safe_bool(
+            monitoring_data.get("prefer_structured_arming"), False
+        )
         tunnel_data = _coerced_section(data, "tunnel", _degraded)
         skills_data = _coerced_section(data, "skills", _degraded)
         session_summary_data = _coerced_section(data, "session_summary", _degraded)
@@ -4379,6 +4458,7 @@ class KiroCrewConfig:
         telemetry_data = _coerced_section(data, "telemetry", _degraded)
         orchestrator_data = _coerced_section(data, "orchestrator", _degraded)
         watchdog_data = _coerced_section(data, "watchdog", _degraded)
+        decisions_data = _coerced_section(data, "decisions", _degraded)
         resource_limits_data = _coerced_section(data, "resource_limits", _degraded)
 
         # Parse agents section into dict[str, KiroCrewAgentConfig]
@@ -4398,6 +4478,7 @@ class KiroCrewConfig:
                     # not survive load — select_crew's roster calls .strip() on it.
                     raw_triggers = entry.get("triggers", "")
                     agents[name] = KiroCrewAgentConfig(
+                        member_id=entry.get("member_id", ""),
                         kiro_agent=entry.get("kiro_agent", ""),
                         workspace=entry.get("workspace", "default"),
                         memory_store=entry.get("memory_store", "default"),
@@ -4472,6 +4553,7 @@ class KiroCrewConfig:
                         defect,
                     )
                 memory_stores[name] = MemoryStoreConfig(
+                    owner_member_id=entry.get("owner_member_id", ""),
                     description=entry.get("description", ""),
                     embedding_provider=entry.get("embedding_provider", ""),
                     owner_member=entry.get("owner_member", ""),
@@ -4488,12 +4570,12 @@ class KiroCrewConfig:
         if not isinstance(default_memory_store_val, str):
             default_memory_store_val = DEFAULT_MEMORY_STORE
         # Reported, not repaired, for the same reason as the store names above.
-        # Legacy default_memory_store is retained for compatibility. Private
+        # Legacy default_memory_store is retained for V1 compatibility. Member
         # member resolution never uses it as a fallback or a filesystem path.
         elif memory_store_name_defect(default_memory_store_val) is not None:
             logger.warning(
                 "default_memory_store %r is not a usable store name (%s); preserved "
-                "for compatibility but not used for private memory resolution",
+                "for V1 compatibility but not used for member memory resolution",
                 default_memory_store_val,
                 memory_store_name_defect(default_memory_store_val),
             )
@@ -4612,6 +4694,10 @@ class KiroCrewConfig:
                 connect_timeout_raw, instances_data, mint_timeout_raw
             ),
             heartbeat=HeartbeatConfig(default_deliver=heartbeat_default_deliver),
+            monitoring=MonitoringConfig(
+                prefer_structured_arming=monitoring_prefer_structured_arming
+            ),
+            decisions=DecisionsConfig.from_raw(decisions_data),
             skills=_build_skills_config(skills_data),
             session_summary=_build_session_summary_config(session_summary_data),
             slack_channels={
@@ -4862,6 +4948,8 @@ class KiroCrewConfig:
             "cron_history": asdict(self.cron_history),
             "knowledge": asdict(self.knowledge),
             "heartbeat": asdict(self.heartbeat),
+            "monitoring": asdict(self.monitoring),
+            "decisions": asdict(self.decisions),
             "skills": asdict(self.skills),
             "session_summary": asdict(self.session_summary),
             "telemetry": asdict(self.telemetry),
@@ -4888,6 +4976,15 @@ class KiroCrewConfig:
         if isinstance(_gw_section, dict):
             _gw_section["stub_servers"] = list(self.mcp_gateway.stub_roster)
             _gw_section.pop("_stub_roster", None)
+        # ``telegram.accounts`` is deprecated and inert. It is kept on disk ONLY
+        # so an operator's named-account tokens survive the next save(); an
+        # empty map protects nothing, and writing it back materializes a
+        # deprecated key into every config Kiro Crew has ever saved -- which
+        # validation then announces as a deprecation on every launch, to an
+        # operator who never wrote it. Emit the map only when it holds accounts.
+        _tg_section = d.get("telegram")
+        if isinstance(_tg_section, dict) and not _tg_section.get("accounts"):
+            _tg_section.pop("accounts", None)
         # Re-emit unknown/edition-contributed top-level sections captured at
         # load() so save()/PATCH does not silently drop them. A known section
         # never appears here (only keys absent from d are restored), so this can
@@ -5069,6 +5166,7 @@ class KiroCrewConfig:
         agent: str | None,
         model_override: str | None,
         global_model: str | None = None,
+        namespace: str | None = None,
     ) -> str:
         """The model id the ACP factory selects — what its effort gate keys on.
 
@@ -5114,18 +5212,44 @@ class KiroCrewConfig:
             global_model = self.agent.model
             if global_model == DEFAULT_MODEL:
                 global_model = self._resolve_agent_model()
+        # Kiro's namespace is ``acp``, so a supplied member route is unambiguous.
+        if namespace is None:
+            namespace = capabilities_for(self.agent.acp_backend).model_id_namespace
+        candidates: list[tuple[str, str]] = []
         if model_override:
-            m: str = model_override
-        elif not agent or agent == "kirocrew":
-            m = global_model
+            candidates.append((model_override, "model_override"))
+        if agent and agent != "kirocrew":
+            candidates.append((self._resolve_named_agent_model(agent), f"agent spec {agent}"))
+        candidates.append((global_model, "agent.model"))
+        # A pin says WHAT was picked, never for WHICH harness, so a backend switch
+        # hands the next session a model the new harness never served. Scope each
+        # precedence tier to the namespace that will run it and let an out-of-scope
+        # tier defer to the next candidate. The surviving pin is scoped BEFORE
+        # translation because translating a foreign id can make it look native.
+        for candidate, pin_source in candidates:
+            m = model_scope.scoped_pin(candidate, namespace, source=pin_source)
+            if m:
+                break
         else:
-            m = self._resolve_named_agent_model(agent) or global_model
-        if not m:
             return ""
-        namespace = capabilities_for(self.agent.acp_backend).model_id_namespace
-        if namespace != MODEL_NAMESPACE_ACP:
-            return model_registry.to_provider_id(m, namespace)
-        return model_registry.to_acp_id(m)
+        if m == DEFAULT_MODEL:
+            # The empty string is the nothing-pinned spelling every tier below reads.
+            return ""
+        # ``to_acp_id``, not ``to_provider_id``, is the kiro-family choice because
+        # kiro serves the registry aliases as distinct real models.
+        translated = (
+            model_registry.to_acp_id(m)
+            if namespace == MODEL_NAMESPACE_ACP
+            else model_registry.to_provider_id(m, namespace)
+        )
+        # Translation may RE-SPELL a pin, never RE-POINT it at another model. A
+        # different id from a namespace whose vocabulary does not claim this pin
+        # is an alias folding onto a substitute, and a pin the user picked
+        # outranks a substitution they cannot see. A namespace the registry does
+        # not model answers identically, so it re-points nothing.
+        if translated != m and not model_registry.namespace_vocabulary(m, namespace):
+            return m
+        return translated
 
     def crew_pinned_effort(self, agent: str | None, crew_agent: str | None = None) -> str:
         """The reasoning effort THIS CREW pins, or ``""`` when it pins none.
@@ -5419,7 +5543,36 @@ class KiroCrewConfig:
             # gate actually keys on. (Why the translation is keyed on the
             # backend, and why to_acp_id is the non-claude choice, is documented
             # on that method.)
-            m = self.acp_effective_model(agent, model_override, global_model=model)
+            # Per-session backend selection -- ONE call to the selection gate's
+            # per-session half (members.select_provider_backend: member-DM
+            # auto-route > configured default). The factory body carries no
+            # branching of its own, so the kiro construction path gains no
+            # second check (harness-parity H3/H13); resolve_selected_backend
+            # inside the helper applies the same governance/selectability gate
+            # as the persisted field, so a denied or unknown value degrades to
+            # kiro -- the member thread then runs as plain chat and the mount
+            # step logs why.
+            # circular import: members sits above config in the layering.
+            from kiro_crew.members import select_provider_backend
+
+            _backend = select_provider_backend(
+                session_key,
+                self.agent.member_acp_backend,
+                self.agent.acp_backend,
+            )
+            # Resolved BEFORE the model, and threaded into the resolution: the
+            # model's namespace translation and its pin-scope check both have to
+            # key on the backend this session actually gets, not on the
+            # configured default. A member-DM thread auto-routed to another
+            # harness runs a backend the config does not name, so keying either
+            # on the configured field judges the pin for a namespace that
+            # session never reaches.
+            m = self.acp_effective_model(
+                agent,
+                model_override,
+                global_model=model,
+                namespace=capabilities_for(_backend).model_id_namespace,
+            )
             # Thread the slot's effort into a per-model override so the kiro
             # cli.json overlay is written from it at spawn — without this, a
             # kiro cold start (or the handler's reset-then-respawn) would only
@@ -6170,7 +6323,9 @@ def _project_declares_agent(agent_name: str, project_dir: str) -> bool:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return agent_name in project_agent_names(project_dir)
+            return agent_name in project_agent_names(
+                project_dir, operation="project_declares_agent", source="unknown"
+            )
         names = cached_project_agent_names(project_dir)
         if names is None:
             logger.debug(
@@ -6237,7 +6392,7 @@ def resolve_agent_identity(config, agent_name=None, *, selection_kind="") -> tup
     """Alias, provider template and model pin for display/configuration only.
 
     This does not authorize memory access. Runtime callers must resolve the full
-    bindings; a model chip remains inspectable while private memory is unavailable.
+    bindings; a model chip remains inspectable while learned memory is unavailable.
     """
     record, alias, passthrough, _ = _resolve_agent_selection(
         config, agent_name, selection_kind=selection_kind
@@ -6256,6 +6411,7 @@ def resolve_agent_bindings(
     *,
     validate_memory_files: bool = True,
     selection_kind: str = "",
+    execution_context=None,
 ) -> ResolvedBindings:
     """Resolve workspace, memory store, and kiro agent for a session.
 
@@ -6305,17 +6461,25 @@ def resolve_agent_bindings(
 
     from kiro_crew.memory_stores import require_member_memory_store
 
-    # Existing members keep their exact V1 binding until the owner selects V2.
-    # The resolver rejects private ownership damage before admitting legacy use.
+    # Existing V1 members keep their exact configured store binding.
+    # Canonical member/store mismatches are rejected before legacy use.
     store_name = (
-        DEFAULT_MEMORY_STORE
-        if passthrough
-        else require_member_memory_store(
-            config, resolved_alias, require_directory=validate_memory_files
+        execution_context.store.store_id
+        if execution_context is not None
+        else (
+            DEFAULT_MEMORY_STORE
+            if passthrough
+            else require_member_memory_store(
+                config, resolved_alias, require_directory=validate_memory_files
+            )
         )
     )
 
-    kiro_agent = passthrough or agent_cfg.kiro_agent
+    kiro_agent = (
+        execution_context.template_id
+        if execution_context is not None
+        else passthrough or agent_cfg.kiro_agent
+    )
 
     # Build effective memory config via dict-level merge
     store_cfg = config.memory_stores.get(store_name)
@@ -6324,6 +6488,7 @@ def resolve_agent_bindings(
     effective_memory = resolve_memory_store_config(top_level_memory, store_dict)
 
     return ResolvedBindings(
+        execution_context=execution_context,
         workspace_dir=ws_dir,
         memory_store_name=store_name,
         effective_memory_config=effective_memory,
@@ -6359,23 +6524,38 @@ def resolve_effective_model(
     A per-session pick outranks all of these and is NOT considered here — the
     caller holds it. Returns ``""`` when every tier defers, meaning the backend
     picks (kiro-cli's own ``chat.defaultModel``).
+
+    Every tier is scoped to the namespace of the backend that would run the
+    session, the same gate ``create_provider_factory`` applies to the value it
+    sends. Without that the chip and the wire disagree in the one case the scope
+    exists for: after a backend switch the chip kept naming the previous
+    harness's pin while every turn ran on the new harness's default. A tier whose
+    pin the active harness cannot claim is skipped, so the next tier down answers
+    -- exactly as if that tier were unset.
     """
+    namespace = capabilities_for(config.agent.acp_backend).model_id_namespace
+
+    def _in_scope(pin: str) -> str:
+        return model_scope.scoped_pin(
+            pin, namespace, source="resolve_effective_model", log_level=logging.DEBUG
+        )
+
     _, kiro_agent, model_pin = resolve_agent_identity(
         config, agent_name, selection_kind=selection_kind
     )
-    if model_pin:
+    if _in_scope(model_pin):
         return model_pin
     if kiro_agent and kiro_agent != "kirocrew":
         pinned = normalize_agent_model(config._resolve_named_agent_model(kiro_agent))
-        if pinned:
+        if _in_scope(pinned):
             return pinned
 
     configured = normalize_agent_model(config.agent.model)
-    if configured:
+    if _in_scope(configured):
         return configured
     # agent.model is "auto"/unset: fall through to the installed agent file the
     # factory would read, so the chip shows what will actually be used.
-    return normalize_agent_model(config._resolve_agent_model())
+    return _in_scope(normalize_agent_model(config._resolve_agent_model()))
 
 
 def validate_kiro_agent_references(

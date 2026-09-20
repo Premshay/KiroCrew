@@ -73,6 +73,10 @@ _ERROR_CAP = 240
 # Servers per bucket. A stock install runs well under ten; the cap exists so a
 # misconfigured host cannot push an unbounded list into every slots snapshot.
 _BUCKET_CAP = 64
+# Names a one-line summary spells out before it counts the tail. A log line is
+# read at a glance, so the bound is far below ``_BUCKET_CAP``: the point is
+# which servers are broken, and a 64-name line answers that worse than eight.
+_SUMMARY_NAME_CAP = 8
 
 _ACTION_INITIALIZED = "mcp_server_initialized"
 _ACTION_INIT_FAILURE = "mcp_server_init_failure"
@@ -191,8 +195,19 @@ def _server_source(server: dict[str, Any]) -> dict[str, Any] | None:
 class KasMcpReadiness:
     """One activation's required servers; global and other-session state cannot satisfy it.
 
-    Status and tool tags are full snapshots. Tags establish exposure, not the
-    callable spelling: ``@server/tool`` need not be the native function ID.
+    Status and tool tags are full snapshots. Exposure -- the model can actually
+    reach the connected server's tools -- is established by EITHER a non-empty
+    ``tools`` catalog on the server's own ``connected`` status entry OR an
+    ``@server/tool`` tag in the ``_kiro/tools/didChange`` snapshot. Neither is
+    the callable spelling: ``@server/tool`` need not be the native function ID.
+
+    Both are accepted because released kiro-cli versions differ on which one
+    they send. Captured 2.18.0 / 2.20.0 emit both the catalog and the tags.
+    Captured 2.22.0 (KAS 0.66.0) still lists the full catalog on the connected
+    entry but its ``didChange`` snapshot carries only ``builtin`` tags -- no MCP
+    tag ever arrives, with or without ``tool_search`` in the agent's tools. A
+    barrier that took tags as the only exposure evidence timed out every
+    session start on that release.
 
     ``injected`` names the required servers Crew put in the session-level
     ``mcpServers`` array itself (as opposed to the active agent's block). It is
@@ -207,8 +222,18 @@ class KasMcpReadiness:
     injected: frozenset[str] = frozenset()
     states: dict[str, str] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
-    advertised: set[str] = field(default_factory=set)
+    #: Exposure evidence, kept per source because each snapshot is authoritative
+    #: only for its own kind: a status snapshot replaces the catalog evidence,
+    #: a tag snapshot replaces the tag evidence, and neither may retract the
+    #: other's. Read the union through :attr:`advertised`.
+    advertised_by_catalog: set[str] = field(default_factory=set)
+    advertised_by_tag: set[str] = field(default_factory=set)
     intentionally_hidden: set[str] = field(default_factory=set)
+
+    @property
+    def advertised(self) -> set[str]:
+        """Required servers with exposure evidence from either snapshot kind."""
+        return self.advertised_by_catalog | self.advertised_by_tag
 
     def _needs_exposure(self, name: str, server: dict[str, Any]) -> bool:
         """Do not demand tags for tools the active agent deliberately hides.
@@ -256,6 +281,9 @@ class KasMcpReadiness:
             self.errors.clear()
             self.intentionally_hidden.clear()
             entries = [server for server in servers if isinstance(server, dict)]
+            # Servers whose connected entry carries its catalog: fresh exposure
+            # evidence from this very snapshot (see the class docstring).
+            catalogued: set[str] = set()
             # Whether this BACKEND speaks provenance at all is read off the whole
             # snapshot, not one entry: a backend that does (2.20.0 stamps every
             # entry, connecting included) and leaves one entry unstamped is
@@ -289,20 +317,31 @@ class KasMcpReadiness:
                 self.states[name] = state
                 if not self._needs_exposure(name, server):
                     self.intentionally_hidden.add(name)
+                catalog = server.get("tools")
+                if state == "connected" and isinstance(catalog, list) and catalog:
+                    catalogued.add(name)
                 error = server.get("errorMessage")
                 if isinstance(error, str):
                     self.errors[name] = sanitize_sink_text(error, _ERROR_CAP)
                 if state == STATE_CONNECTED_WITHOUT_PROVENANCE:
                     self.errors[name] = _PROVENANCE_LIMIT
-            # A reconnect must obtain fresh catalog evidence.
-            self.advertised.intersection_update(
-                name for name in self.required if self.states.get(name) == "connected"
-            )
+            # A reconnect must obtain fresh exposure evidence of either kind; a
+            # connected entry that carries its catalog in this snapshot IS that
+            # evidence.
+            connected = {name for name in self.required if self.states.get(name) == "connected"}
+            self.advertised_by_catalog.intersection_update(connected)
+            self.advertised_by_catalog.update(catalogued)
+            self.advertised_by_tag.intersection_update(connected)
         elif msg.is_method(METHOD_KAS_TOOLS_CHANGED):
             tags = params.get("tags")
             if not isinstance(tags, list):
                 return
-            self.advertised = {
+            # A full snapshot: it replaces the TAG evidence, so a tag that
+            # disappears while the server stays connected is retracted as
+            # before. It never touches the catalog evidence -- on a release whose
+            # snapshot lists only builtin tags (2.22.0) that would clear it on the
+            # very next frame and reopen the timeout this path was built to end.
+            self.advertised_by_tag = {
                 name
                 for name in self.required
                 if any(
@@ -341,6 +380,21 @@ class KasMcpReadiness:
             if self.states.get(name) != "connected"
             or (name not in self.advertised and name not in self.intentionally_hidden)
         )
+
+
+def _joined(names: list[str]) -> str:
+    """Join names for one line, counting the tail instead of printing it.
+
+    A pure formatter. Names and failure texts arrive already sanitized from the
+    points that admit them (:meth:`McpSessionReport.record_frame`,
+    :meth:`McpSessionReport.record_unresolved_refs`), so nothing is re-cleaned
+    here: a composite like ``name (error)`` would otherwise be re-truncated to a
+    name's length and lose the reason.
+    """
+    head = names[:_SUMMARY_NAME_CAP]
+    rest = len(names) - len(head)
+    joined = ", ".join(head)
+    return f"{joined} (+{rest} more)" if rest > 0 else joined
 
 
 @dataclass
@@ -586,6 +640,58 @@ class McpSessionReport:
             or self._failed
             or self._awaiting_auth
         )
+
+    def problem_summary(self, *, include_reasons: bool = True) -> str:
+        """One line naming the servers this session cannot use, or ``""`` if clean.
+
+        A METHOD rather than a module function taking a payload: a consumer that
+        must not import this layer (``agent_sdk``'s boundary gate refuses any new
+        ACP edge) already holds the report itself through
+        ``LLMProvider.mcp_session_report()``, so reaching the summary through the
+        object it has costs it no import at all. It is declared on the
+        ``SessionMcpReport`` protocol beside ``payload`` for the same reason that
+        one is declared: a consumer must be able to name the capability instead of
+        probing for it.
+
+        Three buckets, kept apart because the reader's next move differs: a server
+        that FAILED needs its startup fixed, one AWAITING AUTHORIZATION needs a
+        person to authorize it, and an UNRESOLVED REF means the agent spec asked
+        for a server nothing configured -- so there is no row for it to be missing
+        from. ``ready`` and ``configured`` are deliberately absent: this is the
+        summary a consumer prints only when something is wrong, and naming the
+        healthy servers in it would make the clean case indistinguishable at a
+        glance.
+
+        Empty-on-clean, so a caller's silence-when-fine behaviour is this method's
+        return value rather than a condition each caller repeats.
+
+        ``include_reasons=False`` drops the failure text and keeps the names. A
+        reason is the failing server's OWN startup output -- remote content in the
+        OAuth and network cases -- and it is sanitized for credentials, URLs,
+        control characters and length, none of which neutralizes a natural-language
+        instruction. That is harmless in a log a person reads and is not harmless
+        in a model's prompt, so the sink that feeds a model asks for the summary
+        without it instead of trusting a scrubber to disarm prose.
+        """
+        parts: list[str] = []
+        if self._failed:
+            described = [
+                (
+                    f"{name} ({self._failures[name]})"
+                    if include_reasons and self._failures.get(name)
+                    else name
+                )
+                for name in self._failed
+            ]
+            parts.append("failed to start: " + _joined(described))
+        if self._awaiting_auth:
+            parts.append("awaiting authorization: " + _joined(list(self._awaiting_auth)))
+        if self.unresolved_refs:
+            parts.append(
+                "declared by the agent spec but not configured: "
+                + _joined(list(self.unresolved_refs))
+            )
+        return "; ".join(parts)
 
     def payload(self) -> dict[str, Any] | None:
         """The serialized report, or ``None`` when no session has begun.

@@ -8,7 +8,6 @@ import importlib
 import json
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -57,7 +56,7 @@ from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.memory import normalize_projects_document
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.platform.context import redact_log_via_context
-from kiro_crew.platform_compat import kill_and_reap
+from kiro_crew.platform_compat import isolated_python_argv, kill_and_reap
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     cgroup_scope_argv,
@@ -335,7 +334,10 @@ def _validate_private_profile_update(
     owner = record.owner_member
     bindings = resolve_agent_bindings(cfg, owner)
     builder._build_v2_essentials(
-        store, project=str(bindings.workspace_dir), profile_overrides={filename: content}
+        store,
+        member=record.owner_member_id,
+        project=str(bindings.workspace_dir),
+        profile_overrides={filename: content},
     )
 
 
@@ -575,7 +577,7 @@ async def api_memory_history(request: web.Request) -> web.Response:
         return web.json_response({"ok": True})
     try:
         content = await asyncio.to_thread(mem.read_editable_history)
-    except (UnknownMemoryStore, OSError) as exc:
+    except (UnknownMemoryStore, OSError, FileTooLargeError) as exc:
         return _store_unavailable_response(store, exc)
     return _memory_document_response(content)
 
@@ -1579,7 +1581,7 @@ async def _ensure_pip_available() -> tuple[bool, str]:
         pass
     try:
         sandboxed_argv, cleanup = await wrap_argv_async(
-            [sys.executable, "-m", "ensurepip", "--upgrade"],
+            isolated_python_argv("-m", "ensurepip", "--upgrade"),
             mode="standard",
             _prepare=wrap_argv,
         )
@@ -1705,15 +1707,14 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
                 )
             try:
                 sandboxed_argv, cleanup = await wrap_argv_async(
-                    [
-                        sys.executable,
+                    isolated_python_argv(
                         "-m",
                         "pip",
                         "install",
                         "-q",
                         "faiss-cpu",
                         "--only-binary=:all:",
-                    ],
+                    ),
                     mode="standard",
                     _prepare=wrap_argv,
                 )
@@ -2227,9 +2228,9 @@ async def api_memory_promote(request: web.Request) -> web.Response:
     if store.algorithm_version == "v2":
         return web.json_response(
             {
-                "error": "Automatic episode promotion is not available for private memory. "
+                "error": "Automatic episode promotion is not available for member memory. "
                 "Review and edit the member's records explicitly.",
-                "code": "promotion_unavailable_for_private_memory",
+                "code": "promotion_unavailable_for_member_memory",
             },
             status=400,
         )

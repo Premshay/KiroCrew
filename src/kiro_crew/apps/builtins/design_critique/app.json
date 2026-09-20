@@ -65,9 +65,6 @@
     "cron": false,
     "network": false
   },
-  "backend": {
-    "routes": "backend.routes:register_routes"
-  },
   "iconUrl": "/app-assets/design-critique/icon.svg",
   "heroImage": "/app-assets/design-critique/hero-light.svg",
   "heroImageDark": "/app-assets/design-critique/hero-dark.svg",

@@ -438,6 +438,13 @@ export interface CronJob {
   skip_dates?: string[] | null
   script?: string | null; command?: string | null; last_result?: string | null; last_error?: string | null
   is_running?: boolean; running_since?: number | null
+  /** The installed app that owns this job, or null/absent for a person-owned
+   * one. Host-derived from the job's `created_by` stamp, which an app never
+   * supplies, so it cannot be used to claim another app's jobs. Absent on an
+   * older gateway. */
+  app?: string | null
+  /** True only when the USER paused the job; execution never sets it. */
+  user_paused?: boolean
   /** Operator-granted vault secrets injected into a script/command job's env at
    * fire time: env-var name -> vault secret NAME (values never leave the vault).
    * Absent/null when the job holds no grant. */
@@ -448,6 +455,15 @@ export interface CronJob {
   secret_env_pending?: Record<string, string> | null
   secret_env_pending_ts?: number | null
   folder_id?: string
+  /** Sidebar chat folder this job's `cron-{id}` tab is filed into, or ""/absent
+   *  for a job that is not filed. Persistent jobs only: a stateless job has no
+   *  job-wide tab, and the backend refuses the pair at save time. A different
+   *  tree from `folder_id` directly above, which groups this job's ROW on the
+   *  Schedule page — the two are never read off each other. */
+  chat_folder_id?: string
+  /** False for a job that runs on a fresh session every fire. The form does not
+   *  edit it; it only reads it to disable the chat-folder picker. */
+  persistent_session?: boolean
   /** Chat session that owns this job — ownership decides chat-side reachability
    * (cron_list only lists a session its own jobs). Null for an ownerless job,
    * which is invisible to every chat session and manageable only from the
@@ -753,10 +769,18 @@ export interface DiscoveredMcpServer {
   deprecated: boolean
 }
 
+/** Outcome of one provider leg in an MCP discovery search. */
+export interface McpProviderOutcome {
+  name: string
+  status: 'ok' | 'timeout' | 'error'
+}
+
 /** Response from GET /api/mcp/discover */
 export interface McpDiscoverResponse {
   results: DiscoveredMcpServer[]
   providers: string[]
+  /** Additive for compatibility with gateways that predate outcome reporting. */
+  provider_outcomes?: McpProviderOutcome[]
 }
 
 /** Install-plan preview inside the discover detail response. */
@@ -1260,7 +1284,7 @@ export interface PullRequestSource {
 }
 
 export interface ChatFolder {
-  id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; icon?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
   /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
    *  this folder. Absent = no tags, mirroring the optional `color`. */
   tags?: string[]
@@ -1310,6 +1334,13 @@ export interface ChatMessage {
   seq?: number
   /** Gateway process generation that numbered `seq` (folded snapshot rows). */
   gen?: string
+  /** One skill-selection decision the gateway stamped on the row that ends the
+   *  turn, when the Decisions (Jev) seam answered for it. Typed `unknown`
+   *  because the shape is validated at the read, by
+   *  `pages/chat/decisionRecord.ts` — the strip draws nothing for a record it
+   *  cannot check. The gateway stamps it under `meta` on both doors, and this
+   *  top-level spelling is accepted as well, the split `kind` above has too. */
+  decisions_strip?: unknown
 }
 
 export interface SubagentActivity {
@@ -1333,6 +1364,15 @@ export interface SubagentActivity {
   status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped' | 'reported'
   streaming: string; lastTool: string
   startedAt: number; elapsed: number; error?: string
+  /** True when `startedAt` was ASSUMED rather than observed, which is the case
+   *  for an entry minted by `upsertSlotSub` from an incremental frame: that frame
+   *  carries no start time, so the entry records its arrival instant. The agent
+   *  may already have been running for minutes, so a row MUST NOT render an
+   *  elapsed figure derived from it -- a card reading "3s" for a five-minute run
+   *  is the two-numbers-disagree confusion the idle row exists to remove. Cleared
+   *  by any frame that supplies real timing: a `subagent_snapshot` replay carries
+   *  `started`, and `subagent_done` carries `elapsed`. */
+  startedAtAssumed?: boolean
   toolCount?: number      // observed tool calls (incl. auto-approved) — running-card progress
   stalled?: boolean       // reaper flagged this subagent as idle/stalled
   /** Seconds of no stream activity measured when the reaper raised `stalled`
@@ -1436,8 +1476,11 @@ export interface TaskDetail {
 export type RunStatus = 'planning' | 'planned' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused' | 'pausing';
 export interface ProjectRun {
   task_id: string; name?: string; running: boolean; status: RunStatus
-  steps: number; completed: number; failed: number; skipped: number
-  current_step: number; spec: string; spec_name: string; error: string
+  /** Total step count. Named for the wire: `build_status` emits `tasks`, and
+   *  `steps`/`current_step` — the names this interface used to declare — are
+   *  sent by no producer, so both read `undefined` on every row. */
+  tasks: number; completed: number; failed: number; skipped: number
+  current_task: number; spec: string; spec_name: string; error: string
   tokens_used: number; replan_count: number; task_details: TaskDetail[]
   started_at: number; finished_at: number
   work_dir: string; branch_name: string
@@ -1505,6 +1548,11 @@ export interface PublishProviderDescriptor {
    *  available. Optional: older gateways omit it, and a row with no hint simply shows
    *  none rather than inventing one. */
   install_hint?: string
+  /** False => the published link requires authentication (content is stored privately),
+   *  so the publish flow shows neither the public-exposure warning nor the "publish
+   *  publicly" acknowledgment. Optional: older gateways omit it, and absence means
+   *  reachable -- a missing warning on a public link is the worse mistake. */
+  public_reachable?: boolean
   sharing_model: {
     supports_private: boolean
     supports_shared: boolean

@@ -2,6 +2,9 @@
 
 ## Overview
 
+Off-loop project-agent resolution labels hardened discovery reads with
+`project_declares_agent`; cached event-loop lookups retain their no-I/O path.
+
 Foreign-agent onboarding is gated independently by `dashboard.import_onboarded`,
 migrated from the older `dashboard.onboarded`, and the settings it projects are
 merged strictly (merge-only, never a wholesale replace). The loader preserves legacy
@@ -249,126 +252,113 @@ The CLI (`cli.py:main()`) auto-detects and sets the env var at startup.
 ## Named Memory Stores (`memory_stores.py`)
 
 The reserved `agents.default` assistant uses the existing Global Memory **V1**.
-Every new named `agents` entry receives one private **V2** memory store. Existing
-members retain their exact V1 binding until the owner chooses V2. Changing
+Explicit creation of a new Crew Member allocates one **V2** memory store.
+Automatic discovery and existing V1 members retain their V1 bindings. Changing
 `default_agent` selects the member with its existing memory version and binding;
-it never converts private memory to Global. A materialized provider template which
+it never converts member memory to Global. A materialized provider template which
 is not a Crew Member continues to use V1.
 
 ### Separate files preserve V1
 
-| Resolver | Global `default` | Private named store |
+| Resolver | Global `default` | Member V2 store |
 |---|---|---|
 | `memory_store_dir_for` | `<home>/workspace/` | `<home>/memory_stores/<name>/` |
 | `resolve_store_path` | `<home>/memory.db` | `<home>/memory_stores/<name>/memory.db` |
-| `memory_index_path_for` | `<home>/memory_index.db` | `<home>/memory_stores/<name>/memory_index.db` |
+| `memory_index_path_for` | `<home>/memory_index.db` | `<home>/memory_stores/<name>/memory.db` |
 
-The markdown root contains `memory/preferences.md`, `memory/projects.md` and
-`memory/history/`. It is not the default vector/index directory. No path is
+V1 retains its markdown, history and separate index layout. Explicit V2 creation
+adds only manual `memory/preferences.md` and `memory/projects.md` beside its
+single SQLite database; learned history and search use that database. No path is
 renamed and no V1 data is migrated, copied or algorithmically converted on member
-creation. Private stores begin empty. Explicit selected-content inheritance and
+creation. Member stores begin empty. Explicit selected-content inheritance and
 its provenance are owned by [memory-skills-hooks](memory-skills-hooks.md).
 
-### Private ownership and creation
+### Member identity and creation
 
-`MemoryStoreConfig.owner_member` identifies the sole owning config alias;
-`memory_version` is `2` for private member stores, and defaults to `1` for legacy
-or manually declared stores. A private store also has a bounded
-`member-memory.json` manifest with the same owner and version. Runtime resolution
-checks both records and refuses a store bound by any other member.
+A V2 member has an immutable persisted `member_id`, independent of its editable
+config/display label. `MemoryStoreConfig.owner_member_id` and the database's
+`member_database` singleton record identify the same owner and store ID.
+`memory_version: 2` selects V2; legacy declarations default to V1. `owner_member`
+is descriptive display metadata, never execution authority. Templates and
+projects cannot select a member's memory.
+
+The template-picker roster withholds `member_id`; the full configuration view
+applies the same credential and exfiltration redaction to this hand-editable
+string as other member fields. Stored identity values remain unchanged.
 
 `provision_member_memory(config, member)` allocates an exclusive random directory
-named `member-<slug>-<uuid>`, writes the ownership manifest, initializes an empty V2
-SQLite database, then updates the loaded config. The member is published only
-after initialization succeeds. Directory creation uses `exist_ok=False`, so neither concurrent creations
-nor a reused display name can adopt another directory's contents. Parent and
-child directories receive owner-only permissions. It never resets an existing
-private store or copies the former binding's data.
+and creates a new SQLite database through `create_member_database`, plus the
+explicit manual preferences/projects documents. The member/config binding is
+published only after initialization succeeds. It never adopts an existing
+unidentified database, resets a store, or copies earlier V1/V2 data. An existing
+V2 member must retain its ID and store. No manifest, retirement registry, private
+payload copy, OS admission gate, or memory provisioning feature flag is involved.
 
-`POST /api/agents` and `kirocrew agent create` provision automatically; installed
-agent sync provisions newly discovered members too. An absent, empty or `default`
-create field is accepted for client compatibility and requests automatic private
-allocation. A supplied named store is rejected. `PUT /api/agents/{name}` and CLI
-update reject rebinding: an echoed current store is accepted, another identity
-(including global) is not.
+`POST /api/agents` and `kirocrew agent create` allocate new stores automatically.
+A supplied named store is rejected. Owner edits may echo the current store but
+cannot silently rebind it. Legacy members keep their explicit Global or named V1
+binding. Member updates and automatic discovery never initialize a V2 database;
+only explicit creation of a new member may allocate one. Existing V1 memory
+and transcripts remain unchanged.
 
-The typed `memory.private_provisioning_enabled` boolean defaults to true. The
-existing owner config PATCH API accepts only JSON booleans; the loader normalizes
-a present malformed value to false before advisory schema validation, including
-when jsonschema is unavailable. False pauses new member allocation and V1 opt-in
-through the common creation guard. It leaves existing store execution and
-management unchanged and does not cancel previously admitted work. The setting
-is read at admission, so changes need no gateway restart. See
-[memory-skills-hooks](memory-skills-hooks.md) for its scope and refusal contract.
-The creation guard also refuses degraded `memory` and `DEGRADED_WHOLE_CONFIG`
-markers rather than interpreting their default values as provisioning permission.
+`persist_member_config` publishes the member and store under `update_config_locked`,
+rechecking duplicate creation, immutable member ID, expected binding, and exclusive
+store ownership while preserving unrelated concurrent edits. When creation fails
+or is cancelled after allocating a store, the creation paths call
+`retire_unpublished_allocation`: it re-reads `config.json` under the same lock and
+removes the fresh directory only when no member and no store entry references it,
+then restores the in-memory binding so a retry allocates fresh. A publication that
+landed is kept; pre-existing bindings and stores are never deleted or retired.
+Degraded or unreadable configuration refuses creation instead of guessing defaults.
+Non-string `member_id` or `owner_member_id` values refuse allocation with
+`UnknownMemoryStore` before forming the reserved-ID set, preserving the raw values,
+existing databases and V1 bindings instead of replacing damaged identities.
 
-Legacy members keep working with their exact Global or declared unowned V1
-binding. They may opt in to empty V2 memory through `PUT /api/agents/{name}` with
-`provision_memory: true`, or `kirocrew agent update <name> --provision-memory`.
-Their previous Global or named memory remains untouched. Unchanged legacy
-bindings permit unrelated metadata edits, including description and avatar.
-Broken existing V2 ownership requires recovery instead of another allocation.
-
-An actual dashboard V1-to-V2 opt-in returns `new_conversation_required: true`.
-The owner must finish or stop visible member work and its attached children
-before setup. Idle providers are closed, and their conversation identities keep
-the original V1 store. Opening the member then selects a fresh V2 conversation;
-old V1 transcripts and native provider context are never relabeled as V2.
-The same private-assignment check runs before provider allocation, including
-after CLI opt-in. Existing schedules and child runs retain their recorded store.
-
-Member create/update publish only the member and its store record through
-`persist_member_config` and the cross-process `update_config_locked` primitive.
-The write rechecks duplicate creation, expected prior binding and ownership under
-the lock, retaining unrelated settings written by another caller. A failed or
-competing publication may leave an unreferenced empty store; it cannot expose
-it as a member's memory. The existing installed-agent sync remains a batch config
-save and is serialized with dashboard config edits by the handler lock.
+A `memory_version: 2` record whose `owner_member_id` is empty is a member store
+written before identities existed; the loader keeps it verbatim and every
+resolver refuses it. `repair_legacy_member_stores()` runs in the `cli.main`
+prologue after `boot_platform` for every CLI subcommand except `gateway`,
+`doctor` and the `mcp-*` servers, and for the gateway in its post-readiness
+memory preparation worker (never on the boot path), so both
+surfaces publish the missing `member_id` / `owner_member_id` pair before any
+member is resolved. It writes through `update_config_locked`, skips a config
+whose memory section degraded, and never raises. Criteria, refusals and the
+database half are owned by
+[memory-skills-hooks](memory-skills-hooks.md#pre-identity-member-stores-are-upgraded-at-start).
 
 ### Exact resolution and explicit failures
 
-`resolve_declared_store` either returns the requested declared name or raises
-`UnknownMemoryStore`. There is no named-store fallback to `default_memory_store`
-or to V1. `default_memory_store` remains readable for config compatibility but is
-not a repair target for private memory.
+Admission resolves one frozen `ExecutionContext` containing member ID, store ID,
+selection namespace, template, app attribution, and privacy mode. The snapshot is
+part of the owning session/run/job record, captured before awaiting asynchronous
+work. Background workers, continuations, schedules and reruns inherit it directly;
+closing the originating chat or editing a display name does not retarget execution.
+An explicit `target_member` selects an existing configured member under ordinary
+execution permissions. There is no automatic provisioning or fallback to Global.
 
-`require_memory_store(store, config=..., require_directory=True)` additionally opens
-the directory and validates V2 ownership and the existing SQLite file header.
-A deleted/unreadable directory or database is an error, not permission to
-recreate empty memory. `require_member_memory_store`
-accepts the member's exact declared V1 identity or its uniquely owned V2 identity.
-Legacy admission checks surviving private declarations, member manifests and
-owner metadata in unmanifested regular SQLite files;
-named V1 stores must contain no private manifest or database identity. A damaged
-generated private-store name is a refusal hint, never authority to adopt a store.
-Protected V2 conversation records also prevent a config change from downgrading
-that conversation before provider allocation. Unknown or malformed bindings
-refuse. Callers propagate these failures rather than treating them as absent.
+`resolve_declared_store` and `require_member_memory_store` reject malformed,
+missing and contradictory declarations. `resolve_agent_bindings(...,
+validate_memory_files=False)` captures configuration identity without opening
+learned memory. Persona/project/manual context can therefore load while the
+learned database is unavailable. Actual memory operations validate the captured
+store's database identity with `open_member_database`; an absent, corrupt or wrong
+member database is an explicit error and is never recreated at read time.
 
-`resolve_agent_identity` is a metadata-only helper for member labels and model
-display; it grants no memory access. Sandboxed MCP advisory selection calls
-`resolve_agent_bindings(..., validate_memory_files=False)` because member files
-are hidden there. The flag skips member-directory scans and database validation
-while retaining config ownership checks and the named-store retirement gate.
-It grants no execution authority. Trusted gateway execution uses strict file
-validation off the event loop before accepting the selected member.
+Store names use lowercase letters, digits and hyphens, 1–80 characters, with no
+leading/trailing hyphen, path separators or Windows device basename. Managed paths
+must remain under `memory_stores/` and may not redirect to another store.
+`memory_store_version` reads the exact configured declaration; it does not infer
+ownership from labels, paths or database contents. V1 opens refuse a database
+bearing the explicit V2 identity table rather than treating it as Global memory.
 
-Store names are lowercase letters, digits and hyphens, 1–80 characters, with no
-leading/trailing hyphen, path separators, Windows device basename, trailing dot or
-space. Malformed config declarations are reported and preserved; no sanitization
-can silently merge identities. Composed paths are checked for exact identity
-under `memory_stores/`, refusing links to either a sibling or an external store.
-
-`memory_store_version(store)` reads only the bounded ownership manifest without
-loading config, so vector initialization can positively select V2 algorithms.
-Global, unrecognized and unowned legacy stores answer `1`. This version query is
-not an authorization gate; execution still validates the config binding.
-
-The entire `memory_stores/` subtree is read/write fenced from agent file tools.
-See [security](security.md) for the enforced boundary and shell-access limits,
-and [memory-skills-hooks](memory-skills-hooks.md#memory-across-surfaces-and-channels)
-for how trusted execution carries the member binding.
+Incognito and Temporary modes are inherited monotonically. New restricted sessions
+keep their canonical record in memory and suppress Crew body/checkpoint writes.
+Tightening an existing persisted execution updates only retention metadata so a
+restart cannot broaden it. Ordinary transport authentication, app/owner permissions,
+enterprise governance, host sandbox and credential protection remain independent
+of memory routing. Same-host arbitrary-code confidentiality between member stores
+is not a goal. See [memory-skills-hooks](memory-skills-hooks.md) and
+[security](security.md) for the storage and ordinary host-security contracts.
 
 ## Workspace fall-through is logged
 
@@ -852,6 +842,31 @@ re-emitted with `asdict` and so lose unmodelled keys the same way a section
 does. `hooks` needs neither: it is emitted raw and round-trips whole. A record
 deleted in memory stays deleted — restore fills into existing records only.
 
+A top-level key the core does not model is captured into `_extra_sections` and
+round-tripped, and by default also reported as `Config: unrecognized top-level
+keys`. Two exclusions from that warning are named in code:
+
+- `CONFIG_RESERVED_TOP_KEYS` in `resolution.py` (`meta`, retired keys) — stamped
+  by `save()` itself or written by an older build; never parsed, never
+  captured, dropped on the next save, never warned about.
+- `validation._APP_OWNED_TOP_KEYS` (`dev_fleet`) — a section a builtin app reads
+  from the file directly (`dev_fleet.repo_path`, prescribed by the Dev Fleet
+  "no checkout found" banner). Captured and round-tripped like any unknown
+  section, and NOT reported as unrecognized: the product told the operator to
+  write it. Private to the warning that is its only consumer; a second member
+  is the point at which this becomes an app-declared registration.
+
+A deprecated field is announced only when it holds something: `null` and an
+empty map, list or string carry nothing to migrate, so `validation` stays
+silent on them (`False` and `0` are chosen values and are still announced). A
+schema entry that is marked `deprecated=True` therefore accepts that an empty
+value of its type gets no notice; a field for which `""` or `[]` is itself a
+meaningful choice must not rely on the deprecation notice to surface that
+value. `to_dict()` also omits `telegram.accounts` when the map is empty: the
+field exists only so an operator's named-account tokens survive a save, and
+writing back an empty default materialized a deprecated key into every config,
+which every launch then warned about.
+
 Both capture from the BASE view of the document, not the merged one. When
 `config.local.json` shadows an unknown key that `config.json` also holds, a
 capture of the merged value made `save()` emit the overlay's leaf, which the
@@ -1011,10 +1026,10 @@ Resolution order:
 template namespace even if discovery has imported a same-named member.
 `selection_kind="member"` requires the configured alias instead of falling back
 to a same-named template. Both still report an unavailable explicit selection
-through `requested_resolved=False`; neither flag authorizes private memory.
-Dashboard callers obtain this choice from the protected per-session record
+through `requested_resolved=False`; neither flag authorizes member memory.
+Dashboard callers obtain this choice from the canonical session execution record
 described in [session](session.md#agent-selection-provenance).
-The session resolver rejects a different agent name when a protected record
+The session resolver rejects a different agent name when a execution record
 exists. Live provider switches publish their validated template choice before
 history changes; ordinary resolution cannot replace provenance from metadata.
 
@@ -1063,8 +1078,9 @@ a second directory instead would stall the gateway.
 **filename** and reads at most the one matching spec — resolving every spec's declared
 name would stall Slack on a checkout with many agents.
 
-Dashboard turns and eager allocation offload full binding resolution because it
-also validates protected provenance and private memory files. Their
+Dashboard turns and eager allocation offload binding resolution and capture the
+canonical execution record before provider work. Learned database availability
+is checked by memory operations, not by persona/template admission. Their
 `resolve_session_agent_bindings` wrapper converts a resolver's `StopIteration`
 into an explicit unavailable-selection error before it crosses the worker
 Future: asyncio cannot deliver `StopIteration` through that boundary.
@@ -1074,13 +1090,15 @@ requested name was honored — False means the default answered) and
 `resolved_alias` (the alias key whose bindings were used). `selection_kind`
 records whether the explicit selection was a template or member. Callers
 persisting a member name use `resolved_alias`, never its `kiro_agent`; dashboard
-template conversations retain their requested name together with protected
-namespace provenance so later alias discovery cannot change the selection.
+template conversations retain their requested name together with their recorded
+selection namespace so later alias discovery cannot change the selection.
 The session resolver also captures `selection_revision` before resolving:
-an empty string observes no protected record, while `None` means the caller
+an empty string observes no execution record, while `None` means the caller
 did not make an observation. Automatic publication checks that revision under
 the writer lock before replacing a record. This transient field guards
-publication; it does not change dispatch identity or grant memory access.
+publication. The execution record also persists a unique publication revision to
+distinguish repeated selections during compare-and-set; neither revision grants
+memory access.
 
 #### App-slot cold-snapshot self-heal & fail-loud (`dashboard/chat_runner._run_chat`)
 The one-turn cold fallback above is acceptable for an ordinary session (the next
@@ -1761,7 +1779,7 @@ happens to notice — which is the bug class this closes.
 | `KiroCrewConfig.save()` | `config/loader.py` |
 | `_persist_config_migration` | `config/loader.py` — a boot migration is a config write like any other |
 | `refresh_config_meta_stamp` | `config/loader.py` — kicks only when the stamp actually moved (no rewrite, no mtime churn) |
-| `_atomic_json_write` | `agent.py` — via `_notify_if_config_write`, and ONLY when the target resolves to `config_path()`; the per-channel savers and the STT PUT reach the file through here, bypassing the loader's writers |
+| `_atomic_json_write` | `agent.py` — via `_notify_if_config_write`, and ONLY when the target resolves to `config_path()`; the remaining per-channel savers and the STT PUT reach the file through here, bypassing the loader's writers. Held to a shrinking baseline by `TestTheAtomicJsonWriteConfigFamilyIsRatcheted`, so a new saver cannot join them; the Feishu and iMessage savers are already on `update_config_locked` and are the shape to copy |
 
 A handler that must answer only after the new value is in force calls
 `ConfigWatch.refresh_now()` (`handlers/core.py::_hot_apply_after_write`), which
@@ -1913,7 +1931,7 @@ class MessagingConfig:
 @dataclass
 class SkillsConfig:
     max_triggered: int = 0         # max skills loaded per message (>=0)
-    lazy_load: bool = False        # inject only a usage-ranked top-K of on-demand skills (long tail via skill_search / $skillname / triggers); off = legacy full skills dump
+    lazy_load: bool = False        # false = short skill_search entry; true = bounded usage-ranked index; neither expands background admission
     # ... auto_create_from_sessions / auto_refine_on_deviation / extra_paths
 
 @dataclass
@@ -2149,6 +2167,33 @@ path is that the model must NAME the method (`auto` never resolves onto it) and 
 use is SEL-audited under its own `tool_kind`. Do not re-document the flag without
 re-implementing it. See [security.md](security.md), [governance.md](governance.md)
 and [computer-use.md](computer-use.md).
+
+### Decisions: no `enabled` field here either
+
+`DecisionsConfig` carries the sampling share (`bucket`) and the provider block only.
+Consent to send message text and skill descriptions to Jev lives **outside
+`config.json`**, on the keystone `~/.kiro/crew/decisions_consent.json` (path via
+`config.loader.decisions_consent_path()`, module `decisions.consent`, leaf on
+`security._CREW_SECRET_LEAVES` and `sandbox._CREW_READONLY_LEAVES`):
+
+```json
+{
+  "enabled": false,
+  "endpoint": ""
+}
+```
+
+`endpoint` is the `provider.endpoint` the owner consented to; the gate sends only
+while the configured endpoint still equals it, because that field is in this
+agent-writable file too. Same reasoning as `computer_use.json` above: `config.json` is a `VISIBLE` leaf the
+agent's shell can write, and every `decisions.*` field is hot-applied by the live
+watcher, so an `enabled` toggle here would let a prompt-injected agent start the
+egress of its own conversation without a restart. Reads fail soft to `{}` → **not
+consented**, and only a literal `true` consents. The only writer is the owner-only,
+browser-called `PUT /api/decisions/consent` (`dashboard/handlers/decisions.py`);
+`PATCH /api/config/kirocrew` refuses `decisions.enabled`, and an `enabled` key written
+into the section by hand is inert — the parsed dataclass has no such attribute. See
+[decisions.md](decisions.md).
 
 #### `computer_use.cursor_motion` — the one new `config.json` flag
 
@@ -2654,3 +2699,17 @@ When `agent.model` is `"auto"` (default):
 - Missing file → defaults
 - Invalid JSON → defaults (warning logged)
 - Missing fields → individual defaults
+
+### Default context discovery
+
+`skills.max_triggered=0` disables per-message trigger injection, not discovery.
+The default entry shows up to eight usage-ranked names and short purposes plus
+`skill_search` guidance for short keywords. `lazy_load=true` selects a longer,
+bounded ranked index. Both preserve pinned instructions, confined project-body
+limits and explicit loading. Thread history scales with the model window
+independently of the fixed old-activity allowance; no additional config switches
+are introduced. The model window also derives the non-configurable protected-content
+safety ceiling: `max(3 * 33,000, floor(window_tokens * 4.0 * 0.125))` characters.
+Crossing it omits complete lesson entries first and reports their count; preferences,
+safety rules, and date/runtime identity stay whole. This does not change the fixed
+33,000-character optional-content allowance.

@@ -14,14 +14,29 @@ mode matches its launch template; shared handles provide no full-spec loading
 claim. Member generation and MCP-readiness checks belong to
 [session](session.md#member-capability-generations).
 
-The trusted `private_memory` constructor flag is preserved from provider creation
-through client/runtime spawn and recovery. Only private member processes pass it
-to the sandbox; the default `False` keeps existing V1 spawn arguments. The OS
-wrapper enforces the actual resolved mode and member-only Global V1 file masks,
-including denial of internal-sandbox delegation or unconfined fallback. Private
-MCP session discovery reads protected real-process ancestry before mutable
-environment or legacy flat PID sidecars, so a stable private root view need not
-expose new global files in order for later MCP callbacks to identify themselves.
+The `member_context` flag captures native instruction sources so essential
+context delivery can deduplicate them; it does not change sandboxing or MCP
+transport. Member calls use the ordinary authenticated session identity and the
+gateway's canonical execution record. No member-specific ancestry proof or
+filesystem-isolation capability is required.
+
+The shared Kiro runtime carries its ordinary signed session token on eligible
+unpooled `kirocrew-core` and `kirocrew-cron` stdio elements, on both `session/new`
+and `session/load`. An empty broker stub list does not remove this identity
+channel. Only existing, referenced managed declarations are projected; an
+existing broker element wins. Disabled servers, native-only restrictions,
+custom commands and registry-governed entries remain with Kiro's native loader
+rather than losing their restrictions in the ACP array. A native entry without
+another verifiable identity channel retains the strict caller refusal.
+
+`memory_mode` is fixed before provider startup and before `session/new`, including
+late-start adoption. Incognito and Temporary suppress Crew raw-frame recording
+and payload diagnostics, do not resume retained native context, and cannot retain
+native transcripts for continuation. Shared-runtime recording latches off before
+a restricted session can emit its first frame. Normal shutdown and abandoned
+late starts clean the native transcript files supported by the provider. This
+does not add a sandbox or promise control over every external provider's own
+on-disk session format or crash recovery.
 
 `AcpClient(acp_backend=...)` selects which subprocess to launch:
 
@@ -228,7 +243,7 @@ not mounted.
 |---|---|---|
 | `fs.readTextFile` / `fs.writeTextFile` | `false` | We serve no `fs/*` handler; advertising them would invite requests that hit `_reject_unknown_server_request`. |
 | `terminal` | `false` | Same — the agent uses its own tools. |
-| `elicitation` | `{form: {}, url: {}}` | **Forward-bet.** kiro-cli 2.14.0 compiles the `elicitation/create` schema (form + url modes, `requestedSchema` with `enum`/`oneOf` single-select and array multi-select) and gates it on this capability, but does **not** yet route an MCP server's `elicitation/create` out over ACP — a stub MCP server issuing one gets `-32601 method not found`. Declaring it costs nothing today and makes the richer native prompt available the moment upstream ships the bridge. **Consequence to accept:** once the bridge lands, inbound `elicitation/create` requests will be rejected by `_reject_unknown_server_request` until a handler is wired — the same failure mode as today, but then attributable to us rather than upstream.
+| `elicitation` | *(absent)* | **Withdrawn forward-bet.** It was declared while kiro-cli 2.14.0 compiled the `elicitation/create` schema but did not yet route an MCP server's request out over ACP, on the reasoning that declaring it cost nothing until a handler existed. It costs something. A client that sees the capability sends its human-in-the-loop prompts as `elicitation/create` **instead of** falling back to `session/request_permission` — codex-acp gates on `clientCapabilities.elicitation.form` exactly that way — so the declaration does not wait inertly for a handler, it diverts a working path onto one that answers `-32601`, which that client turns into a cancellation of the tool call the human was approving. Absent, every affected client returns to the fallback that works. Re-add the key **in the same change** that registers the handler: `test_elicitation_is_not_advertised_without_a_handler` fails the moment it reappears. Handler work is tracked in #891. |
 
 Claude ACP 0.74 dynamic workflows and background tasks instead emit standard
 `async_task_spawned`, `async_task_progress`, and `async_task_state_update`
@@ -306,7 +321,14 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
   agent's own `model` field. Only the default kirocrew agent gets KiroCrew's
   configured model override.
 - **MCP servers**: backend-dependent.
-  - **kiro-cli**: `session/new` passes `mcpServers: []` — kiro-cli loads
+  - **kiro-cli**: kiro-cli loads ordinary servers from the agent config. The
+    shared runtime adds eligible managed control-plane elements carrying the
+    per-session token, plus configured broker stubs, to `mcpServers`; it does not
+    project third-party declarations. Override eligibility reads project and
+    global MCP settings through the bounded sensitive-path reader. A refused,
+    unreadable or malformed settings file withholds these overrides, preserving
+    native restrictions; only an absent settings file contributes no restrictions.
+    kiro-cli loads
     servers from the agent config (respects `mcpServers` in the agent's config
     file). Non-kirocrew agents (e.g. AIM-installed) load only their own
     `mcpServers`. The kirocrew agent loads from global `~/.kiro/settings/mcp.json`
@@ -383,8 +405,9 @@ attempts `session/load` instead of `session/new`:
 3. Send `session/load` with `sessionId`, `cwd`, `mcpServers` (the pooled
    broker stubs, re-declared so the resumed session keeps talking to the
    shared gateway — `session/load` re-initializes the session's MCP servers,
-   so an empty list would un-pool the session; `[]` only when the gateway is
-   disabled), and `_meta: {"_kiro.dev/session_file": "<path>"}` (required —
+   so an empty list would un-pool the session), plus eligible unpooled managed
+   elements carrying their session token, and
+   `_meta: {"_kiro.dev/session_file": "<path>"}` (required —
    without it kiro-cli silently ignores the request). `AcpRuntime.load_session`
    builds the same params for the multiplexed runtime.
 4. On success (response contains `modes`): set `_session_id`, `_resumed = True`
@@ -439,16 +462,48 @@ an empty `mcpServers` map — opts out via
 `AcpRuntime(expect_mcp_reports=False)`, which passes a zero ceiling and keeps
 the idle shortcut active from the start (the pre-ceiling behavior).
 
+**`problem_summary()` renders the report's bad news, and nothing else.** The
+report answers two different questions, so it has two renderers: `payload()` is
+the whole picture a dashboard draws (including `ready` and `configured`), and
+`problem_summary()` is one line naming only what this session cannot use --
+`failed to start`, `awaiting authorization`, `declared by the agent spec but not
+configured` -- and the EMPTY string when it can use everything. Empty-on-clean is
+the contract, not a caller's convention: a consumer prints the line
+unconditionally and a healthy session stays silent everywhere. It is declared on
+`providers.base.SessionMcpReport` beside `payload()` because the consumers that
+need it most sit outside this layer, where the agent-SDK boundary gate refuses a
+new ACP import -- a sub-agent spawn reaches it through the report the provider
+already hands it (`subagent_manager/run.py`).
+
+`include_reasons=False` keeps the server names and drops the failure text. A
+reason is the failing server's own startup output, so in the OAuth and
+remote-contacting cases it can carry content nobody here authored, and
+`sanitize_sink_text` bounds credentials, URLs, control characters and length --
+none of which disarms a plain-English instruction. A log a person reads takes the
+reasons; a sink that feeds a MODEL asks without them, and fences the names it does
+pass.
+
 ### KAS managed MCP readiness
 
 KAS opts into a readiness barrier through its harness notification declaration.
 Its `_kiro/mcp/status` and `_kiro/tools/didChange` notifications carry an explicit
 `params.sessionId` and full `servers` / `tags` snapshots. The reader stages both
 methods before the create/load response and transfers only that session's frames.
-Status entries carry `name`, `status`, `failedAuthorization`, `errorMessage`, and
-`_meta.kiro.resource.source.origin`; the required Crew declarations have origin
-`client`. Tool tags have `source: "mcp"` and `tag: "@server/tool"`; these establish
-exposure, not the native callable identifier.
+Status entries carry `name`, `status`, `failedAuthorization`, `errorMessage`,
+`tools` (the connected server's catalog) and `_meta.kiro.resource.source.origin`;
+the required Crew declarations have origin `client`. Exposure -- the model can
+reach the connected server's tools -- is established by EITHER a non-empty
+`tools` catalog on the server's own `connected` entry OR a tool tag with
+`source: "mcp"` and `tag: "@server/tool"`; neither is the native callable
+identifier. Both are accepted because released kiro-cli versions differ: captured
+2.18.0 and 2.20.0 send the catalog and the tags; captured 2.22.0 (KAS 0.66.0)
+sends the full catalog on the connected entry but its `didChange` snapshots list
+only `builtin` tags (`read`, `write`, `shell`, `web`), with or without
+`tool_search` in the agent's tools -- no MCP tag ever arrives. The two kinds of
+evidence are kept apart: a full tag snapshot replaces the tag evidence (a tag
+that disappears is retracted) but never the catalog evidence, and a reconnect
+(`connecting` after `connected`) clears both, so the next connected snapshot's
+catalog or a later tag frame must re-establish it.
 
 Provenance is read off the whole snapshot, not one entry. A backend that stamps
 any entry stamps them all (released 2.20.0 stamps `connecting` and `connected`
@@ -480,7 +535,8 @@ never implies `client`; the connecting state on such a backend stays pending as
 usual.
 
 After activation, create and load wait for every required managed server to be
-`connected` and represented in the tool-tag snapshot when exposure is permitted.
+`connected` and exposed (a connected catalog or a tool tag, as above) when
+exposure is permitted.
 The required roster is the union of the ACTIVE custom agent's `mcpServers`
 declarations and the actual session-level injection, intersected with Crew's
 managed server catalog. Inactive agents and inherited global/external servers do
@@ -972,9 +1028,25 @@ kiro can return a `-32603` error that is an *advisory* that it substituted a dif
 
 ## Process Management
 
+Windows physical spawn uses `create_windows_cleanup_owned_process` in both ACP
+transports. It reserves separate cleanup capacity before calling the subprocess
+factory, pins the original child before resume, and retains only exact handles
+and scalar bookkeeping outside the provider. Cancellation settles the factory
+and the suspended-resume worker before teardown; a returned child cannot be
+refunded as a failed empty launch. Cleanup retires mandatory tracking under the
+root pin before returning capacity. Client reset refuses an unretired cleanup
+reservation, even if the root has exited. The process-local limits, permanent
+manual-overflow quarantine and operator recovery procedure are owned by
+[platform-compat](../common/platform-compat.md#windows-session-tree-teardown).
+The factory accepts `windows_cleanup_owner` from that reservation and records the
+native handle at `CreateProcess` return, before fallible CPython transport setup.
+An exception without a returned `Process` therefore still retains a created child.
+Cancellation settles both creation and suspended-resume work before returning.
+POSIX spawn/cancellation semantics and resource Job settings are unchanged.
+
 Subprocess lifecycle:
 
-- Spawned with process-tree isolation for clean teardown, dispatched per-platform in `_spawn()`: **POSIX** sets `start_new_session=True` (group leader via `setsid`) so cleanup can `killpg`; **Windows** sets `creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP` (no `setsid`/process groups; an inherited Ctrl-C can't reach the gateway). Both flags are passed explicitly (never via `**dict` unpack, which breaks mypy's Popen overload resolution). Teardown in `_kill_process()` awaits `platform_compat.kill_process_tree_async(pid, SIGTERM)` then `SIGKILL` — `os.killpg(os.getpgid(pid), …)` on POSIX (inline, non-blocking), `taskkill /T /F` on Windows offloaded to `kiro_crew.executors.subprocess_executor` so the event loop is never blocked for the `taskkill.exe` spawn. The escaped-child sweep (`_kill_escaped_children`, which raw-`os.kill`s descendants that reparented out of the killed group) is **POSIX-only** — a no-op on Windows, where `taskkill /T` already walked the whole tree and `signal.SIGKILL`/`os.kill(pid,0)` are unavailable/unsafe. The `/proc`+`pgrep`+`ps` child-enumeration helpers (`_direct_children`, `_get_start_time`, `_read_basename`) short-circuit on Windows (return `[]`/`None`) since they only feed that POSIX sweep. `_resolve_ssh_auth_sock()` (called in the spawn prelude) is also a no-op on Windows — its non-darwin branch calls `os.getuid()`, absent on win32, and Windows OpenSSH uses a named pipe with no `SSH_AUTH_SOCK` to repair.
+- Spawned with process-tree isolation for clean teardown, dispatched per-platform in `_spawn()`: **POSIX** sets `start_new_session=True` (group leader via `setsid`) so cleanup can `killpg`; **Windows** sets `creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP` (no `setsid`/process groups; an inherited Ctrl-C can't reach the gateway). Both flags are passed explicitly (never via `**dict` unpack, which breaks mypy's Popen overload resolution). Teardown in `_kill_process()` is dispatched per-platform too. **Windows** returns through the owned-handle drain described above and never reaches the signal ladder: `terminate_windows_asyncio_tree` tears the tree down from handles pinned at spawn, so a `taskkill /T` walk that a reaped root leaves empty is not what the teardown depends on. **POSIX** awaits `platform_compat.kill_process_tree_async(pid, SIGTERM)` then `SIGKILL` — `os.killpg(os.getpgid(pid), …)` inline and non-blocking. The Windows `taskkill /T /F` shim in `kill_process_tree_async` remains for callers that hold only a pid, offloaded to `kiro_crew.executors.subprocess_executor` so the event loop is never blocked for the `taskkill.exe` spawn. The escaped-child sweep (`_kill_escaped_children`, which raw-`os.kill`s descendants that reparented out of the killed group) is **POSIX-only** — a no-op on Windows, where the owned-handle drain has already confirmed each retained member's exit before `_kill_process` returns (the drain, not a `taskkill /T` walk, is what the Windows teardown depends on; that shim is only for callers holding a bare pid) and `signal.SIGKILL`/`os.kill(pid,0)` are unavailable/unsafe. The `/proc`+`pgrep`+`ps` child-enumeration helpers (`_direct_children`, `_get_start_time`, `_read_basename`) short-circuit on Windows (return `[]`/`None`) since they only feed that POSIX sweep. `_resolve_ssh_auth_sock()` (called in the spawn prelude) is also a no-op on Windows — its non-darwin branch calls `os.getuid()`, absent on win32, and Windows OpenSSH uses a named pipe with no `SSH_AUTH_SOCK` to repair.
 - **Off-loop PID inspection**: the PID-recycling/ownership helpers that shell out on macOS — `_get_start_time` / `_read_basename` (`ps`), `_get_child_pids` → `_direct_children` (`pgrep`), the `_capture_child_records` batch wrapper, and the `_kill_escaped_children` sweep — MUST run via `run_in_executor(subprocess_executor(), ...)`, never directly on the event loop. The PID-file tracking writes — `_track_pid`, `_track_session_pid`, `_track_child_pids` in `AcpClient._spawn()`, and `_track_child_pids` plus the `_untrack_child_pids` prune in `AcpRuntime._snapshot_descendants()` / `_prune_dead_descendants()` (the latter reached through `asyncio.to_thread`) — carry the same obligation: each takes an exclusive file lock and does a read-modify-append under it, and `ensure_ready()` awaits `_spawn()` from the loop on every cold start, so an on-loop tracker serializes concurrent spawns behind one file lock with the waiter holding the loop. The subprocess spawn (fork/exec) can block, and on a wedged child the loop would freeze (the macOS wedge class). `subprocess_executor` is a *dedicated* bounded pool (distinct from the `maintenance_executor` orphan sweep) so a wedged scan/close cannot starve the recovery sweep. The `ps` and `pgrep` calls each carry a 2s timeout so no offloaded scan occupies a pool worker indefinitely.
 - **Windows exe-casing normalization** (`_normalize_exe_casing`, applied to the kiro / claude-agent-acp / claude-code resolver results): `shutil.which` builds the resolved name's extension from `PATHEXT`, which lists `.EXE` upper-case, so it returns e.g. `…\kiro-cli.EXE` even though the on-disk file is `kiro-cli.exe`. A case-sensitive multiplexer shim spawned as `kiro-cli.EXE` fails to dispatch, exits instantly, and the ACP pipe breaks (`AcpProcessDied`) → the dashboard shows **"session stuck"** on the first chat turn. `os.path.realpath()` restores the true directory-entry casing. No-op on POSIX (case-sensitive FS). Runnability is checked via `platform_compat.is_executable_file()` (POSIX execute bit; on Windows the X-bit is meaningless so a known runnable extension is required instead), so a bare `.js` adapter entry is correctly treated as **not** directly runnable on Windows and gets wrapped with `node`.
 - **Sandbox ownership**: `_spawn()` calls `sandbox.wrap_argv()` to wrap the command with platform-native isolation (Linux: two-stage `unshare -rm` → `unshare -U` bind-mounts + UID drop; macOS: `sandbox-exec` Seatbelt profile). On Windows, where Kiro Crew has no native OS wrapper, an explicitly classified official Kiro backend delegates to Kiro CLI's built-in sandbox; every other backend retains the no-backend fail-closed policy. The parent passes a fully scrubbed child environment on every platform, which is the enforcement point for raw Windows delegation. Configurable via `sandbox_mode` constructor param (`"auto"` default, `"off"` to disable). See `docs/system-specs/modules/security.md`.
@@ -1034,38 +1106,24 @@ Subprocess lifecycle:
 - 10MB stdout buffer for large JSON-RPC lines
 - stderr drained in background (`_drain_stderr`) to prevent pipe deadlock. Each line bumps `_last_activity` (liveness for `is_responsive`), is appended to the bounded 20-entry `_stderr_lines` diagnostic ring buffer, and is forwarded as a redacted `WARNING`. **Exception — suppression filter:** lines matching a marker in the module-level `_SUPPRESSED_STDERR_MARKERS` tuple (currently `thinking_tokens`) are dropped — no `WARNING`, not appended to the ring buffer — but **still** bump `_last_activity`. This handles the claude-agent-acp "Unexpected case: {...thinking_tokens...}" stderr noise. **Mechanism** (confirmed by reading the vendored adapter's `dist/acp-agent.js`): claude-code emits a `system` message with subtype `thinking_tokens`, but the adapter's `switch (message.subtype)` enumerates only ~18 known subtypes (`init`, `status`, `compact_boundary`, `memory_recall`, `api_retry`, …) and routes anything else to `default: unreachable(message)`, which writes `logger.error("Unexpected case: " + JSON.stringify(message))` to stderr — one line per token delta, measured at ~10 lines/sec during active thinking (one per 2–4 thinking tokens). The payload is only `estimated_tokens`/`_delta`/`uuid`/`session_id`, so dropping it loses no response content. This is a forward-compat gap in the vendored adapter, **not** new behavior in a specific claude-code build — the `thinking_tokens` event is present in both `2.1.165.357` and `2.1.168.358` (verified by string-matching both bundled `claude` binaries), so it predates the `.168` update that drew attention to it. The cleaner long-term fix is upstream (add a `thinking_tokens` case to the adapter or bump the vendored version); this filter is the version-agnostic stopgap that also absorbs the next unenumerated subtype's flood. (Note `thinking_tokens` is by far the dominant subtype hitting `unreachable` — ~14k occurrences vs. a handful of rare `permission_denied` across retained logs — which is why the marker tuple stays narrow rather than suppressing all "Unexpected case" lines.) Two concrete reasons to drop rather than downgrade the level: (1) **log hygiene** — `gateway.log` uses `RotatingFileHandler(maxBytes=2MB, backupCount=3)` (`cli.py`), so a sustained burst rolls genuine diagnostics out of the retained 8MB window; (2) **event-loop load** — the file handler is a plain *synchronous* handler and `_drain_stderr` runs on the gateway event loop, so each forwarded line costs a synchronous file write + two regex redaction passes on the same loop that streams responses (small per session, compounding across concurrent thinking sessions). Keeping liveness prevents the idle watchdog from killing an actively-thinking turn; skipping the ring buffer stops a burst from evicting the last real errors. A throttled `DEBUG` summary (≥ `_SUPPRESSED_STDERR_SUMMARY_INTERVAL_SECS` apart, plus a flush at EOF) keeps the suppression observable. Match substrings are kept narrow so a genuine error is never silently swallowed. This is a log-volume / event-loop-load reduction — **not** a fix for any turn-stall or "agent not responding" symptom (no such causal link was established).
 
-### Private member MCP routing
+### Member MCP routing
 
-Private V2 clients and runtimes discard the shared MCP broker overlay and socket
-before session creation. Tool mirroring, reload, resume and runtime recreation
-use direct MCP servers confined to that member's sandbox. Original agent server
-definitions remain available to direct-MCP-capable backends. V1 retains its
-existing broker routing.
+Member clients and runtimes use the ordinary direct or pooled MCP transport
+supported by their backend. The gateway captures canonical member/store routing
+from authenticated session identity; `member_context` controls native instruction
+deduplication. Memory V2 neither discards the shared broker overlay nor requires
+a member-specific sandbox or direct-MCP capability.
 
 KAS projects the gateway's validated `KIROCREW_BOUND_PORT` as `KIROCREW_PORT`
-for native managed MCP servers. This value is derived inside the gateway at
-session creation, not relayed from an editable agent spec. Native children do
-not inherit the gateway environment, and private sandboxes cannot discover its
-listener through host process markers. Without this explicit address, core
-tools can dial the default port while member-scoped ledger tools reach the
-correct instance. Declared secrets and arbitrary environment values remain
-withheld, and non-managed servers receive no gateway port.
+for native managed MCP servers because native children do not inherit the
+gateway environment. The listener address comes from the gateway, not an editable
+agent spec. Declared secrets and arbitrary environment values remain withheld,
+and non-managed servers receive no gateway port.
 
-The original trusted broker endpoint remains available only for sandbox
-validation. Private execution cannot reach that endpoint or its aliases. A
-configured endpoint outside the reserved broker namespaces refuses private
-startup rather than hiding an arbitrary project directory.
-
-The current public Codex ACP backend has no direct MCP projection. Private V2
-execution with that backend therefore refuses before allocation and names the
-remedy: choose a member backend that supports direct MCP. Ordinary V1 Codex
-sessions retain their existing behavior.
-
-The public provider factory uses `agent.member_acp_backend` for member private
-chat and the configured default backend for Crew work and private background
-consolidation. Each effective backend must support direct MCP. Selecting a
-supported member-chat backend alone does not change a Codex default used by
-background work.
+The provider factory selects `agent.member_acp_backend` for member-DM session
+keys and the configured default backend otherwise. Ordinary backend governance,
+selectability, member-capability checks and host sandbox rules remain independent
+requirements; memory version adds no direct-MCP refusal.
 
 ### Cold-start admission and startup telemetry
 
@@ -1299,6 +1357,87 @@ reparented to init and unreachable. Teardown prunes by descendant liveness and
 retains survivors for the orphan sweep. See
 [session](session.md) for the file formats and the sweeps that read them.
 
+**A reaped root does not end the teardown.** `kill_process_tree` is
+`killpg(getpgid(pid))`, and `getpgid` raises once the root has exited — read as
+"already dead", that leaves the launcher's children, the agent and its chat
+process unsignalled in the group, and a root that died a few seconds into its
+life predates every descendant snapshot, so nothing else can find them either.
+`AcpRuntime._signal_tree` runs the tree kill only while the root's number is
+provably still ours — its live start id matches the one recorded at spawn.
+`returncode` is not that proof: asyncio's child watcher does the `waitpid` in
+the background and propagates the code a callback later, so a root can be
+reaped, its number free for a fresh session leader whose `getpgid` succeeds,
+while `returncode` still reads `None`. A root whose identity cannot be read is
+treated as gone. It treats a root that is gone, by either read,
+as the START of a second path, not the end: the root was spawned as a
+session leader, so its pid IS the group id, and
+`session_pid._signal_orphaned_runtime_group` finds that group's members and
+signals THEM — each re-verified by start id at the instant of the signal — never
+the group number, which is the dead root's pid and can be handed to a fresh
+session leader at any moment. A member vouches when it carries this runtime's
+`KIROCREW_SPAWN_INSTANCE` — the per-spawn token `spawn()` puts on the root's
+environment, inherited by its whole tree — together with the `KIROCREW_SPAWNED`
+marker and a runtime argv identity. The instance is the incarnation pin the
+generic marker cannot supply: every runtime is a marked session leader, so a
+root pid released to a fresh spawn names a group that carries the marker just
+as well, and a signal aimed by number and marker alone would terminate that
+fresh runtime's live session. No vouching member, no signal — the number may
+be somebody else's by now. A vouched signal is followed by
+the same grace a live tree gets and a `SIGKILL` pass, since the root's `wait()`
+returned at once and drove no escalation. The escalation never re-resolves the
+root's number — `_signal_tree` skips `kill_process_tree` when it carries
+`expected`, because `getpgid` on a recycled root pid SUCCEEDS for the fresh
+runtime holding it and would have signalled that runtime's group before any
+identity check ran — and it re-signals only members the `SIGTERM` pass vouched
+that are still alive under the same start id. A shutdown that cancels the teardown
+inside the grace still runs that `SIGKILL` pass on the way out, shielded from
+the cancellation that triggered it: the members were vouched and signalled, and
+the escalation is the only thing still owed.  A further cancel arriving while
+that shielded pass is awaited raises at the await and leaves it running
+unawaited — `shield` bounds one cancellation, it does not confer immunity. Any other `OSError` (a denied signal)
+is final: the root is there and may not be signalled, so its group is not
+guessed at. The vouching read is Linux-only (the environ read is), so macOS
+keeps the missed reap rather than gain a wrong kill (Windows closes it by handle,
+below) — and say so: a
+teardown that could resolve neither path logs one WARNING naming the root pid,
+the signal and which of the three identity verdicts it got, so the leak is
+visible in the field instead of reading as a teardown that worked. The verdict
+is deliberately three-valued: only a read that happened and disagreed may
+describe the root as no longer ours, while an unrecorded or unreadable identity
+refuses just as firmly but reports itself as unmeasured.
+
+**The Windows half of that reaped root is closed, by different evidence.** The
+vouching read above is Linux-only (the environ read is), so macOS keeps the
+missed reap rather than gain a wrong kill. Windows does not reach that ladder at
+all: it has neither a process group to signal nor an inherited token to vouch
+with, and `taskkill /T` on a reaped root walks nothing — so instead of naming the
+survivors after the fact, it pins them BEFORE the fact. `AcpRuntime._kill_inner`
+and `AcpClient._kill_process` both return through
+`platform_compat.terminate_windows_asyncio_tree`, draining the tree from handles
+opened at spawn against exact creation identities and held across the root's own
+exit. That is why a Windows drain may not be softened to best-effort: it is the
+only path, where POSIX still has the vouched group behind it. A drain that cannot
+confirm the exit of every member it retains raises, keeping the pins and the
+tracking for maintenance to retry, and a reservation left unretired blocks client
+reset rather than reporting a teardown that worked. What that set does NOT
+include is a descendant whose sole ancestry edge vanished before any snapshot saw
+it; that residue stays with the orphan sweep and is bounded the same way it was
+before this change. The capacity bound this retention needs,
+and the manual-handling state an unbounded tree lands in, are owned by
+[platform-compat](../common/platform-compat.md#windows-session-tree-teardown).
+
+`AcpClient._kill_process` keeps the same reaped-root window **on POSIX**, and
+there it is known and
+deferred, not closed here. The client holds no spawn of its own and therefore no
+`KIROCREW_SPAWN_INSTANCE`, so the vouched group path refuses for it by
+construction; reaching its tree needs the client to mint and carry an
+incarnation token at spawn time, which is a change to the client's own spawn
+path. What it has instead is the descendant snapshot it takes at spawn, which
+covers every client root that dies after its first scan; the uncovered case is a
+client root that dies before it, and the cost there is the same bounded leak the
+orphan sweep reports. On Windows the client needs neither the token nor the scan:
+its spawn is owned, so the drain reaches a root that died before any scan ran.
+
 **An ownerless server→client request is answered ONCE, at connection level.**
 An inbound frame carrying an `id` **and** a `method` but no `params.sessionId`
 is a request that names no session — it expects exactly one response, so the
@@ -1461,3 +1600,28 @@ in a TTL branch or a dead-provider branch — stays WARNING. Note the default
 `agent.log_level` is WARNING, so expected teardowns are absent from
 `gateway.log` unless the operator raises verbosity; that silence is the point
 of the split (issue #4052).
+
+**The death line is written before the signal, so its exit status is filled in
+afterwards — on BOTH teardown branches.** A kill marks the death while the child
+is still running, so the retained summary carries `[returncode=<not reaped>]`
+rather than a bare `returncode=None`. `_note_reaped_after_kill` replaces the
+placeholder once the reap has completed and the handle is still held, and logs one
+line at the death's own severity. It is called from the POSIX ladder AND from the
+Windows owned-handle drain, which returns from `_kill_inner` on its own and so
+cannot inherit the ladder's call — a status recorded on one platform only is a
+gap the other platform's operator pays for, since the summary outlives the log and
+rides `AcpProcessDied` into a turn's error and a cron's `last_error`. The
+amendment is silent when the status is still unknown: a POSIX pair of timed-out
+waits, or a Windows drain that raised because it could not confirm every member's
+exit, both leave `<not reaped>` standing, which is then true.
+
+Pinned on every platform rather than on the Windows shards alone
+(`test_the_windows_branch_amends_the_summary_too`,
+`test_an_unconfirmed_windows_drain_leaves_the_placeholder` in
+`test/test_acp_runtime.py`, which force the branch through
+`platform_compat.IS_WINDOWS`): a branch one CI lane reaches is a branch whose loss
+is invisible in every other lane. The shared kill test double drains the Windows
+tree by awaiting `process.wait()` for the same reason the real
+`terminate_windows_asyncio_tree` does — that await is what populates `returncode`,
+so a double returning without it would report the placeholder on Windows and hide
+the amendment behind its own unfaithfulness.

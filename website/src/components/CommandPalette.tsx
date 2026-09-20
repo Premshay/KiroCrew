@@ -22,7 +22,6 @@ import { useArtifactsProvider } from './commandPalette/providers/artifactsProvid
 import { useRecentsProvider } from './commandPalette/providers/recentsProvider'
 import { useSettingsProvider } from './commandPalette/providers/settingsProvider'
 import { useAppsProvider } from './commandPalette/providers/appsProvider'
-import { useFoldersProvider } from './commandPalette/providers/foldersProvider'
 import { Highlighted } from './commandPalette/Highlighted'
 import ErrorNotice from './ErrorNotice'
 
@@ -159,19 +158,19 @@ export default function CommandPalette({
   // Apps — launch an installed app by name. Destinations come from the shared
   // `appNav` derivation the left rail uses, so the two cannot disagree.
   const apps = useAppsProvider()
-  // Folders — type a sidebar folder's name and land on that folder (the sidebar
-  // un-hides it, expands it and its ancestors, scrolls to it and flashes it).
-  // Client-side over the shared ['chat-folders'] cache, so it is usually free.
-  const folders = useFoldersProvider()
 
   // Tab strip order (§1): All · Sessions · Knowledge · Skills ·
   // Prompts, with Artifacts + Apps + Pages + Actions riding along after the v1
-  // corpus. Apps sits next to Pages because both are pure navigation targets, and
-  // Folders sits beside Sessions because it names the container of the same thing
-  // Sessions names — you reach for it in the same breath.
+  // corpus. Apps sits next to Pages because both are pure navigation targets.
+  //
+  // Folders are deliberately ABSENT. Reaching a session folder by name is a
+  // Command Bar feature, and it lives in that app (`apps/command-bar/`) the way
+  // session and artifact search reach their corpora there: one row you enter,
+  // then a list that narrows. Registering a second folder surface here would make
+  // the host own a copy of a feature the app already owns, and the two would drift.
   const tabs = useMemo<ResourceProvider[]>(
-    () => [all, sessions, folders, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
-    [all, sessions, folders, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
+    () => [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
+    [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
   )
 
   // Make the per-category providers discoverable by the All aggregator, which
@@ -186,21 +185,15 @@ export default function CommandPalette({
   // Apps IS registered: the list is one small cached request on a key the Apps
   // page already warms, and "type a name, press Enter to launch" is the whole
   // point of putting apps in the palette — it has to work from the default tab.
-  //
-  // Folders IS registered for the same reason and at the same cost: it reads the
-  // ['chat-folders'] cache the sidebar has already filled, so its contribution to
-  // the fan-out is a synchronous filter over a list of tens, and a folder is a
-  // destination people expect the default tab to know about.
   useEffect(() => {
     registerProvider(sessions)
-    registerProvider(folders)
     registerProvider(prompts)
     registerProvider(artifacts)
     registerProvider(apps)
     registerProvider(pages)
     registerProvider(actions)
     registerProvider(settings)
-  }, [sessions, folders, prompts, artifacts, apps, pages, actions, settings])
+  }, [sessions, prompts, artifacts, apps, pages, actions, settings])
 
   const [query, setQuery] = useState('')
   const [scope, setScope] = useState<string | null>(null)
@@ -558,7 +551,7 @@ export default function CommandPalette({
       // height and its lower half sits behind the keyboard, unreachable. iOS also
       // scrolls the focused input into view, which moves the visual viewport's
       // origin -- hence the top offset as well as the height.
-      className="fixed left-0 right-0 z-[9999] flex items-start justify-center bg-bg/60 backdrop-blur-sm animate-rise"
+      className="fixed left-0 right-0 z-[9999] flex items-start justify-center bg-bg/60 backdrop-blur-xs animate-rise"
       style={{ top: vv.offsetTop, height: vv.height }}
       role="dialog"
       aria-modal="true"
@@ -624,7 +617,12 @@ export default function CommandPalette({
             // narrow viewport the row overflows instead and the modal's
             // overflow-hidden clips whatever trails the input — the Tab hint and,
             // worse, the close button.
-            className="flex-1 min-w-0 bg-transparent border-none outline-none text-[14px] text-text placeholder:text-muted"
+            // focus-cue-ok: combobox — focus stays in this field for the palette's
+            // whole lifetime (options are tabIndex={-1}; arrows move the
+            // aria-selected highlight below), so the highlighted option is the
+            // visible cue and the palette frame itself only exists while this
+            // field owns focus.
+            className="flex-1 min-w-0 bg-transparent border-none outline-hidden text-[14px] text-text placeholder:text-muted"
           />
           {scopeHint && (
             <span className="shrink-0 flex items-center gap-1 text-[11px] text-muted">

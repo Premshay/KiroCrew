@@ -88,14 +88,16 @@ with no row here.
      - pre-session registry query (whether enrolled members can load a full saved spec)
    * - ``ACP_BACKENDS_MEMBER_DISPATCH``
      - driver-internal (whether a per-session tool set can be mounted)
-   * - ``ACP_BACKENDS_PRIVATE_MEMORY_MCP``
-     - pre-session registry query (whether private member tools run directly inside the member sandbox)
    * - ``ACP_BACKENDS_STEER``
      - pre-session registry query (whether ``_session/steer`` exists)
    * - ``ACP_BACKENDS_COMPACT``
      - pre-session registry query (whether manual ``/compact`` is offered at all)
    * - ``ACP_BACKENDS_INLINE_COMPACTION``
      - semantic question (``SessionCapabilities.compacts_inline``)
+   * - ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION``
+     - semantic question (whether a skipped autocompact is answered by the harness)
+   * - ``ACP_BACKENDS_CONTEXT_RECYCLE``
+     - semantic question (whether a full context is answered by recycling)
    * - ``ACP_BACKENDS_INTERNAL_SANDBOX``
      - driver-internal (whether Crew's seatbelt is skipped at spawn)
    * - ``ACP_BACKENDS_POD_HOME_REMAP``
@@ -107,14 +109,18 @@ with no row here.
        is gated before the spawn -- the activation guard that runs after
        ``session/new`` reads it through the harness, only on its refusal
        branch, to explain a markdown-only agent the host did not load)
-   * - ``acp_runtime_backends()``
-     - pre-session registry query (the same question as the row above, with the
-       ``KIROCREW_CODEX_ACP_RUNTIME`` preview switch applied). The FOREGROUND
-       start path reads this; the background ``_bg`` path reads the set above on
-       purpose, so a preview never reaches high-churn handles. A function rather
-       than a set for the reason
-       ``backends_retired_by_host_logout()`` is one: the answer is derived, and
-       ``ACP_BACKENDS_*`` is reserved for vocabulary
+   * - ``ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE``
+     - driver-internal (whether the agent spec's own ``mcpServers`` reach the
+       session by a channel other than the ``session/new`` array, so the
+       unresolved-``@server``-ref detector counts them as satisfied instead of
+       judging the spec against an array that was never meant to carry them)
+   * - ``ACP_BACKENDS_SESSION_EVICTION``
+     - pre-session registry query (whether this harness's teardown verb disposes
+       one session, which is what decides if a path that creates and destroys
+       sessions on a shared process -- the high-churn background handles, warm
+       pooled reuse, the entitlement probe -- may run on it). Separate from the
+       row above because multiplexing and eviction are separate claims: a harness
+       can serve N sessions on one process and still have no verb that frees one
    * - ``host_auth.backends_retired_by_host_logout()``
      - pre-session registry query (whether a kiro-cli logout retires the child).
        Declared per harness in :mod:`kiro_crew.agent_sdk.host_auth`, not here, and a
@@ -134,6 +140,10 @@ with no row here.
      - driver-internal (whether ``settings.local.json`` is re-seeded on switch)
    * - ``ACP_BACKENDS_KIRO_SLASH_COMMANDS``
      - driver-internal (whether ``_kiro.dev/commands/execute`` exists)
+   * - ``ACP_BACKENDS_TOOL_SEARCH_OVERLAY``
+     - driver-internal (whether the workspace ``cli.json`` Tool Search keys are written)
+   * - ``ACP_BACKENDS_CLIENT_META_SETTINGS``
+     - driver-internal (whether ``initialize`` carries ``_meta.kiro.settings``)
    * - ``ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD``
      - pre-session registry query (whether the dashboard may skip a session reset)
    * - ``ACP_BACKENDS_STRUCTURED_REFUSAL``
@@ -153,6 +163,13 @@ with no row here.
    * - ``ACP_BACKENDS_RESUME_WITHOUT_LOAD``
      - driver-internal (which ACP verb restores a session, and which capability
        key advertises it)
+   * - ``ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY``
+     - driver-internal (whether the session's project checkout scopes the broker
+       overlay lookup, read only through :func:`overlay_project_scope` while
+       ``kiro_crew.acp`` composes the ``session/new`` MCP array). Deliberately not
+       a semantic question: it describes where a HOST reads agent specs from, and
+       no consumer above the boundary asks it -- what a consumer would ask about
+       is the resulting server list, which it already receives
 
 The two non-set tables ``SessionCapabilities`` also translates are
 :func:`model_registry_namespace` (the model-id namespace) and
@@ -165,9 +182,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import FrozenSet, Mapping, Set
-
-from kiro_crew.constants import env_flag_enabled
+from typing import Any, FrozenSet, Mapping, Set
 
 logger = logging.getLogger(__name__)
 
@@ -370,15 +385,6 @@ ACP_BACKENDS_SESSION_MCP_ARRAY: FrozenSet[str] = frozenset(
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
     }
-)
-
-# Private member tools must execute inside the owned sandbox. A backend joins
-# only after its direct MCP launch path is verified; selectability grants none
-# of this authority. The public Codex adapter uses the shared broker instead.
-# deepseek is not a member for the same reason: its stdio mount is verified, but a
-# direct launch INSIDE the owned sandbox is a separate path nothing has exercised.
-ACP_BACKENDS_PRIVATE_MEMORY_MCP: FrozenSet[str] = frozenset(
-    {ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS}
 )
 
 # ── The selectable registry ──
@@ -704,16 +710,64 @@ def resolve_selected_backend(value: object) -> str:
 # docs/system-specs/modules/harness-parity.md.
 
 # Backends whose single process can host N concurrent ACP sessions (AcpRuntime
-# demux) AND can persist a SHARED subagent session across teardown. KAS runs on
-# AcpRuntime (multi-session), but its teardown maps to _kiro/session/delete,
-# which removes the persisted session — so a shared subagent would strand
-# spawn_continue (conversation_gone). KAS therefore opts in only once a
-# keep-aware teardown lands (native subagent work); until then its subagents get
-# dedicated sessions. claude-agent-acp runs through AcpClient (one process per
-# session) and is not a member. codex-acp is not either, for the same reason: one
-# adapter process serves one session, so there is nothing to share.
-# opencode is not a member for the same reason: one binary serves one session over
-# its own stdio pipe, so there is no second session to share.
+# demux) AND whose shared subagent session can be CONTINUED after the conversation
+# that spawned it ends. claude-agent-acp runs through AcpClient (one process per
+# session) and is not a member.
+#
+# What survives is the PERSISTED THREAD, never a resident session. Teardown closes:
+# a subagent session left alive on the shared process after its parent ends is a
+# memory leak, and on codex an expensive one -- each resident session carries the MCP
+# fleet ``codex`` starts from its own config, measured at roughly 44 processes and
+# 2751 MB for one session. So a member's teardown disposes the in-memory session, and
+# ``spawn_continue`` re-reaches the conversation by loading the record the host kept.
+# Membership therefore asks one question: after this backend's teardown verb, can a
+# ``session/load`` still restore the thread?
+#
+# kiro-cli answers yes with a transcript Crew holds under ``<kiro home>/sessions/cli``
+# that ``_kiro.dev/session/terminate`` leaves on disk.
+#
+# codex-acp answers yes with a thread ``codex`` persists under ``CODEX_HOME``, and
+# the answer is MEASURED rather than argued -- codex-acp 1.11.0 against codex
+# 0.154.0, one real adapter:
+#
+#   * ``session/close`` (a request) evicts: the sessionId stops answering. That is
+#     the same fact ``ACP_BACKENDS_SESSION_EVICTION`` records, and it is unchanged.
+#   * ``session/load`` on that closed id SUCCEEDS, replays the conversation, and the
+#     session then answers a question about the first turn.
+#   * the same load succeeds from a RESTARTED adapter process over the same
+#     ``CODEX_HOME`` -- the shape a continuation actually takes, since the runtime
+#     that served the subagent is usually gone by then. Token accounting confirms
+#     the context came from the thread rather than the prompt: the recall turn spent
+#     330 input tokens against 9786 cached-read.
+#   * ``session/delete`` archives the thread and a load then refuses, so release has
+#     a verb that genuinely disposes.
+#
+# ``ACP_BACKENDS_HARNESS_OWNED_SESSIONS`` is what carries that restore: codex
+# resolves a load from the sessionId alone, with no Crew-side transcript to check.
+# What is measured where, because the halves have different reach.
+# ``test_real_codex_acp_session_close_evicts`` carries the ``real_adapter`` marker, so
+# the contract lane runs it on a pinned adapter and an adapter bump that stops
+# ``session/close`` evicting goes red there. The RESTORE half has no such lane cover:
+# ``session/load`` on a thread the lane's fabricated credential created is refused --
+# "no rollout found for thread id", measured -- because a session that never ran a real
+# turn has nothing to reload, so the property cannot be asserted without a credential.
+# ``test_real_codex_acp_load_after_close_restores`` is where it IS asserted, and that
+# test is opt-in: it prompts, so it runs only where a host sets
+# ``KIROCREW_LIVE_CODEX_PROMPT_TESTS`` and holds a codex credential, never in CI.
+# So an adapter bump does not re-measure the restore this membership rests on, and a
+# release that made ``close`` destroy the record would reach the field before any lane
+# went red. Re-measuring it is a credentialled run of that opt-in test, which
+# ``test/real_adapter_gate.py`` names as part of a codex-acp bump.
+#
+# KAS answers NO, and that is the whole of its exclusion: its teardown maps to
+# ``_kiro/session/delete``, which REMOVES the persisted record, so there is nothing
+# for a load to restore and a shared subagent would strand ``spawn_continue`` on
+# ``conversation_gone``. A different gap from anything codex had, owned by whoever
+# gives KAS a non-destroying teardown; until then its subagents get dedicated
+# sessions, which is working behaviour rather than a degraded one.
+#
+# opencode is not a member: one binary serves one session over its own stdio pipe,
+# so there is no second session to share.
 # pi is not a member: Crew spawns one ``pi-acp`` process per session over its own
 # stdio pipe, so there is no second session to share.
 #
@@ -724,7 +778,7 @@ def resolve_selected_backend(value: object) -> str:
 # demux Crew has -- see ``ACP_BACKENDS_ACP_RUNTIME`` -- so Crew opens one process per
 # session and there is no shared session to persist. A harness capability Crew cannot
 # reach is recorded here rather than claimed.
-ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO})
+ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
 
 # Backends that can load an enrolled member's full saved agent spec at spawn.
 # Separate from session sharing and per-session dispatch (harness-parity H6):
@@ -777,8 +831,10 @@ ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset({ACP_BACKEND_KIRO})
 ACP_BACKENDS_MEMBER_DISPATCH = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS})
 
 # Backends implementing the ``_session/steer`` extension (mid-turn steer).
-# claude-agent-acp does not implement it, so a steer sent there is answered with
-# method-not-found rather than reaching the turn.
+# claude-agent-acp speaks its own spelling (``_session/steering``, answered with
+# ``{outcome: injected|startedNewTurn|failed}`` and advertised as
+# ``initialize._meta.steering.supported``), so its membership is gated on the
+# handshake advertisement (``ACP_BACKENDS_STEER_ADVERTISED``).
 # codex-acp (1.11.0) has a steering channel, but not this one and not usable for
 # what membership buys. Measured against a real adapter: it is a different method
 # (``_session/steering``, ``{sessionId, prompt: [ContentBlock]}``, answered with
@@ -797,36 +853,173 @@ ACP_BACKENDS_MEMBER_DISPATCH = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS})
 # ``sessionCapabilities`` of close, fork, list and resume, and nothing else.
 # pi is not a member: pi-acp's ``initialize`` result advertises ``loadSession`` and
 # ``sessionCapabilities`` of list and delete, and no steering extension.
-# deepseek is not a member: it advertises close, list and resume only, and permits
-# one in-flight prompt per session, so a mid-turn steer has no verb to travel on.
-ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+# deepseek is a member: its bridge serves the kiro-cli-dialect ``_session/steer``
+# verb (``@deepseek-ai/dsh-acp``), splices the message at the running turn's next
+# step, and echoes ``steering_queued``/``steering_consumed`` over ``session/update``
+# exactly like kiro-cli. Membership is gated on the handshake advertisement
+# (``ACP_BACKENDS_STEER_ADVERTISED``), so an installed dsh-acp without the verb
+# reads as unsteerable and takes the queue fallback instead of dropping a message.
+ACP_BACKENDS_STEER = frozenset({
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_DEEPSEEK,
+})
 
 # Backends that can serve a MANUAL ``/compact`` (the user-typed slash command).
-# Both members act on the ``/compact`` prompt that ``AcpProvider.compact()``
-# sends: claude-agent-acp performs the compaction natively inside the
-# session/prompt turn, and kiro-cli ACKs the prompt then emits
-# ``_kiro.dev/compaction/status``, which ``wait_for_compaction()`` picks up.
-# KAS is NOT a member: it treats the ``/compact`` prompt as ordinary text and
-# never emits a compaction status in response — its ``summarization_*`` frames
-# (mapped to compaction status by ``acp.kas_wire``) fire only for
-# KAS-initiated auto-summarization. A manual ``/compact`` on KAS therefore
-# strands the status waiter for the full ``COMPACT_WAIT_TIMEOUT_SECS``, so the
-# manual entry points refuse it up front instead. This set gates ONLY
-# the manual command: KAS auto-summarization keeps mapping to compaction
-# status unchanged.
-# opencode advertises no compaction capability of any kind, so a ``/compact``
-# prompt would reach it as ordinary text and the status waiter would strand.
-# pi is not a member either, and the exclusion is conservative rather than
-# evidenced: pi-acp lists a ``/compact`` built-in in its ``available_commands_update``
-# and documents it as running pi's compaction, but whether that command completes
-# inside the ``session/prompt`` turn has not been observed on this core, and a wrong
-# guess strands the waiter. It joins here and in ``ACP_BACKENDS_INLINE_COMPACTION``
-# together, on a capture.
-# deepseek is not a member, and its exclusion is about the SURFACE rather than the
-# feature: the harness carries compaction internally, but its ACP surface rejects
-# commands outright and its ``session/update`` vocabulary has no compaction status.
-# A ``/compact`` prompt would reach it as ordinary text and strand the waiter.
-ACP_BACKENDS_COMPACT = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE})
+# Every member acts on the ``/compact`` prompt that ``AcpProvider.compact()``
+# sends. They do not all answer it the same way, and that split is
+# ``ACP_BACKENDS_INLINE_COMPACTION``: kiro-cli ACKs the prompt then emits
+# ``_kiro.dev/compaction/status``, which ``wait_for_compaction()`` picks up, while
+# claude-agent-acp, codex-acp, opencode, pi-acp and goose finish the whole
+# compaction inside the ``session/prompt`` turn.
+#
+# opencode is a member on a LIVE capture against opencode 1.18.30, and it joins
+# despite advertising nothing: its ``available_commands_update`` lists only
+# ``customize-opencode``, ``init`` and ``review``. That silence was read here as "no
+# compaction capability of any kind", and it is not one -- the harness serves
+# ``/compact`` out of its PROMPT handler rather than out of its command list, so the
+# command list cannot answer the question. Driven over four turns the session's
+# ``usage_update.used`` climbed 14863 -> 15727 -> 16614 -> 17478. A ``/compact``
+# prompt then returned ``stopReason: end_turn`` with no status frame of any kind,
+# and the next ORDINARY turn read 14577 -- below the pre-compact peak -- with the
+# model answering out of a summary of the turns that were dropped. So the context
+# really shrank, and the turn's own terminal frame is the only done signal there is.
+# The single-turn slice of that drive is committed as evidence rather than quoted:
+# ``test/fixtures/acp_frames/opencode/compact-live.jsonl`` carries the ordinary
+# turn, the ``/compact`` turn's ``used: 514``, and the ``end_turn`` with nothing
+# after it -- which is the ABSENCE this membership rests on.
+#
+# codex is a member on a capture rather than on its documentation. codex-acp 1.11.0
+# driven over stdio advertises ``compact`` in its ``available_commands_update``
+# ("Summarize conversation to avoid hitting the context limit"), intercepts the
+# ``/compact`` prompt as that command, and answers the same ``session/prompt``
+# request once the compaction is done. The frames are a MARKED tool-call pair --
+# ``_meta.contextCompaction`` -- which ``_dispatch.parse_codex_compaction_update``
+# translates into the compaction status every consumer already reads, so the waiter
+# is satisfied from inside the turn rather than stranded after it. Its native
+# auto-compaction is real but CONDITIONAL: with ``model_auto_compact_token_limit``
+# set it fires on its own and emits the same marked pair, and with the limit absent a
+# session held at 50k tokens across three turns compacted not once. So the old
+# "manages compaction automatically" promise was true only for an operator who had
+# configured it.
+#
+# pi and goose are NOT members, and the reason is the evidence CLASS rather than the
+# feature. Both advertise a ``compact`` built-in and both dispatch it before any
+# model turn -- pi-acp 0.0.33 intercepts it in ``prompt()``, awaits
+# ``session.proc.compact(...)`` and returns ``{ stopReason: "end_turn" }``; goose
+# 1.50.1 routes it through ``Agent::reply`` -> ``execute_command`` ->
+# ``handle_compact_command``, and its own ``command_starts_turn("/compact")`` is
+# false. So the source says inline in both cases.
+#
+# What neither has is a driven capture, and this set asks for one: the bar opencode
+# met is a live session whose ``usage_update.used`` was seen to fall. Source says
+# what the code WOULD do; a capture says what the harness DID. For a membership whose
+# wrong answer makes ``wait_for_compaction`` report a completion that did not happen,
+# the second is the bar, and holding both to it is what keeps this set's memberships
+# comparable to each other. Neither could be driven where this was written -- pi
+# answers ``Authentication required``, goose
+# ``Failed to resolve provider: GOOSE_PROVIDER`` -- so they wait for someone who can
+# drive them rather than entering on the weaker class.
+#
+# Until then both are unclassified, which is a better position than the one they
+# held: they take the ``COMPACT_ARM_UNCLASSIFIED`` refusal, which promises nothing,
+# and the gate logs a WARNING naming the memberships they lack, instead of being
+# told their harness manages compaction itself on no evidence at all.
+#
+# kas and deepseek are the other two non-members, and none of the four is the same
+# case.
+# :data:`ACP_BACKENDS_HARNESS_MANAGED_COMPACTION` carries the difference and the
+# consequence: KAS compacts on its own initiative AND says so on the wire, so
+# declining its ``/compact`` costs nothing, while deepseek says nothing at all, so a
+# decline leaves its context unbounded.
+ACP_BACKENDS_COMPACT = frozenset(
+    {
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_OPENCODE,
+    }
+)
+
+# Backends that compact on their OWN initiative and report it on their ACP surface,
+# so Crew's context meter falls back below the threshold without Crew acting.
+#
+# This is the set that makes a decline HONEST. A backend outside
+# :data:`ACP_BACKENDS_COMPACT` cannot be handed a ``/compact`` prompt, and the
+# question that remains is what happens instead. A member answers it: KAS runs
+# auto-summarization and emits ``summarization_started`` /
+# ``summarization_completed``, which ``acp.kas_wire`` maps to a compaction status and
+# which calls ``reset_after_compaction()`` on the meter
+# (``acp/session_handle.py``) -- so the reading that crossed
+# ``session.autocompact_pct`` drops on its own and the user-facing "manages
+# compaction automatically" is a description rather than a hope. A backend outside
+# BOTH this set and ``ACP_BACKENDS_COMPACT`` has no compaction path Crew can see on
+# any surface, so skipping it is not a decline but a leak: nothing bounds the context
+# and nothing tells the user. What Crew does about that is decided by a THIRD
+# membership, :data:`ACP_BACKENDS_CONTEXT_RECYCLE` -- a member of that set is
+# recycled at the threshold, and a backend in none of the three is declined and
+# logged at WARNING, because ending a conversation is not something a harness earns
+# by never having been classified.
+#
+# deepseek is the standing non-member and the reason this set exists, and the frames
+# that establish it are in the corpus rather than quoted here:
+# ``test/fixtures/acp_frames/deepseek/handshake-live.jsonl`` and
+# ``turn-live.jsonl``. What those frames establish is an ACP surface with no
+# compaction on it: no ``available_commands_update`` is emitted at all,
+# ``session/load`` answers ``"Method not found"``, and the advertised capabilities are
+# ``mcpCapabilities`` / ``promptCapabilities`` / ``sessionCapabilities`` -- no
+# compaction anything. Whether the harness summarizes for ITSELF behind that surface
+# is not established here, and is deliberately claimed in neither direction: the
+# capture stops at ``used`` 7695 of ``size`` 8192, so it is evidence about 94% of the
+# window and says nothing about the wall. Driving deepseek across its own window is
+# tracked separately. The membership rests on the observable half, which is the half
+# Crew acts on: there is no status to wait for and no command to send, so a reading
+# that crossed ``session.autocompact_pct`` would be answered by nothing here however
+# the harness behaves at the wall. Meanwhile its ``usage_update`` reports a real
+# meter, climbing ``used`` 7554 -> 7695 of ``size`` 8192 across ONE captured turn: a
+# reading Crew can act on with nowhere to act. Those two files are the whole basis of this membership, which is an ABSENCE --
+# an inventory question, unlike ``ACP_BACKENDS_COMPACT``'s positive capability claim,
+# which is why that set needs a harness DRIVEN and this one does not.
+#
+# A harness that joins NEITHER this set nor ``ACP_BACKENDS_COMPACT`` is DECLINED at
+# the threshold, not recycled. The recycle is its own membership,
+# :data:`ACP_BACKENDS_CONTEXT_RECYCLE`, because granting the one session-ending arm
+# by exclusion would be the same unproven claim this set exists to remove, only
+# louder. What such a harness gets instead is a WARNING from the gate naming both
+# memberships it lacks, and the refusal arm that promises nothing -- so the leak is
+# reported rather than either denied or answered by ending the conversation. pi and
+# goose are that case today.
+ACP_BACKENDS_HARNESS_MANAGED_COMPACTION = frozenset({ACP_BACKEND_KAS})
+
+# Backends whose FULL context is answered by recycling the session, because no
+# compaction reaches them from either side.
+#
+# The third of three answers to "what happens when this context fills", and the
+# only destructive one, which is why it is a membership rather than the leftover.
+# A member is a harness Crew cannot hand ``/compact`` to
+# (:data:`ACP_BACKENDS_COMPACT`) AND that reports no compaction of its own
+# (:data:`ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`), so its context grows until the
+# harness's own window ends the conversation for it. Recycling at
+# ``session.autocompact_pct`` bounds it, at the cost of what the agent remembered
+# — the same cost the window exacts anyway, taken while the session is still
+# usable.
+#
+# deepseek is the one member. Its ACP surface emits no
+# ``available_commands_update`` at all (``session/load`` is already
+# ``Method not found``) and its ``session/update`` vocabulary carries no compaction
+# status, while its ``usage_update`` reports a real meter (``used`` 7554 -> 7695 of
+# ``size`` 8192 in one captured turn) — a reading with nowhere to go.
+#
+# A harness in NONE of the three sets is deliberately not a member here. Granting
+# this by exclusion would hand a session-destroying behaviour to every harness
+# added later without anyone deciding it, which is the same defect as claiming
+# self-management on no evidence — only louder, because this arm ends
+# conversations. Such a harness declines like a harness-managed one and is told so
+# in its own words (:func:`compact_unsupported_reply` has a third sentence for
+# exactly this case), and the gate logs a WARNING naming the gap, so the condition
+# is reported rather than silent while somebody decides which set it belongs in.
+ACP_BACKENDS_CONTEXT_RECYCLE = frozenset({ACP_BACKEND_DEEPSEEK})
 
 # Backends that finish a manual ``/compact`` INSIDE the ``session/prompt`` turn,
 # so the turn's terminal frame is the done signal and there is no asynchronous
@@ -836,25 +1029,38 @@ ACP_BACKENDS_COMPACT = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE})
 # non-member it is done leaves the user's ``/compact`` silently unacknowledged.
 #
 # A STRICT SUBSET of ``ACP_BACKENDS_COMPACT``, which answers the earlier question
-# "is a manual /compact offered at all". KAS is in neither. kiro-cli is in
-# ``ACP_BACKENDS_COMPACT`` but not here: it ACKs the prompt and then emits
+# "is a manual /compact offered at all". kas and deepseek are in neither. kiro-cli
+# is in ``ACP_BACKENDS_COMPACT`` but not here: it ACKs the prompt and then emits
 # ``_kiro.dev/compaction/status``, which is exactly the asynchronous result this
-# set says a non-member has. codex-acp is not a member either, so it keeps taking
-# the waiting arm it takes today.
+# set says a non-member has. codex-acp IS a member, and its evidence is the same
+# capture: the ``tool_call_update`` carrying ``status: "completed"`` and
+# ``_meta.contextCompaction`` arrives BEFORE the ``session/prompt`` response, and
+# that response is a plain ``stopReason: "end_turn"`` with no compaction status
+# following it. So the turn's terminal is the done signal, exactly as it is for
+# claude.
 #
 # Named as a set rather than spelled as an ``is_claude_backend`` check, because an
 # identity check hands the synchronous arm to every harness that is claude and
 # withholds it from every harness that is not, with neither being a decision anyone
 # recorded (harness-parity H6). Membership is exactly the set of harnesses that
 # demonstrate the capability.
-# opencode is in neither this set nor ``ACP_BACKENDS_COMPACT``, which is the same
-# position KAS holds: no manual compaction is offered for it at all.
-# pi is in neither set for the reason recorded on ``ACP_BACKENDS_COMPACT``: the
-# built-in exists but its turn shape is unobserved, and the two memberships move
-# together once it is.
-# deepseek holds that same position: absent from both, so no manual compaction is
-# offered for it and this set is never consulted for it.
-ACP_BACKENDS_INLINE_COMPACTION = frozenset({ACP_BACKEND_CLAUDE})
+#
+# opencode is a member on the evidence recorded on ``ACP_BACKENDS_COMPACT``, and it
+# demonstrates the capability in the one way this set is about -- where the done
+# signal lands. Its ``/compact`` turn ends with ``stopReason: end_turn`` and emits no
+# status frame at all, so the turn's terminal frame is the ONLY signal there is,
+# which makes awaiting one a strand rather than a wait.
+#
+# pi and goose are absent for the reason recorded on ``ACP_BACKENDS_COMPACT``: their
+# source says inline, no capture confirms it, and the two memberships move together
+# when one does.
+ACP_BACKENDS_INLINE_COMPACTION = frozenset(
+    {
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_OPENCODE,
+    }
+)
 
 # Backends carrying their OWN internal OS sandbox, which on macOS cannot nest
 # inside Kiro Crew's seatbelt (kernel EPERM) — so ``sandbox.wrap_argv`` skips
@@ -934,9 +1140,7 @@ ACP_BACKENDS_POD_HOME_REMAP = frozenset({ACP_BACKEND_KIRO})
 # ``not is_claude_backend`` — an inference that silently captures every harness
 # added later. This is a SUPERSET of ACP_BACKENDS_SESSION_SHARING: running on
 # AcpRuntime is necessary for session sharing but not sufficient (KAS runs here
-# yet is excluded from sharing until keep-aware teardown lands). codex-acp is not a
-# member: it is spawned per session and reads none of the kiro-family cli.json
-# overlay, so it takes the AcpClient path.
+# yet is excluded from sharing until keep-aware teardown lands).
 # opencode is not a member: it is spawned per session and reads none of the
 # kiro-family cli.json overlay, so it takes the AcpClient path.
 # pi is not a member for the same reason: one ``pi-acp`` process per session, no
@@ -949,7 +1153,24 @@ ACP_BACKENDS_POD_HOME_REMAP = frozenset({ACP_BACKEND_KIRO})
 # and the ``_kiro/*`` auth and delete verbs -- so serving this harness from it means
 # a demux that is not kiro-shaped, which is its own work. It takes the AcpClient
 # path, one process per session, until that exists.
-ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+#
+# ``ACP_BACKEND_CODEX`` IS a member, and it is the first one that is not
+# kiro-shaped. It earns membership on the two facts a shared process needs, both
+# captured off a live ``codex-acp`` 1.11.0 against a real ``codex`` build:
+#
+# * one adapter process serves N sessions and keeps them apart. Two
+#   ``session/new`` calls on one connection return distinct ids, and across a
+#   prompt on one of them every ``session/update`` notification carries that
+#   session's id -- none leaks to the other.
+# * the adapter itself does not grow with sessions: 103 MB at zero sessions and
+#   85 MB at eight. The growth is in ``codex app-server``, and it is gentle
+#   (+14 MB per session on a minimal config, +37 MB with a host MCP registry).
+#
+# What it does NOT bring is the kiro-family spawn convention: it reads no
+# cli.json overlay and takes effort through ``session/set_config_option``. That
+# is why membership here is a statement about the TRANSPORT and nothing else --
+# every kiro-family convention is its own set, and codex is absent from each.
+ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX})
 
 # Backends that load an agent defined as ONE markdown file (YAML frontmatter
 # plus the body as the system prompt) -- the form the v3 engine and Kiro IDE
@@ -969,79 +1190,150 @@ ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # because none of them reads ``~/.kiro/agents`` at all.
 ACP_BACKENDS_MARKDOWN_AGENT_SPECS = frozenset({ACP_BACKEND_KAS})
 
-# ── The preview switch: codex-acp on AcpRuntime ──
+# Backends whose agent spec comes from the USER-LEVEL directory alone, so a
+# checkout's same-named spec is not the agent their session is running.
 #
-# ``ENV_CODEX_ACP_RUNTIME`` is the ONE thing that moves codex-acp from AcpClient
-# onto AcpRuntime, and it is OFF unless an operator sets it. With it unset this
-# build behaves exactly as the frozenset above says: the FOREGROUND start path asks
-# "is this backend on the shared runtime?" through :func:`acp_runtime_backends`,
-# which with the switch unset returns that frozenset verbatim, so a codex session
-# still gets its own AcpClient process. The background ``_bg`` path does not ask
-# through this function at all -- ``session._bg_runtime_backends`` reads the
-# frozenset directly, so the switch cannot reach it even when it is on. Its reason
-# is in ``session.py`` beside that reader: codex's teardown verb ends a turn without
-# evicting the session, and background handles churn at a rate the user never
-# controls.
+# Every other host resolves the nearer layer too: kiro-cli reads
+# ``<project>/.kiro/agents/`` itself for ``--agent``, and a MIRRORED host receives
+# the array ``acp/session_mcp.py`` translates, which is project-nearest-first. KAS
+# is the exception -- ``acp/kas_agents.load_agent_spec`` is handed
+# ``paths.kiro_agents_dir()`` and reads nothing else, which
+# ``agent_discovery.project_agent_files`` already states, so a project-only agent
+# selected on a KAS session is refused at session start rather than projected.
 #
-# Why a switch rather than a member. The frozenset above is the SHIPPED answer,
-# and adding codex to it IS the product change. That change is worth its own
-# commit -- one line, reviewed on its own, reverted on its own -- rather than
-# being folded into the commit that writes the harness. So the harness lands
-# first, dark, with a switch that exercises it; then the member lands and this
-# switch is deleted. Deleting it is the whole flip: nothing else moves.
-#
-# Why an env read rather than a second registry. ``register_selectable_backend``
-# exists because an EDITION must be able to add a harness this build has never
-# heard of. Nothing of the kind is happening here -- codex is already known and
-# already selectable, and the only open question is which transport it takes --
-# so a registry would be a mutable global that one caller writes once. An env read
-# holds no state, is re-read per call so a test can turn it on around a single
-# assertion, and cannot be aimed at a harness other than codex.
-ENV_CODEX_ACP_RUNTIME = "KIROCREW_CODEX_ACP_RUNTIME"
+# What membership decides is the SCOPE of the broker-overlay lookup
+# (``mcp_gateway.session_servers``). That overlay is keyed by agent name and is
+# also written from the user-level directory, so for every OTHER host a
+# checkout-declared name means the overlay holds no stubs for this session. For a
+# member the reverse holds: the user-level agent IS the one running, so scoping
+# its lookup would suppress the stubs for servers the session really has and run
+# them outside the pool, outside caller-identity attribution and outside broker
+# governance. Read through the runtime's own scope helper, never as "is KAS": a
+# host added later that reads the user level alone joins here.
+ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY = frozenset({ACP_BACKEND_KAS})
 
 
-def codex_runs_on_acp_runtime() -> bool:
-    """Whether the codex-on-AcpRuntime preview switch is on. Default ``False``.
+def overlay_project_scope(backend: str, work_dir: Any) -> dict[str, Any]:
+    """The overlay-lookup scope keywords for *backend*'s session.
 
-    Read per call and never cached at import, for the same reason
-    :func:`kiro_crew.session._bg_runtime_backends` is computed per call: the
-    gateway sets its environment before it spawns anything and a test sets the
-    variable around one assertion, so a value frozen at import answers for
-    whichever of the two happened to run first.
+    The ONE decider, so every call site that resolves the overlay -- ``AcpClient``
+    and ``AcpRuntime`` alike -- answers from
+    :data:`ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY` rather than from its own
+    spelling. A host reading the user level alone joins the set and both paths
+    change together; the alternative, one path keyed on the set and the other
+    hardcoding the session's checkout, silently mis-scopes the next such host,
+    which is the defect this function exists to make unreachable.
 
-    The truthy set is spelled out by :data:`kiro_crew.constants.ENV_TRUTHY` and read
-    through :func:`kiro_crew.constants.env_flag_enabled`, which exists for exactly
-    this footgun: an operator who exports ``=0`` or ``=false`` to keep a preview OFF
-    must not get it on, and a bare ``bool()`` would give it to them silently, since
-    the session starts either way and only the transport differs. ``constants`` is
-    stdlib-only, so reading it here keeps this module's leaf property (see the
-    module docstring) -- the forbidden edges are ``kiro_crew.config``,
-    ``kiro_crew.platform`` and ``kiro_crew.acp``.
+    Returned as keywords to SPLAT, because the checkout is not the whole scope:
+    which spec FORMATS this session's agent resolution SEES is the other half. A
+    project spec shadows the user-level overlay only in a form that resolution
+    honours, and the two halves must name the same file.
+
+    ``markdown_specs`` and ``dispatchable_only`` are two facets of ONE question --
+    which resolver decides this session's agent spec -- so they are computed here
+    together rather than derived from each other at a call site.
+
+    A MIRRORED host's array is composed by Crew from a spec ``acp.session_mcp``
+    resolves through ``_project_spec_path_for``: it scans both forms and matches on
+    ``agent_discovery.project_agent_name``, which falls back to the filename stem.
+    So the overlay lookup must match the same way -- both forms, no parse
+    requirement. That is not a formality: when that resolver matches a project file
+    it returns that file's read and does NOT fall back to the user level, so a
+    MALFORMED project spec leaves the projection with no spec at all, no ``tools``
+    allowlist and no project servers. Keeping the user-level stubs on top of that
+    would put servers in the session that nothing in force declares.
+
+    kiro-cli instead resolves ``--agent`` from the checkout ITSELF, discovers the
+    JSON form there (measured on 2.22.0, and pinned by the
+    ``KIROCREW_E2E_REAL_KIRO_CLI``-gated test), and reports a malformed spec as an
+    error offering no such mode -- so it runs the user-level agent, whose stubs must
+    therefore be kept. Hence JSON only, and a parse required.
+
+    :data:`ACP_BACKENDS_MARKDOWN_AGENT_SPECS` -- a host reading the markdown form
+    from a checkout itself -- is deliberately NOT OR-ed in: its only member also
+    reads the user level alone and leaves above, so the term would have no caller
+    able to reach it. ``test_agent_sdk_capabilities`` pins that containment, so a
+    host which breaks it fails there naming this function.
+
+    The import is deferred because the mirror registry imports THIS module at its
+    own top level. It is not wrapped: an import that does not resolve is a
+    packaging fault, and answering "kiro-shaped" for a mirrored host because of one
+    would silently reinstate the stub-shadowing this scope exists to prevent.
+
+    ``work_dir`` is passed through untouched (``str``, ``Path`` or ``None``) so
+    the caller keeps whichever form it already holds.
     """
-    return env_flag_enabled(ENV_CODEX_ACP_RUNTIME)
+    if backend in ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY:
+        return {}
+    from kiro_crew.providers.mirrors.registry import has_mirror
+
+    mirrored = has_mirror(backend)
+    return {
+        "work_dir": work_dir,
+        "markdown_specs": mirrored,
+        "dispatchable_only": not mirrored,
+    }
 
 
-def acp_runtime_backends() -> FrozenSet[str]:
-    """Backends served by AcpRuntime in THIS process, preview switch included.
+# Backends whose agent spec's own ``mcpServers`` reach the session OFF the wire --
+# by a channel other than the ``session/new`` ``mcpServers`` array.
+#
+# The unresolved-``@server``-ref detector (``agent_sdk.mcp_refs``) judges a spec's
+# ``tools`` refs against the servers the session actually receives, and for an
+# array-backed host that is the wire array: what is not in it is not mounted.
+# These two hosts mount the spec's servers by another channel, so for them the
+# spec's own server names are satisfied by construction and only a ref naming a
+# server the spec does NOT declare is unresolved. kiro-cli resolves ``--agent``
+# itself and loads the spec's servers from disk, which is why Crew hands it an
+# empty array. KAS receives the spec's servers as a projected agent definition in
+# ``_meta.kiro.customAgents`` (``acp/kas_agents.py``), with only the broker stubs
+# on the array. codex is NOT a member: the array Crew sends is the whole of what
+# it mounts, so judging its refs against that array is exactly right. Read by
+# membership rather than as "is kiro": a host added later that mounts a spec's
+# servers by its own channel joins here, and the detector says nothing wrong about
+# it on day one.
+ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
-    The one home the switch has: every FOREGROUND site asking "is this backend on
-    the shared runtime?" reads this instead of the environment. Equal to
-    ``ACP_BACKENDS_ACP_RUNTIME`` whenever the switch is off, which is the default.
-
-    Not every reader of that question. ``session._bg_runtime_backends`` reads the
-    frozenset directly, deliberately, so the switch is scoped to the foreground —
-    its reason lives beside that reader. A site that wants the switch reads here; a
-    site the switch must not reach reads the set and says why.
-
-    A function rather than a set for the reason the module docstring gives for
-    ``host_auth.backends_retired_by_host_logout()``: this is a DERIVED answer, not
-    vocabulary, and the harness-parity gate reserves the ``ACP_BACKENDS_*``
-    spelling for vocabulary.
-    """
-    if codex_runs_on_acp_runtime():
-        return ACP_BACKENDS_ACP_RUNTIME | {ACP_BACKEND_CODEX}
-    return ACP_BACKENDS_ACP_RUNTIME
-
+# Backends whose teardown verb actually EVICTS the session from the adapter's own
+# session map, freeing what it held.
+#
+# Running on a shared process (the set above) is not that claim. A harness can
+# multiplex perfectly and still have no verb that disposes one session, and the
+# difference only shows on a process that outlives many sessions: every
+# non-evicting teardown leaves its session addressable and its context resident,
+# so the adapter grows without bound at whatever rate sessions are created.
+#
+# kiro-cli and KAS are members: their teardown verbs (``_kiro.dev/session/terminate``
+# and ``_kiro/session/delete``) remove the session from the process.
+#
+# codex is a member on captured evidence. Crew's teardown verb for it is the
+# standard ``session/close``, sent as a request; measured live against codex-acp
+# 1.11.0, the adapter answers it with ``{}`` and afterwards the same sessionId
+# stops answering ``session/set_config_option`` -- the session is gone from the
+# process, while the Codex thread's own record survives (evict, not delete). The
+# contrast on the same wire is ``session/cancel``: after it the same oracle keeps
+# answering and a further ``session/prompt``'s ``cachedReadTokens`` shows the
+# context resident, so ``cancel`` interrupts a turn and is not a teardown, and a
+# harness sending it as one is correctly excluded here. The harness docstring on
+# ``CodexHarness.teardown`` carries the full measurement, and a gated live test
+# repeats it on every install that has the adapter.
+#
+# Read by every path that creates and destroys sessions on a shared process, and
+# that is why membership is one fact rather than one gate per caller:
+# :func:`kiro_crew.session._bg_runtime_backends` (background handles -- title
+# generation, suggestions, folders, nav -- each taking an ephemeral sessionId many
+# times per conversation), ``AcpSessionProvider.new_conversation`` (warm pooled
+# reuse, resetting at the rate a workflow's steps run), and the entitlement probe
+# in ``AcpRuntime`` (a throwaway session per unavailable-model pick). A harness
+# whose teardown does not evict leaks one session on every one of those paths, at
+# rates the operator never controls; a harness in this set frees it on each.
+#
+# An opt-in set rather than a subtraction at any call site, for the reason every
+# set in this section is opt-in (harness-parity H6/H7): a harness added later and
+# spelled as "not <some host>" would inherit an eviction guarantee it has never
+# demonstrated, and the operator who never opted into it is the one who finds the
+# adapter growing. Membership is earned by a measured teardown, not by default.
+ACP_BACKENDS_SESSION_EVICTION = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX})
 
 # ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` is gone, and it has no replacement HERE.
 # Whether a ``kiro-cli logout`` may retire a running child is a fact about how the
@@ -1289,10 +1581,11 @@ def model_registry_namespace(backend: str) -> str:
 # slash commands go through ``session/prompt`` and are interpreted by the adapter
 # (or degrade to prompt text) instead of returning -32601 for the whole call.
 #
-# The same membership decides who reads the workspace ``cli.json`` overlay: the
-# kiro-family harnesses take effort and Tool Search from that file at spawn, and
-# writing it for a harness that never reads it leaves a stale file in the user's
-# workspace that no later clear can reach.
+# The same membership decides who reads the workspace ``cli.json`` overlay for
+# EFFORT: the kiro-family harnesses take ``chat.modelDefaults`` from that file at
+# spawn, and writing it for a harness that never reads it leaves a stale file in
+# the user's workspace that no later clear can reach. Tool Search has its own,
+# narrower set below -- the two hosts read that setting from different places.
 # opencode is not a member: it has no ``_kiro.dev`` verb, and it publishes its own
 # command list as an ``available_commands_update`` on ``session/update`` instead.
 # pi is not a member for the same reason: pi-acp publishes its built-ins the same
@@ -1300,6 +1593,23 @@ def model_registry_namespace(backend: str) -> str:
 # deepseek is not a member and publishes no command list either: it carries commands
 # internally and its ACP surface rejects them, so it exposes none over the wire.
 ACP_BACKENDS_KIRO_SLASH_COMMANDS = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends that read the MCP Tool Search setting from the workspace ``cli.json``
+# overlay (``toolSearch.*`` keys). Only kiro-cli's Rust engine does. KAS shares
+# the slash-command dialect above but never opens that file: on the relay path
+# nothing forwards it, so a Tool Search value written there for a KAS session is
+# dead -- the setting looks on in the dashboard while the engine runs with it off.
+# KAS takes the setting from the handshake instead (the set below).
+ACP_BACKENDS_TOOL_SEARCH_OVERLAY = frozenset({ACP_BACKEND_KIRO})
+
+# Backends that take feature settings from the ACP ``initialize`` request, under
+# ``clientCapabilities._meta.kiro.settings``. KAS is the only member: it opened
+# that channel (``KAS_CLIENT_CAPABILITIES``), and the runtime fills it at spawn
+# with the settings the harness declares it reads -- today Tool Search, gated on
+# the spawn agent's spec granting the ``tool_search`` loader, because KAS defers
+# every MCP spec when told to and does not check that a loader exists. kiro-cli
+# is not a member: it has no such channel and reads the overlay file instead.
+ACP_BACKENDS_CLIENT_META_SETTINGS = frozenset({ACP_BACKEND_KAS})
 
 # Backends that reconcile an edited agent config into their RUNNING sessions: a
 # file watcher on ``~/.kiro/agents`` and ``mcp.json`` restarts only the changed
@@ -1756,6 +2066,90 @@ ACP_BACKEND_LAUNCH: Mapping[str, SelfServedLaunch] = {
 #: install probe and the driver seams ask. Derived from the table's keys rather than
 #: written a second time, so the two cannot disagree.
 ACP_BACKENDS_SELF_SERVED_ACP: FrozenSet[str] = frozenset(ACP_BACKEND_LAUNCH)
+
+#: The argv0 basename each harness's child process runs as.
+#:
+#: Read by the PID-file reclaim in :mod:`kiro_crew.session_pid`, which asks one
+#: question of a tracked PID it is about to signal: does this PID still name the kind
+#: of process the tracking entry described? That is a recycle guard, and it needs a
+#: name per harness rather than a capability.
+#:
+#: Declared HERE rather than in the reclaim, for the reason every per-backend fact is
+#: declared here: a harness added to :data:`ACP_BACKENDS_KNOWN` and not to this table
+#: is a harness whose orphans the reclaim cannot recognise, and the reclaim's failure
+#: mode for an unrecognised orphan is to drop its tracking entry and spare the
+#: process — so nothing later can find it. ``test_pid_lifecycle`` ratchets the
+#: coverage, so the omission is a red test rather than a leaked process.
+#:
+#: The three self-served harnesses read their own ``ACP_BACKEND_LAUNCH`` row so the
+#: two tables cannot disagree. The rest are spelled out because their launch is
+#: bespoke: kiro-cli serves both the kiro and KAS backends (KAS is kiro-cli's relay),
+#: and the claude, codex and pi adapters are Node entry scripts whose basenames live
+#: with their resolvers in the ACP layer, which this module must not import.
+ACP_BACKEND_PROCESS_NAMES: Mapping[str, str] = {
+    ACP_BACKEND_KIRO: "kiro-cli",
+    ACP_BACKEND_KAS: "kiro-cli",
+    ACP_BACKEND_CLAUDE: "claude-agent-acp",
+    ACP_BACKEND_CODEX: "codex-acp",
+    ACP_BACKEND_PI: "pi-acp",
+    **{backend: record.binary for backend, record in sorted(ACP_BACKEND_LAUNCH.items())},
+}
+
+
+#: The npm package that ships each NODE-HOSTED adapter.
+#:
+#: Three harnesses are entry scripts Crew hands to ``node``; every other harness is a
+#: binary that serves ACP itself. Only these three can appear in a command line as
+#: ``node <path>``, so only these three need a path to be recognised by.
+#:
+#: Declared here for the same reason :data:`ACP_BACKEND_PROCESS_NAMES` is: the resolvers
+#: live in the ACP layer, which this module must not import, while the reclaim in
+#: :mod:`kiro_crew.session_pid` must not import the ACP layer either. One table both can
+#: read is what keeps the resolver's spelling and the reclaim's from drifting -- and a
+#: drift there is a launch the reclaim cannot recognise, or a path it recognises that
+#: Crew never spawns.
+#:
+#: ``pi-acp`` is unscoped and the other two are scoped: the values are the real published
+#: names, not a pattern, because a pattern is what would let an unrelated package satisfy
+#: it.
+ACP_BACKEND_NODE_ADAPTER_PACKAGES: Mapping[str, str] = {
+    ACP_BACKEND_CLAUDE: "@agentclientprotocol/claude-agent-acp",
+    ACP_BACKEND_CODEX: "@agentclientprotocol/codex-acp",
+    ACP_BACKEND_PI: "pi-acp",
+}
+
+#: The entry script inside such a package, as every resolver builds it.
+NODE_ADAPTER_ENTRY_SEGMENTS: tuple[str, ...] = ("dist", "index.js")
+
+
+def node_adapter_entry_relpaths() -> tuple[str, ...]:
+    """Every ``<package>/dist/index.js`` tail Crew launches a Node adapter with.
+
+    The IDENTITY of an interpreter-hosted adapter, for a consumer that has a command
+    line and must decide whether Crew spawned it. Matching a package DIRECTORY NAME
+    against the harness names instead makes "what a process may call itself" an open
+    axis: an unrelated npm application at ``node /srv/goose/dist/index.js`` carries a
+    directory named after a harness Crew never launches through Node at all. These
+    relative paths are a closed set this repository owns, so the axis closes with it.
+
+    Returned as POSIX-separated relative paths, sorted for a stable value.
+    """
+    return tuple(
+        sorted(
+            "/".join((package, *NODE_ADAPTER_ENTRY_SEGMENTS))
+            for package in ACP_BACKEND_NODE_ADAPTER_PACKAGES.values()
+        )
+    )
+
+
+def agent_process_markers() -> tuple[str, ...]:
+    """Every harness argv0 basename, sorted and de-duplicated.
+
+    A tuple of substrings for a cmdline match, which is what
+    ``platform_compat.process_matches`` takes. Sorted so the value is stable to read
+    in a log, de-duplicated because kiro and KAS share ``kiro-cli``.
+    """
+    return tuple(sorted(set(ACP_BACKEND_PROCESS_NAMES.values())))
 
 
 def launch_for(backend: str) -> SelfServedLaunch:

@@ -33,6 +33,7 @@ const {
   isKirocrewCommand,
 } = require("./gateway-stop");
 const {
+  canonicalWindowsPath,
   windowsGatewayExecutablePaths,
   windowsListenPids,
   windowsProcessCommand,
@@ -86,6 +87,16 @@ const INSTALLING_STATUS = "Finishing installation…";
 const RESTARTING_STATUS = "Restarting Kiro Crew to finish the update…";
 const POLL_INTERVAL_MS = 500;
 const ADOPTED_RECOVERY_WAIT_MS = 30_000;
+// loadFile query that tells loading.html it is being painted by a reconnect
+// path rather than a cold boot, so it can offer its exit control at once
+// (loading.html reads `reconnect=1`). A query, not an IPC send: the splash
+// loads asynchronously and a message sent right after loadFile can be missed.
+const SPLASH_RECONNECT_QUERY = Object.freeze({ reconnect: "1" });
+// loadFile query that tells loading.html it is painted into the main window:
+// the one window whose close hides to tray and keeps the connect loop alive.
+// A connection window is destroyed by close, so the page words its close hint
+// from this flag (loading.html reads `primary=1`; absent means not primary).
+const SPLASH_PRIMARY_QUERY = Object.freeze({ primary: "1" });
 // How long this instance stays alive waiting for a successor copy of the app
 // to prove itself by serving on the gateway port (relaunchViaConfirmedSuccessor):
 // Electron boot plus the successor's own gateway budget, with margin.
@@ -188,6 +199,12 @@ function createGatewaySupervisor({
   // whenever one reaches handoff, and whenever a monitored backend answers
   // again, so each incident gets its own budget.
   let reresolveAttempts = 0;
+  // Executables the CURRENT child was actually spawned from. findKirocrewBin
+  // re-probes on every call, so after a Toolbox `current` junction is repointed
+  // at a newer version it names a backend this shell never started; the child
+  // still running is the one spawned before the repoint, and it must keep
+  // classifying as ours (stop, liveness, port-owner) until it exits.
+  let spawnedExecutablePaths = [];
 
   /**
    * Can app.relaunch() still find something to re-exec? Electron relaunches
@@ -256,7 +273,7 @@ function createGatewaySupervisor({
       if (window && !window.isDestroyed()) {
         try {
           window.webContents.loadFile(path.join(dirname, "loading.html"), {
-            query: { accent: currentThemeAccent() },
+            query: splashQuery(window, { accent: currentThemeAccent() }),
           });
         } catch { /* window may be tearing down */ }
       }
@@ -341,6 +358,19 @@ function createGatewaySupervisor({
     return THEME_ACCENT_RE.test(configured) ? configured : DEFAULT_THEME_ACCENT;
   }
 
+  /**
+   * The loadFile query every loading.html painter uses. `primary` is decided
+   * here, from the window being painted, so no painter can mark a connection
+   * window as the main one (see SPLASH_PRIMARY_QUERY).
+   */
+  function splashQuery(window, { reconnect = false, accent = "" } = {}) {
+    const query = {};
+    if (accent) query.accent = accent;
+    if (reconnect) Object.assign(query, SPLASH_RECONNECT_QUERY);
+    if (window === mainWindow()) Object.assign(query, SPLASH_PRIMARY_QUERY);
+    return query;
+  }
+
   // NOTE: /api/health carries app identity; /api/status does not.
   function fetchHealthInfo(healthUrl = `${BACKEND_URL}${HEALTH_IDENTITY_PATH}`) {
     return new Promise((resolve) => {
@@ -388,6 +418,8 @@ function createGatewaySupervisor({
     });
   }
 
+  const windowsRealpath = (candidate) => fs.realpathSync.native(candidate);
+
   function isTrustedWindowsGatewayCommand(command) {
     const gatewayBin = findKirocrewBin(
       fs,
@@ -397,7 +429,11 @@ function createGatewaySupervisor({
       dirname,
     );
     return isKirocrewCommand(command, {
-      trustedExecutablePaths: windowsGatewayExecutablePaths(gatewayBin),
+      trustedExecutablePaths: [
+        ...windowsGatewayExecutablePaths(gatewayBin, { realpathSync: windowsRealpath }),
+        ...spawnedExecutablePaths,
+      ],
+      canonicalizePath: (candidate) => canonicalWindowsPath(candidate, windowsRealpath),
     });
   }
 
@@ -785,6 +821,11 @@ function createGatewaySupervisor({
     });
     gatewayProcess = child;
     gatewayOwnership = "spawned";
+    if (IS_WIN) {
+      spawnedExecutablePaths = windowsGatewayExecutablePaths(spawnBin, {
+        realpathSync: windowsRealpath,
+      });
+    }
     if (typeof childOut === "number") {
       try { fs.closeSync(childOut); } catch { /* ignore */ }
     }
@@ -831,6 +872,7 @@ function createGatewaySupervisor({
         reresolveAttempts += 1;
         glog(`stale bundle (${cause} on bin=${bin}) — re-resolving the backend and respawning (attempt ${reresolveAttempts})`);
         gatewayProcess = null;
+        spawnedExecutablePaths = [];
         gatewayStartFailure = null;
         spawnGateway(resolve);
         return true;
@@ -843,6 +885,7 @@ function createGatewaySupervisor({
     child.on("error", (error) => {
       userError(`spawn ERROR code=${error.code || "?"} msg=${error.message}`);
       if (gatewayProcess !== child) return;
+      spawnedExecutablePaths = [];
       const giveUp = () => {
         gatewayStartFailure = { error: error.message, bundled };
         sendStatus(`Gateway failed: ${error.message}`);
@@ -863,6 +906,7 @@ function createGatewaySupervisor({
         userWarn("HINT: SIGKILL on a freshly-spawned bundled binary almost always means macOS Gatekeeper blocked an unsigned/quarantined nested executable. On the recipient's Mac run: xattr -cr <path to KiroCrew.app>");
       }
       if (!currentChild) return;
+      spawnedExecutablePaths = [];
       const giveUp = () => {
         if (!gatewayStartFailure) gatewayStartFailure = { code, signal, bundled };
         gatewayProcess = null;
@@ -882,7 +926,11 @@ function createGatewaySupervisor({
    */
   async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
     const gateway = gatewayProcess;
-    if (!gateway || gateway.exitCode !== null) { gatewayProcess = null; return; }
+    if (!gateway || gateway.exitCode !== null) {
+      gatewayProcess = null;
+      spawnedExecutablePaths = [];
+      return;
+    }
     glog("Stopping gateway gracefully...");
     // Resolve secrets at call time. The gateway accepts only the secret for its
     // current boot; trying every readable candidate prevents a stale copy from
@@ -907,6 +955,7 @@ function createGatewaySupervisor({
       killTreeFn: killGatewayTreeOnWindowsBounded,
     });
     gatewayProcess = null;
+    spawnedExecutablePaths = [];
   }
 
   function killGatewayTreeOnWindowsBounded(pid) {
@@ -1324,6 +1373,7 @@ function createGatewaySupervisor({
     // sweep before probing the port or descendants escape and retain locks.
     await killGatewayProcessTree(gatewayProcess, "SIGKILL");
     gatewayProcess = null;
+    spawnedExecutablePaths = [];
     let freed = true;
     let foreignHolder = false;
     let probeFailed = false;
@@ -1354,7 +1404,7 @@ function createGatewaySupervisor({
 
   async function reconnectExternalGateway(window) {
     const webContents = window.webContents;
-    try { webContents.loadFile(path.join(dirname, "loading.html")); }
+    try { webContents.loadFile(path.join(dirname, "loading.html"), { query: splashQuery(window, { reconnect: true }) }); }
     catch { /* window may be tearing down */ }
     if (!window || window.isDestroyed() || quitting()) return;
     // No reveal here: network/tunnel healing must not re-surface a window the
@@ -1376,7 +1426,7 @@ function createGatewaySupervisor({
 
   async function reconnectOrRespawnAdoptedGateway(window) {
     const webContents = window.webContents;
-    try { webContents.loadFile(path.join(dirname, "loading.html")); }
+    try { webContents.loadFile(path.join(dirname, "loading.html"), { query: splashQuery(window, { reconnect: true }) }); }
     catch { /* window may be tearing down */ }
     if (!window || window.isDestroyed() || quitting()) return;
     sendStatus("Gateway stopped responding — waiting for it to recover…");
@@ -1501,7 +1551,7 @@ function createGatewaySupervisor({
     const healthUrl = `${targetBackendUrl}/api/status`;
     const webContents = window.webContents;
     webContents.loadFile(path.join(dirname, "loading.html"), {
-      query: { accent: currentThemeAccent() },
+      query: splashQuery(window, { reconnect, accent: currentThemeAccent() }),
     });
     // Cold boot and user-clicked retries raise. Autonomous liveness recovery
     // loads into the existing hidden/minimized window without touching focus.

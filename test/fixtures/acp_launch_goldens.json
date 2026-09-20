@@ -8,6 +8,7 @@
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
       "KIROCREW_SESSION_KEY": "golden-session",
       "KIROCREW_SPAWNED": "1",
+      "KIROCREW_STUB_SESSION_TOKEN": "<session-token>",
       "PATH": "<augmented-path>"
     },
     "spawn_label": "claude-agent-acp via /opt/lib/claude-agent-acp/index.js",
@@ -20,12 +21,12 @@
     ],
     "env_added": {
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
-      "KIROCREW_SESSION_KEY": "golden-session",
       "KIROCREW_SPAWNED": "1",
+      "KIROCREW_SPAWN_INSTANCE": "<spawn-instance>",
       "PATH": "<augmented-path>"
     },
-    "spawn_label": "codex-acp via /opt/lib/codex-acp/index.js",
-    "stderr_label": "codex-acp via /opt/lib/codex-acp/index.js"
+    "env_removed": [],
+    "served_by": "AcpRuntime"
   },
   "deepseek": {
     "argv": [
@@ -38,6 +39,7 @@
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
       "KIROCREW_SESSION_KEY": "golden-session",
       "KIROCREW_SPAWNED": "1",
+      "KIROCREW_STUB_SESSION_TOKEN": "<session-token>",
       "PATH": "<augmented-path>"
     },
     "spawn_label": "dsh --profile acp",
@@ -55,6 +57,7 @@
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
       "KIROCREW_SESSION_KEY": "golden-session",
       "KIROCREW_SPAWNED": "1",
+      "KIROCREW_STUB_SESSION_TOKEN": "<session-token>",
       "PATH": "<augmented-path>"
     },
     "spawn_label": "goose acp",
@@ -71,6 +74,7 @@
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
       "KIROCREW_SESSION_KEY": "golden-session",
       "KIROCREW_SPAWNED": "1",
+      "KIROCREW_STUB_SESSION_TOKEN": "<session-token>",
       "PATH": "<augmented-path>"
     },
     "spawn_label": "kiro-cli acp",
@@ -87,6 +91,7 @@
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
       "KIROCREW_SESSION_KEY": "golden-session",
       "KIROCREW_SPAWNED": "1",
+      "KIROCREW_STUB_SESSION_TOKEN": "<session-token>",
       "PATH": "<augmented-path>"
     },
     "spawn_label": "kiro-cli acp",
@@ -101,6 +106,7 @@
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
       "KIROCREW_SESSION_KEY": "golden-session",
       "KIROCREW_SPAWNED": "1",
+      "KIROCREW_STUB_SESSION_TOKEN": "<session-token>",
       "OPENCODE_CONFIG_CONTENT": "{\"permission\":\"ask\"}",
       "PATH": "<augmented-path>"
     },
@@ -117,6 +123,7 @@
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
       "KIROCREW_SESSION_KEY": "golden-session",
       "KIROCREW_SPAWNED": "1",
+      "KIROCREW_STUB_SESSION_TOKEN": "<session-token>",
       "PATH": "<augmented-path>",
       "PI_ACP_PI_COMMAND": "/opt/run/pi-launcher.sh"
     },

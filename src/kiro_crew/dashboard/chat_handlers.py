@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
@@ -49,6 +49,7 @@ from kiro_crew.dashboard.chat_delivery import (
     attachment_meta,
     normalize_send_id,
     queue_for_next_turn,
+    start_queue_persist,
     steer_into_running_turn,
 )
 from kiro_crew.dashboard.chat_folders import (
@@ -67,6 +68,7 @@ from kiro_crew.dashboard.chat_persistence import (
     _validate_autocompact_pct,
     get_reasoning_effort_values,
     pin_private_agent_store,
+    release_prewarmed_session,
     save_slot_off_loop,
 )
 from kiro_crew.dashboard.chat_runner import (
@@ -140,6 +142,7 @@ from kiro_crew.dashboard.slot_buffers import (
     note_hold_durable,
     persist_deferred_notes_sync,
 )
+from kiro_crew.dashboard.slot_queue_repository import warn_if_not_durable
 from kiro_crew.dashboard.state import (
     DashboardState,
     SlotOrigin,
@@ -705,11 +708,26 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             # Raw client input — the sink (`normalize_send_id` at the top of
             # `steer_into_running_turn`) type-checks and length-bounds it,
             # treating anything unusable as absent (the old-client shape).
+            # circular import: session_control imports this package's modules at module level.
+            from kiro_crew.dashboard.session_control import containment_meta as _containment_meta
+
             outcome = await steer_into_running_turn(
                 state,
                 slot,
                 message,
                 send_id=user_meta.get("sendId") if user_meta else None,
+                # This branch IS the composer: the text was typed into this
+                # session's own surface by its authenticated human, which is what
+                # earns a requeued entry the exemption from the drain's LINKED drop.
+                # Stated rather than defaulted, because the default fails closed.
+                user_origin=not bool(request_app),
+                # Captured HERE, before the RPC suspends, for the same reason the peer
+                # path captures it: the requeue runs in the turn's teardown and a slot
+                # read there folds a mirror linked during the suspension into the
+                # entry's own admission baseline. The LINKED exemption does not cover
+                # that -- a new outbound mirror is never exempt, because the author
+                # does not control mirror links -- so the composer needs the stamp too.
+                admission=_containment_meta(state, slot),
             )
             if outcome == STEER_STEERED:
                 return web.json_response({"ok": True, "steered": True})
@@ -813,6 +831,16 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         _c, _ = redact_exfiltration_urls(message)
         _c, _ = redact_credentials(_c)
         _redacted = _redact_for_display(_c)
+        warn_if_not_durable(slot._queue, qid, slot.key)
+        # Start the durable write here too, not only in the busy-slot branch.
+        # This branch holds an IDLE slot, so no drain is coming to write the
+        # prompt's transcript row and no turn-end flush is scheduled: the queue
+        # is the only record of the user's words until the last sub-agent
+        # finishes, which is unbounded. Waiting for the periodic flush would
+        # leave a window as wide as its interval, so the accept and the write
+        # start from the same place. Same single-flight and same self-limiting
+        # skip as the other caller.
+        start_queue_persist(state, slot)
         state.broadcast_ws(
             "queue_push",
             {
@@ -822,8 +850,10 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 "queue_id": qid,
             },
         )
-        # Same receipt contract as the busy-slot queue branch: `queue_id`
-        # binds the sender's pre-send composer state to this exact entry.
+        # Same receipt contract as the busy-slot queue branch: `queue_id` binds
+        # the sender's pre-send composer state to this exact entry. An entry the
+        # durable bounds refuse is reported in the log by the call above, not on
+        # the receipt: the on-screen marker belongs with its consumer.
         return web.json_response({"ok": True, "queued": True, "queue_id": qid})
 
     # WS mode: return JSON immediately, chunks delivered via WebSocket
@@ -911,13 +941,22 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 try:
                     cfg = await asyncio.to_thread(KiroCrewConfig.load)
                     assigned_store = await pin_private_agent_store(
-                        state, assignment[3], assignment[0], cfg
+                        state, assignment[3], assignment[0], cfg, memory_mode=slot.memory_mode
                     )
                     chosen = await asyncio.to_thread(
-                        resolve_agent_bindings, cfg, assignment[0], assignment[1] or None
+                        resolve_agent_bindings,
+                        cfg,
+                        assignment[0],
+                        assignment[1] or None,
+                        validate_memory_files=False,
                     )
                     selection_change = await _record_explicit_agent_selection(
-                        assignment[3], assignment[0], chosen
+                        assignment[3],
+                        assignment[0],
+                        chosen,
+                        config=cfg,
+                        memory_mode=slot.memory_mode,
+                        app=slot._app or "",
                     )
                 except Exception as exc:
                     from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
@@ -2880,7 +2919,9 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             else None
         )
         try:
-            bindings = await asyncio.to_thread(resolve_agent_bindings, cfg, agent)
+            bindings = await asyncio.to_thread(
+                resolve_agent_bindings, cfg, agent, validate_memory_files=False
+            )
             workspace = _workspace_name_for_dir(cfg, bindings.workspace_dir)
             if not bindings.requested_resolved:
                 # Log only — the requested binding is the user's intent and is
@@ -3181,15 +3222,22 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 selection_change = None
                 try:
                     assigned_store = await pin_private_agent_store(
-                        state, assignment_key, agent, cfg
+                        state, assignment_key, agent, cfg, memory_mode=slot.memory_mode
                     )
                     chosen = await asyncio.to_thread(
-                        resolve_agent_bindings, cfg, assignment_agent, assignment_project or None
+                        resolve_agent_bindings,
+                        cfg,
+                        assignment_agent,
+                        assignment_project or None,
+                        validate_memory_files=False,
                     )
                     selection_change = await _record_explicit_agent_selection(
                         assignment_key,
                         assignment_agent,
                         chosen,
+                        config=cfg,
+                        memory_mode=slot.memory_mode,
+                        app=slot._app or "",
                     )
                 except Exception as exc:
                     from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
@@ -3309,6 +3357,13 @@ def _reject_pending_approvals(slot: _ChatSlot) -> None:
     """
     for aid, fut in list(slot._approval_futures.items()):
         if not fut.done():
+            # Mark BEFORE resolving. Resolving can wake the runner immediately,
+            # and the runner reads this set where it records who decided; marking
+            # after would race its own reader. The provenance is already known
+            # here -- the SEL line below calls it ``rejected_on_stop`` -- and the
+            # resolved value stays a plain "rejected" so no caller of this future
+            # has to learn a new one.
+            slot._approval_stopped.add(aid)
             fut.set_result("rejected")
             if _mark_permission_resolved(slot.messages, aid, "rejected"):
                 slot._dirty = True
@@ -3406,7 +3461,119 @@ def _resettle_restricted_key(state: DashboardState, name: str) -> None:
         state._restricted_keys.discard(key)
 
 
-async def _persist_handover_tail(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
+class _HandoverDrainResult(NamedTuple):
+    """What a hand-over drain did with the state it is the last reader of.
+
+    ``rows_committed`` answers for the transcript rows: True when nothing was
+    owed or the write committed, False when rows were owed and did not reach
+    disk. ``prompts_lost`` counts the durable-eligible queued prompts whose only
+    copy dies with the popped slot — zero when none were owed or when the
+    durable line holds them, whichever writer put them there.
+
+    A NamedTuple is always truthy, so a bare ``if not result:`` silently passes
+    over a failed drain. Read ``rows_committed``; never test the result itself.
+    """
+
+    rows_committed: bool
+    prompts_lost: int
+
+
+async def _owed_prompts_lost_on_line(
+    state: DashboardState, name: str, slot: _ChatSlot, history_key: str
+) -> int:
+    """Count owed queued prompts with no durable future on the shared line.
+
+    The per-slot persistence signature answers "did THIS slot's last commit
+    carry the queue"; it cannot see a replacement's own full save rebuilding
+    the shared line and clearing ``queued_prompts`` (an owned field, so an
+    emptied queue is cleared by absence — and ``POST /api/chat/slots`` persists
+    at birth, inside the very window a hand-over spans). Nor is a point-in-time
+    read of the line enough on its own: a line still showing the ORIGINAL's
+    entries is one full save away from losing them whenever a live
+    transcript-sharing holder exists, because that holder's save rebuilds the
+    whole ``queued_prompts`` value from its own queue. So survival demands a
+    stable owner, not a lucky read:
+
+    * a live holder shares this transcript — an owed entry survives only when
+      that holder's own durable queue carries it (a rehydrated holder restores
+      the entries as queue cards and re-persists them; a fresh recreate does
+      not), because the holder's next save decides the line;
+    * no live sharing holder — the line is at rest, so an entry it holds stays
+      until an ordinary restore hands it back.
+
+    A line that cannot be read cannot prove survival, so every owed entry
+    counts as lost: over-reporting is recoverable by the reader, while silence
+    over a real loss is the failure this count exists to end.
+
+    The store read is synchronous file I/O, so it goes through
+    ``drained_to_thread`` rather than running on the gateway event loop —
+    the same seam every other blocking read this module performs takes.
+    """
+    owed = slot.durable_queue_entries()
+    if not owed:
+        return 0
+    holder = state._slots.get(name)
+    if holder is not None and _replacement_shares_transcript(state, name, slot):
+        surviving = {entry.get("id") for entry in holder.durable_queue_entries()}
+        return sum(1 for entry in owed if entry.get("id") not in surviving)
+    log = state.conversation_log
+    if log is None:
+        return len(owed)
+    persisted, readable = await drained_to_thread(log.get_metadata_status, history_key)
+    if not readable:
+        return len(owed)
+    on_line = persisted.get("queued_prompts")
+    if not isinstance(on_line, list):
+        return len(owed)
+    line_ids = {entry.get("id") for entry in on_line if isinstance(entry, dict)}
+    return sum(1 for entry in owed if entry.get("id") not in line_ids)
+
+
+def _report_lost_queued_prompts(
+    state: DashboardState, name: str, count: int, history_key: str
+) -> None:
+    """Log and post the user-visible notice that a hand-over lost queued prompts.
+
+    The gateway log alone is not reachable by the person whose words were
+    dropped; the notification feed is, so the loss is told in both. The body
+    carries the COUNT and the slot, never the prompt text: the entries may
+    belong to a restricted session, and a notice about losing words must not
+    be the thing that leaks them.
+
+    Failure to deliver must not fail the drain — the hand-over has to complete
+    for the replacement holding the key either way — so this swallows and logs,
+    the same posture every other lifecycle notice takes.
+    """
+    logger.warning(
+        "Slot %s: %d queued prompt(s) were not carried by the hand-over write to "
+        "%s; they are lost with the original slot",
+        name,
+        count,
+        history_key,
+    )
+    try:
+        state.notify(
+            "agent",
+            "Queued prompts lost in a tab hand-over",
+            (
+                f"{count} queued prompt(s) on tab {name!r} could not be carried "
+                f"to {history_key} when the tab was replaced mid-close; they are "
+                "not recoverable."
+            ),
+            meta={"slot": name, "count": count, "history_key": history_key},
+        )
+    except Exception:
+        logger.error(
+            "Slot %s: the lost-queued-prompts notification failed to deliver; "
+            "the gateway log is the only remaining report of the loss",
+            name,
+            exc_info=True,
+        )
+
+
+async def _persist_handover_tail(
+    state: DashboardState, name: str, slot: _ChatSlot
+) -> _HandoverDrainResult:
     """Write a handed-over original's still-unsaved rows before its object is dropped.
 
     A teardown that yields ``name`` to a concurrent same-key recreate stops
@@ -3463,11 +3630,27 @@ async def _persist_handover_tail(state: DashboardState, name: str, slot: _ChatSl
     flush, and this frame is past the pop, so no flush will ever visit this slot
     again.
 
-    Returns True when nothing was owed or the write committed, False when rows were
-    owed and did not reach disk. Callers MUST honour it: nothing in the process can
-    reach these rows again, so a caller that discards the answer reports a close
-    that succeeded while the rows became unreachable. The log line names the exact
+    Returns a :class:`_HandoverDrainResult`. ``rows_committed`` is True when
+    nothing was owed or the write committed, False when rows were owed and did
+    not reach disk. Callers MUST honour it: nothing in the process can reach
+    these rows again, so a caller that discards the answer reports a close that
+    succeeded while the rows became unreachable. The log line names the exact
     count for the same reason.
+
+    ``prompts_lost`` is the other half of the answer. A committed write can
+    still defer the queue (the metadata line belongs to the replacement holding
+    this key), a failed one leaves the line as it was, and a replacement's own
+    full save can rebuild the shared line without the original's entries at any
+    moment it remains alive — so survival is judged by who writes the line
+    next (see :func:`_owed_prompts_lost_on_line`), not by this slot's
+    persistence signature, which only answers for this slot's own last commit.
+    An owed entry with no durable future dies with the popped object; the count
+    comes back where a caller can surface or tally it, and the drain posts a
+    dashboard notification alongside the warning log — the log is not reachable
+    by the person whose words were dropped. Carrying the prompts instead would
+    mean making ``queued_prompts`` a merge field on the rows-only path, which is
+    a change to what a durable metadata line MEANS for a key two slots share;
+    the write stays as it is, and the loss is reported rather than silent.
     """
     try:
         slot.flush_deferred_notes()
@@ -3491,9 +3674,21 @@ async def _persist_handover_tail(state: DashboardState, name: str, slot: _ChatSl
     # covers the other shape of unsaved state: an in-place edit to a row already
     # persisted leaves the length unchanged.
     unsaved = max(0, len(slot.messages) - slot._disk_window_len)
-    if not unsaved and not slot._dirty:
-        return True
+    # A queued prompt is unsaved state that changes NEITHER of those: its row is
+    # written by the drain, so the window length is unchanged, and an enqueue does
+    # not dirty the slot. Reporting a clean hand-over over that state would send
+    # the prompt's only copy away with the discarded object, unremarked.
     history_key = slot_history_key(slot)
+    if not unsaved and not slot._dirty and not slot.queue_persist_pending:
+        # No write is needed, but "this slot committed its queue" is not the
+        # same fact as "the entries have a durable future": a same-key recreate
+        # persists at birth, and its full save rebuilds the shared line and
+        # clears ``queued_prompts`` by absence. Survival is decided by whoever
+        # writes the line next, so that is what gets checked.
+        lost = await _owed_prompts_lost_on_line(state, name, slot, history_key)
+        if lost:
+            _report_lost_queued_prompts(state, name, lost, history_key)
+        return _HandoverDrainResult(rows_committed=True, prompts_lost=lost)
     try:
         committed = await save_slot_off_loop(
             state,
@@ -3512,7 +3707,14 @@ async def _persist_handover_tail(state: DashboardState, name: str, slot: _ChatSl
             history_key,
             exc_info=True,
         )
-        return False
+        # A failed write leaves the line as it was; whether an owed entry still
+        # has a durable future is decided by who writes that line next, not by
+        # this slot's own persistence signature, which cannot see a
+        # replacement's rebuild clearing the shared key's queue.
+        lost = await _owed_prompts_lost_on_line(state, name, slot, history_key)
+        if lost:
+            _report_lost_queued_prompts(state, name, lost, history_key)
+        return _HandoverDrainResult(rows_committed=False, prompts_lost=lost)
     if not committed:
         # The save declined without writing: the session was permanently deleted
         # while this write awaited the lock, or the slot's routing moved off the
@@ -3525,8 +3727,32 @@ async def _persist_handover_tail(state: DashboardState, name: str, slot: _ChatSl
             unsaved,
             history_key,
         )
-        return False
-    return True
+        lost = await _owed_prompts_lost_on_line(state, name, slot, history_key)
+        if lost:
+            _report_lost_queued_prompts(state, name, lost, history_key)
+        return _HandoverDrainResult(rows_committed=False, prompts_lost=lost)
+    # The write committed, and it can still leave owed entries with no durable
+    # future: a rows-only save over a line another live slot published defers
+    # every slot-owned field, ``queued_prompts`` among them
+    # (``queue_line_is_ours`` keeps them owed rather than falsely credited),
+    # and a live sharing replacement rebuilds the line on its every full save.
+    # Survival is decided by who writes the line next — an entry a rehydrated
+    # replacement carries in its own queue lives on as a queue card and is not
+    # lost. Nothing in this process will visit this slot again, so a loss is
+    # said with the count — the same obligation the held-note arm above
+    # carries, and for the same reason: these are the user's own words and this
+    # frame is their last reader.
+    #
+    # Carrying them instead would mean making ``queued_prompts`` a merge
+    # field on the rows-only path, which is a change to what a durable
+    # metadata line MEANS for a key two slots share, not a loop-side
+    # ordering fix. The write stays rows-only; the remedy is the report, in
+    # every register that can still carry it — the warning log, the
+    # notification, and the count in the returned result.
+    lost = await _owed_prompts_lost_on_line(state, name, slot, history_key)
+    if lost:
+        _report_lost_queued_prompts(state, name, lost, history_key)
+    return _HandoverDrainResult(rows_committed=True, prompts_lost=lost)
 
 
 def _unblock_pending_waits(state: DashboardState, slot: _ChatSlot) -> None:
@@ -4290,6 +4516,8 @@ async def stop_slot_turn(
             # kill discards the text, so there is no requeued entry left to carry
             # the client's send id onto.
             slot._steer_send_ids.pop(_discarded, None)
+            slot._steer_user_origin.pop(_discarded, None)
+            slot._steer_admissions.pop(_discarded, None)
         slot._pending_steers.clear()
         state.push_slots_update()
         logger.info("Stop (force): hard-killing session for slot %s", name)
@@ -5466,6 +5694,39 @@ class SlotCloseError(Exception):
         self.status = status
 
 
+def _release_closed_execution(
+    state: DashboardState, slot: "_ChatSlot", session_key: str, execution
+) -> None:
+    """Release restricted identity after its last consumer and provider stop."""
+    from kiro_crew.execution_context import clear_session_execution
+
+    if execution is not None and execution.memory_mode != "persistent":
+        # A queued-prompt executor may start after the live carrier is released.
+        # Keep the retired slot restricted so that late flush still cannot write.
+        slot.memory_mode = execution.with_mode(slot.memory_mode).memory_mode
+        closing_tasks = tuple(
+            task
+            for task in (slot.task, getattr(slot, "_eager_spawn_task", None))
+            if isinstance(task, asyncio.Task)
+        )
+
+        def release_closed_execution(_finished=None) -> None:
+            if any(not task.done() for task in closing_tasks):
+                return
+            if any(effective_session_key(live) == session_key for live in state._slots.values()):
+                return
+            if state.sessions.get_provider(session_key) is not None:
+                return
+            clear_session_execution(session_key, expected=execution)
+
+        # Late cancellation completion retains the old identity until the final
+        # consumer stops. CAS prevents this close from erasing a newer choice.
+        for task in closing_tasks:
+            if not task.done():
+                task.add_done_callback(release_closed_execution)
+        release_closed_execution()
+
+
 async def close_slot(
     state: DashboardState,
     slot: "_ChatSlot",
@@ -5537,6 +5798,10 @@ async def _close_slot(
     # close observed the already-terminal record, leaving an active orphan.
     slot.begin_close()
     closed_at = note_slot_closed(state, name)
+    from kiro_crew.execution_context import read_live_session_execution
+
+    closing_key = effective_session_key(slot)
+    closing_execution = read_live_session_execution(closing_key)
     # Retire the auto-nudge loop BEFORE the awaits below, so no nudge can expire
     # into the session being closed and resurrect it. See
     # _retire_slot_nudge_loop for why disarming alone does not hold.
@@ -5740,7 +6005,7 @@ async def _close_slot(
                 name,
                 slot._app,
             )
-        if not drained:
+        if not drained.rows_committed:
             # The drain was this frame's last chance at those rows, so a close that
             # reported success here would be reporting durability it does not have —
             # and unlike the arm below there is nothing to roll back and nothing that
@@ -5848,6 +6113,7 @@ async def _close_slot(
     # it if the key is no longer ours.
     if _slot_still_ours(state, name, slot):
         await state.sessions.remove(_history_key_for(name))
+    _release_closed_execution(state, slot, closing_key, closing_execution)
     _sync_dashboard_slots(state)
     state.push_slots_update()
     state.push_refresh("history")
@@ -6024,7 +6290,16 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
     archived: list[str] = []
     failed: list[str] = []
     _tasks_to_cancel: list[asyncio.Task] = []
+    from kiro_crew.execution_context import read_live_session_execution
+
     for name in stale_keys:
+        candidate = state._slots.get(name)
+        if candidate is None:
+            continue
+        closing_key = effective_session_key(candidate)
+        closing_execution = read_live_session_execution(closing_key)
+        if state._slots.get(name) is not candidate:
+            continue
         removed = state._slots.pop(name, None)
         if not removed:
             continue
@@ -6073,7 +6348,7 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             # out: this exit skips the discard below the save, which is the only
             # thing that would otherwise have cleared the original's.
             _resettle_restricted_key(state, name)
-            if not drained:
+            if not drained.rows_committed:
                 # This frame was the last reference to those rows, so a pass that
                 # said nothing here would report a clean sweep over a slot whose
                 # tail it dropped. ``failed`` is the honest column: the key is not
@@ -6169,6 +6444,8 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             await state.sessions.remove(_history_key_for(name))
         except Exception:
             logger.warning("Cleanup: session remove failed for %s", name, exc_info=True)
+        else:
+            _release_closed_execution(state, removed, closing_key, closing_execution)
         archived.append(name)
         # Collect running tasks for concurrent cancellation after the loop
         if removed.running and removed.task is not None:
@@ -6288,7 +6565,7 @@ async def _apply_remote_pick_locked(
         # agent is, so it goes in the same write — persisting one without the
         # other would restore the pair inconsistent after a restart.
         persisted["workspace"] = slot.workspace
-    if state.conversation_log:
+    if state.conversation_log and not slot.is_restricted:
         try:
             # update_metadata takes a flock and closes fds — blocking-on-loop
             # prohibited, so it goes to a worker thread (same reasoning as the
@@ -6319,11 +6596,45 @@ async def _apply_remote_pick_locked(
 
 
 async def _record_explicit_agent_selection(
-    session_key: str, agent_name: str | None, bindings: ResolvedBindings
+    session_key: str,
+    agent_name: str | None,
+    bindings: ResolvedBindings,
+    *,
+    config: KiroCrewConfig,
+    memory_mode: str = "persistent",
+    app: str = "",
 ) -> SelectionChange | None:
-    """Drain an authorized selection and its rollback before honoring cancellation."""
+    """Capture the admitted choice and drain publication before cancellation."""
+    from kiro_crew.execution_context import (
+        ExecutionContext,
+        MemoryStoreRef,
+        resolve_member_execution,
+    )
+
+    selected = agent_name or bindings.resolved_alias
+    if bindings.selection_kind == "member":
+        bindings.execution_context = resolve_member_execution(
+            config, selected, memory_mode=memory_mode, app=app, validate_memory_files=False
+        )
+    else:
+        bindings.execution_context = ExecutionContext(
+            None,
+            MemoryStoreRef(bindings.memory_store_name or "default"),
+            "template",
+            bindings.kiro_agent,
+            memory_mode,
+            app=app,
+            selection_name=selected,
+        )
     writer = asyncio.create_task(
-        asyncio.to_thread(record_agent_selection, session_key, agent_name, bindings, replace=True)
+        asyncio.to_thread(
+            record_agent_selection,
+            session_key,
+            agent_name,
+            bindings,
+            replace=True,
+            memory_mode=memory_mode,
+        )
     )
     cancelled: asyncio.CancelledError | None = None
     while True:
@@ -6539,7 +6850,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         owner_request = is_owner_dashboard_request(request)
         if not owner_request:
             # Permitted chat users keep template and legacy V1 choices, but
-            # cannot authorize private-memory admission. Refuse a V2 choice
+            # cannot change a member assignment through aggregate controls. Refuse a V2 choice
             # before any slot, provider or history mutation.
             try:
                 choice_cfg = await asyncio.to_thread(KiroCrewConfig.load)
@@ -6547,7 +6858,11 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     slot.project or None, operation="api_chat_slot_agent", source="dashboard"
                 )
                 choice = await asyncio.to_thread(
-                    resolve_agent_bindings, choice_cfg, agent_name, slot.project or None
+                    resolve_agent_bindings,
+                    choice_cfg,
+                    agent_name,
+                    slot.project or None,
+                    validate_memory_files=False,
                 )
             except Exception as exc:
                 from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
@@ -6559,27 +6874,27 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 if denied is not None:
                     return denied
         if agent_name != slot.agent:
-            from kiro_crew.member_memory_auth import read_private_session_store
+            from kiro_crew.execution_context import read_session_execution
 
             try:
-                private_store = await asyncio.to_thread(read_private_session_store, session_key)
+                prior_execution = await asyncio.to_thread(read_session_execution, session_key)
             except (OSError, ValueError):
                 return web.json_response(
                     {
                         "error": "This conversation's memory binding could not be read. "
                         "Start a new conversation to choose a different member.",
-                        "code": "private_memory_binding_unavailable",
+                        "code": "member_binding_unavailable",
                     },
                     status=503,
                 )
-            if private_store is not None:
-                # Resetting the provider keeps this key's permanent ownership.
+            if prior_execution is not None and prior_execution.member_id is not None:
+                # Resetting the provider keeps this conversation's member identity.
                 # Refuse before changing the agent, its derived fields or history.
                 return web.json_response(
                     {
                         "error": "This conversation belongs to its original member. "
                         "Start a new conversation to choose a different member.",
-                        "code": "private_memory_session_pinned",
+                        "code": "member_session_pinned",
                     },
                     status=409,
                 )
@@ -6704,7 +7019,11 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             )
             if owner_request:
                 bindings = await asyncio.to_thread(
-                    resolve_agent_bindings, cfg, agent_name, pre_await_project or None
+                    resolve_agent_bindings,
+                    cfg,
+                    agent_name,
+                    pre_await_project or None,
+                    validate_memory_files=False,
                 )
             else:
                 bindings = await asyncio.to_thread(
@@ -6713,6 +7032,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     agent_name,
                     pre_await_project or None,
                     selection_kind=choice.selection_kind,
+                    validate_memory_files=False,
                 )
                 selected_store = cfg.memory_stores.get(bindings.memory_store_name)
                 if selected_store is not None and selected_store.memory_version == 2:
@@ -7053,7 +7373,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # the slot's TRANSCRIPT (the .jsonl the restart scan reads), not the
         # live session the reset above addressed — the same history-vs-session
         # split ``_cancel_target`` documents.
-        conversation_log = state.conversation_log
+        conversation_log = state.conversation_log if not slot.is_restricted else None
         if conversation_log:
 
             async def _rollback_history_selection() -> None:
@@ -7110,7 +7430,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             # truthful current one. The metadata is transcript-scoped and
             # binding-independent, so its restore needs no further re-check.
             _rollback_switch()
-            if state.conversation_log:
+            if state.conversation_log and not slot.is_restricted:
                 try:
                     await drained_to_thread(
                         state.conversation_log.update_metadata,
@@ -7139,7 +7459,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 finally:
                     # The protected drain may re-raise cancellation. History
                     # must still settle before the slot/session locks release.
-                    if state.conversation_log:
+                    if state.conversation_log and not slot.is_restricted:
                         await drained_to_thread(
                             state.conversation_log.update_metadata,
                             _history_key_for(name),
@@ -7147,8 +7467,48 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                         )
 
             try:
+                # Validate the old conversation BEFORE publishing its new
+                # canonical identity; otherwise that publication would conceal
+                # template history from the member-selection guard.
+                selected_memory = cfg.memory_stores.get(bindings.memory_store_name)
+                from kiro_crew.execution_context import read_session_execution
+
+                initial_execution = await asyncio.to_thread(read_session_execution, session_key)
+                changed_member = (
+                    initial_execution is None
+                    or initial_execution.member_id
+                    != getattr(selected_memory, "owner_member_id", None)
+                )
+                if (
+                    selected_memory is not None
+                    and selected_memory.memory_version == 2
+                    and changed_member
+                ):
+                    if slot.messages:
+                        raise ValueError("Open a new conversation to choose member memory.")
+                    await release_prewarmed_session(state, session_key, agent_name, cfg)
+                    await pin_private_agent_store(
+                        state,
+                        session_key,
+                        agent_name,
+                        cfg,
+                        memory_mode=slot.memory_mode,
+                        validate_only=True,
+                    )
+                    if (
+                        state._slots.get(slot.key) is not slot
+                        or slot.agent is not committed_agent
+                        or effective_session_key(slot) != session_key
+                        or slot.messages
+                    ):
+                        raise ValueError("The conversation changed during member selection.")
                 selection_change = await _record_explicit_agent_selection(
-                    session_key, agent_name, bindings
+                    session_key,
+                    agent_name,
+                    bindings,
+                    config=cfg,
+                    memory_mode=slot.memory_mode,
+                    app=slot._app or "",
                 )
             except asyncio.CancelledError:
                 await _rollback_owner_selection()
@@ -7172,8 +7532,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     },
                     status=409,
                 )
-            # A non-owner choice cannot authorize a later private-memory
-            # migration either; a protected private assignment must exist.
+            # A non-owner choice preserves the recorded session assignment.
             slot._memory_assignment_from_history = not owner_request
 
         owner_pick = (
@@ -7189,7 +7548,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # linked_session_key without the slot lock, and they carry native
         # context the pin helper refuses. With this gate, pin_key is the slot's
         # own transcript key, which nothing rebinds. The helper verifies the
-        # transcript is empty before issuing a private grant; V1 picks pass
+        # transcript is empty before capturing member context; V1 picks pass
         # through without a grant.
         if (
             owner_pick
@@ -7218,8 +7577,29 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     # Off the loop: the create path loads it the same way, and
                     # the in-handler load above is not guaranteed to have run.
                     pin_cfg = await asyncio.to_thread(KiroCrewConfig.load)
+                    # The reset above tore this slot's session down but kept its
+                    # resume pointer, and a new chat is pre-warmed while it is
+                    # still on the default agent. Drop that pointer for a
+                    # private pick, or the pin reads it as V1 context and
+                    # refuses a chat with no messages in it. Re-checked after
+                    # the awaits below for the same reason the pin is.
+                    await release_prewarmed_session(state, pin_key, agent_name, pin_cfg)
+                    if (
+                        state._slots.get(slot.key) is not slot
+                        or slot.agent is not committed_agent
+                        or effective_session_key(slot) != pin_key
+                        or slot.messages
+                    ):
+                        await _unwind_pin_failure()
+                        return web.json_response(
+                            {
+                                "error": "slot changed during member assignment",
+                                "code": "session_rebound",
+                            },
+                            status=409,
+                        )
                     assigned_store = await pin_private_agent_store(
-                        state, pin_key, agent_name, pin_cfg
+                        state, pin_key, agent_name, pin_cfg, memory_mode=slot.memory_mode
                     )
                 except Exception as exc:
                     from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
@@ -10206,7 +10586,7 @@ def _hydrate_slot_from_history(
     slot._disk_meta_created_at = str(meta.get("created_at") or "") if disk_meta_observed else ""
     slot._disk_meta_observed = disk_meta_observed and bool(meta)
     # This slot's memory assignment comes from restored history, not a fresh
-    # private assignment -- true for every hydration-from-a-persisted-transcript
+    # member selection -- true for every hydration-from-a-persisted-transcript
     # path (resume, the persistence loaders, channel/member/cron restores) and
     # equally for an import, which materialises from a bundle transcript. The
     # runner reads it when selecting the memory binding; the flag is not

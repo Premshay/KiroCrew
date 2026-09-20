@@ -84,8 +84,6 @@ def test_rewrite_agents_signature_is_pinned_to_fingerprint_inputs() -> None:
 #   * STALE only          -> the read is gone; prune the entry.
 _AMBIENT_READ_ALLOWLIST = frozenset(
     {
-        # Baked into every overlay ``command``; fingerprinted as "python".
-        ("_build_stub_entry", "sys.executable"),
         # The fingerprint builder reading its own declared inputs.
         ("_rewrite_inputs_fingerprint", "os.environ:PATH"),
         ("_rewrite_inputs_fingerprint", "os.environ:PATHEXT"),
@@ -628,6 +626,20 @@ def test_pre_casing_schema_forces_regeneration(
     assert rewrite_counter["n"] == before + 2
 
 
+def test_pre_cmd_safe_schema_forces_regeneration(
+    tmp_path: Path, rewrite_counter: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Schema 6 overlays can carry a spaced interpreter command that cmd.exe
+    quote-stripping destroys; an upgrade must rebuild them, not serve them."""
+    _mk_tree(tmp_path)
+    with monkeypatch.context() as patch:
+        patch.setattr(rewriter, "_FINGERPRINT_SCHEMA", 6)
+        _rewrite(tmp_path)
+    before = rewrite_counter["n"]
+    _rewrite(tmp_path)
+    assert rewrite_counter["n"] == before + 2
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows executable casing")
 @pytest.mark.parametrize("transient_settings_fault", [False, True])
 @pytest.mark.parametrize("rename_command", [False, True])
@@ -673,6 +685,27 @@ def test_windows_casing_is_revalidated_on_cached_and_kept_overlays(
     written = json.loads(overlay.read_text(encoding="utf-8"))
     flags = expand_stub_flags(written["mcpServers"]["srv"]["args"])
     assert flags[flags.index("--target-command") + 1] == str(expected)
+
+
+def test_effective_user_site_policy_change_invalidates(
+    tmp_path: Path,
+    rewrite_counter: dict[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mk_tree(tmp_path, n_agents=1, with_env=False)
+    monkeypatch.setattr(rewriter.platform_compat, "is_bundled_interpreter", lambda: False)
+    monkeypatch.setattr(rewriter.platform_compat.site, "ENABLE_USER_SITE", True)
+    _rewrite(tmp_path)
+    overlay = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
+    first_args = json.loads(overlay.read_text())["mcpServers"]["srv"]["args"]
+    assert first_args[:2] == ["-m", rewriter._STUB_MODULE]
+
+    before = rewrite_counter["n"]
+    monkeypatch.setattr(rewriter.platform_compat.site, "ENABLE_USER_SITE", False)
+    _rewrite(tmp_path)
+    assert rewrite_counter["n"] == before + 1, "a user-site policy change must not serve cache"
+    second_args = json.loads(overlay.read_text())["mcpServers"]["srv"]["args"]
+    assert second_args[:3] == ["-s", "-m", rewriter._STUB_MODULE]
 
 
 def test_path_env_change_invalidates(

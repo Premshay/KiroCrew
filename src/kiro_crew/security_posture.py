@@ -1003,6 +1003,24 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "reaches this renderer already through the driver's rolling redactor.",
     ),
     (
+        "Feishu answer body",
+        "feishu/renderer.py",
+        "The answer body Feishu renders as markdown. `text()` is what `on_done` "
+        "sends, and Feishu is a buffered zero-widget channel: its body reaches "
+        "`render_options_as_text` -> `apply_options_cap`, which display-redacts the "
+        "numbered OPTIONS choices but returns the body itself unscrubbed, so the "
+        "only pass the body had was the driver's channel-neutral LITERAL stream "
+        "scan. A credential split by emphasis (`AKIA**REST`) or a link therefore "
+        "survives that scan and is reassembled when Feishu renders the markdown. "
+        "The body is screened at the send boundary through `Renderer.redact_for_"
+        "target` -- the `redact_for_display` pass over the credential + "
+        "exfiltration-URL chain, on the display form that actually ships. `text()` "
+        "is where the scrub lands because `text()` is what `on_done` sends; history "
+        "is persisted separately by `messaging.dispatch` from the driver's own "
+        "accumulated text, so this pass covers the shipped bytes without touching "
+        "the transcript.",
+    ),
+    (
         "Slack attachment titles and filenames",
         "slack/files.py",
         "The two upload sinks that are NOT the message body: an attachment's "
@@ -1409,6 +1427,17 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # consent card and the tool's own error string are the surfaces that
         # show a refusal, and those are owned by their registered sinks.
         "file_delivery_consent.py",
+        # Detector, not redactor: the decision seam runs redact_credentials
+        # AND redact_exfiltration_urls over the state it is about to send to a
+        # third-party judge, then DISCARDS both cleaned strings and refuses the
+        # whole call on any warning. So the module sits on an egress path but
+        # never emits redacted bytes -- a hit means nothing is sent at all, and
+        # the row records which scanner refused. Registering it as a redaction
+        # sink would make the panel claim this path is covered BY redaction,
+        # when what covers it is refusal; a partially redacted payload is still
+        # derived from a credential, and a judge's answer over redacted state
+        # would be logged as if it had judged the real thing.
+        "decisions/gate.py",
         # Capture-side, not egress: the opt-in frame recorder scrubs a raw ACP
         # frame as it WRITES it to a local file, so a credential never lands in
         # a recording the operator may later commit to the replay corpus. There
@@ -1666,6 +1695,10 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "knowledge/ingestion.py",
         "workflows/library.py",
         "mcp_core.py",
+        # Same class as mcp_core.py: this stdio server redacts every rendered tool
+        # result -- a crew log page, a fold, a refusal -- before returning it, but
+        # the egress boundary is the transport the result crosses, not this module.
+        "mcp_crew_log.py",
         "mcp_cron.py",
         # Same class as mcp_core.py: an MCP stdio server redacts tool RESULTS and
         # agent-authored names before they are persisted or returned, but the
@@ -2082,6 +2115,7 @@ def _suspicious_pattern_items() -> list[PostureItem]:
 #: names, so an omission fails there rather than quietly shrinking the report.
 _SCHEMA_REGISTRY_NAMES: tuple[str, ...] = (
     "MCP_CORE_SCHEMAS",
+    "MCP_CREW_LOG_SCHEMAS",
     "MCP_CRON_SCHEMAS",
     "MCP_COMPUTER_SCHEMAS",
     "MCP_DASHBOARD_SCHEMAS",

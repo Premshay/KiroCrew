@@ -49,7 +49,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from kiro_crew.crew_log.errors import CODE_BAD_DATA_FIELD, LedgerError
+from kiro_crew.crew_log.errors import CODE_BAD_DATA_FIELD, CrewLogError
 from kiro_crew.crew_log.schema import KIND_SESSION
 
 #: JSON types a declared field may hold. ``int`` and ``float`` are separate
@@ -162,7 +162,24 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
                 "model",
                 JSON_STRING,
                 required=True,
-                note="Configured model; empty when the backend serves its own default.",
+                note=(
+                    "Model the backend confirmed is serving this session; empty when "
+                    "that id is not known, which covers both the backend's own default "
+                    "and a configured model that was never applied."
+                ),
+            ),
+            Field(
+                "model_requested",
+                JSON_STRING,
+                note=(
+                    "Model the gateway SELECTED for the allocation that produced this "
+                    "session, before the provider decides whether to send it -- a model "
+                    "this account cannot run is withheld rather than requested. Absent "
+                    "when no tier resolved one, and also when this gateway process did "
+                    "not observe the allocation, as on a re-attach. A difference from "
+                    "model is not by itself a refusal: the backend serves the spelling "
+                    "it resolved."
+                ),
             ),
             Field("cwd", JSON_STRING, required=True, note="Working directory; may be empty."),
             Field("owner", JSON_STRING, required=True, note="Owner."),
@@ -590,8 +607,8 @@ def declaration_for(kind: str, entry_type: str) -> EntryType | None:
 # --------------------------------------------------------------------------- #
 
 
-def _refuse(path: str, message: str) -> LedgerError:
-    return LedgerError(f"{path}: {message}", code=CODE_BAD_DATA_FIELD, field=path)
+def _refuse(path: str, message: str) -> CrewLogError:
+    return CrewLogError(f"{path}: {message}", code=CODE_BAD_DATA_FIELD, field=path)
 
 
 def _type_ok(value: Any, json_type: str) -> bool:
@@ -655,7 +672,7 @@ def validate_data(kind: str, entry_type: str, data: Any) -> None:
     falls outside a CLOSED enum. Returns silently for a type with no declaration,
     which is every crew type and every guest namespace.
 
-    A refusal is a :class:`~kiro_crew.crew_log.errors.LedgerError`, so the
+    A refusal is a :class:`~kiro_crew.crew_log.errors.CrewLogError`, so the
     write-behind emitter already treats it the way it treats an oversize entry: a
     permanent refusal, reported and counted in ``dropped_writes()``, never raised
     into the gateway and never retried against a verdict that cannot change.
