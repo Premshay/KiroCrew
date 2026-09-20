@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew.config import KiroCrewConfig
+from kiro_crew.config.loader import build_provider_factory
 from kiro_crew.hooks import (
     TOOL_DENY,
     HookManager,
@@ -1179,7 +1180,7 @@ class SessionAgentRunner:
         self._total_cost_usd = 0.0
         self._stop_check = stop_check
         self._on_activity = on_activity if callable(on_activity) else None
-        # The Kiro Crew provider factory (``cfg.create_provider_factory()``). Injectable for
+        # The platform provider factory (``build_provider_factory(cfg)``). Injectable for
         # tests; resolved lazily from config when None so importing this module never loads
         # the whole config/provider stack.
         self._provider_factory = provider_factory
@@ -1196,7 +1197,7 @@ class SessionAgentRunner:
         try:
 
             cfg = KiroCrewConfig.load()
-            return cfg.create_provider_factory() is not None
+            return build_provider_factory(cfg) is not None
         except Exception:  # noqa: BLE001 — any failure → not available, caller falls back
             # Do NOT discard this. ``create_provider_factory`` has a single method-level
             # return and cannot yield None, so False is reachable ONLY from this handler —
@@ -1222,13 +1223,10 @@ class SessionAgentRunner:
         ``spawn_sub_agents``). That fallback is exactly what made the discovery
         agent spawn subagents that orphan and hang the run.
 
-        The app bridge namespaces builtin agents (``app--name``) AND does not copy
-        a builtin's ``agents/`` into its install dir at all, so neither the bare
-        name nor the namespaced one is reliably present. Rather than depend on
-        that, write the app's own agent JSON straight to ``~/.kiro/agents/<name>.json``
-        under the exact bare name this runner requests. Idempotent, best-effort:
-        on failure the run still proceeds (with the default agent), so this
-        hardens the tool scoping without becoming a hard dependency.
+        Reuse an equivalent app-bridge spec by its declared name. When none is
+        installed, write the app's own JSON under the requested bare name.
+        Ambiguity or conflicting content returns False so the caller can refuse
+        the run without replacing the user's agent or widening its tool scope.
         """
 
         try:
@@ -1247,6 +1245,20 @@ class SessionAgentRunner:
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / f"{self.agent_name}.json"
             desired = src.read_bytes()
+            from kiro_crew.agent_discovery import spec_by_declared_name
+
+            registered = spec_by_declared_name(
+                dest_dir,
+                self.agent_name,
+                operation="auto_improvement.register_agent",
+                source=__name__,
+            )
+            if registered is not None and not dest.exists():
+                # The app bridge injects its MCP map into the namespaced copy.
+                # Reuse that copy without creating a second declared identity.
+                return {k: v for k, v in registered.items() if k != "mcpServers"} == {
+                    k: v for k, v in data.items() if k != "mcpServers"
+                }
             # Do NOT clobber a DIFFERENT existing file. `~/.kiro/agents/<name>.json` is the
             # user's own agent directory; overwriting a file they wrote — because it happens
             # to share this app's agent name — destroys their data. Write only when the file
@@ -1278,7 +1290,7 @@ class SessionAgentRunner:
             return self._provider_factory
 
         cfg = KiroCrewConfig.load()
-        self._provider_factory = cfg.create_provider_factory()
+        self._provider_factory = build_provider_factory(cfg)
         return self._provider_factory
 
     def _emit_activity(self, ev: dict) -> None:
