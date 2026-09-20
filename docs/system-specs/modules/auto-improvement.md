@@ -23,6 +23,16 @@ port replaced that review service, its CLI, its build tooling, and its cookie au
 with GitHub equivalents, and renamed the change-request vocabulary to pull request
 throughout.
 
+## Discovery targeting
+
+Without a diff scope or edit allowlist, discovery lists all Git-tracked product
+Python files, including flat and Django layouts. It uses the same value ordering,
+per-cycle rotation, complete focus-list rendering, and eight-read budget as scoped
+discovery. The priority slice guides reads; remaining files stay visible for later
+cycles. Caller hints search tracked Python files across the repository rather than
+assuming a `src/` directory. Diff scopes and edit allowlists retain precedence.
+A valid empty findings array remains a completed discovery result, without a retry.
+
 ## Routes
 
 `SessionAgentRunner` resolves availability and execution through

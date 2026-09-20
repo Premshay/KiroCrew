@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,8 +53,6 @@ class TestAllowlistedPyFiles:
         assert set(files) == {"src/app/engine.py", "src/app/sub/helper.py"}
 
     def test_no_globs_is_empty_not_the_whole_tree(self, repo: Path) -> None:
-        # A None/empty allowlist must NOT be read as "focus on everything" — the
-        # caller uses the empty return to mean "no focus, read the tree as before".
         assert AD.allowlisted_py_files(repo, []) == []
 
     def test_basename_glob_matches_nested_paths(self, repo: Path) -> None:
@@ -103,10 +102,11 @@ class TestUnscopedFocusActivation:
         self, repo: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         cap = self._run_capture(repo, monkeypatch, edit_globs=None)
-        # Falls back to the unscoped whole-tree prompt (no focus list, no
-        # allowlist-focus wording).
         assert "ONLY region a fix may land in" not in cap["prompt"]
         assert "reviewing a Python codebase" in cap["prompt"]
+        assert "src/app/engine.py" in cap["prompt"]
+        assert "src/other/unrelated.py" in cap["prompt"]
+        assert "UP TO 8" in cap["prompt"]
 
     def test_a_diff_scope_still_wins_over_the_allowlist_focus(
         self, repo: Path, monkeypatch: pytest.MonkeyPatch
@@ -122,3 +122,68 @@ class TestUnscopedFocusActivation:
         )
         assert "ONLY region a fix may land in" not in cap["prompt"]
         assert "This branch introduces/changes" in cap["prompt"]
+
+
+@pytest.mark.parametrize("prefix", ["", "epistemic/", "src/app/"])
+def test_unscoped_tracked_targets_rotate_without_hiding_files(tmp_path, prefix):
+    repo = tmp_path
+    _git("init", "-q", cwd=repo)
+
+    products = [f"{prefix}logic_{i:02}.py" for i in range(16)]
+    for rel in products + [f"{prefix}test_logic.py"]:
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("def f(): return 1\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    (repo / "untracked.py").write_text("pass\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+    (repo / "ignored.py").write_text("pass\n", encoding="utf-8")
+    calls = []
+
+    class Runner:
+        def run(self, prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            return SimpleNamespace(ok=True, text="[]", error="")
+
+    for rotate in (0, 12):
+        assert (
+            AD.discover_surfaces_via_agent(Runner(), clone=repo, edit_globs=[], rotate=rotate) == []
+        )
+    assert len(calls) == 2
+    first, second = [prompt for prompt, _ in calls]
+    for prompt, kwargs in calls:
+        assert "READ the code under src" not in prompt
+        assert "UP TO 8" in prompt
+        assert "ALSO TRACKED" in prompt
+        assert "ALSO CHANGED" not in prompt
+        assert "untracked.py" not in prompt
+        assert "ignored.py" not in prompt
+        assert f"{prefix}test_logic.py" not in prompt
+        assert all(f"  - {rel}" in prompt for rel in products)
+        assert kwargs["max_turns"] == 16
+        assert kwargs["timeout_s"] == 720.0
+    assert first.index(products[0]) < first.index(products[12])
+    assert second.index(products[12]) < second.index(products[0])
+
+
+def test_flat_repository_callers_are_listed(tmp_path):
+    (tmp_path / "logic.py").write_text("def f(): return 1\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text("from logic import f\n", encoding="utf-8")
+    (tmp_path / "test_logic.py").write_text("from logic import f\n", encoding="utf-8")
+    _git("init", "-q", cwd=tmp_path)
+    _git("add", "-A", cwd=tmp_path)
+    assert AD.dependents_of(tmp_path, ["logic.py"]) == {"logic.py": ["consumer.py"]}
+
+
+def test_explicit_scope_filters_unscoped_findings(repo):
+    class Runner:
+        def run(self, prompt, **kwargs):
+            return SimpleNamespace(
+                ok=True,
+                text='[{"file":"src/app/engine.py","line":1,"symbol":"f"},'
+                '{"file":"src/other/unrelated.py","line":1,"symbol":"h"}]',
+                error="",
+            )
+
+    findings = AD.discover_surfaces_via_agent(Runner(), clone=repo, scope={"src/app/engine.py"})
+    assert [finding["file"] for finding in findings] == ["src/app/engine.py"]
