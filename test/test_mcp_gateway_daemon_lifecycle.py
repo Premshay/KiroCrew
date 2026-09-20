@@ -345,12 +345,9 @@ async def test_a_real_daemon_exits_when_its_owner_dies(
         start_new_session=True,
     )
     try:
-        from kiro_crew.mcp_gateway import transport
+        from kiro_crew.mcp_gateway.manager import GatewayManager
 
-        deadline = asyncio.get_running_loop().time() + 60
-        while not await asyncio.to_thread(transport.endpoint_exists, sock):
-            assert asyncio.get_running_loop().time() < deadline, "daemon never bound"
-            await asyncio.sleep(0.05)
+        assert await GatewayManager._wait_for_socket(sock, 60), "daemon never listened"
         from kiro_crew.mcp_gateway.daemon_control import describe_daemon
 
         info = await asyncio.to_thread(describe_daemon, sock)

@@ -1620,14 +1620,15 @@ class GatewayManager:
     async def _wait_for_socket(path: Path, timeout: float) -> bool:
         """Poll until the endpoint is reachable, or the deadline passes.
 
-        Reachability rather than a directory entry: a Windows named pipe has no
-        filesystem presence, so ``transport.endpoint_exists`` probes it. The
-        Windows probe blocks briefly, so it runs off the loop.
+        A POSIX socket file appears at bind(), before listen() accepts connects.
+        Waiting for that file alone can send both startup pings into immediate
+        refusal and terminate a healthy daemon. Probe reachability off the loop
+        on both platforms before attempting the protocol handshake.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
-            if await asyncio.to_thread(transport.endpoint_exists, path):
+            if await asyncio.to_thread(transport.probe_live, path):
                 return True
             await asyncio.sleep(_SOCKET_POLL_INTERVAL_SECS)
-        return await asyncio.to_thread(transport.endpoint_exists, path)
+        return await asyncio.to_thread(transport.probe_live, path)
