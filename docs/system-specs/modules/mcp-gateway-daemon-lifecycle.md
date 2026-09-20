@@ -36,6 +36,12 @@ The fail-open branch is unchanged in kind and louder in degree: a stale daemon t
 
 ## Diagnosis
 
+Startup readiness requires a reachable endpoint before the ping/pong handshake.
+On POSIX, `bind()` creates the socket file before `listen()` accepts connections;
+file existence alone can exhaust both pings immediately and kill a daemon that
+is still starting. `GatewayManager._wait_for_socket` polls `transport.probe_live`
+off the event loop within its existing readiness deadline on both platforms.
+
 `dashboard/handlers/sessions.py::api_session_directive` recognises the pre-call-input body (`kind` present, `tool` absent) and refuses it as `stale_mcp_backend`, with a warning that names the cause (an MCP server running older code than the gateway) and the fix, instead of the generic `not_derivable` that pointed operators at the directive tools. `kirocrew doctor` (`cli_doctor._doctor_mcp_gateway_daemon`) prints the daemon's pid, owner and fingerprint beside this install's, and records an issue when they differ; the same read is `daemon_control.describe_daemon`.
 
 ## Overload is not death

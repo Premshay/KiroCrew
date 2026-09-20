@@ -314,6 +314,20 @@ async def test_probe_live_distinguishes_a_bound_endpoint(sock_dir: Path) -> None
         await server.wait_closed()
 
 
+@pytest.mark.skipif(pc.IS_WINDOWS, reason="AF_UNIX bind precedes listen")
+@pytest.mark.asyncio
+async def test_manager_readiness_waits_for_listen(sock_dir: Path) -> None:
+    from kiro_crew.mcp_gateway.manager import GatewayManager
+
+    endpoint = sock_dir / "starting.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(endpoint))
+        assert endpoint.exists()
+        assert not await GatewayManager._wait_for_socket(endpoint, timeout=0)
+        listener.listen(1)
+        assert await GatewayManager._wait_for_socket(endpoint, timeout=0)
+
+
 @pytest.mark.skipif(pc.IS_WINDOWS, reason="POSIX socket files")
 @pytest.mark.asyncio
 async def test_remove_stale_unlinks_a_dead_socket(sock_dir: Path) -> None:
