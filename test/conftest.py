@@ -1402,14 +1402,22 @@ def short_sock_dir(tmp_path):
     Yields a short-rooted dir instead, cleaned up afterwards. Falls back to
     ``tmp_path`` where no short root exists (notably Windows, where AF_UNIX tests
     are skipped anyway), so this never hard-fails on an unusual platform.
+
+    The root comes from ``tmpdir_helpers.short_tmp_base()`` -- the ONE seam the suite
+    has for "short enough for ``sun_path``" -- and not from a literal ``/tmp`` spelled
+    here. A second spelling of the same platform rule is what let the two drift: this
+    fixture kept creating ``/tmp/kcsock-XXXX`` directories that no run owned, while the
+    helper was the place the run-owned short root could be introduced once.
     """
     import tempfile
 
-    short_root = "/tmp" if os.path.isdir("/tmp") else None
-    if short_root is None:
+    from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
+
+    short_root = short_tmp_base()
+    if short_root is None or not os.path.isdir(short_root):
         yield tmp_path
         return
-    path = tempfile.mkdtemp(dir=short_root, prefix="kcsock-")
+    path = tempfile.mkdtemp(dir=short_root, prefix=SHORT_TMP_PREFIX + "unixsock-")
     try:
         yield pathlib.Path(path)
     finally:
@@ -1651,6 +1659,7 @@ _REAL_MCP_POST_MODULES = frozenset(
         "test_mcp_core",
         "test_mcp_core_coverage",
         "test_mcp_internal_caller",
+        "test_session_token_header_parity",
     }
 )
 

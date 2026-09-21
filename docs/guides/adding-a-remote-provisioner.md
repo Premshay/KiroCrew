@@ -90,7 +90,7 @@ A descriptor says which lanes exist and how to draw each one. It never says how 
 |---|---|---|
 | `preflight(profile, region)` | Fails the launch on any raise | Raise if the launch cannot possibly succeed. Run your own authorization here; a frontend form cannot skip a check by not drawing it |
 | `provision(tag, size_key, profile, region)` | Stored as `job.instance_id`, passed to `begin_signin` and `register` | Return the identity `register` accepts. **Also tag the resource with `tag`** — that is the only handle `teardown` gets. Validate your own `size_key` here |
-| `begin_signin(instance_id, profile, region)` | Reads `already_logged_in`, `url`, `code`, `ports`; calls `wait(cancel)` then `close()` | Return a handle — **do not raise for a sign-in that merely did not complete.** Set `already_logged_in` when there is nothing to do; leave `url` empty to skip without blocking |
+| `begin_signin(instance_id, profile, region, login_target=None)` | Reads `already_logged_in`, `error`, `url`, `code`, `ports`; calls `wait(cancel)` then `close()`; on a **cancelled** sign-in calls `abort()` first | Return a `SigninHandle` — **do not raise for a sign-in that merely did not complete.** Set `already_logged_in` when there is nothing to do; leave `url` empty to skip without blocking. `abort()` must answer whether the login on the box is confirmed stopped; see *The sign-in handle* below |
 | `register(instance_id, tag, profile, region)` | Nothing — it is the last step | **Raise loudly if the registry write fails.** `register_instance` is best-effort by contract and returns `None` on failure; swallowing that marks the launch done while the user pays for an invisible machine |
 | `teardown(tag, profile, region)` | `True` is reported to the user as removed | Return `True` only when the resource is **confirmed** gone. An accepted delete request that later fails is not a `True`. Note it receives `tag`, never `provision`'s return |
 
@@ -121,11 +121,11 @@ They are named for the built-in lane but are not owned by it. For `aws_ec2` they
 | Manual SSH instance (a developer's own EC2, a dev desktop) | No | `ssh` | `handlers_instances.py::api_instances_add` |
 | Manual SSM instance | No | `ssm` | Same handler, `connection_method="ssm"` in the body |
 | Built-in `aws_ec2` | Yes — CloudFormation deploy | `ssm` | `src/kiro_crew/cloud/launch_engine.py::RealLaunchEngine` |
-| Remote Instance on Fargate | Designed, not built | Would be unchanged | [rfc-remote-instance-on-fargate.md](../request-for-change/rfc-remote-instance-on-fargate.md) |
+| Remote Instance on Fargate | Yes — ECS task, offered only when `cloud.json` configures it | Nothing — `register` is a no-op, so a launch adds no instances entry | `src/kiro_crew/cloud/fargate_engine.py::FargateLaunchEngine`, designed in [rfc-remote-instance-on-fargate.md](../request-for-change/rfc-remote-instance-on-fargate.md) |
 
-The Fargate RFC is a **draft**. Its front matter says `status: draft` with an empty `implementation-prs` list, and no `LaunchEngine` for it exists in the tree. It is the clearest worked design of a second lane, which is why it is example one below — but it is a design, not a shipped lane.
+The Fargate RFC is **in progress**. Its front matter says `status: in-progress` with `implementation-prs: [9223]`, and the lane is half-shipped: `DefaultRemoteProvisionerProvider.provisioners()` appends the `aws_fargate` descriptor once `cloud.json` carries a complete `fargate` block, and `engine_for` hands out `src/kiro_crew/cloud/fargate_engine.py::FargateLaunchEngine` for it. What is missing is the dashboard half — no `registerRemoteProvisionerRenderer` claims that `kind`, so the lane is reachable through the API and absent from the Set-up selector. It is still the clearest worked design of a second lane, which is why it is example one below.
 
-Two adjacent pieces of work are easy to mistake for a provisioner lane, so state it plainly: the **crew bundle builder** under `src/kiro_crew/apps/builtins/aws_control/crew/packaging/` (merged as #9213) and the **crew container runtime** added by the open PR #9223 are the bundle and image side. Neither implements `LaunchEngine` and neither writes to the instances registry — a search of the `aws_control` app for `LaunchEngine`, `register_instance` or `InstancesRegistry` returns nothing on `main`, and the same search across #9223's diff returns nothing either. They produce something a lane could one day run; they are not a lane.
+Two adjacent pieces of work are easy to mistake for a provisioner lane, so state it plainly: the **crew bundle builder** under `src/kiro_crew/apps/builtins/aws_control/crew/packaging/` (merged as #9213) and the **crew container runtime** added by PR #9223 (merged) are the bundle and image side. Neither implements `LaunchEngine` and neither writes to the instances registry — a search of the `aws_control` app for `LaunchEngine`, `register_instance` or `InstancesRegistry` returns nothing on `main`, and the same search across #9223's diff returns nothing either. They produce something a lane could one day run; they are not a lane.
 
 ### Lifecycle routes are not part of the seam
 
@@ -180,6 +180,14 @@ Five methods, with the guarantees from the table in section B. Three are worth r
 `register` must raise on failure. Mirror `RealLaunchEngine.register`: it checks `register_instance`'s return for `None` and raises a message naming the resource, so a machine that was created but never registered is still recoverable by hand.
 
 `begin_signin` must not raise for an incomplete sign-in. It runs after `provision` and before `register`, which is the one window rollback does not cover.
+
+### The sign-in handle
+
+`begin_signin` returns a `src/kiro_crew/cloud/launch_job.py::SigninHandle`. Core reads its `already_logged_in`, `error`, `url`, `code` and `ports`, calls `wait(cancel)` while a code is being polled, and always calls `close()`. One more method is part of the contract and easy to miss because the happy path never calls it:
+
+`abort() -> bool` runs **only when the user cancels** a launch or a sign-in retry while a login may be polling on the box. It must stop that login — the built-in lane runs `cancel_device_login`, which kills the `kiro-cli login` process and removes its code files **without** signing the box out — and return `True` only when the stop is **confirmed**. Anything else (`False`, `None`, a raise, a missing method) is recorded on the job as `ABORT_UNCONFIRMED_NOTE`: "the Kiro sign-in on the instance was NOT confirmed stopped", with a warning in the gateway log. Core never infers a clean stop from silence, because a device code left polling can sign the crew in minutes after the owner said no.
+
+A lane whose sign-in involves **no remote login** — one that hands the box a credential at provision time, say, and whose `begin_signin` answers `already_logged_in` — should still implement `abort()` and return `True`, with the reason in its docstring: there was never a login to stop, so the stop is trivially confirmed. `src/kiro_crew/cloud/fargate_engine.py::FargateSigninHandle.abort` is the in-tree example. Do **not** leave the method off and rely on the fallback: that fallback is the unconfirmed note, and its text is about a polling device code your lane does not have.
 
 ### 4. Choose the transport at `register` time
 

@@ -219,9 +219,9 @@ def test_stated_config_defaults_are_the_real_defaults(doc_text: str) -> None:
     """The doc's two easiest-to-get-backwards claims are the dataclass defaults."""
     skills = SkillsConfig()
     assert skills.max_triggered == 0, "the doc says per-turn trigger matching is OFF by default"
-    assert skills.lazy_load is False, "the doc says the ranked index is opt-in via skills.lazy_load"
+    assert skills.lazy_load is True, "the ranked directory is the default"
     assert "defaults to **0**" in doc_text
-    assert "(default false)" in doc_text
+    assert "(default true)" in doc_text
 
 
 def test_session_sharing_default(doc_text: str) -> None:
@@ -238,23 +238,33 @@ def test_skill_injection_table_matches_the_plan_function(doc_text: str) -> None:
     preserves behaviour keeps passing and one that changes behaviour fails.
     ``agent_skill_globs`` is patched through the module attribute the function
     actually resolves, which is what decides the ``globs`` half.
+
+    This is the ONE place the truth table is executed. The same four rows are
+    stated as prose in ``src/kiro_crew/docs/agent-spec-fields.md``, whose own
+    module (``test_agent_spec_fields_doc.py``) pins that page's wording and defers
+    the matrix to here rather than running a second copy of it.
+
+    Both halves of the return are asserted. A plan answering ``(True, [])`` for a
+    mapped agent satisfies every "is it injected" check while handing that agent
+    the whole catalog its mapping exists to exclude, which is the one outcome the
+    tables' "only the mapped set" wording rules out.
     """
     import kiro_crew.context as ctx_mod
 
+    mapping = ["/root/*/SKILL.md"]
     original = ctx_mod.agent_skill_globs
     try:
-        # row 1: kirocrew, unmapped -> injected on both backends
-        ctx_mod.agent_skill_globs = lambda _agent: []
-        assert ctx_mod._skills_injection_plan("kirocrew", is_cc=False)[0] is True
-        assert ctx_mod._skills_injection_plan("kirocrew", is_cc=True)[0] is True
-        # row 3: custom, unmapped -> nothing, on either backend
-        assert ctx_mod._skills_injection_plan("kirocrew-worker", is_cc=False)[0] is False
-        assert ctx_mod._skills_injection_plan("kirocrew-worker", is_cc=True)[0] is False
-        # rows 2 and 4: mapped -> Claude Code only, for both agent kinds
-        ctx_mod.agent_skill_globs = lambda _agent: ["/root/*/SKILL.md"]
-        for agent in ("kirocrew", "kirocrew-worker"):
-            assert ctx_mod._skills_injection_plan(agent, is_cc=True)[0] is True
-            assert ctx_mod._skills_injection_plan(agent, is_cc=False)[0] is False
+        ctx_mod.agent_skill_globs = lambda _agent, **_kwargs: []
+        for is_cc in (False, True):
+            # row 1: kirocrew, unmapped -> the whole catalog, on both backends
+            assert ctx_mod._skills_injection_plan("kirocrew", is_cc=is_cc) == (True, [])
+            # row 3: custom, unmapped -> nothing, on either backend
+            assert ctx_mod._skills_injection_plan("kirocrew-worker", is_cc=is_cc) == (False, [])
+        ctx_mod.agent_skill_globs = lambda _agent, **_kwargs: list(mapping)
+        for is_cc in (False, True):
+            # rows 2 and 4: the mapped set only, on either backend
+            for agent in ("kirocrew", "kirocrew-worker"):
+                assert ctx_mod._skills_injection_plan(agent, is_cc=is_cc) == (True, mapping)
     finally:
         ctx_mod.agent_skill_globs = original
 

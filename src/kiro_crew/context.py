@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew import model_registry
+from kiro_crew import model_registry, resource_status
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
@@ -1059,6 +1059,12 @@ _MEMORY_PREFS_CAP = _budget(0.026)  # user preferences                     = 2.6
 _MEMORY_PROJECTS_CAP = _budget(0.039)  # active projects                      = 3.9%
 _MEMORY_HISTORY_CAP = _budget(0.16)  # daily history (multi-tier decay)     = 16%
 _LESSONS_CAP = _budget(0.226)  # learned corrections (high priority)  = 22.6%
+# Past findings the author marked as experience rather than as standing rules.
+# A SEPARATE, deliberately smaller allowance instead of a share of
+# ``_LESSONS_CAP``: the two tiers answer different questions, so a user with many
+# findings must not be able to crowd out their own standing rules, and a user with
+# many rules must not lose the findings budget. Both are window-independent.
+_LESSON_EXPERIENCE_CAP = _budget(0.05)  # learned experience (on-demand tier)  = 5%
 _SEMANTIC_MEMORY_CAP = _budget(0.077)  # semantic memory (vector)             = 7.7%
 _EPISODIC_MEMORY_CAP = _budget(0.077)  # episodic memory (vector)             = 7.7%
 _SKILLS_CAP = _budget(0.15)  # skills top-K block (lazy-loaded)     = 15%
@@ -1138,6 +1144,7 @@ class _ResolvedCaps:
     projects: int
     memory_history: int
     lessons: int
+    lesson_experience: int
     semantic: int
     episodic: int
     skills: int
@@ -1194,6 +1201,7 @@ def _resolve_caps_cached(window: int) -> _ResolvedCaps:
         projects=_scaled(_MEMORY_PROJECTS_CAP),
         memory_history=_scaled(_MEMORY_HISTORY_CAP),
         lessons=_scaled(_LESSONS_CAP),
+        lesson_experience=_scaled(_LESSON_EXPERIENCE_CAP),
         semantic=_scaled(_SEMANTIC_MEMORY_CAP),
         episodic=_scaled(_EPISODIC_MEMORY_CAP),
         skills=_scaled(_SKILLS_CAP),
@@ -1744,7 +1752,14 @@ def ui_language_tag(cfg: "KiroCrewConfig") -> str:
 def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
     """Build the [UI LANGUAGE] block from ``dashboard.language``.
 
-    Tool-call purpose text (``__tool_use_purpose``) is the one piece of
+    Which FIELD carries the tool-call purpose depends on the harness: the Kiro
+    backend injects a reserved ``__tool_use_purpose`` argument into every tool
+    schema, while other backends' shell tool takes a ``description`` field
+    beside ``command`` (``select_tool_title`` in ``acp/_dispatch.py`` reads it
+    first). The block names both, because a model on the second kind never
+    sees a field called "purpose" and would otherwise miss the steer.
+
+    Tool-call purpose text is the one piece of
     model-generated prose that renders as UI *chrome* rather than as a reply:
     the dashboard shows it as the tool-call pill label, and the messaging
     renderers (Slack/Discord/Telegram/...) reuse it as the task title. Every
@@ -1787,7 +1802,9 @@ def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
         f"[UI LANGUAGE] {lang}\n"
         "The interface around your output is rendered in this language "
         "(BCP-47 tag). Write the short purpose you attach to each tool call in "
-        "this language too, so the tool-call timeline and the task titles "
+        "this language too, whichever field carries it: the reserved "
+        "`__tool_use_purpose` argument, or a tool's own `description` field "
+        "(as on a shell tool), so the tool-call timeline and the task titles "
         "derived from it read in one language instead of two.\n"
         "This applies ONLY to that tool-call purpose text. Your replies to the "
         "user keep following the language the user writes in, and code, "
@@ -2775,22 +2792,23 @@ def build_session_replay(
     return replay.translate(_MULTIBYTE_TABLE)
 
 
-def _skills_injection_plan(agent: str | None, *, is_cc: bool) -> tuple[bool, list[str]]:
+def _skills_injection_plan(
+    agent: str | None, *, is_cc: bool, project_dir: str | Path | None = None
+) -> tuple[bool, list[str]]:
     """Whether to inject skills for *agent*, plus the glob restriction to apply.
 
     THE single source of truth for the agent-scoping rule, shared by the
     session-start injection and the post-compaction re-injection. Mapped agents
-    (a ``skill://`` resource in their agent JSON) are Claude-Code-only, since
-    kiro loads those natively; an unmapped agent gets skills only when it is the
-    default one.
+    receive the same scoped directory on either backend; an unmapped agent
+    gets the startup directory only when it is the default one.
 
     Deliberately one function rather than the same expression written twice: a
     hand-copied second gate is exactly what let the re-injection path ship
     without scoping, handing a mapped agent the catalog its mapping excludes.
     """
-    globs = agent_skill_globs(agent) if agent else []
+    globs = agent_skill_globs(agent, project_dir=project_dir) if agent else []
     is_custom = bool(agent) and agent != "kirocrew"
-    return (is_cc if globs else not is_custom), globs
+    return (bool(globs) or not is_custom), globs
 
 
 def _emit_context_section_timings(
@@ -3048,23 +3066,33 @@ class ContextBuilder:
         """Resolve conditional template blocks in prompt text.
 
         Dashboard sessions get a short widget pointer; Slack/CLI get it stripped.
-        The ``{{MAX_SUBAGENTS}}`` token is replaced with the live resolved
-        concurrent sub-agent cap so the delegation guidance carries a concrete
-        number the model can fan out to with confidence. Resolved for every
-        transport (not just dashboard), before the widget-block branch.
+        The ``{{MAX_SUBAGENTS}}`` token is replaced with the concurrent
+        sub-agent cap IN FORCE, so the delegation guidance carries the number
+        the model can actually fan out to. ``agent.max_subagents`` is a ceiling
+        the adaptive controller may be dispatching 1 at a time under; the live
+        cap is a registry read (``resource_status.adaptive_exec_cap``), which
+        this gateway-process path can afford on every assembly. When no
+        controller runs here (the CLI, tests) the configured ceiling is used and
+        labelled as one. Resolved for every transport (not just dashboard),
+        before the widget-block branch.
         """
         if "{{MAX_SUBAGENTS}}" in prompt:
-            # Lazy import: kiro_crew.subagent imports this module, so a
-            # top-level import would cycle.
-            try:
-                from kiro_crew.subagent import (  # circular import: subagent -> context
-                    resolve_max_subagents,
-                )
+            cap = resource_status.adaptive_exec_cap()
+            if cap > 0:
+                figure = str(cap)
+            else:
+                # Lazy import: kiro_crew.subagent imports this module, so a
+                # top-level import would cycle.
+                try:
+                    from kiro_crew.subagent import (  # circular import: subagent -> context
+                        resolve_max_subagents,
+                    )
 
-                cap = resolve_max_subagents(KiroCrewConfig.load())
-            except Exception:
-                cap = 0
-            prompt = prompt.replace("{{MAX_SUBAGENTS}}", str(cap) if cap > 0 else "several")
+                    ceiling = resolve_max_subagents(KiroCrewConfig.load())
+                except Exception:
+                    ceiling = 0
+                figure = f"{ceiling} (configured ceiling)" if ceiling > 0 else "several"
+            prompt = prompt.replace("{{MAX_SUBAGENTS}}", figure)
 
         cfg = KiroCrewConfig.load()
 
@@ -3991,9 +4019,9 @@ class ContextBuilder:
         # on-demand skills (plus always:true pinned) and leave the tail to
         # skill_search, keeping the block bounded instead of dumping every
         # skill's summary. The slice below is a defensive backstop only.
-        # Mapped: CC only (kiro loads them natively). Unmapped: kirocrew only.
+        # Mapped agents get scoped discovery on both backends. Unmapped: kirocrew only.
         # Shared with the post-compaction re-injection in build_message.
-        inject_skills, skill_globs = _skills_injection_plan(agent, is_cc=is_cc)
+        inject_skills, skill_globs = _skills_injection_plan(agent, is_cc=is_cc, project_dir=project)
         if inject_skills:
             required_skills: list[str] = []
             skills_ctx = self.skills.get_context(
@@ -4048,11 +4076,13 @@ class ContextBuilder:
 
                 def _render_member_lessons(hard_cap: int) -> str:
                     return member_store.get_lessons_context(
-                        query_text="",
+                        query_text=query_text,
                         cap=caps.lessons,
                         project_dir=project,
                         background=True,
                         hard_cap=hard_cap,
+                        directive_budget=caps.lessons,
+                        experience_budget=caps.lesson_experience,
                     )
 
                 lessons_renderer = _render_member_lessons
@@ -4068,6 +4098,8 @@ class ContextBuilder:
                         project_dir=project,
                         background=True,
                         hard_cap=hard_cap,
+                        directive_budget=caps.lessons,
+                        experience_budget=caps.lesson_experience,
                     )
 
                 lessons_renderer = _render_vector_lessons
@@ -4075,13 +4107,25 @@ class ContextBuilder:
                 lesson_store = self.get_lessons_for(workspace, memory_store)
 
                 def _render_named_jsonl_lessons(hard_cap: int) -> str:
-                    return lesson_store.get_context(project_dir=project, cap=hard_cap)
+                    return lesson_store.get_context(
+                        project_dir=project,
+                        cap=hard_cap,
+                        directive_budget=caps.lessons,
+                        experience_budget=caps.lesson_experience,
+                        query_text=query_text,
+                    )
 
                 lessons_renderer = _render_named_jsonl_lessons
             else:
 
                 def _render_default_jsonl_lessons(hard_cap: int) -> str:
-                    return self.lessons.get_context(project_dir=project, cap=hard_cap)
+                    return self.lessons.get_context(
+                        project_dir=project,
+                        cap=hard_cap,
+                        directive_budget=caps.lessons,
+                        experience_budget=caps.lesson_experience,
+                        query_text=query_text,
+                    )
 
                 lessons_renderer = _render_default_jsonl_lessons
 
@@ -4631,7 +4675,7 @@ class ContextBuilder:
                 parts.append(
                     "[Memory tools] Call memory_recall with specific keywords for prior facts and tasks.\n"
                 )
-            _inject, _globs = _skills_injection_plan(agent, is_cc=is_cc)
+            _inject, _globs = _skills_injection_plan(agent, is_cc=is_cc, project_dir=project)
             if _inject:
                 _cfg = KiroCrewConfig.load()
                 lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))
@@ -4949,11 +4993,11 @@ class ContextBuilder:
             # reaches `build_message` only through `run_in_embed_pool`, so the
             # loop captured at construction runs only the `decide` await.
             def select() -> list[str] | None:
-                from kiro_crew.decisions.points.skills_select import (
+                from kiro_crew.decisions.points import (
                     HISTORY_ROLES,
                     MAX_HISTORY_MESSAGES,
-                    selected_skills,
                 )
+                from kiro_crew.decisions.points.skills_select import selected_skills
 
                 def prior_turns() -> list[dict]:
                     # The cheapest prior-turn source this method can reach: a
@@ -4990,6 +5034,13 @@ class ContextBuilder:
                 )
 
             triggered = self.skills.get_triggered_skills(text, project_dir=project, select=select)
+            mapped = agent_skill_globs(agent, project_dir=project) if agent else []
+            if mapped:
+                allowed = {
+                    row["key"]
+                    for row in self.skills.scoped_skills(project_dir=project, only=mapped)
+                }
+                triggered = [key for key in triggered if key in allowed]
 
             if triggered:
                 enforced, pointer_only = self.skills.split_triggered(triggered, project)

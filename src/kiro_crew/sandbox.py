@@ -407,6 +407,21 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     _LIVE_TARGET_STAGING_LEAF,
     "backup",
     "mcp-apps",
+    # Published crew webview records. Same model as the entries above, and named
+    # here rather than under ``trust/`` for a specific reason: ``trust`` is a
+    # declared READ-WRITE exception below (in-sandbox ``verify_session_pid`` reads
+    # ``trust/sel_hmac.key`` and the in-sandbox MCP servers append to the audit
+    # log), so a record under it stayed writable by a sandboxed command that built
+    # the path at runtime -- defeating command matching, which has no literal path
+    # to match. Masking costs no live consumer: the publishing MCP tool does not
+    # import the store at all, it POSTs to ``/api/agent-panel/publish``, so the
+    # gateway process is the only writer and the only reader.
+    #
+    # Listed in ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES`` too, because on Linux the
+    # mask is a bind mount and the loop guards on ``isdir`` -- an absent directory
+    # is SKIPPED, which on a fresh install is exactly the disposition this entry
+    # exists to deny.
+    "crew-panels",
     # Auth stores and signing keys owned by the gateway web server alone.
     "token_signing.key",
     "refresh_chains.json",
@@ -554,6 +569,20 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # fence how a command SPELLS this path, and the kernel denial is what still
     # holds when a spelling is built at runtime (``$(printf ...)``).
     "settings_seeds.json",
+    # The crew webview template directory. A ceiling in exactly the sense above:
+    # the whole value of splitting a panel into human-authored TEMPLATE and
+    # agent-published DATA is that layout is authored by a person, so a crew must
+    # never be able to write one -- a template it authored could put markup, and
+    # therefore a hostile issue body's markup, straight into the operator's
+    # dashboard. ``security._CREW_SECRET_LEAVES`` fences it from the agent FILE
+    # TOOLS; sealing it read-only here closes the other half, because a fence that
+    # only covers file tools is bypassed by any spawned shell that can write.
+    #
+    # READ-ONLY rather than masked, and the direction matters: templates are
+    # versioned, human-reviewed repo content with nothing secret in them, so
+    # reading one costs nothing, while hiding a directory the OPERATOR drops
+    # overrides into would silently change which template renders.
+    "panel-templates",
     # The fork-lineage / model-state sidecar (agent_state.py). Same
     # input-to-an-authorization-decision class as the ceilings above:
     # ``forked_from`` / ``private_to`` decide whether the fork endpoint treats
@@ -793,6 +822,19 @@ _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
     # the product depends on and buy nothing.
     "cloud.json",
     "cloud_launch_state.json",
+    # The crew webview template directory. Holds no credential and is no input to an
+    # authorization decision an in-sandbox process makes: a template decides how a
+    # published panel is laid out, never who may publish one, and every reader runs
+    # in the gateway (``agent_panel.available_templates`` behind the dashboard route,
+    # the renderer behind publish) -- the ``kirocrew-panel`` MCP server asks that
+    # route over HTTP rather than opening the directory itself. Classified for
+    # completeness rather than for effect, like ``subagents`` above: the leaf is
+    # WRITE-protected only (``security.paths._WRITE_PROTECTED_HOME_PATHS``), not on
+    # the read-gate floor, so the mask never covers it and neither classification
+    # changes what any child can open. The risk it carries is a WRITE (crew-authored
+    # markup reaching the operator's dashboard), and the read-only seal above is what
+    # answers it.
+    "panel-templates",
 )
 
 
@@ -800,8 +842,10 @@ def crew_host_runtime_leaves() -> tuple[str, ...]:
     """Crew-home leaves an ENFORCED harness's child may read, per this module.
 
     :data:`_CREW_CHILD_READABLE_LEAVES` verbatim -- the half of this module's
-    non-hidden crew leaves that holds no credential: the governance ceilings, the
-    opt-out and consent records, the browser launcher, the authorization sidecars.
+    non-hidden crew leaves that holds no credential AND is no input to an
+    authorization decision: the browser launcher, the authorization sidecars
+    (``apps/.dev-grants.json``, ``settings_seeds.json``, the model-state pair), the
+    gateway-owned run and decision records, and the operator's cloud configuration.
     Its sibling :data:`_CREW_CHILD_WITHHELD_LEAVES` carries the rest, and
     ``test_sandbox_governance_mask`` pins the pair complete and disjoint against
     ``_CREW_SANDBOX_VISIBLE_LEAVES | _CREW_READONLY_LEAVES``, so a leaf added to
@@ -821,10 +865,17 @@ def crew_host_runtime_leaves() -> tuple[str, ...]:
     same entry hides the artifact from the CHILD -- which is not the reader the floor
     was aiming at, and is the reader these lists exist to serve.
 
-    Hiding a ceiling is the sharpest case, because it is not merely lost: an empty
-    bind over ``security_policy.json`` makes ``boot_platform()`` raise, so every
-    in-sandbox Crew process under an enforced harness stops booting on exactly the
-    governed hosts that set one.
+    The governance ceiling is NOT in this set, and that is deliberate rather than an
+    omission -- see the governance family in
+    :data:`_CREW_CHILD_WITHHELD_LEAVES`. It is the case where the two readers pull
+    hardest in opposite directions: an empty bind over ``security_policy.json`` makes
+    ``boot_platform()`` raise, so an in-sandbox Crew process under an enforced harness
+    stops booting on exactly the governed hosts that set one. That cost is accepted
+    because it lands in the safe direction -- a session refuses rather than proceeding
+    ungoverned -- and a ceiling is an INPUT TO AN AUTHORIZATION DECISION, which a
+    foreign harness's child reads through a channel that reaches no gate and leaves no
+    record. So do not read the paragraph above as licence to move a ceiling or a
+    consent record here to make a harness boot.
 
     Subtracting these is not a hole. An unenforced harness's child already sees every
     leaf that remains (those harnesses get no mask at all), each readonly entry is
@@ -1240,6 +1291,14 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     "member-memory-bindings",
     "memory_stores",
     "profiles",
+    # The crew webview template directory. A fence only fences an EXISTING path:
+    # the Linux launcher skips the read-only mount for an absent target, so on a
+    # fresh install -- where no operator has dropped an override yet -- the
+    # directory does not exist, the seal is silently skipped, and the agent can
+    # create it and author its own template. Which is precisely the write the
+    # read-only listing above exists to deny, so without this entry that listing
+    # protects only hosts that happen to have the directory already.
+    "panel-templates",
     "playwright-cli",
     # The decision log, on the ``profiles`` argument rather than the JSON one.
     # (1) An EMPTY dir means what an ABSENT dir means to its only reader:
@@ -1296,6 +1355,10 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
         "sealed browser runtime",
         "the agent could replace the browser executable the gateway runs",
     ),
+    # These two are gateway-owned run records: results stay readable, and agent code must
+    # not rewrite the app owner a continuation restores its authorization from. The wording
+    # follows _CREW_READONLY_LEAVES' own note on them. Every leaf sealed on either nofollow
+    # list needs an entry here, which is what the assert below enforces.
     "subagents": (
         "sealed run records",
         "the agent could rewrite the app owner a cold continuation restores its "
@@ -1306,6 +1369,10 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
         "the agent could rewrite the app owner a retained V1 run restores its "
         "authorization from",
     ),
+    # Sealing the seam that turns the feature on without sealing the record it writes
+    # would be half a control: appending one feedback row is enough to put a verdict
+    # in the owner's own summary. Every legitimate writer is the gateway, outside the
+    # sandbox.
     "decisions": (
         "sealed decision log",
         "the agent could append a feedback row the owner's summary counts as a "
@@ -1431,6 +1498,13 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     # first spawn so the mask has a mount target, and the temp the materialiser stages
     # in it is never visible to a running namespace.
     _LIVE_TARGET_STAGING_LEAF,
+    # ``crew-panels`` is the same requirement seen from the mirror side of the
+    # ceilings above: a read-only ceiling is materialised so the SEAL can apply,
+    # a hidden leaf so the MASK can. The skip lands precisely on a fresh install,
+    # where the agent could then create the directory itself and write what the
+    # gateway later reads back as authoritative. Same failure the
+    # ``panel-templates`` ceiling has, one list over.
+    "crew-panels",
     # Append-only per-unit crew logs, and the hazard is the sharpest here: the
     # record is the AUTHORITY a reader trusts instead of re-deriving, and the
     # store creates this root on its first write. A sandbox spawned before that
@@ -1513,7 +1587,13 @@ _CEILING_TEMP_PREFIX: str = ".kirocrew-ceiling-"
 
 
 def _sealable_absent_ceilings() -> tuple[list[str], list[str]]:
-    """Resolved (dir, file) ceiling paths that may be created so the seal can apply.
+    """Resolved (dir, file) paths that may be created so their disposition can apply.
+
+    Two kinds of directory, one requirement. A read-only ceiling is materialised so
+    the SEAL can apply; a hidden leaf is materialised so the MASK can. Both are
+    skipped by their launcher loop when absent, so both need the path to exist
+    before the loop runs, and the creation rules are identical -- 0o700, never
+    truncate, never remove, refuse a dangling symlink.
 
     Resolved through ``config_dir()`` — the LIVE data home — rather than expanded over
     both ``_CREW_HOME_PREFIXES`` the way the deny lists are. A deny rule covers both
@@ -1533,7 +1613,12 @@ def _sealable_absent_ceilings() -> tuple[list[str], list[str]]:
         logger.debug("could not resolve the crew data home for ceiling sealing", exc_info=True)
         return ([], [])
     file_targets = [os.path.join(root, leaf) for leaf in _CREW_PRECREATE_READONLY_FILE_LEAVES]
-    dir_targets = [os.path.join(root, leaf) for leaf in _CREW_PRECREATE_READONLY_DIR_LEAVES]
+    # Read-only ceilings AND hidden leaves: the seal needs the former to exist,
+    # the mask needs the latter (see the docstring), so both are materialised here.
+    dir_targets = [
+        os.path.join(root, leaf)
+        for leaf in _CREW_PRECREATE_READONLY_DIR_LEAVES + _CREW_PRECREATE_HIDDEN_DIR_LEAVES
+    ]
     try:
         # The kiro agents tree (fork governance's specs + their lock; see the
         # readonly-target entry above): the Linux mount seal needs a directory
@@ -1589,6 +1674,61 @@ def _warn_unsealed_ceiling(target: str, exc: "OSError | None") -> None:
         "writable inside the sandbox",
         target,
         exc if exc is not None else "publish failed",
+    )
+
+
+#: Protected leaves where an ALIASED name is a hard spawn failure, not a warning.
+#:
+#: ``_warn_if_alias_backed`` warns for every other ceiling, deliberately: those are
+#: an operator's config files and a dotfile manager (chezmoi, stow) legitimately
+#: symlinks them, so refusing would turn a normal setup into a spawn failure for a
+#: hole that is pre-existing and narrower than the breakage.
+#:
+#: These two are not config files and nothing has a reason to link them:
+#:
+#: * ``crew-panels`` -- created on demand by the GATEWAY and read by nothing else.
+#:   It is bind-MASKED, so a link means the mask attaches to the target while the
+#:   link name stays writable in the data home: a sandboxed process unlinks it,
+#:   drops its own directory, and forges records the gateway reads back as
+#:   authoritative -- past the ownership check and past the redactors.
+#: * ``panel-templates`` -- holds the human-authored TEMPLATE whose separation from
+#:   crew-published DATA is the whole containment story. Replacing that directory is
+#:   authoring markup that renders in the panel, not changing a setting.
+#:
+#: So for these, a link is refused: the disposition must attach to the same name the
+#: reader uses, and following a link is exactly the gap that voids it.
+_CREW_NO_ALIAS_LEAVES: frozenset[str] = frozenset({"crew-panels", "panel-templates"})
+
+
+def _refuse_if_aliased_protected_leaf(target: str) -> None:
+    """Refuse the spawn when a protected leaf is reachable under a second name.
+
+    Same two shapes ``_warn_if_alias_backed`` reports -- a symlink, or a regular
+    file with an extra hardlink -- but for :data:`_CREW_NO_ALIAS_LEAVES` the
+    outcome is a refusal. Warning and continuing is what made this silent: the log
+    said the path was sealed while the writes went somewhere else.
+    """
+    if os.path.basename(target.rstrip("/" + os.sep)) not in _CREW_NO_ALIAS_LEAVES:
+        return
+    try:
+        info = os.lstat(target)
+    except OSError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        pointed_at = "(unreadable)"
+        with contextlib.suppress(OSError):
+            pointed_at = os.readlink(target)
+        raise SandboxCeilingUnsealable(
+            f"the protected directory {target} is a SYMLINK -> {pointed_at}. Its "
+            "disposition attaches to this NAME, so the link would leave the name "
+            "replaceable inside the sandbox while reads and writes went to an "
+            "unfenced inode. Remove the link and use a real directory."
+        )
+    if stat.S_ISDIR(info.st_mode):
+        return
+    raise SandboxCeilingUnsealable(
+        f"the protected directory {target} is not a directory. It must be a real "
+        "directory under this name for its mask to apply."
     )
 
 
@@ -1892,6 +2032,10 @@ def _materialize_sealable_ceilings() -> list[str]:
     for target in dir_targets:
         strict_nofollow = os.path.basename(target) in _CREW_NOFOLLOW_READONLY_DIR_LEAVES
         _refuse_if_dangling_symlink(target)
+        # BEFORE the warn-and-continue below: for a protected leaf an alias is a
+        # refusal, and reaching `_warn_if_alias_backed` would log that the path was
+        # covered while the bytes went elsewhere.
+        _refuse_if_aliased_protected_leaf(target)
         if strict_nofollow:
             _refuse_if_symlink_leaf(target)
         if os.path.exists(target):
@@ -6888,6 +7032,33 @@ def _build_seatbelt_profile(
         # Also deny hardlinking the protected file (see above).
         rules.append(f'(deny file-link (literal "{escaped}"))')
     extra_hidden_targets = list(dict.fromkeys(os.path.abspath(path) for path in extra_hidden_dirs))
+    # Private windows inside a CALLER's own extra-hidden tree, same primitive and
+    # same rule shape as the tier loop above. Both builders must agree about one
+    # spawn: ``_build_launcher_script`` extends ``hidden_dirs`` with
+    # ``extra_hidden_dirs`` BEFORE it computes ``_private_window_spellings``, so a
+    # window inside a caller's own mask is staged and re-bound there, and this
+    # builder computes its windows against the caller's targets as well as the
+    # TIER ones so the same window survives the blanket denies below. Without the
+    # caller's targets a window here is swallowed and the child loses read AND
+    # write on its own directory -- fail-closed, so it breaks the spawn rather
+    # than exposing anything, but it leaves the primitive enforced on one
+    # platform only for the one shape that needs it: a tree masked as a whole
+    # with the process's own state kept live inside it. That is the durable-data
+    # view an app-bundle cron script needs -- mask ``apps/`` so no sibling app's
+    # ``.app_secret`` is reachable, including one installed mid-run, and keep
+    # ``apps/<app>/data`` on its real inode at its real path so provisioned
+    # dependencies and logs survive the run.
+    #
+    # Window-first, like the tier loop: a window keeps the tree denied except the
+    # one directory, whereas the ``extra_visible_dirs`` check below cancels the
+    # tree's whole rule set. When a caller passes both for one tree the narrower
+    # answer wins, which is the refusal-leaning direction.
+    #
+    # Equality is refused by ``_private_window_spellings`` itself (a window equal
+    # to its mask would be a mask lift by another name), so every entry here is a
+    # PROPER descendant and the ``(literal …)`` denies emitted for the target
+    # cannot reach it.
+    extra_private_windows = _private_window_spellings(extra_private_dirs, extra_hidden_targets)
     # Read-only carve-outs inside an extra-hidden dir (the enforced adapter's
     # ``~/.aws/config``). READ only: the write and hardlink denies below stay
     # blanket over the subpath, exactly as the ``.ssh/known_hosts`` carve-out
@@ -6897,6 +7068,27 @@ def _build_seatbelt_profile(
     # ``extra_expose_abs`` was built above so the tier loop applies the same
     # carve-out when the tier itself already hides the parent (strict + .aws).
     for target in extra_hidden_targets:
+        windows = [w for w in extra_private_windows if w.startswith(target.rstrip("/") + "/")]
+        if windows:
+            # Deny the tree except the window, in every direction: the window is
+            # the process's own state, so it stays read-WRITE (a read-only
+            # window would fail the deps swap renames the view exists to keep
+            # working), while every sibling -- and anything installed into the
+            # tree after the profile was built -- stays denied.
+            window_exceptions = " ".join(
+                f"(require-not (subpath {json.dumps(w)}))" for w in windows
+            )
+            # An exposed file under the same tree keeps its READ carve-out; it
+            # gets no write or link exception, matching the blanket branch below.
+            carved_here = sorted(f for f in extra_expose_abs if f.startswith(target + os.sep))
+            read_exceptions = window_exceptions + "".join(
+                f" (require-not (literal {json.dumps(f)}))" for f in carved_here
+            )
+            subpath = f"(subpath {json.dumps(target)})"
+            rules.append(f"(deny file-read* (require-all {subpath} {read_exceptions}))")
+            for operation in ("file-write*", "file-link"):
+                rules.append(f"(deny {operation} (require-all {subpath} {window_exceptions}))")
+            continue
         if _hidden_path_contains_visible_path(target, extra_visible_dirs):
             continue
         escaped = target.replace('"', '\\"')
@@ -7055,6 +7247,112 @@ def kiro_internal_sandbox_switch() -> tuple[str, str]:
     :data:`_KIRO_INTERNAL_SETTINGS_PATH` gets its own path back here too.
     """
     return _KIRO_INTERNAL_SETTINGS_PATH, _KIRO_INTERNAL_SANDBOX_KEY
+
+
+#: The two isolation layers an agent spawn can be wrapped by, as the names a
+#: diagnostic prints. Constants rather than literals at each raise site: the
+#: layer travels into an exception type, a log line and an operator-facing
+#: remedy, and three spellings of the same layer is how a remedy ends up naming
+#: the wrong switch.
+SANDBOX_LAYER_CREW = "kirocrew"
+SANDBOX_LAYER_HARNESS = "harness-internal"
+
+
+def wrapped_by_crew_sandbox(argv: "Sequence[str]") -> bool:
+    """Whether *argv* -- as returned by :func:`wrap_argv` -- runs the child
+    through Kiro Crew's OWN sandbox layer.
+
+    Read off the wrapped argv rather than re-deriving the decision from mode +
+    platform + settings, because that decision is not a single expression: the
+    delegated branch still falls back to Crew's seatbelt when the caller asks for
+    path masks a delegated sandbox cannot enforce, the governance floor can clamp
+    a requested ``off`` back up, and the audit-or-deny step can refuse a
+    delegation after it was chosen. A second copy of that reasoning would answer
+    differently from the wrap on exactly the hosts where the answer matters. The
+    argv is the wrap's own record of what it did.
+
+    Keys on the two things only Crew's wrappers put in an argv -- the
+    ``KIROCREW_SANDBOX_ACTIVE`` env assignment the macOS seatbelt wrap prepends,
+    and the generated launcher script the Linux namespace wrap execs. The
+    delegated and unconfined paths add neither (they prepend at most ``env -u``
+    scrub flags), so this is False for both, which is the point: on those paths
+    the only sandbox left in the chain belongs to the harness.
+    """
+    marker = f"{_IN_SANDBOX_MARKER}="
+    for token in argv:
+        if not isinstance(token, str):
+            continue
+        if token.startswith(marker):
+            return True
+        if os.path.basename(token).startswith(_SANDBOX_ARTIFACT_PREFIX):
+            return True
+    return False
+
+
+def sandbox_init_remediation(layer: str, *, corroborated: bool) -> str:
+    """What an operator must change to get past a sandbox that will not initialize.
+
+    **The switch that turns a layer OFF is emitted only on a CORROBORATED
+    verdict**, and that is the whole shape of this function. The signature that
+    reaches the caller is the dead child's own stderr, and that child is the
+    unverified binary the sandbox exists to contain: a planted one can print any
+    line it likes. A message that answered it with "run
+    ``kirocrew config set agent.sandbox off``" would let that binary talk the
+    operator into removing the isolation it is running under -- the same hazard
+    :func:`launcher_refusal` states for its own callers, answered the same way it
+    prescribes. *corroborated* must therefore come from
+    :func:`corroborate_launcher_refusal` (a real launcher run around a trusted
+    no-op, whose stderr no child wrote), never from the child's text.
+
+    Uncorroborated, the message still names the layer -- that comes from the argv
+    Kiro Crew itself built, not from the child -- and routes the operator to the
+    check that can reach a verdict, which is where the switch lives.
+
+    Corroboration exists for Crew's Linux launcher only. On macOS the probe
+    validates an ``(allow default)`` profile against a fixed system binary while
+    the real wrap applies the strict generated one, so a passing probe is not
+    evidence that the real wrap works and the uncorroborated branch is the honest
+    answer there. Closing that gap is the real-wrap self-test, tracked separately.
+
+    It follows that the HARNESS layer never gets a switch from here at all, whatever
+    *corroborated* says: the only trusted run available speaks to Crew's launcher,
+    so treating its verdict as evidence about the harness's own sandbox would be a
+    cross-layer inference -- and on that branch the harness's sandbox is the only
+    isolation the child had.
+    """
+    if layer == SANDBOX_LAYER_HARNESS:
+        # Names NO switch, and *corroborated* cannot change that -- which is the
+        # point of reading this branch before that flag. Corroboration re-runs
+        # KIRO CREW'S OWN launcher, so a verdict from it is evidence about Crew's
+        # layer and says nothing whatever about the harness's internal sandbox.
+        # Letting it unlock this switch would be a cross-layer inference: a host
+        # that cannot build Crew's namespace would hand the operator the key that
+        # turns off the OTHER sandbox -- and on this branch that sandbox is the
+        # only isolation the child had, so the one confirmed thing would be that
+        # isolation is gone. The remaining evidence is the agent's own output, and
+        # the agent is the unverified binary that sandbox exists to contain.
+        return (
+            "the agent reported its own sandbox refusing, and Kiro Crew did not wrap "
+            "this spawn -- so that sandbox is the only isolation this child had. The "
+            "report above is the agent's own output and Kiro Crew has NOT confirmed "
+            "it; check the host's sandbox support"
+        )
+    if not corroborated:
+        return (
+            "Kiro Crew wrapped this spawn in its own OS sandbox, but the refusal above "
+            "is the agent's own output and not a verdict on this host -- and Kiro Crew's "
+            "own trusted sandbox run covers its Linux launcher only, so it has NOT "
+            "confirmed the failure here. Check the host's sandbox support before turning "
+            "either layer off"
+        )
+    return (
+        "a trusted launcher run confirms this host refuses Kiro Crew's own OS sandbox: "
+        "run `kirocrew config set agent.sandbox off`, which spawns agents unconfined "
+        "WHERE GOVERNANCE PERMITS IT -- a governance floor clamps the mode back up and "
+        "the request has no effect. Where it does take, it removes Kiro Crew's "
+        "OS-level isolation for EVERY agent process (no credential-path masks, no "
+        "data-home seal); each unconfined spawn is recorded in the security event log"
+    )
 
 
 def delegated_workspace_exposes_sealed_target(
@@ -9330,6 +9628,45 @@ def detect_backend(config_mode: str = "auto") -> str:
     return _backend
 
 
+#: Env marker the cron *script* launcher sets on its child -- the one way to tell
+#: that child apart at a spawn site every caller shares.
+CRON_SCRIPT_CHILD_ENV = "_KIROCREW_CRON_SCRIPT_CHILD"
+
+
+class UnauditedSpawnRefused(BaseException):
+    """A cron script child refused to proceed after an ENOSYS audit failure.
+
+    ``BaseException`` because it is raised inside the user function's own stack
+    (``ctx.call_tool`` re-enters ``wrap_argv``), and a script's own ``except
+    Exception`` must not be able to swallow it and return a success envelope.
+    """
+
+
+def refuse_unaudited_on_dead_fs(exc: BaseException, what: str) -> None:
+    """Turn a best-effort audit degrade into a refusal, for a cron script child.
+
+    Log-and-proceed is right for the gateway: denying a spawn on an audit hiccup
+    would brick built-in tooling and every in-sandbox MCP call. It is wrong for a
+    detached cron child, whose ``ENOSYS`` write means its filesystem is gone, so it
+    can neither audit nor persist what it does next. Both conditions are required.
+    """
+    if os.environ.get(CRON_SCRIPT_CHILD_ENV) != "1":
+        return
+    # SEL wraps its writes, so the errno can sit a link or two down the chain;
+    # ``seen`` bounds a cyclic one.
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, OSError) and cur.errno == errno.ENOSYS:
+            raise UnauditedSpawnRefused(
+                f"{what}: the security-event log write failed with ENOSYS (errno 38), "
+                "so this cron child can neither audit nor persist -- refusing to "
+                "continue unaudited."
+            ) from exc
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+
+
 class SandboxUnavailableError(RuntimeError):
     """``wrap_argv`` fail-closed because this host could not build a sandbox.
 
@@ -9931,7 +10268,8 @@ def wrap_argv(
                     ),
                     critical=True,  # synchronous write for audit integrity
                 )
-            except Exception:
+            except Exception as exc:
+                refuse_unaudited_on_dead_fs(exc, "mode=off delegation audit")
                 # Fail OPEN (not to seatbelt): an unaudited delegation with
                 # mode=off still applies env scrub but returns without seatbelt.
                 # This is deliberately different from _delegate_to_kiro_internal_sandbox
@@ -10047,7 +10385,8 @@ def wrap_argv(
                 },
                 critical=True,
             )
-        except Exception:
+        except Exception as exc:
+            refuse_unaudited_on_dead_fs(exc, "nested-sandbox passthrough audit")
             logger.warning(
                 "SEL audit failed for nested-sandbox passthrough — proceeding "
                 "unaudited: the outer namespace + seccomp still confine this "

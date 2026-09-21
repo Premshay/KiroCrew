@@ -33,6 +33,14 @@ surfaces, out-of-range values are clamped with a warning rather than raising, an
 a malformed section degrades to defaults so a hand-edited file cannot prevent the
 gateway from starting.
 
+## Orchestration prompt contract
+
+`config/prompt.md` and `config/prompt-orchestrator.md` guide direct work and
+delegation using the same concrete-value policy. Parent-plus-child parallelism
+depends on the spawn receipt's delivery capability; the existing Autopilot
+approval and stage boundaries remain. Runtime checks and compatibility are
+owned by [subagent.md](subagent.md), not inferred from prompt wording.
+
 ## Embedding rebuild request publication
 
 `memory.embed_rebuild_generation` is an explicit-apply request identity, not a
@@ -398,8 +406,17 @@ Registered so far: `mcp_gateway.forward_declared_env` (False -> True, #4566),
 `dashboard.loop_stall_exit_after_secs` (25 -> unset, #6651),
 `instances.warm_set_cap` (5 -> 0, #7248),
 `agent.chat_turn_timeout_secs` (7200 -> 14400, #8949) and
-`agent.subagent_timeout_secs` (1800 -> 10800, #8891). **Two** carry `auto_adopt` --
-the agent timeout budgets -- and the other six are report-only; see below.
+`agent.subagent_timeout_secs` (1800 -> 10800, #8891), and
+`agent.subagent_max_turns` (100 -> 1000, #12203). **Two** carry `auto_adopt` --
+the agent timeout budgets -- and the other entries are report-only; see below.
+
+The subagent turn budget follows 1000 automatically when its key is absent,
+including in an existing installation after an update. Every valid stored value
+is retained, even 100: a materialized old default and an explicitly selected
+100-turn cap are indistinguishable without historical per-key provenance.
+The defaults report exposes the change and the existing adopt/keep commands;
+it does not claim that ambiguous legacy files can be upgraded without risking
+an operator's deliberate cap. The three-hour execution timeout remains separate.
 
 ### Auto-adoption, and the line it does not cross
 
@@ -427,6 +444,7 @@ supported configuration:
 | `mcp_gateway.forward_declared_env` | reports | `test_a_real_false_still_turns_it_off` |
 | `stt.model` | reports | a picker value; adopting changes transcription accuracy |
 | `instances.warm_set_cap` | reports | 5 is an ordinary deliberate cap |
+| `agent.subagent_max_turns` | reports | An explicitly stored 100 is a supported cost/turn cap |
 
 A row whose old value another suite guarantees is not stale noise by definition,
 whatever its type. `test_only_unpinned_broken_budgets_adopt_themselves` pins the
@@ -1833,10 +1851,11 @@ class AgentConfig:
     subagent_max_per_parent: int = 0  # fallback cap for active child runs from one parent; 0 leaves the process-wide cap only
     subagent_max_per_parent_by_agent: dict[str, int] = {}  # exact agent names or shell-style patterns override the fallback; exact names, then most-specific pattern, win
     subagent_auto_max: int = 16    # ceiling on the auto-sized cap (max_subagents=0 only). Load-time clamped to [3, 64]
-    subagent_max_turns: int = 100  # default per-subagent tool-call budget. Load-time clamped to [1, 1000]
+    subagent_max_turns: int = 1000  # default per-subagent tool-call budget. Load-time clamped to [1, 1000]
     subagent_result_ttl_secs: int = 3600  # seconds a delivered subagent's result.txt is retained before the reaper prunes it
     chat_turn_timeout_secs: int = 14400  # wall-clock ceiling for one chat turn. Load-time clamped to [300, 86400]; the ACP prompt wait follows it (resolve_prompt_timeout)
     tool_approval_timeout_secs: int = 600  # how long a chat turn waits for a human to answer a tool-approval prompt. Load-time clamped to [30, 7200] AND to 60s below chat_turn_timeout_secs
+    apps_ui_stream_timeout_secs: int = 30  # total transfer deadline for one response body on the unauthenticated /apps/<app>/ui/ route. Load-time clamped to [5, 600]; read per request (live), and no off switch — the route has eight descriptor permits and this deadline is what stops a client that quits reading from holding one indefinitely
     task_queue_enabled: bool = True   # persist every accepted subagent spawn to $KIROCREW_HOME/tasks/tasks.db before its id is returned; memory pressure defers instead of refusing. false = the in-memory spawn queue, for one release (tasks.db left in place, unread). See modules/taskq.md
     task_dispatch_window: int = 64    # max queued spawns held in memory; the rest are rows read FIFO as the window drains. Load-time clamped to [1, 4096]; restart=True
     task_store_journal_mode: str = "auto"  # tasks.db SQLite journal: "auto" = WAL locally, DELETE when $KIROCREW_HOME is on a network filesystem; "wal" | "delete" force one (RFC overload-resilience §13 Q6 reversal). Unknown -> "auto"; restart=True
@@ -1851,6 +1870,7 @@ class AgentConfig:
     adaptive_concurrency_mode: str = "aimd"  # "aimd" | "fixed" ("fixed" pins both caps at their initial values -- the one-flip reversal). Live
     adaptive_floor: int = 1                  # lowest execution cap under sustained pressure. Load-time clamped to [1, 64]. Live
     adaptive_initial: int = 4                # fresh-gateway execution cap, bounded by max_subagents; earned upward. Load-time clamped to [1, 64]. Live
+    adaptive_slow_start: bool = True          # before the first corroborated pressure, double the execution cap per clear 5 s window instead of +1 per 30 s, bounded by max_subagents and by what this host's memory and CPU size the cap at. Live
     # AIMD tuning uses fixed constants in adaptive/policy.py.
     controller_sample_secs: int = 5          # adaptive controller sampling interval. Load-time clamped to [1, 300]. Live
     dependency_max_attempts: int = 20          # coordinated probes a dependency scope gets before every waiter is failed. Load-time clamped to [1, 1000]
@@ -1931,7 +1951,7 @@ class MessagingConfig:
 @dataclass
 class SkillsConfig:
     max_triggered: int = 0         # max skills loaded per message (>=0)
-    lazy_load: bool = False        # false = short skill_search entry; true = bounded usage-ranked index; neither expands background admission
+    lazy_load: bool = True         # true (default) = bounded usage-ranked index with paths and a families line; false = short eight-name skill_search entry; neither expands background admission
     # ... auto_create_from_sessions / auto_refine_on_deviation / extra_paths
 
 @dataclass
@@ -2421,8 +2441,13 @@ is what says whether it worked.
 catalog-membership gate described above — into session
 context as a `[UI LANGUAGE] <tag>` block (next to `[CURRENT AGENT]`/`[RUNTIME]`,
 and in `minimal_context` mode as well). It exists for one string: the tool-call
-purpose (`__tool_use_purpose`), which the dashboard paints as the tool-call pill
-label and the messaging renderers reuse as the task title. That is the only piece
+purpose, which the dashboard paints as the tool-call pill label and the
+messaging renderers reuse as the task title. Which field carries that string
+depends on the harness — the Kiro backend's reserved `__tool_use_purpose`
+argument, or the `description` field other backends' shell tool takes beside
+`command` (`acp/_dispatch.py::select_tool_title` reads it first) — so the block
+names both; a model on the second kind never sees a field called "purpose" and
+would otherwise miss the steer. That is the only piece
 of model-generated prose rendered as *chrome*, and without the block the model
 has nothing to go on and mirrors the language the user typed in — an inferred
 signal that flips mid-session the moment the user pastes an English stack trace,
@@ -2703,9 +2728,11 @@ When `agent.model` is `"auto"` (default):
 ### Default context discovery
 
 `skills.max_triggered=0` disables per-message trigger injection, not discovery.
-The default entry shows up to eight usage-ranked names and short purposes plus
-`skill_search` guidance for short keywords. `lazy_load=true` selects a longer,
-bounded ranked index. Both preserve pinned instructions, confined project-body
+The default entry (`lazy_load=true`) is a bounded usage-ranked index carrying each
+skill's path, and one line naming the families it leaves out. `lazy_load=false`
+selects the shorter entry: up to eight usage-ranked names with short purposes plus
+`skill_search` guidance for short keywords. An agent with its own `skill://`
+mapping gets neither -- those skills arrive as complete instructions. Both preserve pinned instructions, confined project-body
 limits and explicit loading. Thread history scales with the model window
 independently of the fixed old-activity allowance; no additional config switches
 are introduced. The model window also derives the non-configurable protected-content

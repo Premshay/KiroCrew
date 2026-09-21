@@ -54,6 +54,7 @@ from kiro_crew.acp.client import (
     apply_pod_bundle_spawn,
     finish_suspended_spawn,
     is_auth_failure_output,
+    is_sandbox_init_failure_output,
 )
 from kiro_crew.acp.harness import (
     HarnessAdapter,
@@ -148,6 +149,7 @@ from kiro_crew.sandbox import (
     scrub_agent_subprocess_env,
     wrap_argv,
     wrap_argv_async,
+    wrapped_by_crew_sandbox,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_pid import (
@@ -1034,7 +1036,33 @@ def _get_rss_mb(pid: int) -> float | None:
         return None
 
 
-def _iter_descendant_pids(pid: int, max_depth: int | None = None) -> list[int]:
+def _own_children(pid: int) -> list[int]:
+    """Direct children of *pid*, asked of the kernel one thread at a time."""
+    kids: list[int] = []
+    try:
+        entries = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return kids
+    for tid in entries:
+        try:
+            with open(f"/proc/{pid}/task/{tid}/children") as f:
+                tokens = f.read().split()
+        except OSError:
+            continue
+        for tok in tokens:
+            try:
+                kids.append(int(tok))
+            except ValueError:
+                continue
+    return kids
+
+
+def _iter_descendant_pids(
+    pid: int,
+    max_depth: int | None = None,
+    *,
+    children: "dict[int, list[int]] | None" = None,
+) -> list[int]:
     """Return ``[pid, *descendants]`` (Linux only), best-effort.
 
     Walks ``/proc/<pid>/task/<tid>/children`` breadth-first. Returns ``[pid]``
@@ -1046,6 +1074,14 @@ def _iter_descendant_pids(pid: int, max_depth: int | None = None) -> list[int]:
     carries each pid's own depth rather than the loop tracking a level, so a
     process reachable at two depths is counted once, at whichever it is reached
     first — the same single-visit rule the unbounded walk has.
+
+    ``children`` supplies a parent map (``platform_compat.proc_child_map``) to
+    read the edges from instead of asking the kernel per process. Same walk and
+    same rules; only where an edge comes from changes. It is for a caller that
+    needs MANY roots' trees in one pass: the kernel route costs one read per
+    thread of every process visited, which a per-root caller pays again on every
+    root, while one map answers all of them. A map that is missing a process
+    yields the root alone for it, exactly as an unreadable ``children`` file does.
     """
     order: list[int] = []
     visited: set[int] = set()
@@ -1058,23 +1094,9 @@ def _iter_descendant_pids(pid: int, max_depth: int | None = None) -> list[int]:
         order.append(p)
         if max_depth is not None and depth >= max_depth:
             continue
-        try:
-            entries = os.listdir(f"/proc/{p}/task")
-        except OSError:
-            continue
-        for tid in entries:
-            try:
-                with open(f"/proc/{p}/task/{tid}/children") as f:
-                    tokens = f.read().split()
-            except OSError:
-                continue
-            for tok in tokens:
-                try:
-                    cpid = int(tok)
-                except ValueError:
-                    continue
-                if cpid not in visited:
-                    queue.append((cpid, depth + 1))
+        for cpid in children.get(p, ()) if children is not None else _own_children(p):
+            if cpid not in visited:
+                queue.append((cpid, depth + 1))
     return order
 
 
@@ -1162,7 +1184,29 @@ def _ps_process_table() -> _ProcessTable | None:
         return table
 
 
-def _get_rss_tree_mb(pid: int, max_depth: int | None = None) -> float | None:
+def _rss_tree_mb_for_pids(pids: list[int]) -> float | None:
+    """Sum RSS (MiB) over pids already walked (Linux), or None if none answered.
+
+    Split out of _get_rss_tree_mb so a caller that ALREADY holds the descendant
+    set can sum it without walking again. Nearly all of the cost is the walk,
+    not the sum: measured over 245 live session trees of 2 to 31 processes, the
+    walk took a median 10.3ms while summing RSS over the set it returned took
+    0.8ms. So a caller that needs both the set and the total, and cannot hand
+    the set over, walks twice and roughly doubles its own cost.
+    """
+    total = 0.0
+    found = False
+    for p in pids:
+        r = _get_rss_mb(p)
+        if r is not None:
+            total += r
+            found = True
+    return total if found else None
+
+
+def _get_rss_tree_mb(
+    pid: int, max_depth: int | None = None, *, pids: list[int] | None = None
+) -> float | None:
     """Sum RSS (MiB) of *pid* and its descendants, or None if unavailable.
 
     ``max_depth`` bounds the sum in generations below *pid*, for a host that
@@ -1194,16 +1238,15 @@ def _get_rss_tree_mb(pid: int, max_depth: int | None = None) -> float | None:
     footprint and blinds the watchdog's leak ceiling. The macOS tree is NOT "just
     the process itself" — believing otherwise is what makes the per-pid
     whole-machine snapshot look free.
+
+    ``pids`` lets a caller that has ALREADY walked the descendants hand the set
+    over so it is not walked a second time. Linux only, because that is the one
+    branch whose total is reached from a pid list at all.
     """
     if sys.platform == "linux":
-        total = 0.0
-        found = False
-        for p in _iter_descendant_pids(pid, max_depth):
-            r = _get_rss_mb(p)
-            if r is not None:
-                total += r
-                found = True
-        return total if found else None
+        if pids is None:
+            pids = _iter_descendant_pids(pid, max_depth)
+        return _rss_tree_mb_for_pids(pids)
 
     if platform_compat.IS_WINDOWS:
         if max_depth is not None:
@@ -1596,6 +1639,37 @@ class AcpRuntime:
         # stays observed for the life of this runtime, which is correct because
         # nothing about a rejected credential un-rejects itself mid-process.
         self._saw_auth_failure = False
+        # Latched sandbox-init-refusal observation, latched for the same reason
+        # and at the same sink as the auth latch above: the question ("why is this
+        # runtime dead?") is asked after the ring has already turned over on a
+        # chatty startup, and a re-scan that misses the line answers "not a
+        # sandbox problem" indistinguishably from a real negative.
+        #
+        # Its LIFETIME is narrower than the auth latch's, though, and deliberately:
+        # this one is a verdict about THIS CHILD'S STARTUP, and it is spent once
+        # startup has demonstrably SUCCEEDED -- which is the first session handle,
+        # not the ``initialize`` handshake. Startup continues past the handshake
+        # through ``session/new``, and a sandboxed MCP launcher that the child
+        # starts for that session can refuse there: closing the window at the
+        # handshake would leave every such refusal unclassified, on the very
+        # translation site (``create_session``) added to catch it.
+        #
+        # See the clear in ``_finish_create_session`` and the arming guard in
+        # ``_drain_stderr``.
+        self._saw_sandbox_init_failure = False
+        # Whether a session handle has ever been produced on this runtime. The
+        # startup window the latch above arms in, and the reason it is a separate
+        # flag from ``_initialized``: the handshake is the middle of startup, not
+        # its end.
+        self._first_session_ready = False
+        # Which isolation layer wrapped this runtime's child, recorded by
+        # ``_spawn_admitted`` off the argv its wrap returned. False until then --
+        # also the safe default for the classifier, since a spawn that never
+        # reached the wrap cannot have been refused by it.
+        self._sandbox_wrapped_by_crew = False
+        # The mask set this spawn asked for, so a trusted corroboration run can
+        # exercise the same mounts rather than a weaker profile.
+        self._sandbox_hidden_dirs: tuple[str, ...] = ()
         # Unroutable-frame drop accounting: (sessionId, method) → count since
         # the last flush, plus the monotonic timestamp of that flush (0.0 = no
         # window open yet; the first counted drop opens it). Written ONLY from
@@ -2121,6 +2195,16 @@ class AcpRuntime:
             plan = await self._resolve_spawn_plan()
             self._max_rss_depth = plan.rss_depth
             argv = plan.argv
+            if self.acp_backend == ACP_BACKEND_KIRO:
+                from kiro_crew.acp.skill_projection import prepare_native_skill_projection
+
+                self._native_skill_projection = await asyncio.to_thread(
+                    prepare_native_skill_projection, self._work_dir
+                )
+                if self._native_skill_projection is not None:
+                    argv = list(argv)
+                    agent_position = argv.index("--agent") + 1
+                    argv[agent_position] = self._native_skill_projection.agent(self._agent)
         except _KiroExecutableTrustError as exc:
             raise AcpRuntimeError(str(exc)) from exc
         # The handshake declaration is the harness's constant. A host that takes
@@ -2193,6 +2277,13 @@ class AcpRuntime:
             extra_expose_files=plan.extra_expose_files,
             _prepare=wrap_argv,
         )
+        # Twin of acp/client.py's record: the wrap's own account of the branch it
+        # took, read before the cgroup scope below prepends its tokens. A later
+        # re-derivation from mode + platform + settings cannot match it -- the
+        # delegated branch still falls back to Crew's seatbelt for a masked spawn,
+        # and the audit-or-deny step can refuse a delegation after it was chosen.
+        self._sandbox_wrapped_by_crew = wrapped_by_crew_sandbox(argv)
+        self._sandbox_hidden_dirs = tuple(plan.extra_hidden_dirs)
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
         # No-op + loud warning where cgroup delegation is unavailable. --scope
@@ -2549,6 +2640,16 @@ class AcpRuntime:
             # cancellation reaches this arm.
             await self._snapshot_descendants(retry_when_empty=True)
         except BaseException:
+            # BEFORE the kill, which is the whole point of the ordering. The
+            # cleanup below cancels the stderr drain, and a line still in the pipe
+            # when it does is a line nobody will ever read -- so the caller's own
+            # settle finds the task already done and learns nothing. Draining here
+            # is the last moment the child's own account of why it could not start
+            # is still reachable, and a sandbox refusal is exactly the failure that
+            # arrives this way: the child writes its signature and closes stdout
+            # together. Bounded and swallowing (see ``settle_stderr``); this is
+            # already the failure path.
+            await self.settle_stderr()
             try:
                 # This death IS abnormal (failed spawn/handshake): kill()'s
                 # expected=False default keeps its log at WARNING.
@@ -3688,6 +3789,9 @@ class AcpRuntime:
                 if self.recording_allowed:
                     await record_frame(self._acp_backend, data, len(line))
 
+                projection = getattr(self, "_native_skill_projection", None)
+                if projection is not None:
+                    data = projection.frame(data)
                 msg = JsonRpcMessage.from_dict(data)
 
                 # Route responses
@@ -4114,6 +4218,86 @@ class AcpRuntime:
         """
         return self._saw_auth_failure
 
+    async def settle_stderr(self, timeout: float = 0.5) -> None:
+        """Give the stderr drain a bounded chance to finish before its latches are read.
+
+        The latches (:meth:`saw_sandbox_init_failure`, :meth:`saw_not_logged_in`)
+        are written by the ``_drain_stderr`` TASK, while a death is discovered on
+        the stdout side: ``_reader_loop`` sees EOF and ``_mark_dead`` fails the
+        pending ``initialize`` future SYNCHRONOUSLY. Both tasks become runnable
+        together -- which is the ordinary shape of a real refusal, since the child
+        writes its signature and closes stdout at once -- so a caller that reads a
+        latch straight off that failure can win the race and see ``False`` for a
+        line already in the pipe.
+
+        Bounded and swallowing, because the caller is already on a failure path:
+        the worst case of not settling is the generic error it would have produced
+        anyway, and no failure here may become a second failure. The same shape
+        and the same budget as ``AcpClient._read_message``'s own EOF drain.
+        """
+        task = self._stderr_task
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except (Exception, asyncio.CancelledError):
+            pass
+
+    def saw_sandbox_init_failure(self) -> bool:
+        """True if an OS sandbox told this runtime's child it could not initialize.
+
+        Lets callers translate a runtime death into ``AcpSandboxInitFailed`` -- a
+        non-retryable error naming the layer that refused and its switch --
+        instead of a generic process-death error the retry ladder then reproduces
+        on a host that will refuse identically. Parity with
+        :meth:`saw_not_logged_in`, including reading the latch rather than the
+        ring buffer.
+        """
+        return self._saw_sandbox_init_failure
+
+    @property
+    def sandbox_wrapped_by_crew(self) -> bool:
+        """Whether Kiro Crew's own sandbox wrapped this runtime's child.
+
+        The one fact a sandbox refusal's stderr cannot carry: WHICH layer to turn
+        off. A harness's internal sandbox nested inside Crew's wrap fails with the
+        harness's wording while the layer the operator must change is Crew's.
+        """
+        return self._sandbox_wrapped_by_crew
+
+    def redacted_stderr_tail(self) -> str:
+        """The retained stderr lines, newline-joined and redacted.
+
+        A SEPARATE reader from :meth:`death_summary`, which exists to be read by a
+        person: it folds the same lines onto one line behind a ``returncode``
+        prefix. Anything that classifies PER LINE -- the launcher's own refusal
+        test -- sees nothing in that shape, so it needs the lines as lines.
+
+        Redacted like every other path out of this buffer: child stderr is
+        untrusted subprocess output that can echo a credential. Empty for a
+        restricted session, which retains nothing.
+        """
+        if not self._stderr_lines:
+            return ""
+        tail = "\n".join(self._stderr_lines)
+        tail, _ = redact_exfiltration_urls(tail)
+        tail, _ = redact_credentials(tail)
+        return tail
+
+    @property
+    def sandbox_mode(self) -> str:
+        """The sandbox tier this runtime's child was spawned under."""
+        return self._sandbox_mode
+
+    @property
+    def sandbox_hidden_dirs(self) -> tuple[str, ...]:
+        """The extra path masks this spawn asked its sandbox for.
+
+        Read with :attr:`sandbox_mode` when a trusted corroboration run has to
+        rebuild the profile this spawn was actually refused under.
+        """
+        return self._sandbox_hidden_dirs
+
     def _exit_reason(self, rc: object) -> str:
         """The death reason for a process that exited: rc plus what it last said.
 
@@ -4301,6 +4485,9 @@ class AcpRuntime:
         if self._dead:
             raise AcpRuntimeDead("runtime is dead")
 
+        projection = getattr(self, "_native_skill_projection", None)
+        if projection is not None:
+            params = projection.request(method, params)
         req_id = self._next_id
         self._next_id += 1
 
@@ -4844,6 +5031,14 @@ class AcpRuntime:
                 await self.terminate_session(session_id)
                 raise AcpRuntimeError(str(exc)) from exc
         try:
+            if getattr(self, "_native_skill_projection", None) is not None:
+                from kiro_crew.acp.skill_projection import prepare_native_skill_projection
+
+                # Keep the transport mode selected at spawn for this process.
+                # The rollback environment switch takes effect after restart.
+                self._native_skill_projection = await asyncio.to_thread(
+                    prepare_native_skill_projection, self._work_dir, enabled=True
+                )
             # set_mode is a handshake request: switching to an agent boots THAT
             # agent's MCP servers, the same server (re-)initialization that gives
             # session/new and session/load their 90s budget. A switched-to server
@@ -5244,12 +5439,28 @@ class AcpRuntime:
         if self.acp_backend == ACP_BACKEND_KIRO:
             from kiro_crew.acp.session_mcp import kiro_control_plane_servers
 
+            projection = getattr(self, "_native_skill_projection", None)
+            projection_kwargs: dict[str, Any] = (
+                {"spec_override": projection.specs.get(agent or self._agent)}
+                if projection is not None
+                else {}
+            )
             native = await asyncio.to_thread(
                 kiro_control_plane_servers,
                 agent,
                 work_dir=work_dir,
                 existing_names={str(entry.get("name")) for entry in entries},
+                **projection_kwargs,
             )
+            if (
+                projection is not None
+                and (agent or self._agent) in projection.search_agents
+                and not any(entry.get("name") == "kirocrew-core" for entry in [*entries, *native])
+            ):
+                raise AcpRuntimeError(
+                    "Cannot bind skill_search to this session without losing native MCP restrictions. "
+                    "Check the agent's kirocrew-core server configuration."
+                )
             return [*entries, *native]
         return entries
 
@@ -5897,6 +6108,18 @@ class AcpRuntime:
         # session live in the shared process with no handle returned to anyone.
         # Only a cancellation can reach this arm; the scan swallows its own
         # failures.
+        #
+        # Startup is over by this point: session/new has succeeded, which is the
+        # proof no sandbox refusal on the way here was fatal. So the startup latch
+        # is spent, and spending it -- rather than merely ceasing to arm it -- is
+        # what makes every consumer correct by construction: a translator reached
+        # after this can only ever see False, so none of them re-derives the window.
+        #
+        # First session only. A later session/new on a warm runtime is ordinary
+        # mid-life work, and a refusal its child prints then says nothing about
+        # whether the agent process can start.
+        self._first_session_ready = True
+        self._saw_sandbox_init_failure = False
         try:
             await self._snapshot_descendants()
         except BaseException:
@@ -6373,6 +6596,9 @@ class AcpRuntime:
         req_id = self._next_id
         self._next_id += 1
 
+        projection = getattr(self, "_native_skill_projection", None)
+        if projection is not None:
+            params = projection.request(method, params)
         req = JsonRpcRequest(method=method, params=params, id=req_id)
         data = json.dumps(req.to_dict()) + "\n"
 
@@ -6483,6 +6709,30 @@ class AcpRuntime:
                     # surfaced where it is actionable instead -- as AcpAuthRequired.
                     if not self._saw_auth_failure and is_auth_failure_output(text):
                         self._saw_auth_failure = True
+                    # Same sink, same reason as the auth latch: matched
+                    # unconditionally (not only when ``recording_allowed``), so a
+                    # restricted session that retains no stderr still gets the
+                    # actionable classification rather than a bare exit code.
+                    #
+                    # SCOPED TO THE PRE-INITIALIZE WINDOW, unlike the auth latch,
+                    # and the asymmetry is the point. A rejected credential does
+                    # not un-reject itself, so latching it for the runtime's life
+                    # is correct. This signature is not that: the child's OWN
+                    # sandbox can refuse mid-life when the HARNESS spawns a tool
+                    # subprocess, which says nothing about whether the agent
+                    # process can start. A life-long latch would turn the next
+                    # unrelated death -- a broken pipe, an OOM kill -- into a
+                    # permanent "your sandbox is broken", and permanently is
+                    # exactly how long the wrong verdict would last. A refusal
+                    # that genuinely stops the child from starting is always
+                    # printed before ``initialize`` completes, so the window that
+                    # matters closes there.
+                    if (
+                        not self._first_session_ready
+                        and not self._saw_sandbox_init_failure
+                        and is_sandbox_init_failure_output(text)
+                    ):
+                        self._saw_sandbox_init_failure = True
                     if self.recording_allowed:
                         logger.debug("stderr: %s", text[:200])
         except asyncio.CancelledError:

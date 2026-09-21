@@ -98,7 +98,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -389,6 +389,21 @@ _pinned: "dict[str, int]" = {}
 #: call left open by one turn and closed under the next one's ordinal is a
 #: false statement about a turn that never used the tool.
 _tool_started: "OrderedDict[tuple[str, str], tuple[float, str, str, int, int, int]]" = OrderedDict()
+#: (session, call_id) -> the turn the call was settled in. A tool call settles
+#: exactly ONCE: the first terminal frame writes its closer, and a later frame for
+#: the same id must add nothing. Both update parsers can emit a status-only result
+#: for one terminal frame, so two closers for the same call is a live hazard rather
+#: than a corner case. Popping ``_tool_started`` alone cannot tell "already settled
+#: by us" from "never opened" -- both find no started record -- so this set records
+#: the calls this emitter has closed. A frame whose id is in here is dropped; a
+#: frame whose id is in NEITHER map is a call whose ``tool/called`` was never
+#: recorded and still gets its closer, with empty name/server/elapsed as before.
+#: Pruned on the SAME lifecycle as ``_tool_started``: per turn in ``_release_live``,
+#: for a closed session's orphaned turns in ``on_session_closed``, and wholesale in
+#: ``reset_caches``. Its CAP is its own, ``_bound_settled_tools``, because a marker
+#: accumulates per completed call where a started record is popped by one, so the
+#: shared never-evict-a-live-turn rule would leave this map growing for a whole turn.
+_settled_tools: "OrderedDict[tuple[str, str], int]" = OrderedDict()
 #: session -> the appends waiting to be written, in the order they were made.
 #: Producers only ever append here; the writer prepends a batch it could not
 #: write. Keyed per session because each session is a separate file, so one slow
@@ -510,6 +525,17 @@ _shutdown_started: float = 0.0
 #: is the only thing a reader wants from it. Keyed per session, not per turn,
 #: because the configuration outlives a turn.
 _last_config: "OrderedDict[str, tuple[Any, ...]]" = OrderedDict()
+#: session -> the last class this process stated for it, as ``(memory, app,
+#: channel)``. ``session/class`` is a CHANGE record for the same reason
+#: ``request/configured`` is: the class holds still for the whole life of most
+#: sessions, and restating it every turn would bury the turn where it moved.
+#:
+#: A MISSING entry is treated as a change rather than as agreement, so the bound
+#: below can cost a redundant line but never a missed restriction. That direction
+#: is deliberate: the fold that reads these entries takes the most restrictive
+#: value each member ever held, so a duplicate changes no verdict, while a
+#: dropped transition would silently widen who may read the log.
+_last_class: "OrderedDict[str, tuple[str, str, bool, str]]" = OrderedDict()
 #: session -> {turn ordinal -> the highest attempt opened at it}. A regenerate or
 #: a rewind reruns a turn the ordinal already names, so without this two starts
 #: at one ordinal are indistinguishable and a fold cannot tell a retry from a
@@ -745,7 +771,9 @@ def reset_caches() -> None:
         _live.clear()
         _pinned.clear()
         _tool_started.clear()
+        _settled_tools.clear()
         _last_config.clear()
+        _last_class.clear()
         _attempts.clear()
         _child_origin.clear()
         _pending.clear()
@@ -2036,6 +2064,13 @@ def _release_live(session_id: str, turn: int) -> None:
     global _live_overage_reported
     if _live.pop((session_id, int(turn)), None) is None:
         return
+    # The turn is gone, so its settled-tool markers can go too: a later frame for
+    # one of its calls can only be a duplicate of a closer already written, and the
+    # turn's own state is what a duplicate would have keyed on. Pruning here keeps
+    # ``_settled_tools`` on the same lifecycle as ``_tool_started`` rather than
+    # relying on the bound alone.
+    for key in [k for k, t in _settled_tools.items() if k[0] == session_id and t == int(turn)]:
+        _settled_tools.pop(key, None)
     remaining = _pinned.get(session_id, 0) - 1
     if remaining > 0:
         _pinned[session_id] = remaining
@@ -2151,6 +2186,37 @@ def _bound_unpinned(
         )
 
 
+def _bound_settled_tools() -> None:
+    """Trim ``_settled_tools`` to its cap, OLDEST first. Called with ``_lock`` held.
+
+    This map is the one exception to :func:`_bound_unpinned`'s never-evict-a-live-turn
+    rule, and what an entry MEANS is why. Every other map holds state a later event of
+    the same turn has to read back -- a handle, a step ordinal, an open call's start
+    time -- so evicting one mid-turn corrupts that turn's own record, which is why the
+    shared rule lets a store overshoot instead. A settle marker carries only "a closer
+    for this id is already written", and the frames it suppresses come from two parsers
+    reading the SAME terminal frame, so a duplicate arrives beside its original. The
+    youngest markers are therefore the ones doing the work and the oldest are the ones
+    worth spending. Under the shared rule the map would instead grow for the whole of
+    any turn that makes more calls than the cap, since the turn stays pinned and no
+    marker is popped until it ends -- unlike ``_tool_started``, whose entries are popped
+    by each call's own completion. The cost of a dropped marker is bounded and visible:
+    at worst a second ``tool/completed`` for a call whose duplicate frame arrives after
+    the cap's worth of later calls have settled.
+    """
+    dropped = 0
+    while len(_settled_tools) > _MAX_PENDING_TOOLS:
+        _settled_tools.popitem(last=False)
+        dropped += 1
+    if dropped:
+        logger.debug(
+            "session log dropped %d settled tool marker(s) at the %d cap: a "
+            "duplicate terminal frame for one of them would write a second closer",
+            dropped,
+            _MAX_PENDING_TOOLS,
+        )
+
+
 def _mint_call_index(session_id: str, turn: int) -> int:
     """The next TOOL-CALL ordinal inside *turn*. Caller's thread.
 
@@ -2233,7 +2299,8 @@ def _seed_attempts(session_id: str, log: Any) -> None:
     """
     highest: dict[int, int] = {}
     try:
-        for entry in log.iter_from(1):
+        # Like read_page, this best-effort scan keeps readable records; folds still refuse seq damage.
+        for entry in log.iter_from(1, strict_seq=False):
             if entry.type != "turn/started":
                 continue
             turn = entry.data.get("turn")
@@ -2310,6 +2377,15 @@ def close_open_tool_calls(
             for (sid, call_id), started in list(_tool_started.items())
             if sid == session_id and started[5] == int(turn)
         ]
+        # The sweep IS this call's closer, so mark each one settled: a terminal
+        # frame arriving after the sweep closed the call must not write a second
+        # ``tool/completed``. Same settle-once rule as ``on_tool_completed``, so a
+        # late duplicate is dropped there once its id is in this set.
+        for call_id, _ in stale:
+            _settled_tools[(session_id, call_id)] = int(turn)
+            _settled_tools.move_to_end((session_id, call_id))
+        if stale:
+            _bound_settled_tools()
     closed = 0
     for call_id, started in stale:
         began, name, server, call_index, step, _ = started
@@ -2484,6 +2560,145 @@ def _write(
     _submit(_job, f"appending {entry_type}", session_id, after=after)
 
 
+def _latch_class(session_id: str, observed: "tuple[str, str, bool, str]") -> None:
+    """Remember the class a line just stated for *session_id*.
+
+    Called only AFTER the entry carrying it is on disk, for the reason
+    ``on_request_configured`` gives about its own fingerprint: committing the
+    value before the append would let one transient failure suppress every later
+    statement of the same class, leaving the log permanently without the record.
+    """
+    with _lock:
+        _last_class[session_id] = observed
+        _last_class.move_to_end(session_id)
+        _bound_unpinned(_last_class, _MAX_OPEN_CREW_LOGS, lambda k: k, "session classes")
+
+
+def _note_class_change(
+    session_id: str, log: Any, observed: "tuple[str, str, bool, str] | None"
+) -> None:
+    """Append ``session/class`` when *observed* is not what this log last stated.
+
+    The class recorded when a log is opened is true of that instant, and a session
+    can be given a channel surface, an app owner or a different memory mode while
+    it runs. A reader deciding whether one session may read this log has to be able
+    to see that, and for a session that has closed the log is the only thing left
+    to see it in -- so a move is recorded here rather than left to a live lookup
+    that will not be available when the question is asked.
+
+    ``observed`` is ``None`` when the caller supplied no memory mode. Nothing is
+    written then, matching the opening entry: a log that states no class refuses
+    every test built on one, and appending a transition to it would leave a log
+    whose class history has a middle but no beginning.
+
+    A latch MISS appends rather than seeds. The latch is bounded, so an eviction
+    is possible while the log stays open, and the two directions are not
+    symmetric: a redundant line cannot change a fold that takes the most
+    restrictive value each member ever held, while a skipped one silently widens
+    who may read the log.
+    """
+    if observed is None:
+        return
+    with _lock:
+        known = _last_class.get(session_id)
+    if known == observed:
+        return
+    memory, app, channel, workspace = observed
+    data: dict[str, Any] = {"memory": memory}
+    if app:
+        data["app"] = app
+    if channel:
+        data["channel"] = True
+    if workspace:
+        data["workspace"] = workspace
+    log.append("session/class", data, src=_SRC_GATEWAY)
+    _latch_class(session_id, observed)
+
+
+def on_class_observed(
+    session_id: str,
+    *,
+    memory: str = "",
+    app: str = "",
+    channel: bool = False,
+    workspace: str = "",
+) -> None:
+    """Record that this session's CLASS is now *(memory, app, channel, workspace)*.
+
+    For the moment a class becomes true rather than the moment someone next samples
+    it. The per-turn observation in :func:`on_session_opened` cannot see a channel
+    link that commits and is removed inside ONE turn, and content authored through
+    that link is in the log with nothing saying it was published -- so the surfaces
+    that COMMIT a link call this instead of waiting to be sampled.
+
+    Writes nothing when the class has not moved, and nothing at all when *memory* is
+    empty: a log that states no class refuses every test built on one, and appending a
+    transition to it would leave a history with a middle and no beginning.
+
+    Returns without waiting, like every other emitter here, which is what lets a
+    caller holding a lock use it. That is safe because a write this writer permanently
+    loses is itself recorded, and the class fold reads a dropped write as a hole -- so
+    a lost move costs a refusal rather than a silent grant.
+    """
+    if not session_id or not memory:
+        return
+    observed = (memory, app, channel, workspace)
+
+    def _job() -> None:
+        log = _handle(session_id)
+        if log is None:
+            return
+        _note_class_change(session_id, log, observed)
+
+    _submit(_job, "appending session/class", session_id)
+
+
+def _candidate_is_same_slot(candidate_sid: str, slot: str) -> bool:
+    """Whether *candidate_sid*'s crew log records *slot* as its own.
+
+    ``previous`` means the crew log the SAME slot was writing, and the reference
+    says so, but the id reaches this emitter from the slot-to-session mapping --
+    a persisted file whose entry can be stale or recycled by the time a successor
+    cold-starts. So the invariant is CHECKED rather than assumed, against the
+    candidate's own header, which is written once at create and never rewritten.
+    Comparing the mapping against itself would prove nothing; the header is the
+    crew log's own statement about which slot it belongs to.
+
+    Answering False on any failure is deliberate, because an edge is worth writing
+    only when the two crew logs are KNOWN to be one slot's. A candidate whose
+    header cannot be read -- retention removed the crew log, or its header line is
+    unreadable -- is not known to be this slot's, and sending a reader down an
+    unverified edge lands it somewhere this slot never wrote, which is worse than
+    ending the walk one link early. A session with no slot has no slot identity to
+    match, so it gets no edge either.
+
+    ``unit_header_slot`` is the accessor rather than ``CrewLog.open`` because this
+    path must not write, and ``open`` does: its torn-tail truncation is
+    unconditional, deliberately so, since trailing bytes that are not a whole line
+    are not a record. Harmless in itself, and still wrong here -- a verification
+    read would take the crew log's lock and rewrite a candidate's file while asking
+    for nothing but one field. The accessor states the opposite contract, no lease
+    and nothing written, and its ``None`` means "cannot prove" rather than "no such
+    field", which is the refusal this function already wanted. It is also stricter
+    than ``open``: it refuses a linked directory, and a header whose own ``id`` does
+    not fold back to the directory holding it, both of which would let one store
+    answer for another unit. Its own docstring names this caller's position exactly
+    -- a unit id reached through a channel the caller does not fully trust.
+
+    Nothing is caught here because the accessor answers ``None`` for every
+    unreadable-crew-log case itself, down to the directory walk and the header
+    parse. Anything it still raises is a bug in this module, and it belongs in the
+    log rather than swallowed into a permanently silent "not the same slot", which
+    would read exactly like a correct refusal while disabling the check for every
+    slot at once.
+    """
+    if not slot or not candidate_sid:
+        return False
+    from kiro_crew.crew_log.store import unit_header_slot
+
+    return unit_header_slot(_KIND, candidate_sid) == slot
+
+
 def on_session_opened(
     session_id: str,
     *,
@@ -2496,6 +2711,11 @@ def on_session_opened(
     resumed: bool = False,
     parent_slot: str = "",
     parent_sid: str = "",
+    memory: str = "",
+    app: str = "",
+    channel: bool = False,
+    workspace: str = "",
+    previous_sid: str = "",
 ) -> None:
     """Create the crew log if this session has none, then echo its header.
 
@@ -2549,6 +2769,42 @@ def on_session_opened(
     crew log in an entry that can never be corrected. Both empty means nobody
     created this session (a person's own tab, a fork) and no ``parent`` is
     written at all, so a fold can tell "no creator" from "creator unknown".
+
+    ``memory``, ``app`` and ``channel`` record WHAT KIND of session this log
+    belongs to: the slot's memory mode verbatim, the app that owns it if one does,
+    and whether its conversation is published to a messaging channel by a link or
+    a mirror. They are written as one ``class`` object and only when ``memory`` is
+    given, which makes that member the witness that the class was recorded -- so a
+    reader can tell a session with nothing to declare from a log written before
+    this existed, and must refuse rather than assume on the second.
+
+    They belong on the record rather than in a live lookup because the question
+    they answer -- may another session read this log -- is asked about sessions
+    that have CLOSED, and a closed session has no slot left to ask. They are also
+    facts and not a verdict: recording "readable" would freeze this build's reading
+    of a rule into an entry that can never be corrected. The facts are true when
+    the log is opened; a class a session ACQUIRES later (a channel link added
+    mid-conversation) is not in them, so a reader that can also see the live
+    session applies both and refuses on either.
+
+    ``previous_sid`` names the crew log this SLOT was writing before, and it
+    answers the continuity ``resumed`` cannot. ``resumed`` is true only when this
+    claim re-attached to the same crew log; when the ACP session was instead torn
+    down and a successor cold-started, the successor has a different id and
+    therefore a different unit, and nothing in the record joined the two. So a
+    ``create`` that is handed a DIFFERENT prior id writes ``previous {sid}``, and
+    the comparison is made here rather than trusted from the caller: on the resume
+    path the prior id and this one are the same store, and an edge pointing at
+    itself would make a chain walker loop. Empty, or equal to this session, means
+    no edge is written -- the slot's first crew log, and a predecessor the gateway
+    could not name, are both "nothing to follow" rather than a store with an empty
+    name.
+
+    The edge is a citation and nothing more: this entry records which store came
+    before, and no writer here touches that store. Closing a superseded store's own
+    dangling turn and tool calls needs a same-slot check on the candidate and a
+    deferral that can be resumed, so it is tracked separately rather than attempted
+    from this job.
     """
     if not session_id or not enabled():
         return
@@ -2561,12 +2817,14 @@ def on_session_opened(
     # owes the release and the file still shows that turn open until the entry
     # lands.
     _release_session_live(session_id)
-    # Latched on the FIRST attempt and read back on every later one. The decision
-    # below is derived from filesystem state this job itself changes: a retry after
+    # Latched on the FIRST attempt and read back on every later one. The decisions
+    # below are derived from filesystem state this job itself changes: a retry after
     # the header landed but the entry did not finds ``exists`` true and ``created``
     # false, so an unlatched decision would flip to "nothing new to say" and skip
-    # the entry it still owes -- permanently, and without counting the loss.
-    announce: "dict[str, bool]" = {}
+    # the entry it still owes -- permanently, and without counting the loss. It
+    # holds the supersede edge too, which is a session id rather than a flag, so
+    # the values are not all bools.
+    announce: "dict[str, Any]" = {}
 
     def _job() -> None:
         created = False
@@ -2635,7 +2893,44 @@ def on_session_opened(
             )
             created = True
         _remember(session_id, log)
+        # The class as observed for THIS turn. The caller reads it off the live slot
+        # on every turn rather than only the first, which is what lets a class the
+        # session acquires LATER reach the log at all.
+        observed = (memory, app, bool(channel), workspace) if memory else None
+        # Latched on the FIRST attempt and read back on every later one, exactly like
+        # ``owed`` below and for the same reason: the decision is derived from
+        # filesystem state this job itself changes, so a retry after the header
+        # landed reads ``exists`` true and ``created`` false, and an unlatched edge
+        # would be dropped there -- silently, and permanently, while the entry it
+        # belongs to still gets written. The latch holds the ID rather than a flag,
+        # so the retry writes the edge the first attempt decided on, and an empty
+        # string is a latched "no edge" that nothing downstream re-tests.
+        #
+        # ``created`` is part of the condition, not just the ``previous_sid``
+        # comparison. A re-attach has a store already, so the unit the caller names
+        # is either this same one or an unrelated one that may still be LIVE, and
+        # repairing that is how a running turn gets an outcome it never had.
+        superseded = announce.setdefault(
+            "superseded",
+            (
+                previous_sid
+                if (
+                    created
+                    and previous_sid
+                    and previous_sid != session_id
+                    and _candidate_is_same_slot(previous_sid, slot)
+                )
+                else ""
+            ),
+        )
         if not announce.setdefault("owed", created or bool(resumed)):
+            # Nothing new to say about the OPENING, which is what this entry
+            # records. A class that has moved since the last statement of it is
+            # something new to say about the session, and it goes out as its own
+            # entry rather than as a second opening entry: the opener is read as
+            # what the session was CREATED as, and a fold over the transitions
+            # after it is what gives a reader the whole life.
+            _note_class_change(session_id, log, observed)
             return
         data: dict[str, Any] = {
             "agent": agent or _DEFAULT_AGENT,
@@ -2657,6 +2952,10 @@ def on_session_opened(
             # string and cannot lose the requested/served pair. The entry states two
             # facts and infers nothing: what the gateway asked for, and what serves.
             data["model_requested"] = model_requested
+        if superseded:
+            # No ``slot`` inside: it is the slot in ``data.slot``, and repeating it
+            # would invite a reader to trust a second copy of one fact.
+            data["previous"] = {"sid": superseded}
         if parent_slot:
             # Written only when there IS a creator, and ``sid`` only when the
             # creator still had a live handle: an empty string in either place
@@ -2665,7 +2964,40 @@ def on_session_opened(
             if parent_sid:
                 parent["sid"] = parent_sid
             data["parent"] = parent
+        if memory:
+            # The class of session this log belongs to, as facts. Written only when
+            # the caller supplied ``memory``, which every live slot has: that makes
+            # one member the witness that the class was recorded at all, so a reader
+            # can tell "recorded, and nothing applies" from "not recorded", and an
+            # object that is never empty carries that distinction without a flag
+            # saying so. A caller that passes no memory mode -- a test fixture, an
+            # older build's log -- records no class, and a reader that needs one
+            # must refuse rather than read the absence as "nothing applies".
+            #
+            # These live HERE, on the opening entry, because the crew log is the
+            # authoritative record of a session and the question they answer is
+            # asked about sessions that have CLOSED. A gate that read them from the
+            # live slot instead can answer only for a session still being served,
+            # which is the one case it does not need.
+            #
+            # Facts, not a verdict: what owns the session, whether it keeps memory,
+            # whether its conversation is published to a channel. A verdict recorded
+            # here would be this build's reading of a rule that may change, and the
+            # entry cannot be rewritten.
+            session_class: dict[str, Any] = {"memory": memory}
+            if app:
+                session_class["app"] = app
+            if channel:
+                session_class["channel"] = True
+            if workspace:
+                session_class["workspace"] = workspace
+            data["class"] = session_class
         log.append("session/opened", data, src=_SRC_GATEWAY)
+        if observed is not None:
+            # This line states the class, so it is also what later turns compare
+            # themselves against. Seeding it here is what stops the first warm turn
+            # from restating an unchanged class as though it had moved.
+            _latch_class(session_id, observed)
 
     def _flag_creation_failed() -> None:
         # The creating record died with no crew log file behind it: no later append
@@ -3453,7 +3785,23 @@ def on_tool_completed(
     step = 0
     if call_id:
         with _lock:
+            # A tool call settles exactly ONCE. Both update parsers can produce a
+            # status-only terminal frame for the same id, so a second frame arriving
+            # after the first closed the call must add NOTHING -- otherwise one call
+            # gets two ``tool/completed`` entries. The distinction that matters is
+            # "already settled by us" (drop) versus "never opened" (still write): a
+            # missing ``_tool_started`` record alone cannot separate them, because
+            # the first frame POPS that record, so a settled set records the ids this
+            # emitter has closed. A frame whose id is in ``_settled_tools`` is a
+            # duplicate and returns here; a frame whose id is in neither map is a
+            # call whose ``tool/called`` we never saw, which still gets its closer
+            # with empty name/server and no elapsed, exactly as before.
+            if (session_id, call_id) in _settled_tools:
+                return
             started = _tool_started.pop((session_id, call_id), None)
+            _settled_tools[(session_id, call_id)] = int(turn)
+            _settled_tools.move_to_end((session_id, call_id))
+            _bound_settled_tools()
         if started is not None:
             began, called_name, called_server, called_index, called_step, _ = started
             elapsed_ms = max(0, int((time.monotonic() - began) * 1000))
@@ -4101,6 +4449,117 @@ def on_compaction_applied(
     )
 
 
+def on_ledger_recorded(session_id: str, data: dict[str, Any]) -> None:
+    """Append ONE ``ledger/recorded`` entry -- a session's own durable work state.
+
+    The write half of the session ledger. Every field the caller set rides on this
+    single entry, including the event that explains a phase change, so the rule
+    that a phase never moves without a logged reason is a property of one append
+    rather than of two writes that a crash can separate.
+
+    Queued through the same writer as every other entry, deliberately. The ledger
+    could not open the file itself: an append takes that unit's WRITE OWNERSHIP,
+    and while the emitter holds this session's handle a second handle in this
+    process is refused -- so a ledger that wrote around the emitter would fail for
+    exactly the sessions that are running. Going through the writer also keeps this
+    entry ordered against the turn it was recorded inside.
+
+    The caller is the one that establishes the session has a crew log to write to;
+    this is the ordinary ``_write``, so a session without one is a policy no-op
+    here and the refusal belongs where a user can be told about it.
+    """
+    _write(session_id, "ledger/recorded", data, src=_SRC_GATEWAY)
+
+
+def ledger_entry_fits(data: dict[str, Any]) -> bool:
+    """Whether *data* would fit one ``ledger/recorded`` entry.
+
+    Beside the write rather than inside it, because the two answers have different
+    owners. ``_write`` is a policy no-op for a session with no crew log and refuses an
+    oversized entry by COUNTING it -- both correct there, since it serves callers that
+    cannot act on either. The ledger's caller can act on this one: an entry over the
+    ceiling by construction can never land, so the record it would report as taken
+    never exists, and only that caller can turn the refusal into an answer a user sees.
+
+    It asks the same question the append will, through the same serializer with the
+    same entry type and src, so the two cannot disagree about what fits. Not a
+    reservation: a later entry does not make this one smaller, and nothing else
+    consumes the budget.
+    """
+    return _entry_line_fits("ledger/recorded", data, src=_SRC_GATEWAY)
+
+
+def on_object_observed(
+    session_id: str,
+    *,
+    producer: str,
+    kind: str,
+    target: str,
+    fingerprint: str,
+    facts: "Mapping[str, Any]",
+    observed_at: float,
+) -> None:
+    """Record the state of an object outside the session, as *producer* observed it.
+
+    The producer half of the crew log's external-state record. A structured
+    monitor's probe computes a canonical snapshot of the pull request it watches
+    and, before this, threw that snapshot away once the wake was decided. This
+    appends it into the OWNER session's log -- the session the monitor works for --
+    so "what state is that pull request in" becomes a typed read beside the holder
+    fold's "which session holds it", instead of a text search over whatever an
+    agent happened to say about it.
+
+    *producer* is refused outside
+    :data:`~kiro_crew.crew_log.entry_types.OBJECT_PRODUCERS`, and refused HERE
+    rather than coerced. The value is the point of the entry: a reader trusts a
+    measured record because it can see which mechanism measured it, and a producer
+    coerced to some default would attribute the record to a mechanism that did not
+    make it. The ``ValueError`` is a programming error surfaced at the site that
+    made it; the registry's closed enum behind this is the guard a caller cannot
+    skip by writing around this function.
+
+    The caller decides WHEN: one call per change of the probe's fingerprint, never
+    one per poll, so the log holds distinct states rather than a heartbeat.
+
+    *facts* is recorded verbatim. When the whole line would cross the store's
+    ceiling -- a review host reporting hundreds of long check identities can do
+    it -- the largest members are removed until it fits and are named in
+    ``facts_omitted``, so the record is short by a NAMED part rather than lost
+    whole or silently trimmed. Recording nothing was rejected: the change
+    happened, and a reader that finds no entry cannot tell "unchanged" from
+    "did not fit".
+    """
+    from kiro_crew.crew_log.entry_types import OBJECT_PRODUCERS
+
+    if producer not in OBJECT_PRODUCERS:
+        raise ValueError(
+            f"object/observed producer must be one of {list(OBJECT_PRODUCERS)}, not {producer!r}"
+        )
+    # Off is free: the fit loop below serializes the snapshot and reaches the
+    # storage package, work no disabled launch should do on the event loop.
+    if not session_id or not enabled():
+        return
+    snapshot: dict[str, Any] = dict(facts)
+    data: dict[str, Any] = {
+        "producer": producer,
+        "kind": str(kind),
+        "target": str(target),
+        "fingerprint": str(fingerprint),
+        "facts": snapshot,
+        "observed_at": float(observed_at),
+    }
+    omitted: list[str] = []
+    while snapshot and not _entry_line_fits("object/observed", data, src=_SRC_GATEWAY):
+        largest = max(
+            snapshot,
+            key=lambda name: len(json.dumps(snapshot[name], ensure_ascii=True, default=str)),
+        )
+        del snapshot[largest]
+        omitted.append(largest)
+        data["facts_omitted"] = omitted
+    _write(session_id, "object/observed", data, src=_SRC_GATEWAY)
+
+
 def on_session_closed(session_id: str, reason: str) -> None:
     """Record a session teardown and drop its cached state.
 
@@ -4168,6 +4627,19 @@ def on_session_closed(session_id: str, reason: str) -> None:
                 if k[0] == session_id and (session_id, rec[5]) not in _live
             ]:
                 _tool_started.pop(tool_key, None)
+            # Sweep this session's settled markers on the SAME rule, so a closed
+            # session leaves neither map behind: a marker whose turn is already gone
+            # from ``_live`` can only match a late duplicate of a closer already
+            # written, and the successor that reuses the id must settle its own
+            # calls afresh. Markers of turns still running are left to their own
+            # ``_release_live`` so a mid-teardown turn still suppresses its own
+            # duplicates.
+            for settled_key in [
+                k
+                for k, t in _settled_tools.items()
+                if k[0] == session_id and (session_id, t) not in _live
+            ]:
+                _settled_tools.pop(settled_key, None)
 
     _write(
         session_id,

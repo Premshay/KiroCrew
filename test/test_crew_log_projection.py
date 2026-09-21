@@ -10,6 +10,8 @@ batch implementation would be free to break.
 from __future__ import annotations
 
 import json
+import os
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -236,6 +238,24 @@ def _entries(handle: CrewLog) -> tuple:
 
 
 # --- the contract ---------------------------------------------------------
+
+
+def test_the_class_fold_is_registered_but_not_advertised():
+    """MUTATION-SENSITIVE: the class fold is machinery, not a panel value.
+
+    It must stay REGISTERED, because its one caller asks the registry for it by name
+    and that is what gives it the shared checkpoint, the incremental reuse and the
+    recreated-log guard. It must stay OUT of the advertised set, because nothing on a
+    client draws it: naming it there makes the growth push ship a frame per log growth
+    to every owner socket for no reader, and advertises a projection with no consumer.
+    Both halves are asserted, so neither drifts without this failing.
+    """
+    from kiro_crew import mcp_crew_log
+
+    assert "class" in crew_log.FOLD_NAMES
+    assert "class" in crew_log.INTERNAL_PROJECTION_NAMES
+    assert "class" not in crew_log.PROJECTION_NAMES
+    assert "class" not in mcp_crew_log.PROJECTION_NAMES
 
 
 @pytest.mark.parametrize("name", crew_log.PROJECTION_NAMES)
@@ -720,6 +740,206 @@ def test_fold_session_continues_from_an_earlier_bundle():
     assert second.projection("usage").value == crew_log.fold_usage(_entries(handle))
 
 
+def test_fold_session_incremental_refuses_a_backward_seq_like_a_fold_from_the_start():
+    """A non-advancing seq in the tail refuses BOTH ways -- never one way only.
+
+    The append-only writer cannot produce a duplicate or backward seq, so one
+    in the file is external damage. A fold from the start refuses it in
+    ``advance``. Without the walked-entry guard, an incremental read drops the
+    record below its resume seq unexamined and folds on -- two reads of the
+    same bytes disagree and a reader cannot tell which answer it is getting.
+    The guard in ``iter_from`` makes the incremental read refuse the same
+    damage with the same code.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+
+    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
+    last_line = path.read_bytes().splitlines(keepends=True)[-1]
+    with open(path, "ab") as damaged:
+        damaged.write(last_line)  # byte-identical copy: the last seq appears twice
+    _turn(handle, 2)  # a real turn past the damage, so the incremental read walks over it
+
+    with pytest.raises(CrewLogError) as from_start:
+        crew_log.fold_session(SESSION)
+    with pytest.raises(CrewLogError) as incremental:
+        crew_log.fold_session(SESSION, since=bundle)
+
+    assert from_start.value.code == lg.CODE_BAD_DATA
+    assert incremental.value.code == lg.CODE_BAD_DATA
+
+
+def test_fold_session_incremental_refuses_a_backward_tail_after_real_growth():
+    """A regressed physical tail cannot hide valid growth from a cached fold."""
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+
+    _turn(handle, 2)
+    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
+    earlier_line = next(
+        line
+        for line in path.read_bytes().splitlines(keepends=True)
+        if json.loads(line).get("seq") == bundle.last_seq
+    )
+    with open(path, "ab") as damaged:
+        damaged.write(earlier_line)
+
+    with pytest.raises(CrewLogError) as from_start:
+        crew_log.fold_session(SESSION)
+    with pytest.raises(CrewLogError) as incremental:
+        crew_log.fold_session(SESSION, since=bundle)
+
+    assert from_start.value.code == lg.CODE_BAD_DATA
+    assert incremental.value.code == lg.CODE_BAD_DATA
+
+
+def test_fold_session_incremental_refuses_same_size_rewrite_of_folded_seq():
+    """A same-size rewrite behind the resume point must invalidate the cache."""
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+
+    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
+    before = path.stat()
+    lines = path.read_bytes().splitlines(keepends=True)
+    damaged = json.loads(lines[-2])
+    damaged["seq"] = json.loads(lines[-3])["seq"]
+    replacement = (
+        json.dumps(damaged, ensure_ascii=True, separators=(",", ":"), sort_keys=False).encode()
+        + b"\n"
+    )
+    assert len(replacement) == len(lines[-2])
+    lines[-2] = replacement
+    path.write_bytes(b"".join(lines))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    assert path.stat().st_size == before.st_size
+
+    with pytest.raises(CrewLogError) as incremental:
+        crew_log.fold_session(SESSION, since=bundle)
+
+    assert incremental.value.code == lg.CODE_BAD_DATA
+
+
+def test_fold_session_incremental_refuses_older_segment_seq_regression():
+    """A seq regression in a NON-newest segment must invalidate the fast path.
+
+    ``handle.path`` names only the newest segment, so a fingerprint taken from
+    it alone never sees an older segment move -- the fast return would serve the
+    cached bundle while a cold fold refuses the log. The fingerprint covers the
+    whole segment set for exactly this case.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    _turn(handle, 2)
+    del handle
+
+    # Split the single-segment log into two valid segments: the head keeps the
+    # early records, ``log.<first_seq>.jsonl`` carries the tail. Each segment
+    # begins with the header line, as the raw walks expect.
+    head = lg.crew_log_path(lg.KIND_SESSION, SESSION)
+    lines = head.read_bytes().splitlines(keepends=True)
+    header, records = lines[0], lines[1:]
+    keep, moved = records[: len(records) // 2], records[len(records) // 2 :]
+    first_moved_seq = json.loads(moved[0])["seq"]
+    head.write_bytes(header + b"".join(keep))
+    (head.parent / f"log.{first_moved_seq}.jsonl").write_bytes(header + b"".join(moved))
+
+    handle = CrewLog.open(lg.KIND_SESSION, SESSION)
+    bundle = crew_log.fold_session(SESSION, log=handle)
+
+    # Regress a seq INSIDE the older segment, same byte length, and touch only
+    # that older file -- the newest segment never changes, which is what the
+    # newest-only fingerprint could not see.
+    before = head.stat()
+    old_lines = head.read_bytes().splitlines(keepends=True)
+    damaged = json.loads(old_lines[-1])
+    damaged["seq"] = json.loads(old_lines[-2])["seq"] if len(old_lines) > 2 else damaged["seq"]
+    replacement = (
+        json.dumps(damaged, ensure_ascii=True, separators=(",", ":"), sort_keys=False).encode()
+        + b"\n"
+    )
+    assert len(replacement) == len(old_lines[-1])
+    old_lines[-1] = replacement
+    head.write_bytes(b"".join(old_lines))
+    os.utime(head, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+
+    with pytest.raises(CrewLogError) as incremental:
+        crew_log.fold_session(SESSION, since=bundle)
+
+    assert incremental.value.code == lg.CODE_BAD_DATA
+
+
+def test_fold_session_unchanged_fast_path_does_not_walk_entries(monkeypatch):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+    calls = 0
+    original = CrewLog.iter_from
+
+    def counting(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CrewLog, "iter_from", counting)
+    unchanged = crew_log.fold_session(SESSION, since=bundle)
+
+    assert unchanged == bundle
+    assert calls == 0
+
+
+def test_fold_session_old_bundle_without_size_walks_once(monkeypatch):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+    old_bundle = replace(bundle, size=None)
+    calls = 0
+    original = CrewLog.iter_from
+
+    def counting(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CrewLog, "iter_from", counting)
+    refreshed = crew_log.fold_session(SESSION, since=old_bundle)
+
+    assert refreshed.projection("usage") == bundle.projection("usage")
+    assert refreshed.size is not None
+    assert refreshed.mtime_ns is not None
+    assert calls == 1
+
+
+def test_fold_session_old_bundle_without_mtime_walks_once(monkeypatch):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+    old_bundle = replace(bundle, mtime_ns=None)
+    calls = 0
+    original = CrewLog.iter_from
+
+    def counting(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CrewLog, "iter_from", counting)
+    refreshed = crew_log.fold_session(SESSION, since=old_bundle)
+
+    assert refreshed.projection("usage") == bundle.projection("usage")
+    assert refreshed.mtime_ns is not None
+    assert calls == 1
+
+
 def test_fold_session_rebuilds_when_the_log_is_shorter_than_the_bundle():
     """A recreated unit restarts seq, so continuing would swallow the new log.
 
@@ -833,7 +1053,7 @@ def test_known_types_is_the_declared_session_vocabulary():
 
 
 def test_the_fold_registry_and_the_public_name_list_agree():
-    assert tuple(crew_log._FOLDS) == crew_log.PROJECTION_NAMES
+    assert tuple(crew_log._FOLDS) == crew_log.FOLD_NAMES
 
 
 def test_a_ref_on_a_session_entry_is_left_to_the_page_path():
@@ -1047,6 +1267,92 @@ def test_fold_session_reuses_the_bundle_when_the_file_is_the_same():
     second = crew_log.fold_session(SESSION, since=first, log=handle)
     assert second.origin == first.origin
     assert second.projection("usage").value == crew_log.fold_usage(_entries(handle))
+
+
+def _rewrite_in_place(target, lines: list[str]) -> None:
+    """Replace *target*'s whole content, keeping its device and inode.
+
+    A removal and a create would hand the new file a new inode on most runs, and
+    then device and inode refuse the reuse on their own -- so a test written that
+    way is decided by whether the filesystem recycled the inode, and passes
+    without the identity it means to exercise. Truncating in place is the
+    recycled-inode case made deterministic: same device, same inode, different
+    file. The assertion below is what keeps it that way.
+    """
+    before = target.stat()
+    with target.open("w", encoding="utf-8") as handle:
+        for line in lines:
+            handle.write(line + "\n")
+    after = target.stat()
+    assert (after.st_dev, after.st_ino) == (
+        before.st_dev,
+        before.st_ino,
+    ), "the rewrite moved the file, so device and inode alone would refuse it"
+
+
+def test_the_file_identity_reads_the_creation_stamp_from_disk_not_from_the_handle():
+    """A handle's own header describes the file that existed when it was opened.
+
+    The identity exists to separate a recreated log from the one a reader started
+    on. Taken from the open handle, the stamp cannot do that: it is parsed once at
+    open and keeps answering for the replaced file, leaving device and inode as the
+    only live signal -- and those agree whenever the new file landed on the freed
+    inode, which is the common case. Here they are held IDENTICAL on purpose, so
+    only a stamp read from disk can tell the two files apart.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=1.0)
+    before = crew_log.log_origin(handle)
+    assert before is not None
+
+    lines = handle.path.read_text(encoding="utf-8").splitlines()
+    header = json.loads(lines[0])
+    header["createdAt"] = header["createdAt"] + 1
+    _rewrite_in_place(handle.path, [json.dumps(header), *lines[1:]])
+
+    after = crew_log.log_origin(handle)
+    assert after is not None, "a readable header is a provable identity"
+    assert after != before
+
+
+def test_a_log_recreated_under_a_held_handle_is_folded_again_rather_than_spliced():
+    """The caller passes its handle back in, so the reuse must not trust it.
+
+    ``fold_session`` takes ``log=`` from a caller that already holds one, which is
+    what makes this reachable without any race: the handle was opened before the
+    recreation, so a stamp read from it still names the retired file. The seq guard
+    passes because the new file is longer, so nothing else stands between the old
+    file's folded state and the new file's bytes -- the totals below are the old
+    turn plus part of the new ones, a number no file on disk ever held.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=1.0)
+    first = crew_log.fold_session(SESSION, log=handle)
+
+    # A different, longer log, written over the first one's bytes: the same id, a
+    # fresh creation stamp, and turns whose credits could not come from the file
+    # the bundle was folded from.
+    donor = _log("s-recreated")
+    _opened(donor)
+    for turn in (1, 2, 3):
+        _turn(donor, turn, credits=99.0)
+    body = donor.path.read_text(encoding="utf-8").splitlines()
+    header = json.loads(body[0])
+    header["id"] = SESSION
+    retired = json.loads(handle.path.read_text(encoding="utf-8").splitlines()[0])
+    header["createdAt"] = retired["createdAt"] + 1
+    _rewrite_in_place(handle.path, [json.dumps(header), *body[1:]])
+
+    settled = CrewLog.open(lg.KIND_SESSION, SESSION)
+    assert first.last_seq <= settled.last_seq, "the seq guard alone would allow the reuse"
+    honest = crew_log.fold_usage(_entries(settled))
+
+    rebuilt = crew_log.fold_session(SESSION, since=first, log=handle)
+
+    assert rebuilt.projection("usage").value == honest
+    assert rebuilt.origin is not None and rebuilt.origin != first.origin
 
 
 # --------------------------------------------------------------------------- #
@@ -1520,3 +1826,295 @@ def test_a_close_mid_turn_still_reports_the_turn_as_open():
     assert value["lifecycle"] == "closed"
     assert value["close_reason"] == "crashed"
     assert value["turn_open"] is True, "a turn nothing completed is still open"
+
+
+# --------------------------------------------------------------------------- #
+# class
+# --------------------------------------------------------------------------- #
+
+
+def _opened_with_class(handle: CrewLog, **members: Any) -> None:
+    """``session/opened`` carrying a ``class`` object, the shape the emitter writes."""
+    handle.append(
+        "session/opened",
+        {
+            "agent": "kirocrew",
+            "slot": "dashboard:1",
+            "model": "opus",
+            "cwd": "/w",
+            "owner": "raymond",
+            "resumed": False,
+            "class": {"memory": "persistent", **members},
+        },
+        src=GATEWAY,
+    )
+
+
+def _class_moved(handle: CrewLog, **members: Any) -> None:
+    handle.append("session/class", {"memory": "persistent", **members}, src=GATEWAY)
+
+
+def test_a_class_that_never_moved_folds_to_the_opening_one():
+    """The ordinary session: recorded, complete, and nothing restrictive.
+
+    This is the admitting case, so it is what stops the fold being satisfied by
+    something that simply reports every log as restricted.
+    """
+    handle = _log()
+    _opened_with_class(handle)
+
+    value = crew_log.fold("class", _entries(handle))
+    assert value["recorded"] is True
+    assert value["complete"] is True
+    assert value["channel"] is False
+    assert value["app"] == ""
+    assert value["memory"] == "persistent"
+
+
+def test_a_class_folds_to_the_most_restrictive_value_it_ever_held():
+    """MUTATION-SENSITIVE: restrictive-ever, not latest.
+
+    The log is published to a channel for one turn and then unpublished. Those turns
+    are still in this file, so a fold taking the LATEST value would report a log that
+    holds a third party's words as readable. Each member is checked separately
+    because they latch by different rules: ``channel`` is a flag, ``app`` keeps its
+    first owner, ``memory`` keeps its first non-persistent mode.
+    """
+    handle = _log()
+    _opened_with_class(handle)
+    _class_moved(handle, channel=True, app="travel-desk", memory="incognito")
+    _class_moved(handle)
+
+    value = crew_log.fold("class", _entries(handle))
+    assert value["channel"] is True, "a channel the log ever had stays recorded"
+    assert value["app"] == "travel-desk", "an app that ever owned it stays recorded"
+    assert value["memory"] == "incognito", "a non-persistent mode stays recorded"
+
+
+def test_a_history_with_only_moves_is_recorded_but_not_complete():
+    """MUTATION-SENSITIVE: ``complete`` is what says the history has a BEGINNING.
+
+    Retention can take the segment carrying the opening entry. What survives states a
+    class, so ``recorded`` is true and a reader keying on that alone would admit --
+    while the earliest class this log held is unknown. ``complete`` is separately
+    false, which is what a reader refuses on.
+    """
+    handle = _log()
+    _class_moved(handle)
+
+    value = crew_log.fold("class", _entries(handle))
+    assert value["recorded"] is True
+    assert value["complete"] is False
+
+
+def test_an_opener_with_no_class_object_records_nothing():
+    """A log written before the class was recorded, which must not read as unrestricted."""
+    handle = _log()
+    _opened(handle)
+
+    value = crew_log.fold("class", _entries(handle))
+    assert value["recorded"] is False
+    assert value["complete"] is False
+
+
+def test_a_class_object_with_no_memory_mode_is_refused_at_append():
+    """``memory`` is required INSIDE the object, so a fragment never reaches a log.
+
+    This is the strong half of the guarantee: the declaration enforces it, so a
+    well-formed log cannot carry a class whose memory mode is unknown.
+    """
+    handle = _log()
+    with pytest.raises(CrewLogError) as caught:
+        handle.append(
+            "session/opened",
+            {
+                "agent": "kirocrew",
+                "slot": "dashboard:1",
+                "model": "opus",
+                "cwd": "/w",
+                "owner": "raymond",
+                "resumed": False,
+                "class": {"channel": True},
+            },
+            src=GATEWAY,
+        )
+    assert "class.memory" in str(caught.value)
+
+
+def test_a_recorded_dropped_write_marks_the_history_damaged():
+    """MUTATION-SENSITIVE: the log's own admission that an append was lost.
+
+    The writer sheds nothing on backpressure, but it has hard ceilings for a
+    filesystem that has stopped answering, and an entry refused there is recorded as
+    ``write/dropped``. For a fold whose answer is an authorization ceiling that is a
+    hole: the lost append may have been the class move that restricted this session,
+    and nothing else records it.
+
+    This is what lets the RECORDER be best-effort where it is called. A class move is
+    handed to the writer without waiting, matching the listener contract it runs
+    under, and if it never reaches the file the log says so here -- so a move that was
+    lost cannot leave the log reading as permissive.
+    """
+    handle = _log()
+    _opened_with_class(handle)
+    handle.append("write/dropped", {"dropped_count": 1, "dropped_bytes": 120}, src=GATEWAY)
+
+    value = crew_log.fold("class", _entries(handle))
+    assert value["damaged"] is True
+    assert value["complete"] is True, "the beginning is intact; what is lost came later"
+
+
+def test_a_gap_in_the_seqs_marks_the_history_damaged():
+    """MUTATION-SENSITIVE: a hole in the MIDDLE, which the short-fold check cannot see.
+
+    The store skips an unreadable interior line on purpose and does not check interior
+    seq continuity -- one damaged record must not make a whole file unreadable. That is
+    right for a fold accumulating totals and wrong for this one: the skipped line can be
+    the sole record of a restriction, and the fold still reaches the file's tail, so
+    nothing stopped early and the short-fold refusal never fires. Only this fold's own
+    contiguity check sees it.
+
+    The entries are handed to the fold directly because a skipped line is exactly what
+    no writer produces: the seq that is missing was never delivered.
+    """
+    from kiro_crew.crew_log.schema import Entry
+
+    opener = Entry(
+        seq=1,
+        time=1000,
+        type="session/opened",
+        src=GATEWAY,
+        data={"class": {"memory": "persistent"}},
+    )
+    after_the_hole = Entry(
+        seq=3,
+        time=1002,
+        type="session/class",
+        src=GATEWAY,
+        data={"memory": "persistent"},
+    )
+
+    value = crew_log.fold("class", [opener, after_the_hole])
+    assert value["damaged"] is True, "seq 2 was never delivered, so a record is missing"
+    assert value["complete"] is True, "the log's beginning is intact; the hole is later"
+    assert value["channel"] is False, (
+        "the fold cannot invent what the lost line said -- which is why the reader "
+        "refuses on damage rather than on the value"
+    )
+
+
+def test_a_class_move_that_cannot_be_read_marks_the_history_damaged():
+    """MUTATION-SENSITIVE: a move whose content is unreadable is a hole, not a no-op.
+
+    Append validation refuses a fragment, so this line can only come from damage -- and
+    what a move entry says is its whole content, so skipping it discards the transition.
+    The direction it discards is always toward permissive, because a class move is worth
+    writing only when it restricts.
+    """
+    from kiro_crew.crew_log.schema import Entry
+
+    opener = Entry(
+        seq=1,
+        time=1000,
+        type="session/opened",
+        src=GATEWAY,
+        data={"class": {"memory": "persistent"}},
+    )
+    unreadable_move = Entry(
+        seq=2,
+        time=1001,
+        type="session/class",
+        src=GATEWAY,
+        data={"channel": True},
+    )
+
+    value = crew_log.fold("class", [opener, unreadable_move])
+    assert value["damaged"] is True
+    assert value["channel"] is False, "the unreadable move was not absorbed"
+
+
+def test_an_absent_class_object_is_a_date_not_a_hole():
+    """MUTATION-SENSITIVE: the control that keeps damage from swallowing AGE.
+
+    An opener with no ``class`` object at all is a log written before the field existed.
+    That is answered by ``complete`` staying false, and it must not also read as damaged:
+    if it did, every pre-field log would report a hole and the two reasons a reader
+    refuses -- too old to say, and missing a record -- would be indistinguishable in the
+    log. An unreadable object that is PRESENT is the damaged case, and the test above
+    covers it.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+
+    value = crew_log.fold("class", _entries(handle))
+    assert value["damaged"] is False, "an absent object is a date, not a hole"
+    assert value["complete"] is False
+
+
+def test_the_reader_treats_a_memory_less_class_as_nothing_stated():
+    """MUTATION-SENSITIVE: the reader defends itself rather than trusting the writer.
+
+    Append validation binds the WRITER, and a damaged segment or a planted line is
+    exactly the input that ignores it -- so the entries are handed to the fold
+    directly here, which is the only way to reach that line. A fragment must read as
+    nothing stated rather than as a class whose memory mode is unknown, otherwise it
+    would satisfy a reader's recorded-and-complete test.
+    """
+    from kiro_crew.crew_log.schema import Entry
+
+    planted = Entry(
+        seq=1,
+        time=1000,
+        type="session/opened",
+        src=GATEWAY,
+        data={"class": {"channel": True}},
+    )
+
+    value = crew_log.fold("class", [planted])
+    assert value["recorded"] is False
+    assert value["complete"] is False
+    assert value["channel"] is False, "no member is read off an object with no memory mode"
+    assert value["damaged"] is True, (
+        "the object is present and unreadable, which is a hole rather than a date -- "
+        "so a reader refuses on it even though nothing was stated"
+    )
+
+
+def test_a_later_opener_cannot_date_a_log_whose_first_one_stated_no_class():
+    """MUTATION-SENSITIVE: only the log's FIRST opener may supply its beginning.
+
+    A log carries an opening entry PER RE-ATTACHMENT, so an old log written before the
+    class was recorded gains a later opener that does state one the moment a current
+    build re-attaches to it. Reading that as the beginning would date the log by an
+    entry written long after the stretch whose class is unknown -- and everything in
+    that stretch is still in this file. ``complete`` therefore stays false, and the
+    reader refuses, even though the log now visibly states a class.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    _opened_with_class(handle)
+
+    value = crew_log.fold("class", _entries(handle))
+    assert value["recorded"] is True, "the later opener did state a class"
+    assert (
+        value["complete"] is False
+    ), "a later opener must not supply a beginning the log's own first one did not"
+
+
+def test_a_resume_cannot_widen_a_class_the_log_already_moved_away_from():
+    """A re-attach writes ``session/opened`` again, and it must not reset the history.
+
+    The same file gets a second opener with a clean class, which is truthful about the
+    session as re-attached and says nothing about the turns already in the log. The
+    fold is ever-held, so the earlier channel survives it.
+    """
+    handle = _log()
+    _opened_with_class(handle)
+    _class_moved(handle, channel=True)
+    _opened_with_class(handle)
+
+    value = crew_log.fold("class", _entries(handle))
+    assert value["channel"] is True
+    assert value["complete"] is True

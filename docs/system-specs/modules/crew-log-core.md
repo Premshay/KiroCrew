@@ -66,7 +66,7 @@ Two overlaps between the kinds are intentional and are not collisions. The `mess
 
 ### 4a. The session's log
 
-One session's own history: the ACP turn lifecycle, what was put in front of the model, and what the model did.
+One session's own history: the ACP turn lifecycle, what was put in front of the model, what the model did, and durable work-state updates.
 
 `src` is `gateway` or `acp`, and nothing else. Those are the two writers a session's entries come from -- the gateway around each turn, the ACP runtime for the measured path -- and a list wider than that is an authorization hole rather than a convenience, because `src` is what a reader attributes an entry to. A `patrol` or a guest crew has nothing to say inside one session's turn history. Adding a name is ADDITIVE: no reader validates `src`, so the list names the emitters that exist. `session:<id>` is spelled by no kind, because no emitter writes it.
 
@@ -163,7 +163,7 @@ source were removed (see the emitter spec's "Removed types").
 ### Session, turn
 | Type | `data` | Emitter |
 |---|---|---|
-| `session/opened` | header echo + `resumed`; `model_requested` when a tier resolved one; `parent {slot, sid?}` on a session another session made through `session_create` | yes |
+| `session/opened` | header echo + `resumed`; `model_requested` when a tier resolved one; `previous {sid}` on a crew log created while its slot already had one; `parent {slot, sid?}` on a session another session made through `session_create` | yes |
 | `session/closed` | `{reason}` | yes |
 | `turn/started` | `{turn, actor, depth, message_seq?, attempt?}` | yes |
 | `turn/refused` | `{turn, actor, reason, depth}` | yes |
@@ -238,6 +238,38 @@ and naming a guess is worse than naming nobody.
 | `compaction/applied` | `{turn, pct_before, pct_after, freed_pct}` | yes |
 | `plan/updated` | `{turn, items:[{id, text, state: done \| open}], total?}` — the session's own task list | yes |
 
+### Ledger
+
+| Type | `data` | Emitter |
+|---|---|---|
+| `ledger/recorded` | `{slot, goal?, phase?, next?, tried?:{approach, rejected_because?}, artifacts?, event?, event_kind?}` — one session-ledger update | yes |
+
+One entry per `session_ledger_record` call, carrying only the fields that call set;
+an absent field means unchanged. A phase and the event explaining it ride on the
+same entry, so no reader can observe a phase that moved without its reason. No
+`turn`: a slot records against its workstream rather than against whichever turn it
+happened to be inside, and the record is folded across every session unit of the
+slot (`session-work-ledger.md`).
+
+### Observed objects
+
+| Type | `data` | Emitter |
+|---|---|---|
+| `object/observed` | `{producer: probe, kind, target, fingerprint, facts, facts_omitted?, observed_at}` — the state of an object outside the session, as one named producer observed it | yes |
+
+One entry per CHANGE of the producer's fingerprint for one subject, never one per
+poll, appended into the log of the session the producer works for. `producer` is a
+CLOSED vocabulary (`probe`, the structured monitor's provider probe) and the emitter
+refuses a value outside it rather than coercing it: the value is what lets a reader
+tell a measured record from a sentence an agent typed, and a coerced producer would
+attribute the record to a mechanism that did not make it. `facts` is the probe's
+canonical snapshot verbatim, so its members are the monitored kind's own vocabulary
+and a fact the probe could not establish stays absent; a snapshot too large for one
+line is recorded short by a NAMED member in `facts_omitted` rather than dropped or
+trimmed silently. No `turn`: a probe runs without a model turn, so the observation
+belongs to no turn. The monitor's state document still holds no history of the
+subject -- this entry is that history (`monitor-architecture.md`).
+
 ### Background and children
 
 | Type | `data` | Emitter |
@@ -280,15 +312,51 @@ those tools precisely so nothing in it can be forged as gateway-authored, so `_c
 from transcript metadata is restored for authorization but never promoted to lineage, and the sid is
 not persisted at all. A child whose gateway restarted between mint and its first turn therefore
 writes no `parent`. `sid` is a citation of the creator's unit, not the tree key -- a slot outlives its ACP
-session, so the fold that builds the session tree (`crew_log/tree.py`, `crew-log-projection.md` section 6)
+session, so the fold that builds the session tree (`crew_log/session_tree.py`, `crew-log-projection.md` section 6)
 keys it by `slot`, reads the first `session/opened` of each crew log, takes the parent from any log of
 the slot that carries one, and never lets a log without one retract it.
+
+**The other edge is the SLOT's own succession.** A slot outliving its ACP session is not an edge case
+but the steady state: a restart whose `session/load` does not re-attach, a reset, an agent/model/effort
+switch, a compaction that recycles the session and a provider swap each tear the ACP session down, and
+the successor cold-starts under a new id. `CrewLog.exists` is false for that id, so the slot gains a
+SECOND crew log, and `resumed` is false there because nothing re-attached. That is correct and is also
+all `resumed` can say, so the successor's `session/opened` carries `previous {sid}`: the crew log the
+same slot was writing before. Same citation shape as `parent`, written once at creation and never
+rewritten, absent rather than empty when there is nothing to name -- the slot's first crew log, a
+predecessor the gateway could not name, and one whose own header does not name this slot are all
+"nothing to follow". No `slot` is repeated inside it,
+because it is the slot in `data.slot`. The id comes from the persisted slot-to-session mapping, read
+without pruning before allocation publishes the successor over it. One limit is recorded rather than
+handled: an allocation whose replay is still pending does not publish its fresh id over the mapping,
+so for that window a mapping read can
+name the crew log BEFORE the newest one -- two successive crew logs then cite one predecessor
+and the crew log between them is cited by nobody, which is a chain gap tracked with the rest of the
+supersede work in #12148. A successful resume answers the same id and the emitter writes no edge,
+since a crew log cannot be its own predecessor.
+
+The edge is a citation and nothing else. Recording it opens no store for writing but this session's
+own, and no writer here appends to the crew log it names. It does READ that crew log's header, because
+`previous` means the same slot and the source it comes from can name a crew log the slot never
+wrote -- a mapping entry can be stale or recycled: the
+edge is recorded only when the named crew log's own header names this slot, and a candidate whose
+header cannot be read is not named at all. Closing that crew log's own dangling turn and tool calls
+is a separate change: a repair that must wait on the predecessor's outstanding writes has to be
+resumable rather than decided once, which a citation neither needs nor has. Tracked as #12148. Until
+then a superseded crew log keeps an open `turn/started`, which is the state every reader of this log
+already tolerates.
+
+The read side is `session/opened.data.previous` itself, folded into the `status` projection and served
+by the existing projection route. A reader that wants the SLOT rather than the session folds the newest
+crew log, follows `previous` to the one before it, and repeats. There is deliberately no chain-walking
+helper in the store: the walk is one field read per fold, and a bounded, cycle-guarded walker belongs
+with the first fold that actually performs it rather than shipped ahead of any caller.
 
 ## 6. Rules
 
 Every refusal is a `CrewLogError` carrying a stable `code`; the codes are API surface and are additive-only.
 
-**Ownership** answers whether a kind of unit has such events at all. `schema.TYPE_OWNERSHIP` maps kind to owned `type` domains -- crew: `member` `activity` `slot` `patrol` `message` `crew` `item` `memory`; session: `session` `turn` `step` `tool` `approval` `model` `compaction` `plan` `message` `request` `context` `background` `subagent` `write` -- and anything else is `event_type_not_owned`. It is prefix-based, so a new action under an owned domain needs no change: `crew/dispatch` and `crew/report` are owned by the `crew` domain the registry already lists. `message` appears in both registries, which is what ownership means: a crew forwards messages and a session records its own bodies, so both kinds have such events and neither name is a collision.
+**Ownership** answers whether a kind of unit has such events at all. `schema.TYPE_OWNERSHIP` maps kind to owned `type` domains -- crew: `member` `activity` `slot` `patrol` `message` `crew` `item` `memory`; session: `session` `turn` `step` `tool` `approval` `model` `compaction` `plan` `ledger` `object` `message` `request` `context` `background` `subagent` `write` -- and anything else is `event_type_not_owned`. It is prefix-based, so a new action under an owned domain needs no change: `crew/dispatch` and `crew/report` are owned by the `crew` domain the registry already lists. `message` appears in both registries, which is what ownership means: a crew forwards messages and a session records its own bodies, so both kinds have such events and neither name is a collision.
 
 **Namespacing** answers whether an emitter may write it, and it is a rule about `src`. Two halves:
 

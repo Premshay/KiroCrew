@@ -47,10 +47,14 @@ _MAX_TURNS = 500
 
 
 async def _yield_until(predicate: Callable[[], bool]) -> bool:
-    for _ in range(_MAX_TURNS):
+    # A bounded number of loop turns (`sleep(0)`) was enough when the handler's
+    # post-lock path was pure turn-to-turn work, but the merged tree's switch
+    # handlers do REAL awaits on that path (agent resolution, config reads), so
+    # poll with a real deadline. The semantic asserts below are unchanged.
+    for _ in range(500):
         if predicate():
             return True
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
     return predicate()
 
 
@@ -85,6 +89,7 @@ def _mock_state(slot: _ChatSlot) -> DashboardState:
     state.sessions = MagicMock()
     state.sessions.reset = AsyncMock(return_value=True)
     state.sessions.get_provider = MagicMock(return_value=_idle_provider())
+    state.conversation_log = MagicMock()
     return state
 
 

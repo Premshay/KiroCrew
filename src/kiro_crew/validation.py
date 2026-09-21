@@ -46,6 +46,7 @@ from kiro_crew.constants import (
 # the role pin / provider default"). Import-safe: ``effort`` pulls in only
 # ``model_registry`` (stdlib-only), so no cycle back into validation.
 from kiro_crew.effort import EFFORT_VALUES
+from kiro_crew.lesson_validation import LESSON_APPLIES_VALUES
 from kiro_crew.monitoring.models import (
     MAX_MONITOR_AGENT_TURNS,
     MAX_MONITOR_CADENCE_SECS,
@@ -65,6 +66,7 @@ from kiro_crew.solo_spawn import SOLO_SPAWN_REASONS
 # Max lengths for string inputs
 MAX_TOOL_NAME_LEN = 256
 MAX_SHORT_STRING = 500  # names, IDs, categories
+MAX_SKILL_KEY_CHARS = 32768  # nested catalog keys, transported in JSON for exact reads
 MAX_MEDIUM_STRING = 5_000  # messages, rules
 MAX_LONG_STRING = 50_000  # task specs, inline content
 # Longest backend-authored ACP session id Kiro Crew RETAINS in a store of its
@@ -102,6 +104,29 @@ SESSION_RESTART_CONTINUATION_MAX = 2_000
 ALLOWED_LESSON_CATEGORIES = frozenset({"tool", "preference", "knowledge"})
 
 
+def bounded_session_id(value: object) -> "str | None":
+    """*value* when it is a non-empty ACP session id within
+    :data:`MAX_ACP_SESSION_ID_LEN`, else ``None``.
+
+    The one spelling of the bound, here because more than one store retains these
+    ids and a bound applied twice is a bound that can diverge -- two same-named
+    private copies had already split on their sentinel before this became shared.
+
+    The id comes from the backend, or is read back from a file an agent can write,
+    so it is input rather than a fact at every retention point. An over-long or
+    non-string value answers "no id" rather than a truncated one, which would name
+    a different unit; and a caller that retains an unbounded string can push a
+    whole record past its own maximum size, where the record is dropped rather
+    than truncated, so one bad value costs a record that had nothing to do with it.
+
+    Callers wanting an empty string rather than ``None`` spell it ``or ""`` at the
+    call site, so the sentinel is the caller's choice and not a second definition.
+    """
+    if not isinstance(value, str) or not value or len(value) > MAX_ACP_SESSION_ID_LEN:
+        return None
+    return value
+
+
 def normalize_lesson_category(value: object, *, strict: bool) -> str:
     """Normalize a lesson category to a usable string label.
 
@@ -126,6 +151,9 @@ def normalize_lesson_category(value: object, *, strict: bool) -> str:
 
 # Allowed scopes for lessons (mirrors the learn_add MCP inputSchema enum).
 ALLOWED_LESSON_SCOPES = frozenset({"global", "workspace"})
+# Derived from the vocabulary module rather than restated, so a new tier cannot be
+# accepted by one surface and refused by the other.
+ALLOWED_LESSON_APPLIES = frozenset(LESSON_APPLIES_VALUES)
 
 # The ``GET /api/lessons`` window: how many lessons one call returns when the
 # caller names no ``limit``, and the most it may ask for. Both the route and the
@@ -1085,6 +1113,7 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # that requires it lives in ``mcp_tools.spawn`` (task count) and
         # ``handlers.messaging.api_spawn`` (roster check); this only bounds it.
         FieldSpec("solo_reason", str, allowed=SOLO_SPAWN_REASONS),
+        FieldSpec("solo_details", str, max_len=MAX_MEDIUM_STRING),
         # Switchable context groups the sub-agent inherits. Explicit
         # ``default=True`` rather than the implicit ``None``: the semantic
         # default is "on", and without it an explicit JSON ``null`` cleans to
@@ -1154,6 +1183,7 @@ SPAWN_SUB_AGENTS_SCHEMA = ToolSchema(
         # Same solo-spawn reason as spawn_run: required when ``agents`` holds
         # exactly one entry that names no agent_or_mode.
         FieldSpec("solo_reason", str, allowed=SOLO_SPAWN_REASONS),
+        FieldSpec("solo_details", str, max_len=MAX_MEDIUM_STRING),
     ],
 )
 
@@ -1170,6 +1200,11 @@ LEARN_ADD_SCHEMA = ToolSchema(
         # rather than stored as a lesson that reports success and applies nowhere.
         # Whether the named path exists is still the gate's business, at injection.
         FieldSpec("repo_scope", str, max_len=MAX_SHORT_STRING, pattern=SCOPE_FRAGMENT_RE),
+        # Which startup tier the correction belongs to, as STATED by the caller.
+        # Nothing infers it from category, source or wording, because none of
+        # those separates a standing rule from a past finding. Absent leaves the
+        # row unstated, which is served as a standing rule.
+        FieldSpec("applies", str, allowed=ALLOWED_LESSON_APPLIES),
         # scope/workspace: the /api/lessons handler stores and lists
         # workspace-scoped lessons, but that tier does NOT reach a prompt -- the
         # context builder gates injected lessons on repo_scope instead. The
@@ -1603,8 +1638,11 @@ UPDATE_MESSAGE_SCHEMA = ToolSchema(
 SKILL_SEARCH_SCHEMA = ToolSchema(
     tool_name="skill_search",
     fields=[
-        FieldSpec("query", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("query", str, max_len=MAX_SHORT_STRING),
         FieldSpec("limit", int),
+        FieldSpec("offset", int),
+        FieldSpec("action", str, allowed=frozenset({"search", "list", "read"})),
+        FieldSpec("key", str, max_len=MAX_SKILL_KEY_CHARS),
     ],
 )
 
@@ -4004,6 +4042,32 @@ MCP_WORK_SCHEMAS: dict[str, ToolSchema] = {
     "work_ledger_record": WORK_LEDGER_RECORD_SCHEMA,
 }
 
+
+# ── Tool Schemas (MCP Panel — server ``kirocrew-panel``) ──
+#
+# Its own registry for the same reason the dashboard one is separate: the panel
+# tools ship in an opt-in server, and a tool absent from its server's registry
+# has its args passed through raw.
+PANEL_PUBLISH_SCHEMA = ToolSchema(
+    tool_name="panel_publish",
+    fields=[
+        # No max_len on the object itself — the store enforces the byte and
+        # depth ceilings, because a character count over a nested structure is
+        # not the bound that matters and would pass a deeply nested payload.
+        FieldSpec("data", dict, required=True),
+        FieldSpec("template", str, max_len=64),
+        FieldSpec("title", str, max_len=200),
+    ],
+)
+# Empty on purpose and registered on purpose: the tool takes no arguments, and
+# an empty registered schema REJECTS an unexpected one, where no schema at all
+# would pass it through unvalidated.
+PANEL_TEMPLATES_SCHEMA = ToolSchema(tool_name="panel_templates")
+
+MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
+    "panel_publish": PANEL_PUBLISH_SCHEMA,
+    "panel_templates": PANEL_TEMPLATES_SCHEMA,
+}
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
     _cu_types.TOOL_LIST_APPS: ToolSchema(tool_name=_cu_types.TOOL_LIST_APPS, fields=[]),

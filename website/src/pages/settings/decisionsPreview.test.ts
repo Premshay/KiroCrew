@@ -18,10 +18,21 @@ import {
   readBucket,
   readConsent,
   readDecisions,
+  DECISIONS_COMPACTION_POINT,
 } from './decisionsPreview'
 
 const ENDPOINT = 'https://api.typesafe.ai/v1/systemone'
-const OFF = { supported: false, enabled: false, configuredEndpoint: '', endpointMoved: false }
+const OFF = {
+  supported: false,
+  enabled: false,
+  configuredEndpoint: '',
+  endpointMoved: false,
+  // The tool-argument egress scope reads FALSE for an unreadable body, on the same
+  // fail-closed terms as `enabled`: a body nobody could parse grants nothing.
+  toolArgs: false,
+  // And so does the whole-transcript scope, for the same reason.
+  compaction: false,
+}
 
 describe('readConsent', () => {
   it('reads an absent or unresolved body as unsupported', () => {
@@ -32,9 +43,30 @@ describe('readConsent', () => {
 
   it('reads a literal true as on and anything else as off', () => {
     expect(readConsent({ enabled: true, configured_endpoint: ENDPOINT, permits: true }))
-      .toEqual({ supported: true, enabled: true, configuredEndpoint: ENDPOINT, endpointMoved: false })
+      .toEqual({
+        supported: true,
+        enabled: true,
+        configuredEndpoint: ENDPOINT,
+        endpointMoved: false,
+        // Consent to SEND is not consent to send tool arguments: a body that does
+        // not mention the scope grants none of it.
+        toolArgs: false,
+        // Nor is it consent to send a whole transcript, which is wider still.
+        compaction: false,
+      })
     for (const sloppy of [false, 'true', 1, null]) {
       expect(readConsent({ enabled: sloppy, configured_endpoint: ENDPOINT, permits: false }).enabled).toBe(false)
+    }
+  })
+
+  it('reads the tool-argument scope as an exact true, like the switch itself', () => {
+    // The field decides whether a NEW category of conversation content leaves the
+    // machine, so a truthy stand-in is not a deliberate yes -- and an older gateway
+    // omits it entirely, which must read as off rather than as unknown.
+    const base = { enabled: true, configured_endpoint: ENDPOINT, permits: true }
+    expect(readConsent({ ...base, tool_args: true }).toolArgs).toBe(true)
+    for (const sloppy of [undefined, false, 'true', 1, 0, null, [], {}]) {
+      expect(readConsent({ ...base, tool_args: sloppy }).toolArgs).toBe(false)
     }
   })
 
@@ -84,13 +116,36 @@ describe('readDecisions', () => {
     const on = { enabled: true, configured_endpoint: ENDPOINT, permits: true }
     const off = { enabled: false, configured_endpoint: ENDPOINT, permits: false }
     expect(readDecisions(on, { decisions: { bucket: 25 } }))
-      .toEqual({ supported: true, enabled: true, configuredEndpoint: ENDPOINT, endpointMoved: false, bucket: 25 })
+      .toEqual({
+        supported: true,
+        enabled: true,
+        configuredEndpoint: ENDPOINT,
+        endpointMoved: false,
+        bucket: 25,
+        toolArgs: false,
+        compaction: false,
+      })
     expect(readDecisions(off, { decisions: { bucket: 100 } }).bucket).toBe(100)
     expect(readDecisions(off, undefined).bucket).toBeNull()
   })
 
+  it('reads the whole-transcript scope as an exact true, and never off the narrower one', () => {
+    // The widest of the three categories, so the same exactness applies -- and
+    // `tool_args` must NOT grant it: that scope was reviewed as the arguments of the
+    // one call about to run, not as everything the session has run.
+    const base = { enabled: true, configured_endpoint: ENDPOINT, permits: true }
+    expect(readConsent({ ...base, compaction: true }).compaction).toBe(true)
+    expect(readConsent({ ...base, tool_args: true }).compaction).toBe(false)
+    for (const sloppy of ['true', 1, 'yes', null, undefined]) {
+      expect(readConsent({ ...base, compaction: sloppy }).compaction).toBe(false)
+    }
+  })
+
   it('spells the constants the backend spells', () => {
     expect(DECISIONS_BUCKET_PATH).toBe('decisions.bucket')
+    // The compaction point's identifier, which the card names and the card's record
+    // dispatches on.
+    expect(DECISIONS_COMPACTION_POINT).toBe('compaction.keep')
     // Singular on purpose: `skills.dedupe` and `cron.novelty` shipped as rows in
     // the shadow release and are retired here, because a row for an answer
     // nothing consumes described a comparison rather than a thing being on.

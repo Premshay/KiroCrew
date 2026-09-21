@@ -3,7 +3,7 @@
 **Local page, not a mirror.** Part of the [crew log reference](README.md), which is
 marked as a named exception in [the Reference index](../README.md).
 
-Twenty-six types. Read [envelope.md](envelope.md) first for the fields every entry
+Twenty-nine types. Read [envelope.md](envelope.md) first for the fields every entry
 carries; this page covers only each type's `data`.
 
 Session entries are written with `src` `gateway` or `acp` and nothing else. They
@@ -26,6 +26,7 @@ its **Since** line. A type this kind owns with no emitter anywhere is under
 | Type | One line | Emitter | `src` | Pairing |
 |---|---|---|---|---|
 | [`session/opened`](#sessionopened) | The crew log was created, or a claim re-attached to it. | live | `gateway` | — |
+| [`session/class`](#sessionclass) | The session's class changed after its log was opened. | live | `gateway` | supersedes `session/opened.class` |
 | [`session/closed`](#sessionclosed) | The gateway stopped serving this session. | live | `gateway` | — |
 | [`turn/started`](#turnstarted) | A turn was authorized and is about to run. | live | `gateway` | opener of `turn/completed` |
 | [`turn/refused`](#turnrefused) | A gate refused to run a dispatched turn. | live | `gateway` | terminal on its own |
@@ -51,6 +52,8 @@ its **Since** line. A type this kind owns with no emitter anywhere is under
 | [`subagent/steered`](#subagentsteered) | A correction sent into a running child. | live | `gateway` | — |
 | [`subagent/completed`](#subagentcompleted) | A child finished its work. | live | `gateway` | closer, by `agent_id` |
 | [`subagent/failed`](#subagentfailed) | A child did not finish its work. | live | `gateway` | closer, by `agent_id` |
+| [`ledger/recorded`](#ledgerrecorded) | One session-ledger update: the fields it set and the event explaining them. | live | `gateway` | — |
+| [`object/observed`](#objectobserved) | The state of an object outside the session, as a named producer observed it. | live | `gateway` | — |
 
 ## Session and turn
 
@@ -78,6 +81,8 @@ entry's write is the point the interrupted-turn repair runs.
 | `cwd` | string | required | Working directory. May be empty. | |
 | `owner` | string | required | Owner, defaulted to `default`. | |
 | `resumed` | bool | required | `true` when this claim re-attached to an existing crew log. | |
+| `class` | object | when the gateway could read the slot's memory mode | What kind of session this log belongs to: `memory` (the slot's memory mode, required inside the object), `app` (the app that owns it, when one does), `channel` (`true` when its conversation is published to a messaging channel), `workspace` (the workspace it belongs to). | |
+| `previous` | object | | `{sid}` — the crew log the SAME slot was writing before this one. Present only on a crew log that was just created while the slot already had one, and only when that crew log's own header names this slot. Absent on the slot's first crew log, on every re-attach, when the gateway could not name the predecessor, and when the named crew log's header does not name this slot or cannot be read. | |
 
 **Invariants** — At most one per create and one per re-attach. The session's
 *starting* model rides here rather than in a `model/selected` entry, which records
@@ -92,11 +97,44 @@ message the backend received. An empty `model` is
 not a claim that nothing was configured, and a `model_requested` that differs from
 `model` is not by itself a refusal — the backend serves the spelling it resolved.
 
+`class` records facts and never a verdict, because the entry cannot be rewritten
+and a verdict would freeze one build's reading of a rule into it. Its `memory`
+member is required *inside* the object, so the object is never empty and the
+object's own presence is what says the class was recorded at all — a reader can
+therefore tell a session with nothing to declare (`{"memory":"persistent"}`) from a
+log written before the field existed (no `class` at all). The facts are true when
+the log is OPENED: a class a session acquires later, such as a channel link added
+mid-conversation, is not in them, so a reader that can also see the live session
+applies both and refuses on either. A reader deciding whether one session may read
+another's log must treat an absent `class` as a refusal rather than as "nothing
+applies"; that is what
+[reading-from-an-agent.md](reading-from-an-agent.md) means by a closed target
+staying decidable.
+
 `model_requested` is written from #12017 onward. An entry older than that carries
 no such field whatever the gateway chose, so even the qualified reading of an
 absent field holds only for entries written since. A fold spanning the upgrade must
 read an absent field on an older entry as *unknown*, which is the same misreading
 #12017 exists to remove.
+
+`previous` never names this same session: a re-attach is the same crew log, and a
+self-edge would make a chain walker revisit the crew log it started from.
+
+`previous` always names a crew log of the SAME slot, and that is verified rather
+than assumed. The id reaches the emitter from the slot-to-session mapping, read
+without pruning and latched by whichever allocation observes it first. One limit
+is recorded rather than worked around: an allocation whose replay is still pending
+does not publish its fresh id over the mapping, so for that window a mapping read
+names the crew log BEFORE the newest one — two successive crew logs then cite one
+predecessor and the crew log between them is cited by nobody, which a chain walker
+steps over without any sign that a crew log is missing. Closing that needs a
+deferral that resumes once the predecessor's own writes settle, and it is tracked
+with the rest of the supersede work in #12148. The mapping can also name a crew log
+the slot never wrote, since an entry can be stale or recycled by the time a
+successor cold-starts, so the emitter reads the named crew log's own header —
+written once at create, never rewritten — and records the edge only when that
+header names this slot. A candidate that cannot be verified gets no edge, so a
+reader following one never lands in a crew log the slot never wrote.
 
 ```json
 {"type":"session/opened","seq":1,"time":1789000000000,"src":"gateway","data":{"agent":"kirocrew","slot":"dashboard:3","model":"","cwd":"/home/u/proj","owner":"default","resumed":false}}
@@ -104,6 +142,10 @@ read an absent field on an older entry as *unknown*, which is the same misreadin
 
 ```json
 {"type":"session/opened","seq":1,"time":1789000000000,"src":"gateway","data":{"agent":"worker","slot":"dashboard:7","model":"","model_requested":"claude-opus-5","cwd":"/home/u/proj","owner":"default","resumed":false}}
+```
+
+```json
+{"type":"session/opened","seq":1,"time":1789000000000,"src":"gateway","data":{"agent":"worker","slot":"chat-9-1789000000","model":"","cwd":"/home/u/proj","owner":"default","resumed":false,"parent":{"slot":"chat-4-1788900000","sid":"acp-sess-conductor"},"class":{"memory":"persistent"}}}
 ```
 
 **Reader hint** — `resumed: true` means entries below this line belong to earlier
@@ -114,7 +156,64 @@ that needs it reads the provider's own outcome rather than comparing the two
 strings. When `model` is empty the served id, once known, appears on the first
 `turn/completed` that reports one.
 
+`resumed` and `previous` answer two different continuities, and a reader needs
+both. `resumed` covers one crew log served again; `previous` covers one SLOT whose
+ACP session was torn down, so its work continues in a crew log with a different
+id. A reader that wants the slot rather than the session folds the newest crew
+log, reads `previous` off the `status` projection, folds that crew log, and
+repeats. A `null` answer is "no edge to follow", never "there was no earlier crew
+log": retention deletes whole segments off the front, and the edge rides on the
+creating entry.
+
 **Since** — #10091.
+
+### `session/class`
+
+The session's class changed after its log was opened.
+
+**Kind and `src`** — `session`; `src` is `gateway`.
+
+**When written** — At the start of a turn, when the class observed there differs from
+the last one this log stated. The ordinary session never produces one.
+
+**Pairing** — Supersedes the `class` object on `session/opened`, and any earlier
+`session/class`.
+
+| Field | Type | Required | Meaning | Enum |
+|---|---|---|---|---|
+| `memory` | string | required | The slot's memory mode, verbatim. | |
+| `app` | string | | The app that owns the session, when one does. | |
+| `channel` | boolean | | True when the conversation is published to a messaging channel. | |
+| `workspace` | string | | The workspace the session belongs to. | |
+
+**Invariants** — Same four members as `session/opened.class`, from one shared
+declaration, so the two cannot describe different shapes. A reader takes the most
+restrictive value each of the first three ever held: a log published to a channel for one turn
+holds that turn's content for good, so the fold does not let a later entry withdraw
+a restriction an earlier one recorded.
+
+`workspace` folds differently because it is an identity rather than a restriction:
+there is no more-restrictive workspace to keep, so a reader keeps the FIRST one
+stated and treats a later different one as the log spanning two workspaces, which
+no single workspace's session may read. A dispatch grant is compared against it
+because a recorded lineage outlives a workspace switch.
+
+Observed at the START of a turn, which is what makes sampling at turn boundaries
+exact rather than approximate. A channel link exists before the inbound message it
+routes, so the turn that carries a third party's words into the log is a turn whose
+opening observation already saw the link that carried them. A class acquired
+part-way through a turn is recorded on the next one, and the only content inside
+that window is the session's own.
+
+Absence means the class never moved — but only on a log whose `session/opened`
+carries a `class`. The two landed together, so a class on the opener is what dates a
+log to a build that also records transitions; an opener without one says nothing
+about either, and a reader deciding whether another session may read the log refuses
+on it.
+
+```json
+{"type":"session/class","seq":94,"time":1789000070000,"src":"gateway","data":{"memory":"persistent","channel":true}}
+```
 
 ### `session/closed`
 
@@ -190,7 +289,7 @@ attracts a repair closer.
 |---|---|---|---|---|
 | `turn` | int | required | Turn ordinal. | |
 | `actor` | string | required | Who caused the turn. Same folding as `turn/started`. | `user`, `app`, `crew`, `cron`, `autonudge`, `subagent`, `gateway`, `other` |
-| `reason` | string | required | Which gate refused. The writer records the caller's value without constraining it. | `not_authorized`, `gateway_closing`, `stopped_before_dispatch` |
+| `reason` | string | required | Which gate refused. The writer records the caller's value without constraining it. | `not_authorized`, `gateway_closing`, `stopped_before_dispatch`, `replay_superseded_before_dispatch`, `blocked`, `too_large` |
 | `depth` | int | required | Prompt depth. | |
 
 **Invariants** — No `turn/completed` follows it for that ordinal.
@@ -288,7 +387,9 @@ The body of a message the gateway accepted into this session.
 **Kind and `src`** — `session`; `src` is `gateway`.
 
 **When written** — Before the dispatch gates, so a refused turn still shows what
-was said.
+was said. A turn a gate refuses — including a blocked or oversized `@prompt`
+expansion — writes this entry and then a [`turn/refused`](#turnrefused), the same
+pair every dispatch gate records.
 
 **Pairing** — None, but on an oversize body it cites its
 [`message/chunk`](#messagechunk) entries and is written in the same batch as them.
@@ -462,19 +563,24 @@ there are no blocks to tally.
 | `chars` | int | required | Total characters. | |
 | `tokens` | int | required | Estimated tokens. | |
 | `tokens_estimated` | bool | required | Always `true`. | `true` |
-| `step` | int | optional | Model call ordinal. Omitted when 0. | |
+| `step` | int | optional | Model call ordinal. Omitted when 0. A turn-opening composition is written before the first `step/started`, so it is step-less; join it to the turn's FIRST model call. | |
 
 **Invariants** — `tokens` is an estimate derived from `chars`, which is why
 `tokens_estimated` is written on every entry rather than only when it is true.
 Blocks with no classification are folded into a single `other` source, so `sources`
-does not enumerate every injected block by name.
+does not enumerate every injected block by name. A step-less `context/composed`
+belongs to its turn's first model call: the context is composed once, in front of
+the call that opens as step 1, and the entry is written before that opener, so it
+cannot carry the ordinal without dropping below the `message/received` it is derived
+from.
 
 ```json
 {"type":"context/composed","seq":9,"time":1789000000140,"src":"gateway","data":{"turn":3,"sources":[{"kind":"system","chars":4000,"tokens":1000},{"kind":"other","chars":1200,"tokens":300}],"chars":5200,"tokens":1300,"tokens_estimated":true}}
 ```
 
 **Reader hint** — Do not report these token numbers as billed usage. The billed
-figures are on [`turn/completed`](#turncompleted).
+figures are on [`turn/completed`](#turncompleted). An entry with no `step` is the
+turn's opening composition; attribute it to the turn's first model call.
 
 **Since** — #10091.
 
@@ -495,14 +601,19 @@ again at each transition from a tool group back to text.
 | `step` | int | required | Model call ordinal, from 1. | |
 
 **Invariants** — Steps are numbered within a turn, so `(turn, step)` identifies a
-model call.
+model call. The boundary is DERIVED from a tool group followed by fresh text, the
+only per-call transition the stream exposes, so a step MAY cover consecutive
+tool-only model calls: a turn that calls tools, is called again with their results
+and calls more tools, speaking only at the end, shows one such transition and folds
+those calls into one step.
 
 ```json
 {"type":"step/started","seq":14,"time":1789000000220,"src":"gateway","data":{"turn":3,"step":1}}
 ```
 
-**Reader hint** — Step count per turn is the cheapest measure of how much
-tool-calling a turn did.
+**Reader hint** — Step count per turn is a LOWER BOUND on the turn's model calls,
+not an exact count: consecutive tool-only calls may share one step. Use `call_index`
+on the tool entries to order every tool call regardless of how the steps fell.
 
 **Since** — #10091.
 
@@ -601,7 +712,11 @@ closes still-open calls at a tool-group boundary or at turn end; crash repair.
 **Invariants** — `status: "unknown"` means the writer could not observe the
 outcome, not that the tool failed. Both `cancelled` and `canceled` occur, because the
 word is the backend's and is not normalized on the way in. A sweep close carries
-`result_bytes: 0` and no `result_hash`.
+`result_bytes: 0` and no `result_hash`. Exactly one `tool/completed` is written per
+`call_id`: the first terminal frame settles the call, and a later terminal frame for
+the same id — the two update parsers can each emit one — writes nothing. A terminal
+frame for a call whose `tool/called` was never recorded still gets its closer, so an
+unmatched completion is a real close rather than a dropped one.
 
 ```json
 {"type":"tool/completed","seq":18,"time":1789000000400,"src":"acp","data":{"turn":3,"call_id":"c-01","name":"read","server":"","status":"completed","call_index":1,"step":1,"elapsed_ms":90,"result_hash":"1a3c9e02","result_bytes":512}}
@@ -914,6 +1029,99 @@ separates them.
 child was running and no liveness predicate was available.
 
 **Since** — type #10091; written by #11185.
+
+## The session ledger
+
+### `ledger/recorded`
+
+One session-ledger update: the fields it set, and the event explaining them.
+
+**Kind and `src`** — `session`; `src` is `gateway`.
+
+**When written** — One entry per `session_ledger.record` call. Every reader folds
+these entries back into the record, so the ledger is a projection of the log rather
+than a stored document.
+
+**Pairing** — None.
+
+| Field | Type | Required | Meaning | Enum |
+|---|---|---|---|---|
+| `slot` | string | required | The ledger's key — the slot this update belongs to. Carried on the entry as well as in the header so a reader of one entry can say which slot it belongs to; selecting a slot's units is done from their headers. | |
+| `goal` | string | optional | The workstream's objective, when this call set one. | |
+| `phase` | string | optional | The new phase. Never written without `event` and `event_kind`, which is what makes the phase-requires-a-reason rule a property of ONE entry. | |
+| `next` | string | optional | The resumable intent — the concrete next step. | |
+| `tried` | object | optional | One rejected approach, appended to the fold's list. | |
+| `tried.approach` | string | required | What was tried. | |
+| `tried.rejected_because` | string | optional | Why it was rejected. | |
+| `artifacts` | object | optional | String-to-string pointers merged into the fold's map. The members are the caller's own keys — worktree, branch, pr — so they are deliberately not declared and are checked for shape by the fold. | |
+| `event` | string | optional | One-line progress note appended to the event tail. | |
+| `event_kind` | string | optional | Which kind of step this records. Closed: the writer coerces an unrecognized kind to `note` before it builds the entry. | `blocked`, `decision`, `note`, `phase`, `progress`, `tried`, `unblocked` |
+
+**Invariants** — One entry per call, carrying only the fields that call set — an
+omitted field means "unchanged", which is what lets a partial update be one line. A
+phase change carries its event in the SAME entry, so no reader can observe a phase
+that moved without its logged reason. The ledger therefore DEPENDS on this log: a
+gateway started without `KIROCREW_CREW_LOG=1` records none, and the tool refuses
+rather than keeping a document of its own.
+
+```json
+{"type":"ledger/recorded","seq":80,"time":1789000002600,"src":"gateway","data":{"slot":"dashboard:3","goal":"land the ledger fold","phase":"implementation","next":"regenerate the reference tables","tried":{"approach":"stored document","rejected_because":"cannot survive compaction"},"artifacts":{"worktree":"/w/proj","branch":"feat/x","pr":"123"},"event":"folded the ledger over the crew log","event_kind":"phase"}}
+```
+
+**Reader hint** — Fold the slot's entries oldest first across every unit the slot
+ran under; a later entry's set fields overwrite an earlier one's, and an omitted
+field leaves the folded value unchanged.
+
+**Since** — #11185.
+
+## Observed objects
+
+### `object/observed`
+
+The state of an object outside the session — a pull request the session is watching —
+as one named producer observed it.
+
+**Kind and `src`** — `session`; `src` is `gateway`.
+
+**When written** — Once per CHANGE of the producer's fingerprint for one subject, never
+once per poll. The structured monitor's probe writes it into the log of the session the
+monitor was armed from, right after the monitor's persisted observation moved to the new
+fingerprint; a poll that saw the same fingerprint, a failed read, an observation the
+monitor declined, and a slot with no live session each write nothing. The record is
+independent of whether anyone was woken: a subject that moved from one pending state to
+another is recorded even though the engine delivered nothing for it.
+
+**Pairing** — None.
+
+| Field | Type | Required | Meaning | Enum |
+|---|---|---|---|---|
+| `producer` | string | required | Which mechanism made the observation. Closed: the emitter refuses a value outside the vocabulary instead of coercing it, so a reader can tell a measured record from a sentence an agent typed. `probe` is the structured monitor's provider probe. | `probe` |
+| `kind` | string | required | The monitored kind of the subject, as the monitoring registry names it — `github_pull_request`, `gitlab_merge_request`, and so on. Passed through from the armed monitor, which validated it at arm time. | |
+| `target` | string | required | The subject's full URL, exactly as the monitor was armed on it. | |
+| `fingerprint` | string | required | The probe's own dedupe digest of the facts it acts on. An entry is written only when this differs from the previous observation's, so consecutive entries for one subject are consecutive DISTINCT states. | |
+| `facts` | object | required | The canonical facts snapshot the probe computed, verbatim — the object the wake envelope is rendered from, including its own `kind` and `target`. The members are the kind's canonical vocabulary and are deliberately not declared: a fact the probe could not establish is absent or carries the kind's own unknown marker, never a default the registry invented. | |
+| `facts_omitted` | array[string] | optional | Members removed from `facts` so the entry fits the line ceiling, largest first. Absent when nothing was removed, which is the ordinary case. | |
+| `observed_at` | float | required | When the producer observed the subject, seconds since the epoch. Distinct from the envelope's `time`, which is when the append landed. | |
+
+**Invariants** — `producer` is a closed vocabulary, and the closure is enforced twice:
+the emitter raises on a value outside it and the registry refuses the entry on append.
+A typed record carrying its producer is what a reader can trust about an object outside
+the session; the agent's own report about that object is a `message/sent` entry and is
+evidence of nothing but the report. `facts` is never defaulted: a snapshot too large for
+one line is recorded short by a NAMED member rather than dropped or trimmed silently,
+so a reader cannot mistake "did not fit" for "unchanged".
+
+```json
+{"type":"object/observed","seq":81,"time":1789000002700,"src":"gateway","data":{"producer":"probe","kind":"github_pull_request","target":"https://github.com/acme/widgets/pull/7","fingerprint":"9f2b9f2b9f2b9f2b9f2b9f2b9f2b9f2b9f2b9f2b9f2b9f2b9f2b9f2b9f2b9f2b","facts":{"kind":"github_pull_request","target":"https://github.com/acme/widgets/pull/7","state":"open","draft":false,"head_revision":"abc123","mergeability":"mergeable","review_decision":"approved","blocking_review":"none","unresolved_review_threads":0,"review_threads_complete":true,"checks":{"failed":[],"passed":["ci"],"pending":[],"unknown":[]},"checks_complete":true},"observed_at":1789000002.5}}
+```
+
+**Reader hint** — Group by `target` and take the newest entry for the subject's current
+state; an entry's `facts` is complete in itself, so nothing needs to be folded across
+entries. Read `state`, `mergeability`, `review_decision` and the `checks` buckets off
+`facts` for a review subject, and treat a member that is absent or listed in
+`facts_omitted` as unknown, never as its default.
+
+**Since** — the producer half of #12397.
 
 ## Removed types
 

@@ -176,25 +176,16 @@ _UNSCANNED = "[withheld: redaction unavailable]"
 
 
 def _credentials_are_unconfined() -> str:
-    """A REASON string when a provider-driven agent would run without credential masking.
+    """Return a refusal reason unless effective strict isolation or risk consent permits a run.
 
-    Empty string means "confined, safe to run". The app's subprocess path forces
-    ``sandboxed_spawn_argv(mode="strict")`` + ``strip_credential_env``; the provider path
-    inherits ``agent.sandbox`` plus its governance floor. Only ``"cc"`` and ``"strict"``
-    profiles hide credential stores (``~/.aws``, ``~/.ssh``, ``~/.config/gh``, ``~/.kube``);
-    the default ``"auto"``/``"standard"`` intentionally exposes ``.aws/.ssh`` for
-    interactive workflow use — safe for human-driven chat, but NOT for unattended
-    repository-controlled execution where a crafted instruction could read credentials.
+    The provider inherits ``agent.sandbox``, clamped by the governance floor. Only
+    ``strict`` hides all required credential stores: ``cc`` leaves SSH and GitHub CLI
+    credentials visible, while ``auto`` and ``standard`` also expose AWS credentials.
+    Repository-controlled instructions must not reach those credentials unattended.
 
-    FAIL CLOSED on an unreadable config: a state we cannot verify is treated as unconfined,
-    because the alternative is running an agent over repository-controlled text with the
-    operator's credentials visible.
-
-    The operator can ACKNOWLEDGE the residual risk with ``acceptUnsandboxedAgentRisk``
-    (default OFF, compared with ``is True`` so only the explicit boolean opts in) — the same
-    one-time-consent shape as the watcher's ``watcherAcceptEgressRisk`` (D-118). That escape
-    hatch exists so a hard refusal doesn't silently take the loop offline rather than
-    telling the operator what to decide. Raised by the GPT review.
+    An unreadable config fails closed. The operator can acknowledge the residual risk
+    with ``acceptUnsandboxedAgentRisk`` (default OFF, only the explicit boolean ``True``
+    opts in). An empty result therefore means either strict isolation or explicit consent.
     """
     if _unsandboxed_agent_accepted():
         return ""
@@ -202,21 +193,14 @@ def _credentials_are_unconfined() -> str:
         from kiro_crew.config import KiroCrewConfig
         from kiro_crew.sandbox import effective_sandbox_mode
 
-        configured = KiroCrewConfig.load().agent.sandbox
-        mode = effective_sandbox_mode(configured)
+        mode = effective_sandbox_mode(KiroCrewConfig.load().agent.sandbox)
     except Exception as exc:  # noqa: BLE001 — an unverifiable sandbox is an unconfined one
-        return f"the effective provider sandbox could not be resolved ({type(exc).__name__})"
-    # The provider path runs repository-controlled text through an agent with
-    # auto-approved shell, so it requires a sandbox level that HIDES credential
-    # stores (~/.aws, ~/.ssh, ~/.config/gh, ~/.kube). Only 'cc' and 'strict'
-    # do this; 'auto'/'standard' intentionally EXPOSE .aws/.ssh for interactive
-    # workflow use — safe for human-driven chat, but not for unattended
-    # repo-controlled execution.
-    _CREDENTIAL_HIDING_MODES = {"cc", "strict"}
-    if mode not in _CREDENTIAL_HIDING_MODES:
+        return f"the gateway sandbox setting could not be read ({type(exc).__name__})"
+    if mode != "strict":
         return (
-            f"the effective provider sandbox is {mode or 'unset'!r} — the auto-improvement "
-            f"provider path requires 'cc' or 'strict' (credential-hiding profiles) "
+            f"the gateway sandbox is {mode or 'unset'!r} — the auto-improvement "
+            f"provider path requires a sandbox.min_level governance floor of 'strict' "
+            f"(credential-hiding profile) "
             f"or the explicit acceptUnsandboxedAgentRisk opt-in"
         )
     return ""
@@ -444,8 +428,7 @@ class RunSupervisor:
     # ── construction (blocking; called from the route's worker thread) ────────
 
     def _build_runner(self, *, stop_check) -> Any:
-        """Pick the agent runner: the in-process provider when one is configured,
-        else the ``claude -p`` subprocess, else None (offline spine — no fabricated fixes).
+        """Build the app's member team on the gateway, or return None (offline).
 
         ``import kiro_crew.acp`` FIRST: there is a known circular import that only
         resolves when the acp package is imported before ``create_provider_factory()``
@@ -457,14 +440,15 @@ class RunSupervisor:
         from ..spine.agent_runner import SessionAgentRunner
 
         if SessionAgentRunner.available():
-            # Repository-controlled prompts run unattended, so the provider's
-            # effective sandbox must hide credentials before any agent is started.
+            # Unattended repository execution requires effective strict isolation or
+            # explicit risk consent before constructing the member team. Lesser profiles
+            # expose credentials. Watchers retain their separate egress acknowledgement.
             unconfined = _credentials_are_unconfined()
             if unconfined:
                 logger.warning(
                     "%s: refusing the provider-backed agent runner — %s, so an agent-run "
                     "command could read credential stores and exfiltrate. Running OFFLINE. "
-                    "The provider requires an effective 'cc' or 'strict' credential-hiding sandbox, "
+                    "Set the governance `sandbox.min_level` floor to 'strict', "
                     "or set `acceptUnsandboxedAgentRisk` to acknowledge the residual risk.",
                     store.APP_NAME,
                     unconfined,
@@ -473,8 +457,15 @@ class RunSupervisor:
                     f"the provider-backed agent runner was refused because {unconfined}"
                 )
                 return None
-            runner = SessionAgentRunner(stop_check=stop_check, on_activity=self._on_agent_activity)
-            # Register the tool-restricted discovery agent so kiro-cli resolves it by name.
+            from .crew import build_runner
+
+            try:
+                runner = build_runner(stop_check=stop_check, on_activity=self._on_agent_activity)
+            except Exception as exc:
+                self._offline_reason = f"member team unavailable: {exc}"
+                logger.warning("%s: %s", store.APP_NAME, self._offline_reason)
+                return None
+            # Verify both app-owned role templates before dispatching any assignment.
             # FAIL CLOSED on the returned bool: an unknown agent name does not error, it
             # silently activates the DEFAULT agent — which carries the full kirocrew-core
             # toolset including `spawn_sub_agents`. Ignoring this result lets an unwritable
@@ -495,7 +486,7 @@ class RunSupervisor:
                     store.APP_NAME,
                 )
                 self._offline_reason = (
-                    "the tool-restricted discovery agent could not be registered, and falling "
+                    "the tool-restricted member templates could not be registered, and falling "
                     "back to the subprocess agent would bypass the configured provider's "
                     "permission gate"
                 )

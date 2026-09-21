@@ -48,8 +48,26 @@ const consentOf = (enabled: boolean, overrides: Partial<DecisionsConsentData> = 
   endpoint: enabled ? ENDPOINT : '',
   configured_endpoint: ENDPOINT,
   permits: enabled,
+  // The tool-argument egress scope. FALSE by default here on purpose: that is what
+  // a keystone recorded before the scope existed reads as, and it is the state the
+  // overwhelming majority of consented installs are in.
+  tool_args: false,
+  // The whole-transcript egress scope, false by default for the same reason: it is
+  // what a keystone recorded before the scope existed reads as, and no narrower yes
+  // grants it.
+  compaction: false,
   ...overrides,
 })
+
+/** The tool-argument consent switch. Only drawn while the main switch is on. */
+const toolArgsSwitch = () =>
+  screen.getByRole('switch', { name: 'Also send tool-call arguments so Jev can flag risky calls' })
+
+/** The whole-transcript consent switch. Only drawn while the main switch is on. */
+const compactionSwitch = () =>
+  screen.getByRole('switch', {
+    name: 'Also send the conversation and tool-call inputs so Jev can score compaction',
+  })
 
 /**
  * Stub all three reads: the governance answer that decides whether the card is
@@ -389,6 +407,104 @@ describe('Decisions (Jev) preview card', () => {
     expect(Object.keys(localStorage).filter(k => k.startsWith(PREVIEW_FLAG_PREFIX))).toEqual([])
   })
 
+    describe('the tool-argument consent switch', () => {
+    it('is absent while the main switch is off, because nothing is sent at all then', async () => {
+      // A second egress control under an off switch would describe a state that
+      // cannot happen, and would invite a grant nothing could act on.
+      stubGateway({ enabled: false })
+      renderSection()
+      await waitFor(() => {
+        expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
+      })
+      expect(screen.queryByRole('switch', { name: /tool-call arguments/ })).toBeNull()
+    })
+
+    it('appears unchecked once consent is on, for a keystone that never recorded it', async () => {
+      // The state every install consented before this scope existed is in: sending
+      // is allowed, tool arguments are not, and the card must draw exactly that
+      // rather than inferring the scope from the main switch.
+      stubGateway({ enabled: true })
+      renderSection()
+      await waitFor(() => {
+        expect(toolArgsSwitch()).toBeInTheDocument()
+      })
+      expect(toolArgsSwitch().getAttribute('aria-checked')).toBe('false')
+    })
+
+    it('reflects a recorded scope', async () => {
+      stubGateway(consentOf(true, { tool_args: true }))
+      renderSection()
+      await waitFor(() => {
+        expect(toolArgsSwitch().getAttribute('aria-checked')).toBe('true')
+      })
+    })
+
+    it('grants the scope through the same consent route, with no new endpoint', async () => {
+      stubGateway({ enabled: true })
+      const save = vi.spyOn(api, 'saveDecisionsConsent').mockResolvedValue(
+        consentOf(true, { tool_args: true }),
+      )
+      renderSection()
+      await waitFor(() => {
+        expect(toolArgsSwitch()).toBeInTheDocument()
+      })
+      toolArgsSwitch().click()
+      await waitFor(() => {
+        // `undefined` for the switch, not `true`: a scope write carries no switch, so
+        // this view cannot re-grant a consent revoked since it last read. The reviewed
+        // address still rides along.
+        expect(save).toHaveBeenCalledWith(undefined, ENDPOINT, true)
+      })
+    })
+
+    it('revokes it with an explicit false rather than by omission', async () => {
+      // Omission PRESERVES the recorded scope on this route, so a revoke has to send
+      // the boolean. A card that omitted it would leave the scope granted.
+      stubGateway(consentOf(true, { tool_args: true }))
+      const save = vi.spyOn(api, 'saveDecisionsConsent').mockResolvedValue(consentOf(true))
+      renderSection()
+      await waitFor(() => {
+        expect(toolArgsSwitch().getAttribute('aria-checked')).toBe('true')
+      })
+      toolArgsSwitch().click()
+      await waitFor(() => {
+        expect(save).toHaveBeenCalledWith(undefined, ENDPOINT, false)
+      })
+    })
+
+    it('leaves the scope unmentioned when the MAIN switch is flipped', async () => {
+      // The main switch says nothing about tool arguments, and the route preserves a
+      // recorded scope for an absent field. So an ordinary flip must send two
+      // arguments, not three: a third would make the main switch able to grant or
+      // erase an egress scope the owner did not touch.
+      stubGateway({ enabled: false })
+      const save = vi.spyOn(api, 'saveDecisionsConsent').mockResolvedValue(consentOf(true))
+      renderSection()
+      await waitFor(() => {
+        expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
+      })
+      decisionsSwitch().click()
+      await waitFor(() => {
+        expect(save).toHaveBeenCalledWith(true, ENDPOINT)
+      })
+    })
+
+    it('states what the extra data is, and that it changes no permission', async () => {
+      stubGateway({ enabled: true })
+      renderSection()
+      await waitFor(() => {
+        expect(toolArgsSwitch()).toBeInTheDocument()
+      })
+      // Read off the whole rendered section: the description is a sibling of the
+      // switch inside SettingsToggle, and walking a fixed number of parents pins a
+      // DOM shape this test has no business asserting.
+      const body = document.body.textContent ?? ''
+      expect(body).toContain('name and arguments of each call')
+      expect(body).toContain('Passwords and keys are replaced')
+      expect(body).toContain('changes nothing about which tool calls are allowed')
+    })
+  })
+
   describe('capabilities.decisions governance gate', () => {
     // The card is the door to a PAID external egress, so a managed fleet can
     // withdraw the whole feature: `GET /api/dashboard/config` reports the ceiling's
@@ -463,5 +579,179 @@ describe('Decisions (Jev) preview card', () => {
       })
       expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
     })
+  })
+})
+
+describe('the whole-transcript consent scope', () => {
+  it('is not drawn while the main switch is off', () => {
+    stubGateway({ enabled: false })
+    renderSection()
+    expect(
+      screen.queryByRole('switch', {
+        name: 'Also send the conversation and tool-call inputs so Jev can score compaction',
+      }),
+    ).toBeNull()
+  })
+
+  it('draws OFF for a consent recorded before the scope existed', async () => {
+    // The whole point of a third leaf: an owner who consented to sending, and even to
+    // tool arguments, has not consented to a whole transcript.
+    stubGateway(consentOf(true, { tool_args: true }))
+    renderSection()
+    await waitFor(() => {
+      expect(toolArgsSwitch().getAttribute('aria-checked')).toBe('true')
+      expect(compactionSwitch().getAttribute('aria-checked')).toBe('false')
+    })
+  })
+
+  it('draws ON when the keystone recorded it', async () => {
+    stubGateway(consentOf(true, { compaction: true }))
+    renderSection()
+    await waitFor(() => {
+      expect(compactionSwitch().getAttribute('aria-checked')).toBe('true')
+    })
+  })
+
+  it('grants the scope through the same consent route, with no new endpoint', async () => {
+    stubGateway({ enabled: true })
+    const save = vi.spyOn(api, 'saveDecisionsConsent').mockResolvedValue(
+      consentOf(true, { compaction: true }),
+    )
+    renderSection()
+    await waitFor(() => {
+      expect(compactionSwitch()).toBeInTheDocument()
+    })
+    compactionSwitch().click()
+    await waitFor(() => {
+      // `undefined` in the tool-argument slot is deliberate: an OMITTED field
+      // preserves the recorded scope, so acting on this switch cannot grant or erase
+      // the narrower one beside it.
+      expect(save).toHaveBeenCalledWith(undefined, ENDPOINT, undefined, true)
+    })
+  })
+
+  it('revokes it with an explicit false rather than by omission', async () => {
+    stubGateway(consentOf(true, { compaction: true }))
+    const save = vi.spyOn(api, 'saveDecisionsConsent').mockResolvedValue(consentOf(true))
+    renderSection()
+    await waitFor(() => {
+      expect(compactionSwitch().getAttribute('aria-checked')).toBe('true')
+    })
+    compactionSwitch().click()
+    await waitFor(() => {
+      expect(save).toHaveBeenCalledWith(undefined, ENDPOINT, undefined, false)
+    })
+  })
+
+  it('names the point only while the scope is granted', async () => {
+    stubGateway(consentOf(true, { compaction: true }))
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByTitle('compaction.keep')).toBeInTheDocument()
+    })
+    cleanup()
+    stubGateway(consentOf(true))
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByTitle('skills.select')).toBeInTheDocument()
+    })
+    expect(screen.queryByTitle('compaction.keep')).toBeNull()
+  })
+
+  it('says the compaction itself is unchanged', async () => {
+    // A switch that read as "better compaction" would be a promise this build does
+    // not keep: nothing is applied, and the answer is a line on a notice.
+    stubGateway({ enabled: true })
+    renderSection()
+    await waitFor(() => {
+      expect(compactionSwitch()).toBeInTheDocument()
+    })
+    const rendered = document.body.textContent ?? ''
+    expect(rendered).toContain('It is a measurement')
+    expect(rendered).toContain('Tool OUTPUT is never sent')
+    expect(rendered).toContain('Passwords and keys are replaced')
+  })
+})
+
+describe('the whole-transcript scope reports its own in-flight and failed states', () => {
+  /**
+   * Both are about THIS PR's switch. A scope PUT carries `enabled: true` — the scope is
+   * only meaningful while the seam is on — so a scope flip followed immediately by a
+   * main switch OFF is two concurrent writes to one keystone, and the scope one
+   * landing second restores consent the owner just revoked. And a refused scope write is
+   * otherwise silent: the switch snaps back on the refetch with nothing saying why.
+   *
+   * The FREEZE is asserted for both scopes, because it is one hazard rather than one per
+   * scope and the main switch's condition is this row's own. The tool-argument switch's
+   * error surface is still not asserted here: that switch shipped before this one, and
+   * #12492 is fixing the server side for every scope at once.
+   */
+  const heldSave = () => {
+    let release: (v: DecisionsConsentData) => void = () => {}
+    const promise = new Promise<DecisionsConsentData>(resolve => { release = resolve })
+    return { promise, release: () => release(consentOf(true)) }
+  }
+
+  it('freezes the main switch while the scope write is in flight', async () => {
+    stubGateway(consentOf(true))
+    const held = heldSave()
+    vi.spyOn(api, 'saveDecisionsConsent').mockReturnValue(held.promise)
+    renderSection()
+    await waitFor(() => { expect(compactionSwitch()).toBeInTheDocument() })
+    expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
+    compactionSwitch().click()
+    await waitFor(() => {
+      expect(decisionsSwitch().getAttribute('aria-disabled')).toBe('true')
+    })
+    held.release()
+    await waitFor(() => {
+      expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
+    })
+  })
+
+  it('freezes the main switch while the TOOL-ARGUMENT scope write is in flight too', async () => {
+    // Same hazard, other scope: a condition that named only one of the two covered part
+    // of its own subject.
+    stubGateway(consentOf(true))
+    const held = heldSave()
+    vi.spyOn(api, 'saveDecisionsConsent').mockReturnValue(held.promise)
+    renderSection()
+    await waitFor(() => { expect(toolArgsSwitch()).toBeInTheDocument() })
+    expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
+    toolArgsSwitch().click()
+    await waitFor(() => {
+      expect(decisionsSwitch().getAttribute('aria-disabled')).toBe('true')
+    })
+    held.release()
+    await waitFor(() => {
+      expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
+    })
+  })
+
+  it('says so when the scope write is refused, rather than reverting in silence', async () => {
+    stubGateway(consentOf(true))
+    vi.spyOn(api, 'saveDecisionsConsent').mockRejectedValue(new Error('dashboard owner required'))
+    renderSection()
+    await waitFor(() => { expect(compactionSwitch()).toBeInTheDocument() })
+    compactionSwitch().click()
+    await waitFor(() => {
+      expect(screen.getByText(/could not save this setting/i)).toBeInTheDocument()
+    })
+    // The stored value is what the switch shows: the refused write did not take.
+    expect(compactionSwitch().getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('draws no error while the write is merely in flight', async () => {
+    stubGateway(consentOf(true))
+    const held = heldSave()
+    vi.spyOn(api, 'saveDecisionsConsent').mockReturnValue(held.promise)
+    renderSection()
+    await waitFor(() => { expect(compactionSwitch()).toBeInTheDocument() })
+    compactionSwitch().click()
+    await waitFor(() => {
+      expect(decisionsSwitch().getAttribute('aria-disabled')).toBe('true')
+    })
+    expect(screen.queryByText(/could not save this setting/i)).toBeNull()
+    held.release()
   })
 })

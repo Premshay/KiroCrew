@@ -45,6 +45,13 @@ from kiro_crew.apps.manager import (
     trust_grant_removal_blocked,
     uninstall_app,
 )
+from kiro_crew.apps.plugin_import import (
+    PluginImportError,
+    convert_plugin_package,
+    find_plugin_manifest,
+    normalize_app_name,
+    read_manifest_name,
+)
 from kiro_crew.apps.scaffold import scaffold_app
 from kiro_crew.cli_server import _marker_port, resolve_client_port
 from kiro_crew.config import config_dir
@@ -120,7 +127,7 @@ from kiro_crew.security import (
     scan_memory,
 )
 from kiro_crew.sel import sel
-from kiro_crew.terminal_safe import _TERMINAL_CTRL_RE
+from kiro_crew.terminal_safe import _TERMINAL_CTRL_RE, safe_terminal_line
 from kiro_crew.validation import (
     _AGENT_NAME_RE,
     CHANNEL_ID_RE,
@@ -932,6 +939,76 @@ def _run_app_mcp_server(app_name: str) -> None:
     runner()
 
 
+def _handle_app_import(args: argparse.Namespace) -> None:
+    """Convert a manifest-declared plugin package into an app directory.
+
+    Conversion reads and copies only: nothing in the source package is imported or
+    executed while this command runs. It says nothing about later -- a converted
+    MCP server entry names a command, and enabling the emitted app launches it
+    like any other app's. See ``kiro_crew.apps.plugin_import``.
+    """
+    source = Path(args.source).expanduser()
+    try:
+        manifest_path, _ = find_plugin_manifest(source)
+        # The manifest is foreign input, and the module that owns its contract
+        # does the parsing: it refuses a document that is not a JSON object and
+        # reads a non-string `name` as absent. Parsing it here instead loses both
+        # checks, and every refusal it raises is a PluginImportError the arm
+        # below already prints.
+        manifest_name = read_manifest_name(manifest_path)
+        derived = normalize_app_name(
+            getattr(args, "name", None) or (manifest_name or source.resolve().name)
+        )
+    except PluginImportError as exc:
+        # Every refusal message in this command embeds a path taken from the
+        # package under conversion -- a declared resource, a missing file, the
+        # source root -- and that text lands after a ``❌`` prefix on the operator's
+        # terminal. Untouched, a crafted package name could carry escapes that
+        # repaint the screen, or a newline that opens an unprefixed line reading as
+        # this tool's own output. ``exc.code`` is an internal literal, so only the
+        # message needs the repo's shared one-line sanitizer.
+        print(f"❌ {exc.code}: {safe_terminal_line(exc.message)}", file=sys.stderr)
+        sys.exit(1)
+    except (OSError, json.JSONDecodeError) as exc:
+        # str() of either carries the offending filename, which is package-supplied.
+        print(
+            f"❌ cannot read the plugin manifest: {safe_terminal_line(str(exc))}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    out_dir = Path(args.out).expanduser() if getattr(args, "out", None) else Path(f"{derived}-app")
+    try:
+        report = convert_plugin_package(source, out_dir, name_override=derived)
+    except PluginImportError as exc:
+        print(f"❌ {exc.code}: {safe_terminal_line(exc.message)}", file=sys.stderr)
+        sys.exit(1)
+
+    print(report.render_text())
+    # out_dir needs no sanitizing on either line below: when it is derived it comes
+    # from normalize_app_name, which folds every non-alphanumeric character to a
+    # hyphen and then requires a full kebab-case match, so no control character
+    # survives it; when it is given it was typed by the operator reading this line.
+    print(f"\n✅ wrote {out_dir / 'app.json'}")
+
+    if not getattr(args, "install", False):
+        print(f"\n   Run: kirocrew app install {out_dir}")
+        return
+
+    result = install_app(str(out_dir))
+    if not result.ok:
+        print(f"❌ {safe_terminal_line(result.error)}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✅ {safe_terminal_line(result.message)}")
+    # NOT registered here. Installing writes the app's files; it does not turn the
+    # app on, and this path leaves it disabled -- the line below is what tells the
+    # operator so. Registering at this point activates the app's executable
+    # resources (its agents, its MCP servers) for a disabled app, so the next agent
+    # session launches a command from a third-party package that nobody enabled.
+    # The enable path registers, which is where the decision to run it is made.
+    print(f"\n   Run: kirocrew app enable {result.name}")
+
+
 def _handle_app(args: argparse.Namespace) -> None:
     """Dispatch app subcommands: install, list, enable, disable, uninstall, info."""
     action = getattr(args, "app_action", None)
@@ -941,6 +1018,10 @@ def _handle_app(args: argparse.Namespace) -> None:
         # manifest mcpServers). stdout is the JSON-RPC channel — never print to
         # it here, or the handshake breaks.
         _run_app_mcp_server(args.name)
+        return
+
+    if action == "import":
+        _handle_app_import(args)
         return
 
     if action == "install":
@@ -2535,13 +2616,14 @@ def _learn(args: argparse.Namespace) -> None:
                     category = normalize_lesson_category(le.category, strict=False)
                     # Same classification the JSONL store's scope-selective remove
                     # applies: None is global, anything else is judged admissible.
-                    scope = _lesson_scope_suffix(
-                        (
-                            ""
-                            if le.repo_scope is None
-                            else (le.repo_scope if scope_is_admissible(le.repo_scope) else None)
-                        ),
-                    )
+                    stored_scope: str | None
+                    if le.repo_scope is None:
+                        stored_scope = ""
+                    elif scope_is_admissible(le.repo_scope):
+                        stored_scope = le.repo_scope
+                    else:
+                        stored_scope = None
+                    scope = _lesson_scope_suffix(stored_scope)
                     print(
                         f"  [{_TERMINAL_CTRL_RE.sub('', category)}] {_TERMINAL_CTRL_RE.sub('', str(le.rule))}{neg}{scope}"
                     )
@@ -3736,8 +3818,22 @@ def _pod(args: argparse.Namespace) -> None:
 def _container_valued_sections() -> dict[str, type]:
     """Top-level config keys the model expects to be a JSON object or array.
 
-    Derived from the dataclass rather than hardcoded, so a section added to
-    ``KiroCrewConfig`` later is covered without anyone remembering to edit this.
+    Read off ``KiroCrewConfig``'s own fields rather than hardcoded, so most
+    sections added later are covered without an edit here. Which branch does that
+    reading is worth knowing, because it bounds the "most": ``config/loader.py``
+    carries ``from __future__ import annotations``, so every ``field.type``
+    arrives as a STRING and the string branch is the one that runs. It matches on
+    the annotation's TEXT — a ``list`` prefix, a ``dict`` prefix, a ``Config``
+    suffix for a nested config — so a section spelled another way
+    (``Optional[list[...]]``, ``Mapping[str, str]``, a nested dataclass not named
+    ``*Config``) is not recognised and gets no guard. A new section in one of
+    those spellings needs a look here. So does dropping that future import from
+    ``config/loader.py``: ``field.type`` would then arrive as a resolved object,
+    the ``isinstance`` guard would skip every field, and this map would come back
+    empty — which stops the model-derived half of the guard below, though not the
+    hardcoded ``dashboard.tailscale`` check after it. That is not a silent loss:
+    ``test_tailnet_cli.py``'s section-guard tests go red on an empty map.
+
     Both shapes matter: a nested-config or mapping field must be an object, and a
     ``list[...]`` field must be an array — the loader *iterates* the latter, so a
     scalar there is an uncaught ``TypeError`` rather than a merge that loses data.
@@ -3745,18 +3841,11 @@ def _container_valued_sections() -> dict[str, type]:
     out: dict[str, type] = {}
     for field in dataclasses.fields(KiroCrewConfig):
         ann = field.type
-        if isinstance(ann, str):  # from __future__ import annotations
-            if ann.startswith("list"):
-                out[field.name] = list
-            elif ann.endswith("Config") or ann.startswith("dict"):
-                out[field.name] = dict
+        if not isinstance(ann, str):
             continue
-        origin = getattr(ann, "__origin__", None)
-        if origin is list:
+        if ann.startswith("list"):
             out[field.name] = list
-        elif origin is dict or ann is dict:
-            out[field.name] = dict
-        elif dataclasses.is_dataclass(ann):
+        elif ann.endswith("Config") or ann.startswith("dict"):
             out[field.name] = dict
     return out
 

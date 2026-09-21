@@ -10619,7 +10619,15 @@ class TestBothScopeLanesTolerateAnIndentedVerdictHeader:
             stripped = line.strip()
             if stripped.startswith("#"):
                 continue
-            if "grep -iE" in stripped and "Scope-Verdict:" in stripped:
+            # Case-insensitively, because the capture is: an expression that
+            # lowercases the line before comparing spells the header in lower
+            # case, and a selector keyed to one casing would skip it.
+            if "scope-verdict:" not in stripped.lower():
+                continue
+            # The ASSIGNMENT, named by shape rather than by the program it runs:
+            # a pin keyed to one tool silently stops finding the capture the day
+            # the capture changes tool, and then measures nothing.
+            if '="$(' in stripped:
                 return stripped
         raise AssertionError(f"{workflow}: no Scope-Verdict capture expression")
 
@@ -10631,7 +10639,10 @@ class TestBothScopeLanesTolerateAnIndentedVerdictHeader:
         assert any(line != line.lstrip() for line in header), header
 
     @pytest.mark.parametrize("workflow", _SCOPE_LANES)
-    @pytest.mark.parametrize("indent", ("", "    ", "\t"))
+    # Every whitespace form `[[:space:]]` matches inside a line, because the
+    # capture's own class has to match it: a narrower one silently stops reading
+    # a header the contract's own indentation could produce.
+    @pytest.mark.parametrize("indent", ("", "    ", "\t", "\v", "\f", "\r"))
     def test_each_lane_reads_the_same_verdict_however_it_is_indented(
         self, workflow: str, indent: str, tmp_path: Path
     ) -> None:
@@ -10658,12 +10669,15 @@ class TestBothScopeLanesTolerateAnIndentedVerdictHeader:
                 f'printf %s "${name}"',
             ]
         )
-        # No `bash -e`: the lane's step runs `set -uo pipefail` and nothing else, so
-        # a grep that matches nothing leaves the capture EMPTY and the lane carries
-        # on to read `UNKNOWN`. Running this under `-e` would abort at the failed
-        # assignment and hide which verdict the expression actually yields.
+        # `-e` IS the production flag, and running without it is what let this pin
+        # pass while the lane aborted. A `run:` block with no `shell:` key gets
+        # `bash -e {0}`, which the lane's own job log records, so an expression
+        # whose status is non-zero dies at the assignment -- above whatever
+        # fallback was written for it. Asserting the STATUS as well as the value
+        # is the half that catches that: a capture may legitimately come back
+        # empty, and must never take the step down on its way.
         out = subprocess.run(
-            [bash, "-c", script],
+            [bash, "-e", "-c", script],
             check=False,
             capture_output=True,
             text=True,
@@ -10671,9 +10685,87 @@ class TestBothScopeLanesTolerateAnIndentedVerdictHeader:
             env={**os.environ, "IN": str(review)},
             cwd=tmp_path,
         )
+        assert out.returncode == 0, (
+            f"{workflow}: indent {indent!r} aborted the step (rc={out.returncode}) "
+            f"under the runner's own `bash -e`: {out.stderr.strip()}"
+        )
         assert out.stdout == "PASS", (
             f"{workflow}: indent {indent!r} captured {out.stdout!r} "
             f"(rc={out.returncode}) {out.stderr.strip()}"
+        )
+
+    #: How many ``Scope-Verdict:`` lines the many-headers review carries. Chosen
+    #: well above the smallest count that makes a ``grep | head -n1`` pipeline
+    #: close the pipe on its producer (measured between 200 and 500 on Linux), and
+    #: small enough that the fixture is tens of kilobytes rather than megabytes.
+    _MANY_HEADERS = 2000
+
+    #: Reviews whose header the capture cannot return, and the value each must
+    #: yield. Every one is an ordinary model outcome, and in every one the
+    #: capture's own exit status decides whether the step lives to read its
+    #: fallback. ``many-headers`` is the case where a value IS in hand when the
+    #: read ends early, so an expression that merely suppresses the status would
+    #: hand the lane a verdict it never finished reading.
+    _NO_VERDICT_REVIEWS = {
+        "no-header": ("The change refuses nothing new.\n\nNo header here.\n", ""),
+        "header-shaped-prose": ("I would write Scope-Verdict as a header if asked.\n", ""),
+        "many-headers": (None, "PASS"),
+    }
+
+    @pytest.mark.parametrize("workflow", _SCOPE_LANES)
+    @pytest.mark.parametrize("review_kind", sorted(_NO_VERDICT_REVIEWS))
+    def test_a_capture_that_returns_no_verdict_still_leaves_the_step_alive(
+        self, workflow: str, review_kind: str, tmp_path: Path
+    ) -> None:
+        """An empty capture is an ANSWER, and must not be an abort.
+
+        Each lane keeps a fallback one line under its capture -- ``UNKNOWN`` for the
+        same-repo lane, a ``[ -n ]`` test for the fork lane -- so a review that names
+        no verdict has a defined, fail-closed outcome. A ``run:`` block with no
+        ``shell:`` key runs under ``bash -e``, and these steps add ``pipefail``, so a
+        capture whose status is non-zero dies ABOVE that fallback: the lane writes no
+        verdict output at all, its status step reads an empty verdict, and the comment
+        that would have named the cause is never posted. A red either way, but one of
+        them tells nobody why.
+
+        The status assertion is the whole point. Asserting only the value passes an
+        expression that returns the right value and takes the step down anyway.
+        """
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the capture is Bash; skip where Bash is absent")
+        body, expected = self._NO_VERDICT_REVIEWS[review_kind]
+        if body is None:
+            body = "Scope-Verdict: PASS\n" + "Scope-Verdict: BLOCK\n" * self._MANY_HEADERS
+        review = tmp_path / "scope-review.md"
+        review.write_text(body, encoding="utf-8")
+        line = self._capture_line(workflow)
+        name = line.split("=", 1)[0]
+        script = "\n".join(
+            [
+                "set -uo pipefail",
+                'summary="$(cat "$IN")"',
+                'OUT="$IN"',
+                line,
+                f'printf %s "${name}"',
+            ]
+        )
+        out = subprocess.run(
+            [bash, "-e", "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env={**os.environ, "IN": str(review)},
+            cwd=tmp_path,
+        )
+        assert out.returncode == 0, (
+            f"{workflow}: a {review_kind} review aborted the step "
+            f"(rc={out.returncode}) under the runner's own `bash -e`, above the "
+            f"fallback written for it: {out.stderr.strip()}"
+        )
+        assert out.stdout == expected, (
+            f"{workflow}: a {review_kind} review captured {out.stdout!r}, " f"expected {expected!r}"
         )
 
 
@@ -11822,6 +11914,116 @@ class TestForkLaneBunEgress:
                 f"{lane} job {name!r} runs no model and downloads no bun, so "
                 f"allowing {self.ENDPOINT} widens its egress for nothing"
             )
+
+
+class TestForkLaneBubblewrapBootstrapEgress:
+    """The fork reviewers fetch the whole toolchain their own settings turn on.
+
+    Setting `allowed_non_write_users` auto-enables `claude-code-action`'s
+    subprocess secret-scrub plus bubblewrap isolation, and the action bootstraps
+    in two sequential network phases. First `apt-get install bubblewrap socat`:
+    on the ubuntu-latest image `/etc/apt/apt-mirrors.txt` names the azure mirror
+    first over plaintext http and falls back to the two canonical hosts over
+    https, so all three are on the path of that one install. Then the CLI itself,
+    via `curl https://claude.ai/install.sh`, whose script reads its version
+    manifest and binary from `downloads.claude.ai/claude-code-releases`.
+
+    Both phases are asserted together because they are SEQUENTIAL: an allowlist
+    carrying only the apt half lets apt succeed and then dies on curl, with the
+    same `review incomplete` and no model call, so a green apt phase is not
+    evidence that the bootstrap resolves.
+
+    Blocked, the install exits 7 before the model is ever reached, and the lane
+    reports `review incomplete` rather than a verdict. Failing closed is
+    correct -- the isolation is a security control, so running unsandboxed must
+    never be a silent fallback -- but the lane then cannot review at all, and the
+    advisory lanes publish that as a NEUTRAL check, so three reviewers stopped
+    reviewing every fork PR without turning anything red.
+
+    This is the whole-file guard: `workflow_run` lanes always execute the DEFAULT
+    branch's yaml, so a PR editing these files cannot exercise its own change.
+    The endpoints are asserted on the model job only, for the same least-privilege
+    reason as the bun release-asset host above.
+    """
+
+    ENDPOINTS = (
+        "azure.archive.ubuntu.com:80",
+        "archive.ubuntu.com:443",
+        "security.ubuntu.com:443",
+        "claude.ai:443",
+        "downloads.claude.ai:443",
+    )
+    ACTION = "anthropics/claude-code-action"
+
+    @classmethod
+    def _runs_a_model(cls, job: dict) -> bool:
+        return any(cls.ACTION in str(step.get("uses") or "") for step in job.get("steps") or ())
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_every_model_job_allows_the_bubblewrap_bootstrap_hosts(self, lane: str) -> None:
+        checked = 0
+        for name, job in _lane_jobs(lane).items():
+            if not self._runs_a_model(job):
+                continue
+            endpoints = _blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            checked += 1
+            missing = [host for host in self.ENDPOINTS if host not in endpoints]
+            assert not missing, (
+                f"{lane} job {name!r} runs {self.ACTION} behind a blocking egress "
+                f"policy but does not allow {missing}, so a phase of its bootstrap "
+                "is refused (apt for the bubblewrap sandbox, curl for the CLI "
+                "itself), the action exits 7 before any model call, and the lane "
+                "publishes `review incomplete` instead of a verdict"
+            )
+        assert checked, f"{lane} has no blocking-egress {self.ACTION} job to check"
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_jobs_that_run_no_model_keep_the_narrower_allowlist(self, lane: str) -> None:
+        # Least privilege, exactly as for the bun host: only a job that actually
+        # bootstraps the sandbox gets the package mirrors.
+        # `fork-security-scope-review.yml` blocks egress in four jobs and runs the
+        # model in one, so a blanket per-file edit would widen three allowlists
+        # that install nothing.
+        for name, job in _lane_jobs(lane).items():
+            if self._runs_a_model(job):
+                continue
+            endpoints = _blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            present = [host for host in self.ENDPOINTS if host in endpoints]
+            assert not present, (
+                f"{lane} job {name!r} runs no model and installs no sandbox, so "
+                f"allowing {present} widens its egress for nothing"
+            )
+
+    @pytest.mark.parametrize("lane", FORK_REVIEW_LANES)
+    def test_no_lane_allows_a_host_nothing_here_fetches(self, lane: str) -> None:
+        # Two ways a reader widens this allowlist from something that merely
+        # APPEARED in the output. The runner image preinstalls google-chrome and
+        # microsoft apt sources, so a blocked `apt-get update` names them in the
+        # same wall of text as the ubuntu archive -- but their failures are apt
+        # WARNINGS (`W:`) and nothing here installs from them. And the CLI
+        # installer script prints `code.claude.com` and `www.anthropic.com` inside
+        # its own error messages without ever requesting them, so grepping that
+        # script for hostnames yields two more that belong nowhere near a
+        # blast-radius control.
+        forbidden = (
+            "dl.google.com",
+            "packages.microsoft.com",
+            "code.claude.com",
+            "www.anthropic.com",
+        )
+        for name, job in _lane_jobs(lane).items():
+            endpoints = _blocking_endpoints(job)
+            if endpoints is None:
+                continue
+            for host in forbidden:
+                assert not any(entry.startswith(host) for entry in endpoints), (
+                    f"{lane} job {name!r} allows {host}, which this lane never "
+                    "requests; it only ever appeared in a warning or an error string"
+                )
 
 
 class TestForkGptLaneMantleEgress:

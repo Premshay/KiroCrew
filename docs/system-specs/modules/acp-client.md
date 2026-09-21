@@ -4,6 +4,156 @@
 
 The ACP layer spans **five** modules: the legacy per-session client (`acp/client.py`, one subprocess per session), the multiplexed runtime (`acp/runtime.py`, one subprocess fanned out to N sessions), the per-session handle (`acp/session_handle.py`, one `sessionId` + queue + prompt/approve/reject loop), a shared dispatch parser (`acp/_dispatch.py`, pure frame-shaping/redaction helpers all paths route through), and the session provider (`acp/session_provider.py`, `AcpSessionProvider` adapting an `AcpSessionHandle` to the `LLMProvider` ABC so runtime-backed sessions are interchangeable with `AcpClient`). All are JSON-RPC 2.0 over stdio for `kiro-cli acp` or `claude-agent-acp`, managing subprocess lifecycle, session initialization, prompt streaming, and tool permissions. All protocol constants in `acp/types.py`.
 
+## Native skill startup views
+
+Native CLI launches prepare a `skill_projection` after the existing spec freshness
+check. The alias preserves the prompt, approval policy and non-skill resources,
+while Crew retains the authored skill mapping for scoped discovery. A workspace
+CLI overlay suppresses implicit native resource inheritance; explicit steering and
+AGENTS.md resources preserve enabled inheritance. Aliases are excluded from Crew's
+agent roster, translated on `session/set_mode`, and normalized in incoming mode and
+agent-name fields. The original agent name remains the Crew session identity.
+Both the direct client and multiplexed runtime apply the same preparation.
+Projection defaults to enabled. Set `KIROCREW_NATIVE_SKILL_PROJECTION=0` in the
+Crew process environment and restart Crew's native sessions to roll back to
+authored native agents. Disabled launches restore the Crew-owned inheritance
+overlay before spawning and bypass alias translation and projected search
+requirements. Existing governance, sandbox and signed-session identity checks
+still apply. The switch is latched at spawn; mode changes in a running projected
+process keep projection enabled until restart. Rollback restores native skill
+metadata enumeration, so the bounded native startup guarantee no longer applies.
+The new alias integration has fixture coverage; an end-to-end native CLI probe
+remains outstanding. The enabled default is an explicit rollout decision.
+Mapped agents and the default `kirocrew` agent expose the single
+`@kirocrew-core/skill_search` tool when the authored tool list does not already
+include it. Unmapped custom agents gain no tools or servers and have an empty
+discovery scope. The added tool uses the managed server declaration without
+adding auto-approval. Native `/agent` mutations are refused with a pointer to Crew's
+agent selector, which updates both the native mode and Crew's template binding.
+Read-only native agent listing/schema commands remain available. Mode activation
+refreshes the view inside the existing derived-spec freshness bracket.
+The reserved core server's command and environment are pinned to the managed
+declaration. Explicit search exclusions disable that agent's projected view with an
+actionable error. The reserved server's `disabled` must be a boolean and
+`disabledTools` a list of strings; null or malformed values fail only that agent
+with an actionable error instead of aborting preparation of healthy agents.
+Shared runtimes derive session control-plane elements from the
+prepared view, then attach the existing signed session token. An existing broker
+element wins; a configuration whose native restrictions prevent a scoped identity
+element is refused instead of silently falling back to global skill discovery.
+
+The workspace overlay owns `chat.disableInheritingDefaultResources=true` while
+Crew supplies discovery. Only literal JSON `true` in the original native setting
+disables inherited steering/AGENTS files; malformed values such as `"false"` or
+`1` preserve those instructions. Rollback still restores the original local value
+and key presence unchanged. For an inherited global preference, global changes are
+re-read at each launch. A pre-existing local preference is preserved in
+`kirocrew.skillDiscovery.inheritFiles`; edit that boolean to change explicit
+steering/AGENTS inheritance while retaining the native skill metadata bound.
+This overlay also affects standalone native custom agents in that workspace.
+The [Kiro CLI 2.10 release notes](https://kiro.dev/changelog/cli/2-10/)
+document this setting and agent-config hot reload. No documented per-invocation
+settings channel was found; changing `KIRO_HOME` would also relocate native
+identity and session state, so it is not used for this overlay. Every in-product
+workspace `cli.json` writer—projection, effort, Tool Search, and the built-in
+review pool—takes the same verified `.kirocrew-cli-settings.lock` sidecar and
+reads the file only after acquiring it. Projection holds that lock from the
+fresh read through alias publication and settings commit, so a concurrent writer
+cannot be replaced by a stale pre-enumeration snapshot. Lock identity changes or
+a two-second acquisition timeout fail closed without writing the settings file.
+Crew records the original local inheritance key's presence and value in
+`kirocrew.skillDiscovery.previousInheritance`. Rollback restores that snapshot
+only while the native key still equals Crew's asserted `true`, removes Crew's
+overlay markers and preserves unrelated settings and a native key that the
+operator changed or removed. Older overlays use their recorded local/global
+source and boolean preference for restoration. Stop projected sessions before
+rollback so another active Crew process cannot reassert the shared overlay.
+Inactive aliases owned by the same Crew data home are pruned only when the
+recorded work directory or authored source proves that the pair cannot be
+regenerated. Aliases published by builds that predate this lifecycle carry NO
+record of either kind, so an ownership-keyed reclaim alone would leave the entire
+accumulated backlog on disk and bound only post-upgrade growth -- which is the
+per-turn tool-spec cost this exists to remove. Those are reclaimed on a separate
+path that does not read a record: the name must match Crew's own prefix plus the
+24-hex digest the projection derives, the file must be a projected view (it
+renames itself to that alias and carries no `skill://` resource), AND it must
+carry one positive mark the projection itself writes -- Crew's managed
+`kirocrew-core` server entry, or the absolute steering resource pointing at this
+host's kiro home. A matching NAME alone never authorizes removal, and neither
+does shape: an unlink is not undoable and an operator's own agent could in
+principle carry that name, so an unrecorded view Crew cannot positively claim is
+left alone. That is a smaller reclaim than the name shape would allow and the
+right side to err on. That path cannot prove the pair unregenerable, so
+its safety rests on the consumer contract instead -- the spawn argv and
+`session/set_mode` both re-prepare before they use an alias, and `/agent` is
+refused rather than translated -- which makes a removal a cache eviction for a
+live pre-upgrade session (its next preparation republishes the same name WITH a
+record) and a reclaim for every dead work directory. That contract has exactly
+one hole, at the upgrade boundary: a publisher from a build predating the lease
+holds no lease, and between its write and kiro-cli reading `--agent` its alias is
+indistinguishable from backlog -- and it will NOT re-prepare, having already done
+so, making a deletion a failed spawn rather than an eviction. An unrecorded alias
+is therefore spared until it is older than a minimum age. That age is NOT a
+liveness proxy -- the reason an age cut-off is rejected for the recorded path --
+it only has to exceed publish-to-spawn, which is milliseconds, while the backlog
+it reclaims is hours to days old; a clock that moved backwards lands on the
+sparing side. Because no record exists, a
+legacy alias also carries no data-home attribution, so a second Crew home sharing
+this agents directory sees the same eviction-then-republish rather than the
+home-scoped skip a recorded alias gets. Every other gate still applies to it:
+this run's own set, live in-process projections and held leases are all checked
+first, and removal is identity-checked against the bytes and inode just read.
+Reclaims are capped PER RUN rather than per candidate examined: the first prune
+after an upgrade faces the whole accumulated backlog, and it runs while the
+publication lock is held, whose own acquisition ceiling is 2s — draining
+thousands of files in one sweep would make a concurrent spawn fail to acquire and
+fall back to authored agents. The backlog is bounded and shrinking, so spreading
+it over successive spawns reclaims it just as completely. Projected agent JSON contains only fields accepted by Kiro's strict
+schema; lifecycle ownership lives in the non-spec
+`.kirocrew-skill-projection-metadata` directory. Each sidecar records the alias's
+exact byte digest, so a stale or replaced sidecar cannot authorize deletion of a
+different spec. No released build ever wrote lifecycle fields INTO a spec --
+kiro-cli denies unknown fields, so the projection never could -- and an alias
+without a sidecar is judged by the unrecorded path above instead. On Windows, untrusted metadata paths must resolve to a classified
+local volume with no linked ancestor or linked leaf before any existence probe;
+remote, unclassifiable, or linked paths retain the alias without triggering a
+network lookup. Each live projection publishes one bounded lease in the non-spec
+`.kirocrew-skill-projection-leases` directory as TWO files: a `.json` record
+naming its aliases, which is never locked, and a `.hold` sidecar that carries the
+lock for the projection object's lifetime and is never read. The split is
+required, not stylistic: Windows file locks are MANDATORY, so a lock on byte 0 of
+the record makes a reader's parse fail with a lock violation from any other
+handle, including one in the same process. Pruning always runs while the current
+projection holds its own lease, so a single-file lease turned every liveness
+probe into the uncertainty answer and reclaimed nothing on Windows while passing
+on POSIX, where locks are advisory. Finalization releases the lock and removes
+both identity-verified sidecars. Pruning reads each record without any lock and
+tests its `.hold` with a non-blocking exclusive acquisition: a held lease keeps
+every alias it names, while an unlocked one is crash/finalizer residue and both
+files are identity-checked and reclaimed. An unreadable, malformed, linked,
+replaced, or otherwise uncertain lease keeps the alias. OS lock release makes a
+crashed process's lease stale without trusting a PID.
+
+Alias publication and pruning share one cross-process lock sidecar in the native
+agents directory, with a two-second acquisition ceiling instead of the platform
+lock's general five-minute ceiling. A sidecar that is a symlink or junction,
+changes identity while opened or acquired, or is otherwise unverifiable is
+treated as lock failure. Removal revalidates the candidate's identity, bytes,
+digest-bound ownership sidecar, and source staleness under that lock immediately before
+unlinking it. POSIX uses descriptor-relative identity-checked deletion; Windows
+uses the same global publisher lock plus a final no-link identity check before
+its by-name unlink. An unknown platform without either contract retains the
+stale alias. A changed, unreadable, oversized, or otherwise uncertain candidate
+remains on disk. If the lock cannot be opened or acquired, preparation retains
+every alias and the current settings file byte-for-byte, then falls back to the
+authored native agent rather than risking a stale-snapshot overwrite or blocking
+startup. Active, foreign-home, unmarked, malformed, unreadable, oversized or
+otherwise uncertain alias files remain on disk.
+
+Windows runtime teardown records the reaped return code after the owned-handle
+drain, before dropping the process reference, just as POSIX teardown does. The
+existing death summary is amended without changing its reason or stderr tail.
+
 ## Backend Selection
 
 `AcpSessionHandle.active_agent` records the mode named by session configuration,

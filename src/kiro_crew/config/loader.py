@@ -345,6 +345,7 @@ from kiro_crew.config.validation import (  # noqa: F401
 )
 from kiro_crew.config.validation import validate_config_data as _validate_config_data  # noqa: F401
 from kiro_crew.constants import (
+    DEFAULT_SUBAGENT_MAX_TURNS,
     SUBAGENT_TIMEOUT_MAX,
     SUBAGENT_TIMEOUT_MIN,
     SUBAGENT_TIMEOUT_SECS,
@@ -2620,6 +2621,9 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
             )
             else {}
         ),
+        apps_ui_stream_timeout_secs=_safe_int(
+            agent_data.get("apps_ui_stream_timeout_secs", 30), 30, 5, 600
+        ),
         jail=_normalize_jail(agent_data.get("jail", "auto")),
         dangerously_skip_permissions=_read_skip_permissions(agent_data),
         yolo_duration=_normalize_yolo_duration(agent_data.get("yolo_duration")),
@@ -2667,7 +2671,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
             agent_data.get("subagent_auto_max", 32), 32, 3, SUBAGENT_AUTO_MAX_CEILING
         ),
         subagent_spawn_stagger_secs=_safe_float(
-            agent_data.get("subagent_spawn_stagger_secs", 2.0), 2.0
+            agent_data.get("subagent_spawn_stagger_secs", 0.25), 0.25
         ),
         spawn_min_memory_gb=_safe_float(agent_data.get("spawn_min_memory_gb", 4.0), 4.0),
         resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
@@ -2717,6 +2721,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         ),
         adaptive_floor=_safe_int(agent_data.get("adaptive_floor", 1), 1, 1, 64),
         adaptive_initial=_safe_int(agent_data.get("adaptive_initial", 4), 4, 1, 64),
+        adaptive_slow_start=_safe_bool(agent_data.get("adaptive_slow_start"), True),
         controller_sample_secs=_safe_int(agent_data.get("controller_sample_secs", 5), 5, 1, 300),
         # Dependency coordinator (taskq/dependency.py coordinator_from_config).
         dependency_max_attempts=_safe_int(
@@ -2736,7 +2741,10 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
             "wait" if agent_data.get("interactive_command_policy") == "wait" else "cancel"
         ),
         subagent_max_turns=_safe_int(
-            agent_data.get("subagent_max_turns", 100), 100, 1, SUBAGENT_MAX_TURNS_CEILING
+            agent_data.get("subagent_max_turns", DEFAULT_SUBAGENT_MAX_TURNS),
+            DEFAULT_SUBAGENT_MAX_TURNS,
+            1,
+            SUBAGENT_MAX_TURNS_CEILING,
         ),
         subagent_timeout_secs=_subagent_timeout_from(
             agent_data.get("subagent_timeout_secs", SUBAGENT_TIMEOUT_SECS)
@@ -3653,26 +3661,55 @@ def _build_instances_config(
 
 
 def _build_skills_config(skills_data: dict) -> SkillsConfig:
+    # Every default here is READ FROM THE DATACLASS, never written a second time.
+    # A config.json omits any key it predates, so a literal in this function is a
+    # second declaration of the same default that can drift from the first and then
+    # answer with the opposite value, silently, for exactly the installs that have
+    # not touched the setting.
+    d = SkillsConfig()
     return SkillsConfig(
-        max_triggered=_safe_int(skills_data.get("max_triggered", 0), 0),
-        lazy_load=bool(skills_data.get("lazy_load", False)),
-        auto_create_from_sessions=bool(skills_data.get("auto_create_from_sessions", False)),
-        auto_refine_on_deviation=bool(skills_data.get("auto_refine_on_deviation", False)),
-        auto_min_tool_calls=_safe_int(skills_data.get("auto_min_tool_calls", 5), 5),
-        auto_similarity_threshold=_safe_float(
-            skills_data.get("auto_similarity_threshold", 0.85), 0.85
+        max_triggered=_safe_int(skills_data.get("max_triggered", d.max_triggered), d.max_triggered),
+        lazy_load=_safe_bool(skills_data.get("lazy_load", d.lazy_load), d.lazy_load),
+        auto_create_from_sessions=_safe_bool(
+            skills_data.get("auto_create_from_sessions", d.auto_create_from_sessions),
+            d.auto_create_from_sessions,
         ),
-        approval_required=bool(skills_data.get("approval_required", True)),
-        max_auto_skills=_safe_int(skills_data.get("max_auto_skills", 100), 100),
-        stale_after_days=_safe_int(skills_data.get("stale_after_days", 30), 30),
-        archive_after_days=_safe_int(skills_data.get("archive_after_days", 90), 90),
-        pending_ttl_days=_safe_int(skills_data.get("pending_ttl_days", 30), 30),
-        generate_scripts=bool(skills_data.get("generate_scripts", True)),
-        judge_model=str(skills_data.get("judge_model", "auto") or "auto"),
+        auto_refine_on_deviation=_safe_bool(
+            skills_data.get("auto_refine_on_deviation", d.auto_refine_on_deviation),
+            d.auto_refine_on_deviation,
+        ),
+        auto_min_tool_calls=_safe_int(
+            skills_data.get("auto_min_tool_calls", d.auto_min_tool_calls), d.auto_min_tool_calls
+        ),
+        auto_similarity_threshold=_safe_float(
+            skills_data.get("auto_similarity_threshold", d.auto_similarity_threshold),
+            d.auto_similarity_threshold,
+        ),
+        approval_required=_safe_bool(
+            skills_data.get("approval_required", d.approval_required), d.approval_required
+        ),
+        max_auto_skills=_safe_int(
+            skills_data.get("max_auto_skills", d.max_auto_skills), d.max_auto_skills
+        ),
+        stale_after_days=_safe_int(
+            skills_data.get("stale_after_days", d.stale_after_days), d.stale_after_days
+        ),
+        archive_after_days=_safe_int(
+            skills_data.get("archive_after_days", d.archive_after_days), d.archive_after_days
+        ),
+        pending_ttl_days=_safe_int(
+            skills_data.get("pending_ttl_days", d.pending_ttl_days), d.pending_ttl_days
+        ),
+        generate_scripts=_safe_bool(
+            skills_data.get("generate_scripts", d.generate_scripts), d.generate_scripts
+        ),
+        judge_model=str(skills_data.get("judge_model", d.judge_model) or d.judge_model),
         extra_paths=[p for p in _safe_list(skills_data.get("extra_paths")) if isinstance(p, str)],
         # Security off-switch: malformed values must not become truthy
         # through Python coercion (for example, the string "false").
-        project_skills_enabled=(skills_data.get("project_skills_enabled", True) is True),
+        project_skills_enabled=(
+            skills_data.get("project_skills_enabled", d.project_skills_enabled) is True
+        ),
     )
 
 

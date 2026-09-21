@@ -111,7 +111,7 @@ from kiro_crew.dashboard.chat_utils import (
     slot_history_key,
     subagents_attached_async,
 )
-from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.handlers._shared import _owner_denial_response, read_bounded_json
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.remote_adopt import (
     ADOPT_PEER_MODE_UNKNOWN,
@@ -307,6 +307,82 @@ def _deny_app_yolo(request_app: str, operation: str) -> web.Response:
     )
 
 
+#: Row-meta keys a REQUEST may never supply, because the gateway mints them and a
+#: surface reads them as the gateway's own claim. ``decisions_strip`` is a Jev
+#: decision receipt with a verdict control attached (``decisions/points/
+#: message_steer.py``, ``website/src/pages/chat/SteerDecisionLine.tsx``), so a
+#: caller-supplied one would render a decision nobody made.
+RESERVED_ROW_META_KEYS = frozenset({"decisions_strip"})
+
+#: The ``steer`` value that means "let Jev choose between the two paths" rather
+#: than naming one. A STRING beside the boolean the two manual modes send, so the
+#: manual wire is untouched: ``steer: true`` still steers and an absent flag still
+#: queues, byte for byte, whatever this build decides about ``auto``.
+STEER_AUTO = "auto"
+
+
+def steer_is_auto(value: object) -> bool:
+    """Whether a send's ``steer`` flag asks Jev to choose the path.
+
+    Only the exact string, case- and space-insensitively. A boolean ``True`` is a
+    MANUAL steer and must never read as auto: that flag is what every existing
+    client sends, and reading it as a request to decide would put an oracle on a
+    path the sender already answered.
+    """
+    return isinstance(value, str) and value.strip().lower() == STEER_AUTO
+
+
+async def decided_message_handling(slot: Any, message: str) -> tuple[bool, dict | None]:
+    """Ask ``message.steer`` whether *message* queues instead of steering.
+
+    Returns ``(queues, record)``: whether to take the QUEUE path, and the decision
+    row to stamp on the persisted user row (``None`` when nothing was decided, or
+    when the row itself was refused).
+
+    A BOOLEAN rather than the point's choice string, so the caller holds no copy of
+    that vocabulary and cannot drift from it: every refusal -- the seam off, the
+    session unsampled, a timeout, an answer outside the two options, a failed
+    import -- is ``False``, which is the steer path a manual Steer and the
+    composer's default have always taken.
+
+    Called for a send the dashboard's own human made while a turn is running, and
+    nowhere else (the busy branch's ``not request_app`` conjunct): an app token, an
+    integration or a cron has nobody watching the reply, and every such send
+    already falls through to the fail-closed queue. Consent and sampling are the
+    seam's own gates, re-checked inside ``decide``.
+
+    Never raises except cancellation. The seam may cost an observation and must
+    never cost a send.
+    """
+    try:
+        # Imported HERE, not at module scope: this module is on the gateway's boot
+        # path and the decisions package is optional, off by default, and pulls the
+        # config loader in behind it.
+        from kiro_crew.decisions.points import message_steer
+
+        session_key = effective_session_key(slot)
+        decided = await message_steer.steer_or_queue(
+            message,
+            session_key=session_key,
+            # The live list, sliced and read off the loop by the point; nothing is
+            # written back.
+            rows=getattr(slot, "messages", ()) or (),
+        )
+        if decided is None:
+            return False, None
+        # The row is written BEFORE the path is taken, and the receipt is stamped
+        # only when it landed: the strip's thumbs POST this turn id, so a receipt
+        # from a row `append` refused would invite a verdict about a decision the
+        # log does not hold. Off the loop -- the append locks a file.
+        record = await asyncio.to_thread(message_steer.record_outcome, session_key, decided)
+        return decided.get("choice") == message_steer.CHOICE_QUEUE, record
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("message.steer: taking the shipped default", exc_info=True)
+        return False, None
+
+
 async def api_chat(request: web.Request) -> web.StreamResponse:
     """POST /api/chat — send message to a slot, stream response via SSE."""
     state: DashboardState = request.app["state"]
@@ -321,6 +397,20 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     user_meta = body.get("meta")  # knowledge/files/pastes metadata from frontend
     if not isinstance(user_meta, dict):
         user_meta = None
+    else:
+        # The row's decision receipt is SERVER-minted and must never be one a
+        # caller can write. `meta` rides verbatim onto the persisted user row
+        # (`_redact_meta` redacts string values; it is not an allowlist) and onto
+        # the queue entry, and the transcript renders `meta.decisions_strip` as a
+        # Jev decision with a verdict control whose POST names the turn id in it.
+        # So an app token or any other caller could otherwise stamp a decision
+        # nobody made and file feedback against it. Dropped HERE, where the field
+        # enters, so every downstream user of `user_meta` -- the dispatch row, the
+        # busy-slot queue entry, the sub-agent hold -- is covered by one gate
+        # rather than each remembering.
+        user_meta = {k: v for k, v in user_meta.items() if k not in RESERVED_ROW_META_KEYS}
+        if not user_meta:
+            user_meta = None
     theme_consent = body.get("theme_consent") is True
     # Content-bound persona consent: the sha256 hex the user
     # granted in the consent modal. Injection is gated on this matching the
@@ -700,7 +790,34 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         # start a concurrent turn. The orchestrating flag keeps it on the queue
         # path (steer is unavailable between stages, so it falls through to the
         # queue below and is held until the plan ends).
-        if body.get("steer") and not request_app:
+        # `steer: "auto"` is the composer's third mode: the sender asked Jev which
+        # of the two shipped paths this message takes. Decided HERE, above both
+        # branches, because the answer chooses between them -- and only here, where
+        # a turn IS running (this branch's own condition) and the send is the
+        # session's own human, are the point's preconditions already established.
+        #
+        # Resolved before the steer `if` rather than inside it, so the steer block
+        # below keeps its exact shape: the only thing `auto` changes about it is one
+        # more conjunct on its condition and the receipt it stamps.
+        _auto_strip: dict | None = None
+        _auto_queues = False
+        if steer_is_auto(body.get("steer")) and not request_app:
+            # The turn the question is ABOUT, captured before the await. The
+            # decision is a provider round-trip, so the turn it describes can end
+            # while it is in flight -- and an answer about a turn that is gone is
+            # not an answer about this send: "interrupt what it is doing" names
+            # work that finished, and a successor turn is a different subject.
+            # On a change the send takes the manual steer path (this branch's own
+            # default) and carries NO receipt, because the decision that was made
+            # is not about the turn the message now reaches. The row is still in
+            # the log, where it belongs -- the receipt is what would misattribute
+            # it.
+            _turn_before = slot.task
+            _auto_queues, _auto_strip = await decided_message_handling(slot, message)
+            if slot.task is not _turn_before:
+                _auto_queues = False
+                _auto_strip = None
+        if body.get("steer") and not request_app and not _auto_queues:
             # Client-minted send correlation id (the same `meta.sendId`
             # convention the plain send path persists): thread it through the
             # steer so the persisted row and the steer_push echo can be matched
@@ -728,6 +845,9 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 # that -- a new outbound mirror is never exempt, because the author
                 # does not control mirror links -- so the composer needs the stamp too.
                 admission=_containment_meta(state, slot),
+                # The receipt for an `auto` send that was decided; absent for a
+                # manual steer, which is what keeps that row byte-identical.
+                decision_strip=_auto_strip,
             )
             if outcome == STEER_STEERED:
                 return web.json_response({"ok": True, "steered": True})
@@ -795,6 +915,13 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             directive_user_origin=not bool(request_app),
             send_id=normalize_send_id(user_meta.get("sendId")) if user_meta else None,
             attachments=attachment_meta(user_meta),
+            # The receipt travels whichever way the send went, including the one
+            # case where the two disagree: `auto` answered steer and the steer was
+            # UNAVAILABLE, so this path runs with a record saying steer. That is the
+            # truth of the decision, and the row's own `steerState` is what says how
+            # the delivery ended -- a receipt withheld there would lose the only
+            # record that a decision was made at all.
+            decision_strip=_auto_strip,
         )
         return web.json_response({"ok": True, "queued": True, "queue_id": qid})
 
@@ -2568,6 +2695,15 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         # path that did not rather than adding a new rule.
         name = str(name)
     agent = body.get("agent", "")
+    # The selection NAMESPACE, when the caller states one. "member" names a
+    # configured crew, "template" a shared provider template; an omitted kind
+    # keeps the legacy name-only resolution. The kind is selection input, never
+    # authority: every owner, app and private-memory gate below still applies.
+    agent_kind = body.get("agent_kind", "")
+    if agent_kind not in ("", "member", "template"):
+        return web.json_response(
+            {"error": "invalid agent kind", "code": "invalid_agent_kind"}, status=400
+        )
     model = body.get("model", "")
     # Folder membership at BIRTH. Assigning it afterwards (client PATCH) is
     # visibly too late: get_or_create_slot broadcasts the new slot before this
@@ -2919,10 +3055,30 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             else None
         )
         try:
+            # Resolved in the STATED namespace, so a template pick takes the
+            # template's workspace rather than a same-name member's. No project
+            # scope here: a create carries no slot yet, and the catalog offers a
+            # slot-less chat global rows only, so this is the whole choice set.
             bindings = await asyncio.to_thread(
-                resolve_agent_bindings, cfg, agent, validate_memory_files=False
+                resolve_agent_bindings,
+                cfg,
+                agent,
+                validate_memory_files=False,
+                selection_kind=agent_kind,
             )
             workspace = _workspace_name_for_dir(cfg, bindings.workspace_dir)
+            if agent_kind and not bindings.requested_resolved:
+                # A stated namespace never falls back to whoever answers by
+                # default -- and it is refused HERE, before get_or_create_slot,
+                # so a refused create registers no slot. The legacy name-only
+                # path below keeps its store-verbatim-and-log behaviour.
+                return web.json_response(
+                    {
+                        "error": "the selected agent choice is not available",
+                        "code": "agent_choice_unavailable",
+                    },
+                    status=409,
+                )
             if not bindings.requested_resolved:
                 # Log only — the requested binding is the user's intent and is
                 # stored VERBATIM. Rewriting it to whatever currently answers was
@@ -3221,8 +3377,14 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 await creation_stack.enter_async_context(_slot_switch_session_lock(assignment_key))
                 selection_change = None
                 try:
-                    assigned_store = await pin_private_agent_store(
-                        state, assignment_key, agent, cfg, memory_mode=slot.memory_mode
+                    # An explicit template choice is the shared template even when
+                    # a member carries the same name: it never pins member memory.
+                    assigned_store = (
+                        ""
+                        if agent_kind == "template"
+                        else await pin_private_agent_store(
+                            state, assignment_key, agent, cfg, memory_mode=slot.memory_mode
+                        )
                     )
                     chosen = await asyncio.to_thread(
                         resolve_agent_bindings,
@@ -3230,7 +3392,11 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                         assignment_agent,
                         assignment_project or None,
                         validate_memory_files=False,
+                        selection_kind=agent_kind,
                     )
+                    # Availability was settled before the mint; this records
+                    # the namespace the pick was committed in.
+                    slot.agent_kind = chosen.selection_kind
                     selection_change = await _record_explicit_agent_selection(
                         assignment_key,
                         assignment_agent,
@@ -6781,10 +6947,19 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     agent_name = body.get("agent", "")
     if agent_name and not _AGENT_NAME_RE.match(agent_name):
         return web.json_response({"error": "invalid agent name"}, status=400)
-    if slot.mode == "member" and agent_name != slot.agent:
+    # Same contract as the create route: an optional namespace for the name.
+    agent_kind = body.get("agent_kind", "")
+    if agent_kind not in ("", "member", "template"):
+        return web.json_response(
+            {"error": "invalid agent kind", "code": "invalid_agent_kind"}, status=400
+        )
+    if slot.mode == "member" and (agent_name != slot.agent or agent_kind == "template"):
         # Member DM threads are pinned to their crew: refuse the switch before
         # any state is touched. A same-name "switch" stays allowed — it is a
-        # session reset, not a re-bind. Audited like every other pin denial
+        # session reset, not a re-bind — but only in the MEMBER namespace: the
+        # same name picked as a template would run the shared template and
+        # detach the thread from the member's memory, which is a re-bind by
+        # another spelling. Audited like every other pin denial
         # (the send path's guard emits the same event), so a probe against the
         # pin is visible in the SEL trail.
         _emit_agent_assignment(slot.key, agent_name, outcome="denied_member_pin")
@@ -6863,6 +7038,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     agent_name,
                     slot.project or None,
                     validate_memory_files=False,
+                    selection_kind=agent_kind,
                 )
             except Exception as exc:
                 from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
@@ -7024,6 +7200,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     agent_name,
                     pre_await_project or None,
                     validate_memory_files=False,
+                    selection_kind=agent_kind,
                 )
             else:
                 bindings = await asyncio.to_thread(
@@ -7151,6 +7328,18 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             raise
         except Exception:
             logger.warning("Failed to resolve agent bindings for %r", agent_name, exc_info=True)
+
+        if agent_kind and not assignment_resolved:
+            # A stated namespace never falls back to whoever answers by default.
+            if slot.agent is committed_agent:
+                slot.agent = prior_agent
+            return web.json_response(
+                {
+                    "error": "the selected agent choice is not available",
+                    "code": "agent_choice_unavailable",
+                },
+                status=409,
+            )
 
         if not assignment_resolved and prior_selection is not None:
             # A failed lookup cannot commit a name while retaining a different
@@ -7553,6 +7742,9 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         if (
             owner_pick
             and agent_name
+            # A shared-template pick has no member memory to grant, even when
+            # a member of the same name exists.
+            and agent_kind != "template"
             and not slot.messages
             and not slot.linked_session_key
             and not slot.channel_origin
@@ -7630,9 +7822,16 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     # The reset destroyed any eagerly created session; picking an agent is
     # itself a strong first-message intent signal (it also resets the
     # project), so re-arm the speculative spawn for the new bindings.
+    if slot.agent is committed_agent:
+        slot.agent_kind = bindings.selection_kind if assignment_resolved else ""
     schedule_eager_spawn(state, slot)
     state.push_slots_update()
-    resp_body: dict = {"ok": True, "agent": agent_name, "workspace": workspace}
+    resp_body: dict = {
+        "ok": True,
+        "agent": agent_name,
+        "agent_kind": slot.agent_kind,
+        "workspace": workspace,
+    }
     if teardown_incomplete:
         # Advisory only — the switch itself succeeded and the response
         # carries the committed state the acting tab writes optimistically.
@@ -7675,6 +7874,26 @@ def _model_rejected_reason(model_name: str, provider: str | None = None) -> str 
             f"select a listed model or 'auto'."
         )
     return None
+
+
+#: The chat picker's "Auto (Jev)" entry, as the id a client sends for it. NOT a
+#: provider model id and never stored in ``slot.model``: it asks the
+#: ``model.route`` decision point to pick a difficulty tier for each turn, and
+#: until it answers the session runs on the backend default. The prefix is
+#: ``auto`` so a client too old to know the entry (or a backend without the point)
+#: reads it as the Auto it behaves like, and the colon keeps it outside the model
+#: namespace -- no advertised id carries one.
+JEV_ROUTE_MODEL = "auto:jev"
+
+
+def _is_jev_route_pick(raw: object) -> bool:
+    """Whether a request body's ``model`` is the "Auto (Jev)" sentinel.
+
+    Exact identity on a stripped string. A near-miss spelling is NOT this entry
+    and falls through to the ordinary model path, where the guard refuses it --
+    resolving it loosely would turn a typo into paid third-party egress.
+    """
+    return isinstance(raw, str) and raw.strip() == JEV_ROUTE_MODEL
 
 
 def _wire_model_id(provider: AcpProvider, model_name: str) -> str:
@@ -7882,7 +8101,29 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    model_name = _normalize_model(body.get("model", ""))
+    # The "Auto (Jev)" entry is resolved HERE and nowhere else: every reader below
+    # -- the guard, the live switch, the reset, the session allocation, the
+    # composer chip -- takes the id it produces, which is the plain ``auto`` the
+    # session actually runs on until a tier is answered. The choice itself
+    # survives as ``slot.jev_route`` alone.
+    jev_route = _is_jev_route_pick(body.get("model", ""))
+    if jev_route and not is_owner_dashboard_request(request):
+        # Arming routing is an OWNER action: it hands the per-turn model choice to
+        # the oracle, and a dear tier spends the owner's credential on a model the
+        # caller never named. The cross-app gate above cannot carry that decision --
+        # it admits an allow-listed non-owner whose ``app`` claim is empty -- so the
+        # arm is gated on the same predicate the decision seam's consent route uses.
+        # Only the arm is refused: a plain pick stays open to the same caller.
+        sel().log_api_access(
+            caller="non-owner",
+            operation="chat_slot_model_jev_route",
+            outcome="denied",
+            source="owner_only",
+            resources=f"slot={name}",
+            error="non-owner identity rejected",
+        )
+        return _owner_denial_response(request, "arming Jev routing is owner-only")
+    model_name = "auto" if jev_route else _normalize_model(body.get("model", ""))
     reason = _model_rejected_reason(model_name)
     if reason:
         logger.warning("Slot %s model rejected: %s", name, reason)
@@ -7959,6 +8200,11 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
         denied = _app_cancel_denied(request, slot, "chat.slot_model", session_key)
         if denied is not None:
             return denied
+        # The routing flag is committed on each SUCCESS path and nowhere else -- see
+        # the two writes below. Nothing is written here, because the busy check
+        # between this line and the transaction answers 409 without a rollback: a
+        # pick that was refused must not change what the next turn runs on.
+        #
         # Checked INSIDE the locks only: a serialized predecessor targeting the
         # same model may have committed while this request waited, and acting
         # again would tear down the session that predecessor just set up.
@@ -7998,7 +8244,14 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             except Exception:  # pragma: no cover - a frozen/slotted stub client
                 pass
             slot._model_pick_gen += 1
-            return web.json_response({"ok": True, "model": model_name})
+            # The one place the flag is recorded on this path, and the reason it is
+            # not written before the branch: an unpinned slot picking "Auto (Jev)"
+            # resolves to the ``auto`` it already holds and lands HERE, so a write
+            # placed only in the transaction below would never run for the
+            # commonest case. This shortcut is a success, so committing is correct.
+            slot.jev_route = jev_route
+            state.push_slots_update()
+            return web.json_response({"ok": True, "model": model_name, "jev_route": jev_route})
         provider = state.sessions.get_provider(session_key)
         if slot.running or (isinstance(provider, LLMProvider) and provider.has_active_turn()):
             # Never tear down an in-flight turn: _try_live_model_switch
@@ -8024,7 +8277,14 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             )
         prior_model = slot.model
         prior_pick_gen = slot._model_pick_gen
+        prior_jev_route = slot.jev_route
         slot.model = model_name
+        # Set on every pick, not only the Jev one: picking a concrete model is the
+        # owner answering the very question the point asks, so it clears the flag
+        # rather than leaving a routing that the next turn would apply over the
+        # model they just chose. Inside the transaction, so ``_rollback_pick``
+        # covers it.
+        slot.jev_route = jev_route
         # Explicit user pick: bump the pick generation so the model-fallback
         # restore probe never overrides this choice (automatic backfill does NOT
         # bump it).
@@ -8048,6 +8308,10 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             if slot._model_pick_gen == prior_pick_gen + 1 and slot.model == model_name:
                 slot.model = prior_model
                 slot._model_pick_gen = prior_pick_gen
+                # The routing choice is part of the same commit: a refused pick
+                # changed nothing, and leaving the flag would route the next turn
+                # for a request the caller was told had failed.
+                slot.jev_route = prior_jev_route
 
         def _live_serves_target(candidate: object) -> bool:
             """True when the live session's BACKEND-RESOLVED model already
@@ -8154,7 +8418,9 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
                     _sync_served_model(slot, recheck)
                     _broadcast_context_reset(state, slot.key, recheck)
                     state.push_slots_update()
-                    return web.json_response({"ok": True, "model": model_name})
+                    return web.json_response(
+                        {"ok": True, "model": model_name, "jev_route": jev_route}
+                    )
                 _rollback_pick()
                 return web.json_response(
                     {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
@@ -8273,7 +8539,7 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
                 )
             _broadcast_context_reset(state, slot.key, None)
     state.push_slots_update()
-    model_resp: dict = {"ok": True, "model": model_name}
+    model_resp: dict = {"ok": True, "model": model_name, "jev_route": jev_route}
     if teardown_incomplete:
         # Advisory only — the switch itself succeeded and the response
         # carries the committed state (agent-handler precedent).
@@ -8586,6 +8852,9 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
     switched: list[str] = []
     skipped_running: list[str] = []
     unchanged: list[str] = []
+    # Whether any slot's per-turn routing flag was cleared without its model
+    # changing -- the one bulk outcome that is invisible in the three lists below.
+    routing_cleared = False
     failed: list[str] = []
     # Snapshot the slot keys up front: sessions.reset awaits, so iterating the
     # live dict directly would risk a concurrent-modification surprise.
@@ -8647,6 +8916,17 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
                 # Skipped silently, like every other slot the app does not own.
                 continue
             if slot.model == model_name:
+                # The MODEL is unchanged; the routing choice may not be. A slot
+                # already on this model but routed per turn is a slot whose turns
+                # would still be moved off it, so the flag is cleared here as well
+                # -- otherwise the one case where the bulk switch reports "nothing
+                # to do" is the one case where it silently did nothing at all.
+                # Tracked so the push below fires for a slot whose only change is
+                # this: the picker reads the flag, so without a broadcast the chip
+                # keeps naming a routing this request has just stopped.
+                if slot.jev_route:
+                    slot.jev_route = False
+                    routing_cleared = True
                 unchanged.append(name)
                 continue
             if skip_running and slot.running:
@@ -8740,6 +9020,12 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             slot.model = model_name
             # Explicit pick (bulk): same generation bump as the single-slot pick.
             slot._model_pick_gen += 1
+            # And the same clearing of the routing choice. This surface takes no
+            # "Auto (Jev)" target -- it switches many sessions to one model, which
+            # is the opposite of a per-turn tier -- but it is an explicit pick, so
+            # leaving the flag set would route the next turn away from the model
+            # the owner just chose for this slot.
+            slot.jev_route = False
             _broadcast_context_reset(state, slot.key, None)
             switched.append(name)
 
@@ -8754,6 +9040,9 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
         )
         # Guard the push on real progress so partial switches still broadcast
         # even when a later slot's reset failed.
+        state.push_slots_update()
+    elif routing_cleared:
+        # No model moved, but a routing flag did, and the picker renders that.
         state.push_slots_update()
     return web.json_response(
         {
@@ -8856,7 +9145,7 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
         logger.info("Slot %s reasoning_effort switched to %r", name, effort or "default")
 
         provider = state.sessions.get_provider(session_key)
-        _updated_live = False
+        _updated_live: bool | None = False
         if isinstance(provider, AcpProvider) and provider.supports_effort():
             # Guard against racing the in-flight prompt read loop: a live
             # change_effort issues session/set_config_option and its response wait
@@ -8892,6 +9181,23 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             # user switches to a capable model, but do not touch the live session.
             _updated_live = True
             logger.info("Slot %s effort persisted (model not effort-capable)", name)
+
+        if _updated_live is None:
+            # clear_effort's third outcome: NOTHING changed -- not the workspace
+            # overlay, not the provider's map. A bool cannot carry that here,
+            # because both of its values commit the new slot value below (the
+            # reset branch at the `slot.reasoning_effort = effort` before its
+            # teardown, and the success path at the one before the final 200),
+            # so either would show "default" while the overlay still holds the
+            # old level and a respawn re-applies it. Commit nothing, reset
+            # nothing, and let the caller retry once the other writer is done.
+            return web.json_response(
+                {
+                    "error": "the workspace effort overlay is locked by another writer",
+                    "code": "effort_overlay_busy",
+                },
+                status=409,
+            )
 
         if effective_session_key(slot) != session_key and _updated_live:
             # The slot was bound to a different session while change_effort /

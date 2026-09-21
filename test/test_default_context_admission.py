@@ -187,7 +187,13 @@ class TestProtectedContextCeiling:
         assert "JSONL LESSON 59" in text
         assert "JSONL LESSON 00" not in text
         assert "[Context budget: omitted " in text
-        assert "lessons above the model-safe protected-content ceiling; use memory_recall." in text
+        # The notice now names the RULE BUDGET it hit rather than the model-safe
+        # ceiling, and points at ``learn_list`` rather than ``memory_recall``:
+        # every row here is unclassified, so it is the rule tier that filled up,
+        # and the withheld rows are read back by listing lessons, not by recall.
+        assert "retained rules above the" in text
+        assert "-character rule budget" in text
+        assert "read them with learn_list" in text
         assert "[CURRENT DATE]" in text
 
     def test_oversized_vector_lessons_are_trimmed(self, rig, tmp_path):
@@ -238,9 +244,9 @@ class TestProtectedContextCeiling:
             assert preference in text
             assert "PRIORITY VECTOR LESSON" in text
             assert "[Context budget: omitted " in text
-            assert (
-                "lessons above the model-safe protected-content ceiling; use memory_recall." in text
-            )
+            assert "retained rules above the" in text
+            assert "-character rule budget" in text
+            assert "read them with learn_list" in text
             assert "[CURRENT DATE]" in text
         finally:
             vector.close()
@@ -261,14 +267,18 @@ class TestAdmissionAndSkills:
             ),
         )
 
-    def test_default_discovery_is_short_and_full_skills_remain_loadable(self, rig):
+    def test_default_discovery_is_bounded_and_full_skills_remain_loadable(self, rig):
         builder, _, skills, _, _ = rig
         for i in range(80):
             seed_skill(skills._dir, f"procedure-{i}")
         text = builder.build_session_context()
-        assert "skill_search(query)" in text
-        shown = [i for i in range(80) if f"- procedure-{i}:" in text]
-        assert 0 < len(shown) <= 8
+        shown = [i for i in range(80) if f"- **procedure-{i}**:" in text]
+        assert 0 < len(shown) < 80
+        # The entry names what it drops, by count and by family, and points at the
+        # tool that reaches them.
+        assert f"{80 - len(shown)} more skill(s) not shown here" in text
+        assert "skill_search" in text
+        assert "Families not shown: procedure-* (" in text
         assert "[Skills:]" in text and "Synthetic procedure" not in text
         hidden = next(i for i in range(80) if i not in shown)
         matches = skills.search_skills(f"procedure-{hidden}")
@@ -277,6 +287,18 @@ class TestAdmissionAndSkills:
         matches = skills.search_skills("procedure-79")
         assert any(s["name"] == "procedure-79" for s in matches)
         assert "Synthetic procedure" in skills.load_skill("procedure-79")
+
+    def test_short_entry_names_at_most_eight_when_selected(self, rig):
+        """`skills.lazy_load = false` selects the shorter eight-name entry."""
+        _, _, skills, _, cfg = rig
+        for i in range(80):
+            seed_skill(skills._dir, f"procedure-{i}")
+        cfg.skills.lazy_load = False
+        text = skills.get_context(budget=4950, discovery_only=True)
+        assert "skill_search(query)" in text
+        shown = [i for i in range(80) if f"- procedure-{i}:" in text]
+        assert 0 < len(shown) <= 8
+        assert "Synthetic procedure" not in text
 
     def test_pinned_body_survives_budget_and_reinjection(self, rig):
         builder, _, skills, _, _ = rig
@@ -287,13 +309,15 @@ class TestAdmissionAndSkills:
             assert body in text
             assert text.endswith("current")
 
-    def test_native_mapped_skills_stay_native(self, rig, monkeypatch):
+    def test_native_mapped_skills_receive_only_scoped_discovery(self, rig, monkeypatch):
         builder, _, skills, _, _ = rig
-        monkeypatch.setattr(ctx, "agent_skill_globs", lambda agent: ["*/mapped/SKILL.md"])
-        monkeypatch.setattr(
-            skills, "get_context", Mock(side_effect=AssertionError("duplicate mapped skills"))
-        )
-        builder.build_session_context(agent="kirocrew", provider_type="acp")
+        mapped = seed_skill(skills._dir, "mapped")
+        seed_skill(skills._dir, "outside")
+        monkeypatch.setattr(ctx, "agent_skill_globs", lambda agent, **kwargs: [str(mapped)])
+        text = builder.build_session_context(agent="kirocrew", provider_type="acp")
+        assert "skill_search" in text and "mapped" in text
+        assert "outside" not in text
+        assert "Synthetic procedure" not in text
 
     def test_lazy_setting_does_not_expand_admission(self, rig):
         builder, _, skills, _, cfg = rig
@@ -330,10 +354,125 @@ class TestSelectedEvidence:
             rule = ("Never deploy without approval. " + "Complete safety rule. " * 100).strip()
             store.write_lesson(rule, category=category, source=source)
             store.embed_fn = Mock(side_effect=AssertionError("background model call"))
-            output = store.get_lessons_context(query, background=True, cap=1)
+            # cap=0 is ceiling-only admission (no ordinary budget, no hard_cap
+            # here), so the single rule is kept whatever its source. Before the
+            # background branch honoured cap, any positive cap was dead here; it
+            # now bounds admission, so this asserts the provenance property, not
+            # a no-op cap.
+            output = store.get_lessons_context(query, background=True, cap=0)
             assert rule in output
             assert output.endswith("[End of learned corrections]\n")
             assert store.count_lessons() == 1
+        finally:
+            store.close()
+
+
+class TestBackgroundBudget:
+    """Background admission is complete and byte-identical below the ``hard_cap``
+    ceiling regardless of ``cap`` (the pinned retain-every-in-scope-rule
+    invariant). Only when the full set exceeds the ceiling does it fall back to
+    the ordinary budget ``cap`` (bounded by ``hard_cap``); ``cap=0`` keeps the
+    historical ceiling-only budget there."""
+
+    @staticmethod
+    def _store_with_lessons(tmp_path, count, *, chars=800):
+        store = VectorMemoryStore(db_path=tmp_path / "lessons.db")
+        store.init()
+        for index in range(count):
+            # set_semantic with a unique key and distinct text avoids
+            # write_lesson's dedup, which would otherwise collapse near-identical
+            # filler into one row. Newest last once read back.
+            store.set_semantic(
+                f"lesson.{index:012x}",
+                {
+                    "rule": f"Distinct rule {index:03d} keep this rule intact "
+                    + (f"word{index:03d} " * (chars // 8)),
+                    "category": "tool",
+                    "negative": None,
+                },
+                confidence=1.0,
+                source="user_explicit",
+            )
+        store.embed_fn = Mock(side_effect=AssertionError("background model call"))
+        return store
+
+    def test_below_hard_cap_is_complete_and_independent_of_cap(self, tmp_path):
+        store = self._store_with_lessons(tmp_path, 40)
+        try:
+            # 40 lessons of ~825 chars render to ~33k, comfortably below a
+            # 500k ceiling. This is the pinned invariant: below the ceiling the
+            # block is complete and no rule is dropped, whatever cap is. A small
+            # cap must NOT bind here.
+            complete = store.get_lessons_context("", background=True, cap=0, hard_cap=500_000)
+            with_small_cap = store.get_lessons_context(
+                "", background=True, cap=6_000, hard_cap=500_000
+            )
+            assert complete == with_small_cap
+            assert "omitted" not in complete
+            assert "Distinct rule 000" in complete
+            assert "Distinct rule 039" in complete
+            # Byte-identical to the fully unbounded render too: the gate returned
+            # the complete block before any budget was consulted.
+            unbounded = store.get_lessons_context("", background=True, cap=0, hard_cap=0)
+            assert complete == unbounded
+        finally:
+            store.close()
+
+    def test_above_hard_cap_with_positive_cap_fits_min_cap_hard_cap(self, tmp_path):
+        store = self._store_with_lessons(tmp_path, 40)
+        try:
+            # Ceiling far below the full ~33k render, so the overflow branch runs.
+            # With a positive cap smaller than hard_cap, the block fits cap.
+            cap_binds = store.get_lessons_context("", background=True, cap=6_000, hard_cap=20_000)
+            assert len(cap_binds) <= 6_000
+            assert "omitted" in cap_binds
+            assert "use memory_recall." in cap_binds
+            # With cap larger than hard_cap, the ceiling binds instead (the min).
+            ceiling_binds = store.get_lessons_context(
+                "", background=True, cap=40_000, hard_cap=8_000
+            )
+            assert len(ceiling_binds) <= 8_000
+            assert "omitted" in ceiling_binds
+        finally:
+            store.close()
+
+    def test_above_hard_cap_with_cap_zero_matches_hard_cap_budget(self, tmp_path):
+        store = self._store_with_lessons(tmp_path, 40)
+        try:
+            # cap=0 means "no ordinary budget", so the overflow budget is the
+            # hard_cap ceiling alone -- exactly the behaviour on main, so no
+            # existing caller changes meaning.
+            ceiling_only = store.get_lessons_context("", background=True, cap=0, hard_cap=8_000)
+            assert len(ceiling_only) <= 8_000
+            assert "omitted" in ceiling_only
+            # A cap wider than the ceiling cannot widen past it.
+            capped_at_ceiling = store.get_lessons_context(
+                "", background=True, cap=500_000, hard_cap=8_000
+            )
+            assert capped_at_ceiling == ceiling_only
+        finally:
+            store.close()
+
+    def test_both_zero_is_unbounded(self, tmp_path):
+        store = self._store_with_lessons(tmp_path, 40)
+        try:
+            full = store.get_lessons_context("", background=True, cap=0, hard_cap=0)
+            # Every rule is kept and nothing is omitted when neither bound is set.
+            assert "omitted" not in full
+            assert "Distinct rule 000" in full
+            assert "Distinct rule 039" in full
+        finally:
+            store.close()
+
+    def test_omission_notice_present_whenever_rules_are_dropped(self, tmp_path):
+        store = self._store_with_lessons(tmp_path, 40)
+        try:
+            # Any overflow branch that drops rules must carry the notice pointing
+            # the model at memory_recall.
+            dropped = store.get_lessons_context("", background=True, cap=6_000, hard_cap=8_000)
+            assert "Distinct rule 000" not in dropped or "omitted" in dropped
+            assert "omitted" in dropped
+            assert "use memory_recall." in dropped
         finally:
             store.close()
 
@@ -439,7 +578,7 @@ def test_first_oversized_summary_is_not_forced_and_footer_is_charged(rig, monkey
     for row in original:
         if row["key"] == "large":
             row["path"] = "x" * 5000
-    monkeypatch.setattr(skills, "list_skills", lambda project=None: original)
+    monkeypatch.setattr(skills, "list_skills", lambda project=None, **kwargs: original)
     monkeypatch.setattr(skills, "_rank_key", lambda row: (row["key"] == "large", 0))
     output = skills.get_context(budget=1000)
     assert len(output) <= 1000
@@ -504,9 +643,13 @@ def test_agent_skill_search_entry_finds_omitted_catalog(rig, monkeypatch):
     from kiro_crew.mcp_tools import skills as tools
 
     builder, _, skills, _, _ = rig
-    path = seed_skill(skills._dir, "notebookquartz")
+    seed_skill(skills._dir, "notebookquartz")
+    for i in range(80):
+        seed_skill(skills._dir, f"filler-{i}")
     greeting, _ = builder.build_message("hi", True)
-    assert "skill_search(query)" in greeting
+    # The entry is bounded, so it names the tool that reaches what it omits.
+    assert "skill_search" in greeting
+    assert "more skill(s) not shown here" in greeting
     monkeypatch.setattr(
         mcp_core, "_get", lambda path, **kwargs: {"matches": skills.search_skills("notebookquartz")}
     )
@@ -514,7 +657,7 @@ def test_agent_skill_search_entry_finds_omitted_catalog(rig, monkeypatch):
     monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:synthetic")
     output = tools.skill_search("skill_search", {"query": "notebookquartz"})
     assert "notebookquartz" in output
-    assert str(path) in output
+    assert "key='notebookquartz'" in output
     assert "Synthetic procedure" in skills.load_skill("notebookquartz")
 
 
@@ -537,3 +680,108 @@ def test_required_skill_body_does_not_protect_optional_summary(rig):
     assert body in "".join(required)
     assert "optional" not in "".join(required)
     assert optional == ""
+
+
+def test_member_lessons_renderer_ranks_against_the_request(tmp_path, monkeypatch):
+    """The member path must pass the real query, not an empty string.
+
+    With an empty query background admission keeps recency order, so an
+    overflowing block drops the oldest rows -- which can be exactly the rule the
+    request is about. Passing the request lets ranking keep the relevant rule and
+    drop an irrelevant newer one instead.
+    """
+    from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+    from kiro_crew.members import slug_for_name, write_member_rules
+    from kiro_crew.memory_stores import (
+        memory_store_dir_for,
+        persist_member_config,
+        provision_member_memory,
+    )
+    from kiro_crew.vector_memory import open_member_database
+
+    home = tmp_path / "host-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("KIRO_HOME", str(home / ".kiro"))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    agents = home / ".kiro" / "agents"
+    monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents)
+    monkeypatch.setattr("kiro_crew.agent_discovery._KIRO_AGENTS_DIR", agents)
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents["writer"] = KiroCrewAgentConfig(
+        kiro_agent="writer-template", description="A careful writer"
+    )
+    store = provision_member_memory(cfg, "writer")
+    persist_member_config(cfg, "writer", create=True)
+    write_member_rules(slug_for_name("writer"), member="writer", text="Do not publish drafts.")
+
+    project = tmp_path / "project"
+    (project / ".kiro" / "agents").mkdir(parents=True)
+    (project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "prompt": "Preserve the user's voice."}),
+        encoding="utf-8",
+    )
+
+    tier = open_member_database(
+        memory_store_dir_for(store) / "memory.db",
+        member_id=cfg.agents["writer"].member_id,
+        store_id=store,
+    )
+    try:
+        # Oldest, and the only rule that mentions the request term. Recency order
+        # would place it LAST; relevance ranking places it first. set_semantic
+        # with distinct keys avoids write_lesson dedup collapsing the fillers.
+        tier.set_semantic(
+            "lesson.000000000000",
+            {
+                "rule": "Always run the zephyrquux migration before deploy. " + ("detail " * 90),
+                "category": "tool",
+                "negative": None,
+            },
+            confidence=1.0,
+            source="user_explicit",
+        )
+        # Newer, irrelevant fillers that together push the protected lesson set
+        # past the model-safe ceiling (max(3*33_000, 200_000*4.0*0.125) =
+        # 100_000 chars at a 200K window, minus the small non-lesson protected
+        # prefix). Each filler is ~3.2k chars (under the 4096-byte per-value
+        # store limit); forty of them clear the ceiling with margin, so
+        # background admission must drop rules and fall back to the ordinary
+        # lessons budget.
+        for index in range(40):
+            tier.set_semantic(
+                f"lesson.{index + 1:012x}",
+                {
+                    "rule": f"Unrelated filler rule {index:02d}. " + (f"noise{index:02d} " * 400),
+                    "category": "tool",
+                    "negative": None,
+                },
+                confidence=1.0,
+                source="user_explicit",
+            )
+        # No embedding backend: ranking is the lexical keyword pass, and any
+        # background embed call is a bug.
+        tier.embed_fn = Mock(side_effect=AssertionError("background model call"))
+        monkeypatch.setattr(ctx, "_memory_stores", {})
+        monkeypatch.setattr(ctx, "_vector_stores", {store: tier})
+
+        builder = ctx.ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "global"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path / "lessons"),
+            hooks=HookManager(),
+        )
+        text = builder.build_session_context(
+            memory_store=store,
+            member=cfg.agents["writer"].member_id,
+            project=str(project),
+            query_text="zephyrquux migration",
+            model_window=200_000,
+        )
+        # Truncation happened, and the request-relevant rule is the one kept.
+        assert "zephyrquux migration before deploy" in text
+        assert "omitted" in text and "use memory_recall." in text
+    finally:
+        tier.close()

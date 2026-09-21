@@ -36,6 +36,7 @@
         "apps_trusted": [],
         "apps_trusted_local": [],
         "apps_trusted_repositories": {},
+        "apps_ui_stream_timeout_secs": 30,
         "jail": "auto",
         "dangerously_skip_permissions": false,
         "yolo_duration": "6h",
@@ -65,6 +66,7 @@
         "adaptive_concurrency_mode": "aimd",
         "adaptive_floor": 1,
         "adaptive_initial": 4,
+        "adaptive_slow_start": true,
         "controller_sample_secs": 5,
         "dependency_max_attempts": 20,
         "dependency_wait_deadline_secs": 3600,
@@ -81,8 +83,8 @@
         "subagent_cost_gb": 0.5,
         "subagent_cpu_cost_cores": 1.0,
         "subagent_auto_max": 32,
-        "subagent_spawn_stagger_secs": 2.0,
-        "subagent_max_turns": 100,
+        "subagent_spawn_stagger_secs": 0.25,
+        "subagent_max_turns": 1000,
         "subagent_timeout_secs": 10800,
         "subagent_stall_idle_secs": 120,
         "completion_keep": "head",
@@ -493,6 +495,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null
+    },
+    {
+      "path": "agent.apps_ui_stream_timeout_secs",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "App UI Stream Timeout",
+      "help": "Total transfer deadline, in seconds, for ONE response body on the unauthenticated /apps/{name}/ui/ route. Clamped to 5..600; a value that is not a whole number loads as 30. Read per request, so an edit applies without a restart. There is no off switch: the route holds eight descriptor permits, and this deadline is what stops a client that quits draining its socket from holding one for as long as it stays connected — eight such clients would otherwise stop every app UI on the host. Raise it only when a real transfer on this host needs longer than the default allows.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 30
     },
     {
       "path": "agent.jail",
@@ -932,10 +948,24 @@
       "sensitive": false,
       "tags": [],
       "label": "Adaptive Initial Cap",
-      "help": "Execution cap a fresh gateway starts at, bounded by max_subagents. The controller raises it one step per clean window once work completes. Clamped to 1..64.",
+      "help": "Execution cap a fresh gateway starts at, bounded by max_subagents. Healthy work and queued demand let the controller raise it; see adaptive_slow_start for growth rules. Clamped to 1..64.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 4
+    },
+    {
+      "path": "agent.adaptive_slow_start",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Adaptive Slow Start",
+      "help": "Until the gateway first meets corroborated host pressure, let the execution cap DOUBLE per clear 5-second window (on one completion and real demand) instead of climbing +1 per clear 30-second window, bounded by max_subagents and by what this host's memory and CPU size the cap at. The first pressure ends slow start for the life of the process. Set false to climb +1 per clear 30-second window from the start. Slow start earns an increase on one completion plus real demand; congestion avoidance earns each +1 after one full wave of the CURRENT cap completes (at most 20 runs). Alternatively, fresh stream progress with queued work and measured headroom can earn one probe slot per clear window without a completion; this never earns doubling or relaxes the initialization gate.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
     },
     {
       "path": "agent.controller_sample_secs",
@@ -1173,10 +1203,10 @@
       "sensitive": false,
       "tags": [],
       "label": "SubAgent Spawn Stagger (seconds)",
-      "help": "Delay between successive subagent spawns (initial fill and queued drain) to bound cold-start CPU/memory spikes.",
+      "help": "Delay between successive subagent spawns (initial fill and queued drain) to bound cold-start CPU/memory spikes. Starts stay serialized; the interval only decides how fast a wide fan-out fills. Raise it if this host or the model provider is the bottleneck -- a spawn still has to clear spawn_min_memory_gb and the host budget, and the adaptive controller cuts the cap on real pressure, so this is a smoothing interval rather than the memory guard.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 2.0
+      "defaultValue": 0.25
     },
     {
       "path": "agent.subagent_max_turns",
@@ -1190,7 +1220,7 @@
       "help": "Default tool-call budget per subagent.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 100
+      "defaultValue": 1000
     },
     {
       "path": "agent.subagent_timeout_secs",
@@ -1859,7 +1889,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Embedding Threads",
-      "help": "CPU threads for an explicit memory query or user-started re-embedding. Defaults to 4; explicit settings are honoured up to the machine's core count. All memory stores share one model and inference worker. V2 message context does not run an embedding search; V1 retains its session-start retrieval.",
+      "help": "CPU threads for an explicit memory query or user-started re-embedding. Defaults to 4, capped one core below the machine's core count -- never below one thread, so a single-core host still embeds -- to leave the event loop a core wherever there is one to spare; 4 means that default, so pinning threads on a 4-core host takes another number. Any other setting is honoured up to the core count. All memory stores share one model and inference worker. V2 message context does not run an embedding search; V1 retains its session-start retrieval.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 4
@@ -2480,7 +2510,7 @@
       "enumValues": null,
       "defaultValue": {
         "max_triggered": 0,
-        "lazy_load": false,
+        "lazy_load": true,
         "auto_create_from_sessions": false,
         "auto_refine_on_deviation": false,
         "auto_min_tool_calls": 5,
@@ -2519,10 +2549,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Lazy Skill Injection",
-      "help": "When true, show a bounded usage-ranked index of on-demand skills instead of the default short skill_search discovery entry. Both modes use the same Crew background budget, independent of model window size. Pinned instructions, native skill mappings, explicit loading and trigger gates are preserved.",
+      "help": "When true (the default), show a bounded usage-ranked index of on-demand skills, each with its path, plus a line naming the families the index leaves out. Set to false for the shorter entry that names only the eight hottest skills and points at skill_search for the rest. Both modes use the same Crew background budget, independent of model window size, and neither applies to an agent with its own skill:// mapping, which gets a bounded directory of mapped skills with complete search, paginated listing and exact reads on demand. Required pinned instructions share an explicit startup capacity; explicit loading and trigger gates are preserved.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": false
+      "defaultValue": true
     },
     {
       "path": "skills.auto_create_from_sessions",
@@ -4008,6 +4038,11 @@
       "defaultValue": {
         "bucket": 100,
         "history_budget_chars": 0,
+        "model_route": {
+          "simple": "",
+          "medium": "",
+          "complex": ""
+        },
         "provider": {
           "endpoint": "https://api.typesafe.ai/v1/systemone",
           "api_key": "secret://TYPESAFE_API_KEY",
@@ -4043,6 +4078,38 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0
+    },
+    {
+      "path": "decisions.model_route",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Model per difficulty tier",
+      "help": "Which model answers a chat turn Jev put in each difficulty tier, for a session whose model is set to 'Auto (Jev)' in the chat model picker. Keys are the three tiers the question offers -- 'simple', 'medium', 'complex' -- and each value is a model id the provider advertises to your account, exactly as the chat model picker spells it. Every tier is EMPTY by default, which means inherit: the turn keeps the model its session is already on, and the decision is still recorded so you can see which tier Jev chose before you pin anything. No model id is named for you, because an id your account is not offered would fail on the first prompt. 'auto' means the same as empty. An id your account cannot run keeps the session's model too and records why in the decision log. Routing a turn to a dearer model costs more, which is why it happens only for a session whose owner picked 'Auto (Jev)' -- a manual model choice is never overridden.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "simple": "",
+        "medium": "",
+        "complex": ""
+      }
+    },
+    {
+      "path": "decisions.model_route.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "decisions.provider",

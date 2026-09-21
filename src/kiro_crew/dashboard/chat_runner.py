@@ -62,7 +62,11 @@ from kiro_crew.acp.types import (
     classify_stop_reason,
 )
 from kiro_crew.acp_backends import ACP_BACKENDS_COMPACT
-from kiro_crew.agent_discovery import agent_welcome_message, warm_project_agent_names
+from kiro_crew.agent_discovery import (
+    agent_welcome_message,
+    session_skill_globs,
+    warm_project_agent_names,
+)
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.autonudge import get_instance
@@ -330,6 +334,7 @@ from kiro_crew.security import (
     StreamRedactor,
     is_sensitive_path,
     oauth_url_contains_credential,
+    redact,
     redact_and_truncate,
     redact_credentials,
     redact_exfiltration_urls,
@@ -1534,6 +1539,84 @@ def _crew_log_lineage(slot: Any) -> tuple[str, str]:
     )
 
 
+#: Slot attribute carrying a channel binding that committed BEFORE the session had a
+#: crew log to record it in. The recorder sets it in that case instead of dropping the
+#: fact, and :func:`_crew_log_class` folds it in, so the opening entry of a log created
+#: later still states the restriction. Never cleared: the fold holds each member at the
+#: most restrictive value the log ever recorded, and a session that was published once
+#: holds that content for good.
+PENDING_CHANNEL_ATTR = "_crew_log_pending_channel"
+
+
+def _crew_log_workspace(slot: Any) -> str:
+    """The workspace a session's crew log records, or ``""`` when the slot states none.
+
+    Read alongside the class rather than folded into it, because a workspace is an
+    IDENTITY and the class members are RESTRICTIONS -- there is no more-restrictive
+    workspace for the class fold to keep, so it holds the first one stated and records a
+    later different one as a move instead.
+
+    A live slot always states one (it defaults to ``default``), so an empty answer means
+    the object is not a slot -- a state double in a test. The arm that compares
+    workspaces refuses on empty rather than treating it as a match, so an unstated
+    workspace costs a cross-session read a refusal.
+    """
+    return str(getattr(slot, "workspace", "") or "")
+
+
+def _crew_log_class(state: Any, slot: Any) -> tuple[str, str, bool]:
+    """The ``(memory, app, channel)`` a session's ``session/opened`` records.
+
+    The facts a reader needs to decide whether one session may read this one's
+    crew log, taken from the live slot at the moment the log is opened -- which is
+    the only moment they can be taken, because the reader that asks is usually
+    asking about a session that has since closed.
+
+    ``channel`` is true when this session's conversation is published to a
+    messaging channel, by a channel-born link or by an outbound mirror recorded in
+    the session store. A cron tab's link is not one: it names the job's own run and
+    republishes to nobody, which is the exemption ``CRON_LINK_PREFIX`` carries
+    wherever that boundary is enforced. The mirror probe is asked to fail CLOSED,
+    so a store that cannot answer records a channel rather than silently recording
+    a session as unpublished.
+
+    A slot whose memory mode cannot be read yields an empty ``memory``, and the
+    emitter then records no class at all rather than a partial one -- an absent
+    record is refusable, a half-filled one reads as complete.
+    """
+    # circular import: session_control imports this package's modules at module level.
+    from kiro_crew.dashboard.session_control import CRON_LINK_PREFIX, _has_channel_mirror
+
+    link = str(getattr(slot, "linked_session_key", "") or "")
+    channel = bool(link) and not link.startswith(CRON_LINK_PREFIX)
+    if not channel:
+        try:
+            channel = _has_channel_mirror(state, slot)
+        except Exception:
+            # The probe already fails closed on a store it cannot read; this covers
+            # the narrower case of a state double that has no store at all, and it
+            # fails the same way. A log is being opened, not a boundary crossed, so
+            # this must not raise -- and recording "published" on a state nobody can
+            # read costs a dispatcher one refusal it can ask about.
+            logger.debug("channel mirror probe failed; recording a channel", exc_info=True)
+            channel = True
+    if not channel and bool(getattr(slot, PENDING_CHANNEL_ATTR, False)):
+        # A binding that committed while this slot had NO OPEN LOG could not be recorded
+        # when it happened -- there was nothing to append to -- so the recorder left this
+        # mark rather than dropping the fact. Reading it here is what makes a link that
+        # was bound AND removed before the log existed still count: the turn that link
+        # routed is in this log's content, so a class read from the live slot alone would
+        # state never-published about a log holding channel-authored words. The mark is
+        # never cleared, which matches the fold: each member is held at the most
+        # restrictive value the log ever recorded, so this can only add a restriction.
+        channel = True
+    return (
+        str(getattr(slot, "memory_mode", "") or ""),
+        str(getattr(slot, "_app", "") or ""),
+        channel,
+    )
+
+
 def _sync_served_model(slot: Any, client: Any) -> None:
     """Re-read the live session's served model into the slot.
 
@@ -2131,6 +2214,42 @@ _MAX_SNAPSHOT = 200_000  # cap per-file snapshot to bound message meta size
 # reconstruction declines instead of stalling the loop on a huge file.
 _MAX_RECONSTRUCT_BYTES = 2_000_000
 
+# Distinct redacted tool_call_ids one turn tracks a source digest for. The ids
+# come from the LLM, so their number is not the runner's to trust; past this a
+# further id is treated as collapsed, which withholds its app notice rather than
+# letting the turn's state grow with the stream. Far above any real turn's tool
+# count, so a genuine conversation never reaches it.
+_MAX_TCID_SOURCES = 512
+
+# Bytes of a redacted tool_call_id this turn will track an identity for. The ids
+# come from the LLM, so neither their number nor their LENGTH is the runner's to
+# trust, and a bound on the count alone still retains 512 unbounded strings. Well
+# under `_MAX_TOOL_FIELD`, so a tracked id is never one `_redact_tool_field`
+# truncates -- two different over-long ids share a truncated prefix, so a
+# truncated id cannot be told from another and must not be tracked at all.
+_MAX_TCID_LEN = 1024
+
+
+def _tcid_identity_key(tcid: str | None) -> str:
+    """Bounded key for a redacted ``tool_call_id``, or ``""`` when it names nothing.
+
+    The key is a digest, so what the turn retains is 16 characters however long the
+    id was. It is taken over ``_redact_tool_field``'s output -- the same call the
+    reader makes -- because that, not the raw field, is the value rows are stored
+    and compared under, and deriving the key with the reader's own function is what
+    makes the two ends agree by construction rather than by assumption.
+
+    An absent or over-long id returns ``""``, which no caller treats as identifying,
+    so both fail towards withholding the notice.
+    """
+    if not tcid:
+        return ""
+    if len(tcid.encode("utf-8", "replace")) > _MAX_TCID_LEN:
+        return ""
+    canonical = _redact_tool_field(tcid)
+    return hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()[:16]
+
+
 # Poisoned-conversation escalation threshold: number of CONSECUTIVE turn
 # cycles that must each exhaust the full pre-stream transient-5xx ladder
 # (TRANSIENT_RETRIES + 1 attempts, zero output) before the terminal error
@@ -2455,21 +2574,22 @@ def _flush_file_changes(slot: "_ChatSlot") -> None:
             entry["after"] = after.content
         if entry.pop("_before_truncated") or after.truncated:
             entry.update(truncated=True, snapshot_limit_chars=_MAX_SNAPSHOT)
-    # Scrub credentials and exfil URLs from path/before/after BEFORE attaching
+    # Scrub exfil URLs and credentials from path/before/after BEFORE attaching
     # to message meta. _save_slot_to_history runs _redact_meta on persist, but
     # the in-memory slot.messages reaches the dashboard UI via SSE/WS BEFORE
     # persistence — so without this, a config file containing an AKIA* key
     # (path not on the sensitive-path list) would briefly appear in the chip
     # diff. Redact in place so both the live and persisted views are clean.
+    # `security.redact` IS the canonical exfil-first composition — the URL pass
+    # classifies partly by query length and replaces the whole URL, so a
+    # hand-sequenced pair here risks re-introducing the creds-first ordering
+    # that defeats it.
     for entry in deduped.values():
-        entry["path"], _ = redact_credentials(entry["path"])
-        entry["path"], _ = redact_exfiltration_urls(entry["path"])
+        entry["path"] = redact(entry["path"])
         if entry["before"]:
-            entry["before"], _ = redact_credentials(entry["before"])
-            entry["before"], _ = redact_exfiltration_urls(entry["before"])
+            entry["before"] = redact(entry["before"])
         if entry["after"]:
-            entry["after"], _ = redact_credentials(entry["after"])
-            entry["after"], _ = redact_exfiltration_urls(entry["after"])
+            entry["after"] = redact(entry["after"])
     # No-op entries (before == after, e.g. an idempotent format-on-save)
     # are deliberately KEPT: the dashboard renders an explicit "no changes"
     # caption for them (FileChangeChips) instead of a contentless diff, so
@@ -4874,15 +4994,23 @@ def _discard_stale_decision(slot: _ChatSlot) -> None:
 
 
 def _decisions_strip_meta(slot: _ChatSlot) -> dict | None:
-    """This session's pending decision outcome as row ``meta``, or ``None``.
+    """This session's pending decision outcomes as row ``meta``, or ``None``.
 
-    The decision that shaped this reply was made during prompt assembly, on a
-    worker thread, before any message existed to carry it
+    The decisions that shaped this reply were made during the turn -- prompt
+    assembly for ``skills.select``, just before the prompt is sent for
+    ``model.route`` -- before any message existed to carry them
     (:mod:`kiro_crew.decisions.outcomes`). This is the other end of that hand-off,
     and it is read at the moment the assistant row is APPENDED rather than after:
     ``slot.append`` broadcasts the live ``chat_message`` frame from inside the
     call, so a field written onto the row afterwards would persist but be missing
     from the frame the open tab renders -- one door out of two.
+
+    A LIST, always, even for the one-decision turn that is the common case. Two
+    points can decide the same reply, so a shape that held one would have to drop
+    the second or change shape between turns -- and a reader that must branch on
+    "object or array" is a reader two producers can disagree about. The frontend
+    still accepts a bare object, so a row written by an earlier release reads
+    unchanged.
 
     Carried under ``meta`` rather than as a top-level key because ``meta`` is the
     part of a row that already travels every door: ``_build_message_entry_uncached``
@@ -4899,8 +5027,241 @@ def _decisions_strip_meta(slot: _ChatSlot) -> dict | None:
     """
     from kiro_crew.decisions.outcomes import consume
 
-    strip = consume(effective_session_key(slot))
-    return {"decisions_strip": strip} if strip else None
+    strips = consume(effective_session_key(slot))
+    return {"decisions_strip": strips} if strips else None
+
+
+def _route_history_source(state: DashboardState, session_key: str) -> "Callable[[], list[dict]]":
+    """A callable serving this session's recent user/assistant rows, or nothing.
+
+    A CALLABLE and not a list, for the reason ``skills.select`` passes one: the
+    point invokes it only after the history budget is known to be above 0, so at
+    the shipped default of 0 no transcript is read at all.
+
+    Roles are restricted at the READ, so tool output is never projected rather
+    than filtered afterwards.
+    """
+    from kiro_crew.decisions.points import HISTORY_ROLES, MAX_HISTORY_MESSAGES
+
+    log = getattr(state, "conversation_log", None)
+    if log is None or not session_key:
+        return lambda: []
+
+    def _rows() -> list[dict]:
+        return log.recent(
+            session_key,
+            max_messages=MAX_HISTORY_MESSAGES,
+            roles=HISTORY_ROLES,
+        )
+
+    return _rows
+
+
+async def _route_model_for_turn(
+    state: DashboardState,
+    slot: _ChatSlot,
+    client: Any,
+    message: str,
+    session_key: str,
+) -> None:
+    """Ask ``model.route`` which model this turn should run on, and switch to it.
+
+    Called for a NORMAL dashboard chat turn of a slot whose owner picked
+    ``Auto (Jev)`` in the model picker, after the fallback restore probe and before
+    the prompt is sent. Every refusal -- the seam off, the session unsampled, an
+    answer outside the three tiers, a pinned id this account cannot run, a
+    timeout, a provider failure, no ``set_model`` seam -- leaves the session on
+    the model it was already on, which is exactly what an unconsented install
+    does. Nothing here raises except ``CancelledError``.
+
+    An UNPINNED tier is not a refusal and is the shipped state: every tier of
+    ``decisions.model_route`` is ``""`` until an owner pins one, because no model id
+    may be hardcoded as a default. The answer is then recorded and published --
+    the strip reads "complex -> (unpinned)" -- and no switch is attempted, so an
+    owner can see which tier their turns land in before pinning anything.
+
+    The BASELINE recorded on the row is the model this turn would have used, i.e.
+    whatever the session is on as the turn starts. A routed turn is not reverted
+    afterwards -- the point runs again next turn and answers again -- so on a
+    session that has already been routed the baseline is the previous turn's
+    tier, not the pin. That is the honest reading of "what would this turn have
+    run on", and it is what a refusal keeps.
+
+    The switch is taken under the SAME two locks the fallback swap and the restore
+    probe hold (session lock, then pick lock, in that order), because it is the
+    same kind of model transaction: without them a pick arriving through another
+    alias of this session could land inside the ``set_model`` await and then be
+    silently overwritten. The ``decide`` call is deliberately OUTSIDE them: it is
+    a network round trip, and holding a session-scoped lock across it would stall
+    every sibling alias for the provider budget.
+    """
+    try:
+        from kiro_crew.decisions.points import model_route
+    except Exception:  # pragma: no cover - a build without the point
+        return
+    try:
+        routed = await model_route.routed_model(
+            message,
+            session_key=session_key,
+            current_model=_crew_log_model(slot),
+            advertised=provider_advertised_ids(client),
+            history_source=_route_history_source(state, session_key),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pragma: no cover - the point guards itself
+        logger.debug("model.route: keeping the session's own model", exc_info=True)
+        return
+    if not routed:
+        return
+    if not routed.get("model_chosen"):
+        # The answered tier is unpinned: nothing to switch, and the decision is
+        # still the owner's evidence for what to pin. Recorded and published on the
+        # same terms as an applied one, so the strip and the log describe the turn.
+        await asyncio.to_thread(model_route.record_outcome, session_key, routed)
+        return
+    set_model_fn = resolve_substitute_set_model(client)
+    if set_model_fn is None:
+        # No seam to switch through: the tier was answered and cannot be applied,
+        # which is a finding rather than a quiet no-op -- the owner picked
+        # Auto (Jev) and every turn would keep the same model with nothing said.
+        await asyncio.to_thread(
+            model_route.record_error,
+            session_key,
+            turn_id=str(routed.get("turn_id") or ""),
+            tier=str(routed.get("tier") or ""),
+            latency_ms=int(routed.get("latency_ms") or 0),
+            error=model_route.ERROR_NO_SWITCH,
+        )
+        return
+    _pick_lock = getattr(slot, "_model_pick_lock", None)
+    if _pick_lock is None:  # pragma: no cover - minimal slot doubles
+        _pick_lock = asyncio.Lock()
+    try:
+        async with slot_switch_session_lock(effective_session_key(slot)), _pick_lock:
+            # The answer was computed against a premise that a pick landing during
+            # the network round trip invalidates, and a pick made by hand is the
+            # newer instruction. So both halves of the premise are re-read HERE,
+            # inside the locks, where an in-flight pick has already completed: the
+            # flag any manual pick clears, and the model the answer's baseline names.
+            # Either having moved drops the answer -- re-asking would spend again on
+            # a turn whose model the owner just chose.
+            if not getattr(slot, "jev_route", False) or _crew_log_model(slot) != str(
+                routed.get("baseline_model") or ""
+            ):
+                logger.debug(
+                    "model.route: dropping the routed model for slot %s, the slot was "
+                    "re-picked during the await",
+                    slot.key,
+                )
+                return
+            await set_model_fn(str(routed["model_chosen"]))
+            _sync_served_model(slot, client)
+            # A returning ``set_model`` is not proof of a switch: on a backend that
+            # judges the model VALUE, the candidate ladder can be exhausted and the
+            # call returns having stayed on the backend default -- no exception. The
+            # row appended below is durable and never rewritten, so it is read here
+            # rather than assumed, and it records the model the turn RAN on.
+            _used = _crew_log_model(slot)
+            routed["model_used"] = _used
+            # Two ways a switch counts. The session reports the chosen id, or it
+            # reports something other than where the turn started -- the ladder's
+            # own fallback spelling, which is the pin under a name this build serves.
+            # Only staying put, on a model that was not the ask, is a failed switch.
+            routed["applied"] = _used == str(routed["model_chosen"]) or _used != str(
+                routed.get("baseline_model") or ""
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "model.route: set_model(%r) failed for slot %s (%s); keeping the current model",
+            routed.get("model_chosen"),
+            slot.key,
+            type(exc).__name__,
+        )
+        await asyncio.to_thread(
+            model_route.record_error,
+            session_key,
+            turn_id=str(routed.get("turn_id") or ""),
+            tier=str(routed.get("tier") or ""),
+            latency_ms=int(routed.get("latency_ms") or 0),
+            error=model_route.ERROR_SWITCH_FAILED,
+        )
+        return
+    # Written and published only once the switch has landed, so the strip and the
+    # log describe the model the turn actually ran on. Off the loop: the row is a
+    # filesystem append.
+    await asyncio.to_thread(model_route.record_outcome, session_key, routed)
+
+
+def _session_auto_approves(state: DashboardState, slot: _ChatSlot) -> bool:
+    """Whether this session answers its own permission requests (trust or YOLO).
+
+    Read through the SAME two helpers the permission branch decides by, so the
+    annotation cannot claim a mode the approval path is not in. It asks a question
+    and authorises nothing: no caller of this function approves, rejects or delays
+    a tool call.
+    """
+    return _slot_is_trusted(slot) or state.is_yolo_active()
+
+
+async def _tool_risk_meta(
+    state: DashboardState,
+    slot: _ChatSlot,
+    event: "LLMEvent",
+    *,
+    session_key: str,
+    message: str,
+    calls_this_turn: int,
+) -> dict | None:
+    """One ``decisions_tool_risk`` record for this tool card, or ``None``.
+
+    An ANNOTATION on the row the transcript already appends for this call. It reads
+    the permission mode and changes no DECISION about it: it does not approve,
+    reject or re-order a permission request, and it is called from the ``tool_call``
+    branch, which contains no approval code at all. That is why "the approval is
+    byte-identical with the point on and off" is a property a test asserts rather
+    than a claim to trust (``test_decisions_tool_risk_card.py``).
+
+    It does cost TIMING, and that is stated rather than implied: the ``tool_call``
+    frame arrives BEFORE the permission request, so awaiting here delays when this
+    turn's next event -- often that request -- is read, by up to the point's own
+    wait budget. Bounded, sampled, and paid only by a session the seam is on for;
+    the alternative was an await beside ``approve_tool``, where the same cost would
+    buy a far weaker claim about the decision.
+
+    Only for a session that AUTO-APPROVES. A session that prompts puts the call in
+    front of the human, who is the annotation; adding a badge to a card they are
+    already judging would sit a second opinion beside a control. A trusting
+    session shows nobody anything, which is where a badge is the only signal.
+
+    ``None`` on every other path -- the seam off, the session unsampled, the turn
+    cap, a scrub, a timeout, a ``safe`` verdict -- so an ordinary tool row is
+    exactly the row this build appends today. Nothing here raises: the call is
+    already approved and an observation must not cost it.
+
+    The decisions package is imported INSIDE the function for the reason every
+    other caller does it: an ordinary turn with the seam off must not pull that
+    graph onto the tool-call path.
+    """
+    try:
+        if not _session_auto_approves(state, slot):
+            return None
+        from kiro_crew.decisions.points import tool_risk
+
+        record = await tool_risk.risk_record(
+            tool=event.tool_name or event.title or "",
+            arguments=event.tool_input or "",
+            message=message,
+            policy=_auto_approve_reason(slot, state.is_yolo_active()),
+            session_key=session_key,
+            calls_this_turn=calls_this_turn,
+        )
+        return {"decisions_tool_risk": record} if record else None
+    except Exception:  # pragma: no cover - an observation may not cost a call
+        logger.debug("decisions: could not annotate the tool card", exc_info=True)
+        return None
 
 
 def _append_redaction_notice(slot: _ChatSlot, redacted: str) -> None:
@@ -5631,7 +5992,10 @@ def _expand_dollar_skills(
         return message, 0
     skills = _get_skills(state)
     try:
-        resolved = skills.resolve_dollar_skills(message)
+        only = session_skill_globs(
+            session_key, slot.agent or "kirocrew", project_dir=slot.project or None
+        )
+        resolved = skills.resolve_dollar_skills(message, slot.project or None, only=only)
     except Exception:
         logger.exception("dollar-skill resolution failed")
         # Audit the failed resolution attempt — the security-controls guideline
@@ -6747,6 +7111,24 @@ async def _spawn_admitted_prefetch(
     the admission reservation; a ``return`` from any guard below lands there.
     """
     try:
+        # The store this slot was writing, read before the allocation below maps
+        # its own session over it. This is the EARLIER of the two allocation
+        # sites, so it is the only one that can still see the predecessor: once
+        # this registers, the slot's mapping names the successor, and the first
+        # real turn reading the mapping itself would read that successor and
+        # write no `previous` edge at all -- leaving the superseded store
+        # unlinked, so nothing joins the slot's history across the restart, which is
+        # the failure this edge exists to remove. The latch is write-once, so a turn that
+        # observes afterwards cannot replace this with the successor's id.
+        #
+        # Same source as the turn site: the slot-to-session mapping, read
+        # non-pruning. One known limit is recorded rather than worked around here:
+        # an allocation whose replay is still pending defers publishing its fresh
+        # id, so for that window the mapping names the store before the newest one
+        # and the store between them is cited by nobody. Closing that needs a
+        # deferral that resumes once the predecessor's own writes settle, which is
+        # the same mechanism the superseded-tail work needs and is tracked with it.
+        slot.latch_crew_log_previous(sessions.mapped_sid(session_key))
         # speculative=True keeps the one-shot first-turn flag armed for
         # the real first message (atomically, at registration) and
         # refuses resumable keys — unless allow_resume opted in, in
@@ -9408,6 +9790,54 @@ async def _run_chat(
     # tool_call_id -> DISPLAY TITLE (LLM-authored prose for shell tools; used
     # only for PostToolUse hook name-matching — NOT trustworthy for security).
     _pending_tools: dict[str, str] = {}
+    # The `ts` of every row ALREADY in this slot when the turn began, so a row
+    # this turn appended can be told from one that predates it.
+    #
+    # It exists because `tool_call_id` alone cannot say which rows belong to the
+    # call in front of us: it is the BACKEND's id and session-local, so a reset
+    # that recreates the session WITHOUT clearing `slot.messages` -- a project
+    # change does exactly that -- leaves a historical row holding an id a later
+    # call can be issued again. Scanning `slot.messages` by id then returns that
+    # old row beside the new one, and an app flag written from such a scan lands
+    # on a row that never had an app. Durably, too: the flag is deliberately
+    # never written False, so nothing later clears it, and the notice would draw
+    # on the older row while the row that really has the app is passed over.
+    #
+    # A SET of the pre-existing values, compared by membership, rather than a
+    # high-water mark compared by order: `ts` is a string, so an ordering test
+    # would need it to sort numerically, and membership needs nothing of the
+    # format at all. Snapshotted once per turn here, before any tool row of this
+    # turn exists, which is what makes absence from it mean "appended since".
+    #
+    # Rows of THIS turn are kept whatever their id, so one call owning two rows
+    # still works: an auto-approved tool appends a pre- and a post-approval row
+    # under one id, both within this turn, and both keep their flag.
+    _rows_before_turn: frozenset[str] = frozenset(str(_m.get("ts") or "") for _m in slot.messages)
+    # Bounded identity key (`_tcid_identity_key`) -> digest of the FIRST raw id this
+    # turn folded into it, plus `_tcid_collapsed` for the keys more than one raw id
+    # reached. Credential redaction replaces the whole field with one constant rather
+    # than masking a span inside it, so two calls whose ids both look like a
+    # credential reach every downstream reader as the same string. A row stores that
+    # string, so selecting rows by it would hand one call's row to another call.
+    #
+    # EVERY id is recorded, including one redaction left alone. An id whose raw
+    # value already IS the redaction tag is indistinguishable from a
+    # credential-shaped id that redacts to it, so skipping the unchanged ones
+    # would leave that pair tracked as a single source and reading unambiguous --
+    # and `tool_call_id` comes from the LLM, so that pair is producible.
+    #
+    # A key identifies a call only when it is IN the first-source map and absent
+    # from the collapsed set. Recorded-means-identified rather than
+    # absent-means-identified is what bounds this: past `_MAX_TCID_SOURCES` a
+    # further key is simply not recorded, and so reads as naming nothing, instead
+    # of being accumulated in a second structure that had no bound of its own.
+    # `_tcid_collapsed` is therefore a subset of the map's keys and bounded with it.
+    #
+    # Digests on both sides: distinguishing values is all this needs, a digest keeps
+    # the credential-shaped value itself out of the turn's state, and a digest KEY
+    # keeps what is retained at 16 characters however long the id was.
+    _tcid_first_source: dict[str, str] = {}
+    _tcid_collapsed: set[str] = set()
     # tool_call_id -> canonical directive-tool name (forgery gate). Written
     # ONLY at EVENT_TOOL_CALL, ONLY from the trusted adapter identity
     # (event.tool_name + event.mcp_server_name), never from the title. This is
@@ -10180,6 +10610,42 @@ async def _run_chat(
         # which decides whether to send it, and the crew log's `session/opened`,
         # which records the choice.
         _requested_model = slot.model or agent_model or default_model or ""
+        # The crew log this slot was last writing to, read BEFORE allocation
+        # publishes the successor's id over it. A slot outlives its ACP session, so
+        # when the session below cold-starts under a NEW id the crew log gains a new
+        # store and this is the only moment the previous one is still nameable: the
+        # emitter records it as `session/opened.data.previous`, a citation only.
+        # That crew log's own dangling turn stays open; nothing here writes into it.
+        # A resume answers the same id, and the emitter compares and writes no edge.
+        #
+        # Through the slot's write-once latch, not straight into a local, because
+        # THIS is not always the first allocation for the slot: an eager prefetch
+        # allocates ahead of the first turn and maps its own session over the key,
+        # so by the time this line runs the mapping can already name the successor.
+        # The latch keeps whichever observation came first, which is the only one
+        # that saw the predecessor; when no prefetch ran, the latch is empty and
+        # this read is that first observation.
+        #
+        # `mapped_sid` is the single source here, and it is the right one of the
+        # two mapping accessors. `resumable_sid` asks "can this id still be
+        # resumed": it stats the ACP transcript on the calling thread, which is a
+        # synchronous store read this coroutine must not make, and it PRUNES the
+        # entry when that file is gone or empty. Both consequences are wrong for a
+        # history citation. The stat is work on the loop for a fact that needs no
+        # file, and the prune erases the id exactly when the two stores disagree --
+        # a crew log unit can outlive a truncated ACP transcript, and that unit is
+        # the one whose tail most needs closing. `mapped_sid` is one dict lookup,
+        # no disk and no mutation, so it is safe here and it still answers when a
+        # resume would not: it asks what the key was last serving, not what can
+        # still be resumed.
+        #
+        # The window a single mapping read cannot close is a replay-pending
+        # allocation. Such an allocation defers publishing its fresh id, so the
+        # mapping keeps naming the store before it; two successive allocations then
+        # cite that same older store and the store between them is cited by nobody,
+        # which a walker steps over with no signal. That is a recorded residual,
+        # tracked with the superseded-tail work rather than handled here.
+        slot.latch_crew_log_previous(state.sessions.mapped_sid(session_key))
         client, is_new, resumed = await state.sessions.get_or_create(
             session_key,
             agent=kiro_agent or slot.agent or None,
@@ -10443,6 +10909,14 @@ async def _run_chat(
         # stamped them -- see `_crew_log_lineage` for why a restored `_created_by`
         # must never be promoted to gateway-authored lineage.
         _creator_key, _creator_sid = _crew_log_lineage(slot)
+        # Read HERE rather than at mint, because these are facts about the session
+        # this log is being opened for and they are recorded as of this moment. A class
+        # the session acquires LATER reaches the log through its own record: every
+        # surface that commits a change routes through ``note_crew_log_class``, so this
+        # entry states the opening class and the moves are stated as they happen. What
+        # this read still owes is the BEGINNING -- the value a later move is a move
+        # from.
+        _class_memory, _class_app, _class_channel = _crew_log_class(state, slot)
         crew_log_emit.on_session_opened(
             _crew_log_sid,
             agent=slot.agent or "",
@@ -10457,6 +10931,17 @@ async def _run_chat(
             resumed=bool(resumed),
             parent_slot=_creator_key,
             parent_sid=_creator_sid,
+            memory=_class_memory,
+            app=_class_app,
+            channel=_class_channel,
+            workspace=_crew_log_workspace(slot),
+            # Read-and-clear: the latch is owed to exactly one `session/opened`,
+            # and the emitter alone decides whether it becomes an edge -- it
+            # writes one only on a CREATE naming a different store, so handing
+            # the value over on a re-attach costs nothing and leaving it behind
+            # would make the slot's next store cite this store's predecessor
+            # instead of this store.
+            previous_sid=slot.take_crew_log_previous(),
         )
         agent_label = kiro_agent or slot.agent or "default"
         # The label states what the session RUNS on, so a withheld pin reports the
@@ -10554,6 +11039,23 @@ async def _run_chat(
         # here — build_message maps these bounds to their final position itself.
         user_typed_message = message
         user_typed_len = len(user_typed_message)
+        # The crew log turn ordinal is resolved HERE, above the @prompt expansion
+        # gate, rather than only at the emit block below. A blocked or oversized
+        # expansion returns before that block, so computing it there left a refused
+        # expansion with no crew log entry at all -- neither the accepted input nor
+        # the refusal. Resolving it now lets the refusing branch record the same
+        # pair the dispatch gates already do: the ``message/received`` for the
+        # accepted input and a ``turn/refused`` naming the reason. Nothing between
+        # here and the emit block appends a durable row or advances
+        # ``_disk_older_durable_count`` (the mid-turn clear that does is inside the
+        # stream loop, far below), so this single computation is exactly what the
+        # accepted path would otherwise have read -- the emit block reuses it rather
+        # than recomputing it. `durable_row_count` is the SHARED counting rule every
+        # site that sets or advances that base uses, so the ordinal cannot disagree
+        # with the base about which rows are durable.
+        _crew_log_turn_no = int(
+            getattr(slot, "_disk_older_durable_count", 0) or 0
+        ) + durable_row_count(slot.messages)
         # A quick prompt is a REPLACING expansion, the same class as @prompt: the
         # instruction the model receives is injected content, not the user's typing,
         # so none of it is attributable to them. This flag drives the FALLBACK
@@ -10600,6 +11102,31 @@ async def _run_chat(
                 )
                 slot.append("system", f"🔒 Prompt blocked — {label}.", "msg msg-info")
                 state.push_slots_update()
+                # Append-only the session's log (flag-gated, fail-soft). This gate
+                # returns above the normal emit block, so without these two calls a
+                # refused expansion would leave the accepted turn with no entry at
+                # all. Record the accepted input and then a ``turn/refused`` naming
+                # the reason -- the same pair every dispatch gate below writes for
+                # ``not_authorized`` and its siblings. The composed request does not
+                # exist yet here, so ``request/configured`` and ``context/composed``
+                # are deliberately NOT written: the contract on a refusal is the
+                # accepted input plus the refusal, not facts derived from a request
+                # that was never assembled.
+                crew_log_emit.on_message_received(
+                    _crew_log_sid,
+                    _crew_log_turn_no,
+                    role="user",
+                    text=user_typed_message,
+                    source=telemetry_channel_of(session_key),
+                    attachments=_attachments,
+                )
+                crew_log_emit.on_turn_refused(
+                    _crew_log_sid,
+                    _crew_log_turn_no,
+                    _status,
+                    _crew_log_actor,
+                    depth=_prompt_depth,
+                )
                 return
             elif _status == "not_found":
                 sel().log_tool_invocation(
@@ -10652,6 +11179,12 @@ async def _run_chat(
         # context_builder; without this default, a non-slash turn with no
         # context_builder would hit UnboundLocalError at the mirror legs.
         _user_msg_for_mirror = message
+
+        # What the PERSON asked, after `@prompt`/`$skill` expansion and before any
+        # prepend this runner authors -- no cancelled-turn preamble, no sub-agent
+        # failure text, no app context -- so the consented history budget is the only
+        # prior transcript `model.route` can ever see.
+        _jev_route_text = message
 
         # Per-turn injection breakdown, recorded on the usage row at turn end.
         # Empty when this turn injected nothing (no context builder / raw path).
@@ -11127,6 +11660,47 @@ async def _run_chat(
         ):
             await _probe_fallback_restore_for_slot(slot, client)
 
+        # ── Jev model routing (decisions/points/model_route.py) ──
+        # Only for a slot whose owner picked "Auto (Jev)" in the model picker, and
+        # only for a NORMAL dashboard chat turn: `_crew_log_actor` is the turn's
+        # structural origin, so cron deliveries, sub-agent turns, crew-relayed
+        # turns, app injections and autonudge wakes are all excluded -- none has an
+        # owner watching the price of the answer, and each already resolves its
+        # model through its own tier. A runner-authored recovery continuation and a
+        # harness slash command are excluded too: neither is a request whose
+        # difficulty is a question, and re-routing mid-answer would swap the model
+        # under a turn already in progress.
+        # ``_directive_user_origin`` is the load-bearing half, not the actor: a
+        # dispatch that names no actor falls back to ``user`` by design, so the
+        # rewind, regenerate and OpenAI-compatible paths reach here as ``user``
+        # while carrying an app's provenance. The origin flag is the one fact a
+        # person cannot write -- the auth middleware stamps the app claim it is
+        # derived from -- and routing spends the owner's credential, so it asks
+        # for authenticated-human provenance and keeps the actor check beside it
+        # for the wakes that do declare themselves.
+        # The text sent is ``_jev_route_text``, not ``message``: Jev classifies the
+        # difficulty of what the PERSON asked, and by here ``message`` carries every
+        # prepend this turn made -- a cancelled-turn preamble, sub-agent failure text,
+        # the drained app context. The mirror's own snapshot is taken after the first
+        # two, so it is not the right source either: a preamble is prior transcript,
+        # and prior transcript reaches this send only through the consented history
+        # budget, whose shipped value is 0.
+        # ``_synthetic_recovery_turn`` rides beside the text check for the reason the
+        # parameter's own comment gives and the two sibling guards apply: a runner
+        # requeue of the USER'S OWN words is a recovery turn that fixed-text
+        # membership cannot recognize, and re-routing it would re-answer a turn
+        # already in progress on a model the owner is billed for twice.
+        if (
+            slot.jev_route
+            and _directive_user_origin
+            and _crew_log_actor == "user"
+            and not _is_synthetic
+            and not is_slash
+            and message not in _SYNTHETIC_RECOVERY_MSGS
+            and not _synthetic_recovery_turn
+        ):
+            await _route_model_for_turn(state, slot, client, _jev_route_text, session_key)
+
         status_payload: dict[str, Any] = {"slot": slot.key, "status": "Thinking…"}
         if _drained_queue_ids:
             # `queue_pop` is intentionally fire-and-forget, so a client that
@@ -11356,10 +11930,11 @@ async def _run_chat(
         # has to be threaded through either path.
         # `durable_row_count` is the SHARED counting rule every site that sets or
         # advances that base uses, so the ordinal cannot disagree with the base
-        # about which rows are durable.
-        _crew_log_turn_no = int(
-            getattr(slot, "_disk_older_durable_count", 0) or 0
-        ) + durable_row_count(slot.messages)
+        # about which rows are durable. It is resolved ONCE, above the @prompt
+        # expansion gate (see the hoist there), and reused here: nothing between
+        # the two points appends a durable row or advances the base, so the value
+        # this path reads is the value the refusal branch already recorded against.
+        # Recomputing it here would be the same expression twice.
 
         # Append-only the session's log: what the request was configured as, what
         # the gateway put in front of the model, and the body it accepted. All
@@ -11544,9 +12119,28 @@ async def _run_chat(
 
             # Security: tool_call_id originates from LLM — redact before any use
             if hasattr(event, "tool_call_id") and event.tool_call_id:
-                _tcid, _ = redact_exfiltration_urls(event.tool_call_id)
+                _raw_tcid = event.tool_call_id
+                _tcid, _ = redact_exfiltration_urls(_raw_tcid)
                 _tcid, _ = redact_credentials(_tcid)
                 event.tool_call_id = _tcid
+                # The raw id is gone after that assignment, and every later reader
+                # sees only the redacted value, so whether that value still names
+                # ONE call has to be recorded HERE. EVERY id is recorded, not only
+                # one redaction changed: a raw id that already IS the redaction tag
+                # is left alone, yet shares its value with every credential-shaped
+                # id that redacts to that tag, so skipping it would leave the pair
+                # tracked as one source and reading unambiguous.
+                _tcid_digest = hashlib.sha256(_raw_tcid.encode("utf-8", "replace")).hexdigest()[:16]
+                _tcid_key = _tcid_identity_key(_tcid)
+                if not _tcid_key or _tcid_key in _tcid_collapsed:
+                    pass
+                elif _tcid_key not in _tcid_first_source:
+                    # Bounded: past the cap the key is simply not recorded, and an
+                    # unrecorded key reads as naming nothing.
+                    if len(_tcid_first_source) < _MAX_TCID_SOURCES:
+                        _tcid_first_source[_tcid_key] = _tcid_digest
+                elif _tcid_first_source[_tcid_key] != _tcid_digest:
+                    _tcid_collapsed.add(_tcid_key)
 
             # Leaving the thinking phase → flush any withheld thinking tail so a
             # credential split across thinking chunks can't cross the wire raw.
@@ -11759,8 +12353,26 @@ async def _run_chat(
                     "tool_call",
                     _tool_payload,
                 )
+                # AFTER the live ``tool_call`` broadcast above and BEFORE the
+                # row is appended: the pill the open tab draws is not delayed by
+                # the annotation, and the record reaches both doors -- the
+                # ``chat_message`` frame ``append`` broadcasts from inside the
+                # call, and the persisted transcript line -- from one write.
+                # Returns None for every session this seam is off or unsampled
+                # for, which is every session by default.
+                _tool_row_meta = _tool_meta(event)
+                _risk_meta = await _tool_risk_meta(
+                    state,
+                    slot,
+                    event,
+                    session_key=session_key,
+                    message=message,
+                    calls_this_turn=_turn_tool_calls,
+                )
+                if _risk_meta:
+                    _tool_row_meta = {**(_tool_row_meta or {}), **_risk_meta}
                 slot.append(
-                    "tool", f"🔧 {_tool_payload['tool']}", "msg msg-tool", meta=_tool_meta(event)
+                    "tool", f"🔧 {_tool_payload['tool']}", "msg msg-tool", meta=_tool_row_meta
                 )
                 sel().log_tool_invocation(
                     session_key=session_key,
@@ -12076,6 +12688,36 @@ async def _run_chat(
                 # redacted form, so the comparison must use the redacted form
                 # too — see the `_tool_meta` docstring for the convention.
                 _tcid = _redact_tool_field(event.tool_call_id) if event.tool_call_id else ""
+                # Whether that value still NAMES one call. It cannot be answered by
+                # re-redacting: the loop preamble already replaced
+                # `event.tool_call_id` with the redacted form for every event, so
+                # comparing the two here compares a value with itself and is true
+                # even for a collapsed id. The turn records an identity key at that
+                # preamble, while the raw id still exists, and `_tcid_collapsed` holds
+                # the keys more than one distinct raw id reached. The key is derived
+                # here with the SAME helper, so both ends agree by construction; a key
+                # that was never recorded -- an over-long id, or one past the tracking
+                # bound -- names nothing and is withheld.
+                #
+                # Where this is false, the durable "an app was here" claim is
+                # withheld -- see `_owned_rows` below and the flag write further
+                # down. Both fail towards silence, which a later render repairs; a
+                # flag persisted onto an unrelated row does not, because it is
+                # never written False and the client draws its notice on the first
+                # flagged row it finds for the id. `done` and `output` keep the
+                # id-wide walk they already had: they describe the CALL, not a
+                # claim about which row once held an app.
+                #
+                # Evaluated at the moment of the write, which is sound because a
+                # row can only be wrongly selected if it already exists, and a row
+                # exists only if its own call event passed that preamble and was
+                # counted here.
+                _tcid_identifies = (
+                    bool(_tcid)
+                    and bool(_tcid_row_key := _tcid_identity_key(event.tool_call_id))
+                    and _tcid_row_key in _tcid_first_source
+                    and _tcid_row_key not in _tcid_collapsed
+                )
                 # Every TERMINAL frame, not only the successful one. `tool_final`
                 # is true for `completed` alone -- that is what the transcript
                 # paths need, and changing it would change what they credit and
@@ -12112,7 +12754,52 @@ async def _run_chat(
                 # the marker from the transcript text (cosmetic, like redaction).
                 # Awaited: the spool read inside is thread-offloaded (multi-MB
                 # records must not stall this event loop).
-                _out = await mcp_apps_render.handle_tool_result(
+                # Rows this call already owns, by their own `ts`. Resolved HERE,
+                # synchronously, so the claim below can be attributed to a row
+                # identity rather than to the backend's `tool_call_id`: a `ts`
+                # is minted per row, where a session reset can reissue a
+                # `tool_call_id` an older row already used. A `ts` is not an
+                # identity: an explicit one is preserved verbatim for a replayed
+                # channel row, and a coarse clock stamps two rows appended in one
+                # tick alike, which is the reason `meta.mid` is minted at all. Reading `slot.messages` adds no
+                # await, so the claim stays adjacent to the checks above it.
+                #
+                # Restricted to rows THIS TURN appended. Matching on the id
+                # alone would also return a historical row a transcript-
+                # preserving reset left holding the same id, which would put
+                # that old row's `ts` into the claim and let the old row answer
+                # for this call's app.
+                #
+                # Gated on the id still identifying one call: a redacted id is
+                # one constant shared by every redacted id, so it would select
+                # an unrelated same-turn row as an owner. Empty here is an
+                # already-handled case rather than a failure -- the claim is
+                # still written for its render-once half and simply attributes
+                # nothing, which is what `handle_tool_result` documents for a
+                # claim whose row list is empty.
+                _owned_rows: list[dict] = (
+                    [
+                        m
+                        for m in slot.messages
+                        if m.get("role") == "tool"
+                        and m.get("meta", {}).get("tool_call_id") == _tcid
+                        and str(m.get("ts") or "") not in _rows_before_turn
+                    ]
+                    if _tcid_identifies
+                    else []
+                )
+                # Both identities are derived from ONE row list so they cannot
+                # drift apart. `meta.mid` is what the claim is ATTRIBUTED by: it is
+                # minted per row, so it separates two rows a coarse clock stamped
+                # in the same tick, and a row replayed from a channel transcript
+                # whose own `ts` was kept verbatim. The `ts` rides along as the
+                # fallback identity for a claim body carrying no ids, and is
+                # compared as a set rather than for order.
+                _owned_row_ts: list[str] = [str(m.get("ts") or "") for m in _owned_rows]
+                _owned_row_ids: list[str] = [
+                    str(m.get("meta", {}).get("mid") or "") for m in _owned_rows
+                ]
+                _render = await mcp_apps_render.handle_tool_result(
                     state,
                     slot_key=slot.key,
                     tool_call_id=_tcid,
@@ -12122,7 +12809,37 @@ async def _run_chat(
                     # the binding check or every real render is refused as a
                     # bare-vs-prefixed mismatch (silent no-render).
                     producing_session_key=effective_session_key(slot),
+                    row_ts=_owned_row_ts,
+                    row_ids=_owned_row_ids,
+                    # The claim is durable the moment it is taken; these rows are
+                    # not, until a flush writes them. `rows_only` writes the
+                    # transcript window and leaves the metadata line alone, which
+                    # is all the claim needs to be attributable after a restart.
+                    # This does NOT clear `_dirty` -- only the flush passes do --
+                    # so the `mcp_app_lead` flag written further below is still
+                    # owed to the periodic flush exactly as before.
+                    persist_rows=lambda: save_slot_off_loop(state, slot, rows_only=True),
                 )
+                _out = _render.text
+                # Rows this frame flags, by their own `ts`. That is enough HERE,
+                # because the flag write is in-memory against the very rows just
+                # selected. It is not enough to identify a row LATER: append
+                # keeps an explicit `ts` verbatim for a row replayed from a
+                # channel, and a coarse clock stamps two appends in one tick
+                # alike, which is the collision `meta.mid` is minted to answer --
+                # so the claim records the mids and is attributed by them. A
+                # tool_call_id identifies even less: an auto-approved call has a
+                # pre- and a post-approval row sharing the id, and the client's
+                # patch reducer takes only the newest of those.
+                _app_flag_rows: list[str] = []
+                # The render payload is LIVE-ONLY by design (owner-scoped WS, a
+                # callback capability, and a record that expires), so a reload
+                # has nothing to rebuild the frame from. Remember that this row
+                # HAD an app and persist it below, so a reader is told the app
+                # exists instead of seeing nothing at all. True as well when the
+                # claim was already spent, which is how a row recovers after a
+                # gateway death between the claim and this flag reaching disk.
+                _app_on_row = _render.app_on_row
                 # Session directive: a stateless session-bound tool
                 # (monitor_start / monitor_update / autonudge_stop / set_project
                 # / suggest_followup / ask_question) returns a directive marker
@@ -12531,6 +13248,72 @@ async def _run_chat(
                         ):
                             _meta = m.setdefault("meta", {})
                             _meta["done"] = True
+                            # Written only when this row HAD an app record, and
+                            # never written False: absent means "no app", which
+                            # is also what every row predating this field says.
+                            # The frontend renders its there-is-an-app-here
+                            # notice from this alone, so a flag on a row that
+                            # never had an app would point at nothing.
+                            # `_app_on_row` is THIS frame's: it is assigned
+                            # unconditionally at the top of this same
+                            # EVENT_TOOL_RESULT branch, which is what keeps one
+                            # tool call's app off another call's row.
+                            #
+                            # Gated on the row being one THIS TURN appended, for
+                            # the same reason the claim is: this walk selects by
+                            # `tool_call_id`, and a transcript-preserving reset
+                            # can leave a historical row holding the id the
+                            # backend has just reissued. Without the gate that
+                            # old row is flagged too -- permanently, since the
+                            # flag is never written False below -- and because
+                            # the client draws the notice on the FIRST flagged
+                            # row for the id, the stale row would answer for the
+                            # app while the row that actually has it is passed
+                            # over. `done` and `output` keep the id-wide walk
+                            # they have always had: both describe the CALL, and
+                            # a row replaying that call is not made wrong by
+                            # them, where a claim of "an app was here" is.
+                            #
+                            # Gated on the id identifying one call for the same
+                            # reason: credential redaction collapses the whole
+                            # field to one constant, so without this a second
+                            # call's row in the same turn takes a permanent flag
+                            # for an app it never had.
+                            if (
+                                _app_on_row
+                                and _tcid_identifies
+                                and str(m.get("ts") or "") not in _rows_before_turn
+                            ):
+                                # ONE update rather than two assignments. The periodic
+                                # flush takes `slot.messages` as a shallow copy of
+                                # REFERENCES and serializes these same live dicts on a
+                                # worker thread, so a snapshot landing between two
+                                # assignments stores `mcp_app` with no `mcp_app_lead`.
+                                # The client draws the notice on the lead alone, so that
+                                # row renders nothing, and the restore pass cannot
+                                # repair it: it reads a surviving `mcp_app` as proof the
+                                # lead survived, marks the claim's lead taken and skips,
+                                # and the claim is swept at its TTL. `dict.update`
+                                # applies both keys in one step, so a reader holding the
+                                # interpreter sees both or neither.
+                                _row_flags: dict[str, Any] = {"mcp_app": True}
+                                # The FIRST row this occurrence flags is its lead,
+                                # and the client draws the notice on that row
+                                # alone. Stamped here because only this loop knows
+                                # which rows belong to THIS call: the client sees
+                                # a flat transcript where a pre-reset row that had
+                                # its own app keeps `mcp_app` forever, so any
+                                # client-side rule that picked the earliest
+                                # flagged row for an id chose that stale row and
+                                # suppressed the notice for the app this turn
+                                # really lost. `slot.messages` is in transcript
+                                # order, so the first row this branch reaches is
+                                # the earliest of the occurrence, and the marker
+                                # needs no ordering comparison to read.
+                                if not _app_flag_rows:
+                                    _row_flags["mcp_app_lead"] = True
+                                _meta.update(_row_flags)
+                                _app_flag_rows.append(str(m.get("ts") or ""))
                             # A terminal frame carrying no renderable output states a
                             # STATUS, not an empty output, so it must not overwrite an
                             # output an earlier frame for this same call already
@@ -12539,6 +13322,47 @@ async def _run_chat(
                             # a first terminal frame with no output still reads as one.
                             if _out or "output" not in _meta:
                                 _meta["output"] = _out
+                    # Tell open clients about the app flag as well as storing it.
+                    # `chat.mcpApps` is a BOUNDED cache, so a session that opens
+                    # many apps evicts the oldest payload while its row is still
+                    # on screen; without this the row goes blank there and only
+                    # names the app after a reload. The reducer MERGES meta, so
+                    # the patch carries that one key and nothing else -- notably
+                    # not the row's output, which is capped at 1 MB and already
+                    # delivered.
+                    #
+                    # One patch per flagged row, addressed by that row's own
+                    # `ts`, because a tool_call_id names TWO rows for an
+                    # auto-approved call and the reducer would patch only the
+                    # newest -- so both rows are correct live, as well as after a
+                    # reload from the persisted write above. A `ts` is the right
+                    # address for THIS send and not a durable identity: it is
+                    # resolved against the transcript the sender is holding, in
+                    # the same turn that wrote these rows. The claim, which is
+                    # read back on a later process, records `meta.mid` instead.
+                    for _i, _flag_ts in enumerate(_app_flag_rows):
+                        if not _flag_ts:
+                            continue
+                        # The lead marker travels with the flag, or an open client
+                        # would hold a flagged row that the stored transcript calls
+                        # the lead and the live view calls neither -- the notice
+                        # would then appear only after a reload.
+                        _patch_meta: dict[str, Any] = {"mcp_app": True}
+                        if _i == 0:
+                            _patch_meta["mcp_app_lead"] = True
+                        try:
+                            state.broadcast_ws(
+                                "chat_message_update",
+                                {
+                                    "slot": slot.key,
+                                    "ts": _flag_ts,
+                                    "meta": _patch_meta,
+                                },
+                            )
+                        except Exception:
+                            # The stored rows are already correct; a client
+                            # reconciles from slot detail on its next fetch.
+                            logger.debug("mcp-app flag broadcast failed", exc_info=True)
                 # Fire PostToolUse hooks
                 _tool_name = _pending_tools.pop(event.tool_call_id, "")
                 try:

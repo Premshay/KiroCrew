@@ -4,6 +4,13 @@ How MCP (Model Context Protocol) servers are configured, merged, probed and
 loaded, plus the two invariants every new Kiro Crew MCP tool must satisfy: it
 ships as an MCP tool (not only a CLI command), and it holds no per-caller state.
 
+The spawn tools share their reason vocabulary with `solo_spawn.py` and validate
+optional `solo_details` through `validation.py`. New reasons require details;
+legacy calls remain compatible. Async receipts declare supported parent-work
+delivery, while the inline tool rejects `parent_parallel`. See the
+[subagent contract](../system-specs/modules/subagent.md) for the enforced limits
+and model-only value judgments.
+
 Related: the CPP extension-point seam this doc reads from is
 [platform-context](../system-specs/modules/platform-context.md); the governance
 ceiling that filters auto-approve is
@@ -1054,12 +1061,28 @@ The third layer is defense in depth for hosts that ignore `disabledTools`. When 
 policy cannot be read, what it does depends on WHY, because the reasons differ in
 kind and its two consumers carry different risk.
 
-`tools/call` fails **closed** on `policy_unreadable`, the gateway's `409`: a spec for
-this session exists and its policy could not be determined, so an operator exclusion may
-exist and be withheld. The call is refused with an error naming the reason and audited as
-`rejected_policy_unresolved`. The test for admitting a reason here is that it means ONE
-thing, because a refusal derived from an ambiguous reason is wrong for half the callers
-it hits.
+`tools/call` fails **closed** on two reasons, and both mean "an operator exclusion may
+exist and this process could not read it". `policy_unreadable` is the gateway's `409`
+whose body carries `"code": "policy_unreadable"`: a spec for this session exists and its
+policy could not be determined. `identity_unattested` is the gateway's `409` whose body
+carries `"code": "member_identity_unavailable"`: the gateway could not establish the
+execution identity behind the declared `X-Session-Key`. Usually the request carries no
+`X-Session-Token`, or one that vouches for another key; an attested key whose execution
+record cannot be read, or a `cron:` key the scheduler has no record for, answers the
+same way. In every case the spec was never consulted, so whatever it excludes is unknown
+here. The two
+share a status, so the MCP side tells them apart by the body's `code`; a `409` whose body
+cannot be read or carries no `code` takes the `policy_unreadable` arm, the status's
+meaning for the unreadable-spec condition, so an unknown `409` is never read as anything
+narrower. The call is refused with an error naming the reason -- the `identity_unattested`
+text names the missing token, its usual cause, the `policy_unreadable` text the agents
+directory -- and
+audited as `rejected_policy_unresolved`; the read that produced `identity_unattested` is
+itself audited as `tool_policy.unattested`. A control-plane backend
+(`CONTROL_PLANE_BACKENDS` in `mcp_gateway/gatewayd.py`) is handed the token per frame in
+the caller block and the policy read sends it, so its calls do not land there. The test
+for admitting a reason here is that it means ONE thing, because a refusal derived from an
+ambiguous reason is wrong for half the callers it hits.
 
 `resolution_failed` -- no usable answer, meaning nothing came back or a `5xx` said the
 gateway is broken -- passes that test and is still permissive, which is the one place
@@ -1109,12 +1132,13 @@ gets a 400/404, never an empty policy.
 An empty body from that endpoint means one thing only: this agent genuinely
 declares no exclusions. A spec that EXISTS and cannot be read -- unparseable,
 valid JSON that is not an object, a `managedToolPolicy` of the wrong shape, or two
-specs declaring one agent name -- answers `409` with `{"error":
-"policy_unreadable"}` and a SEL `denied` record. Sharing the empty body with those
+specs declaring one agent name -- answers `409` with `"code": "policy_unreadable"` in the
+body and a SEL `denied` record. Sharing the empty body with those
 cases would make an unreadable deny indistinguishable from no deny on the wire, so
 no caller could tell them apart however carefully it fails closed. The MCP side
-maps that `409` to `unresolved="policy_unreadable"` and does NOT negative-cache
-it: the answer is immediate so there is no timeout to debounce, and both negative
+maps a `409` carrying that code to `unresolved="policy_unreadable"` and does NOT
+negative-cache it, nor its `identity_unattested` sibling: the answer is immediate so
+there is no timeout to debounce, and both negative
 clocks are process-global, so caching one session's malformed spec there would
 refuse calls for every sibling session in a pooled backend.
 
@@ -1139,6 +1163,9 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
 | `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `session_create`, `session_send`, `session_read_message`, `session_stop`, `session_close` |
+| `kirocrew-work` | `kirocrew mcp-work` (`mcp_work.py`) | `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_record` |
+| `kirocrew-crew-log` | `kirocrew mcp-crew-log` (`mcp_crew_log.py`) | `crew_log_list`, `crew_log_read`, `crew_log_projection` |
+| `kirocrew-panel` | `kirocrew mcp-panel` (`mcp_panel.py`) | `panel_publish`, `panel_templates` |
 
 `kirocrew-dashboard` is one transport carrying **two** authorization models, which is
 what makes its assignment decision larger than its name suggests. The
@@ -1786,11 +1813,16 @@ can persist it.
 gatewayd spawns a pooled backend from its OWN environment, so the per-session
 token the stub carries never reaches the backend's `os.environ`. That is right
 for a third-party server, which has no business proving a session to anyone.
-`kirocrew-core` and `kirocrew-cron` are different: they post back to the gateway
-over loopback (`/api/crons/tools`, the memory routes) on behalf of the session
-they act for, and since #11780 the gateway requires `X-Session-Token` on that
+`kirocrew-core`, `kirocrew-cron` and the opt-in Crew servers (`kirocrew-dashboard`,
+`kirocrew-work`, `kirocrew-crew-log`, `kirocrew-panel`) are different: they
+post back to the gateway over loopback (`/api/crons/tools`, the memory routes,
+the session and folder routes) on behalf of the session they act for, and every
+one of them reads the session's tool policy through `mcp_shared`, a read the
+gateway answers only behind the attestation; since
+#11780 the gateway requires `X-Session-Token` on that
 transport when no kernel peer attestation is present — which a gatewayd child
-never has. So for exactly `gatewayd.CONTROL_PLANE_BACKENDS` the connection
+never has. So for exactly `gatewayd.CONTROL_PLANE_BACKENDS` -- every managed
+Crew server, read from `mcp_cleanup.KIROCREW_BIN_MCP_SERVERS` -- the connection
 handler copies `conn.stub_session_token` onto the injected `CallerContext`
 (`session_token`), `build_caller_meta` emits it as `sessionToken` only when set,
 and `mcp_core._session_token_header` reads the gateway-injected caller's token
@@ -1806,9 +1838,12 @@ only. The invocation being ours is still not proof of what runs: the managed
 spec falls back to `<python> -m kiro_crew <sub>` when no launcher resolves, and
 the child's CWD could carry foreign code under our name. Python's `PYTHON*`
 environment namespace is an extensible interpreter control surface: entries can add roots, execute hooks, select an executable, or move
-user-site without changing the command. For a control-plane backend, the
-gateway's pooled-backend resolver removes that whole namespace from the operator
-environment. Any non-empty `PYTHON*` entry present at the verdict therefore came
+user-site without changing the command, and the dynamic-loader `LD_*` / `DYLD_*`
+namespaces replace code in every binary of the spawn chain. For a control-plane
+backend, the
+gateway's pooled-backend resolver removes all three namespaces
+(`env._SPEC_ENV_DENIED_PREFIXES`) from the operator
+environment. Any non-empty entry in them present at the verdict therefore came
 from a hand-declared overlay or another resolver and denies the token without
 value inspection. The prefix rule fails closed when Python adds a variable; it
 cannot drift into a false grant through an incomplete list. Third-party pooled
@@ -1846,7 +1881,7 @@ and for every pooled backend, the spawn site re-applies Kiro Crew's own UTF-8
 pinning (`platform_compat._UTF8_PROCESS_ENV`: `PYTHONUTF8` and
 `PYTHONIOENCODING`) to the child environment, so a pooled interpreter builds
 its stdio from UTF-8 rather than a Windows ANSI codepage. The order is the
-guarantee: the classifier sees a `PYTHON*`-free environment, and the pinning
+guarantee: the classifier sees an environment free of every denied namespace, and the pinning
 lands on a child whose verdict is already fixed -- the same pair present before
 the verdict would deny every control plane its own token.
 `Backend.control_plane` is set from that pre-spawn verdict and never recomputed.
@@ -1860,15 +1895,40 @@ the frames the session forwards afterwards decide against whatever backend now
 serves it — so a control plane that died is not a warrant for the fresh process
 spawned under its name. A denial for a reserved name is logged at spawn
 (`_deny_control_plane`) naming the backend and the condition that failed — no
-spec entry, a different binary, different args, a non-empty `PYTHON*` variable,
+spec entry, a different binary, different args, a non-empty `PYTHON*` / `LD_*` /
+`DYLD_*` variable,
 or a root that shadows `kiro_crew` (named in the message, so per-user site-packages
 is distinguishable from the local one) — so an
 install that trips the check has more to read than every cron tool answering
 403.
 
-`CONTROL_PLANE_BACKENDS` mirrors `acp.session_mcp.CONTROL_PLANE_SERVERS`
-(importing it would put `kiro_crew.agent` on the daemon's boot path) and a
-ratchet test pins the two equal. The stub-strip in
+`CONTROL_PLANE_BACKENDS` is named in gatewayd itself (importing
+`acp.session_mcp` would put `kiro_crew.agent` on the daemon's boot path; the
+set is read from the `mcp_cleanup` leaf instead). It is
+a superset of `acp.session_mcp.CONTROL_PLANE_SERVERS`, not a mirror, because the
+two answer different questions: `CONTROL_PLANE_SERVERS` decides which servers
+every session mounts and which survive a `disabledTools` entry;
+`CONTROL_PLANE_BACKENDS` decides who is handed the token. Containment holds in
+one direction: a server mounted in every session posts back for that session,
+so it needs the token. The opt-in Crew servers are the reverse case --
+`kirocrew-dashboard` posts back for the CALLING session (`session_create`,
+`session_send`, the folder and tag tools), so it needs the token, but it is
+`opt_in`, so naming it in
+`CONTROL_PLANE_SERVERS` would mount it in every session and make an operator's
+decision to switch its tools off unenforceable. A ratchet test pins that
+relationship rather than equality with `CONTROL_PLANE_SERVERS`: it asserts
+`CONTROL_PLANE_SERVERS` is
+contained in `CONTROL_PLANE_BACKENDS`, pins the token-only extras to exactly
+`mcp_cleanup.OPT_IN_BIN_MCP_SERVERS` plus the spec-gated `kirocrew-computer`,
+requires every extra to be a managed server that is not unconditionally mounted
+(`opt_in`, or behind a `spec_gate`), and pins the whole set equal to
+`acp.session_mcp.IDENTITY_BOUND_SERVERS` -- the kiro-backend element list that
+carries the same token per element -- so the two identity paths grant the same
+servers and a new recipient has to update both in the same commit. Because the
+opt-in servers are `opt_in`, `_spawns_own_control_plane` asks
+`agent.managed_mcp_spec_entry` for the invocation with `include_opt_in=True`,
+which skips only the `opt_in` emission disqualifier; a closed `spec_gate` still
+yields no invocation, and therefore no token. The stub-strip in
 `backend._strip_caller_meta` removes the whole caller block, so a stub cannot
 forge a `sessionToken` either. A gateway-injected caller also marks the backend
 as gateway-hosted: when its dial to the gateway is refused it reports the
@@ -2155,3 +2215,8 @@ through `SkillsLoader.load_skill` with a shared 24,750-byte read allowance.
 Those results contain safe names and content, not live project paths. Sessionless
 CLI search remains global-only. Mixed CJK/English keywords use memory's existing
 CJK-pair tokenizer. Native tool schemas and Tool Search thresholds are unchanged.
+
+`skill_search` supports scoped `search`, paginated `list` and exact-key `read`. The
+gateway resolves scope from the signed session, never a model-supplied agent name.
+Without signed identity it uses the global installed catalog. Incremental indexing
+reports incomplete recall explicitly; list/read remain available during refresh.

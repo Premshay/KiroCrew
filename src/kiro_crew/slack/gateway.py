@@ -7846,7 +7846,27 @@ class GatewayOrchestrator:
             on_fire=_fire,
             on_monitor_tick=_monitor_tick,
         )
-        controller = MonitorController(self.autonudge_svc, _fire_monitor)
+
+        def _monitor_owner_session_id(loop: NudgeLoop) -> str:
+            """The crew log unit the loop's owner slot is serving on, or ``""``.
+
+            The same resolver the session ledger uses: an exact registry read plus
+            an attribute read, no disk and no session state mutated by asking. A
+            slot with no live session answers ``""`` and the controller records
+            nothing for it -- a probe runs without a model turn and must not start
+            a session to file its result.
+            """
+            if self.dashboard_state is None:
+                return ""
+            from kiro_crew.crew_log.resolve import unit_for_session_key
+
+            return unit_for_session_key(self.dashboard_state.sessions, loop.slot_key)
+
+        controller = MonitorController(
+            self.autonudge_svc,
+            _fire_monitor,
+            owner_session_id=_monitor_owner_session_id,
+        )
         # Timers can complete while start() awaits store repair. Install the
         # observer first so that transition cannot fall between startup and
         # terminal replay.
@@ -10108,6 +10128,13 @@ class GatewayOrchestrator:
             # ``_start_subagent_dispatch_after_memory_ready`` opens it.
             defer_queue_dispatch=True,
         )
+        # A parent that ends takes its children with it, on every backend. The
+        # session lifecycle owns the boundary and drives both halves at each of its
+        # parent-end paths, so no surface that closes, resets, discards or retires a
+        # conversation needs a cancel call of its own. The manager is passed whole
+        # rather than as two bound methods because the halves have to agree about
+        # which runs they are talking about.
+        self.sessions.set_child_teardown_handler(self.subagent_mgr)
         self.subagent_mgr.start_reaper()
 
     async def _start_subagent_dispatch_after_memory_ready(self) -> None:
@@ -11541,6 +11568,14 @@ class GatewayOrchestrator:
         if cleanup_tasks:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
+        # AFTER the gather, not beside cancel_all() above: cancel_all() is what stops
+        # the runs that still write to the durable task queue, so closing the store
+        # before it finishes would pull the connection out from under them. Off-loop,
+        # because ``close()`` is synchronous and waits for the store's writer lock --
+        # on the loop that stalls shutdown behind an in-flight executor write.
+        if self.subagent_mgr:
+            await asyncio.to_thread(self.subagent_mgr.close)
+
         await asyncio.to_thread(self._stop_memory_startup)
 
     # ------------------------------------------------------------------
@@ -11875,7 +11910,7 @@ class GatewayOrchestrator:
                 #     command in `remediation`) -> the installer can apply it, so
                 #     a floor does drive it; a floor above the newest build
                 #     notifies instead of reinstalling the same bytes forever.
-                #   * externally managed (dmg/appimage/deb/rpm/docker: no
+                #   * externally managed (dmg/appimage/deb/rpm/nsis/docker: no
                 #     `can_apply` and no command) -> its own updater owns this; the
                 #     backend must not drive a git reset on a non-git tree nor show
                 #     an inapplicable CLI-update badge.
@@ -11934,7 +11969,7 @@ class GatewayOrchestrator:
                     return
                 # Everything below cannot apply here, so the operator has to act.
                 # Two of the three cases light the badge; the third deliberately
-                # does not, because a dmg/appimage/deb/rpm/docker install cannot
+                # does not, because a dmg/appimage/deb/rpm/nsis/docker install cannot
                 # act on a CLI-update badge and its own updater owns the upgrade.
                 #
                 # Where the badge IS lit, `check_status` and `error_code` are left

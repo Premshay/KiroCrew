@@ -29,12 +29,18 @@
  *
  * Which member is open rides the URL (`?member=<name>`), and the last one
  * opened is remembered per browser: a visit that names no member lands on
- * the remembered one (else the first row), never on the empty column.
+ * the remembered one if it is still on the roster. A fresh visit with
+ * nothing remembered lands on the roster with no member pre-opened (the
+ * 'Pick a member' empty pane), matching the below-md two-level list rule, so
+ * the user picks rather than being primed on whichever row the sort floated
+ * to the top (#11763).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Clock, ExternalLink, Goal, MessageCircleQuestionMark, Pencil, Plus, Route, Square, Star, UserPlus, Users, Webhook, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Clock, Cloud, ExternalLink, Goal, MessageCircleQuestionMark, Pencil, Plus, Route, Square, Star, Webhook, Zap } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
+import { CrewMemberMark } from '../../components/CrewMemberMark'
+import DeployMyCrewDialog from './DeployMyCrew'
 import { useTranslation } from 'react-i18next'
 import { api, type MemberRosterRow, type WebhookTokenEntry } from '../../api/client'
 import {
@@ -66,6 +72,7 @@ import { setViewedThreadSlot, clearViewedThreadSlot } from '../../lib/viewedThre
 import CrewAvatar from '../../components/CrewAvatar'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
 import ChatPane from '../../components/ChatPane'
+import CrewWebview from './CrewWebview'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useGuardedLeave, useRegisterNavigationLeaveGuard, usePublishNavigationStake } from '../../components/NavigationLeaveGuard'
@@ -137,11 +144,17 @@ const MEMBER_PARAM = 'member'
  *  localStorage is already per-gateway. */
 const LAST_MEMBER_KEY = 'mc-members-last-member'
 
-/** Which member to open when the URL names none, or names one that is gone
- *  (deleted or renamed since the link/memory was written): the remembered
- *  member if it is still on the roster, else the first row in display order.
- *  `undefined` only for an empty roster. Pure, so the three cases — default,
- *  restore, stale fallback — are tested directly. */
+/** Which member to RESTORE when the URL names none, or to fall back to when
+ *  it names one that is gone (deleted or renamed since the link/memory was
+ *  written): the remembered member if it is still on the roster, else
+ *  `undefined`. It deliberately does NOT fall back to the first row — a fresh
+ *  visit with nothing remembered lands on the roster with no member pre-opened
+ *  (the empty column, matching the below-md two-level list rule), so the user
+ *  picks the member they want rather than being primed on whichever row the
+ *  sort floated to the top (#11763). `undefined` therefore means both "empty
+ *  roster" and "nothing remembered": either way there is nothing to auto-open.
+ *  Pure, so the cases — restore, nothing-remembered, stale — are tested
+ *  directly. */
 export function resolveDefaultMember(
   remembered: string | null,
   ordered: readonly MemberRosterRow[],
@@ -150,7 +163,7 @@ export function resolveDefaultMember(
     const hit = ordered.find((m) => m.name === remembered)
     if (hit) return hit
   }
-  return ordered[0]
+  return undefined
 }
 
 type MemberMemoryDisplay = 'global' | 'legacy' | 'private' | 'ownership_mismatch' | 'unavailable'
@@ -473,6 +486,9 @@ export default function MembersPage() {
   // '' — no thread opened). The remembered-member fallback never sets it —
   // there the user named nobody. Cleared once a different member opens.
   const [gone, setGone] = useState<{ name: string; shown: string } | null>(null)
+  // Deploy my crew. Page-level because a launch is crew-wide, and the panel's
+  // own read is gated on this, so it stays false until someone asks for it.
+  const [deployOpen, setDeployOpen] = useState(false)
   // The member the fallback is about to open in place of a gone one a link
   // named. Set right before the fallback's URL write, read (and cleared) by
   // the open that write triggers, so that open can skip the memory write. A
@@ -714,9 +730,10 @@ export default function MembersPage() {
     },
     [mutateStar],
   )
-  // Display order before the search filter — this is what "the first member"
-  // means for the default-open below, so a typed filter never changes which
-  // member a fresh visit lands on. The ORDER is committed per MEMBERSHIP and
+  // Display order before the search filter — this is the roster the rows
+  // render from and the list `resolveDefaultMember` searches for a remembered
+  // member, so a typed filter never changes the order or which member a
+  // return visit restores. The ORDER is committed per MEMBERSHIP and
   // per chosen SORT, not per refetch: the roster query refetches on every
   // server refresh frame, on window focus and on staleness, and re-sorting
   // when a last_active_ts advances would move rows under the cursor mid-click
@@ -1502,31 +1519,43 @@ export default function MembersPage() {
         setGone(null)
         return
       }
-      if (urlMember) {
-        // Switching between members while one is open REPLACES the entry, so
-        // the page holds one history entry however many members are visited
-        // and Back leaves it in one press — the Sessions sidebar's rule.
+      if (urlMember || !isMobile) {
+        // Switching between members while one is open REPLACES the entry, and
+        // so does opening one above md, where the roster and the thread sit
+        // side by side and an open is not a navigation step. Either way the
+        // page holds one history entry however many members are visited and
+        // Back leaves it in one press — the Sessions sidebar's rule. The
+        // breakpoint is named directly because the desktop half used to ride
+        // on `urlMember` always being set by the arrival auto-open: a fresh
+        // visit with nothing remembered now leaves the URL bare (#11763), and
+        // that first click must still replace.
         setSearchParams({ [MEMBER_PARAM]: m.name }, { replace: true })
         return
       }
-      // Entering a thread from the roster (below md, where no member is open)
-      // is a step in a two-level navigation, so it is PUSHED. The state marks
-      // the entry as pushed from this page's roster, which is what lets the
-      // below-md back button pop instead of replace.
+      // Entering a thread from the roster below md — the one place where the
+      // roster IS the page and no member is open — is a step in a two-level
+      // navigation, so it is PUSHED. The state marks the entry as pushed from
+      // this page's roster, which is what lets the below-md back button pop
+      // instead of replace.
       setSearchParams({ [MEMBER_PARAM]: m.name }, { state: { fromRoster: true } })
     },
-    [activeName, urlMember, activate, setSearchParams],
+    [activeName, urlMember, isMobile, activate, setSearchParams],
   )
 
   // URL -> open member. Once the roster is in: a URL that names a member
   // opens it; a URL that names none (a fresh visit, the sidebar entry, a
-  // reload) is REPLACED with the remembered member, else the first row — so
-  // the page never lands on the empty column, and the URL always says what
-  // is on screen. A URL naming a member that is gone (deleted or renamed)
-  // takes the same fallback, with a one-line notice above the thread naming
-  // the swap — the user asked for someone specific, and a silently mounted
-  // other thread is the misroute this page exists to prevent. Below md the
-  // page is a two-level list->detail navigation: no `?member=` IS the
+  // reload) is REPLACED with the remembered member if one is still on the
+  // roster, so returning users land back on the conversation they left. A
+  // fresh visit with NOTHING remembered does NOT auto-open the first row —
+  // the page stays on the roster with the empty column's 'Pick a member'
+  // pane, so the user chooses instead of being primed on whichever row the
+  // sort floated to the top (#11763). A URL naming a member that is gone
+  // (deleted or renamed) falls back to the remembered member if present, with
+  // a one-line notice above the thread naming the swap — the user asked for
+  // someone specific, and a silently mounted other thread is the misroute
+  // this page exists to prevent; with nothing remembered it returns to the
+  // roster with the notice rather than standing in the first row. Below md
+  // the page is a two-level list->detail navigation: no `?member=` IS the
   // roster, so no auto-open there (same rule as SidePanelLayout's remembered
   // tab), and a gone member in the URL returns to the roster instead of
   // bouncing the phone user into a different member's thread.
@@ -1571,8 +1600,38 @@ export default function MembersPage() {
       }
       return
     }
+    // Desktop, URL names no member (or names a gone one): restore the
+    // remembered member if it is still on the roster. A fresh visit with
+    // NOTHING remembered no longer opens the first row — there is no member
+    // the user chose, so the page lands on the roster with the empty column's
+    // 'Pick a member' pane (the same rule the phone already follows: no
+    // `?member=` IS the roster). Auto-opening whichever row the 'recent' sort
+    // floated to the top primed the user to believe it was the member they
+    // asked for, which is the #11763 friction; the sort itself is left as-is.
     const target = resolveDefaultMember(safeGetItem(LAST_MEMBER_KEY), orderedMembers)
-    if (!target) return
+    if (!target) {
+      // Named a gone member but nothing remembered to stand in for them: say
+      // where they went above the roster (shown: '' marks the roster variant
+      // of the notice, as below md) and clear the URL back to the bare list.
+      if (urlMember) {
+        setGone((prev) =>
+          prev && prev.name === urlMember && prev.shown === '' ? prev : { name: urlMember, shown: '' },
+        )
+        setSearchParams({}, { replace: true })
+      }
+      // Nothing to open means nothing may STAY open — the same clear the
+      // below-md branch does. A member can be open with nothing remembered:
+      // the write that remembers it is `safeSetItem`, which returns false when
+      // storage is denied, and then `safeGetItem` reads null. Returning to a
+      // bare `/members` from there (the crew editor's exit, the rail's Crew
+      // Members row) would otherwise leave the previous thread standing over a
+      // URL that names no one, next to the roster's 'Pick a member' pane.
+      if (activeName) {
+        activeNameRef.current = ''
+        setActiveName('')
+      }
+      return
+    }
     if (urlMember) {
       setGone((prev) =>
         prev && prev.name === urlMember && prev.shown === target.name
@@ -1615,14 +1674,43 @@ export default function MembersPage() {
         <div className={LIST_HEADER_CLS}>
           {/* pl-1.5 is the sidebar's title inset when no rail toggle sits
               before it; the page icon leads the title where the sidebar's
-              reads bare, because this header names a page, not a pane. */}
+              reads bare, because this header names a page, not a pane.
+              The icon is the same two-ghost brand mark the nav rail draws
+              for this page (`components/CrewMemberMark.tsx`), so the rail
+              row and the page it opens name the thing with one glyph. */}
           <div className="flex items-center gap-1.5 min-w-0 flex-1 pl-1.5">
-            <Users size={15} className="lucide-inline text-muted shrink-0" />
+            <CrewMemberMark size={15} className="inline-block text-muted shrink-0" />
             <h1 className={LIST_TITLE_CLS}>{t('pages.membersPage.title')}</h1>
           </div>
           {/* Adding a member IS creating a crew, and the crew manager is the
               only write path — so this is a navigation, not an inline form.
-              It lands ON the create form, not on the crew list (#9513). */}
+              It lands ON the create form, not on the crew list (#9513).
+              A bare `Plus`, not `UserPlus`: the page icon beside it already
+              says "members", and a person-figure here would be the one
+              Lucide person on a page whose members are drawn as ghosts. */}
+          {/* Crew-WIDE, so it sits in the page header rather than in a member's
+              own drawer: one launch ships the whole checkout to one machine and
+              names one stack, so there is no per-member deployment and a
+              per-row placement would draw the same one under every member.
+              Labelled, not icon-only: a bare cloud glyph names nothing a
+              first-time reader can guess, and this is the feature's only
+              entry. A plain `Cloud` glyph, not `CloudUpload`: the arrow-into-cloud
+              reads as "send something up", and a reader who takes the button for
+              an action never opens the read-only panel behind it. Bordered like
+              the secondary `Btn`, unlike its ghost `+`
+              sibling: an icon-plus-word with no edge reads as a status chip,
+              and a reader who takes it for a label never opens the panel.
+              The panel's actions lead into Settings > Remote Instances,
+              which owns the set-up flow. */}
+          <button
+            onClick={() => setDeployOpen(true)}
+            className="flex items-center gap-1 h-7 px-2 rounded-md transition-colors bg-transparent border border-border shrink-0 text-[12px] text-muted hover:text-text hover:border-border-strong hover:bg-bg-hover cursor-pointer"
+            title={t('pages.membersPage.deploy_title')}
+            data-testid="member-deploy-open"
+          >
+            <Cloud size={15} />
+            {t('pages.membersPage.deploy_trigger')}
+          </button>
           <button
             onClick={() => navigate(CREW_CREATE_PATH)}
             className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
@@ -1630,7 +1718,7 @@ export default function MembersPage() {
             title={t('pages.membersPage.add_member')}
             data-testid="member-add"
           >
-            <UserPlus size={15} />
+            <Plus size={15} />
           </button>
         </div>
         <div className={`px-4 pb-2 ${ROW_STATUS_CLS} text-muted`} data-testid="member-count">
@@ -1801,9 +1889,12 @@ export default function MembersPage() {
           />
         </div>
         {gone && gone.shown === '' && (
-          /* Below md a stale link lands on the roster; this is where the
-             answer to "where did they go" has to live. Same tone as the
-             thread-side notice. */
+          /* The roster is the answer surface when there is no thread to stand
+             in the gone member's place: below md a stale link always lands
+             here, and on desktop a gone `?member=` with nothing remembered
+             now does too (#11763) rather than mounting a stranger's thread.
+             This is where the answer to "where did they go" has to live. Same
+             tone as the thread-side notice. */
           <div className="px-4 py-1.5 text-[13px] text-warn" role="status" data-testid="member-gone-roster-notice">
             {t('pages.membersPage.member_gone_roster', { name: gone.name })}
           </div>
@@ -1824,7 +1915,7 @@ export default function MembersPage() {
                 className="mt-2 inline-flex items-center gap-1 text-[11.5px] px-2 py-1 rounded border border-border hover:bg-accent/40"
                 data-testid="member-empty-cta"
               >
-                <UserPlus size={12} className="lucide-inline" />
+                <Plus size={12} className="lucide-inline" />
                 {t('pages.membersPage.add_member')}
               </button>
             </li>
@@ -2304,6 +2395,24 @@ export default function MembersPage() {
               <div className="text-[11px] text-muted">{t('pages.membersPage.stat_week')}</div>
             </div>
           </div>
+          {/* The crew's own webview — the surface the crew fills in to answer
+              "what am I holding, what is stuck, what needs you", which is what
+              the operator opens this tab for. It sits between the activity
+              counts above and the session list below: those two are what the
+              backend can attest, this is the crew's own account of itself. */}
+          <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5">
+            {t('pages.membersPage.webview_heading')}
+          </div>
+          {activeSlug && activeMemberName ? (
+            <CrewWebview
+              slug={activeSlug}
+              member={activeMemberName}
+              onSetUp={() => {
+                const destination = crewEditPath(activeMemberName)
+                leave(() => navigate(destination), destination)
+              }}
+            />
+          ) : null}
           {/* Sessions this member is driving — the worker sessions it opened
               and steers. Live rows off the WS slots frames (see the
               drivingSessions memo); each row is a jump into that session.
@@ -3114,6 +3223,9 @@ export default function MembersPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {/* Crew-wide and read-only. It owns its own Dialog, and its launch read is
+          gated on `open`, so a visit that never opens it costs no request. */}
+      <DeployMyCrewDialog open={deployOpen} onClose={() => setDeployOpen(false)} members={members} />
     </div>
   )
 }

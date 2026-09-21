@@ -20,8 +20,43 @@
  * consent would turn on egress from a value nobody wrote for it.
  */
 
-/** The one point this build consumes an answer for. */
+/** The point that chooses which skill a message loads. */
 export const DECISIONS_LIVE_POINT = 'skills.select'
+
+/**
+ * The point that chooses whether a message sent into a RUNNING turn steers it or
+ * queues for the next one.
+ *
+ * Named here, beside the skill point, because both are identifiers the gateway
+ * owns: the strip reader dispatches on them and the Decisions card names them, so
+ * a second spelling in either place would be a record nobody renders.
+ */
+export const DECISIONS_STEER_POINT = 'message.steer'
+
+/** The point that chooses which model tier a chat turn runs on.
+ *
+ *  Every DECIDING point consumes its answer, and each is reached only through a
+ *  choice the owner makes somewhere else: a non-zero `skills.max_triggered` for
+ *  the skill point, the send button's `Auto (Jev)` entry for the steer point, and
+ *  the chat model picker's `Auto (Jev)` entry for this one. The switch on this
+ *  card is what lets any of them be asked at all, never what arms one.
+ */
+export const DECISIONS_MODEL_POINT = 'model.route'
+
+/**
+ * The point that scores, at every AUTOMATIC compaction, which of the session's tool
+ * calls would be worth keeping.
+ *
+ * Named beside the others because it is the gateway's own identifier: the compaction
+ * card's record dispatches on it and the Decisions card names it, so a second spelling
+ * in either place would be a record nobody renders.
+ *
+ * The one SHADOW point in the list. The four above are asked so their answer can be
+ * used; this one is asked so the answer can be measured, and the compaction runs
+ * identically whatever it says -- which is why it needs no arming choice anywhere, only
+ * its own consent scope.
+ */
+export const DECISIONS_COMPACTION_POINT = 'compaction.keep'
 
 /** Config path of the sampling share; the only decisions value the config PATCH accepts. */
 export const DECISIONS_BUCKET_PATH = 'decisions.bucket'
@@ -61,6 +96,27 @@ export interface DecisionsView {
    * see.
    */
   bucket: number | null
+  /**
+   * Whether the owner consented to sending TOOL-CALL ARGUMENTS — the extra egress
+   * category `tool.risk` needs, and the only thing that lets it run.
+   *
+   * Read from the keystone's own answer rather than inferred from `enabled`: a
+   * consent recorded before this scope existed reads `false` here, which is
+   * exactly the state its owner agreed to, and the second switch must draw that
+   * rather than a value it guessed.
+   */
+  toolArgs: boolean
+  /**
+   * Whether the owner consented to sending a WHOLE SLOT TRANSCRIPT — the conversation
+   * text and every tool-call input in it — the category `compaction.keep` needs and
+   * the only thing that lets it run.
+   *
+   * Read from the keystone's own answer and never inferred from `toolArgs`: that scope
+   * was reviewed as the arguments of the one call about to run, so reading it as
+   * permission for everything the session has run would widen egress with no new
+   * choice.
+   */
+  compaction: boolean
 }
 
 const UNSUPPORTED: DecisionsView = {
@@ -69,6 +125,8 @@ const UNSUPPORTED: DecisionsView = {
   configuredEndpoint: '',
   endpointMoved: false,
   bucket: null,
+  toolArgs: false,
+  compaction: false,
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -110,7 +168,14 @@ export function readBucket(config: unknown): number | null {
 export function readConsent(body: unknown): Omit<DecisionsView, 'bucket'> {
   const root = asRecord(body)
   if (!root || !('enabled' in root)) {
-    return { supported: false, enabled: false, configuredEndpoint: '', endpointMoved: false }
+    return {
+      supported: false,
+      enabled: false,
+      configuredEndpoint: '',
+      endpointMoved: false,
+      toolArgs: false,
+      compaction: false,
+    }
   }
   const enabled = root.enabled === true
   const configuredEndpoint = typeof root.configured_endpoint === 'string' ? root.configured_endpoint : ''
@@ -118,7 +183,15 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket'> {
   // rather than re-deriving equality here, so the card and the gate cannot
   // disagree about whether anything is being sent.
   const endpointMoved = enabled && root.permits !== true
-  return { supported: true, enabled, configuredEndpoint, endpointMoved }
+  // An exact `true`, like `enabled` above: this field decides whether a new
+  // category of conversation content leaves the machine, so a truthy stand-in is
+  // not a deliberate yes. An older gateway omits it entirely and reads as off.
+  const toolArgs = root.tool_args === true
+  // An exact `true` on the same terms, and read separately from `toolArgs`: this is
+  // the widest of the three categories, so a truthy stand-in and a narrower yes are
+  // both "no".
+  const compaction = root.compaction === true
+  return { supported: true, enabled, configuredEndpoint, endpointMoved, toolArgs, compaction }
 }
 
 /** Combine the two reads into the card's one view. */

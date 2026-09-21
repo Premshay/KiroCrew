@@ -1,4 +1,9 @@
-"""Folds over ONE session's crew log -- the session side panel's five views.
+"""Folds over ONE session's crew log -- the side panel's five views, and the ledger.
+
+The panel reads five, and those five are what the growth push carries. ``class`` is a
+sixth registered fold that is deliberately NOT advertised: its reader is
+a session deciding whether it may read ANOTHER unit's log, which is why it is held at
+the most restrictive value the log ever recorded rather than at the current one.
 
 A projection folds one crew log and carries that log's ``seq`` as its version
 (RFC FR-5), so a reader that holds a projection at seq N and reads the entries
@@ -17,6 +22,9 @@ the rendered value. A fold keeps bookkeeping a reader has no use for (the open
 tool calls it is matching by ``call_id``, the attempt an open turn is on), and
 :func:`Checkpoint.state` holding exactly what the fold needs to continue is what
 lets the render stay the surface the dashboard reads.
+:mod:`kiro_crew.crew_log.checkpoint` writes that state beside the log, so a read
+resumes where the last one stopped; this module owns no path and every failure
+over there is answered by folding from seq 1 again.
 
 Absent is never read as zero. ``turn/completed`` carries ``credits`` and
 ``tokens`` only on a provider-reported close, so a synthesized closer omits them
@@ -32,30 +40,97 @@ ownership, and a reader inventing the same fact in memory would make two readers
 of one file disagree.
 
 This module reads its own unit's file and nothing else (FR-4: no fold reads more
-than its own crew log). Resolving a ``ref`` is the PAGE path's work, in the routes
-that serve a person a citation to follow.
+than its own crew log) -- with ONE stated exception, and it is stated because a
+reader has to know which kind of fold it is holding. The ``ledger`` fold is keyed
+by SLOT, and a slot owns one ACP session id at a time rather than for its whole
+life, so the record it answers for is spread over a unit per id the slot ran
+under. It therefore joins those units (:func:`fold_slot`), which is a wider read
+than the five panel folds make and is why it is not one of them: the growth push
+and the side panel address a session, and a slot-wide value pushed under one
+session's id would report a partial answer as the whole one. The units it joins
+are still exactly one slot's own, so nothing here reads across slots.
+
+Resolving a ``ref`` is the PAGE path's work, in the routes that serve a person a
+citation to follow.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Final
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Final
 
 from kiro_crew.crew_log.entry_types import SESSION_ENTRY_TYPES
 from kiro_crew.crew_log.errors import CODE_BAD_DATA, CrewLogError
 from kiro_crew.crew_log.schema import KIND_SESSION, Entry
-from kiro_crew.crew_log.store import CrewLog
+from kiro_crew.crew_log.store import (
+    CrewLog,
+    segment_paths,
+    session_units_for_slot,
+    unit_header_created_at,
+)
 
-#: The session side panel's projections, in the RFC section 5 order.
+if TYPE_CHECKING:
+    # Type-only: the savepoint module imports this one, so a runtime import here
+    # would close the cycle the function-local imports below exist to avoid.
+    from kiro_crew.crew_log.checkpoint import PrefixWitness
+
+# The ledger fold reads a record whose semantics -- which phases end a workstream,
+# which event kinds exist, how much of each field is kept -- belong to the ledger
+# subsystem. They are imported rather than restated so one owner sets them, the
+# same direction ``store`` already takes for the store-name fold.
+from kiro_crew.session_ledger import _FOLD_NAME as LEDGER_FOLD_NAME
+from kiro_crew.session_ledger import _MAX_ARTIFACT_KEY as LEDGER_ARTIFACT_KEY_LIMIT
+from kiro_crew.session_ledger import _MAX_ARTIFACTS as LEDGER_ARTIFACT_LIMIT
+from kiro_crew.session_ledger import _MAX_EVENTS as LEDGER_EVENT_LIMIT
+from kiro_crew.session_ledger import _MAX_PHASE as LEDGER_PHASE_LIMIT
+from kiro_crew.session_ledger import _MAX_TEXT as LEDGER_TEXT_LIMIT
+from kiro_crew.session_ledger import _MAX_TRIED as LEDGER_TRIED_LIMIT
+from kiro_crew.session_ledger import EVENT_KINDS as LEDGER_EVENT_KINDS
+from kiro_crew.session_ledger import LEDGER_ENTRY_TYPE
+from kiro_crew.session_ledger import SCHEMA_VERSION as LEDGER_SCHEMA_VERSION
+from kiro_crew.session_ledger import TERMINAL_PHASES as LEDGER_TERMINAL_PHASES
+
+logger = logging.getLogger(__name__)
+
+#: The session side panel's projections, in the RFC section 5 order. These fold ONE
+#: session's crew log and are the set the growth push sends, which is why ``class``
+#: is NOT among them: nothing on a client draws it, so pushing it would ship a frame
+#: per log growth to every owner socket for no reader.
 PROJECTION_NAMES: Final[tuple[str, ...]] = (
     "status",
     "usage",
     "timeline",
     "tools",
     "approvals",
+)
+
+#: Folds this module registers but does NOT advertise: no panel draws them and the
+#: growth push does not carry them. ``class`` answers what kind of session a log
+#: belongs to over the log's whole life, for a reader deciding whether another
+#: session may read it, and its one caller asks for it by name
+#: (``fold_session(("class",))``). It is registered here rather than kept private so
+#: that one machinery folds it -- the same checkpoint, the same incremental reuse, the
+#: same recreated-log guard -- while staying out of the advertised set, which would
+#: otherwise name a projection with no reader.
+INTERNAL_PROJECTION_NAMES: Final[tuple[str, ...]] = ("class",)
+
+#: Projections keyed by a SLOT instead of by one crew log. A slot owns one ACP
+#: session id at a time, so a fact that belongs to the slot for its whole life --
+#: its work ledger -- is spread over a unit per id it ran under, and answering for
+#: it means joining them (:func:`fold_slot`). Kept out of
+#: :data:`PROJECTION_NAMES` for that reason: the growth push and the side panel
+#: address a session, and pushing a slot-wide value under one session's id would
+#: report a partial answer as the whole one.
+SLOT_PROJECTION_NAMES: Final[tuple[str, ...]] = ("ledger",)
+
+#: Every fold this module registers, in registry order.
+FOLD_NAMES: Final[tuple[str, ...]] = (
+    PROJECTION_NAMES + INTERNAL_PROJECTION_NAMES + SLOT_PROJECTION_NAMES
 )
 
 #: The types these folds can interpret, handed to ``iter_from(known=...)`` so an
@@ -176,9 +251,10 @@ class Projection:
 class Checkpoint:
     """A fold's resumable position: the seq it has consumed, and its state.
 
-    The state is JSON-serializable so a caller may persist it. Storing it on disk
-    is not this module's business, and the shape is what a later checkpoint file
-    would carry.
+    The state is JSON-serializable so a caller may persist it. Writing it to disk
+    is :mod:`kiro_crew.crew_log.checkpoint`, which records exactly this shape
+    beside the log it was folded from; this module stays the folding and holds no
+    path.
     """
 
     name: str
@@ -206,7 +282,39 @@ class Checkpoint:
             raise CrewLogError(
                 "checkpoint state must be an object", code=CODE_BAD_DATA, field="state"
             )
+        if not _state_matches_fold(name, state):
+            raise CrewLogError(
+                f"checkpoint state does not match the {name} fold",
+                code=CODE_BAD_DATA,
+                field="state",
+            )
         return cls(name=name, last_seq=last_seq, state=state)
+
+
+def _state_matches_fold(name: str, state: dict[str, Any]) -> bool:
+    """Whether *state* has the registered fold's durable top-level shape."""
+    expected = _FOLDS[name].start()
+    if state.keys() != expected.keys():
+        return False
+    for key, initial_value in expected.items():
+        value = state[key]
+        if isinstance(initial_value, bool):
+            valid = isinstance(value, bool)
+        elif isinstance(initial_value, str):
+            valid = isinstance(value, str)
+        elif isinstance(initial_value, (int, float)):
+            valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+        elif isinstance(initial_value, dict):
+            valid = isinstance(value, dict)
+        elif isinstance(initial_value, list):
+            valid = isinstance(value, list)
+        else:
+            # ``None`` is a sentinel for fields that later hold different JSON
+            # kinds, so the initial value cannot safely constrain their type.
+            valid = True
+        if not valid:
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -223,7 +331,7 @@ def require_name(name: str) -> str:
     """*name* if it is a projection this module folds, else raise ``bad_data``."""
     if name not in _FOLDS:
         raise CrewLogError(
-            f"unknown projection {name!r}; expected one of {list(PROJECTION_NAMES)}",
+            f"unknown projection {name!r}; expected one of {list(FOLD_NAMES)}",
             code=CODE_BAD_DATA,
             field="name",
         )
@@ -325,8 +433,8 @@ def fold_approvals(entries: Iterable[Entry]) -> dict[str, Any]:
 class SessionProjections:
     """Every projection for one session, all folded through the same seq.
 
-    One pass over the file serves all five, which is what makes pushing the whole
-    side panel on each growth cost one read rather than five.
+    One pass over the file serves every requested fold, which is what makes pushing the whole
+    side panel on each growth cost one read rather than one per fold.
     """
 
     session_id: str
@@ -339,6 +447,27 @@ class SessionProjections:
     #: passes -- stale state would then apply to a different file's bytes. ``None``
     #: when no log existed (the empty bundle) and never matches a real file.
     origin: str | None = None
+    #: The seq every checkpoint in this bundle is PERSISTED through
+    #: (:mod:`kiro_crew.crew_log.checkpoint`), which is not the seq it was folded
+    #: through: a savepoint is allowed to lag, because resuming from an older one
+    #: replays the tail and reaches the same value. Carried on the bundle so a
+    #: caller reusing it across reads decides whether a write is owed from what it
+    #: already holds, instead of reading the savepoint files to find out. 0 is
+    #: "nothing on disk", which is what an unpersisted bundle must claim.
+    saved_seq: int = 0
+
+    #: A size fingerprint of the WHOLE segment set, captured beside ``origin``:
+    #: the byte sum across every segment the walk would read, with the segment
+    #: count folded in so a segment appearing or vanishing cannot cancel against
+    #: another's growth. A reusable bundle may skip walking the log only while
+    #: this still matches; ``None`` keeps bundles created before this field safe
+    #: by forcing one validating walk before their next O(1) poll.
+    size: int | None = None
+
+    #: The newest modification time across the same segment set as ``size``. It
+    #: detects an in-place same-size rewrite that size alone cannot distinguish;
+    #: ``None`` keeps older bundles safe by forcing one validating walk.
+    mtime_ns: int | None = None
 
     def projection(self, name: str) -> Projection:
         """One rendered projection, or raise ``bad_data`` for an unknown name."""
@@ -376,8 +505,8 @@ def open_session_log(session_id: str) -> CrewLog | None:
     return CrewLog.open(KIND_SESSION, session_id)
 
 
-def _log_origin(handle: CrewLog) -> str | None:
-    """The crew log file's creation identity for *handle*, or ``None``.
+def _log_identity(handle: CrewLog) -> tuple[str | None, int | None, int | None]:
+    """The crew log file's creation identity, size and mtime from stat calls alone.
 
     A reuse (:func:`fold_session` ``since=``) folds new bytes onto a cached
     checkpoint only when the file it folds now is the SAME one the checkpoint
@@ -389,16 +518,63 @@ def _log_origin(handle: CrewLog) -> str | None:
     only colliding case -- itself near-impossible). This catches what the seq
     guard cannot: a recreated log that has already grown PAST the cached seq.
     ``None`` is "unknown identity" and never matches, so a header without the
-    field or a stat failure falls back to the safe full rebuild.
+    field or a stat failure falls back to the safe full rebuild. Size and mtime
+    together also prevent a same-size in-place rewrite from taking the unchanged
+    fast path. A successful stat still returns both when the header lacks
+    ``created_at``.
+
+    BOTH identity signals are read from the file on disk on every call, and
+    neither comes from *handle*'s own parsed header. That header was parsed when
+    the handle was opened, so it keeps answering for the file that existed then --
+    which would leave this comparing device and inode alone across exactly the
+    recreation it exists to catch, and a just-freed inode is commonly handed
+    straight back.
+
+    The size and mtime cover EVERY segment the walk would read, not only the
+    newest one that ``handle.path`` names: size is the sum and mtime the newest
+    across the segment set, with the count folded into the sum so a whole
+    segment appearing or vanishing (rotation, retention) can never cancel out
+    against another's growth. The fingerprint must cover exactly what the walk
+    consumes -- a fingerprint narrower than the walk is how each round of this
+    guard's history got the same finding back in a new spelling -- and it stays
+    stat-only, because reading file contents per poll is the cost the fast path
+    exists to avoid. A segment vanishing between the listing and its stat is a
+    file set in motion, and reads as "unknown": the fold then walks, which is
+    the safe answer to a moving target.
     """
-    created_at = getattr(handle.header, "created_at", None)
-    if not isinstance(created_at, int) or isinstance(created_at, bool):
-        return None
+    created_at = unit_header_created_at(handle.kind, handle.id)
     try:
         stat = handle.path.stat()
+        total_size = 0
+        newest_mtime = 0
+        segments = segment_paths(handle.kind, handle.id)
+        for segment in segments:
+            seg_stat = segment.stat()
+            total_size += seg_stat.st_size
+            newest_mtime = max(newest_mtime, seg_stat.st_mtime_ns)
+        # The count rides in the size so "one segment of N bytes" and "two
+        # segments of N bytes total" cannot fingerprint alike even at one stat's
+        # granularity, and an empty listing stays distinct from an unstatable one.
+        total_size = total_size + (len(segments) << 48)
     except OSError:
-        return None
-    return f"{created_at}:{stat.st_dev}:{stat.st_ino}"
+        return None, None, None
+    if created_at is None:
+        return None, total_size, newest_mtime
+    return f"{created_at}:{stat.st_dev}:{stat.st_ino}", total_size, newest_mtime
+
+
+def log_origin(handle: CrewLog) -> str | None:
+    """The crew log file's creation identity for *handle*, or ``None``.
+
+    The identity half of :func:`_log_identity` -- see there for what the value
+    means and why it is read from disk on every call.
+
+    Public because the on-disk savepoints (:mod:`kiro_crew.crew_log.checkpoint`)
+    record this same value and must compare it the same way. Two spellings of "is
+    this the same log" would be free to disagree, and the one that said yes too
+    often would fold a retired file's state onto a live one's bytes.
+    """
+    return _log_identity(handle)[0]
 
 
 def fold_session(
@@ -420,13 +596,123 @@ def fold_session(
     *log* is an already-open handle, so a caller that has just read
     ``last_seq`` folds against the same handle rather than opening the file
     twice.
+
+    The on-disk savepoint (:mod:`kiro_crew.crew_log.checkpoint`) is not optional
+    and has no switch: with no reusable *since* the fold resumes from what is
+    beside the log instead of from seq 1, and the result is written back once it
+    has moved far enough to earn a write. A read that DID reuse *since* serves from
+    it but writes nothing, because it cannot vouch for the prefix that bundle was
+    folded from -- so a hot incremental reader's savepoint is brought forward by the
+    next read that folds the prefix itself rather than by every read. A flag would be
+    a public surface with no production caller, and it is not needed to reach the
+    from-scratch answer -- :func:`fold` and :func:`advance` ARE that answer, and a
+    savepoint is never load-bearing, since every failure over there falls back to
+    folding from seq 1.
     """
     wanted = tuple(require_name(name) for name in names)
+    bundle, stable, handle, prefix = _fold_attempt(
+        session_id, wanted, since=since, log=log, resume=True
+    )
+    if stable:
+        return _persisted(bundle, handle=handle, prefix=prefix)
+    # The file's identity changed WHILE it was being folded: the unit was removed
+    # and recreated between the identity read and the pass, so the entries just
+    # consumed may belong to a different file than the state they were folded onto.
+    # One more attempt, from scratch -- no cached bundle, no savepoint, and a freshly
+    # opened handle, since the one this call was given does not name the file it was
+    # opened on.
+    bundle, stable, handle, prefix = _fold_attempt(
+        session_id, wanted, since=None, log=None, resume=False
+    )
+    if stable:
+        return _persisted(bundle, handle=handle, prefix=prefix)
+    # Twice in a row, so the unit is being recreated faster than it can be read.
+    # The value is served, because the alternative is refusing to render a session
+    # that exists, but its identity is reported as UNKNOWN: that is what stops a
+    # caller from reusing it and stops it from being written to disk, both of which
+    # compare against this field and neither of which accepts ``None``.
+    logger.debug("crew log %s changed identity twice while folding it", session_id)
+    return SessionProjections(
+        session_id=session_id,
+        last_seq=bundle.last_seq,
+        checkpoints=bundle.checkpoints,
+        origin=None,
+        saved_seq=0,
+    )
+
+
+def _fold_attempt(
+    session_id: str,
+    wanted: Sequence[str],
+    *,
+    since: SessionProjections | None,
+    log: CrewLog | None,
+    resume: bool,
+) -> tuple[SessionProjections, bool, CrewLog | None, PrefixWitness | None]:
+    """One pass for :func:`fold_session`. ``(bundle, the file held still, handle, witness)``.
+
+    The middle element is what makes the pass checkable. ``iter_from`` opens the
+    log by NAME, so a unit removed and recreated mid-pass hands this function a
+    different file's entries while it holds the first file's state -- and the seq
+    numbers do not say so, because a recreated log starts its own again. So the
+    identity is read before the pass and again after it, and a change makes the
+    bundle untrustworthy rather than merely stale. The caller decides what to do
+    about it; nothing is persisted from here, which is why the handle comes back
+    too -- the caller writes the savepoint against the same handle rather than
+    opening the file a second time.
+    """
     handle = log if log is not None else open_session_log(session_id)
     if handle is None:
-        return empty_session(session_id, wanted)
+        return (empty_session(session_id, wanted), True, None, None)
     last_seq = handle.last_seq
-    origin = _log_origin(handle)
+    origin, size, mtime_ns = _log_identity(handle)
+    # What the pass trusted about the file before reading it, so the same two things
+    # can be asked again afterwards. The savepoint is held rather than a copy of its
+    # digest: re-running the load is what re-checks it, and that keeps one routine
+    # deciding whether a savepoint describes this file.
+    resumed_from: SessionProjections | None = None
+    prefix_seen: PrefixWitness | None = None
+    # Whether this pass is standing on state an EARLIER call folded. That decides
+    # whether it may write a savepoint at all, because a savepoint has to carry a
+    # digest of the bytes its state came from. A pass that resumed from DISK carries
+    # one transitively: the savepoint records the digest its own writer read before
+    # folding, and ``resumed_prefix_still_verifies`` checks it again here, so the
+    # custody survives the gap between the two calls. A cached bundle records no
+    # digest -- there is no such field on it -- and the bytes below its seq were
+    # consumed by a call that has already returned, so nothing this pass can read is
+    # evidence about them. A digest read now would be honest about the file and wrong
+    # about the state beside it, and the two would then agree with each other, so
+    # every later resume would recompute those same bytes, match, and serve that state
+    # for the life of the unit. So this pass takes no witness, and ``save`` writes
+    # nothing without one. The savepoint is brought forward by the next read that
+    # folds the prefix itself, which is a lag the module already allows for: resuming
+    # from an older savepoint replays the tail and reaches the same value.
+    reused_cached_state = False
+
+    def held_still() -> bool:
+        """Whether the file still matches everything this pass trusted about it.
+
+        Three facts, and every one is read BEFORE the pass: the file's identity; on a
+        read that resumed, the digest of the prefix the savepoint stood for; and, on a
+        pass that will write a savepoint, the digest of the prefix it is about to
+        consume. A pass is only trustworthy if none of them moved, so they are asked
+        together here rather than at each return, where one would eventually be
+        forgotten.
+
+        The third is what lets the savepoint be written from a digest read before the
+        pass instead of after it: proving that prefix held still is what makes the
+        digest describe the bytes this fold actually consumed.
+        """
+        from kiro_crew.crew_log import checkpoint as savepoints
+
+        if log_origin(handle) != origin:
+            return False
+        if prefix_seen is not None and not savepoints.prefix_unchanged(handle, prefix_seen):
+            return False
+        if resumed_from is None:
+            return True
+        return savepoints.resumed_prefix_still_verifies(handle, resumed_from)
+
     reusable = (
         since is not None
         and since.session_id == session_id
@@ -440,15 +726,78 @@ def fold_session(
         and since.last_seq <= last_seq
         and all(name in since.checkpoints for name in wanted)
     )
-    base: dict[str, Checkpoint] = (
-        {name: since.checkpoints[name] for name in wanted}
-        if reusable and since is not None
-        else {name: initial(name) for name in wanted}
-    )
+    if reusable and since is not None:
+        base: dict[str, Checkpoint] = {name: since.checkpoints[name] for name in wanted}
+        saved_seq = since.saved_seq
+        reused_cached_state = True
+    else:
+        # No bundle in hand, so ask the disk before folding the file. A savepoint
+        # covers the names it has and is silent about the rest, and each checkpoint
+        # takes only the part of a chunk above its own seq, so a partial answer
+        # costs the cold fold to the folds it did not cover rather than to all of
+        # them.
+        base = {name: initial(name) for name in wanted}
+        saved_seq = 0
+        # ``resume`` is false only on the retry a mid-pass identity change forces:
+        # the savepoint on disk describes the file that just went away, so the
+        # retry must not read it. It is private for that reason -- the one caller
+        # that needs it is the retry, and a public switch would be a surface with
+        # no production caller.
+        resumed = _resume_from_disk(handle, wanted) if resume else None
+        if resumed is not None:
+            base.update(resumed.checkpoints)
+            saved_seq = resumed.saved_seq
+            resumed_from = resumed
+    from kiro_crew.crew_log import checkpoint as savepoints
+
+    # The digest a savepoint is written with has to be read BEFORE the pass consumes
+    # the file, and it is read here rather than at the write because a digest taken
+    # afterwards can cover bytes the pass never saw. Only a fold that owes a write
+    # pays for it, and only one that can vouch for the whole prefix may write at all --
+    # see ``reused_cached_state``. Its boundary is the seq read before the pass, so a
+    # pass that ends somewhere else -- the file grew under it, or the handle's own seq
+    # was stale -- matches no fold in the bundle and writes nothing, which costs the
+    # savepoint rather than the read: what this fold SERVES is unaffected either way.
+    if not reused_cached_state and savepoints.write_is_earned(last_seq, saved_seq):
+        prefix_seen = savepoints.prefix_witness(handle, last_seq)
     from_seq = min((cp.last_seq for cp in base.values()), default=0) + 1
-    if from_seq > last_seq:
-        return SessionProjections(
-            session_id=session_id, last_seq=last_seq, checkpoints=base, origin=origin
+    if from_seq > last_seq and (
+        not reused_cached_state
+        or (
+            since is not None
+            and since.size is not None
+            and since.size == size
+            and since.mtime_ns is not None
+            and since.mtime_ns == mtime_ns
+        )
+    ):
+        # No entries were read, but the bundle still describes the identity and the
+        # prefix seen before this check. Recheck both so a recreation or interior
+        # damage during the call retries cold instead of serving retired state.
+        #
+        # A pass standing on an in-memory cached bundle carries no prefix digest
+        # (see ``reused_cached_state``), so identity alone is all ``held_still``
+        # can recheck for it -- and identity survives an in-place rewrite that
+        # regresses the tail seq back to the bundle's position. The segment-set
+        # size and mtime fingerprint read beside the identity closes that gap:
+        # they may skip the validating walk only while both still match what the
+        # bundle recorded, and ``None`` (a bundle from before these fields) never
+        # matches, which costs one validating walk before that bundle's next O(1)
+        # poll. A pass that did NOT reuse a cached bundle is covered by the
+        # digest machinery instead, so it keeps the fast return unconditionally.
+        return (
+            SessionProjections(
+                session_id=session_id,
+                last_seq=last_seq,
+                checkpoints=base,
+                origin=origin,
+                saved_seq=saved_seq,
+                size=size,
+                mtime_ns=mtime_ns,
+            ),
+            held_still(),
+            handle,
+            prefix_seen,
         )
     # ONE pass over the file, in bounded chunks. Five folds consume the same
     # entries, so a bare generator would be exhausted by the first of them and
@@ -469,9 +818,55 @@ def fold_session(
     if chunk:
         grown = _advance_all(grown, chunk)
     reached = max((cp.last_seq for cp in grown.values()), default=last_seq)
-    return SessionProjections(
-        session_id=session_id, last_seq=reached, checkpoints=grown, origin=origin
+    return (
+        SessionProjections(
+            session_id=session_id,
+            last_seq=reached,
+            checkpoints=grown,
+            origin=origin,
+            saved_seq=saved_seq,
+            size=size,
+            mtime_ns=mtime_ns,
+        ),
+        held_still(),
+        handle,
+        prefix_seen,
     )
+
+
+# The savepoint module imports this one for the fold surface it persists, so the
+# dependency runs one way and these two calls are function-local. A module-level
+# import here would close the cycle, and the alternative -- moving the fold types
+# into a third module to break it -- would split the surface a reader of either
+# file has to hold in mind, for no gain at the one place they meet.
+
+
+def _resume_from_disk(handle: CrewLog, wanted: Sequence[str]) -> SessionProjections | None:
+    """The savepoints for *wanted* beside *handle*'s log, or ``None``."""
+    from kiro_crew.crew_log import checkpoint as savepoints
+
+    return savepoints.load(handle, wanted)
+
+
+def _persisted(
+    bundle: SessionProjections, *, handle: CrewLog | None, prefix: PrefixWitness | None
+) -> SessionProjections:
+    """*bundle*, with its savepoint on disk brought forward if a write is owed.
+
+    Whether a write is owed is the savepoint module's decision, not this one's: how
+    far a fold must have moved to earn one is a property of the files, and stating
+    it here as well would give two places an answer that has to agree. A session
+    with no log has nothing to write beside.
+
+    *prefix* is the digest the pass read before consuming the file and rechecked
+    after it, and it is what the savepoint is written with -- that write must not read
+    the file again, or it could certify bytes no fold saw.
+    """
+    if handle is None:
+        return bundle
+    from kiro_crew.crew_log import checkpoint as savepoints
+
+    return savepoints.save(handle, bundle, prefix=prefix)
 
 
 def _advance_all(
@@ -479,7 +874,7 @@ def _advance_all(
 ) -> dict[str, Checkpoint]:
     """Every checkpoint advanced over the part of *chunk* it has not consumed.
 
-    The per-checkpoint filter is what lets one chunk serve five folds that may sit
+    The per-checkpoint filter is what lets one chunk serve every fold that may sit
     at DIFFERENT seqs: a reused bundle can hold a status checkpoint further along
     than its tools one, and ``advance`` refuses an entry at or below the seq it
     already reached rather than silently double-counting it.
@@ -507,6 +902,7 @@ def _status_start() -> dict[str, Any]:
         "closed_at": None,
         "close_reason": None,
         "resumed": False,
+        "previous": None,
         "seeded": False,
         "agent": "",
         "owner": "",
@@ -539,6 +935,16 @@ def _status_step(state: dict[str, Any], entry: Entry) -> None:
         if state["opened_at"] is None:
             state["opened_at"] = entry.time
         state["resumed"] = bool(data.get("resumed")) or state["resumed"]
+        # The edge to the crew log this slot was writing BEFORE this one. Kept from
+        # whichever entry carried it rather than refreshed from the newest, because
+        # only the creating entry carries one: a re-attach echo has no ``previous``,
+        # and letting it overwrite would drop the edge a chain walker needs.
+        if state["previous"] is None:
+            previous = data.get("previous")
+            if isinstance(previous, dict):
+                sid = previous.get("sid")
+                if isinstance(sid, str) and sid:
+                    state["previous"] = _as_str(sid)
         for key in ("agent", "owner", "slot", "cwd"):
             value = data.get(key)
             if isinstance(value, str):
@@ -611,6 +1017,10 @@ def _status_render(state: dict[str, Any]) -> dict[str, Any]:
         "closed_at": state["closed_at"],
         "close_reason": state["close_reason"],
         "resumed": state["resumed"],
+        # The previous crew log of this SLOT, or null when this is its first one (or
+        # when retention removed the segment that carried the edge). A reader
+        # joining a slot's whole history follows this, one store at a time.
+        "previous": state["previous"],
         "seeded": state["seeded"],
         "agent": state["agent"],
         "owner": state["owner"],
@@ -1107,6 +1517,427 @@ def _approvals_render(state: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# ledger
+# --------------------------------------------------------------------------- #
+
+
+def _ledger_iso(stamp_ms: int) -> str:
+    """An entry's epoch-millisecond ``time`` as the record's local ISO spelling.
+
+    The envelope already carries when each update happened, so the record's
+    timestamps are DERIVED from it rather than written into the entry -- one clock,
+    and no way for an entry to claim a time the log disagrees with.
+
+    A value outside the range a ``datetime`` can hold answers ``""``, the same thing
+    an absent stamp answers. ``fromtimestamp`` raises ``OverflowError`` or ``OSError``
+    on one, and this reads bytes a reader does not control: a damaged or planted
+    ``time`` would otherwise turn every read of that slot into a crash, permanently,
+    since the line stays on disk and nothing rewrites it. Losing one stamp costs a
+    reader a display value; raising costs it the whole record.
+    """
+    try:
+        return datetime.fromtimestamp(stamp_ms / 1000).astimezone().isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _ledger_field(value: Any, limit: int = LEDGER_TEXT_LIMIT) -> str:
+    """*value* as a clamped string, or ``""``. The fold's own shape gate.
+
+    The writer clamps too, but these bytes come off a file a reader does not
+    control, so the length is re-applied here: a planted or damaged line is exactly
+    the input that ignores the writer's rule, and every field below is RETAINED in
+    a state a nudge turn carries.
+    """
+    if not isinstance(value, str):
+        return ""
+    return value[:limit]
+
+
+def _ledger_start() -> dict[str, Any]:
+    return {
+        "goal": "",
+        "phase": "",
+        "next": "",
+        "tried": [],
+        "artifacts": {},
+        "events": [],
+        "created_at": "",
+        "last_progress_at": "",
+        "finished_at": "",
+    }
+
+
+def _ledger_step(state: dict[str, Any], entry: Entry) -> None:
+    if entry.type != LEDGER_ENTRY_TYPE:
+        return
+    data = entry.data
+    stamp = _ledger_iso(entry.time)
+    if not state["created_at"]:
+        state["created_at"] = stamp
+    # An ABSENT field means unchanged, which is what lets a partial update be one
+    # entry; only a present one is applied. ``isinstance`` rather than truthiness,
+    # so a caller clearing a field to "" is applied rather than ignored.
+    if isinstance(data.get("goal"), str):
+        state["goal"] = _ledger_field(data["goal"])
+    if isinstance(data.get("phase"), str):
+        state["phase"] = _ledger_field(data["phase"], LEDGER_PHASE_LIMIT)
+        # Re-derived on every phase write rather than latched: a workstream that
+        # leaves a terminal phase is in flight again, and a stale ``finished_at``
+        # would keep the snapshot suppressed for a session that resumed.
+        state["finished_at"] = stamp if state["phase"] in LEDGER_TERMINAL_PHASES else ""
+    if isinstance(data.get("next"), str):
+        state["next"] = _ledger_field(data["next"])
+    tried = data.get("tried")
+    if isinstance(tried, Mapping) and isinstance(tried.get("approach"), str):
+        rows: list[dict[str, str]] = state["tried"]
+        rows.append(
+            {
+                "approach": _ledger_field(tried["approach"]),
+                "rejected_because": _ledger_field(tried.get("rejected_because")),
+                "at": stamp,
+            }
+        )
+        # Bounded like every other fold state here: the oldest rejected approach
+        # ages out so a long workstream cannot grow the record without limit.
+        if len(rows) > LEDGER_TRIED_LIMIT:
+            del rows[: len(rows) - LEDGER_TRIED_LIMIT]
+    artifacts = data.get("artifacts")
+    if isinstance(artifacts, Mapping):
+        merged: dict[str, str] = state["artifacts"]
+        for key, value in artifacts.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            folded = _ledger_field(key, LEDGER_ARTIFACT_KEY_LIMIT)
+            # Popped before reassigning: a plain update keeps the key's ORIGINAL
+            # insertion position, so updating the oldest pointer on a full map would
+            # leave it first in line for the age-out below -- dropping the very
+            # artifact this entry just set.
+            merged.pop(folded, None)
+            merged[folded] = _ledger_field(value)
+        while len(merged) > LEDGER_ARTIFACT_LIMIT:
+            merged.pop(next(iter(merged)))
+    event = data.get("event")
+    if isinstance(event, str) and event.strip():
+        kind = data.get("event_kind")
+        # The kind is a FILTER over the text, not the fact, so an unrecognized one
+        # degrades to ``note`` rather than discarding the event. A phase that moved
+        # without a recognized kind cannot reach the file at all: the writer refuses
+        # it, so nothing here has to reconstruct that rule.
+        if not (isinstance(kind, str) and kind in LEDGER_EVENT_KINDS):
+            kind = "note"
+        events: list[dict[str, str]] = state["events"]
+        events.append({"ts": stamp, "kind": kind, "text": _ledger_field(event.strip())})
+        if len(events) > LEDGER_EVENT_LIMIT:
+            del events[: len(events) - LEDGER_EVENT_LIMIT]
+    state["last_progress_at"] = stamp
+
+
+def _ledger_render(state: dict[str, Any]) -> dict[str, Any]:
+    """The state RECORD, in the shape every reader of the ledger already expects.
+
+    Deliberately the same ten keys the ledger's document carried when it was a file
+    of its own, so the MCP tool, the route and the injected snapshot did not have to
+    learn a new shape to stop being a second copy of the truth. ``schema`` describes
+    the RECORD, which is unchanged; where the record lives is not something a
+    consumer of it branches on.
+    """
+    return {
+        "schema": LEDGER_SCHEMA_VERSION,
+        "goal": state["goal"],
+        "phase": state["phase"],
+        "next": state["next"],
+        "tried": [dict(row) for row in state["tried"]],
+        "artifacts": dict(state["artifacts"]),
+        "events": [dict(row) for row in state["events"]],
+        "created_at": state["created_at"],
+        "last_progress_at": state["last_progress_at"],
+        "finished_at": state["finished_at"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# class -- what kind of session this log belongs to, over its whole life
+# --------------------------------------------------------------------------- #
+
+
+def _class_start() -> dict[str, Any]:
+    return {
+        # Whether the FIRST opener this fold saw stated a class. ``saw_opener`` is
+        # what makes it the first one rather than any one: a log carries an opening
+        # entry per re-attachment, so a log whose original opener predates the field
+        # gains a later one that does state a class, and letting that set ``opened``
+        # would date the log by an entry written long after the part whose class is
+        # unknown.
+        "opened": False,
+        "saw_opener": False,
+        "stated": 0,
+        "memory": "",
+        "app": "",
+        "channel": False,
+        # The workspace the FIRST stated class named, and whether a later one named a
+        # different one. Not folded most-restrictively like the members above, because a
+        # workspace is an identity rather than a restriction -- there is no "more
+        # restrictive" workspace to keep. What a reader needs is whether ONE workspace
+        # owns this log's whole content, so the first is kept and any move is recorded as
+        # a fact of its own. A log that moved belongs to no single workspace, and a
+        # cross-session read of it is refused whichever workspace asks.
+        "workspace": "",
+        "workspace_moved": False,
+        # The last seq this fold RECEIVED, and whether the history it saw has a hole
+        # in it. Separate from ``complete``, which is about the log's beginning: a log
+        # can begin properly and still be missing a record in the middle.
+        "last_seq": 0,
+        "damaged": False,
+    }
+
+
+def _class_read(data: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The class members of *data*, or ``None`` when it states no class.
+
+    ``memory`` is required, so its absence is what says a class was not stated. A
+    line carrying the other members without it is a fragment, and a fragment reads
+    as nothing stated rather than as a class with an unknown memory mode -- the
+    same rule the reader applies to a missing object.
+
+    ``workspace`` is NOT required, and that is deliberate: whether a class was stated
+    and which workspace stated it are two questions, and a line that names a memory
+    mode did state a class. An absent workspace reads as the empty string, which no
+    live slot can produce (a slot's workspace defaults to ``default``), so the arm that
+    compares workspaces refuses on it rather than treating it as a match.
+    """
+    memory = data.get("memory")
+    if not isinstance(memory, str) or not memory:
+        return None
+    app = data.get("app")
+    workspace = data.get("workspace")
+    return {
+        "memory": _as_str(memory),
+        "app": _as_str(app) if isinstance(app, str) else "",
+        "channel": data.get("channel") is True,
+        "workspace": _as_str(workspace) if isinstance(workspace, str) else "",
+    }
+
+
+def _class_absorb(state: dict[str, Any], stated: dict[str, Any]) -> None:
+    """Fold *stated* into *state*, keeping the most restrictive value ever held.
+
+    Restrictive, not latest, and that is the whole semantics of this fold. The
+    question a reader asks is whether this log could hold content that must not
+    cross a boundary, and content is durable: a session published to a channel for
+    one turn holds that turn's words for good, so a later turn reporting no channel
+    does not make the log readable again. The same reasoning covers an app that
+    owned the session and a memory mode that was ever not persistent.
+
+    So each member only ever moves AWAY from the permissive value: ``channel``
+    latches true, ``app`` keeps the first owner it ever had, and ``memory`` keeps
+    the first non-persistent mode. A member that has never been restrictive tracks
+    what was last stated, which is what makes an ordinary session's fold read as
+    the ordinary class rather than as an empty one.
+    """
+    state["stated"] += 1
+    if state["memory"] == "" or state["memory"] == "persistent":
+        state["memory"] = stated["memory"]
+    if not state["app"] and stated["app"]:
+        state["app"] = stated["app"]
+    state["channel"] = state["channel"] or stated["channel"]
+    # Workspace is the exception to the paragraph above: it is an identity, so there is
+    # no more-restrictive value to keep. The first one stated is kept, and a later one
+    # that differs sets ``workspace_moved`` -- which is itself the restrictive fact,
+    # since a log whose content spans two workspaces is owned by neither.
+    if not state["workspace"]:
+        state["workspace"] = stated["workspace"]
+    elif stated["workspace"] and stated["workspace"] != state["workspace"]:
+        state["workspace_moved"] = True
+
+
+def _class_step(state: dict[str, Any], entry: Entry) -> None:
+    # Seq CONTIGUITY, and for this fold only. The store skips an unparseable interior
+    # line deliberately -- its own words: one unreadable record must not make the rest
+    # of the file unreadable -- and that is right for a fold accumulating totals, where
+    # a lost entry costs a count. It is wrong for this one: the skipped line may be the
+    # SOLE record of a restriction, and dropping it turns a restricted log into a
+    # permissive answer, which is an authorization ceiling raised by byte damage. So a
+    # gap in the seqs this fold receives marks the history damaged and the reader
+    # refuses on it, while every other fold keeps the store's tolerance.
+    #
+    # The FIRST entry seen is accepted at whatever seq it carries: a log whose front
+    # retention took does not begin at 1, and that is the reader's own check to make,
+    # from the segment names, rather than a hole reported from the middle.
+    previous = state["last_seq"]
+    state["last_seq"] = entry.seq
+    if previous and entry.seq != previous + 1:
+        state["damaged"] = True
+    if entry.type == "write/dropped":
+        # The log itself saying an append was permanently lost. For a fold whose
+        # answer is an authorization ceiling that is a hole: the lost append may have
+        # been the class move that restricted this session, and nothing else records
+        # it. This is what lets the RECORDER be best-effort at the call site -- a
+        # class move that never reaches the file cannot leave the log readable.
+        state["damaged"] = True
+        return
+    if entry.type == "session/opened":
+        first = not state["saw_opener"]
+        state["saw_opener"] = True
+        recorded = entry.data.get("class")
+        if not isinstance(recorded, Mapping):
+            # A log opened before the field existed. Nothing is absorbed and
+            # ``opened`` stays false, so the render reports a history with no
+            # beginning rather than an unrestricted session.
+            return
+        stated = _class_read(recorded)
+        if stated is None:
+            # The object is THERE and cannot be read, which is damage rather than
+            # age: a writer that records the field records it whole, and the
+            # declaration refuses a fragment at append. Absence is a date; an
+            # unreadable presence is a hole.
+            state["damaged"] = True
+            return
+        if first:
+            # Only the log's own beginning can date it. A later opener is written
+            # when a new gateway process re-attaches to the same session, so on a log
+            # whose first opener predates the field it would otherwise supply a
+            # beginning for a stretch of the log it was not present for.
+            state["opened"] = True
+        _class_absorb(state, stated)
+    elif entry.type == "session/class":
+        stated = _class_read(entry.data)
+        if stated is None:
+            # A move was recorded and cannot be read. What it moved TO is the whole
+            # content of this entry, so skipping it discards a transition this fold
+            # exists to carry -- and the direction it discards is always toward
+            # permissive, since only a restriction is worth recording a move for.
+            state["damaged"] = True
+            return
+        _class_absorb(state, stated)
+
+
+def _class_render(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        # Whether any class was stated at all. False for a log written before the
+        # class was recorded, and for one whose class-bearing entries retention has
+        # taken.
+        "recorded": state["stated"] > 0,
+        # Whether the history has a BEGINNING -- the log's FIRST opening entry
+        # stated a class. A fold that saw only transitions knows the class moved and
+        # not what it moved from, so it cannot report the earliest class the log
+        # held, and a reader deciding an authorization question must treat that as
+        # unknown. A LATER opener does not supply that beginning: one is written per
+        # re-attachment, so on a log whose first opener predates the field it would
+        # date a stretch of the log it was not present for.
+        # This is also what dates the log: the opening ``class`` object and
+        # ``session/class`` were declared together, so a log stating the first was
+        # written by a build that records the second, and its absence of transitions
+        # is therefore a real account of a class that never moved rather than the
+        # silence of a writer that could not say.
+        "complete": state["opened"],
+        # Whether the history this fold saw has a HOLE: a seq the store skipped
+        # because the line was unreadable, or a class record present and unreadable.
+        # Distinct from ``complete`` at the other end of the same question -- that one
+        # is about the log's beginning, this one about its middle -- and a reader
+        # deciding an authorization question refuses on either, because the record a
+        # hole swallows is more likely to be a restriction than a relaxation: only a
+        # restriction is worth writing a move for.
+        "damaged": state["damaged"],
+        "memory": state["memory"],
+        "app": state["app"],
+        "channel": state["channel"],
+        # Which workspace owns this log's content, and whether more than one ever did.
+        # A cross-session read compares the first against the caller's own workspace and
+        # refuses on the second, so an empty ``workspace`` (no live slot can state one)
+        # and a moved one both refuse rather than matching.
+        "workspace": state["workspace"],
+        "workspace_moved": state["workspace_moved"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Reading a slot's folds
+# --------------------------------------------------------------------------- #
+
+
+def fold_slot_checkpoint(name: str, unit_ids: Sequence[str]) -> Checkpoint:
+    """*name* folded over every crew log of one slot, OLDEST UNIT FIRST.
+
+    The slot-keyed read. ``unit_ids`` comes from
+    :func:`~kiro_crew.crew_log.store.session_units_for_slot`, which orders them by
+    creation, and a unit with no crew log is skipped rather than refused -- a slot
+    whose oldest unit was collected by retention still folds the ones it has.
+
+    A ``seq`` is comparable only WITHIN one file, so the guard :func:`advance`
+    applies is RE-BASED per unit: the state carries forward across units while the
+    seq restarts at each one. Without that, the second unit's entries would all sit
+    at or below the first unit's seq and be refused as a re-fold -- the collision
+    ``advance`` exists to name, arriving here for a legitimate reason.
+
+    The returned ``last_seq`` is the last entry folded from the NEWEST unit, which
+    is the only figure a later read of the same slot can compare against; it is 0
+    when that unit contributed nothing. It is deliberately not a sum across files:
+    that would be a number no file carries, and a reader could not truncate
+    against it.
+
+    A CHECKPOINT rather than a rendered value, because the writer needs one: it
+    advances this state over the entry it is appending to answer with the record
+    that entry produces, so the answer comes out of this same fold instead of a
+    second implementation of the same update rules.
+    """
+    fold_spec = _FOLDS[require_name(name)]
+    state = fold_spec.start()
+    reached = 0
+    for unit_id in unit_ids:
+        handle = open_session_log(unit_id)
+        if handle is None:
+            continue
+        grown = advance(
+            Checkpoint(name=name, last_seq=0, state=state),
+            handle.iter_from(1, known=KNOWN_TYPES),
+        )
+        state = grown.state
+        reached = grown.last_seq
+    return Checkpoint(name=name, last_seq=reached, state=state)
+
+
+def fold_slot(name: str, unit_ids: Sequence[str]) -> Projection:
+    """:func:`fold_slot_checkpoint` rendered -- the value a slot-keyed reader is served."""
+    return projection_of(fold_slot_checkpoint(name, unit_ids))
+
+
+def read_slot_projection(slot: str, name: str) -> Projection:
+    """One slot-keyed projection for *slot*, folded over every unit it ran under.
+
+    The units come from the fold's OWNER, not from a raw store listing. For the ledger
+    that owner drops the units a permanent delete excluded and puts the recorded order
+    ahead of the header clock, and a raw listing here would serve a different answer
+    from the one every other reader gets -- including a deleted conversation's goal and
+    phase on a recycled slot key. A fold whose owner has no such rule falls through to
+    the store listing, which is what it would have used anyway.
+    """
+    return fold_slot(require_name(name), _slot_units_for_fold(slot, name))
+
+
+def _slot_units_for_fold(slot: str, name: str) -> "tuple[str, ...]":
+    """The units *name* is folded over for *slot*, as that fold's owner defines them."""
+    if name == LEDGER_FOLD_NAME:
+        from kiro_crew import session_ledger
+
+        return session_ledger.crew_log_units(slot)
+    return session_units_for_slot(slot)
+
+
+def slot_of_session(session_id: str) -> str:
+    """The slot *session_id*'s crew log belongs to, or ``""`` when unprovable.
+
+    The bridge a SESSION-addressed caller needs to reach a slot-keyed fold. The
+    header is the answer rather than a session mapping: it is written once inside
+    the fenced tree and never rewritten, so it cannot be made to name another
+    conversation's slot by anything that can write the mapping file.
+    """
+    from kiro_crew.crew_log.store import unit_header_slot
+
+    return unit_header_slot(KIND_SESSION, session_id) or ""
+
+
+# --------------------------------------------------------------------------- #
 
 
 def _as_int(value: Any) -> int:
@@ -1209,12 +2040,13 @@ _FOLDS: Final[dict[str, _Fold]] = {
     "timeline": _Fold("timeline", _timeline_start, _timeline_step, _timeline_render),
     "tools": _Fold("tools", _tools_start, _tools_step, _tools_render),
     "approvals": _Fold("approvals", _approvals_start, _approvals_step, _approvals_render),
+    "class": _Fold("class", _class_start, _class_step, _class_render),
+    "ledger": _Fold("ledger", _ledger_start, _ledger_step, _ledger_render),
 }
 
-if tuple(_FOLDS) != PROJECTION_NAMES:  # pragma: no cover - import-time consistency
+if tuple(_FOLDS) != FOLD_NAMES:  # pragma: no cover - import-time consistency
     raise RuntimeError(
-        "the fold registry and PROJECTION_NAMES disagree: "
-        f"{tuple(_FOLDS)} against {PROJECTION_NAMES}"
+        "the fold registry and FOLD_NAMES disagree: " f"{tuple(_FOLDS)} against {FOLD_NAMES}"
     )
 
 

@@ -42,20 +42,14 @@ _MAX_TURNS = 500
 async def _yield_until(predicate: Callable[[], bool]) -> bool:
     """Hand the loop back until *predicate* holds, then report whether it did.
 
-    Scheduler turns, not wall clock. ``asyncio.sleep(0)`` reschedules this
-    coroutine behind whatever is already runnable, so how many turns a given
-    interleaving needs is a property of the code under test, identical on a busy
-    host and an idle one -- unlike a sleep, whose duration decides the outcome.
-
-    Returning a bool rather than asserting is what keeps a caller readable in
-    both worlds: a racer that becomes blocked by a future fix reports False here
-    and the caller fails on its own assertion, instead of hanging until the
-    suite-wide timeout kills it with no explanation.
+    Originally scheduler turns only, but the merged tree's switch paths do real
+    awaits (agent resolution, config reads), so poll with a real deadline. The
+    semantic asserts below are unchanged.
     """
-    for _ in range(_MAX_TURNS):
+    for _ in range(500):
         if predicate():
             return True
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
     return predicate()
 
 

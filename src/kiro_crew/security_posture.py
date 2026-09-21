@@ -105,6 +105,67 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Tool-call risk questions sent to the decision judge",
+        "decisions/points/tool_risk.py",
+        "The tool name, its arguments and the message excerpt that one `tool.risk` "
+        "question carries to the third-party judge. Unlike its sibling "
+        "`decisions/gate.py` -- which SCANS the same request and refuses the whole "
+        "call on a hit, emitting nothing -- this module scrubs, and the scrubbed "
+        "bytes are what leaves the machine: a credential in a tool argument is "
+        "ordinary (an `aws` command, a curl header), so refusing on it would mean "
+        "the seam never looks at the calls most worth looking at. Each field passes "
+        "the shared exfiltration-URL then credential chain and is clipped only "
+        "AFTER that, because clipping first can halve a secret into a fragment "
+        "neither redactor matches; a scanner that raises drops the field instead of "
+        "sending it. The gate then scans the placeholder, so a request it clears "
+        "carries no unredacted byte.",
+    ),
+    (
+        "Mid-turn handling decisions",
+        "decisions/points/message_steer.py",
+        "The running turn's own request and its newest assistant text and tool "
+        "activity, sent to the third-party judge that decides whether a message "
+        "typed into that turn interrupts it or waits for the next one. Unlike the "
+        "gate above it, this module EMITS its redacted bytes: the cleaned excerpt "
+        "is what leaves the machine, because refusing on it would turn 'the reply "
+        "quoted an env file' into 'the seam stopped deciding'. Both scanners run, "
+        "in the order credential-then-URL, over each half in FULL, and the clip to "
+        "the consented budget is taken AFTER them -- a cut placed first can halve a "
+        "secret, and a half is a fragment neither pattern matches, which is the "
+        "same order `tool_risk.scrubbed` states; a scanner that fails yields the empty "
+        "string rather than the input, and the gate's own scan still refuses the "
+        "whole request for a spelling this pass missed. Nothing else about the "
+        "turn is sent -- private reasoning is excluded at the read.",
+    ),
+    (
+        "Compaction scoring sent to the decision judge",
+        "decisions/points/compaction_keep.py",
+        "A whole slot transcript sent to the third-party judge that scores, in the "
+        "SHADOW, which of a session's tool calls an automatic compaction should have "
+        "kept: the conversation text and every tool-call INPUT in it. Tool OUTPUT "
+        "never leaves the machine at any fitting stage -- each result is replaced by "
+        "its own character count (`result_placeholder`), which is the widest single "
+        "omission in this table and is what keeps the largest half of a transcript "
+        "local. Like the two points above it this module EMITS its redacted bytes "
+        "rather than refusing on a hit: a credential in a tool argument is ordinary, "
+        "and refusing would mean the measurement never runs on the transcripts most "
+        "worth measuring. Both scanners run, credential-then-URL, over each field in "
+        "FULL, and the stage's clip is taken AFTER them -- a cut placed first can "
+        "halve a secret into a fragment neither pattern matches; a scanner that "
+        "fails yields the empty string rather than the input, and the gate's own "
+        "scan still refuses the whole request for a spelling this pass missed. "
+        "Routed through `platform.context.redact_via_context` rather than the bare "
+        "baseline pass, so a loaded companion's own credential and cookie spellings "
+        "apply: this state is a whole transcript, and a baseline-only scrub would "
+        "send a companion-defined secret verbatim to a third party. A composition "
+        "failure re-raises out of the shim and DROPS the field here, which is the "
+        "same direction every other arm of this module fails in. The shipped "
+        "exfiltration-URL pass runs on top, because the shim covers credentials. "
+        "Authorized by a THIRD keystone scope (`consent.STATE_KEY_COMPACTION`), "
+        "because neither the message excerpt the main switch records nor the "
+        "single-call `tool_args` scope describes it.",
+    ),
+    (
         "Member capability editor responses",
         "agent_capabilities.py",
         "Owner-facing capability rows, Parent-change previews and impact summaries. "
@@ -1359,6 +1420,24 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "preference is not one the client can use, and the sync loop would "
         "write the sentinel back over the file.",
     ),
+    (
+        "Crew webview panels",
+        "agent_panel.py",
+        "Everything a crew publishes into its drawer webview: every string in the "
+        "`data` object -- KEYS as well as values, because the template renders a "
+        "key as a heading -- plus the panel title. A panel is assembled unattended "
+        "from issue bodies, review comments and command output, so it is untrusted "
+        "text on a path that ends at the operator's dashboard, both in the native "
+        "docked summary and inside the composed sandbox document. Each string is "
+        "Unicode-sanitized BEFORE the chain, because a redactor matches the "
+        "characters it is handed: an invisible character inside a token hides it "
+        "from both patterns and is then dropped downstream, which would store the "
+        "joined-up secret with redaction skipped. The chain runs at "
+        "PUBLISH rather than at render, so a credential never enters `panel.json` at "
+        "all: it cannot be read back by a later reader, cannot survive in halves "
+        "across the record's byte ceiling, and is not left on disk for the next "
+        "reader that forgets to scrub.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do
@@ -1414,6 +1493,15 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # surfaces that SHOW the report are the registered sinks (the dashboard
         # slot snapshot and the live stream).
         "acp/mcp_session_report.py",
+        # Same shape: the workflow previewer scrubs the script-authored strings it
+        # RETAINS (an agent label, a prompt fallback label, a phase title) inside
+        # `_bounded`, before its own 120-char title cap. Redacting first is the
+        # whole point -- the response-level redactors match a credential by its
+        # full shape, so cutting first can leave a prefix no later pass
+        # recognises. It owns no output: the plan reaches a client only through
+        # dashboard/handlers/workflows.py, the registered sink for this surface,
+        # and that handler is the previewer's sole caller.
+        "workflows/preview.py",
         # Audit-side log hygiene: log_decline scrubs the model-authored tool
         # title before writing the shared auto_approve_declined SEL row. The
         # audit log is a gate-side record, not an output bound for a human or
@@ -1709,6 +1797,24 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # worker-authored prose before returning it, but the egress boundary is
         # the transport the result crosses, not this module.
         "mcp_work.py",
+        # Same class again, and worth stating precisely because the module's NAME
+        # suggests otherwise. Two flows pass through the kirocrew-panel server and
+        # only one of them touches a redactor:
+        #
+        #   agent -> dashboard: the `data` object and `title` are FORWARDED
+        #     verbatim by `panel_publish` (`_post` at mcp_panel.py:189). This
+        #     module applies no redactor to them. The scrub happens in
+        #     `agent_panel.publish`, which is a registered sink above -- so the
+        #     panel content IS counted in the posture report, under the module
+        #     that actually performs it rather than the one that relays it.
+        #   dashboard -> model: the gateway's refusal prose, which can quote
+        #     caller-supplied material (an echoed template id), is scrubbed at
+        #     mcp_panel.py:167 and :194 before being handed back as a tool result.
+        #
+        # It is the second flow that matches the call-site scan, and its consumer
+        # is the MODEL over the stdio transport -- the boundary is that transport,
+        # not this module, exactly as for `mcp_dashboard.py` above.
+        "mcp_panel.py",
         "mcp_gateway/backend.py",
         # The kirocrew-core tool handlers, moved out of mcp_core.py into their
         # domain modules. Same classification as mcp_core.py above for the same
@@ -2120,6 +2226,7 @@ _SCHEMA_REGISTRY_NAMES: tuple[str, ...] = (
     "MCP_COMPUTER_SCHEMAS",
     "MCP_DASHBOARD_SCHEMAS",
     "MCP_WORK_SCHEMAS",
+    "MCP_PANEL_SCHEMAS",
 )
 
 

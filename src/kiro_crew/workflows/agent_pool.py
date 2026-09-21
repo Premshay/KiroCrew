@@ -38,7 +38,7 @@ from typing import Any, Callable, Optional
 from kiro_crew.acp.worker_pool import WorkerPool
 from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
 from kiro_crew.messaging.identity import publish_turn_identity
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import redact
 from kiro_crew.taskq.adapters.runner import (
     RunnerAdmission,
     RunnerAdmissionRefused,
@@ -79,8 +79,8 @@ async def _run_step(provider: Any, prompt: str, *, timeout: Optional[float] = No
     ``_MAX_TURNS_PER_STEP`` tool-call ceiling, an optional per-task ``timeout``
     (via ``asyncio.wait_for`` — the pool passes its per-task bound here so a
     wedged turn is terminated instead of holding a permit until the run ceiling),
-    and the credential + exfiltration-URL output redaction pair (parity with
-    ``agent_exec`` — prevents credential leakage into workflow results stored in
+    and canonical output redaction (parity with ``agent_exec`` — prevents
+    credential or exfiltration-URL leakage into workflow results stored in
     history / injected into parent chat).
     """
     coro = stream_and_collect(
@@ -90,9 +90,7 @@ async def _run_step(provider: Any, prompt: str, *, timeout: Optional[float] = No
         max_turns=_MAX_TURNS_PER_STEP,
     )
     text = await (asyncio.wait_for(coro, timeout) if timeout is not None else coro)
-    text, _ = redact_credentials(text)
-    text, _ = redact_exfiltration_urls(text)
-    return text
+    return redact(text)
 
 
 class _WorkflowSessionWorker:
@@ -188,6 +186,29 @@ class _WorkflowSessionWorker:
         prov = self._provider
         new_conv = getattr(prov, "new_conversation", None) if prov is not None else None
         if new_conv is not None:
+            # BEFORE ``new_conv()``, not after. The cheap path replaces the CONVERSATION and
+            # keeps the process, so the previous conversation's sub-agent runs still have to
+            # end -- the process surviving does not give them anywhere to report, and
+            # without this they inject into whatever this warm worker is handed next.
+            #
+            # The ordering is the whole point. ``new_conv()`` swaps the provider's
+            # conversation handle, and a child that finishes during that await lands in the
+            # handle that exists when it reports. Arming the suppression afterwards leaves a
+            # window in which the previous task's result is delivered into the NEXT task's
+            # conversation -- the exact confusion this verb exists to prevent, and worse
+            # than no teardown because it is silent.
+            #
+            # Outside the try below, so a failure here is not read as ``new_conversation``
+            # having failed: that would send a healthy warm worker down a hard reset it does
+            # not need.
+            try:
+                await self._sessions.end_children_for(self._key)
+            except Exception:
+                logger.debug(
+                    "workflow pool: ending %s's children on reuse failed",
+                    self._key,
+                    exc_info=True,
+                )
             try:
                 await new_conv()
                 return
@@ -200,7 +221,9 @@ class _WorkflowSessionWorker:
                 )
         # Fallback: hard reset (kill+respawn) via the manager, then re-acquire.
         try:
-            await self._sessions.reset(self._key)
+            # This method STARTS A NEW CONVERSATION on a pooled key, so the previous
+            # one ends here and its sub-agent runs end with it.
+            await self._sessions.reset(self._key, ends_conversation=True)
         except Exception:
             logger.debug("workflow pool: hard reset failed for %s", self._key, exc_info=True)
         self._provider = None

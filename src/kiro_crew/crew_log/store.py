@@ -48,6 +48,7 @@ scan, so it costs the same on a crew log with ten lines and one with a million.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -494,8 +495,8 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
     return REMOVE_REMOVED
 
 
-def unit_header_slot(kind: str, unit_id: str) -> "str | None":
-    """The slot recorded in *unit_id*'s HEADER, or None when it cannot be proved.
+def _unit_header_object(kind: str, unit_id: str) -> "dict[str, Any] | None":
+    """*unit_id*'s header line, parsed FROM DISK, or None when it cannot be proved.
 
     An independent second answer to "whose crew log is this", for a caller that
     reached the unit id through a channel it does not fully trust. The header is
@@ -503,15 +504,14 @@ def unit_header_slot(kind: str, unit_id: str) -> "str | None":
     the fenced crew log tree, so it does not move when a mapping does.
 
     None for every reason a caller must not proceed on: no directory, no segment,
-    an unreadable or unparseable header, a header whose own id does not fold back
-    to this directory (the same refusal the sweep makes, since a directory
-    carrying another unit's id would answer for that other unit), or a header with
-    no slot at all. None is "cannot prove", never "no slot", so a caller that
-    requires a match refuses rather than guessing.
+    an unreadable or unparseable header, or a header whose own id does not fold
+    back to this directory (the same refusal the sweep makes, since a directory
+    carrying another unit's id would answer for that other unit). None is "cannot
+    prove", never "that field is absent", so a reader that requires a match
+    refuses rather than guessing.
 
     Read-only: it takes no lease and writes nothing. A concurrent append cannot
-    change a header, and the caller's own decision is re-made under the lease by
-    ``remove_unit``'s guard.
+    change a header, so what it reports stands for as long as that file lives.
     """
     require_kind(kind)
     try:
@@ -519,12 +519,33 @@ def unit_header_slot(kind: str, unit_id: str) -> "str | None":
         if is_link(named):
             return None
         directory = crew_log_dir(kind, unit_id)
+    except (CrewLogError, OSError):
+        return None
+    return _proved_header(directory)
+
+
+def _proved_header(directory: Path) -> "dict[str, Any] | None":
+    """*directory*'s header, but only when the header's own id folds back to it.
+
+    The half of :func:`unit_header_slot` that a caller which reached a store by
+    PATH can use -- the slot scan walks the kind root and never learns an id until
+    it reads one. Every reason to refuse is the same: a linked directory (it names
+    somewhere else), a store with no segment, an unreadable or unparseable header,
+    or a header whose ``id`` does not fold to this directory's name, which would
+    make this store answer for a different unit.
+
+    ``None`` is "cannot prove", never "no such field", so a caller that needs a
+    value refuses rather than guessing. Read-only: it takes no lease.
+    """
+    try:
+        if is_link(directory):
+            return None
         segments = [
             (first, child)
             for child in directory.iterdir()
             if (first := _segment_first_seq(child)) is not None
         ]
-    except (CrewLogError, OSError):
+    except OSError:
         return None
     if not segments:
         return None
@@ -541,8 +562,128 @@ def unit_header_slot(kind: str, unit_id: str) -> "str | None":
     own_id = parsed.get("id")
     if not isinstance(own_id, str) or not own_id or _store_name(own_id) != directory.name:
         return None
+    return parsed
+
+
+def unit_header_slot(kind: str, unit_id: str) -> "str | None":
+    """The slot recorded in *unit_id*'s HEADER, or None when it cannot be proved."""
+    parsed = _unit_header_object(kind, unit_id)
+    if parsed is None:
+        return None
     slot = parsed.get("slot")
     return slot if isinstance(slot, str) and slot else None
+
+
+#: The cached slot map, the root identity it was built from, and the children that
+#: scan could NOT prove. Replaced WHOLE, so a reader loads one reference and sees
+#: either the old triple or the new one; two threads racing rebuild it twice, which
+#: costs a scan and cannot produce a wrong answer. ``None`` means nothing is cached.
+_slot_index: "tuple[tuple[Any, ...], dict[str, tuple[str, ...]], tuple[str, ...]] | None" = None
+
+
+def _slot_root_fingerprint(root: Path, names: "list[str]") -> "tuple[Any, ...]":
+    """What must be unchanged for a cached slot map to still be current.
+
+    A unit's slot NEVER changes -- the header is written once and never rewritten
+    -- so the only thing that can invalidate the map is a unit appearing or
+    disappearing, and both rename an entry in this directory.
+
+    The NAMES are in the key, not just how many there are. A count plus an mtime
+    cannot tell one set of children from another: a purge and a create landing inside
+    one mtime granularity tick leave the count equal and the mtime unmoved, and the
+    replacement unit's record would then stay invisible for as long as the directory
+    sat still. The names are already read to do the scan, so carrying them costs the
+    comparison and nothing else. The root's device and inode are in the key too, so a
+    different data home (a pod, a test) never reads another one's map.
+    """
+    try:
+        stat = root.stat()
+    except OSError:
+        return (str(root), None, None, tuple(names))
+    return (str(root), stat.st_dev, stat.st_ino, stat.st_mtime_ns, tuple(names))
+
+
+def session_units_for_slot(slot: str) -> "tuple[str, ...]":
+    """Every session crew log whose HEADER names *slot*, oldest unit first.
+
+    The slot-keyed read path. A slot owns one ACP session id AT A TIME rather than
+    for its whole life -- a reset, an agent or model switch and a provider swap all
+    cold-start a new id -- so one slot's history is spread across a unit per id it
+    ran under, and a fold that answers for the SLOT has to join them. The header is
+    what says which slot a unit belongs to: written once at create, never
+    rewritten, and inside the fenced tree, so it does not move when a mapping does.
+    A unit whose header cannot be PROVED to be its own is left out rather than
+    attributed to a slot it may not belong to (see :func:`_proved_header`).
+
+    Ordered by the header's ``createdAt``, then by unit id so a tie is stable.
+    That is the order the units were opened in, and therefore the order their
+    entries happened in -- a fold applies a later update over an earlier one, so
+    reversing it would let a retired session's state win over the live one.
+
+    The per-unit header reads are CACHED against the root's identity, so a reader
+    that folds on every loop cycle pays one scan per change to the set of units
+    rather than one per read.
+    """
+    if not slot:
+        return ()
+    global _slot_index
+    try:
+        root = _checked_crew_log_root(KIND_SESSION)
+        names = sorted(child.name for child in root.iterdir())
+    except (CrewLogError, OSError):
+        return ()
+    fingerprint = _slot_root_fingerprint(root, names)
+    cached = _slot_index
+    if cached is not None and cached[0] == fingerprint and not _any_now_provable(root, cached[2]):
+        return cached[1].get(slot, ())
+    rows: "dict[str, list[tuple[int, str]]]" = {}
+    unproven: list[str] = []
+    for name in names:
+        parsed = _proved_header(root / name)
+        if parsed is None:
+            # Kept, not forgotten. ``create`` makes the directory and PUBLISHES the
+            # header as a second step, so a scan landing inside that window sees a
+            # store with nothing to prove -- and the header then arrives INSIDE the
+            # directory, which does not touch the root's mtime or child count. The
+            # fingerprint alone would therefore stay valid over a map that is
+            # missing a real unit, and the miss would outlive the window until some
+            # unrelated child churn happened to invalidate it. Naming the
+            # unprovable children is what bounds that: a cache hit re-checks just
+            # those, which is nothing at all in the ordinary case.
+            unproven.append(name)
+            continue
+        unit_slot = parsed.get("slot")
+        unit_id = parsed.get("id")
+        if not isinstance(unit_slot, str) or not unit_slot or not isinstance(unit_id, str):
+            # Provable as a store but not attributable to a slot -- a session that
+            # never ran on one. It is not a pending unit and cannot become one: the
+            # header is written once. So it is not re-checked.
+            continue
+        created = parsed.get("createdAt")
+        # A header with no usable ``createdAt`` still belongs to the slot, and
+        # dropping it would silently lose that unit's updates. It sorts FIRST, the
+        # position that lets any dated unit's later state win over it.
+        order = created if isinstance(created, int) and not isinstance(created, bool) else 0
+        rows.setdefault(unit_slot, []).append((order, unit_id))
+    by_slot = {key: tuple(unit for _order, unit in sorted(found)) for key, found in rows.items()}
+    _slot_index = (fingerprint, by_slot, tuple(unproven))
+    return by_slot.get(slot, ())
+
+
+def _any_now_provable(root: Path, unproven: "tuple[str, ...]") -> bool:
+    """Whether any child the last scan could not prove has since become a unit.
+
+    The cache's second condition. The root fingerprint sees a child appear or
+    disappear; it does NOT see a header published inside a directory that already
+    existed, which is exactly what ``create`` does after its ``mkdir``. Re-checking
+    the named children closes that window with work proportional to how many were
+    unprovable -- normally none, so a cache hit stays a dictionary lookup.
+
+    A child that is permanently unprovable (a stray directory, a link) is re-checked
+    on every hit and never proves, which costs one header read per hit and is the
+    price of never serving a stale map.
+    """
+    return any(_proved_header(root / name) is not None for name in unproven)
 
 
 def unit_dir_for(kind: str, unit_id: str) -> "Path | None":
@@ -550,7 +691,7 @@ def unit_dir_for(kind: str, unit_id: str) -> "Path | None":
 
     One ``stat``, no read. For the one reader that must find NAMED units ahead
     of the store's order (the session tree admits the live sessions' logs first,
-    :mod:`kiro_crew.crew_log.tree`). None for an absent directory, a linked entry
+    :mod:`kiro_crew.crew_log.session_tree`). None for an absent directory, a linked entry
     (it answers for a directory outside the tree), a root the store refuses
     (:func:`_checked_crew_log_root`) and an id that cannot be named; a caller
     reads None as "nothing to read here", never as an error.
@@ -565,14 +706,16 @@ def unit_dir_for(kind: str, unit_id: str) -> "Path | None":
         return None
 
 
-def unit_dirs(kind: str, *, limit: int, exclude: "Collection[str]" = ()) -> tuple[list[Path], bool]:
+def unit_dirs(
+    kind: str, *, limit: int, exclude: "Collection[str]" = ()
+) -> tuple[list[Path], bool, bool]:
     """Up to *limit* unit directories under *kind*'s root, in the directory's own
-    order, and whether at least one more exists; ``([], False)`` when none. A
-    directory whose name is in *exclude* is neither listed nor counted: the
-    caller already holds it.
+    order, whether at least one more exists, and whether the listing FAILED.
+    ``([], False, False)`` when there are none. A directory whose name is in
+    *exclude* is neither listed nor counted: the caller already holds it.
 
     The enumeration for the one reader that looks ACROSS units (the session
-    tree, :mod:`kiro_crew.crew_log.tree`). Bounded in WORK, not only in what it
+    tree, :mod:`kiro_crew.crew_log.session_tree`). Bounded in WORK, not only in what it
     retains: the listing stops as soon as *limit* candidates are in hand and one
     more has been seen, so a root holding a million unit directories costs the
     caller *limit* + 1 candidate checks and never a walk of the million. The
@@ -581,29 +724,37 @@ def unit_dirs(kind: str, *, limit: int, exclude: "Collection[str]" = ()) -> tupl
     order rather than the names: for the tree that is the right trade, since
     the live sessions' logs are admitted by name ahead of this listing and the
     closed sessions' logs it lists do not decide anything a row on screen shows.
-    ``([], False)`` alike for an absent root, for a root the store refuses
-    (:func:`_checked_crew_log_root`) and for one that cannot be listed: a reader
-    of many units reports the units it can prove, and a root it cannot vouch
-    for proves none. A linked entry is skipped for the reason
-    :func:`unit_header_slot` skips one -- it answers for a directory outside
-    the tree.
+
+    An absent root lists nothing and is NOT a fault: a store with no root for
+    this kind holds no units, and an answer without them is the whole truth. A
+    root the store refuses, and one whose listing raises, both set the third
+    value: those roots hold units this call cannot prove, and the difference
+    between "none" and "none I could read" is the difference between a complete
+    answer and a confident wrong one. The fault is reported from the read that
+    failed rather than left to a caller's second look, which cannot see a
+    failure that surfaced PART WAY through -- ``iterdir`` yields as it goes, so
+    an error after the first entry escapes any probe that draws one entry and
+    stops. Whatever was already in hand is returned WITH the fault rather than
+    discarded: those directories were read, and the flag says the answer is
+    short. A linked entry is skipped for the reason :func:`unit_header_slot`
+    skips one -- it answers for a directory outside the tree.
     """
     excluded = frozenset(exclude)
     kept: list[Path] = []
     try:
         root = _checked_crew_log_root(kind)
         if not root.is_dir():
-            return [], False
+            return [], False, False
         for child in root.iterdir():
             if child.name in excluded or is_link(child) or not child.is_dir():
                 continue
             if len(kept) >= max(0, limit):
                 # One past the limit is all the caller needs to know.
-                return kept, True
+                return kept, True, False
             kept.append(child)
     except (CrewLogError, OSError):
-        return [], False
-    return kept, False
+        return kept, False, True
+    return kept, False, False
 
 
 def oldest_segment(directory: Path) -> Path | None:
@@ -681,6 +832,29 @@ def read_head(path: Path) -> "tuple[dict[str, Any] | None, Entry | None, bool]":
         return header, None, False
     entry = None if parsed is None else Entry.from_dict(parsed)
     return header, entry, True
+
+
+def unit_header_created_at(kind: str, unit_id: str) -> "int | None":
+    """*unit_id*'s creation stamp, read from the header ON DISK, or None.
+
+    The stamp is written once at create and never rewritten, so it separates a
+    RECREATED log from the one a reader started on -- including a recreation that
+    landed on the freed inode, where device and inode alone report the two files as
+    one. A caller holding an open handle cannot get this from the handle itself:
+    that header was parsed when the handle was opened, so it describes the file
+    that existed then and keeps answering for it after the file is replaced.
+
+    None for a header that cannot be proved, and for a stamp that is absent or not
+    an integer. None never matches a recorded identity, so an unprovable header
+    costs a rebuild instead of licensing a reuse.
+    """
+    parsed = _unit_header_object(kind, unit_id)
+    if parsed is None:
+        return None
+    created_at = parsed.get("createdAt")
+    if not isinstance(created_at, int) or isinstance(created_at, bool):
+        return None
+    return created_at
 
 
 def _remove_unit_contents(directory: Path) -> "tuple[int, int]":
@@ -1848,7 +2022,111 @@ class CrewLog:
 
     # -- read --------------------------------------------------------------- #
 
-    def iter_from(self, seq: int = 1, *, known: Collection[str] | None = None) -> Iterator[Entry]:
+    def raw_prefix_digest(self, records: int) -> tuple[str, int]:
+        """SHA-256 of the first *records* raw entry records, and count hashed.
+
+        Segments are walked oldest first with the store's normal binary framing.
+        Each segment's header is excluded: log identity is checked separately,
+        while this digest proves that the entry bytes already consumed by a fold
+        have not changed. No JSON is decoded on this path.
+
+        *records* is a RAW record count and must come from
+        :meth:`raw_records_through`, never from a fold's entry span. The two differ
+        by every blank or unparseable interior line, and an entry span therefore
+        stops this walk short of the records the fold actually consumed.
+
+        Never raises. An invalid count, unreadable segment, framing failure, or
+        prefix shorter than requested returns a count other than *records*, which
+        makes a savepoint comparison fail closed.
+        """
+        if not isinstance(records, int) or isinstance(records, bool) or records < 0:
+            return ("", 0)
+        digest = hashlib.sha256()
+        hashed = 0
+        if records == 0:
+            return (digest.hexdigest(), hashed)
+        try:
+            paths = segment_paths(self._kind, self._id)
+            for path in paths:
+                with open(path, "rb") as source:
+                    for index, raw in enumerate(
+                        bounded_raw_records(source, path, cap=MAX_ENTRY_BYTES, label="crew log")
+                    ):
+                        if index == 0:
+                            continue
+                        digest.update(raw)
+                        hashed += 1
+                        if hashed == records:
+                            return (digest.hexdigest(), hashed)
+        except Exception:
+            logger.debug("crew log raw prefix for %s could not be read", self._id, exc_info=True)
+        return (digest.hexdigest(), hashed)
+
+    def raw_records_through(self, seq: int) -> int | None:
+        """How many raw entry records end at the entry numbered *seq*, or ``None``.
+
+        This is the boundary :meth:`raw_prefix_digest` has to be given, and it
+        exists because the two ways of measuring "how much of this file did a fold
+        consume" are NOT the same number. A fold counts ENTRIES, so its span is
+        ``last_seq - first_seq + 1``. The digest walks RAW records, and a blank or
+        unparseable interior line is a record to that walk while the fold skips it.
+        Handed the entry span, the walk therefore stops one record short per such
+        line, and the trailing records a fold did consume fall outside the digest --
+        where later damage to them passes verification, which is the one thing the
+        digest exists to prevent.
+
+        So the boundary is resolved here, once, by the same walk the digest uses,
+        and the record's own ``seq`` decides where it lies. That costs a JSON decode
+        per record, which is why only the WRITE path calls it: a savepoint is
+        written rarely, and the reader is handed the resolved count so its own
+        verification stays decode-free.
+
+        ``None`` when *seq* is not a real boundary in this log: a bad argument, an
+        unreadable or unframeable segment, or a file whose records do not reach it.
+        A savepoint is then not written, which costs a cold fold rather than
+        recording a boundary nothing can check.
+        """
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+            return None
+        seen = 0
+        try:
+            for path in segment_paths(self._kind, self._id):
+                with open(path, "rb") as source:
+                    for index, raw in enumerate(
+                        bounded_raw_records(source, path, cap=MAX_ENTRY_BYTES, label="crew log")
+                    ):
+                        if index == 0:
+                            continue  # the header
+                        seen += 1
+                        stripped = raw.strip()
+                        if not stripped:
+                            continue
+                        parsed = _parses_to_object(stripped)
+                        if parsed is None:
+                            continue
+                        own = parsed.get("seq")
+                        if not isinstance(own, int) or isinstance(own, bool):
+                            continue
+                        if own == seq:
+                            return seen
+                        if own > seq:
+                            # Past the boundary without landing on it, so the entry
+                            # is not in this log and no count describes it.
+                            return None
+        except Exception:
+            logger.debug(
+                "crew log prefix boundary for %s could not be read", self._id, exc_info=True
+            )
+            return None
+        return None
+
+    def iter_from(
+        self,
+        seq: int = 1,
+        *,
+        known: Collection[str] | None = None,
+        strict_seq: bool = True,
+    ) -> Iterator[Entry]:
         """Every entry from *seq* onward, OLDEST first -- the shape a fold wants.
 
         *known* is the reader DECLARING the types it can interpret, and passing
@@ -1871,8 +2149,40 @@ class CrewLog:
         and yielding across it would hand a fold a hole it cannot see. A gap at the
         FRONT is not damage: that is retention, so a first segment starting above 1
         is read as it stands.
+
+        Every WALKED entry -- including the ones below *seq* that are never
+        yielded -- must carry a seq strictly greater than the entry before it.
+        A duplicate or backward seq is refused with ``bad_data``, the same
+        verdict :func:`~kiro_crew.crew_log.projection.advance` gives it, so an
+        incremental read and a fold from the start agree on a damaged file
+        instead of one refusing and the other silently skipping the record.
+        The append-only writer cannot produce a non-advancing seq, so one in
+        the file is external damage, not history. A forward GAP stays
+        tolerated: inside one file it is a damaged line ``_iter_entries``
+        skipped on purpose, and this check deliberately does not harden into
+        a contiguity requirement.
+
+        *strict_seq* is that refusal, and ``False`` is for the RENDERING
+        callers only: a page shows history to a human, so refusing every
+        intact line of a unit because one damaged line exists elsewhere in it
+        would take the history away exactly when damage makes it most worth
+        reading. A caller that FOLDS state must keep the default -- tolerating
+        a non-advancing seq there is how two reads of the same bytes disagree,
+        which is the defect this parameter's default closes.
         """
+        walked = 0
         for entry in self._iter_segments():
+            if entry.seq <= walked:
+                if strict_seq:
+                    raise CrewLogError(
+                        f"entry {entry.seq} is at or below the previously read "
+                        f"entry's seq {walked}; a duplicate or backward seq is "
+                        "damage the append-only writer cannot produce",
+                        code=CODE_BAD_DATA,
+                        field="seq",
+                    )
+            else:
+                walked = entry.seq
             if entry.seq < seq:
                 continue
             if known is not None and entry.type not in known:
@@ -2455,6 +2765,7 @@ def _open_tail(
     """
     open_turn: Any = None
     last_time = 0
+    last_walked = 0
     calls: dict[str, dict[str, Any]] = {}
     approvals: dict[str, dict[str, Any]] = {}
     children: dict[str, dict[str, Any]] = {}
@@ -2468,6 +2779,19 @@ def _open_tail(
                 if entry is None:
                     skipped = skipped or reason
                     continue
+                if entry.seq <= last_walked:
+                    # A non-advancing seq is damage the append-only writer cannot
+                    # produce (the same verdict ``iter_from`` and ``advance`` give
+                    # it). This fold feeds a MUTATION: ``_scan_tail`` takes the
+                    # newest line's seq, so a backward tail lowers the closers'
+                    # first seq onto records that already exist -- a repair here
+                    # would amplify the damage before any reader refuses it.
+                    skipped = skipped or (
+                        f"entry {entry.seq} at record {index} is at or below the "
+                        f"previously read entry's seq {last_walked}"
+                    )
+                    continue
+                last_walked = entry.seq
                 last_time = entry.time
                 data = entry.data if isinstance(entry.data, dict) else {}
                 if entry.type == "turn/started":

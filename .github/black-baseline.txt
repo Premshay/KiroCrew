@@ -149,9 +149,6 @@ src/kiro_crew/changelog.py
 src/kiro_crew/channel_history.py
 src/kiro_crew/channel_transcript_migration.py
 src/kiro_crew/cli_desktop.py
-src/kiro_crew/cloud/ec2.py
-src/kiro_crew/cloud/launch_engine.py
-src/kiro_crew/cloud/launch_job.py
 src/kiro_crew/config/schema.py
 src/kiro_crew/config/validation.py
 src/kiro_crew/connections/alias_record.py
@@ -237,7 +234,6 @@ src/kiro_crew/knowledge/spend.py
 src/kiro_crew/knowledge/store.py
 src/kiro_crew/knowledge/sync.py
 src/kiro_crew/knowledge/watcher.py
-src/kiro_crew/mcp_apps_render.py
 src/kiro_crew/mcp_cleanup.py
 src/kiro_crew/mcp_gateway/abort.py
 src/kiro_crew/mcp_gateway/app_call.py
@@ -674,7 +670,6 @@ test/test_mcp_api_port_resolution.py
 test/test_mcp_app_panel_config.py
 test/test_mcp_apps_call_endpoint.py
 test/test_mcp_apps_e2e.py
-test/test_mcp_apps_render.py
 test/test_mcp_artifact_folders.py
 test/test_mcp_artifacts.py
 test/test_mcp_core.py
@@ -836,7 +831,6 @@ test/test_sandbox_launcher_sweep.py
 test/test_sandbox_probe.py
 test/test_sandbox_remedy.py
 test/test_sandbox_unsandboxed_exec_consent.py
-test/test_scenarios_v2.py
 test/test_scenarios_v2_logic.py
 test/test_search_sessions_cost.py
 test/test_sel.py
@@ -880,7 +874,6 @@ test/test_skill_script_validator.py
 test/test_skill_trigger_pointer.py
 test/test_skill_update_flow.py
 test/test_skill_versioning.py
-test/test_skills.py
 test/test_slack_agent_passthrough.py
 test/test_slack_dashboard_live_sync.py
 test/test_slack_handler_coverage_branches.py
@@ -918,10 +911,8 @@ test/test_stt_config_atomic.py
 test/test_stt_stream_cov80.py
 test/test_stub_bridge_liveness.py
 test/test_stuck_turn_watchdog.py
-test/test_subagent_context_group_plumbing.py
 test/test_subagent_cost.py
 test/test_subagent_reap_race.py
-test/test_subagent_sizing.py
 test/test_subagent_stall.py
 test/test_subquestion_queue.py
 test/test_sweep_stale_permissions.py

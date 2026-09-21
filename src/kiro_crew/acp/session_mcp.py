@@ -89,6 +89,8 @@ from kiro_crew.agent import (
 )
 from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
 from kiro_crew.agent_sdk.mcp_refs import parse_tools_refs
+from kiro_crew.env import sanitize_spec_env
+from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,30 @@ logger = logging.getLogger(__name__)
 # set the loop below REPLACES from the managed source: the element's command, args
 # and env are Crew's own by construction, not the spec's.
 CONTROL_PLANE_SERVERS = ("kirocrew-core", "kirocrew-cron")
+
+# Every managed Crew server that must be handed the session's IDENTITY when it
+# is mounted -- a wider set than the control plane above, and a different
+# question. The control plane is what a session gets whether or not its spec
+# names it; this is what a session's tool calls on any Crew server need to
+# succeed. Each of these servers runs through ``mcp_shared.run_mcp_stdio_loop``,
+# whose ``tools/call`` reads the session's tool policy from the gateway, and the
+# gateway reads a declared session key only behind an attestation. A server that
+# is granted (``@kirocrew-dashboard`` in ``tools``) but carries no token comes up
+# present-but-unusable: it resolves the session key through the pid sidecar and
+# then refuses every call as ``identity_unattested``. On the kiro backend the
+# runtime is session-unbound, so identity travels per MCP element
+# (:func:`kiro_control_plane_servers`), and that carriage has to cover the
+# opt-in servers too, not only the two always-on ones.
+#
+# Derived from the managed set rather than spelled out so a server added to it
+# later is covered by construction; gatewayd mirrors this for its per-frame
+# token hand-off (``CONTROL_PLANE_BACKENDS``) and a ratchet test pins the two.
+# The control plane leads, in ITS order: a session that grants only the two
+# always-on servers emits the same elements in the same order it always did,
+# and the opt-in servers follow in the managed set's order.
+IDENTITY_BOUND_SERVERS: tuple[str, ...] = CONTROL_PLANE_SERVERS + tuple(
+    name for name in KIROCREW_BIN_MCP_SERVERS if name not in CONTROL_PLANE_SERVERS
+)
 
 # kiro-cli's enterprise-governance discriminator, mirrored rather than imported
 # (``agent._MCP_REGISTRY_TYPE`` is private; a ratchet test pins the two equal).
@@ -795,21 +821,78 @@ def session_mcp_servers(
     return out
 
 
+def _managed_element_env(declared: Any) -> dict[str, str]:
+    """One managed control plane's element ``env``, owned the way the disk path owns it.
+
+    :func:`kiro_control_plane_servers` re-declares Crew's OWN servers, and a
+    session-injected element outranks the spec's same-named entry at launch, so
+    this ``env`` is the whole environment that shim receives. It therefore answers
+    to the same rules ``agent._enforce_managed_mcp_ownership`` applies to the entry
+    it writes for this same population, in the same order and no wider: a non-dict
+    declaration is nothing, ``sanitize_spec_env`` drops Crew's reserved namespace
+    and the loader channels, the home-deriving and launcher-exec classes are
+    dropped, and Crew's own managed env is pinned last.
+
+    Parity in BOTH directions is the property. Granting less would cost a user the
+    ordinary variable they declared, for no reason but which backend the session
+    happened to run on; granting more would let a spec that copies the managed
+    command choose what Crew's own shim executes and which data home it reads, on
+    the one element that also carries this session's identity token.
+
+    A mirror rather than a shared helper: the disk consumer mutates a dict entry in
+    place while this builds one array element. The key classes are read from
+    ``agent`` rather than restated here, and the regression test derives its
+    withheld set from those same frozensets, so the two cannot drift apart.
+    """
+    env = sanitize_spec_env(declared.items()) if isinstance(declared, dict) else {}
+    for home_key in [k for k in env if k.upper() in _agent_mod._HOME_DERIVING_ENV_KEYS]:
+        env.pop(home_key, None)
+        logger.warning(
+            "session MCP: dropping %r from a managed control plane's element env: it would"
+            " move the data home this shim shares with the gateway",
+            home_key,
+        )
+    for exec_key in [k for k in env if k.upper() in _agent_mod._LAUNCHER_EXEC_ENV_KEYS]:
+        env.pop(exec_key, None)
+        logger.warning(
+            "session MCP: dropping %r from a managed control plane's element env: it would"
+            " choose what this shim executes rather than configure it (see"
+            " agent._LAUNCHER_EXEC_ENV_KEYS)",
+            exec_key,
+        )
+    env.update(_agent_mod._managed_mcp_env())
+    return env
+
+
 def kiro_control_plane_servers(
     agent: str | None,
     *,
     work_dir: str | Path | None,
     existing_names: Collection[str] = (),
+    spec_override: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Carry ordinary session identity without widening Kiro's native tool surface.
 
     Only an existing managed stdio declaration can be overridden. Native-only
     restrictions stay in the native declaration instead of being discarded by
     ACP shaping. Registry entries remain the enterprise catalog's responsibility.
+    The element's ``env`` is owned by :func:`_managed_element_env`, which holds it to
+    the rule the disk-writing consumer applies to this same population.
+
+    Covers every server in :data:`IDENTITY_BOUND_SERVERS` the spec grants, not
+    only the control plane: an opt-in server such as ``kirocrew-dashboard`` is
+    mounted by kiro-cli straight from the spec with no session-valued environment,
+    so this element is the ONLY way its calls can carry the attestation the
+    gateway's tool-policy read demands. The grant itself is still the spec's --
+    ``allow.grants`` -- and the expected invocation is resolved with
+    :func:`~kiro_crew.agent.managed_mcp_spec_entry` under ``include_opt_in=True``,
+    the same form ``mcp_gateway.gatewayd`` reads: it answers for a granted opt-in
+    server where the writers' emission question would refuse to mint one, and
+    still yields ``None`` behind a closed ``spec_gate``.
     """
     if not agent or _registry_mode():
         return []
-    spec = _agent_spec_for(agent, work_dir)
+    spec = spec_override if spec_override is not None else _agent_spec_for(agent, work_dir)
     if not isinstance(spec, dict) or not isinstance(spec.get("mcpServers"), dict):
         return []
     allow = _tools_allowlist(spec)
@@ -822,11 +905,11 @@ def kiro_control_plane_servers(
         return []
     supported = {"command", "args", "env", "type", "autoApprove", "disabled", "disabledTools"}
     out = []
-    for name in CONTROL_PLANE_SERVERS:
+    for name in IDENTITY_BOUND_SERVERS:
         if name in existing_names or not allow.grants(name):
             continue
         entry = spec["mcpServers"].get(name)
-        managed = managed_mcp_spec_entry(name)
+        managed = managed_mcp_spec_entry(name, include_opt_in=True)
         if not isinstance(entry, dict) or not isinstance(managed, dict):
             continue
         sources = [entry]
@@ -847,7 +930,8 @@ def kiro_control_plane_servers(
             for source in sources
         ):
             continue
-        element = acp_server_element(name, entry)
+        owned = {**entry, "env": _managed_element_env(entry.get("env"))}
+        element = acp_server_element(name, owned)
         if element is not None:
             out.append(element)
     return out

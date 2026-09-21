@@ -62,6 +62,19 @@ _POSIX_EXEC_PATHS_ONLY = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _native_projection_for_fake_processes(monkeypatch):
+    from kiro_crew.acp import skill_projection
+
+    # These protocol/process doubles do not own installed native agent specs.
+    # The projection contract is exercised in test_native_skill_projection.
+    monkeypatch.setattr(
+        skill_projection,
+        "prepare_native_skill_projection",
+        lambda work_dir: skill_projection.NativeSkillProjection({"kirocrew": "kirocrew"}),
+    )
+
+
 async def _stop_stderr_drain(client: "AcpClient") -> None:
     """Cancel and await the background stderr-drain task a mocked _spawn started.
 
@@ -4934,15 +4947,21 @@ class TestResetStateExtended:
         assert not sb_file.exists()
         assert client._sandbox_cleanup is None
 
-    def test_sandbox_cleanup_missing_file_no_error(self):
+    def test_sandbox_cleanup_missing_file_no_error(self, tmp_path):
         client = AcpClient()
-        client._sandbox_cleanup = "/nonexistent/path.sb"
+        # The missing file lives under tmp_path: the remove() this exercises is a
+        # real syscall against whatever path is here, and an absolute host path
+        # (``/nonexistent/path.sb``) would aim it at the operator's filesystem.
+        missing = tmp_path / "missing.sb"
+        assert not missing.exists()
+        client._sandbox_cleanup = str(missing)
         client._process = None
         client._child_pids = {}
         client._pid = None
 
         client._reset_state()  # should not raise
         assert client._sandbox_cleanup is None
+        assert not missing.exists()
 
     def test_untracks_pids(self):
         client = AcpClient()

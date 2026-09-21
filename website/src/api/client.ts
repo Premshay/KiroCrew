@@ -1,4 +1,5 @@
 import { installSessionExpiryHandler } from './sessionExpirySignal'
+import { chatSlotDetailPath } from './chatSlotPaths'
 import { resizeImageForModel, type ResizeInfo } from '../utils/resizeImage'
 import type {
   AppContributor,
@@ -27,15 +28,8 @@ import type {
   WorkflowRunSummary,
 } from '../types'
 import type { RemoteCrewCapabilities } from '../hooks/useRemoteCapabilities'
-import type {
-  MemoryRecord,
-  MemoryRecordRef,
-  MemoryRecordQuery,
-  MemoryRecordSelection,
-  MemoryEditOperation,
-  MemoryEditPreview,
-  MemoryRecordRevision,
-} from '../types/memoryEditing'
+import type { KiroCrewAgent } from '../components/AgentSelector'
+import type { MemoryRecord, MemoryRecordRef, MemoryRecordQuery, MemoryRecordSelection, MemoryEditOperation, MemoryEditPreview, MemoryRecordRevision } from '../types/memoryEditing'
 import type { AutoNudgeListResponse } from '../components/autoNudgeLoop'
 import type { TaskDetailResponse, TasksListResponse, TasksSummary } from './tasks'
 import { ApiError, friendlyErrText } from './apiError'
@@ -483,6 +477,21 @@ export interface DecisionsConsentData {
   endpoint: string
   configured_endpoint: string
   permits: boolean
+  /**
+   * Whether the owner consented to sending TOOL-CALL ARGUMENTS — the extra egress
+   * category `tool.risk` needs. Absent on a gateway older than the scope, which
+   * reads as not consented; the keystone's own absent value reads the same way, so a
+   * consent recorded before this existed authorizes only what its owner reviewed.
+   */
+  tool_args?: boolean
+  /**
+   * Whether the owner consented to sending a WHOLE SLOT TRANSCRIPT — the conversation
+   * text and every tool-call input in it — which is what `compaction.keep` scores.
+   * Absent on a gateway older than the scope and reads as not consented, the same way
+   * the keystone's own absent value does, so neither of the narrower yeses above is
+   * ever read as this one.
+   */
+  compaction?: boolean
 }
 
 /** Which side of a logged decision a reader's verdict is about. */
@@ -1941,6 +1950,9 @@ export interface InstanceTunnelStatus {
   error?: string
   connected_at?: number
   token_ttl_remaining?: number
+  /** Fargate only: the loopback URL of the crew's turn API through the open
+   *  forward. Present only while connected; never accompanied by a token. */
+  turn_url?: string
   diagnosis?: {
     code:
       | 'ok'
@@ -1971,13 +1983,16 @@ export interface InstanceView {
   local_port: number
   ttl: string
   remote_bin: string
-  /** Transport used to reach the instance. Older records default to 'ssh'. */
-  connection_method: 'ssh' | 'ssm'
-  /** SSM-only: EC2 instance id (i-...) or SSM managed-instance id (mi-...). */
+  /** Transport used to reach the instance. Older records default to 'ssh'.
+   *  'fargate' forwards SSM to an ECS task that serves a turn API and no
+   *  dashboard, so its status carries `turn_url` and never a token. */
+  connection_method: 'ssh' | 'ssm' | 'fargate'
+  /** SSM: EC2 instance id (i-...) or SSM managed-instance id (mi-...).
+   *  Fargate: ECS task target (ecs:<cluster>_<task-id>_<runtime-id>). */
   ssm_target: string
-  /** SSM-only: named AWS profile ('' = default credential chain). */
+  /** SSM/fargate: named AWS profile ('' = default credential chain). */
   aws_profile: string
-  /** SSM-only: AWS region ('' = profile/environment default). */
+  /** SSM/fargate: AWS region ('' = profile/environment default). */
   aws_region: string
   ssm_run_as: string
   /** Provisioner that created this crew, when it came from a launcher. */
@@ -1994,8 +2009,9 @@ export interface AddInstanceBody {
   ttl?: string
   remote_bin?: string
   /** Transport to reach the instance. Defaults to 'ssh' when omitted. */
-  connection_method?: 'ssh' | 'ssm'
-  /** Required when connection_method is 'ssm': i-... / mi-... instance id. */
+  connection_method?: 'ssh' | 'ssm' | 'fargate'
+  /** Required when connection_method is 'ssm' (i-... / mi-... instance id)
+   *  or 'fargate' (ecs:<cluster>_<task-id>_<runtime-id> task target). */
   ssm_target?: string
   aws_profile?: string
   aws_region?: string
@@ -2579,6 +2595,20 @@ export interface MemberActivityEntry {
   ts: number
   via: 'chat' | 'select_crew' | string
   project?: string
+}
+
+/** Free-form fields a crew publishes into its webview. The crew owns the shape,
+ *  so every value is unknown until the renderer narrows it. */
+export type CrewPanelData = Record<string, unknown>
+
+/** Metadata half of GET /api/members/{slug}/panel. The document itself travels
+ *  beside it as `html`, already composed server-side from the template. */
+export interface CrewPanelMeta {
+  template: string
+  title: string
+  crew: string
+  published_at: string
+  data: CrewPanelData
 }
 
 /** WakaTime coding-stats payload (GET /api/wakatime/stats). When the
@@ -3293,9 +3323,15 @@ export const api = {
   // Fetches the device-code prompt while the job is awaiting sign-in; 409 when
   // there is no pending prompt (surfaced as ApiError(409) to the caller).
   cloudLaunchSignin: (id: string) =>
-    post('/api/cloud/launch/' + encodeURIComponent(id) + '/signin').then(j) as Promise<{
-      signin: CloudLaunchSignin
-    }>,
+    post('/api/cloud/launch/' + encodeURIComponent(id) + '/signin').then(j) as Promise<{ signin: CloudLaunchSignin }>,
+  // Starts the Kiro sign-in AGAIN on a crew whose launch finished unsigned: a
+  // fresh device code, run with the `login_target` the job was created with, so
+  // a company-SSO crew is not retried through the Builder ID prompt its
+  // organization cannot approve. Answers the job, which becomes the polled one.
+  // 409 while another launch or sign-in is already running on it, 400 when the
+  // job never created a crew (there is nothing to sign in).
+  cloudLaunchSigninRestart: (id: string) =>
+    post('/api/cloud/launch/' + encodeURIComponent(id) + '/signin/restart').then(j) as Promise<LaunchJob>,
   // The gateway resolves the stack from the tag but needs the launch's AWS
   // coordinates: a crew created under a non-default profile/region is invisible
   // to the default ones, so omitting them makes stop/start/destroy fail. destroy
@@ -3655,6 +3691,16 @@ export const api = {
    *  `agent` resolves the configured default agent. */
   agentResolvedModel: (agent: string) =>
     fetch('/api/agents/resolved-model?agent=' + encodeURIComponent(agent)).then(j),
+  /** Execution choices for a chat: configured members AND installed shared
+   *  templates, each row tagged with its `selection_kind`. Read-only -- unlike
+   *  the sync route it enrols nothing and allocates no member memory, so
+   *  every picker can call it without side effects. Same `X-Session-Key`
+   *  scoping as `kirocrewAgents`: project templates come from THIS chat's
+   *  project, never from another open pane's. */
+  agentCatalog: (sessionKey?: string) =>
+    fetch('/api/agents/catalog', {
+      headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk },
+    }).then(j) as Promise<{ agents: KiroCrewAgent[]; default_agent: string }>,
   /** Models and effort levels advertised by this agent's own ACP runtime. */
   kirocrewAgentModels: (agent: string) =>
     fetch('/api/agents/' + encodeURIComponent(agent) + '/models').then(j) as Promise<{
@@ -3691,6 +3737,17 @@ export const api = {
       capped: boolean
       entries: MemberActivityEntry[]
     }>,
+  // The crew's published webview: metadata plus the composed document. Read
+  // through this layer rather than a component-local `fetch`, like every sibling
+  // above -- the members page's tests stub THIS module, so a hand-rolled fetch was
+  // the one reader they could not stub, and a silent fallback (a remembered crew
+  // renamed away) surfaced as a red alert instead. `member` is the exact crew name
+  // because the record carries an ownership claim the server checks against it;
+  // slugs are lossy, so two crews can share one.
+  memberPanel: (slug: string, member: string) =>
+    fetch(
+      '/api/members/' + encodeURIComponent(slug) + '/panel?member=' + encodeURIComponent(member),
+    ).then(j) as Promise<{ panel: CrewPanelMeta | null; html: string | null }>,
   updateKirocrewAgent: (name: string, body: object) =>
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) => del('/api/agents/' + encodeURIComponent(name)).then(j),
@@ -3755,15 +3812,17 @@ export const api = {
   // Bounded HERE, not per initiator: react-query dedupes on the key, so the
   // weakest initiator would otherwise decide whether the promise is bounded.
   slashCommands: (signal?: AbortSignal) =>
-    withDeadline(SLASH_COMMANDS_TIMEOUT_MS, signal, (s) =>
-      fetch('/api/slash-commands', { signal: s }).then(j),
-    ),
-  chatSlotAgent: (slot: string, agent: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', { agent }).then(j) as Promise<{
-      ok?: boolean
-      agent?: string
-      workspace?: string
-    }>,
+    withDeadline(SLASH_COMMANDS_TIMEOUT_MS, signal, s =>
+      fetch('/api/slash-commands', { signal: s }).then(j)),
+  /** `kind` names the namespace the user picked from. Omitted, the backend
+   *  keeps its legacy name-first resolution; stated, a same-name template and
+   *  member are told apart and an unresolvable choice is refused (409) rather
+   *  than answered by the default agent. */
+  chatSlotAgent: (slot: string, agent: string, kind?: 'member' | 'template') =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', {
+      agent,
+      ...(kind ? { agent_kind: kind } : {}),
+    }).then(j) as Promise<{ ok?: boolean; agent?: string; agent_kind?: 'member' | 'template' | ''; workspace?: string }>,
   chatSlotModel: (slot: string, model: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/model', { model }).then(j) as Promise<{
       ok?: boolean
@@ -4550,7 +4609,7 @@ export const api = {
     const p = new URLSearchParams()
     if (limit) p.set('limit', String(limit))
     if (before !== undefined) p.set('before', String(before))
-    return fetch('/api/chat/slots/' + encodeURIComponent(slot) + '?' + p, { signal }).then(j)
+    return fetch(chatSlotDetailPath(slot) + '?' + p, { signal }).then(j)
   },
   /** Create a chat slot. `instance_id` binds the new session to a connected crew
    *  for EXECUTION: it lives in this machine's list and history, and its turns run
@@ -4565,18 +4624,7 @@ export const api = {
    *  the `remote_already_bound` guard does not fire, and the peer's transcript is
    *  backfilled server-side. Requires `instance_id`; without it the backend
    *  answers `400 adopt_needs_instance`. */
-  createChatSlot: async (
-    name?: string,
-    agent?: string,
-    model?: string,
-    mode?: string,
-    memory_mode?: string,
-    title?: string,
-    artifact?: string,
-    folder_id?: string,
-    instance_id?: string,
-    adopt_remote_slot?: string,
-  ) => {
+  createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, instance_id?: string, adopt_remote_slot?: string, agent_kind?: 'member' | 'template') => {
     // ADOPT deliberately resolves NO default memory mode. The adopted slot carries
     // the PEER session's own `memory_mode` — that mode is the privacy boundary and
     // the session it belongs to already chose it — so sending this machine's
@@ -4591,6 +4639,8 @@ export const api = {
     return post('/api/chat/slots', {
       ...(name ? { name } : {}),
       ...(agent ? { agent } : {}),
+      // Only beside an agent: a namespace without a name selects nothing.
+      ...(agent && agent_kind ? { agent_kind } : {}),
       ...(model ? { model } : {}),
       ...(mode ? { mode } : {}),
       ...(resolvedMemoryMode ? { memory_mode: resolvedMemoryMode } : {}),
@@ -4860,20 +4910,8 @@ export const api = {
     },
   ) => patch('/api/chat/tag-columns/' + encodeURIComponent(id), body).then(j),
   deleteTagColumn: (id: string) => del('/api/chat/tag-columns/' + encodeURIComponent(id)).then(j),
-  reorderTagColumns: (ids: string[]) =>
-    fetch('/api/chat/tag-columns/order', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', ..._sk },
-      body: JSON.stringify({ ids }),
-    }).then(j),
-  sendChat: (
-    message: string,
-    slot?: string,
-    colorTheme?: string,
-    signal?: AbortSignal,
-    meta?: Record<string, unknown>,
-    steer?: boolean,
-  ) => {
+  reorderTagColumns: (ids: string[]) => fetch('/api/chat/tag-columns/order', { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ ids }) }).then(j),
+  sendChat: (message: string, slot?: string, colorTheme?: string, signal?: AbortSignal, meta?: Record<string, unknown>, steer?: boolean | 'auto') => {
     // theme_consent_sha is the WIRE TOKEN (two-tier consent). The client just
     // TRANSMITS the raw stored grant (see themeConsentSha) — the server verifies
     // content-binding, injecting the persona only when this token equals sha256
@@ -4894,6 +4932,13 @@ export const api = {
     // the fetch seam under the chat-core `sendTurn`, which every steer now
     // rides (there is no separate steer helper).
     //
+    // `'auto'` is the composer's third busy mode: the same intent to act NOW,
+    // with the choice between injecting and queueing handed to the gateway for
+    // this one message (`decisions/points/message_steer.py`). Sent as the literal
+    // string beside the boolean the two manual modes send, so a gateway that does
+    // not know the word reads a truthy flag and steers — which is exactly the
+    // fallback the decision itself has.
+    //
     // The response is handed back RAW (the chat-core transport reads the
     // receipt itself; a 4xx/5xx must resolve, not throw like `j`), but it still
     // runs the same auth recovery every `j`-parsed call has -- see
@@ -4901,19 +4946,7 @@ export const api = {
     // stale-owner session as a bare "refused" send. The steer helper this
     // replaced went through `j` and had both; the transport must not lose them.
     const themeConsent = themeConsentSha(colorTheme)
-    return fetch('/api/chat?ws=1', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ..._sk },
-      body: JSON.stringify({
-        message,
-        slot,
-        ...(colorTheme ? { color_theme: colorTheme } : {}),
-        ...(themeConsent ? { theme_consent_sha: themeConsent } : {}),
-        ...(meta ? { meta } : {}),
-        ...(steer ? { steer: true } : {}),
-      }),
-      signal,
-    }).then(sendResponseAuthRecovery)
+    return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}), ...(steer ? { steer: steer === 'auto' ? 'auto' : true } : {}) }), signal }).then(sendResponseAuthRecovery)
   },
   sessionsHealth: () => fetch('/api/sessions/health').then(j),
   // Durable task queue + capacity view (System > Services "Tasks & capacity").
@@ -6010,8 +6043,31 @@ export const api = {
   getDecisionsConsent: () => get('/api/decisions/consent').then(j) as Promise<DecisionsConsentData>,
   // Enabling echoes the endpoint the card showed: the gateway binds consent to
   // that address and answers 409 if config.json moved it since the read.
-  saveDecisionsConsent: (enabled: boolean, endpoint?: string) =>
-    put('/api/decisions/consent', enabled ? { enabled, endpoint } : { enabled }).then(j) as Promise<DecisionsConsentData>,
+  // `toolArgs` and `compaction` are each OMITTED when the caller does not pass one,
+  // and that omission is meaningful: the gateway preserves the recorded scope for an
+  // absent field, so an ordinary switch flip can neither grant nor erase it. Pass a
+  // boolean only for the switch the owner actually acted on — including `false`,
+  // because on this route a revoke has to be written and cannot be left out.
+  // `enabled` is OPTIONAL, and leaving it out is what makes a scope write safe rather
+  // than careful: a body that carries the switch can only carry what this client last
+  // read, so a view read before a revoke turns egress back on. Omitted, the route reads
+  // the switch and the endpoint off the keystone under its own lock, and the write moves
+  // only the scopes named. A body with neither the switch nor a scope is a 400.
+  saveDecisionsConsent: (enabled?: boolean, endpoint?: string, toolArgs?: boolean, compaction?: boolean) =>
+    put('/api/decisions/consent', enabled === undefined
+      ? {
+        endpoint,
+        ...(toolArgs === undefined ? {} : { tool_args: toolArgs }),
+        ...(compaction === undefined ? {} : { compaction }),
+      }
+      : enabled
+        ? {
+          enabled,
+          endpoint,
+          ...(toolArgs === undefined ? {} : { tool_args: toolArgs }),
+          ...(compaction === undefined ? {} : { compaction }),
+        }
+        : { enabled }).then(j) as Promise<DecisionsConsentData>,
   // One reader's verdict on one side of one decision, from the transcript's
   // decision strip. `verdict: null` takes an answer back, which is why the field
   // is nullable rather than absent — the server records the retraction.

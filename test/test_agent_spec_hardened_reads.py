@@ -33,6 +33,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import source_corpus
 from aiohttp import web
 
 from conftest import requires_symlinks
@@ -51,10 +52,10 @@ from kiro_crew.dashboard.handlers.mcp import (
     api_mcp_active,
 )
 
-# One xdist worker for the whole module: every test here derives from ONE module-cached
-# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
-# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
-# per full run for this file alone. Grouping keeps the cache single-copy per run.
+# One xdist worker for the whole module: the call-site ratchet below reads src/ through
+# ``test/source_corpus.py``'s shared, module-lifetime text cache. Under `--dist loadgroup`
+# an unmarked module is spread across workers and each worker re-pays that read and holds
+# its own copy of the corpus. Grouping keeps the cache single-copy per run.
 pytestmark = pytest.mark.xdist_group(name="tree_scan_test_agent_spec_hardened_reads")
 
 # The two refusal shapes cheap enough to plant per surface. "oversized" is the
@@ -881,6 +882,13 @@ class TestProjectNamesDenialAttribution:
 # Forwarding helpers are pinned as forwarding rather than forced to use a fixed
 # literal that would erase the caller's attribution.
 _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    # Two reads under one label: the launch loop reads each authored spec to
+    # project it, and stale-alias validation re-reads the recorded source to
+    # confirm it still names the same agent before reclaiming the view.
+    "kiro_crew/acp/skill_projection.py": [
+        ("native_skill_projection", "acp"),
+        ("native_skill_projection", "acp"),
+    ],
     # Two reads, deliberately labelled apart: the session-MCP translation resolves
     # the PROJECT checkout first (kiro-cli resolves --agent there before the user
     # level) and falls back to the user-level spec, so a refusal names which of the
@@ -895,6 +903,7 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     ],
     "kiro_crew/agent_capabilities.py": [("capability_publish", "dashboard")],
     "kiro_crew/agent_discovery.py": [
+        ("agent_skill_globs", "unknown"),
         # ``agent_welcome_message`` reads the PROJECT checkout's specs itself
         # (project scope shadows the user level, as `list_agents` resolves it),
         # so it names the hint read rather than forwarding: a refused checkout
@@ -912,6 +921,9 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("list_agents", "unknown"),
         ("list_agents", "unknown"),
         ("resolve_project_agent_name", "unknown"),
+    ],
+    "kiro_crew/apps/builtins/auto_improvement/spine/crew_runner.py": [
+        ("auto_improvement_assignment", "unknown")
     ],
     "kiro_crew/cli_doctor.py": [("doctor", "cli"), ("doctor", "cli"), ("doctor", "cli")],
     "kiro_crew/config/loader.py": [("load_config", "unknown")],
@@ -1018,14 +1030,19 @@ def _labelled_call_sites(target: str) -> dict[str, list[tuple[str | None, str | 
     forwarded kwargs are written. This applies to every entry in
     ``_RATCHET_INVENTORY``, not to any one callee.
 
-    Cached per *target*: the source tree cannot change mid-run, both tests in
-    ``TestCallSiteLabelRatchet`` ask the same three targets, and the scan itself
-    (rglob + ast.parse of the whole ``src/`` tree) is the expensive part.
+    Cached per *target*: the source tree cannot change mid-run and both tests in
+    ``TestCallSiteLabelRatchet`` ask the same targets. The scan itself goes through
+    ``test/source_corpus.py``: one shared read of ``src/`` for the module, and a
+    parse of only the files whose text names *target* at all. That narrowing cannot
+    hide a site -- every match above is an identifier equal to *target* (a ``Name``
+    id, an ``Attribute`` attr, or a positional ``Name`` argument), and the corpus
+    matches identifiers on NFKC-normalised text, which is how CPython folds them at
+    parse time. Before this the function did its own ``rglob`` + ``ast.parse`` of
+    all ~1,600 modules once PER TARGET (6 x ~9 s per run).
     """
-    src = Path(__file__).resolve().parent.parent / "src"
+    src = source_corpus.src_root().parent
     sites: dict[str, list[tuple[str | None, str | None]]] = {}
-    for path in sorted(src.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+    for path, _text, tree in source_corpus.parsed_candidates(require_any=(target,)):
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue

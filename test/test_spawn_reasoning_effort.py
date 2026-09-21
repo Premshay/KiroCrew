@@ -30,6 +30,36 @@ from kiro_crew.validation import SPAWN_RUN_SCHEMA, ValidationError, validate_too
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
 # looks short of memory, which is the runner's state, not this test's input.
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
+
+@pytest.fixture(autouse=True)
+def _close_subagent_managers(monkeypatch):
+    """Close every ``SubagentManager`` built in a test.
+
+    Construction opens the durable task queue (a SQLite connection and its
+    writer thread); nothing in these unit tests closes it, so each manager
+    leaked those descriptors. Track every instance and release it at teardown.
+    """
+    import kiro_crew.subagent as _subagent_mod
+
+    created = []
+    orig_init = _subagent_mod.SubagentManager.__init__
+
+    def _tracking_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(_subagent_mod.SubagentManager, "__init__", _tracking_init)
+    try:
+        yield
+    finally:
+        for mgr in created:
+            try:
+                mgr.close()
+            except Exception:
+                pass
+
+
 continuation_runtime = _continuation_runtime
 
 
@@ -453,6 +483,7 @@ class TestRecordAndRetry:
             reasoning_effort="xhigh",
             approval_mode="",
             silent=False,
+            delegation={},
             include_memory=True,
             include_lessons=True,
             include_project=True,
@@ -1021,7 +1052,7 @@ class TestAppliedLineRendering:
         mgr = MagicMock()
         mgr.spawn.return_value = SimpleNamespace(id="a1", done=False, error="")
         state = SimpleNamespace(
-            _slots={"1": SimpleNamespace(is_restricted=False, blocks_reads=False)},
+            _slots={"1": SimpleNamespace(key="1", is_restricted=False, blocks_reads=False)},
             _restricted_keys=set(),
             subagents=mgr,
             sessions=SimpleNamespace(
@@ -1063,7 +1094,7 @@ class TestAppliedLineRendering:
         mgr = MagicMock()
         mgr.spawn.return_value = SimpleNamespace(id="a1", done=False, error="")
         state = SimpleNamespace(
-            _slots={"1": SimpleNamespace(is_restricted=False, blocks_reads=False)},
+            _slots={"1": SimpleNamespace(key="1", is_restricted=False, blocks_reads=False)},
             _restricted_keys=set(),
             subagents=mgr,
             sessions=SimpleNamespace(
@@ -1185,7 +1216,7 @@ class TestVerdictOffTheEventLoop:
         mgr = MagicMock()
         mgr.spawn.return_value = SimpleNamespace(id="a1", done=False, error="")
         state = SimpleNamespace(
-            _slots={"1": SimpleNamespace(is_restricted=False, blocks_reads=False)},
+            _slots={"1": SimpleNamespace(key="1", is_restricted=False, blocks_reads=False)},
             _restricted_keys=set(),
             subagents=mgr,
             sessions=SimpleNamespace(

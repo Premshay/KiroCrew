@@ -777,7 +777,18 @@ send time.
   `session.timeout_secs` and `session.watchdog_rss_max_mb` off the manager's
   current `_cfg` (which the config watcher keeps current) and re-applying the
   same bounds the loader does — the 60s floor, the `0` = sweep-disabled
-  sentinel, and the non-negative-int coercion of the RSS ceiling. The sleep
+  sentinel, and the non-negative-int coercion of the RSS ceiling — plus a
+  `MAX_TICK_INTERVAL_SECS` = 300s **ceiling on the derived interval itself**.
+  The ceiling exists because one tick drives the idle-expiry hook AND every
+  housekeeping sweep below it, so deriving the cadence from `timeout_secs`
+  alone coupled the sweeps to a setting about something else and coupled it
+  backwards: `timeout_secs=86400` gave an `86400 // 6` four-hour tick while
+  DISABLING idle expiry (`timeout_secs=0`) gave 300s, so asking for long-lived
+  sessions bought slower orphan cleanup than switching the idle sweep off.
+  Capping cannot expire a session early — `_expire_idle_hook` passes
+  `state.idle_timeout`, so the timeout still decides WHEN a session is stale
+  and the interval only decides how often the question is asked — and it is a
+  ceiling, not a floor, so sub-300s intervals are untouched. The sleep
   between sweeps is chopped into waits of at most `POLICY_REFRESH_SECS` (60s);
   each wake re-adopts the policy and, when the interval moved, re-anchors the
   next sweep to the last sweep plus the new interval, so a shortened timeout
@@ -796,8 +807,8 @@ send time.
   monkeypatch seams remain observable: `idle_expiry`, `orphan_mcp`,
   `reap_agent_scopes`, `rss_threshold`, `stuck_turn`, and `bg_drain_reap`.
   `SessionCleanup._cleanup_loop` then directly coordinates the session-root,
-  sandbox-artifact, bytecode-cache, periodic tracked-PID, and untracked-MCP
-  sweeps.
+  sandbox-artifact, session-pid-mapping, bytecode-cache, periodic tracked-PID,
+  and untracked-MCP sweeps.
 - **Reaping abandoned agent scopes** (`session_scope_reap.py`,
   Linux/systemd only): each agent session runs inside a transient
   `systemd-run --user --scope` under a per-instance child of
@@ -931,7 +942,7 @@ send time.
 | `cancel_current(key, *, wait_ack_timeout=0.0)` | Cancel in-flight operation without destroying session. Returns `CancelOutcome`. Default `wait_ack_timeout=0.0` preserves fire-and-forget behavior for internal callers (taskrunner, subagent, llm_helpers). |
 | `stop_turn(key, *, force=False, on_soft=None, on_hard=None)` | Cooperative stop with kill fallback. Returns `StopOutcome` (`"soft"`, `"hard"`, or `"idle"`). Clears queue unconditionally, then sends `session/cancel` and waits up to `agent.soft_stop_budget_secs`; falls back to `reset()` + eager respawn on timeout or error. `force=True` skips cancel and goes straight to hard kill. `on_soft`/`on_hard` callbacks fire before return. |
 | `reset(key, *, expect_session=None, skip_if_busy=False, clear_conversation=False)` | Kill session; returns `bool` (True iff a session was actually torn down). Does NOT delete session map entry (kiro-cli file persists for future resume). Optional guards evaluated atomically under the lock with the pop, used by the RSS-recycle watchdog: `expect_session` only resets if that exact session object still occupies the key (guards against recycling a reset+recreated session on a stale off-lock RSS reading); `skip_if_busy` skips when the current session's semaphore is held so a live stream is never cut mid-turn. `clear_conversation=True` additionally clears the native resume sid in the SAME event-loop tick as the pop (entry + channel bindings survive, as in `_recycle_held`) — used by the still-critical post-compaction escalation so the overflowed conversation is not reloaded, without a delayed clear ever erasing a racing successor's sid. |
-| `discard_conversation(key)` | Kill session AND clear only the resume sid (`SessionMap.clear_sid`) — the map ENTRY survives, preserving Slack thread/channel linkage and the reverse thread→session index. The cleared sid is stashed as `discarded_sid` in the entry, so the discard is diagnosable and manually reversible (the native conversation persists on disk; only the pointer is dropped). The next turn cold-starts a fresh native conversation instead of `session/load`-ing the old one. Used by the poisoned-conversation escalation in `chat_runner` (canary-verified backend rejection of a specific persisted conversation) and by the Slack / Discord / Telegram `/compact` failure recovery: the conversation is unusable but the session's channel identity must persist. This is the shape every HOUSEKEEPING teardown takes — `SessionMap.prune` refuses to delete an entry carrying a channel binding, and `_recycle_held` clears the sid for the same reason. Only an explicit user action (`destroy`) may remove a channel identity. Sits between `reset` (sid kept, resume expected) and `remove` (entry deleted, no resume). |
+| `discard_conversation(key)` | Kill session AND clear only the resume sid (`SessionMap.clear_sid`) — the map ENTRY survives, preserving Slack thread/channel linkage and the reverse thread→session index. The cleared sid is stashed as `discarded_sid` in the entry, so the discard is diagnosable and manually reversible (the native conversation persists on disk; only the pointer is dropped). Every path that empties `sid` in place records what it dropped, through one shared `_stash_and_clear_sid` — this discard, the provider switch, the startup prune and the per-read stale repair — because a history reader answers from that field and cannot tell which path wrote it, so a field written by only some of them holds a genuine id that is not the latest one. The next turn cold-starts a fresh native conversation instead of `session/load`-ing the old one. Used by the poisoned-conversation escalation in `chat_runner` (canary-verified backend rejection of a specific persisted conversation) and by the Slack / Discord / Telegram `/compact` failure recovery: the conversation is unusable but the session's channel identity must persist. This is the shape every HOUSEKEEPING teardown takes — `SessionMap.prune` refuses to delete an entry carrying a channel binding, and `_recycle_held` clears the sid for the same reason. Only an explicit user action (`destroy`) may remove a channel identity. Sits between `reset` (sid kept, resume expected) and `remove` (entry deleted, no resume). |
 | `remove(key)` | Shut down a session but PRESERVE the session map entry — the kiro-cli session files remain on disk, so a future `get_or_create` restores the conversation losslessly via `session/load`. For revivable teardown (tab close, agent switch, idle kill). Permanent deletion is `destroy(key)`. |
 | `destroy(key)` | Permanently remove the live provider, compaction override, and session-map entry. The map entry is deleted in the yield-free registry-pop span before the awaited end metric, so a dashboard slot cannot adopt the predecessor binding during that metric write. |
 | `destroy_if(key, expected_generation, should_destroy, *, preserve_autocompact_override=False)` | Conditional permanent removal for the monotonic canonical-key generation captured by `session_generation(key)`. Under the manager lock it requires no current allocation/claim reservation, requires the generation to remain equal, requires the current session semaphore to be idle, then evaluates the synchronous slot-owner predicate immediately before the registry pop and yield-free session-map delete. Any reservation, generation mismatch (including absent→successor→absent ABA), busy session, false predicate, or predicate exception leaves provider, override, and map untouched. History deletion passes `preserve_autocompact_override=True` because another process can claim the same logical transcript; ordinary conditional and unconditional destroy keep clearing the old override. Returns whether destruction occurred. |
@@ -1138,6 +1149,25 @@ the four where `rewind` does not yet, so nobody reads them as already shared:
   something else has taken `slot.task`, committing would run this handler's turn
   alongside whatever now owns the slot — two concurrent turns writing one
   window). Any of the three refuses with a retryable 503.
+- **The durable write is NOT covered by that predicate, and the gap is open.**
+  Every call to the commit predicate above happens AFTER the save has settled, so
+  for the file it is a post-mortem: it can refuse the live commit and the
+  dispatch, and it cannot un-truncate a transcript that has already been
+  replaced. The truncated window is frozen against ONE slot incarnation, and a
+  same-name close-and-recreate can be published inside the executor wait, after
+  every check the handler can run on the loop. Such a recreate resuming the same
+  conversation leaves the transcript key unchanged, so `expected_history_key`
+  waves it through.
+  `chat_persistence._save_slot_to_history` does accept `expected_slot_name` and
+  re-reads `state._slots` under the transcript lock before writing, which is what
+  the `regenerate` and `switch-variant` saves pass. That check is necessary but
+  not sufficient, and no caller should be read as closing the race: the harm does
+  not need the replacement published before the check, only that it READS the
+  file after the write commits. The save holds the per-session lock across its
+  whole read-modify-write, so a replacement published during the write waits and
+  then hydrates from the truncated content. Closing it needs slot publication to
+  be ordered against the persistence commit, and no such contract exists between
+  the registry and the persistence layer today. Tracked in issue #12090.
 - **The periodic dirty-slot flush is excluded for the whole rewrite.** Because
   the live slot keeps the full window until the commit, a flush tick can snapshot
   that stale window, block behind the rewrite on the per-session history lock,
@@ -1521,6 +1551,8 @@ Three properties the route holds, each of which fails silently if broken:
   `dashboard:<slot>`: a channel-born slot's turns run on the channel's session,
   and the derived form yields a key no session ever had — the clear finds nothing
   and the call still reports success.
+- The teardown also ends the parent's sub-agent runs; see "Parent end ends the
+  children" below for why that rides the release rather than being called here.
 - `discard_conversation`, never `destroy`: the entry carries the Slack
   thread/channel linkage and the reverse index built from it.
 - It is nonetheless a FULL teardown (provider shutdown plus
@@ -1557,6 +1589,95 @@ The transcript is deliberately left in place, so the tab still shows earlier
 messages the model no longer remembers. That is the honest rendering — the record
 is the user's, the context was the conversation's — and it is why this is an
 explicit request rather than something the gateway does on its own.
+
+### Parent end ends the children
+
+`release_subagent_runtime` IS this module's parent-end boundary, so the runs a
+parent owns are ended at every site that calls it. Both halves are driven here:
+`_snapshot_parent_children` in the same lock hold as the pop, because every await
+after that is a window a successor can register under the retired key in, and
+`_cancel_parent_children` after the provider teardown, bounded and best-effort,
+with the release as the backstop for whatever it does not reach. `subagent.md`
+describes the two verbs and why the teardown one suppresses parent delivery.
+
+Two properties of that call, each of which fails silently if broken:
+
+- **It is outside any `if session` guard.** A live provider is not what makes a call a
+  parent end. A reset pops the session and keeps the conversation, so the tab close that
+  follows arrives with `session is None` while the children are still running — and that
+  is the call that ends them. `remove` guarded both the cancel and the release on a live
+  provider, which skipped exactly the sequence the reset/remove split makes ordinary.
+- **The timeout bounds the parent's WAIT, not the reap.** `_cancel_parent_children` runs
+  the verb as a task registered in `_background_tasks` and waits on
+  `asyncio.shield(task)`, so `_CHILD_CANCEL_TIMEOUT_SECS` expiring leaves the reap
+  running to completion. A bare `wait_for` cancels what it waits on, and this coroutine
+  kills child processes: a long child reset would have its `_force_reap` cancelled after
+  the marks were written and before the kills landed, leaving a write-capable child
+  executing against a conversation that has ended.
+
+Sites: `reset` (conditionally, see below), `remove`, `destroy`,
+`discard_conversation`, `remove_if_unclaimed`, `retire_kiro_identity_sessions`.
+
+The selection is NOT complete, and deliberately so. The mark and the snapshot are both
+taken inside this lock hold, which is the only synchronous point available, so anything
+already in flight sees neither: a spawn admitted late may still START, and a report already
+past the delivery gate may still DELIVER into a conversation that has ended. Both are
+bounded by the run's own timeout. Neither closes with another recheck at one end, because
+any wider selection or later re-test needs an await, and an await cannot tell work
+belonging to the retired conversation from work a successor under the same key has just
+started — which needs a conversation-incarnation counter the session layer does not have.
+Full argument in [subagent.md](subagent.md) § RESIDUAL; tracked in #12069.
+
+The distinction is "does the CONVERSATION end", not "does the process die". `remove` is a
+revivable ending — the entry survives for a future `session/load` — and it still takes the
+children, because the conversation is over as far as the parent is concerned.
+
+`reset` is on the other side by DEFAULT. It keeps the session-map entry and its resume sid,
+so the next turn restores the same native conversation through `session/load`, which is why
+it is the verb every evict-and-retry path reaches for: a wedged prompt (`AcpPromptBusy`), a
+failed auto-compaction, a provider or model switch (`_reset_slot_session`, which serves the
+agent / model / reasoning-effort / workspace switches and the reload endpoint), an idle
+expiry, the channel watchdog, a task step's re-prompt. A child of a recycled session has a
+conversation to deliver into and is bounded by its own run timeout, so stopping it would
+discard live work for a conversation that is coming right back. The RSS recycle sits here
+too and needs no argument: `_rss_threshold_check` declines outright for a session with
+attached sub-agent work.
+
+But some endings reach ONLY `reset`, so `ends_conversation=True` exists to say so, and
+those callers are:
+
+| caller | why it ends the conversation |
+|---|---|
+| `dashboard/handlers_channel.py` — `api_channel_clear_context` | the user asked the agent to forget the conversation (`scope=all` also wipes the channel's shared buffer) |
+| `cron.py` — `cancel` / `_force_reap` | the job is cancelled or reaped, so its conversation is over |
+| `taskrunner.py` — `_cleanup_run_sessions` | cancel cleanup ends every step conversation of the run |
+| `workflows/agent_pool.py` — `reset` | the pool STARTS A NEW conversation on a pooled key |
+
+The default is the recycle because that is what the overwhelming majority of `reset`'s ~46
+callers are, and the two mistakes do not cost the same — but a MISSED flag costs more than an
+orphan, which is the number a future caller has to weigh. It arms no delivery gate either, so
+the child's report still reaches `_on_done`, which resolves the parent through
+`get_or_create` and creates a session when none is live: the conversation the caller ended
+re-opens, seeded with that report. The miss is the headline defect in full, not a bounded
+process. A wrong `True` destroys live work for a conversation that resumes next turn, which is
+why the default stays the recycle — but a new ending path that forgets the flag RESURRECTS,
+and nothing structural catches it, because a keyword is invisible to the AST ratchet. Until
+#12069's conversation-incarnation identity makes a forgotten flag harmless, the flag is the
+whole guard and the path pin below is the only thing watching it.
+
+Two exemptions from the release-site rule, each on a fact about itself:
+
+- `close_all` — gateway shutdown runs `SubagentManager.cancel_all`, which also drains
+  follow-up watchers and announces undelivered messages.
+- `_retire_kiro_subagent_runtimes` — it reaps only IDLE companion runtimes, skipping any
+  that answer `has_active_or_initializing_sessions()`, so it has no running child to end
+  and the parent conversation continues.
+
+A ratchet in `test_session.py` reads that off the source on the AST: a method that releases
+a companion runtime without calling both halves fails it, the two exemptions are named
+there, and an exempt method that stops releasing a runtime is reported so its exemption
+never goes unchecked. The `ends_conversation=True` call sites are pinned separately, by
+path, because a structural ratchet cannot see a keyword and losing one is silent.
 
 ### Load Recovery (stale native session lock — F2)
 
@@ -2463,6 +2584,34 @@ a trust root on its own; publication therefore also writes a
   graceful-shutdown sweep asks for the narrowing. This pass touches only the
   `session_pid_<pid>` family, never the shared `kiro_session_pids.txt` that
   pass 1 rewrites.
+- **Cadence** (`SessionCleanup._sweep_session_pid_mappings`): the pass above is
+  reached from `cleanup_orphaned_sessions` — **startup + shutdown only** — so a
+  gateway that kept running held every mapping it published until it restarted,
+  one per released session, and a recycled pid number went on carrying a
+  dashboard slot's key (measured on a Windows host: twelve files from six
+  released sessions inside an hour, two of those numbers already handed to
+  unrelated live processes). The periodic cleanup tick therefore calls
+  `_prune_stale_session_pid_files` as well, which is why the
+  `MAX_TICK_INTERVAL_SECS` ceiling above is the other half of the same change:
+  it is what makes this cadence bounded at 300s instead of derived from
+  `session.timeout_secs`. Deliberately NOT hooked onto provider teardown, even
+  though a teardown is the moment a runtime is known dead: `_untrack_session_pid`
+  is synchronous and `AcpClient._reset_state` calls it on the event loop, so a
+  mapping read or unlink placed there is filesystem work over predictable
+  same-uid agent-writable paths in the one place
+  `no-blocking-call-on-event-loop` forbids — a planted FIFO or reparse point
+  would park the gateway. On the maintenance executor the same pass needs no
+  per-syscall bounding at all, and the case a teardown hook could not reach (a
+  gateway that dies without running one) is covered by the same pass.
+  Retraction latency is bounded rather than immediate: a released session's
+  mapping survives at most one tick. The pass keeps its own decision rules
+  unchanged, deliberately — in particular it still retains a mapping whose pid
+  number was recycled to a live process, because that mapping is already refused
+  at READ time (`_pid_recycled` on both the strict and the lenient path) and its
+  file is reclaimed once the unrelated process exits. Adding a prune branch for
+  it would trade a disk saving against the read-then-unlink window in which a
+  new owner's `publish_session_pid` can land, and losing a live mapping costs
+  that session its identity until its next turn republishes.
 - **Member execution routing**: the ordinary session/run owner record carries
   the immutable member/store snapshot. Strict MCP caller identity still uses
   the existing transport token and signed `session_pid` publication. No separate

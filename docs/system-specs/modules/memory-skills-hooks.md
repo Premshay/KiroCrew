@@ -1850,10 +1850,13 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 **Embedding backend abstraction** (`EmbeddingBackend` ABC): the public swap seam for future runtimes (Ollama again, remote endpoints, ONNX) and user-defined models. Surface: `model_id`, `dim`, `is_ready()`, `embed()`, `embed_batch()`, `close()`. Consumers (vector memory, knowledge library) depend only on this interface; everything llama.cpp-specific lives in `LlamaCppEmbedder`. Swap flow: `register_embedding_backend(factory)` + `reset_shared_embedder()` replaces the singleton (pass `None` to restore the default). A backend with a different `model_id`/`dim` produces incomparable vectors — the knowledge library's `embed_signature` is derived from `embedding_space_signature` and so folds BOTH in, meaning a swap (including a width change at a constant model id) automatically triggers the sig-gated knowledge re-embed; vector memory re-embeds via `migrate`.
 
 **Shared embedding budget.** Native inference has one shared worker and model.
-The normal interactive default is four native threads; background bulk work
-defaults to one. Explicit normal and bulk thread settings are honored within
-the available CPU count and the existing configuration range of 1–256; a bulk
-value of 0 inherits the ordinary thread setting. At most eight pending native
+The normal interactive default is four native threads, capped at one core below
+the host's CPU count and never below one thread, so the event loop keeps a core
+wherever there is one to spare; background bulk work defaults to one. A normal-thread value equal to that four-thread default reads as
+the default policy rather than as operator intent, because a whole-document config
+save materializes it. Any other explicit normal or bulk thread setting is honored
+within the available CPU count and the existing configuration range of 1–256; a
+bulk value of 0 inherits the ordinary thread setting. At most eight pending native
 jobs are retained, with
 two slots reserved for interactive queries; overflow returns `None`, leaving
 unembedded writes eligible for ordinary backfill. Native batch calls contain
@@ -2173,7 +2176,9 @@ When vector memory is active, lessons are stored as semantic entries:
   carrying `repo_scope` folds the scope into the hash, so the same rule scoped to two
   repositories is two rows and an unscoped row keeps its historical key byte-for-byte.
 - Value: a mapping `{"rule": ..., "category": ..., "negative": ...}` — the NOT-clause
-  — plus `"repo_scope": ...` when the lesson is restricted to one repository. The key
+  — plus `"repo_scope": ...` when the lesson is restricted to one repository. A
+  `"applies"` key is present only when the writer named a tier (`"always"` or
+  `"on_topic"`); absent means unstated and is the byte-identical legacy shape. The key
   is absent for a global lesson, so no migration was needed. A `repo_scope` that is
   present but not a usable string is withheld from injection rather than read as
   global, and is refused at every write surface.
@@ -2578,7 +2583,8 @@ the `memories` category. A **foreign memory row the source types as a
 `directive`** is also an instruction, not a fact, so it lands in the same lesson
 tier (`_add_db_directive`) under the same identity guard and ceiling rather than
 being dropped. Import contributes at most 50 lessons
-(`_MAX_IMPORTED_LESSONS`) because `LessonStore` prunes oldest-first at 200; an
+(`_MAX_IMPORTED_LESSONS`) because `LessonStore` prunes at 200 (by tier, findings
+first, then unstated rows, then authored rules — each oldest-first); an
 unbounded import would silently evict the user's own accumulated corrections. What is excluded
 is the persona *role*: a foreign persona document never becomes Kiro Crew's
 persona (that surface is theme-pack persona, gated by
@@ -2773,7 +2779,15 @@ remain durable.
 
 **V1 migration**: `migrate_from_markdown()` reads `lessons.jsonl` and writes each entry as `lesson.*` semantic key with `source=migration, confidence=0.9`. User-explicit lessons (confidence 1.0) can't be overwritten by migration. V2 refuses this importer.
 
-Categories: `tool`, `preference`, `knowledge`. Injected as a `[Learned corrections]` block. V1 background context retains every eligible, project-scoped lesson without query ranking or ordinary-budget truncation while the complete protected context remains below its model-safe ceiling; V2 keeps its essential-delivery and scope gates. The ceiling is `max(3 * 33,000, floor(model_window_tokens * 4.0 * 0.125))` characters. Crossing it trims only complete lesson entries, preserving preferences and safety rules; a preferences file that alone exceeds the ceiling is the one exception, kept from its head with an in-prompt notice naming the omitted character count and the file to read. Vector lessons keep the lexical relevance order already computed for the request; JSONL fallback has no relevance score and keeps newest entries first. The prompt reports the exact omitted lesson count and points to `memory_recall`. Content below the ceiling is byte-identical. Explicit lesson readers can use hybrid relevance and fill the caller's character budget, reporting shown and omitted counts. The JSONL store retains `_MAX_LESSONS_TOTAL = 200` and prunes oldest-first beyond that. The listing surface is bounded too — `GET /api/lessons` returns one `limit`/`offset` window and carries `total` and `truncated` so `learn_list` can say `Showing N of M`; `VectorMemoryStore.get_lessons(limit, offset)` honours the offset only on the bounded read, and the unbounded read the scorers use ignores it. Contract: [learn-cron-dashboard](learn-cron-dashboard.md).
+Categories: `tool`, `preference`, `knowledge`. Startup injects lessons as TWO blocks with TWO separate, window-INDEPENDENT budgets, split on an authored `applies` field rather than on anything a reader could infer. `applies: "always"` is a standing rule and renders in `[Learned corrections]` under the `lessons` budget (22.6% of the 33,000 base); `applies: "on_topic"` is a past finding and renders in `[Learned experience]` under the separate, smaller `lesson_experience` budget (5%). The write surfaces that state it today are the `learn_add` MCP tool (whose schema carries the enum and whose description tells the model to decide from what the user said, not from wording), `POST /api/lessons`, and the CLI reaching that route; consolidation states none, so its extracted rows stay unstated and take the rule tier. A row with NO `applies` value — every lesson written before the field existed, and any unrecognized stored value — reads as **unstated** and is served in the rule block, because demoting a real standing rule is the costlier mistake. Within the rule block, authored `always` rows are ordered AHEAD of unstated rows: ranked together on recency or relevance, a crowd of untagged rows displaces exactly the rules the user was most explicit about. The two budgets are separate rather than one shared allowance so a user with many findings cannot crowd out their own rules and vice versa; they are not added into a larger total, and a wider model window does not enlarge either one. The model-safe protected ceiling, `max(3 * 33,000, floor(model_window_tokens * 4.0 * 0.125))` characters, still bounds the two blocks TOGETHER, with one deliberate exception: a block's MANDATORY frame — its label plus the omission notice — is rendered even when the remaining ceiling is too small to hold it, so the two blocks can exceed the ceiling by those frames. That is the same trade as the preferences exception below: a silently absent block is indistinguishable from "this user has no rules", and the frame is a bounded constant while the entries it announces are not. The rule block is served first so a finding yields to a rule rather than the two sharing a shortfall. V2 keeps its essential-delivery and scope gates. **A findings tier is WITHHELD when the request matches none of it.** Ordering alone left a bare greeting spending the entire findings allowance on the newest rows, which are unrelated to the request by construction; `on_topic` means "worth having when the task touches it", so a request that touches none of them gets none of them. The test is the SAME tokenization each store's own ranking sorts with — `any_request_overlap` (unstemmed) for JSONL, `VectorMemoryStore._any_lesson_overlap` (stemmed, the keyword half of `_rank_lessons`) for the vector store — because ordering and admission must read one signal or a tier is suppressed for a match its own ranking found; the vector store stems, so it matches strictly more and must not borrow the unstemmed answer. This costs no recall that filler provided: newest-first never rescued a near-miss either, since it surfaces the newest rows rather than the closest. It applies to findings ONLY — a standing rule, and an untagged row served as one, arrives whatever the message is about. Two boundaries: a request is needed for the test to mean anything, so a caller that supplies NO `query_text` keeps the previous behaviour and stays byte-identical, and a tier with no findings at all renders nothing rather than an empty block. `render_withheld_tier` renders the frame with a notice naming the withheld total, stating that this is not a budget limit, and pointing at `memory_recall`/`learn_list` — a silently absent block reads as "this user has no findings", which is the reading that stops anyone from going to look, and the notice is also what lets the NEXT turn act on findings the greeting turn did not carry. Measured on a 10,000-finding store: a greeting's findings tier costs 298 characters with 0 findings injected instead of filling the 1,650-character allowance, while a matching request still receives 6.
+
+**Startup selection is not re-run per turn, and the withheld notice is what carries the gap.** A session that opens with a greeting and then states its real task on the next turn keeps the greeting turn's lesson selection: the warm path does not reselect. That predates the budgets, and no per-turn retrieval trigger is added here — one would need its own trigger condition, its own budget, and its own coverage across resume, fork and compaction, which is a second mechanism rather than a bound on this one. What the budgets change is that the gap is now VISIBLE where it was not: the greeting turn renders the withheld notice naming the total and the tool, so the follow-up turn is looking at an explicit pointer instead of at filler that silently displaced the finding it needed. Closing it properly is deliberately left to a change that owns the retrieval trigger.
+
+Crossing a budget trims only complete lesson entries, never a partial rule, and an entry too large for the room that remains is SKIPPED rather than ending the selection: the kept set is then a superset of what stopping would give, since an oversized entry is dropped either way and continuing can only add later entries that do fit, never displacing one already accepted. Stopping wasted room a shorter, more relevant entry could have used — five in-budget rows rendered 1,408 of 1,650 characters while omitting a later 76-character line with 242 characters free. Preferences and safety rules are never sliced to make space; a preferences file that alone exceeds the ceiling is the one exception, kept from its head with an in-prompt notice naming the omitted character count and the file to read. Vector lessons keep the lexical relevance order already computed for the request. The JSONL fallback orders EVERY tier the same way (`order_by_request_relevance`, length>=3 word tokens, no stemming and no embedding), and orders them PER TIER so authored rules keep their precedence over untagged rows: newest-first alone drops a row the task is actually about while newer irrelevant ones fit, measured on a 199-lesson store for the findings tier and on a 100-row all-untagged store for the RULE tier — every pre-field row lands in the rule tier, so leaving that tier unordered lost an exact-topic match the vector store kept, since the vector path ranks its whole eligible set before partitioning. Ordering is NOT admission: it decides only which rows survive a truncation that is going to happen anyway, so no row is dropped for being irrelevant that the budget would otherwise have kept. The residual is real and is why the omission notice exists — inside an OVERFLOWING rule tier a standing rule unrelated to this message sorts last and can be the omitted one, which the notice names and points at `learn_list` for; ordering cannot both favour the current task and ignore it. An empty query, or no overlap anywhere, leaves the stored order untouched and renders byte-identically. Both tiers' findings header reads "relevant ones first", which is what each renders: the sort runs before the block is built and deliberately lets an OLDER relevant finding outrank newer irrelevant ones, so a header reading "newest first" would describe the pre-sort order and be false for exactly the crowded store the budget exists to serve. The sort is stable, so equal-overlap rows still read newest-first underneath. **An overflow is always reported and never silent**: each block's notice names its own shown/omitted counts, names the budget it hit, states that the limit is a budget rather than a judgement that the rules stopped applying, and points at `learn_list` (rules) or `memory_recall` (findings). A budget too small for even one entry still renders the labelled block with that notice, because an empty block is indistinguishable from "this user has no rules". Startup spends no embedding inference on either tier. Content below both budgets is byte-identical to the previous behaviour, and a caller that names no budget (every reader predating them) is unchanged: for it the rule block keeps the two-stage contract — COMPLETE below the model-safe ceiling whatever `caps.lessons` says, which is the pinned retain-every-eligible-in-scope-rule invariant, and only an overflow, where that invariant is already unmet, trims to the ordinary lessons budget (`min(caps.lessons, ceiling)`, and the ceiling alone when no lessons budget is named). Naming a tier budget is what asks for a window-independent bound instead, so the two mechanisms never both decide one block, and the rule tier's overflow notice names `learn_list` and `memory_recall` because both reach the omitted rules. Explicit lesson readers can use hybrid relevance and fill the caller's character budget, reporting shown and omitted counts. The JSONL store retains `_MAX_LESSONS_TOTAL = 200`, and prunes **by tier**: findings first, then unstated rows, then authored rules, each oldest-first within its class. A tier-blind `[-200:]` deleted the user's oldest authored rules from disk as cheap findings accumulated, which is strictly worse than a prompt omission — an omission is announced and readable through `learn_list`, a pruned row is gone. Authored rules are evicted only when they alone exceed the cap. A submission the prune itself removes is reported as `refused`, never `inserted`: at the cap a new `on_topic` row is the first eviction candidate, and reporting success for a row that is not in the file is a silent false success the caller cannot recover from. That refusal carries its OWN reason, `store_at_capacity`, and not the content refusal's `volatile_session_fact`: the JSONL store answers both of its refusals with the same bare `refused` string, so `POST /api/lessons` re-derives the cause by re-running the volatile-text predicate — exact rather than a guess, since those are the store's only two refusal paths, and the same re-derivation the listing surface already performs for its withheld marker. Telling a user whose store is full to reword a rule is advice that cannot succeed, so `learn_add` renders a distinct message naming the row cap and `learn_remove` as the action that frees a row. Only the JSONL store raises it; the vector store has no row cap and names its own reasons. The vector store's dedup scan carries the matching guard on the other side: its three delete branches decide on text alone, so an `on_topic` write may retire ONLY another `on_topic` row (the reverse is allowed, since promoting guidance to a standing rule is the direction the user is asking for). Unstated rows are protected too, not just `always` ones: an unstated row is served AS a standing rule at injection, and on an install whose lessons predate the field every row is unstated, so a guard keyed on `always` alone would protect nothing on exactly the stores holding the user's real corrections. Read side and write side classify a row the same way. The `POST /api/lessons` route's model-judged contradiction sweep is a SECOND deletion path ending in `delete_semantic`, and it filters its candidates by the same rule, because guarding one path and not the other leaves a standing rule deletable by a finding. That filter reads the PERSISTED tier, which `write_lesson` reports as `LessonWriteResult.applies`, never the submitted one: the tier is write-once, so a clause-only re-submit of a stored finding — the ordinary enrichment this route documents — omits `applies`, which arrives as `None` while the row keeps `on_topic`. Gating on the submitted value therefore skipped the guard on exactly that input and let the sweep retire a contradictory standing rule, with no recovery, since the sweep's self-heals-next-time note covers a MISSED sweep rather than a wrong deletion. `find_contradiction_candidates` therefore carries each candidate's authored tier on the row it returns: the filter can only apply the guard to a tier it can read, and a candidate without one reads as unstated for EVERY row, which turns the narrowing into a blanket no-op that judges no contradiction at all on a finding submission. It carries each candidate's stored `value_json` too, and the sweep hands it back as `expect_value_json` so its delete is a COMPARE-AND-DELETE. Without it the tier filter is defeatable by timing rather than by tier: the candidates are a write-time snapshot, the delete runs after a per-candidate LLM verdict, and `_lesson_key` keys on rule text plus scope alone — so re-tiering that rule in between (a delete plus a re-add, the documented way to change a tier) puts a DIFFERENT row under the same key, and an unconditional delete tombstones the replacement, including when the replacement is the `always` row the filter exists to protect. A body that changed is reported as kept, not as an error: the row this decided to retire is gone, and a contradiction against whatever replaced it is re-nominated by the next write touching the topic. This is the same guard the inline dedup pass already applies to its own deferred supersedes. The guard gates deletion only, so an `on_topic` rule already contained in an `always` rule is still declined as `substring_covered`. The DECLINE carries the MIRROR of the same rule, because tiering is what makes "already covered" conditional: a submission is covered only while the covering row arrives at least as often as the submission would, and a covering `on_topic` row arrives only when the request is about it. So a STANDING submission (`always`, or unstated) contained in an `on_topic` row is NOT declined — declining it would drop the rule from every unrelated turn while reporting `substring_covered` for a row that does not cover it there, and a re-submit is declined identically so nothing recovers it. In that one direction the submission is stored instead, which can leave a standing rule beside the longer finding containing it; that duplicate is the price of not silently refusing to create the rule. `migrate_from_markdown` carries the authored tier across for the same reason the adjacent lines carry `repo_scope`, and in the same direction: an omitted `applies` reads as unstated, which every read path serves AS a standing rule, so dropping it would promote a row the user filed as a past finding into one injected in every session. It normalizes READ-safely (`authored_lesson_applies`, not the write path's raising form) because that loop reads `lessons.jsonl` directly, so a hand-edited or future-schema value migrates the row as unstated rather than aborting the migration. The listing surface is bounded too — `GET /api/lessons` returns one `limit`/`offset` window and carries `total` and `truncated` so `learn_list` can say `Showing N of M`; `VectorMemoryStore.get_lessons(limit, offset)` honours the offset only on the bounded read, and the unbounded read the scorers use ignores it. That route also reports each row's tier, and `learn_list` marks a finding as `(applies: on_topic)` beside the rule: every overflow notice sends the reader to these surfaces, so a row filed as a finding has to be legible there or a rule the model misfiled stops arriving with nothing to show why, and re-tiering (a delete plus a re-add) cannot even be diagnosed. Only `on_topic` is marked and only an AUTHORED tier is reported — a standing rule and an unstated row are both injected every session, so marking one and not the other would name a difference the injection path does not make. Contract: [learn-cron-dashboard](learn-cron-dashboard.md).
+
+**`applies` is AUTHORED, never derived, and that is the whole reason it is stored.** No property of a stored row separates "a rule the user wants enforced in every session" from "something we worked out once". `source` does not: the consolidator can extract a real safety correction, and a human can type a note about last week's outage. `category` does not: its three values describe subject matter. Keyword shape does not: "always" appears in both classes and reliably in neither. A reader that guessed from any of those would re-decide the user's intent on every turn, and would fail silently in the direction that costs most. So `normalize_lesson_applies` accepts only the two literals, RAISES on a misspelling at the write path (there is no safe clamp — one choice injects a note into every session, the other demotes a standing rule, and both are silent), and treats an omitted value as the supported choice to leave the row unstated. The read path never raises: a hand-edited or future-schema value reads as unstated so one bad row cannot abort prompt assembly for every other lesson. The field is additive and absent when unset in BOTH stores -- the vector writer omits the key, and the JSONL writer drops a `None` through `_serializable` rather than emitting `"applies": null`, which would rewrite every legacy line on the next save and make the two stores disagree about what absence means -- so an unstated row is byte-identical to what the writer produced before the field existed; on the enrich path it is WRITE-ONCE like `category` and `repo_scope`, so enrichment cannot silently demote a rule and re-tiering is a delete + re-add.
+
+**The compatibility limit is real and is not papered over.** A store whose lessons all predate `applies` gets its reduction from the budget alone, not from classification: every row is unstated, so they all compete for the rule budget and the overflow notice is what tells the user which ones did not fit. Classification only starts helping as new lessons are written with a stated value. "Retain an unbounded number of unstated rules" and "a small fixed startup budget" cannot both hold; this is the side that was chosen, and the notice is the mechanism that keeps the trade visible instead of silent. No existing row is rewritten, reclassified or deleted by this change.
 
 Vector scoring builds one scorer per query (`_stored_similarity_scorer`) so the query vector and its norm are derived once instead of once per lesson — the same hoisting `_sqlite_vector_search` does for episodic rows. There is a numpy path and a stdlib fallback, because numpy is guarded by `_HAS_NUMPY`; both produce the same ranking. Stored lesson vectors are un-normalized (unlike episodic vectors, which are L2-normalized for FAISS inner-product scoring), so both norms are divided out per row rather than assuming unit length. A row whose vector has a different dimensionality than the query — a row written under a previous embedding model — is incomparable and scores 0.0, matching `_sqlite_vector_search` and `HybridRetriever._cosine_similarity`, rather than being truncated against the query's leading elements.
 
@@ -2854,6 +2868,22 @@ introduce fragment-loading machinery solely to deduplicate prose.
 Frontmatter is parsed line-by-line (`_parse_frontmatter`): only a column-0 `key: value` line is a field. A value that is a bare block-scalar indicator (`>`, `|`, optionally chomped with `-`/`+`) is resolved from the indented lines that follow — folded (`>`) folds single breaks to spaces while preserving blank-line counts and more-indented line breaks, literal (`|`) preserves newlines — so a multi-line `description` still routes. Explicit indentation indicators (`>2`) are not supported. The other frontmatter readers stay reconciled with this resolution: the onboarding import gate treats a bare indicator as an activating `always` value (fail-closed), the auto-skill update path's `history._frontmatter_value` resolves block scalars the same way, so a live skill's block-scalar `description`/`triggers` survive the staged-candidate round-trip instead of collapsing to the indicator character, and the skill-provider preview endpoint (`dashboard/handlers/discover.py`) parses SKILL.md with the loader's own grammar, so the previewed name/description match what the installed skill will show.
 
 Supports nested directories (e.g. `skills/utils/tiny-url/SKILL.md`). The skill name is the relative path from the skills root (e.g. `utils/tiny-url`).
+
+Cold discovery overlaps filesystem I/O through a bounded worker pool. Global
+directory probes are committed in sorted depth-first order, preserving the same
+winner for aliases and pruning cycles before descent. Confined project walks
+retain their descriptor-pinned traversal. Metadata reads use bounded batches,
+carry the caller's context variables, and join before returning; catalog size
+does not determine the number of threads or queued futures. The usage ledger
+stays on the calling thread. Prompt construction derives pinned instructions
+from the admitted metadata rows instead of scanning the catalog again. It still
+discovers every eligible skill and delivers required instructions on the first
+turn; a cold catalog is not silently treated as empty. Metadata term replacement
+uses a path index, so refreshing one skill does not scan every other skill's
+terms. Opening an existing cache adds this index without discarding its rows.
+Debug catalog logs separate snapshot loading, directory scanning, metadata
+assembly and index persistence. This reduces cold latency without promising a
+constant-time scan of an arbitrary filesystem.
 
 **Source precedence** (project-level wins): `$KIROCREW_PROJECT_DIR/skills/` → `builtin_skills/` (bundled). Auto-copied to `~/.kiro/crew/skills/` on first run. Copies entire skill directories (scripts, assets, etc.).
 
@@ -2992,9 +3022,11 @@ capability check, not a best-effort `lstat` sequence; a pre-check followed by a 
 scan leaves the same swap window. Project skills remain available on macOS and Linux,
 where every traversed component stays pinned to a no-follow directory descriptor.
 
-**One enforcement point for every enumerated read.** Enumeration is TTL-cached, so a
-path vetted while genuine can be replaced by a link out of the granted directory before
-anything reads it — and the root that made it acceptable is only known at enumeration
+**One enforcement point for every enumerated read.** Enumeration is cached, and now
+also PERSISTED across processes (see *The catalog snapshot*), so a path vetted while
+genuine can be replaced by a link out of the granted directory before anything reads
+it — over a longer window than an in-memory TTL alone implied — and the root that made
+it acceptable is only known at enumeration
 time. So `_iter_uncached` records, per path, the root it was vetted against, and
 `SkillsLoader._read_enumerated_skill_bytes` is the only place an enumerated skill file is
 read: it re-checks that root on the *descriptor it opened* (`O_NOFOLLOW` + `fstat`), not
@@ -3024,18 +3056,11 @@ trust-preview catalog omits the row, and direct project `load_skill` applies the
 cap. Oversize and outside-root refusals have distinct log messages. No confined path
 stat is added.
 
-No confined project path is rendered into agent-facing context. Both the legacy and
-budgeted initial skills blocks inject admitted project skills as bodies through
-`load_skill(..., project_dir)` and reserve path summaries for unconfined skills. The
-trigger split and pointer-hint renderer enforce the same rule later in a turn. This
-prevents a checkout from replacing an already-enumerated `SKILL.md` with an escaping link
-and persuading the agent to reopen it directly after the descriptor-confined read. Session
-start and post-compaction callers also pass the skills section cap as a confined-body
-budget even when lazy loading is off. Bodies that fit are injected whole; bodies that do
-not fit are omitted rather than exposed as unsafe paths. The loader checks the enumerated
-size before opening and passes the remaining budget into the descriptor-pinned read, so a
-replacement race or many large project skills cannot materialize more body text than the
-section can retain.
+No confined project path is rendered into agent-facing context. Startup lists
+project skills with a scoped exact-read pointer, and only required project bodies
+are read at startup. Explicit reads and trigger delivery retain the descriptor-pinned
+reader and project byte cap. This prevents a checkout from replacing an enumerated
+file with an escaping link and persuading the agent to reopen that path directly.
 
 The mutable trust-store reader likewise refuses a non-object grant row instead of
 filtering it: grant and revoke must never rewrite a partially unknown store and silently
@@ -3096,9 +3121,8 @@ serve the prior project's fresh catalog for the cache TTL. Both production compo
 provide that project identity. A caller that cannot provide it gets a zero-staleness
 fallback, so closing and reopening the picker revalidates the ambiguous cache key.
 
-**`search_skills` stays project-blind.** Only a session key reaches that boundary and
-resolving a project from it needs a seam that does not exist yet, so the MCP tool
-continues to search locally installed skills only.
+**Search is session-scoped.** Signed sessions resolve their project and active
+agent mapping at the gateway; unsigned MCP fallback remains global-only.
 
 The bundled `session-summaries` skill is on-demand, guidance-only: it explains the
 chat session summary panel (see [session-summary](session-summary.md)) — what it
@@ -3170,19 +3194,143 @@ or authentication refusal never falls back to the costly legacy loop.
 
 Skills with auxiliary files (scripts, assets) include `dir` path so the LLM can `cd` and run them.
 
-**Discovery (`skills.lazy_load`, default false):** startup and post-compaction
-assembly always use a bounded skills entry. OFF selects a short `skill_search`
-pointer for ordinary unmapped skills; ON selects the existing usage-ranked
-index within the same section allowance. Neither increases the shared background
-budget. Direct `get_context(budget=None)` remains available to explicit catalog
-readers, but is no longer the startup default. Pinned full instructions, confined
-project-body reads, native mapping gates, explicit `$skill` loads, trigger settings
-and byte-identical deduplication are preserved. No final slicing may cut pinned
-instructions or the discovery footer.
+**Discovery (`skills.lazy_load`, default true):** startup and post-compaction use
+one bounded directory. The default is the usage-ranked index with a family hint
+for omitted rows; false selects a shorter search pointer. A `skill://` mapping
+restricts availability, not eager body delivery. Directory, search, paginated
+list, exact reads and `$full/key` expansion resolve the same project-aware mapping.
+Unqualified `$leaf` fallback is permitted only when unique. External mapped files
+use stable `mapped/<path digest>/<leaf>` keys; a mapping cannot re-admit disabled
+apps or bypass the existing project consent boundary.
+
+Ordinary mapped and project skills are activated on demand. `skill_search` always
+provides `action="list"` plus `offset` for complete discovery and `action="read"`
+plus the exact `key` for activation, even while the body index is incomplete.
+Required `always:true` bodies share `PINNED_SKILL_BODIES_CAP` (99,000 UTF-8 bytes),
+including rendered framing. Exceeding the capacity or refusing a required read
+raises `SkillContextCapacityError`; no final slice may silently discard required
+instructions. Bounded global reads use `safe_read_file_bytes_nolink`, retaining
+sensitive-path, descriptor identity and hardlink checks while allowing validated
+provider links. Project reads retain descriptor confinement and their byte cap.
+The explicit unbudgeted catalog renderer remains available to non-startup callers.
+
+Native Kiro 2.21.2 progressively loads bodies but places every mapped skill's
+metadata into startup context. Native CLI launch views omit those skill resources
+and suppress implicit native skill inheritance; Crew supplies the bounded directory.
+The authored agent spec remains the mapping authority. See
+[context management](../../architecture/context-management.md#4-default-agent-vs-other-agents)
+for native view and inherited steering behavior.
 
 **Usage ledger (`skill_usage.py`, `SkillUsageLedger`):** in-memory per-skill hit tally with debounced, atomic persistence to `skill-usage.json` (`SKILL_USAGE_FILENAME`, co-located with the Kiro Crew home). Entries older than a 30-day TTL (`_MAX_AGE_SECS`) are dropped on load/flush so a stale skill stops occupying a top-K slot. Hits are recorded in two places: the **body-delivery loop** in `context.py` (`_record_use`, called only after `load_skill` succeeds and the body is appended to the prompt) and in `resolve_dollar_skills`. However, since `max_triggered` defaults to 0 the body-delivery recorder is inactive in stock config — `$skillname` is the only source of hits, so lazy-load ranking is effectively recency-only unless the trigger matcher is re-enabled (`max_triggered > 0`). A trigger match alone does NOT earn a hit — only actual delivery does, so pointer-only skills and false-positive matches do not inflate the ranking. Best-effort: ledger init failure falls back to recency-only / unweighted ranking without breaking skill loading.
 
-**`skill_search` MCP tool (`kirocrew-core`):** greps skill name/description then, only on a metadata miss, the skill body (bounded, tool-call only — never per message). Schema in `mcp_core.py`, validated against `SKILL_SEARCH_SCHEMA` (`validation.py`). Does NOT record usage — searching is not using. Scope is **locally installed skills only**.
+**`skill_search` MCP tool (`kirocrew-core`):** supports `search`, `list` and `read`.
+A signed session resolves its active template and project at the gateway. An
+unreadable or missing custom template fails scope resolution rather than widening
+to the global catalog. A custom template with no mapping has an empty scope; only
+the default `kirocrew` template without mappings gets the global catalog. An
+unsigned caller searches the global installed catalog, without borrowing a session.
+Search combines metadata and body term matches: query coverage first, then inverse
+term frequency, metadata coverage, usage and stable full key. This prevents common
+metadata words from burying a result carrying multiple query words in its body.
+Search/list have stable-key results and offset pagination; search does not record
+usage. Exact reads share the resolved mapping and the bounded file reader.
+An external mapping rooted above a catalog prunes that catalog before descent.
+Its entries come only from normal discovery, retaining project consent, no-link
+confinement, disabled-app filtering and first-wins precedence.
+Each literal external `SKILL.md` mapping scans its own directory, so sibling
+skills are not scanned again for every explicit mapping.
+
+**Term index (`skill_search_index.py`, `SkillSearchIndex`):** metadata and body
+queries answer from a SQLite term index at `skill_search_index.sqlite3`
+(`SKILL_SEARCH_INDEX_FILENAME`, beside the usage ledger), not by reading files. Read
+from disk, the fallback cost one file read per skill on every call, so the query that
+needs the body most — one matching no metadata — was the one that read every
+`SKILL.md` present, at a cost following total body bytes rather than the number of
+matches. Global metadata is persisted beside body terms with the same file identity
+fingerprint; a new loader can reuse both without reading unchanged skill files.
+Metadata also stores a digest of the complete global skill file. Ranked search
+uses that digest to collapse byte-identical mirrors without reopening their bodies;
+paginated listing and exact-key reads retain every key. Schema changes rebuild this
+disposable index. Short-lived consumers close their loader's SQLite handle before
+returning or removing an owned temporary data home.
+Enumeration and stat checks still run, so zero reads does not mean zero filesystem
+work. Cold body refresh is incremental (250 ms per query), with a separately bounded
+read fallback and an explicit incomplete flag. Repeating a query advances refresh;
+listing and exact reads do not wait for the index. Debug timings distinguish catalog
+enumeration, metadata reads and body-index refresh/query work. Confined metadata and
+bodies are never persisted in this global index. The index stores each skill's distinct body terms, from the same
+`recall_terms` tokenizer the query goes through. Indexed bodies are admitted through
+`safe_read_file_bytes_nolink`, so a link, hardlink, sensitive target, non-regular file
+or file swapped between validation and open cannot place terms in SQLite. Rows use a
+`device:inode:ctime_ns:mtime_ns:size` fingerprint: the added inode identity and change
+time distinguish a same-path replacement that preserves modification time and byte
+size, while keeping the warm path metadata-only. These properties are load-bearing:
+
+- **Confined project bodies are never indexed.** A project skill is read through the
+  descriptor-pinned reader under `PROJECT_SKILL_BODY_CAP`, and its text belongs to
+  that checkout; a home-level copy of its terms would outlive the grant and be
+  visible to a session that never opened the project. Those skills keep the
+  read-at-search path, bounded by the project's own skill count.
+- **Prefix, not free substring.** A stored term matches a query term that is its
+  prefix, so `deploy` still reaches a body saying `deployment`, and the range scan
+  replaces the corpus-sized read. The exclusive upper bound is the term with its
+  last code point incremented (skipping the surrogate block, `None` above the
+  maximum), not a high sentinel: `\uffff` encodes as `EF BF BF` while an astral
+  character starts at `F0`, so a sentinel bound sorted BELOW the astral terms it
+  was meant to include. A query term strictly INSIDE a body word stops matching:
+  the query is tokenized the same way, so that case is a near-miss rather than a
+  hit — `rollback` no longer matches a body whose only occurrence is inside
+  `scrollback`.
+- **One lock-guarded connection.** The connection is opened with
+  `check_same_thread=False` and every public method takes an `RLock`. A skill
+  search legitimately arrives on different threads (the dashboard route hands it
+  to a thread, the MCP tool runs in its own subprocess), and because a raise
+  latches the index unusable, a thread-bound connection would drop every later
+  search back to reading files for the life of the process.
+- **The tokenizer is part of the key.** Stored terms are `recall_terms` output, so a
+  change in how it splits or normalizes leaves rows a new query can no longer match —
+  a miss, with nothing raised and nothing logged. `tokenizer_signature()` hashes the
+  tokenizer's ANSWER on a fixed probe and sits beside the schema version, so a
+  mismatch drops and rebuilds without any future editor having to remember a bump.
+  Hashing its source was rejected: a comment or a rename would discard every row for
+  no behavioural reason.
+- **Both paths score alike.** The direct read tokenizes and prefix-matches through
+  `_body_term_hits`, the same rule the index applies, because both can answer inside
+  one search. A substring scan on the read side would make a skill's rank depend on
+  which side answered for it.
+- **A declined body costs only itself.** `sync` answers with the set of keys it
+  cannot store. The caller retries those through the bounded safe reader with
+  the same admitted root; hardlinks and other unsafe files remain refused. One
+  pathological file does not send the whole catalog back to reading every body.
+  Stale terms for a refused key are deleted and no fingerprint is stored, so the
+  refusal is retried rather than cached.
+- **Best effort.** A read-only home or a corrupt file makes methods return `None`;
+  search falls back to bounded body reads and reports incomplete recall when its
+  work budget expires. Discovery does not require a writable database. A BUSY or
+  locked database does not latch the index unusable: another process holding the
+  write lock past the two-second timeout says nothing about the file's health.
+  Deleting the file costs one re-index; a schema bump drops and rebuilds it.
+
+Ranking orders distinct query-term coverage, then term rarity, metadata coverage,
+usage, and the stable key. A term found in metadata and body counts once; metadata
+coverage breaks a tie rather than outweighing other words found in the procedure.
+
+Explicit entry provenance distinguishes project, global and external mapped rows;
+a legitimate `mapped/...` catalog key never changes its admission or body budget.
+External mapped rows retain the canonical root admitted during enumeration for
+metadata, indexed/fallback body search, exact reads and `$` activation. A later
+ancestor swap must not redefine that root. Approved provider targets retain their
+own admitted roots; external mappings retain the global body allowance rather
+than the smaller project-body allowance.
+
+Installed exact reads also accept POST `/api/skills/-/discover` JSON with
+`scope="installed"`, `action="read"` and `key`. MCP uses this transport so URL
+escaping and HTTP request-line limits do not truncate nested keys. GET remains
+compatible. Both gateway and MCP accept up to 32,768 key characters; the POST
+request envelope is bounded at 512 KiB, and existing body-response limits remain.
+The same signed session, app-slot guard, mapping and project consent determine
+access. An unresolvable bound agent fails closed with HTTP 409 and
+`skill_scope_unavailable`, without falling back to the global catalog.
 
 **Direct reads.** The model reaches most skills by reading `SKILL.md` itself — a
 file-read tool, or `cat` in a shell — which bypasses the loader and so recorded
@@ -3238,8 +3386,10 @@ yields no candidate is therefore logged at debug — the one signal that separat
 tool-name drift from a legitimately non-reading call.
 
 `_maybe_note_skill_read` resolves at the tool call and **offloads to a thread** —
-resolution walks the skills tree after cache expiry and resolves every served
-skill, which on the event loop would stall every session in the gateway. Both the
+resolution resolves every served skill, which on the event loop would stall every
+session in the gateway. It no longer walks the tree after cache expiry (the
+snapshot serves the list and expiry only schedules a re-walk), but the resolution
+itself is still per-skill filesystem work and stays off the loop. Both the
 initial `tool_call` and its `tool_call_update` refinement are observed, since
 which one carries `rawInput` is provider-specific, deduped by `tool_call_id`.
 `_maybe_credit_skill_read` then records only on a `status == "completed"` result
@@ -3353,12 +3503,175 @@ the very publisher it warns about. `skill_discover` additionally clamps those
 fields per entry (name 120, id 200, author 80, description 240) so one padded
 entry cannot crowd the other candidates out of the response.
 
+**The catalog snapshot — no turn waits for discovery.** `_iter` answers from one of
+three tiers, none of which walks the tree on the calling thread:
+
+1. this loader's in-memory list, inside `_ITER_CACHE_TTL_SECS`;
+2. the same list past that deadline. Expiry queues a re-walk on the
+   `skill-catalog-refresh` worker and returns the stale list. This is the point of
+   the tier: the deadline used to be BLOCKING, so on a large tree the message that
+   happened to arrive after expiry paid a full walk — about one message in twelve
+   was seconds slower for no reason a user could see;
+3. the stored enumeration for this root set (`skill_catalog` / `skill_catalog_scope`
+   in `skill_search_index.sqlite3`). A restart lands here, and so does every
+   short-lived loader — the unsigned MCP fallback in `mcp_tools/skills.py` builds one
+   per call — instead of walking.
+
+The scope key is a digest of the skills root, the resolved `extra_paths` and the
+trusted project key (`_catalog_scope_id`), because two loaders can share a project
+and still enumerate different trees. Stored rows keep their **ordinal**: enumeration
+order IS precedence, so a re-ordered snapshot would hand a caller a different file
+for the same skill name than the walk would.
+
+A snapshot records only what EXISTS. It is not an authority on who may read it:
+mapping scope, disabled apps, project consent and `repo_scope` are all re-evaluated
+live on top of a served list, and every body still goes through
+`_read_enumerated_skill_bytes`. A revoked project grant is therefore not merely
+unused but unreachable — `_trusted_project_key` turns back into `""`, which selects
+a different scope than the one holding that project's rows. It is also not an
+authority on CONTENT: the stored stat fingerprints are deliberately never returned
+by `_load_catalog_snapshot`, because nothing knows how old they are, and trusting
+them would make a restart serve a description for a file edited out of band since. A
+row may name a file; it may never vouch for its bytes.
+
+**A stored row is not an admission, and the index is agent-writable.**
+`skill_search_index.sqlite3` is a VISIBLE crew-home leaf, so a row is a CLAIM that a
+path was once enumerated, never evidence that anything vetted it — and the unconfined
+branch of `_read_enumerated_skill_bytes` is a direct `read_bytes()` with no
+sensitive-path or UNC screen of its own. Two things therefore stand between a stored
+row and a read, split because they cost differently:
+
+* **at adoption, containment AND key/path binding.** An unconfined row must name a
+  path under `_snapshot_admitted_roots()`: this loader's skills dir, its resolved
+  `extra_paths`, or the same provider roots the mapping walker admits — an app
+  symlinks its skills into the tree, so a legitimately admitted target sits outside it
+  by construction. The key must also DENOTE that path (`_key_denotes_path`): the two
+  fields are consumed by different gates — a mapping is matched against the path while
+  the body is delivered by re-resolving the key — so a row pairing one skill's key with
+  another's path would pass a mapping admitting the second and serve the first. Both
+  checks are lexical, so screening a whole snapshot costs no syscalls. A row that fails
+  either refuses the WHOLE snapshot rather than being dropped: a trimmed catalog would
+  be served as the complete enumeration, and falling back to the walk loses only speed.
+  The same holds for a confined row whose root is not the trusted project key that
+  selected the scope, and for a table past `_MAX_CATALOG_ROWS` (100,000 rows) or
+  carrying a field wider than `_MAX_CATALOG_FIELD_CHARS` (4,096) — unbounded
+  materialization of an adversary-controlled table is an out-of-memory crash on load.
+* **at the read, admission.** Containment does not say the file is still a regular
+  file in a non-sensitive place, so each surviving unconfined path is recorded in
+  `_snapshot_unadmitted` and `_admit_snapshot_path` re-runs `validate_file_path` on it
+  before its first read. Admitting retires it from the set, so a repeated read costs
+  nothing, and a walk that republishes the scope admitted every path it returned and
+  clears the set outright. A path this process walked never pays the check.
+
+That placement is what keeps the cost shape: the O(N) work stays on the walk, and
+admission is paid once per row actually read, at the one point every enumerated read
+already goes through.
+
+**Refresh is a background re-walk, not a per-file incremental index.** There is no
+filesystem watcher: an app-side mutation (`_invalidate_iter_cache`) is the immediate
+path, and everything else converges within `_ITER_CACHE_TTL_SECS` /
+`_CATALOG_REVALIDATE_AFTER_SECS` through a full re-walk on the worker. A watcher plus
+per-file updates would buy a smaller refresh, not a faster turn — the whole walk is
+already off the request path — at the cost of a new dependency and a second source of
+truth about what the tree holds.
+
+Mutations drop the stored snapshot AND move two counters. Both are needed, for
+different races: leaving the snapshot lets the next process serve the pre-mutation
+list; leaving the counters alone lets a walk already in flight publish its
+pre-mutation answer on top of the clear, an invalidation a background refresh
+silently undoes. `_catalog_generation` fences this loader's own worker, and the
+index's `skill_catalog_epoch` — read before a walk and re-checked inside
+`store_catalog`'s own `IMMEDIATE` transaction, because a deferred one leaves the check
+and the insert open to another process's `drop_catalog` landing between them — fences
+a walk running in ANOTHER process. A ROOT-SET change is a mutation for the same reason
+and takes the same path: `_adopt_extra_paths` invalidates rather than only clearing
+the in-memory list, since the stored snapshot belongs to the old root set. And
+`_run_catalog_build` captures its scope id BEFORE the walk and refuses to publish when
+the root set moved while it ran, so rows enumerated over one configuration never
+become another's answer.
+
+**The post-mutation cold window is intended.** An invalidation empties the list rather
+than serving the pre-mutation one, so on a tree whose walk outlasts
+`_COLD_CATALOG_WAIT_SECS` the next turn re-enters the cold path and carries the
+*discovery in progress* notice, with `always: true` bodies not yet injected. Serving
+the pre-mutation list instead would contradict the one thing the mutation path
+guarantees — that a skill written through the app is visible immediately — and would
+do it silently. The invalidation therefore also QUEUES the re-walk rather than waiting
+for the next turn to demand it, which bounds that window to the walk's own duration.
+
+A refresh is single-flight per scope, and the worker drains scopes SERIALLY, so
+several sessions in different trusted projects cost one walk of the shared global tree
+at a time rather than one each. A snapshot read off disk is revalidated only when it is
+older than `_CATALOG_REVALIDATE_AFTER_SECS`, so a process that starts, answers one call
+and exits does not queue a walk of a tree another process enumerated moments ago.
+
+The worker is a DAEMON thread, started on first need and never joined by `close()`,
+which sets `_closed` first so a build already running publishes nothing into a loader
+that is going away. `concurrent.futures` was rejected here for one measured reason: it
+joins its non-daemon workers at interpreter exit, so a walk this design deliberately
+abandoned would delay process exit instead (3.0s vs 0.05s on a 3-second task). A
+finished walk still PERSISTS, though: a build in flight keeps the index handle and
+closes it on its own way out, because on a host served only by short-lived loaders —
+the unsigned MCP fallback closes its loader as soon as one search returns — that store
+is the only thing that lets the next call skip the walk, so discarding it makes every
+call re-walk forever. `close()` also SETS every outstanding completion event, since a
+queued build the worker abandons never reaches the `finally` that would have set it
+and a cold caller would otherwise sit out its whole budget.
+
+**The one case that waits, and what it is allowed to withhold.** A scope with no
+stored snapshot at all — a machine's first run, or one whose index file was deleted —
+waits on the background build for at most `_COLD_CATALOG_WAIT_SECS`. A small tree
+finishes inside that budget, and finishing is what makes `always: true` bodies known
+and therefore honored. Past the budget the partial answer is served, the scope is
+marked in `_catalog_incomplete`, and `catalog_status()` reports `"building"` so a
+caller can distinguish "still discovering" from "no skills" — an empty list alone
+cannot tell those apart. `search_skills` reports the same thing through the
+`search_incomplete` flag the MCP tool and the dashboard already surface.
+
+`get_context` consumes that verdict rather than returning `""`: it emits an explicit
+*discovery in progress* notice saying the set may be incomplete and an always-loaded
+skill may not have been injected yet, charged against the caller's budget like any
+other block. This is the deliberate resolution of a real conflict, not an oversight.
+Required instructions must never be SILENTLY dropped (which is why
+`SkillContextCapacityError` fails loudly rather than trimming a body), and a first run
+cannot know which skills are `always: true` without enumerating. The tradeoff taken is
+to state the incompleteness rather than either block the turn on a large tree or
+present a truncated set as complete.
+
+**An exact key stays readable while that first walk runs.** `read_scoped_skill` falls
+back to `_exact_read_while_building`, which composes the candidate from a root this
+loader owns and the COMPLETE key, so `team-b/review` can never resolve
+`team-a/review` and a bare leaf resolves nothing. `_safe_name` rejects anything that
+is not a plain catalog key, so the key is never a path. The mapping must still admit
+the candidate, a disabled app's skill stays hidden, and `repo_scope` is still checked
+by the caller. Two limits are deliberate: it is reachable ONLY while
+`catalog_status()` is `"building"`, because a complete enumeration is the single
+authority and a second resolution path running beside it is how the two drift apart;
+and it withholds the confined project tier, whose containment is knowable only from
+the enumeration.
+
+**What still costs O(N) per turn, and what no longer does.** `list_skills` used to
+stat every unconfined row on the calling thread purely to decide whether its
+persisted metadata row was still current. The walk now records those fingerprints
+(`_catalog_fingerprints_for`, on the worker) and `list_skills` reuses them, so a turn
+on a process that has walked takes no stat at all. A process still serving the STORED
+list holds no fingerprints of its own and stats as before — validation, not discovery:
+no walk and no body read — because a fingerprint read off disk records what an earlier
+process saw. One cost is knowingly left: `_scoped_entries` expands an EXTERNAL mapping
+prefix (one that resolves outside the catalog roots) with its own walk, which no
+snapshot covers. That walk is bounded by the operator-declared prefix rather than by
+the installed-skill count, so it does not grow with the corpus this section is about.
+
+
 **Trigger matching (`get_triggered_skills`) — per-message hot path.** Runs on
 every non-custom-agent message via the context builder, scoring word-overlap of
 the message against each skill's `triggers` (negative `!`-prefixed triggers
 exclude). To keep it off the per-message filesystem/config hot path:
-- the discovered skill-file list is TTL-cached (`_iter`, `_ITER_CACHE_TTL_SECS`),
-  invalidated by `create_auto_skill`;
+- the discovered skill-file list is served from the **catalog snapshot** rather
+  than a walk (`_iter`; see *The catalog snapshot* above). Expiry of
+  `_ITER_CACHE_TTL_SECS` SCHEDULES a re-walk and keeps serving the previous list,
+  so no message is ever the one that pays for discovery; it is invalidated
+  immediately by `create_auto_skill`;
 - the walk that rebuilds it (`_iter_skill_files`, on a worker thread) asks the
   sensitive-path fence through `is_sensitive_resolved_path` against the
   `realpath` it has already computed for loop detection and containment, with
@@ -3844,6 +4157,8 @@ security decision or the copied content.
 
 **Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The mutating verbs (POST, PUT, DELETE) are owner-only and SEL-audited — app tokens and non-owner subjects get a 403 before any write — and the same owner gate fronts pending approve/dismiss/dismiss-all, pin, and inject-on-trigger, so every mutating skill endpoint in `prompts.py` refuses non-owner callers (the discover-module install endpoint carries its own internal-secret refusal instead; see learn-cron-dashboard.md's Skills CRUD entry). The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
 
+**Skill browse containment** (`_resolve_skill_root`, `read_skill_file` in `handlers/_shared.py`): the tree (`/api/skills/{name}/-/tree`) and file (`/api/skills/{name}/-/file`) endpoints serve any directory the resolver returns, so the resolver is the containment boundary. A candidate's *parent* must resolve at or under its own root (that is what rejects a symlinked intermediate directory), and so must the RESOLVED candidate itself — with two exceptions, both in `_leaf_is_contained`: `LEAF_SYMLINK_PREFIX` = `kiro-user/`, where an edition may install `~/.kiro/skills/<name>` as a link into its own tree; and a leaf whose resolved target is a directory an app DECLARES as a skill, because `apps.bridges._register_skills` symlinks each declared skill into the kirocrew skills root (flat AND `skills/<app>/` namespaced) with the target in the app's own tree — without that the browse side would be stricter than the loader and list skills in `GET /api/skills` that 404 when opened. The admissible set is the manifest's own `skills` entries, read through `bridges._registration_source` (the immutable package copy for a shipped builtin), NOT the app's root: an app tree also holds that app's data, tokens and rendered configs, and a link planted at `<root>/x -> <app>/data` must not serve them. The `package/` branch returns before that shared block, so it applies the same containment itself against the resolved `_edition_package_roots()` set — an edition packager can plant an escaping link in its own root like any other, and `package/` carries no allowance. Checking the parent alone for every prefix was a whole-filesystem read primitive: `<project>/.kiro/skills/x -> /etc` resolved to `/etc` and the endpoints enumerated up to `SKILL_TREE_MAX_ENTRIES` names and returned up to `SKILL_FILE_MAX_BYTES` per file from it, and `is_sensitive_path` is no backstop there (it is a `$HOME`-anchored credential denylist, not a containment check). A deliberate cross-checkout leaf link (`<project>/.kiro/skills/x -> ~/dotfiles/skills/x`) is indistinguishable from the exfiltration shape and is refused with it; the sanctioned way to browse a skill tree that lives elsewhere is `skills.extra_paths`, which makes that location a root of its own. `enumerate_skill_catalog`/`_collect_skills_under` carry the same per-prefix policy, because a key enumeration offers must be one the resolver accepts. File bytes then come from `hooks.safe_read_file_bytes_nolink(within_root=…)`, so containment holds on the opened descriptor rather than on a path resolved earlier: re-opening by name left a check-to-use window (an ancestor swapped for a symlink after the check) and no hardlink guard — `resolve()` does not follow a hardlink, so a link to a file outside the root passed the path check and was served. The root is passed as `within_root_is_canonical=True`, because it is already resolved: re-`realpath`ing it at read time would let the skill directory replaced by a link redefine the root it is being contained to. `list_skill_tree` walks by name, so a root replaced after admission is enumerated as whatever its name then denotes — filenames only, and the same exposure the rest of the by-name filesystem surface carries; holding the root across a traversal needs the walk itself to be descriptor-relative, which is a separate change. Every descriptor-level refusal answers one message (`access denied`, 403) rather than naming which guard fired. Refusals are already SEL-audited by the endpoints (`api_skill_tree` / `api_skill_file` outcomes), and the read is NOT trust-gated by design — reading a `SKILL.md` is how an operator decides whether to grant project-skill trust (#4777).
+
 **LLM tool mechanisms:**
 - MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**
   - `kirocrew-cron`: cron scheduling
@@ -4279,7 +4594,7 @@ Assembles all sources into prompts:
 - Thread history is injected only at session start (via `build_session_context`). Within the same ACP session, kiro-cli manages conversation history natively — duplicate injection wastes context window and accelerates compaction.
 - `_CRITICAL_RULES` injected by DEFAULT for every agent (built-in `kirocrew` and custom alike) — it is the dashboard/Slack assistant's own output contract (runtime-conditional diff blocks — tool-made edits render as structured diff cards on the dashboard, so ```diff blocks are required only for non-tool edits or non-dashboard runtimes — `[OPTIONS:]` footer, absolute-path rule with a URL exclusion — a backticked URL renders as a click-to-copy chip rather than a link, so URLs must use markdown link syntax instead), so diff rendering and OPTIONS buttons work universally. A **custom** agent can OPT OUT by setting `includeCrewContext: false` in its materialized `~/.kiro/agents/<...>.json`: a custom app agent ships its own system prompt and output contract, so injecting this on top both conflicts with it and, on a safety-tuned model, reads as an identity override the model refuses as prompt injection. The flag is read through the same sensitive-path-gated scan as the agent prompt (matched by declared `name` or filename stem) and memoized by agent name; an absent/non-boolean flag, an unreadable/missing spec, and the built-in `kirocrew` agent all default to injecting (only an explicit boolean `false` on a custom agent suppresses it). The same opt-out also suppresses the dashboard tool nudges (`ask_question` / `suggest_followup`) that `build_message` adds on dashboard sessions, but NOT the provider-agnostic `[OPTIONS:]` reminder. The `[OPTIONS:]`/diff tags still RENDER for any agent that emits them (the dashboard parses them regardless); the gate only stops the host from MANDATING them where an agent has declared it does not want them.
 - Switchable context groups (see below) let a spawning parent drop whole sections for one sub-agent.
-- Cap: `_CONTEXT_BUDGET_BASE` is a fixed 33,000-character Crew background admission allowance, reused from the former smallest-window tier. Model window size and `skills.lazy_load` cannot enlarge it. Admission reserves complete explicit preferences, rules, pinned instructions, date/runtime identity and steering, then admits optional source blocks whole. A separate model-safe ceiling bounds the protected lesson contribution at `max(3 * _CONTEXT_BUDGET_BASE, floor(model_window_tokens * 4.0 * 0.125))` characters for the complete protected set. Below it, protected bytes are unchanged. Above it, complete lessons are omitted in relevance order for vectors or newest-first for JSONL; preferences and safety rules remain whole, the prompt reports the omitted count, and a warning is emitted. Preferences are never trimmed to make room for anything else, but they cannot cross the ceiling themselves: an agent-grown preferences file larger than the ceiling is kept from its head, and the prompt carries a `[Context budget: omitted N chars of preferences ...]` notice naming the file to read, so the overflow is visible in-prompt rather than only in a log line. The 33,000-character allowance remains independent and is not falsely reported as a full-input ceiling. Agent contract, outer replay, following-interaction blocks and the current request are measured separately. The request is never budget-truncated.
+- Cap: `_CONTEXT_BUDGET_BASE` is a fixed 33,000-character Crew background admission allowance, reused from the former smallest-window tier. Model window size and `skills.lazy_load` cannot enlarge it. Admission reserves complete explicit preferences, rules, pinned instructions, date/runtime identity and steering, then admits optional source blocks whole. A separate model-safe ceiling bounds the protected lesson contribution at `max(3 * _CONTEXT_BUDGET_BASE, floor(model_window_tokens * 4.0 * 0.125))` characters for the complete protected set. Below it, protected bytes are unchanged. Above it, admission falls back to the ordinary lessons budget (`caps.lessons`, still bounded by the ceiling) and complete lessons are omitted in relevance order for vectors or newest-first for JSONL; preferences and safety rules remain whole, the prompt reports the omitted count, and a warning is emitted. Preferences are never trimmed to make room for anything else, but they cannot cross the ceiling themselves: an agent-grown preferences file larger than the ceiling is kept from its head, and the prompt carries a `[Context budget: omitted N chars of preferences ...]` notice naming the file to read, so the overflow is visible in-prompt rather than only in a log line. The 33,000-character allowance remains independent and is not falsely reported as a full-input ceiling. Agent contract, outer replay, following-interaction blocks and the current request are measured separately. The request is never budget-truncated.
 
 Startup V1 context retains complete preference documents and eligible `pref.*`
 records. A required activity index (at most 1,800 characters) lists project
@@ -4318,7 +4633,7 @@ the model will call the tool. Notebook/history writes maintain the index;
 out-of-band edits still need the existing rebuild. No store binding, privacy
 mode, or private essential-delivery gate changes.
 
-Startup lessons retain every eligible, in-scope rule completely while protected context is below the model-safe ceiling, without a background embedding call. Neither vector `source=consolidation`/`promotion` nor the tool/knowledge category proves optionality: consolidation extracts explicit always/never user corrections through the same path. JSONL likewise has no reliable explicit/inferred provenance. When the ceiling forces omission, only complete lesson entries are removed and the prompt directs explicit recovery through `memory_recall`; wording, lexical mismatch and PR numbers never justify dropping a rule below that ceiling.
+Startup lessons retain every eligible, in-scope rule completely while protected context is below the model-safe ceiling, without a background embedding call. Neither vector `source=consolidation`/`promotion` nor the tool/knowledge category proves optionality: consolidation extracts explicit always/never user corrections through the same path. JSONL likewise has no reliable explicit/inferred provenance. When the ceiling forces omission, only complete lesson entries are removed and the prompt directs explicit recovery through `memory_recall`; wording, lexical mismatch and PR numbers never justify dropping a rule below that ceiling. Above the ceiling, where the retain-everything invariant cannot be met because the full set already exceeds it, admission falls back to the ordinary lessons budget (`caps.lessons`, still bounded by the ceiling) rather than filling to the ceiling with ranked rules; the surviving subset is the one relevant to the request and the omission notice still directs the model to `memory_recall`. This overflow choice is not a statement about what to keep below the ceiling, where the block stays complete.
 
 Explicit recall deduplicates only identical selected evidence with the same stable record ID, independently within facts and episodes. Different IDs, revisions or provenance remain separate. The projection does not mutate input or storage.
 

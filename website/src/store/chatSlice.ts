@@ -45,7 +45,8 @@ import { secureRandomId } from '../utils/secureId'
 import { mergeIntoDraft } from '../utils/chatDrafts'
 import { isRejectedDecision } from '../utils/approvalDecision'
 import { automationForSlot, type AutomationRecord } from '../monitoring/automation'
-import { findReport, parseErrorCode, type ErrorReport } from '../utils/errorReport'
+import { findReport, parseErrorCode, recentErrors, recordError, redactSecrets, type ErrorReport } from '../utils/errorReport'
+import { chatSlotDetailPath } from '../api/chatSlotPaths'
 import type { HistoryDeleteRefusal } from '../utils/historyDeleteRefusal'
 
 const SKIP_ROLES = new Set(['chunk', 'done'])
@@ -2473,11 +2474,79 @@ export type SwitchSlotArg =
 const switchSlotKey = (arg: SwitchSlotArg): string =>
   typeof arg === 'object' && arg !== null ? arg.key : arg
 
-/** Preserve the API report behind a localized switch failure without changing
- *  journal-less reducer fixtures or the serialized rejection contract. */
-const switchSlotFailureReport = (error: unknown): { report?: ErrorReport } => {
-  const report = findReport(errMessage(error))
-  return report ? { report } : {}
+/** The structured report behind a localized switch failure, so the pane notice's
+ *  "ask the agent" hand-off carries the request and the real error, not just the
+ *  sentence the user read.
+ *
+ *  Two sources, in order:
+ *
+ *  1. The transport journal. A non-2xx passed through `apiFailure`, which
+ *     recorded status, endpoint, backend `code` and body under the exact
+ *     message the `ApiError` carries. Matched on message AND this request's
+ *     endpoint, not `findReport`'s message-only lookup: two sessions failing
+ *     with the same words ("Failed to fetch", "HTTP 502") are two requests,
+ *     and the message-only match hands the second one the FIRST one's
+ *     endpoint — a prompt then names a session the user did not click.
+ *  2. Recorded HERE, when the journal has nothing. A fetch that REJECTED
+ *     (`TypeError: Failed to fetch` on a dropped connection, a body that was
+ *     not JSON) never reached `apiFailure`, so nothing journaled it — and the
+ *     notice's hand-off then shipped a prompt with only the localized
+ *     "could not be opened" line: no route, no endpoint, no underlying error,
+ *     which is exactly the dead end the journal exists to prevent.
+ *
+ *     The entry keeps the journal's own key contract: `message` is the sentence
+ *     the notice SHOWS (`switchSlotNoticeCopy`), and the raw error — class and
+ *     text, `TypeError: Failed to fetch` — travels in `detail`. Recording the
+ *     raw text as the message would make this entry the newest `"Failed to
+ *     fetch"` in a journal every other surface still searches by message alone,
+ *     so a different surface's Ask-agent prompt would name a session-open
+ *     request it never made. Wrong context is worse than the empty prompt this
+ *     replaces. The endpoint comes from `chatSlotDetailPath`, the same owner
+ *     the request itself uses. A status-less report has no `status` — the
+ *     prompt says what failed without inventing an HTTP code for a request
+ *     that got none.
+ *
+ *  Returns a spread-friendly shape so journal-less reducer fixtures and the
+ *  serialized rejection contract stay untouched. */
+const switchSlotFailureReport = (
+  error: unknown,
+  key: string,
+  shown: { kind: 'gone' | 'failed'; name: string },
+): { report?: ErrorReport } => {
+  const raw = errMessage(error)
+  const endpoint = chatSlotDetailPath(key)
+  // Same key normalization `findReport` applies (the journal stores redacted
+  // messages), newest first.
+  const needle = redactSecrets(raw).trim()
+  const found = needle ? recentErrors().find(r => r.endpoint === endpoint && r.message.trim() === needle) : undefined
+  if (found) return { report: found }
+  const status = (error as { status?: unknown } | null)?.status
+  const cls = (error as { name?: unknown } | null)?.name
+  const detail = typeof cls === 'string' && cls && cls !== raw ? (raw ? `${cls}: ${raw}` : cls) : raw
+  return {
+    report: recordError({
+      source: 'api',
+      message: switchSlotNoticeCopy(shown.kind, shown.name),
+      status: typeof status === 'number' ? status : undefined,
+      endpoint,
+      detail: detail || undefined,
+    }),
+  }
+}
+
+/** The sentence the pane notice shows for a `switchSlotGone` record. ONE owner
+ *  for ChatPage (which re-resolves it on a locale switch) and the journal entry
+ *  `switchSlotFailureReport` records under it — the journal is keyed by the
+ *  message as the UI shows it, so the two must be the same words. */
+export function switchSlotNoticeCopy(kind: 'gone' | 'failed', name: string): string {
+  if (kind === 'failed') {
+    return name
+      ? i18nT('store.chatSlice.session_open_error_named', { name })
+      : i18nT('store.chatSlice.session_open_error')
+  }
+  return name
+    ? i18nT('store.chatSlice.session_gone_open_failed_named', { name })
+    : i18nT('store.chatSlice.session_gone_open_failed')
 }
 
 export const switchSlot = createAsyncThunk<
@@ -2640,78 +2709,68 @@ export const switchSlot = createAsyncThunk<
             chatSlice.actions.setSwitchSlotGone({
               name: name ?? '',
               kind: 'gone',
-              ...switchSlotFailureReport(e),
-            }),
-          )
-        }
-        // Evict only when the selection will ESCAPE the evicted key. The
-        // rejected reducer restores `slotSwitchOrigin` only when it differs
-        // from the target (chat's `deleteSlot` states the invariant: the
-        // active slot must already name a surviving peer by the time a slot
-        // leaves the list). When the gone session IS the origin — the user
-        // re-activated the session they were already in — no restore runs,
-        // so evicting here would leave `activeSlot` naming a key no sidebar
-        // row lists: the pane stays open, the header chips render blank
-        // (`currentSlot` is undefined), and nothing heals it because an
-        // authoritative write will not re-add a deleted slot. Keeping the
-        // row for that one case is the pre-change behaviour, the notice
-        // still explains the failure, and the next authoritative slots
-        // frame retires the row once the user navigates away.
-        // `keepTargetOnMissing` keeps the selection ON the target by the
-        // reducer's own contract, so the selection never escapes there.
-        const keepTarget =
-          typeof arg === 'object' && arg !== null && arg.keepTargetOnMissing === true
-        const escapes =
-          !keepTarget && chat.slotSwitchOrigin !== null && chat.slotSwitchOrigin.key !== key
-        // Freshness conditions on the DESTRUCTIVE half only (the notice above
-        // stays: it truthfully explains the dead click even when stale).
-        // (1) The row must still be the OBJECT captured at dispatch (see
-        // `rowAtDispatch`): any authoritative frame that changed row `key` in
-        // ANY way — a replacement session included — breaks the identity and
-        // disarms the eviction. `applySlots` reuses a row's identity only
-        // when it is jsonEqual, and a genuinely recreated session cannot be
-        // byte-identical (its message count and last_ts differ from the dead
-        // one's), so identity is honest about content freshness.
-        // (2) This switch must still be the LIVE one: `pending` stored this
-        // thunk's requestId in `slotSwitchRequestId` and any newer switch
-        // overwrote it, so a stale 404 that lost a race to a newer gesture —
-        // a successful same-key re-open included — cannot evict.
-        const rowNow = (getState() as RootState).dashboard?.slots?.find((s) => s.key === key)
-        if (
-          escapes &&
-          rowAtDispatch !== undefined &&
-          rowNow === rowAtDispatch &&
-          chat.slotSwitchRequestId === requestId
-        ) {
-          dispatch(removeSlotOptimistic(key))
-        }
-      } else if (typeof arg === 'object' && arg !== null && arg.announceOnMissing === true) {
-        // A non-404 failure on the SAME user gesture (a 5xx, a proxy error)
-        // is just as silent by default: the rejected reducer keeps the
-        // target selected with an empty pane (the transient-failure branch),
-        // and nothing says why the transcript did not load. Announced
-        // callers get the same pane ErrorNotice with failure copy — no
-        // eviction (the session exists) and no new affordance: the row and
-        // composer already invite the natural retry. Gated on the live
-        // claim, UNLIKE the gone notice above: "was deleted" stays true
-        // whenever the 404 lands, but "could not be opened" describes THIS
-        // attempt — a superseded rejection reporting it would overwrite the
-        // notice belonging to the user's current gesture with one about a
-        // click they already moved past.
-        if ((getState() as RootState).chat.slotSwitchRequestId === requestId) {
-          const name = (getState() as RootState).dashboard?.slots?.find((s) => s.key === key)?.title
-          dispatch(
-            chatSlice.actions.setSwitchSlotGone({
+              ...switchSlotFailureReport(e, key, { kind: 'gone', name: name ?? '' }),
+            }))
+          }
+          // Evict only when the selection will ESCAPE the evicted key. The
+          // rejected reducer restores `slotSwitchOrigin` only when it differs
+          // from the target (chat's `deleteSlot` states the invariant: the
+          // active slot must already name a surviving peer by the time a slot
+          // leaves the list). When the gone session IS the origin — the user
+          // re-activated the session they were already in — no restore runs,
+          // so evicting here would leave `activeSlot` naming a key no sidebar
+          // row lists: the pane stays open, the header chips render blank
+          // (`currentSlot` is undefined), and nothing heals it because an
+          // authoritative write will not re-add a deleted slot. Keeping the
+          // row for that one case is the pre-change behaviour, the notice
+          // still explains the failure, and the next authoritative slots
+          // frame retires the row once the user navigates away.
+          // `keepTargetOnMissing` keeps the selection ON the target by the
+          // reducer's own contract, so the selection never escapes there.
+          const keepTarget = typeof arg === 'object' && arg !== null && arg.keepTargetOnMissing === true
+          const escapes = !keepTarget && chat.slotSwitchOrigin !== null && chat.slotSwitchOrigin.key !== key
+          // Freshness conditions on the DESTRUCTIVE half only (the notice above
+          // stays: it truthfully explains the dead click even when stale).
+          // (1) The row must still be the OBJECT captured at dispatch (see
+          // `rowAtDispatch`): any authoritative frame that changed row `key` in
+          // ANY way — a replacement session included — breaks the identity and
+          // disarms the eviction. `applySlots` reuses a row's identity only
+          // when it is jsonEqual, and a genuinely recreated session cannot be
+          // byte-identical (its message count and last_ts differ from the dead
+          // one's), so identity is honest about content freshness.
+          // (2) This switch must still be the LIVE one: `pending` stored this
+          // thunk's requestId in `slotSwitchRequestId` and any newer switch
+          // overwrote it, so a stale 404 that lost a race to a newer gesture —
+          // a successful same-key re-open included — cannot evict.
+          const rowNow = (getState() as RootState).dashboard?.slots?.find(s => s.key === key)
+          if (escapes && rowAtDispatch !== undefined && rowNow === rowAtDispatch && chat.slotSwitchRequestId === requestId) {
+            dispatch(removeSlotOptimistic(key))
+          }
+        } else if (typeof arg === 'object' && arg !== null && arg.announceOnMissing === true) {
+          // A non-404 failure on the SAME user gesture (a 5xx, a proxy error)
+          // is just as silent by default: the rejected reducer keeps the
+          // target selected with an empty pane (the transient-failure branch),
+          // and nothing says why the transcript did not load. Announced
+          // callers get the same pane ErrorNotice with failure copy — no
+          // eviction (the session exists) and no new affordance: the row and
+          // composer already invite the natural retry. Gated on the live
+          // claim, UNLIKE the gone notice above: "was deleted" stays true
+          // whenever the 404 lands, but "could not be opened" describes THIS
+          // attempt — a superseded rejection reporting it would overwrite the
+          // notice belonging to the user's current gesture with one about a
+          // click they already moved past.
+          if ((getState() as RootState).chat.slotSwitchRequestId === requestId) {
+            const name = (getState() as RootState).dashboard?.slots?.find(s => s.key === key)?.title
+            dispatch(chatSlice.actions.setSwitchSlotGone({
               name: name ?? '',
               kind: 'failed',
-              ...switchSlotFailureReport(e),
-            }),
-          )
+              ...switchSlotFailureReport(e, key, { kind: 'failed', name: name ?? '' }),
+            }))
+          }
         }
+        return rejectWithValue(payload)
       }
-      return rejectWithValue(payload)
-    }
-    // Status-less errors (a transport failure, a thrown TypeError) cross the
+      // Status-less errors (a transport failure, a thrown TypeError) cross the
     // boundary as miniSerializeError. The same announced-gesture contract
     // applies: say the open failed where the user is looking — gated on the
     // live claim like the numeric branch above, so a superseded rejection
@@ -2727,13 +2786,13 @@ export const switchSlot = createAsyncThunk<
         chatSlice.actions.setSwitchSlotGone({
           name: name ?? '',
           kind: 'failed',
-          ...switchSlotFailureReport(e),
-        }),
-      )
+          ...switchSlotFailureReport(e, key, { kind: 'failed', name: name ?? '' }),
+        }))
+      }
+      throw e
     }
-    throw e
   }
-})
+)
 
 /** Re-fetch messages for a slot without changing activeSlot. Only applies if still active. */
 /**
@@ -3620,6 +3679,7 @@ export const createSlot = createAsyncThunk<
   ChatSlot,
   | {
       agent?: string
+      agent_kind?: 'member' | 'template'
       model?: string
       mode?: string
       memory_mode?: string
@@ -3637,6 +3697,9 @@ export const createSlot = createAsyncThunk<
   { fulfilledMeta: { originActiveSlot: string | null; activate: boolean } }
 >('chat/createSlot', async (opts, { getState, fulfillWithValue }) => {
   const agent = typeof opts === 'string' ? opts : opts?.agent
+  // The namespace the agent was picked from; rides with the name so a
+  // same-name member and template create different sessions.
+  const agentKind = typeof opts === 'string' ? undefined : opts?.agent_kind
   const model = typeof opts === 'string' ? undefined : opts?.model
   const mode = typeof opts === 'string' ? undefined : opts?.mode
   const requestedMemoryMode = typeof opts === 'string' ? undefined : opts?.memory_mode
@@ -3691,6 +3754,7 @@ export const createSlot = createAsyncThunk<
     folderId || undefined,
     instanceId,
     adoptRemoteSlot,
+    agentKind,
   )
   const dashState = (getState() as RootState).dashboard
   // An explicit color (e.g. carried from a slot being recreated on a

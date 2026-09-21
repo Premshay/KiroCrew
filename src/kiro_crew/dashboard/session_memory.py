@@ -7,7 +7,9 @@ measurement primitives already existed but were never surfaced:
   only the runtime pid misses everything: that pid is the sandbox launcher parent
   (small, parked in ``waitpid``) while the kiro-cli that accumulates GBs is a
   child. It was called only to decide runtime recycling, and only for the shared
-  ``_bg`` runtime — chat-session runtimes were never measured at all.
+  ``_bg`` runtime — chat-session runtimes were never measured at all. This module
+  hands it the descendant set it has already walked, so the tree is not walked a
+  second time for the total.
 * ``subagent.SubagentManager`` samples per-task RSS/CPU on its reaper sweep for
   learned sizing, and nothing read those numbers back out.
 
@@ -38,12 +40,13 @@ from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.platform_compat import proc_child_map
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session import BACKGROUND_KEY
 from kiro_crew.subagent import _CLK_TCK, _subtree_cpu_jiffies
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
-    from kiro_crew.crew_log.tree import SessionTree, TreeNode
+    from kiro_crew.crew_log.session_tree import SessionTree, TreeNode
     from kiro_crew.session import SessionManager
     from kiro_crew.subagent import SubagentManager
 
@@ -207,10 +210,10 @@ class SessionMemorySampler:
         if not crew_log_emit.enabled():
             return {}, False, 0
         if self._tree is None:
-            from kiro_crew.crew_log.tree import SessionTree
+            from kiro_crew.crew_log.session_tree import SessionTree
 
             self._tree = SessionTree()
-        from kiro_crew.crew_log.tree import TREE_UNIT_CAP
+        from kiro_crew.crew_log.session_tree import TREE_UNIT_CAP
 
         live = [sid for sid in (row.get("sid") for row in rows) if isinstance(sid, str)]
         nodes = self._tree.snapshot(live)
@@ -226,12 +229,19 @@ class SessionMemorySampler:
         return [{"t": ts, "mb": round(mb, 1)} for ts, mb in self._history]
 
     # ── sampling ───────────────────────────────────────────────────────────
-    def _cpu_cores(self, pid: int, now: float) -> Optional[float]:
+    def _cpu_cores(
+        self, pid: int, now: float, *, pids: Optional[list[int]] = None
+    ) -> Optional[float]:
         """Cores used since the previous sample for this pid, or None with no
-        baseline yet (first observation) — reported as unknown, never as 0.0."""
+        baseline yet (first observation) -- reported as unknown, never as 0.0.
+
+        ``pids`` is the subtree the caller has already walked, handed on so the
+        CPU total is summed over it rather than reached by enumerating the tree
+        again. Every figure on the row then describes the same set of processes.
+        """
         if sys.platform != "linux":
             return None
-        jiffies = _subtree_cpu_jiffies(pid)
+        jiffies = _subtree_cpu_jiffies(pid, pids=pids)
         prev = self._cpu_prev.get(pid)
         self._cpu_prev[pid] = (jiffies, now)
         if prev is None:
@@ -242,44 +252,90 @@ class SessionMemorySampler:
             return None
         return (jiffies - prev_jiffies) / (_CLK_TCK * dt)
 
-    def _sample_pid(self, pid: int, now: float) -> dict[str, object]:
+    def _sample_pid(
+        self, pid: int, now: float, *, children: Optional[dict[int, list[int]]] = None
+    ) -> dict[str, object]:
         """Blocking per-pid sample. MUST run off the event loop — a session tree
-        can be dozens of processes, i.e. dozens of ``/proc`` reads."""
-        rss_mb = _get_rss_tree_mb(pid)
+        can be dozens of processes, i.e. dozens of ``/proc`` reads.
+
+        ONE enumeration of the subtree, and every figure on the row is totalled
+        over the set it returns: the RSS sum, the process count, the stub count
+        and the CPU jiffies. Any of the four could reach its own answer by
+        enumerating the tree for itself, and none of them does.
+
+        ``children`` is the host's parent map, built once for the whole poll, and
+        it is where the enumeration cost went. Asking the kernel per root reads
+        one ``children`` file per THREAD of every process visited: measured on a
+        1713-process host sampling 40 session trees of 734 processes, that is
+        11296 reads taking 432ms, and the CPU reading's own walk took another
+        452ms, against 1717 ``stat`` reads taking 70ms for the map that answers
+        every root. Both routes returned the same 40 trees. Without the map (off
+        Linux, or ``/proc`` unlistable) the kernel route is walked as before.
+
+        Each process is still READ exactly as it was -- ``VmRSS`` from
+        ``status``, utime+stime from ``stat`` -- so no figure on the page changes
+        its meaning. What changes is that they now describe one set of processes
+        observed once, which is what the shared walker's own docstring says a
+        single frontier is for.
+        """
         procs: Optional[int] = None
         stubs: Optional[int] = None
         if sys.platform == "linux":
-            tree = _iter_descendant_pids(pid)
+            tree = _iter_descendant_pids(pid, children=children)
+            rss_mb = _get_rss_tree_mb(pid, pids=tree)
             procs = len(tree)
             stubs = sum(1 for p in tree if _STUB_MARKER in _read_cmdline(p))
+            cpu = self._cpu_cores(pid, now, pids=tree)
+        else:
+            # No descendant set to reuse: the other platforms reach the total
+            # through their own snapshot or validated walk, not a pid list.
+            rss_mb = _get_rss_tree_mb(pid)
+            cpu = self._cpu_cores(pid, now)
         return {
             "rss_mb": round(rss_mb, 1) if rss_mb is not None else None,
             "procs": procs,
             "mcp": stubs,
-            "cpu_cores": self._cpu_cores(pid, now),
+            "cpu_cores": cpu,
         }
 
     def _blocking_sample(self, rows: list[dict[str, object]]) -> dict[str, object]:
-        """Sample every distinct pid once, then the machine-wide extras.
+        """Sample every distinct pid ONCE, then the machine-wide extras.
 
-        Co-tenants of a multiplexed runtime share a pid, so sampling per row would
-        read the same tree N times. The orphan scan and the credits window join
-        this offloaded call rather than the async one: both touch the filesystem
-        (a full ``/proc`` walk, and the shard window) and would stall the event
-        loop from the coroutine.
+        One descendant pass per distinct pid, for the RSS total and the process
+        metadata, is the cost bound this function exists to keep, and it can be
+        lost in three ways. Per ROW: co-tenants of a
+        multiplexed runtime share a pid, so a walk per row reads the same process
+        tree N times. Per SAMPLE: the RSS total and the process metadata both come
+        off the same set, so reaching them through two helpers walks the tree
+        twice — ``_sample_pid`` walks once and hands the set over for exactly this
+        reason. Per ROOT: asking the kernel for a tree costs one read per THREAD
+        of every process in it, so the host's parent map is built ONCE here and
+        every row's tree is derived from it -- one read per host process against
+        11296 reads for 40 roots on the measured host. One session's tree is
+        dozens of ``/proc`` reads and this whole call
+        runs on a browser poll, so another pass over the same pids is the most
+        expensive thing that can be added here and the easiest one to add by
+        accident: a reader that wants the descendant set must take it from the
+        sample, never walk again.
+
+        The credits window and the lineage scan join this offloaded call rather
+        than the async one: both touch the filesystem (the shard window, and a
+        stat of every session log's directory) and would stall the event loop
+        from the coroutine.
         """
         now = time.monotonic()
         out: dict[int, dict[str, object]] = {}
-        owned: set[int] = set()
+        # One pass over /proc for the whole poll; None off Linux and when /proc
+        # cannot be listed, which each row then walks for itself as before.
+        children = proc_child_map()
         for row in rows:
             pid = row.get("pid")
             if not isinstance(pid, int):
                 continue
-            owned.update(_iter_descendant_pids(pid))
             if pid in out:
                 continue
             try:
-                out[pid] = self._sample_pid(pid, now)
+                out[pid] = self._sample_pid(pid, now, children=children)
             except Exception:  # pragma: no cover — a dying pid must not fail the page
                 logger.debug("session memory sample failed for pid %s", pid, exc_info=True)
         self._prune_cpu_baselines({r.get("pid") for r in rows})
@@ -375,7 +431,7 @@ class SessionMemorySampler:
             # the only place that loads it, and only behind the flag.
             if not lineage or not isinstance(key, str):
                 return None
-            from kiro_crew.crew_log.tree import parent_payload
+            from kiro_crew.crew_log.session_tree import parent_payload
 
             node = next((lineage[s] for s in slot_spellings(key) if s in lineage), None)
             return parent_payload(node, live_key_of, key)

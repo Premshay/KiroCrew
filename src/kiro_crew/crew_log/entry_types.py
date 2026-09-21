@@ -52,6 +52,15 @@ from typing import Any
 from kiro_crew.crew_log.errors import CODE_BAD_DATA_FIELD, CrewLogError
 from kiro_crew.crew_log.schema import KIND_SESSION
 
+# The ledger subsystem owns the event vocabulary its own writer clamps to, so the
+# declaration below reads it from there instead of restating it. Importing the
+# producer is what this module already does for every other type -- the difference
+# is only that this producer's vocabulary is a named constant. The import is safe
+# in this direction: ``session_ledger`` reaches the crew log lazily, inside the
+# functions that need it, so nothing here pulls the storage package onto the
+# gateway's boot path.
+from kiro_crew.session_ledger import EVENT_KINDS as _LEDGER_EVENT_KINDS
+
 #: JSON types a declared field may hold. ``int`` and ``float`` are separate
 #: because the wire format's numbers are separate to a reader: a count is not a
 #: measurement. ``float`` accepts an int, since JSON has one number type and 0 is
@@ -150,6 +159,73 @@ ACTOR_VALUES: tuple[str, ...] = (
     "other",
 )
 
+#: The ledger's event kinds, in a stable order for the reference tables. Derived
+#: from the writer's own set so the two cannot drift.
+_EVENT_KIND_VALUES: tuple[str, ...] = tuple(sorted(_LEDGER_EVENT_KINDS))
+
+#: The members of a session's recorded class, shared by the opening entry's
+#: ``class`` object and by ``session/class``. One tuple rather than two identical
+#: ones, because a reader folds the second over the first to decide an
+#: authorization question: a member declared on one and not the other would be
+#: read from a transition and silently missing from the opener it supersedes.
+_SESSION_CLASS_FIELDS: tuple[Field, ...] = (
+    Field(
+        "memory",
+        JSON_STRING,
+        required=True,
+        note=(
+            "The slot's memory mode, verbatim: persistent for an ordinary "
+            "session, anything else for one created to leave and learn nothing. "
+            "Required INSIDE the object, so the object is never empty and its "
+            "presence is what says the class was recorded at all."
+        ),
+    ),
+    Field(
+        "app",
+        JSON_STRING,
+        note=(
+            "The app that owns the session, when one does -- a short registered "
+            "app name, never a title or user content."
+        ),
+    ),
+    Field(
+        "channel",
+        JSON_BOOL,
+        note=(
+            "True when this session's conversation is published to a messaging "
+            "channel, by a link or a mirror. A cron tab's link is not one: it "
+            "names the job's own run and republishes to nobody. The channel is "
+            "not named -- a reader of this field needs the fact, not the address."
+        ),
+    ),
+    Field(
+        "workspace",
+        JSON_STRING,
+        note=(
+            "The workspace this session belongs to. Recorded because a dispatch "
+            "grant is derived from a lineage and a lineage OUTLIVES a workspace "
+            "switch -- the creating edge is written on the child and nothing "
+            "rewrites it -- so without this a conductor that moved workspace would "
+            "still read a log belonging to the one it left. Not a restriction like "
+            "the members above but an identity, so a reader keeps the FIRST one "
+            "stated and treats a later different one as the log spanning two "
+            "workspaces, which no single workspace's session may read. Absent on a "
+            "log opened before this field existed, and a reader that needs it must "
+            "refuse rather than assume."
+        ),
+    ),
+)
+
+#: Who may write an ``object/observed`` entry. CLOSED, and closed on purpose: the
+#: value is what lets a reader tell a measured record from anything an agent typed,
+#: so the emitter REFUSES a value outside this tuple rather than coercing it -- a
+#: coerced producer would be a record attributed to a mechanism that did not make
+#: it. ``probe`` is the structured monitor's provider probe. A second producer (a
+#: recogniser on the tool-result path, say) is added here, in one commit with the
+#: site that writes it, or not at all.
+OBJECT_PRODUCER_PROBE = "probe"
+OBJECT_PRODUCERS: tuple[str, ...] = (OBJECT_PRODUCER_PROBE,)
+
 _SESSION_TYPES: tuple[EntryType, ...] = (
     # -- session, turn ------------------------------------------------------ #
     EntryType(
@@ -190,6 +266,31 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
                 note="True when this claim re-attached to an existing crew log.",
             ),
             Field(
+                "previous",
+                JSON_OBJECT,
+                fields=(
+                    Field(
+                        "sid",
+                        JSON_STRING,
+                        required=True,
+                        note=(
+                            "The ACP session id of the store this slot was writing "
+                            "before. A citation of that unit, not a tree key."
+                        ),
+                    ),
+                ),
+                note=(
+                    "The store the SAME slot was writing before this one, present only "
+                    "on a store that was just created while the slot already had one. "
+                    "``resumed`` covers the other continuity -- this claim re-attaching "
+                    "to the same store -- and cannot express this one, because a "
+                    "superseded ACP session has a different id and therefore a "
+                    "different unit. No ``slot`` is repeated inside: it is the slot in "
+                    "``data.slot``. Absent on the slot's first store, and on any store "
+                    "whose predecessor the gateway could not name."
+                ),
+            ),
+            Field(
                 "parent",
                 JSON_OBJECT,
                 fields=(
@@ -218,6 +319,50 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
                     "person's own tab, on a fork, and on a spawn_run subagent."
                 ),
             ),
+            Field(
+                "class",
+                JSON_OBJECT,
+                fields=_SESSION_CLASS_FIELDS,
+                note=(
+                    "What this session IS, as facts rather than as a verdict, recorded "
+                    "when the log is opened. It is here because the crew log is the "
+                    "authoritative record of a session and a reader deciding whether "
+                    "one session may read another's log must be able to answer that "
+                    "for a session that has since CLOSED, which no live lookup can. "
+                    "Absent on a log opened before this field existed, and a reader "
+                    "that needs it must refuse rather than assume: a missing record "
+                    "is not evidence that nothing applies."
+                ),
+            ),
+        ),
+    ),
+    EntryType(
+        "session/class",
+        "The session's class changed after its log was opened.",
+        _SESSION_CLASS_FIELDS,
+        note=(
+            "The class as re-observed after the log was opened, written only when it "
+            "differs from the last one recorded. The opening entry states the class as of "
+            "the moment the log was created, and a session can acquire a channel surface, "
+            "an app owner or a different memory mode afterwards -- so a reader deciding "
+            "whether another session may read this log has to see the whole life of it, "
+            "not its first instant. The fold takes the most restrictive value each "
+            "member ever held, because a log that was published to a channel for one "
+            "turn holds that turn's content for good.\n\n"
+            "Observed at TWO points, which together are what make the record exact "
+            "rather than approximate. A channel binding announces itself as it COMMITS: "
+            "the record is made while the session map's lock is still held, and routing "
+            "an inbound message reads that map, so the turn that carries a third party's "
+            "words into the log cannot precede the record of the surface that carried "
+            "them. Every other way a class moves -- an app owner, a different memory "
+            "mode -- is caught by re-observing at the start of a turn, so a change that "
+            "commits with no announcement is recorded before the next turn appends "
+            "anything.\n\n"
+            "Absent from a log whose class never changed, which is the ordinary case. "
+            "That absence is only readable as 'nothing changed' on a log whose opening "
+            "entry HAS a class: the two landed in one change, so a class on the opener "
+            "is what dates the log to a build that also records transitions. An opener "
+            "with no class says nothing about either, and refuses."
         ),
     ),
     EntryType(
@@ -585,6 +730,158 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
             ),
         ),
         note="No turn: the deferred verdict can settle turns later than the compaction.",
+    ),
+    # -- ledger ------------------------------------------------------------- #
+    EntryType(
+        "ledger/recorded",
+        "One session-ledger update: the fields it set, and the event explaining them.",
+        (
+            Field(
+                "slot",
+                JSON_STRING,
+                required=True,
+                note=(
+                    "The ledger's key -- the slot this update belongs to. Carried on the "
+                    "entry as well as in the header so a reader of one entry can say "
+                    "which slot it belongs to; selecting a slot's units is done from "
+                    "their headers."
+                ),
+            ),
+            Field("goal", JSON_STRING, note="The workstream's objective, when this call set one."),
+            Field(
+                "phase",
+                JSON_STRING,
+                note=(
+                    "The new phase. Never written without event and event_kind, which is "
+                    "what makes the phase-requires-a-reason rule a property of ONE entry."
+                ),
+            ),
+            Field("next", JSON_STRING, note="The resumable intent -- the concrete next step."),
+            Field(
+                "tried",
+                JSON_OBJECT,
+                fields=(
+                    Field("approach", JSON_STRING, required=True, note="What was tried."),
+                    Field("rejected_because", JSON_STRING, note="Why it was rejected."),
+                ),
+                note="One rejected approach, appended to the fold's list.",
+            ),
+            Field(
+                "artifacts",
+                JSON_OBJECT,
+                note=(
+                    "String-to-string pointers merged into the fold's map. The MEMBERS are "
+                    "the caller's own keys -- worktree, branch, pr -- so they are "
+                    "deliberately not declared and are checked for shape by the fold."
+                ),
+            ),
+            Field("event", JSON_STRING, note="One-line progress note appended to the event tail."),
+            Field(
+                "event_kind",
+                JSON_STRING,
+                enum=_EVENT_KIND_VALUES,
+                enum_closed=True,
+                note=(
+                    "Which kind of step this records. Closed: the writer coerces an "
+                    "unrecognized kind to note before it builds the entry."
+                ),
+            ),
+        ),
+        note=(
+            "One entry per ``session_ledger_record`` call, carrying only the fields that "
+            "call set -- an omitted field means 'unchanged', which is what lets a partial "
+            "update be one line. A phase change carries its event in the SAME entry, so "
+            "no reader can observe a phase that moved without its logged reason. The "
+            "ledger therefore DEPENDS on this log: a gateway started without "
+            "``KIROCREW_CREW_LOG=1`` records none, and the tool refuses rather than "
+            "keeping a document of its own."
+        ),
+    ),
+    # -- object ------------------------------------------------------------- #
+    EntryType(
+        "object/observed",
+        "The state of an object outside the session, as one named producer observed it.",
+        (
+            Field(
+                "producer",
+                JSON_STRING,
+                required=True,
+                enum=OBJECT_PRODUCERS,
+                enum_closed=True,
+                note=(
+                    "Which mechanism made the observation. Closed: the emitter refuses a "
+                    "value outside the vocabulary instead of coercing it, so a reader can "
+                    "tell a measured record from a sentence an agent typed. probe is the "
+                    "structured monitor's provider probe."
+                ),
+            ),
+            Field(
+                "kind",
+                JSON_STRING,
+                required=True,
+                note=(
+                    "The monitored kind of the subject, as the monitoring registry names "
+                    "it -- github_pull_request, gitlab_merge_request, and so on. Passed "
+                    "through from the armed monitor, which validated it at arm time."
+                ),
+            ),
+            Field(
+                "target",
+                JSON_STRING,
+                required=True,
+                note="The subject's full URL, exactly as the monitor was armed on it.",
+            ),
+            Field(
+                "fingerprint",
+                JSON_STRING,
+                required=True,
+                note=(
+                    "The probe's own dedupe digest of the facts it acts on. An entry is "
+                    "written only when this differs from the previous observation's, so "
+                    "consecutive entries for one subject are consecutive DISTINCT states, "
+                    "never one per poll."
+                ),
+            ),
+            Field(
+                "facts",
+                JSON_OBJECT,
+                required=True,
+                note=(
+                    "The canonical facts snapshot the probe computed, verbatim -- the "
+                    "object the wake envelope is rendered from, including its own kind "
+                    "and target. The members are the kind's canonical vocabulary, so "
+                    "they are deliberately not declared here: a fact the probe could not "
+                    "establish is absent or carries the kind's own unknown marker, never "
+                    "a default this registry invented."
+                ),
+            ),
+            Field(
+                "facts_omitted",
+                JSON_ARRAY,
+                item_type=JSON_STRING,
+                note=(
+                    "Members removed from facts so the entry fits the line ceiling, "
+                    "largest first. Absent when nothing was removed, which is the "
+                    "ordinary case."
+                ),
+            ),
+            Field(
+                "observed_at",
+                JSON_FLOAT,
+                required=True,
+                note=(
+                    "When the producer observed the subject, seconds since the epoch. "
+                    "Distinct from the envelope's time, which is when the append landed."
+                ),
+            ),
+        ),
+        note=(
+            "One entry per CHANGE of the subject's fingerprint, appended into the log of "
+            "the session the producer works for -- the monitor's owner session. A typed "
+            "record carrying its producer is what a reader can trust about an object "
+            "outside the session; the agent's own report about that object is a "
+            "message/sent entry and is evidence of nothing but the report."
+        ),
     ),
 )
 

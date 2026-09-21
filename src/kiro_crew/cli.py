@@ -1742,7 +1742,7 @@ Examples:
         help="Run a script cron locally with real MCP tools; notifications are captured and printed instead of delivered",
     )
     cron_preview.add_argument(
-        "script", help="Script path in module:function format (e.g. ~/.kiro/crew/crons/my.py:run)"
+        "script", help="Script file in file.py:function format (e.g. ~/.kiro/crew/crons/my.py:run)"
     )
     cron_preview.add_argument("--message", "-m", default="", help="ctx.message value")
     cron_preview.add_argument(
@@ -2605,6 +2605,9 @@ Examples:
     # the two above: the crew log is an optional subsystem behind a flag, so a
     # session that never verifies or audits it spends nothing on the set.
     sub.add_parser("mcp-crew-log")
+    # mcp-panel (MCP server -- an agent publishes its own dashboard panel).
+    # Mounted only for an agent whose spec grants the opt-in set.
+    sub.add_parser("mcp-panel")
 
     # Stable product endpoint for the bundled goal-conductor skill.  Its
     # underscore name keeps it out of the public CLI taxonomy: the supported
@@ -2970,6 +2973,24 @@ Examples:
     app_sub = app_parser.add_subparsers(dest="app_action")
     app_install = app_sub.add_parser("install", help="Install an app from a local directory")
     app_install.add_argument("source", help="Path to app directory containing app.json")
+    app_import = app_sub.add_parser(
+        "import",
+        help="Convert a manifest-declared plugin package into an app directory",
+    )
+    app_import.add_argument("source", help="Path to the plugin package directory")
+    app_import.add_argument(
+        "--out",
+        help="Output app directory (default: ./<app-name>-app)",
+    )
+    app_import.add_argument(
+        "--name",
+        help="Override the derived app name (kebab-case)",
+    )
+    app_import.add_argument(
+        "--install",
+        action="store_true",
+        help="Install the converted app after writing it",
+    )
     app_sub.add_parser("list", help="List installed apps")
     app_enable = app_sub.add_parser("enable", help="Enable an installed app")
     app_enable.add_argument("name", help="App name to enable")
@@ -3348,6 +3369,10 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # the module reads is itself flag-gated: `kirocrew gateway` boots through
         # this module and must not import the crew log to start.
         importlib.import_module("kiro_crew.mcp_crew_log").run_mcp_server()
+    elif args.command == "mcp-panel":
+        # Lazily imported like mcp-dashboard above: a default-off optional
+        # subsystem must not be imported just to start the gateway.
+        importlib.import_module("kiro_crew.mcp_panel").run_mcp_server()
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
         # Registration gates this verb on _builtin_mcp_server_available, and
         # _run_app_mcp_server is the ONE dispatch-time spelling of "import the

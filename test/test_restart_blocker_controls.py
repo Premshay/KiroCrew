@@ -163,7 +163,7 @@ class TestClearingTheBlockers:
         state.sessions.restart_barrier_snapshot = _snapshot(worker.session_key)
         state.restart_barrier.open({}, {worker.session_key})
 
-        async def _drain(key: str) -> bool:
+        async def _drain(key: str, ends_conversation: bool = False) -> bool:
             state.sessions.restart_barrier_snapshot = _snapshot()
             return True
 
@@ -183,7 +183,7 @@ class TestClearingTheBlockers:
                 "role": "Researcher",
             }
         ]
-        state.sessions.reset.assert_awaited_once_with(worker.session_key)
+        state.sessions.reset.assert_awaited_once_with(worker.session_key, ends_conversation=True)
         # The worker keeps its membership: clearing context is not a dismissal.
         assert worker.id in channel.members
         # Refreshed after the clear, so the barrier now reports nothing pending.
@@ -268,7 +268,7 @@ class TestClearingTheBlockers:
         state.sessions.restart_barrier_snapshot = _snapshot(first.session_key, second.session_key)
         state.restart_barrier.open({}, {first.session_key, second.session_key})
 
-        async def _reset(key: str) -> bool:
+        async def _reset(key: str, ends_conversation: bool = False) -> bool:
             if key == first.session_key:
                 raise RuntimeError("provider shutdown timed out")
             return True
@@ -320,7 +320,7 @@ class TestClearingTheBlockers:
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def _slow_reset(key: str) -> bool:
+        async def _slow_reset(key: str, ends_conversation: bool = False) -> bool:
             started.set()
             await release.wait()
             state.sessions.restart_barrier_snapshot = _snapshot()

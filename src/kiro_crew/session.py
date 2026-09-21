@@ -196,15 +196,23 @@ from kiro_crew.session_lifecycle import (
     SessionLifecycleState,
 )
 from kiro_crew.session_map import _kiro_sessions_dir  # noqa: F401
-from kiro_crew.session_map import MIRROR_OPT_OUT_FLAG
+from kiro_crew.session_map import (
+    MIRROR_OPT_OUT_FLAG,
+    BindListener,
+)
 from kiro_crew.session_map import SessionMap as SessionMap  # noqa: F401
-from kiro_crew.session_map import UnbindListener, set_unbind_listener
+from kiro_crew.session_map import (
+    UnbindListener,
+    set_bind_listener,
+    set_unbind_listener,
+)
 from kiro_crew.session_pid import (
     _build_child_map,
     _cleanup_orphaned_mcp_servers,
     _collect_active_pids,
     _kill_confirmed_and_writeback,
     _periodic_pid_sweep,
+    _prune_stale_session_pid_files,
     _rss_mb_from_tree,
     _sync_kill_provider,
 )
@@ -1246,6 +1254,7 @@ class SessionManager:
             cleanup_stale_sandbox_profiles=lambda: cleanup_stale_sandbox_profiles(
                 data_home=data_home
             ),
+            prune_session_pid_mappings=lambda: _prune_stale_session_pid_files(),
             prune_pycache=lambda: prune_pycache(),
             collect_active_pids=lambda sessions: _collect_active_pids(
                 cast(dict[Any, Any], sessions)
@@ -2356,6 +2365,7 @@ class SessionManager:
         skip_if_busy: bool = False,
         skip_if_injecting: bool = False,
         clear_conversation: bool = False,
+        ends_conversation: bool = False,
     ) -> bool:
         """Reset a live session while preserving its persistence entry."""
         return await self._lifecycle_boundary().reset(
@@ -2364,6 +2374,7 @@ class SessionManager:
             skip_if_busy=skip_if_busy,
             skip_if_injecting=skip_if_injecting,
             clear_conversation=clear_conversation,
+            ends_conversation=ends_conversation,
         )
 
     def check_context_usage(self, key: str, provider: LLMProvider) -> float:
@@ -2484,6 +2495,18 @@ class SessionManager:
         if session is not None:
             session.floor_pending = True
         return True
+
+    def set_child_teardown_handler(self, handler: Any) -> None:
+        """Register the hook that ends a parent's sub-agent runs at parent end.
+
+        Called once at wiring time with the ``SubagentManager`` itself, which
+        supplies both halves: a synchronous snapshot of the runs a key owns, and
+        the cancellation that stops exactly those. Every parent-end path in
+        :mod:`kiro_crew.session_lifecycle` drives them, so a surface that ends a
+        conversation — the dashboard, a channel command, the idle sweep —
+        inherits the behaviour without a call of its own.
+        """
+        self._lifecycle_boundary().set_child_teardown_handler(handler)
 
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register the lifecycle recycle callback."""
@@ -2626,6 +2649,15 @@ class SessionManager:
         """Remove a speculative session only before its first real claimant."""
         return await self._lifecycle_boundary().remove_if_unclaimed(key)
 
+    async def end_children_for(self, key: str) -> None:
+        """End *key*'s sub-agent runs without tearing its process down.
+
+        For a caller that replaces the conversation on a live process: the children of the
+        conversation that ended have nowhere to report, and the process surviving does not
+        change that.
+        """
+        return await self._lifecycle_boundary().end_children_for(key)
+
     async def destroy(self, key: str) -> None:
         """Permanently destroy a session and its persistence entry."""
         await self._lifecycle_boundary().destroy(key)
@@ -2746,6 +2778,15 @@ class SessionManager:
     def resumable_hint(self, key: str) -> bool:
         """Return whether a folded key has resumable state."""
         return self._allocation_boundary().resumable_hint(key)
+
+    def mapped_sid(self, key: str) -> str:
+        """The session ID a folded key maps to, in memory, without pruning.
+
+        For a caller recording HISTORY rather than deciding a resume. Use
+        :meth:`resumable_sid` for the latter: its file check is what makes the
+        answer a resumable session, and this one deliberately omits it.
+        """
+        return self._allocation_boundary().mapped_sid(key)
 
     def seed_conversation(self, key: str, sid: str, *, provider: str = "", cwd: str = "") -> None:
         """Seed a persisted conversation mapping."""
@@ -3020,6 +3061,15 @@ class SessionManager:
         """
         set_unbind_listener(callback)
 
+    @staticmethod
+    def set_bind_listener(callback: BindListener | None) -> None:
+        """Register the sink notified when a channel binding COMMITS.
+
+        Same registry reasoning as the unbind sink above: it is the session map's, shared
+        by every instance, so a binding made through a throwaway map is announced too.
+        """
+        set_bind_listener(callback)
+
     async def aflush(self) -> None:
         await self._session_map.aflush()
 
@@ -3048,8 +3098,8 @@ class SessionManager:
 
     # ── Additional session map helpers ──
 
-    def find_key_by_sid(self, sid: str) -> str | None:
-        return self._session_map.find_key_by_sid(sid)
+    def find_key_by_sid(self, sid: str, *, exclude: str = "") -> str | None:
+        return self._session_map.find_key_by_sid(sid, exclude=exclude)
 
     def reserve_generation(self, session_key: str) -> None:
         """Persist a generation floor before its first provider turn."""

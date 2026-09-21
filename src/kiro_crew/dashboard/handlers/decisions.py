@@ -2,6 +2,8 @@
 
 ``GET  /api/decisions/consent``   the keystone plus the endpoint config names now
 ``PUT  /api/decisions/consent``   ``{"enabled": bool}`` -> writes it, bound to that endpoint
+                                 plus the ``tool_args`` / ``compaction`` egress scopes,
+                                 each preserved when its field is omitted
 ``POST /api/decisions/feedback``  a person's verdict on one turn -> one appended log row
 
 Consent is bound to a destination: enabling records the provider endpoint the
@@ -170,6 +172,17 @@ def _payload(state: dict, *, denied: bool) -> dict:
         # -- those differ exactly when an agent has raised the config value, which is
         # the case this ceiling exists to make harmless.
         "history_budget_chars": consent.consented_history_budget(state),
+        # Whether the owner consented to sending TOOL-CALL ARGUMENTS. Reported so the
+        # card can show the second switch in the state actually recorded, rather than
+        # guessing from ``enabled``: a record written before this scope existed reads
+        # false here, which is what the card must draw for it.
+        "tool_args": consent.consented_tool_args(state),
+        # Whether the owner consented to sending a WHOLE SLOT TRANSCRIPT, the scope
+        # ``compaction.keep`` needs. Reported for the reason ``tool_args`` is: the
+        # card draws the switch in the state actually recorded, and a record written
+        # before this scope existed reads false here rather than inheriting either of
+        # the narrower yeses.
+        "compaction": consent.consented_compaction(state),
     }
 
 
@@ -209,6 +222,33 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     would then consent to an address the owner never saw. A mismatch is ``409``
     and nothing is written; the card re-reads and shows the new address.
 
+    ``enabled`` may be OMITTED, and then the body must name at least one scope. Such a
+    write moves only that scope: the switch and the endpoint are read from the keystone
+    inside the writer's lock and written back unchanged, so it can neither grant nor
+    revoke consent. That is the only safe shape for a scope write, because a body
+    carrying ``enabled`` can only carry what its sender last read -- and a view read
+    before a revoke would turn egress back on. A body naming neither the switch nor a
+    scope is a ``400``.
+
+    A scope-only write against a REVOKED keystone leaves it revoked and stores no scope:
+    a scope is only meaningful while the seam is on, which is the same rule that clears
+    the scopes on a disabling write.
+
+    ``tool_args`` records whether the owner consented to sending TOOL-CALL
+    ARGUMENTS, the category ``tool.risk`` needs. Absent PRESERVES the recorded scope
+    and disabling clears it, exactly as the ceiling below behaves, so an ordinary
+    switch flip cannot grant or erase it by omission. Absent on a keystone that never
+    had it reads as false, which is what keeps a consent given before this scope
+    existed meaning only what its owner reviewed.
+
+    ``compaction`` records the same thing for a WHOLE SLOT TRANSCRIPT -- the
+    conversation text and every tool-call input in it -- which is what
+    ``compaction.keep`` sends and neither of the other two scopes covers. It behaves
+    identically: absent preserves, disabling clears, a non-boolean is a ``400``, and
+    absent on a keystone that never had it reads as false. It is a field of its own
+    rather than a wider reading of ``tool_args`` because the owner reviewed that one
+    as the arguments of the one call about to run.
+
     ``history_budget_chars`` records the prior-conversation CEILING the owner
     reviewed, and it is here for the same reason ``endpoint`` is: the value in force
     lives in agent-writable ``config.json``, so a budget recorded only there could be
@@ -245,8 +285,29 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid JSON", "code": _CODE_INVALID_JSON}, status=400)
     # A strict bool, for the same reason the keystone read is a strict identity
     # test: ``"true"`` and ``1`` are not consent.
-    enabled = body.get("enabled") if isinstance(body, dict) else None
-    if not isinstance(enabled, bool):
+    #
+    # OMITTED is a scope-only write, and it is the only safe shape for one. A body that
+    # carries ``enabled`` can only carry what its sender last read, so a view read
+    # before a revoke re-grants egress the owner just withdrew -- and no client-side
+    # guard can make such a body safe, because the staleness is in the value itself.
+    # Omitting it hands ``KEEP_ENABLED`` to the writer, which resolves the switch and the
+    # endpoint from the keystone inside its own lock.
+    #
+    # It is only a scope-only write when a scope is actually present: a body naming
+    # neither the switch nor a scope asks for nothing and stays a 400, so an empty or
+    # misspelled body is refused rather than silently rewriting the record as itself.
+    scope_named = isinstance(body, dict) and ("tool_args" in body or "compaction" in body)
+    enabled = body.get("enabled", consent.KEEP_ENABLED) if isinstance(body, dict) else None
+    if enabled is consent.KEEP_ENABLED and not scope_named:
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
+        return web.json_response(
+            {
+                "error": 'body must carry "enabled", or a scope to change on its own',
+                "code": _CODE_INVALID_BODY,
+            },
+            status=400,
+        )
+    if enabled is not consent.KEEP_ENABLED and not isinstance(enabled, bool):
         await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
         return web.json_response(
             {"error": 'body must be {"enabled": true|false}', "code": _CODE_INVALID_BODY},
@@ -280,6 +341,40 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             status=400,
         )
 
+    # A bool, or absent. Absent is handed on as ``KEEP_TOOL_ARGS`` rather than
+    # resolved here, for the same reason the budget is: the writer resolves it inside
+    # its own read-modify-write, so the scope written comes from the same read the
+    # write is based on. Reading it on this side would hold a value read before a
+    # concurrent PUT cleared it, and write that back -- restoring an egress scope
+    # somebody just revoked.
+    #
+    # Validated rather than coerced, and a truthy stand-in is refused: this value
+    # decides whether a new category of conversation content leaves the machine, so
+    # ``"true"`` and ``1`` are 400s rather than silent yeses.
+    tool_args = body.get("tool_args", consent.KEEP_TOOL_ARGS) if isinstance(body, dict) else False
+    if tool_args is not consent.KEEP_TOOL_ARGS and not isinstance(tool_args, bool):
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
+        return web.json_response(
+            {"error": '"tool_args" must be true or false', "code": _CODE_INVALID_BODY},
+            status=400,
+        )
+
+    # The third scope, on exactly the terms of the one above: absent is the
+    # ``KEEP_COMPACTION`` sentinel resolved inside the writer's own lock, a truthy
+    # stand-in is a 400 rather than a silent yes, and disabling clears it. A separate
+    # field and not a wider reading of ``tool_args``, because the two were reviewed as
+    # different things -- the arguments of one call, versus everything this session has
+    # run.
+    compaction = (
+        body.get("compaction", consent.KEEP_COMPACTION) if isinstance(body, dict) else False
+    )
+    if compaction is not consent.KEEP_COMPACTION and not isinstance(compaction, bool):
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
+        return web.json_response(
+            {"error": '"compaction" must be true or false', "code": _CODE_INVALID_BODY},
+            status=400,
+        )
+
     # Bound to the endpoint the owner REVIEWED, checked against the one the
     # config names now. Equal: consent is for the address on screen, and the one
     # the gate will hold the config to afterwards. Different: the config moved
@@ -291,7 +386,12 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     from kiro_crew.decisions.capability import is_decisions_denied
 
     withdrawn = await asyncio.to_thread(is_decisions_denied)
-    if enabled:
+    # ``is True`` and not truthiness: ``KEEP_ENABLED`` is an object and would pass a bare
+    # ``if``, which would put a scope-only write through the endpoint echo it has no
+    # ``endpoint`` for. Only an ENABLING write is gated here, and a scope-only write is
+    # not one -- it cannot turn the seam on, so it acquires no authority a withdrawn
+    # ceiling would have to refuse.
+    if enabled is True:
         # The fleet's ceiling, ahead of every other check on an enabling write: a
         # withdrawn seam must not acquire a keystone that says otherwise. Only the
         # ENABLING direction is gated -- a disabling PUT stays available so an owner
@@ -332,7 +432,12 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             )
     try:
         state = await asyncio.to_thread(
-            consent.save_enabled, enabled, endpoint=endpoint, history_budget_chars=budget
+            consent.save_enabled,
+            enabled,
+            endpoint=endpoint,
+            history_budget_chars=budget,
+            tool_args=tool_args,
+            compaction=compaction,
         )
     except consent.ConsentCorruptError as exc:
         await _audit(request, operation=OP_CONSENT_PUT, outcome="error", error="corrupt")
@@ -347,10 +452,15 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     await _audit(
         request,
         operation=OP_CONSENT_PUT,
-        outcome="granted" if enabled else "revoked",
+        # The state that was WRITTEN, not what the body asked for: a scope-only write
+        # names no switch, and an auditor needs the row to say which way the record
+        # stands afterwards.
+        outcome="granted" if consent.is_enabled(state) else "revoked",
         resources=(
             f"decisions_consent.json endpoint={endpoint} "
-            f"history_budget_chars={consent.consented_history_budget(state)}"
+            f"history_budget_chars={consent.consented_history_budget(state)} "
+            f"tool_args={consent.consented_tool_args(state)} "
+            f"compaction={consent.consented_compaction(state)}"
         ),
     )
     return web.json_response(_payload(state, denied=withdrawn))

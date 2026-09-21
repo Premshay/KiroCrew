@@ -801,7 +801,11 @@ async def clear_agent_context(state: "DashboardState", agent) -> bool:
     """
     if not agent.session_key:
         return False
-    await state.sessions.reset(agent.session_key)
+    # ``ends_conversation``: the user asked this agent to forget the conversation,
+    # so its sub-agent runs have nothing left to report into. The default is the
+    # recycle, which is what the wedged-session and watchdog resets in
+    # `channel.py` want; this route is the opposite intent.
+    await state.sessions.reset(agent.session_key, ends_conversation=True)
     return True
 
 

@@ -142,6 +142,75 @@ _BUNDLE_ID_CACHE: dict[str, tuple[tuple[int, int], str]] = {}
 _FOLDER_REPOSITORY = FolderRepository(lambda: logger)
 
 
+def note_crew_log_class(state: Any, slot: Any) -> None:
+    """Record *slot*'s current class in its crew log, if it has moved.
+
+    THE recorder, as the surfaces outside this module call it. Every path that commits a
+    change to a session's class reaches it, so there is one place the fact is written and
+    one place to read to know when it is written.
+    ``test_crew_log_class_recorder.py`` derives the call-site list from the source and
+    fails if a new one appears outside it.
+    """
+    _record_crew_log_class(state, slot)
+
+
+def _record_crew_log_class(state: Any, slot: Any) -> None:
+    """The implementation. Never raises, and the reason is not caution.
+
+    A record is not worth turning an injection or a binding into a failure, and the
+    paths that reach here are reached in tests by state DOUBLES that model a slot store
+    and nothing else -- so a missing attribute is an ordinary input rather than a bug.
+    What makes swallowing safe is the far end: the append is handed to the crew log's
+    writer without waiting, a write the writer permanently loses is itself recorded, and
+    the class fold reads a dropped write as a hole. A lost record therefore costs a
+    cross-session read a refusal, never a silent grant.
+
+    A slot with NO OPEN LOG is the one case that argument does not cover, because nothing
+    is handed to the writer at all and so nothing records the loss. It is reachable: an
+    idle session can be bound to a channel, route a turn, and be unbound again before its
+    first turn opens a log, and a class read from the live slot at that point states
+    never-published about a log that holds channel-authored words. So a restriction is
+    MARKED on the slot instead of dropped, and the shared derivation folds the mark in
+    when the log is finally opened.
+
+    The mark is written BEFORE the append is attempted and is NOT conditioned on it,
+    because a session id is not evidence that a log exists: a restored session publishes
+    its id while its log is still absent, and the append then finds no log and returns
+    having written nothing and recorded no loss. Keying the mark on the restriction itself
+    rather than on a prediction about the append covers that ordering and every other
+    reason an append can fail to land, including ones not enumerated here. The cost is a
+    mark that outlives an append that DID land, which only re-states a restriction the log
+    already carries: the fold holds each member at the most restrictive value the log ever
+    recorded, so a redundant mark changes no answer.
+    """
+    from kiro_crew.crew_log import emit as crew_log_emit
+
+    try:
+        from kiro_crew.dashboard.chat_runner import (
+            PENDING_CHANNEL_ATTR,
+            _crew_log_class,
+            _crew_log_workspace,
+        )
+
+        memory, app, channel = _crew_log_class(state, slot)
+        if channel:
+            setattr(slot, PENDING_CHANNEL_ATTR, True)
+        sid = crew_log_emit.session_id_of(getattr(slot, "_acp_client", None))
+        if not sid:
+            return
+        crew_log_emit.on_class_observed(
+            sid,
+            memory=memory,
+            app=app,
+            channel=channel,
+            workspace=_crew_log_workspace(slot),
+        )
+    except Exception:
+        logger.debug(
+            "crew-log class record skipped for %r", getattr(slot, "key", ""), exc_info=True
+        )
+
+
 def _new_notification_coordinator() -> NotificationCoordinator:
     """Build a coordinator whose providers resolve facade seams at call time."""
     return NotificationCoordinator(
@@ -941,6 +1010,31 @@ def row_mid(row: Any) -> str | None:
     meta = row.get("meta")
     mid = meta.get("mid") if isinstance(meta, dict) else None
     return mid if isinstance(mid, str) and mid else None
+
+
+def _compaction_keep_record(key: str) -> dict[str, Any] | None:
+    """This session's pending ``compaction.keep`` record, or ``None``. Never raises.
+
+    ``None`` is the overwhelmingly common answer -- the seam is off until the owner
+    consents to a third, whole-transcript scope -- and it is also what a scoring run
+    that missed the compaction produces. The notice row then looks exactly as it does
+    without the seam, which is the point's own stated contract: the measurement may
+    cost an observation and must never cost the notice.
+
+    The read is DESTRUCTIVE (``take_record``): the record describes ONE compaction, so
+    leaving it in place would attach it to the next one on this key.
+
+    Imported inside the function and guarded as a whole: the decisions package is an
+    optional subsystem and this module is on the gateway boot path, so a build without
+    it -- or with a broken point file -- still appends the notice.
+    """
+    try:
+        from kiro_crew.decisions.points.compaction_keep import take_record
+
+        return take_record(key)
+    except Exception:
+        logger.debug("compact notice: no decision record for %s", key, exc_info=True)
+        return None
 
 
 def append_and_surface(
@@ -2088,11 +2182,14 @@ class _ChatSlot:
         "key",
         "title",
         "agent",
+        "agent_kind",
         "model",
+        "jev_route",
         "_model_withheld",
         "_model_withheld_for",
         "served_model",
         "_session_requested_model",
+        "_crew_log_previous_sid",
         "reasoning_effort",
         "autocompact_pct",
         "mode",
@@ -2316,6 +2413,11 @@ class _ChatSlot:
         self.key = key
         self.title = title or key
         self.agent = agent
+        # Which namespace ``agent`` was chosen in: "member" (a configured crew),
+        # "template" (a shared provider template), or "" when the choice was
+        # made by name alone or restored from history. Display provenance for
+        # the picker; never an authorization input.
+        self.agent_kind: str = ""
         # The agent whose ``welcomeMessage`` this slot has already rendered.
         # The hint is a ONE-SHOT per activation: the switch row emits it and
         # the session start that the switch's own reset produces must not emit
@@ -2325,6 +2427,15 @@ class _ChatSlot:
         # notice rather than a per-turn repeat.
         self._welcomed_agent: str = ""
         self.model = model
+        # Whether the owner asked Jev to pick this turn's model tier
+        # (`decisions.points.model_route`), set by the picker's "Auto (Jev)" entry
+        # and cleared by any concrete pick. A FLAG beside `model`, never a
+        # sentinel inside it: `model` is a provider model id -- it reaches
+        # `session/set_model`, the session allocation and the composer chip -- and
+        # a value no provider advertises would have to be filtered at each of
+        # those, which is one filter per reader and a real breakage the first time
+        # one is missed. The flag leaves `model` meaning exactly what it meant.
+        self.jev_route: bool = False
         # Spawn-time withhold verdict for `model`, and the model id it was
         # computed for. Read through the `model_withheld` property, never these
         # two directly: the pairing is what makes the verdict self-invalidating
@@ -2337,6 +2448,16 @@ class _ChatSlot:
         # Session/opened reads this instead of re-resolving at first turn, since
         # an eager allocation can outlive a config change.
         self._session_requested_model: str | None = None
+        # The crew log store this slot was writing BEFORE any allocation this
+        # process performed, latched at the first observation and not overwritten
+        # by a later one. Two sites allocate for a slot -- the eager prefetch and
+        # the first real turn -- and the eager one publishes its successor over
+        # the slot's mapping before the turn runs, so a turn that read the mapping
+        # itself would read the successor and name no predecessor at all. Written
+        # only while empty, because the second observation is the successor rather
+        # than an earlier store. Cleared once `session/opened` has carried it, so
+        # the next supersede of this slot latches afresh. "" = nothing to follow.
+        self._crew_log_previous_sid: str = ""
         # The model id the live session resolved to, for a slot that is
         # inheriting rather than pinning. "" = unknown. Written through
         # `record_served_model`.
@@ -4423,6 +4544,35 @@ class _ChatSlot:
         """
         self.served_model = model_id or ""
 
+    def latch_crew_log_previous(self, sid: str) -> None:
+        """Remember the crew log store this slot was writing, if none is remembered.
+
+        Called by every site that is about to ALLOCATE a session for this slot,
+        before the allocation publishes its own id over the slot's mapping. The
+        write is conditional on the latch being empty, and that is the whole
+        point: the eager prefetch and the first real turn both allocate, and by
+        the time the turn runs the prefetch has already mapped the successor, so a
+        second observation names the successor rather than an earlier store.
+        Keeping the FIRST observation keeps the predecessor a `session/opened` can
+        cite, and an empty ``sid`` latches nothing rather than latching a store
+        with no name.
+        """
+        if sid and not self._crew_log_previous_sid:
+            self._crew_log_previous_sid = sid
+
+    def take_crew_log_previous(self) -> str:
+        """The latched predecessor store id, clearing it as it is handed over.
+
+        Read-and-clear, because the value is owed to exactly one
+        ``session/opened``: leaving it behind would make the NEXT store of this
+        slot cite a predecessor two links back and skip the store between them,
+        which is the one thing a chain walker cannot detect. Returns ``""`` when
+        nothing is latched, which the emitter reads as "no edge to write".
+        """
+        sid = self._crew_log_previous_sid
+        self._crew_log_previous_sid = ""
+        return sid
+
     def forget_session_model_state(self) -> None:
         """Drop every fact that described the session being torn down.
 
@@ -4492,13 +4642,32 @@ class _ChatSlot:
         it was queued. Lets callers gate UI-visible side-effects (notifications,
         SSE pushes) on whether the prompt actually ran.
 
+        Busy is ``running or _in_stage_execution``, not ``running`` alone. A
+        multi-stage plan closes each stage's own turn before opening the next, so
+        ``self.task`` is None and ``running`` reads False in the gap between
+        stages while the plan is still live. Gating on ``running`` alone admits a
+        prompt there and starts a SECOND turn alongside the plan, with no
+        recovery once two turns own one slot. ``_in_stage_execution`` is held for
+        the whole loop (set by ``_stage_loop``, cleared in its ``finally``) and is
+        the predicate every other producer that must not stack a turn already
+        reads -- the composer and cron injection (``chat_handlers``), the nudge arm
+        (``handlers/autonudge``), channel messaging (``handlers/messaging``),
+        regenerate (``chat_regenerate``) and the transfer gate. This method was the
+        one admission point that did not, which is what left the Slack heartbeat
+        (``slack/gateway.py``), the workflow auto-turn (``dashboard/server.py``) and
+        the Issue Radar crew dispatch (``issue_radar`` ``crew_runtime``) able to
+        start a mid-plan turn while recording no intent to interrupt a plan.
+        Nothing is dropped: ``_stage_loop``'s ``finally`` hands the queue off once
+        the flag clears, so a prompt held here is delivered after the plan.
+
         Concurrency: the check (``self.running``) and mutation (``self.task = ...``)
         run synchronously on the asyncio event loop with no ``await`` between them,
         so two concurrent callers targeting the same slot cannot both observe
         ``running == False`` within a single loop iteration.
         """
-        if self.running:
-            # Circular import: session_control imports this module at module level.
+        if self.running or self._in_stage_execution:
+            # circular import: session_control imports this module at module level.
+            from kiro_crew.dashboard.chat_delivery import start_queue_persist
             from kiro_crew.dashboard.session_control import containment_meta
 
             # Stamp the containment constraints holding at ADMISSION, so the
@@ -4506,6 +4675,19 @@ class _ChatSlot:
             # that gains a channel/mirror link while this prompt waits must not
             # execute it under the weaker constraints that admitted it.
             self.queue_append(prompt, meta=containment_meta(state, self))
+            # Returning False IS the receipt that the prompt was accepted onto the
+            # queue, and until the drain writes its transcript row the queue is the
+            # prompt's only record -- so a restart inside the periodic flush
+            # interval loses a prompt the caller was told had landed.
+            # ``start_queue_persist``'s own contract is that every place a prompt is
+            # accepted onto a slot queue starts the write that makes it durable,
+            # "a receipt from one path and a write from only the other" being the
+            # asymmetry it exists to prevent. This admission point is one of those
+            # places. Started, not awaited, and self-limiting: it is skipped unless
+            # the slot is dirty or its queue drifted from disk, and it is
+            # single-flight per slot, so a burst of queued prompts is not a burst of
+            # transcript rewrites.
+            start_queue_persist(state, self)
             return False
         self.append("user", prompt, "msg msg-u")
         task = asyncio.create_task(run_chat_coro(state, self, prompt))
@@ -5184,6 +5366,15 @@ class DashboardState:
             else:
                 template = _AUTO_COMPACT_NOTICE
             message = template.format(pct=pct)
+            meta: dict[str, Any] = {"kind": "compaction"}
+            record = _compaction_keep_record(key)
+            if record is not None:
+                # The SAME field the two other decision receipts ride
+                # (``meta.decisions_strip``), so the reserved-key protection, the
+                # history reload and the live websocket door are all the ones already
+                # in place. The frontend dispatches on the record's own ``point``, so
+                # a reader that predates this one draws nothing rather than guessing.
+                meta["decisions_strip"] = record
             try:
                 # Tag kind="compaction" so this proactive auto-compact notice
                 # (fired at session.autocompact_pct) is skipped by the dashboard's
@@ -5193,7 +5384,7 @@ class DashboardState:
                 # (Routing through the chat_utils chokepoint would create a
                 # state<->chat_utils import cycle; the notice is a hardcoded
                 # template with no LLM content, so its redaction pass is moot.)
-                slot.append("assistant", message, "msg msg-a", meta={"kind": "compaction"})
+                slot.append("assistant", message, "msg msg-a", meta=meta)
             except Exception:
                 logging.getLogger(__name__).exception(
                     "Failed to append compact notice to slot %s", slot_key
@@ -5236,6 +5427,56 @@ class DashboardState:
             logging.getLogger(__name__).exception(
                 "Failed to deliver channel compact notice for %s", key
             )
+
+    def wire_session_bind_listener(self) -> None:
+        """Register the crew-log class record for a COMMITTED channel binding.
+
+        The session map sees the binding and nothing else about the session; the
+        memory mode and the owning app live on the slot. This is where those halves
+        meet, the same division as :meth:`wire_session_unbind_listener`.
+
+        Runs SYNCHRONOUSLY, unlike the unbind notice, and that difference is the point
+        rather than an oversight. The notice has to reach a transport, so it hops to
+        the gateway loop; this has to be recorded BEFORE anything can be routed through
+        the binding, and it is the map's own lock -- held across this call -- that
+        guarantees it. Hopping to the loop would put the record after traffic could
+        arrive. Every step here is cheap and non-blocking: reading slot attributes,
+        one probe of the map (whose lock is reentrant, so the same thread re-enters it
+        safely), and an append handed to the crew log's writer without waiting.
+        """
+
+        def _on_bind(key: str) -> None:
+            slot = self._slots.get(key.partition(":")[2] or key)
+            if slot is None:
+                # No live slot: nothing is authoring into a crew log under this key
+                # right now, so there is no class to record. A later turn opens the log
+                # and states the class it finds then.
+                return
+            self.note_crew_log_class(slot)
+
+        self.sessions.set_bind_listener(_on_bind)
+
+    def note_crew_log_class(self, slot: Any) -> None:
+        """Record *slot*'s current class in its crew log, if it has moved.
+
+        THE recorder. Every surface that commits a change to a session's class reaches
+        it -- the session map's bind announcement, and the paths that set a link on a
+        slot directly -- so there is one place the fact is written and one place to
+        read to know when it is written. ``test_crew_log_class_recorder.py`` derives the
+        call-site list from the source and fails if a new one appears outside it.
+
+        Best-effort by contract, because a binding must not fail for want of a record.
+        What makes that safe is the far end rather than optimism: the append is handed
+        to the crew log's writer without waiting, a write the writer permanently loses
+        is itself recorded, and the class fold reads a dropped write as a hole -- so a
+        lost record costs a cross-session read a refusal, never a silent grant.
+
+        The module-level :func:`note_crew_log_class` is what the surfaces outside this
+        class call, and it tolerates a state object that does not have this method at
+        all. That is not defensive padding: the link-setting paths are reached in tests
+        by state DOUBLES, and a record is not worth turning an injection into a failure.
+        """
+        _record_crew_log_class(self, slot)
 
     def wire_session_unbind_listener(self) -> None:
         """Register the channel notice for a removed inbound resume binding.
@@ -6438,6 +6679,9 @@ class DashboardState:
             slot.channel_origin = True
         if linked_session_key:
             slot.linked_session_key = linked_session_key
+            # Every path that sets a link records the class it just changed. Free when
+            # the slot has no live session yet, which is the common case here.
+            self.note_crew_log_class(slot)
         elif self.sessions and not app:
             # No caller-supplied binding, but a channel-stem name means this slot
             # displays a conversation that runs on the channel's own session.
@@ -6461,6 +6705,7 @@ class DashboardState:
                 resolved = self.sessions.channel_key_for_stem(name)
                 if isinstance(resolved, str) and is_channel_session_key(resolved):
                     slot.linked_session_key = resolved
+                    self.note_crew_log_class(slot)
         try:
             if self.sessions:
                 from kiro_crew.dashboard.chat_utils import effective_session_key

@@ -22,9 +22,9 @@ while the code holding credentials is not. `pr-readiness.yml` does not read this
 | Path | Role |
 |---|---|
 | `.github/workflows/gui-user-test.yml` | Triggers, boot, run, artifact, PR comment, nightly issue, lane status. |
-| `scripts/gui-user-test/boot.sh` | Xvfb -> `seed_home.py` -> `python -m kiro_crew gateway --test-mode --approval yolo --no-crons` on the packaged fake ACP backend -> Chromium at the dashboard URL. Writes `target.env` (origin + one-time token, mode 0600) and `pids`. |
+| `scripts/gui-user-test/boot.sh` | Xvfb -> `seed_home.py` -> `python -m kiro_crew gateway --test-mode --approval yolo --no-crons` on the packaged fake ACP backend -> Chromium at the dashboard URL. Writes `target.env` (origin + one-time token, mode 0600) and `pids`. Also stages the sample notes folder at a fixed path (see "Seeds" below). |
 | `scripts/gui-user-test/seed_home.py` | Copies a fixture into `$KIROCREW_HOME` through `kiro_crew.seed` and adds `config.agents.<slug>` for each `--member` so the Crew Members page has a roster. |
-| `scripts/gui-user-test/teardown.sh` | Kills the three process groups and removes the scratch home and browser profile. |
+| `scripts/gui-user-test/teardown.sh` | Kills the three process groups and removes the scratch home, the browser profile and the sample notes folder. |
 | `test/gui_user/harness.py` | The screenshot -> Bedrock Messages API -> action loop with the step, time and budget gates. |
 | `test/gui_user/x11.py` | Screenshots (Pillow `ImageGrab`) and input (`xdotool`); coordinate scaling, key aliases and argv building are pure and unit-tested. |
 | `test/gui_user/scenarios.py` + `scenarios/*.yaml` | The scenario DSL (including the `FEATURES` registry) and the shipped scenarios. |
@@ -46,9 +46,16 @@ need no display and never call Bedrock.
 2. `boot.sh` starts Xvfb `:99` at 1600x1000, seeds a throwaway `KIROCREW_HOME`, starts
    the gateway with `KIROCREW_KIRO_BIN` pointed at
    `kiro_crew.testing.fake_acp_backend` (so chat replies without kiro-cli or a
-   login), reads the `KIROCREW_READY:{port, token}` line, opens Chromium
+   login; spawned as the KAS relay -- which is how crew-member DMs run by default --
+   the fake also reports every managed MCP server `connected`, since the KAS
+   harness holds a session's first prompt behind that readiness barrier), reads
+   the `KIROCREW_READY:{port, token}` line, opens Chromium
    (`--no-sandbox --test-type`, full-screen window, omnibox kept) at
-   `http://127.0.0.1:<port>/?token=...`, focuses the window.
+   `http://127.0.0.1:<port>/?token=...`, waits for its window and focuses it. The
+   window wait is bounded by the browser process rather than a stopwatch: a browser
+   that exits fails the boot at once, one still starting gets up to 120 s, because
+   Chromium's cold start on the hosted runner image has ranged from under 2 s to
+   over 30 s between nights with nothing else different.
 3. `harness.py` navigates to each scenario's `start_url` through the omnibox (the
    token has become the `mc_token` cookie by then), takes a screenshot, and loops:
    the model returns one action, the harness executes it, waits about a second, and
@@ -162,9 +169,38 @@ its rail label, which was the same on both sides of the change. When a scenario 
 need to move with the product, change the YAML in the same PR as the UI and re-run it
 on demand (below) before merging.
 
+### Seeds: one home per run, plus a fixed sample folder
+
 `boot.sh` seeds one home per run from `GUI_SEED` (default `rich`) with `GUI_MEMBERS`
 (default `nova-sky`); a scenario's `preconditions.seed` / `members` document what it
 needs and must agree with that boot, because the target is booted once per run.
+
+The home is a `mktemp` directory, so no scenario can spell its path. Where a flow needs
+the tester to TYPE a path -- the Knowledge "Add Source > Local Folder" form, whose
+native picker is macOS-only -- `boot.sh` stages the three markdown files under
+`scripts/gui-user-test/knowledge-notes/` at the fixed path
+`/tmp/kirocrew-gui-user-test/team-notes`: mode 0700, recorded in `target.paths` as
+`notes=` and removed by `teardown.sh`. Because the path is fixed under a shared `/tmp`,
+neither script deletes anything it cannot prove is its own: `boot.sh` writes a marker
+file (`.owned-by-gui-user-test`) into the tree it creates, and both scripts remove the
+tree only when it is a real directory owned by the current user that carries that
+marker -- a stale tree from a crashed run qualifies; a symlink, another user's
+directory or an unmarked directory at that path refuses the boot (exit 2) or the
+removal instead. The path is deliberately not configurable:
+`knowledge-add-folder-source-and-scan` types it verbatim, and an override would
+silently desynchronise the two. Each note is one chunk, so a scan of the folder yields
+exactly three items -- the count that scenario asserts, and
+`test_scenarios_and_report.py` pins the note count and word length to it, so a note
+added without moving the scenario fails a unit test rather than a paid nightly run.
+
+That one boot also serves a failed scenario's retry: the harness runs attempt 2 against
+the same live gateway, with nothing re-seeded in between. A scenario must therefore
+hold on a target its own first attempt already touched -- more bubbles in the same
+thread, a toggle already flipped. One that changes persisted state (creates something,
+switches a store) and then expects the pre-change state cannot be retried: its second
+attempt meets a precondition that no longer holds and cannot reach a verdict. Write the
+steps and expectations so both attempts read the same, or keep the mutation out of the
+scenario.
 
 ### New-user friction: what confused the tester, beside the verdict
 
@@ -190,8 +226,21 @@ logged, or fail with none.
   screenshot's artifact path and the step number. Twelve entries per attempt; a
   duplicate or a malformed call gets a one-line answer and never fails the task. The
   entries ride in `summary.json` under each attempt as `friction[]`.
-- **Identity across nights.** `friction.entry_key(feature, element, what_confused)`
-  after case / whitespace / punctuation normalization. The workflow fetches the
+- **Identity across nights.** `friction.entry_key(feature, element)`
+  after case / whitespace / punctuation normalization -- which control, on which
+  feature. `what_confused` is deliberately not part of it: it is the tester's
+  first-person narration, written fresh every run, and keying on it made one folder
+  row file seven issues across five nights (#11269, #11503, #11504, #11761, #12000,
+  #12261, #12262) including two on a single night from attempt 1 and attempt 2 of
+  the same scenario. Two testers stalling on the same control for different reasons
+  is one issue about that control; each narration still arrives, as the row's
+  current wording and as a recurrence comment. A ledger written before this change
+  (`version: 1`) is re-keyed on load by `friction.migrate_ledger`, which folds the
+  rows that now collide -- earliest `first_seen`, latest `last_seen`, worst
+  severity, newest evidence, the first-filed issue as the survivor and the others
+  recorded in `merged_from`; `count` becomes the number of distinct dates the
+  folded rows can prove, a floor rather than a sum, because a v1 row records no
+  list of nights. The workflow fetches the
   previous `gui-user-test-friction-ledger` artifact, folds
   tonight's entries in (`friction.py merge`: a recurrence bumps `count` and
   `last_seen`, takes the newest sighting's wording and screenshot and keeps the worst
@@ -296,8 +345,8 @@ owning server is not a virtual one.
   10-step scenario on a Sonnet-class model is about $0.25-0.40 and two to four
   minutes. Budget the nightly tier (every shipped scenario, one retry each in the
   worst case) at about $0.50 per scenario and the smoke tier at about $0.35. The run
-  stops at `--budget-usd` (dispatch default $5 -- the smoke tier is seven scenarios,
-  about $2.50 with one retry apiece, so the default has to clear that; nightly $8)
+  stops at `--budget-usd` (dispatch default $5 -- at about $0.35 per smoke scenario
+  with one retry apiece the default has to clear the whole smoke tier; nightly $8)
   and marks the remaining
   scenarios `SKIPPED`; the job's 90-minute timeout is the backstop for a hung target,
   not the budget. Keep the nightly bill under $10: when a new batch would push past

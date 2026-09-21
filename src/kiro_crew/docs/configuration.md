@@ -161,7 +161,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
     "max_channels": 1,
     "max_channel_agents": 3,
     "max_subagents": 0,
-    "subagent_max_turns": 100,
+    "subagent_max_turns": 1000,
     "spawn_min_memory_gb": 4.0,
     "soft_stop_budget_secs": 10.0,
     "completion_keep": "head",
@@ -195,7 +195,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
     "provider": "local",
     "streaming": true,
     "transcribe_region": "us-east-1",
-    "language_code": "en-US"
+    "language_code": "auto"
   },
   "memory": {
     "embedding_provider": "llama_cpp",
@@ -243,7 +243,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `agent.max_subagents` | Max concurrent subagents. `0` auto-sizes the cap at startup from host memory/CPU and a learned per-agent cost. A pin of 1 or 2 is raised to 3, because a cap below 3 would disable auto-sizing and still run under the default | `0` |
 | `agent.subagent_max_per_parent` | Fallback cap for active child runs from one parent session. `0` leaves only the process-wide cap | `0` |
 | `agent.subagent_max_per_parent_by_agent` | Optional map of exact agent names or shell-style patterns to child-run caps. Exact names win, then the most-specific matching pattern; unmatched agents use `subagent_max_per_parent` | `{}` |
-| `agent.subagent_max_turns` | Default tool-call budget per subagent | `100` |
+| `agent.subagent_max_turns` | Default tool-call budget per subagent; stored user values are preserved on upgrade | `1000` |
 | `agent.spawn_min_memory_gb` | Minimum available memory (GB) to spawn a subagent (0 disables the check) | `4.0` |
 | `agent.completion_keep` | Which end of the subagent transcript to keep in the completion event injected into the parent session: `"head"`, `"tail"`, or `"both"` (head + middle marker + tail) | `"head"` |
 | `agent.completion_keep_chars` | Max characters retained in the completion event after applying `completion_keep`. `0` disables truncation. The full transcript stays on disk (see `subagent_result_ttl_secs`) | `3000` |
@@ -312,7 +312,7 @@ transcribed the same way.
 | `stt.enabled` | Turn spoken input into text you can send | `true` |
 | `stt.provider` | `"local"` (this machine, no account), `"apple"` (the on-device recognizer built into macOS 26 and later), or `"transcribe"` (AWS Transcribe, which bills your AWS account) | `"local"` |
 | `stt.model` | Which speech model the local provider downloads and runs: `tiny`, `base`, `small`, or `large-v3-turbo`. Bigger is more accurate and a longer first-time download | `"base"` |
-| `stt.language_code` | Language for speech recognition, e.g. `en-US`, `fr-FR` | `"en-US"` |
+| `stt.language_code` | Language for speech recognition, e.g. `en-US`, `fr-FR`. `"auto"` auto-detects on the local provider | `"auto"` |
 | `stt.streaming` | Show words in the message box while you are still speaking rather than only once you stop. Every provider supports it; turning it off spends less CPU on `local` and fewer API calls on `transcribe` | `true` |
 | `stt.silence_ms` | How long a pause must last before what you said is treated as a finished phrase. Raise it if you are being cut off mid-sentence, lower it if the text lags behind you. A value outside 200-5000 ms is clamped into that range, because a shorter pause than that falls between two ordinary words | `700` |
 | `stt.partial_interval_ms` | How often the live transcript is refreshed while you speak. Lower feels more immediate and costs a little more CPU per second of speech; higher is steadier to read. A value outside 100-5000 ms is clamped into that range | `400` |
@@ -482,7 +482,7 @@ member-memory sandbox is required.
 | Key | Description | Default |
 |-----|-------------|---------|
 | `skills.max_triggered` | Maximum skills loaded per message (>=0) | `0` |
-| `skills.lazy_load` | Inject only a usage-ranked top-K of on-demand skills at session start and leave the long tail discoverable via search, so a large skills set cannot crowd out memory and lessons | `false` |
+| `skills.lazy_load` | Inject a usage-ranked top-K of on-demand skills at session start, plus one line naming the families it leaves out, and leave the tail discoverable via search, so a large skills set cannot crowd out memory and lessons. Set false for the shorter entry that names only the eight hottest skills | `true` |
 
 ### MCP Gateway
 

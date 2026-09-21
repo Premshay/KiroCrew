@@ -163,22 +163,90 @@ async def test_private_store_mixed_load(tmp_path, monkeypatch, concurrency):
         for name in stores:
             for index in range(4):
                 tasks.extend(
-                    asyncio.create_task(operation(name, "episode", index)) for _ in range(2)
+                    asyncio.create_task(
+                        operation(name, "episode", index), name=f"{name}/episode/{index}"
+                    )
+                    for _ in range(2)
                 )
-                tasks.append(asyncio.create_task(operation(name, "fact", index)))
+                tasks.append(
+                    asyncio.create_task(operation(name, "fact", index), name=f"{name}/fact/{index}")
+                )
             tasks.extend(
-                asyncio.create_task(operation(name, "recall", index)) for index in range(2)
+                asyncio.create_task(operation(name, "recall", index), name=f"{name}/recall/{index}")
+                for index in range(2)
             )
-            tasks.append(asyncio.create_task(operation(name, "backfill", 0)))
+            tasks.append(
+                asyncio.create_task(operation(name, "backfill", 0), name=f"{name}/backfill/0")
+            )
 
+        # Wait for the first job to reach the queue. The loop above creates a few
+        # hundred tasks, and this waits for the scheduler to run one of them far
+        # enough to enqueue, so a FIVE-second cap here bounded the scheduler rather
+        # than the work: a shard running the suite in a four-worker pool on a small
+        # runner loses that bet while a slower but less contended shard wins it.
+        #
+        # Still bounded, but the bound is a LOST-RUN CEILING and not a scheduling
+        # budget. Sixty seconds is twelve times the old cap and half this test's own
+        # `--timeout=120`, so a genuine "nothing ever enqueues" regression fails
+        # HERE with a message naming what it saw, instead of spinning until the
+        # per-test timeout kills the worker -- which under CI's
+        # `--max-worker-restart=0` takes the whole job rather than one test.
+        #
+        # Polled rather than waited on ``_jobs_changed``: the dispatch loop CLEARS
+        # that event, so it is a level that can be lowered between the enqueue and
+        # an observer, while ``qsize`` is the condition this test is about.
         async def wait_for_queue():
             while backend._jobs.qsize() == 0:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
 
-        await asyncio.wait_for(wait_for_queue(), 5)
+        try:
+            await asyncio.wait_for(wait_for_queue(), 60)
+        except TimeoutError:
+            finished = sum(1 for task in tasks if task.done())
+            raise AssertionError(
+                "no embed job reached the queue within 60s: "
+                f"{len(tasks)} operation task(s) created, {finished} already finished, "
+                f"queue depth {backend._jobs.qsize()}"
+            ) from None
         stats["queue_peak"] = max(stats["queue_peak"], backend._jobs.qsize())
         release.set()
-        await asyncio.wait_for(asyncio.gather(*tasks), 45)
+        # Diagnostics only. This budget expires on a loaded shard from time to
+        # time and the bare TimeoutError says nothing about WHY, so the failure is
+        # unactionable: you cannot tell a store that never finished from a queue
+        # that never drained from a worker that was starved. The report below is
+        # built from state this test already keeps, the exception is re-raised
+        # unchanged, and nothing here alters the workload, the budget, the task
+        # ordering or any assertion -- a green run takes this path never.
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks), 45)
+        except TimeoutError:
+            # `wait_for` cancels the gather before it raises, so nothing is left
+            # "not done" by the time this runs -- a pending count here is always
+            # zero and says nothing. The tasks the budget actually caught are the
+            # CANCELLED ones; the rest finished in time.
+            caught = [t for t in tasks if t.cancelled()]
+            kinds = Counter(str(t.get_name()).split("/")[1] for t in caught)
+            stores_waiting = Counter(str(t.get_name()).split("/")[0] for t in caught)
+            print(
+                "MIXED_LOAD_TIMEOUT "
+                + json.dumps(
+                    {
+                        "concurrency": concurrency,
+                        "elapsed_s": round(time.monotonic() - started, 1),
+                        "tasks_total": len(tasks),
+                        "tasks_cancelled_by_budget": len(caught),
+                        "cancelled_by_kind": dict(kinds),
+                        "cancelled_stores": len(stores_waiting),
+                        "embed_queue_depth": backend._jobs.qsize(),
+                        "embed_calls": sum(calls.values()),
+                        "stats": dict(stats),
+                        "latencies_recorded": len(latencies),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            raise
         await blocker
         gateway = object.__new__(GatewayOrchestrator)
         gateway._memory_repair_stop = threading.Event()

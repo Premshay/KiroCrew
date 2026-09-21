@@ -25,6 +25,7 @@ import ChatFooter from '../pages/chat/ChatFooter'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
+import { useJevAutoSend } from '../pages/chat/useJevAutoSend'
 import type { DisplayItem } from '../pages/chat/types'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from './AgentDropdownList'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
@@ -46,6 +47,7 @@ import {
   useModelPickerConfigured,
   useModelPickerHiddenModelsQuery,
 } from '../hooks/useInteractiveModels'
+import { JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
@@ -488,11 +490,10 @@ export default function ChatPane({
   }, [followUpOptionsKey, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
   // with the page and no extra request is made for a pane.
-  const { data: dashCfg } = useQuery<{ quick_send?: boolean }>({
-    queryKey: ['dashboardConfig'],
-    queryFn: () => api.dashboardConfig(),
-    staleTime: 30_000,
-  })
+  const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
+  // Whether the split send button may offer `Auto (Jev)`: the fleet ceiling and
+  // the owner's consent, both the gateway's answers (see useJevAutoSend).
+  const jevAutoConsented = useJevAutoSend()
   // Follow-up bar layout: the same persisted setting ChatPage reads, kept live
   // the same way (ChatPage.tsx's reload listener) — a pane is long-lived, so a
   // one-shot read would leave it on the old layout after the user changes the
@@ -534,14 +535,12 @@ export default function ChatPane({
   const agentsRefreshTrigger = useAppSelector((s) => s.dashboard.refreshTrigger ?? 0)
   // This pane takes no project prop, so read THIS slot's project from the store:
   // it scopes which project-local agents exist, so a project change must refetch.
-  const paneProject = useAppSelector(
-    (s) => s.dashboard.slots.find((x) => x.key === slotKey)?.project || undefined,
-  )
-  const { agents: installedAgents, defaultAgent } = useAgents(
-    agentsRefreshTrigger,
-    slotKey,
-    paneProject,
-  )
+  const paneProject = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.project || undefined)
+  const { agents: installedAgents, choices: catalogChoices, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
+  // The picker lists every catalog row (a member and a template of one name
+  // are two rows). A roster source that exposes only the folded list -- one
+  // row per name -- is still a complete, if namespace-blind, catalog.
+  const agentChoices = catalogChoices ?? installedAgents
   // One source for every same-meaning marker: the composer chip, the row's
   // check, and the default-agent row's label. An agent-less slot resolves to
   // the configured default (matching what dispatch runs) before the literal
@@ -568,7 +567,9 @@ export default function ChatPane({
     },
     [dispatch],
   )
-  const agentDD = useFilteredDropdown(installedAgents)
+  // The pop-up lists the full catalog (a same-name member and template are
+  // two rows); every other reader of the roster keeps the name-folded list.
+  const agentDD = useFilteredDropdown(agentChoices)
   const modelPickerAgent = installedAgents.find((agent) => agent.name === paneAgentName)
   const localModels = useAvailableModels({ agent: modelPickerAgent })
   const effectiveModels = useMemo<ModelInfo[]>(() => {
@@ -583,13 +584,31 @@ export default function ChatPane({
   const hiddenModelIds = hiddenModelsQ.data
   const modelPickerConfigured = useModelPickerConfigured()
   const availableModels = effectiveModels
+  // Same two reads and the same fail-closed rule as ChatPage: a split pane is
+  // another view of the same sessions, so it offers the same row or the picker
+  // would disagree with itself about whether routing is available. The dashboard
+  // config comes from this component's EXISTING observer (widened above) rather
+  // than a second one on the same key.
+  const jevConsentQ = useQuery({
+    queryKey: ['decisionsConsent'],
+    queryFn: () => api.getDecisionsConsent(),
+    retry: false,
+  })
+  // Not offered for a remote-bound session, for the reason ChatPage states: its
+  // turns run on the peer and never reach the routing hook.
+  const jevRouteOn =
+    jevRouteOffered(dashCfg, jevConsentQ.data, !!paneSlot) && !paneRemoteCrew.isRemote
+  const jevRouteLabel = i18nT('pages.chatPage.model_auto_jev_description')
   const modelPickerModels = useMemo(
-    () =>
+    () => withJevRoute(
       filterInteractiveModels(effectiveModels, hiddenModelIds, [
         paneSlot?.model || '',
         paneSlot?.served_model || '',
       ]),
-    [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model],
+      jevRouteOn,
+      jevRouteLabel,
+    ),
+    [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model, jevRouteOn, jevRouteLabel],
   )
   const modelDD = useFilteredDropdown(modelPickerModels)
   // Picker anchors: keep each portaled menu glued to the ChatInput chip that
@@ -663,55 +682,54 @@ export default function ChatPane({
   // inside ChatMessageList — growth on EARLIER rows (a tool result updating, a
   // thinking block expanding) and turn-collapse shrink re-pin too.
 
-  const switchAgent = useCallback(
-    async (name: string) => {
-      dispatch(setAgentSwitchNotice(null))
-      setSwitchError('')
-      try {
-        // Same protocol as switchModel below (#4523): the pane must not depend
-        // on the coalesced slots rebroadcast to see its own pick.
-        // performAgentSlotSwitch mirrors exactly what the response names.
-        await performAgentSlotSwitch(slotKey, name, dispatch)
-      } catch (e) {
-        const msg = agentSwitchFailureMessage(e)
-        dispatch(setAgentSwitchNotice(msg))
-        setSwitchError(msg)
-      }
-    },
-    [dispatch, slotKey],
-  )
-  const switchModel = useCallback(
-    async (name: string) => {
-      setSwitchError('')
-      try {
-        // performSlotSwitch owns the whole protocol: serialized dispatch,
-        // latest-request-wins adjudication, hung-request timeout, and exactly
-        // one store write on the authoritative value (#4523) — the pane must
-        // not depend on the coalesced slots rebroadcast to see its own pick.
-        await performSlotSwitch(
-          'model',
-          slotKey,
-          name,
-          async () => {
-            const r = await api.chatSlotModel(slotKey, name)
-            return r?.model ?? name
-          },
-          (value) => dispatch(updateSlot({ key: slotKey, model: value })),
-        )
-      } catch (e) {
-        // Same failure surface as switchAgent above: the shared notice toast,
-        // plus the in-pane notice (the toast alone would be the only report of
-        // a write that did not persist).
-        const msg = agentSwitchFailureMessage(e)
-        dispatch(setAgentSwitchNotice(msg))
-        setSwitchError(msg)
-        // Keep the rejected backend value available in developer diagnostics.
-        // eslint-disable-next-line no-console
-        console.error('[ChatPane] switchModel failed', e)
-      }
-    },
-    [dispatch, slotKey],
-  )
+
+  const switchAgent = useCallback(async (name: string, kind?: 'member' | 'template') => {
+    dispatch(setAgentSwitchNotice(null))
+    setSwitchError('')
+    try {
+      // Same protocol as switchModel below (#4523): the pane must not depend
+      // on the coalesced slots rebroadcast to see its own pick.
+      // performAgentSlotSwitch mirrors exactly what the response names.
+      await performAgentSlotSwitch(slotKey, name, dispatch, kind)
+    } catch (e) {
+      const msg = agentSwitchFailureMessage(e)
+      dispatch(setAgentSwitchNotice(msg))
+      setSwitchError(msg)
+    }
+  }, [dispatch, slotKey])
+  const switchModel = useCallback(async (name: string) => {
+    setSwitchError('')
+    try {
+      // performSlotSwitch owns the whole protocol: serialized dispatch,
+      // latest-request-wins adjudication, hung-request timeout, and exactly
+      // one store write on the authoritative value (#4523) — the pane must
+      // not depend on the coalesced slots rebroadcast to see its own pick.
+      await performSlotSwitch('model', slotKey, name,
+        async () => {
+          const r = await api.chatSlotModel(slotKey, name)
+          return r?.model ?? name
+        },
+          // The routing flag is written from the REQUEST, not from the response's
+          // `model`: the gateway resolves the sentinel to `auto`, so the stored
+          // model cannot tell a routed pick from a plain Auto one. Written on
+          // every pick, because picking a concrete model is what clears it.
+        (value) => dispatch(updateSlot({
+          key: slotKey,
+          model: value,
+          jev_route: name === JEV_ROUTE_MODEL,
+        })))
+    } catch (e) {
+      // Same failure surface as switchAgent above: the shared notice toast,
+      // plus the in-pane notice (the toast alone would be the only report of
+      // a write that did not persist).
+      const msg = agentSwitchFailureMessage(e)
+      dispatch(setAgentSwitchNotice(msg))
+      setSwitchError(msg)
+      // Keep the rejected backend value available in developer diagnostics.
+      // eslint-disable-next-line no-console
+      console.error('[ChatPane] switchModel failed', e)
+    }
+  }, [dispatch, slotKey])
 
   // Roving-focus keyboard nav for the pickers (mirrors ChatPage / StyledSelect):
   // ArrowUp/Down across options, Enter/Space select, Escape/Tab close + return
@@ -723,10 +741,7 @@ export default function ChatPane({
     inputRef: agentDD.inputRef,
     hasFilterInput: true,
     filteredCount: agentDD.filtered.length,
-    onEnterSingleMatch: () => {
-      switchAgent(agentDD.filtered[0].name)
-      agentDD.setOpen(false)
-    },
+    onEnterSingleMatch: () => { switchAgent(agentDD.filtered[0].name, agentDD.filtered[0].selection_kind); agentDD.setOpen(false) },
     closeToTrigger: () => agentDD.setOpen(false),
   })
   const { onListKeyDown: onModelListKeyDown } = useListboxKeyboard({
@@ -1113,7 +1128,7 @@ export default function ChatPane({
   // kiro-cli's steer channel is TEXT-ONLY, so attachments ride as ChatPage's
   // steer sends them — inlined by prepareSendPayload (images as markdown, other
   // files as `[attached_file N]` tokens), the same wire shape doSend now uses.
-  const doSteer = useCallback(() => {
+  const doSteer = useCallback((opts?: { auto?: boolean }) => {
     // Nothing to inject into: busy purely because background sub-agents are
     // still running (the parent turn already ended). Same intent — act on
     // this now — so start a real turn through the normal send path with the
@@ -1163,7 +1178,11 @@ export default function ChatPane({
     // Cleared HERE (not in ChatInput) so text and attachments clear atomically.
     setInput('')
     setPendingFiles([])
-    void sendTurn({ message: txt, slot: slotKey, steer: true, meta: steerMeta }).then((receipt) => {
+    // `auto` hands the steer-or-queue choice to the gateway for this message
+    // (`decisions/points/message_steer.py`); the receipt policy below is unchanged,
+    // because a decided send still comes back as a steer's `dispatched` or a
+    // queue's `queued`.
+    void sendTurn({ message: txt, slot: slotKey, steer: opts?.auto === true ? 'auto' : true, meta: steerMeta }).then((receipt) => {
       // Receipt policy, owned once in chat-core (issue #9457) -- the same
       // rulings as ChatPage's steerMutation. applySteerReceipt decides WHICH
       // ruling; the adapter below is this pane's HOW.
@@ -1896,6 +1915,10 @@ export default function ChatPane({
           // `steer-only` host gets a plain send that steers.
           canSteer={busy}
           onSteer={doSteer}
+          // AND a turn actually running: `busy` also covers a slot whose
+          // sub-agents are still working, where the send starts a fresh turn and
+          // there is no running turn for the point to decide about.
+          jevAutoAvailable={jevAutoConsented && running}
           busyMode={busyMode}
           autoFocusKey={slotKey}
           agentName={paneAgentName}
@@ -2027,9 +2050,10 @@ export default function ChatPane({
                 <AgentDropdownList
                   agents={agentDD.filtered}
                   activeAgent={paneAgentName}
+                  activeKind={paneSlot?.agent_kind}
                   defaultAgent={defaultAgent}
-                  onSelect={(name) => {
-                    switchAgent(name)
+                  onSelect={(name, kind) => {
+                    switchAgent(name, kind)
                     agentDD.setOpen(false)
                   }}
                 />
@@ -2126,7 +2150,7 @@ export default function ChatPane({
               >
                 <ModelDropdownList
                   models={modelDD.filtered}
-                  activeModel={shownModel}
+                  activeModel={jevRouteShownModel(shownModel, paneSlot)}
                   onSelect={(name) => {
                     switchModel(name)
                     modelDD.setOpen(false)

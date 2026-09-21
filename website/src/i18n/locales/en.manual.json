@@ -931,6 +931,19 @@
       }
     },
     "workflows": {
+      "workflowRunGraph": {
+        "failed_see_tree": "Failed. Open Tree for the detail.",
+        "may_not_run": "may not run",
+        "may_not_run_why": "The script only runs this stage under a condition.",
+        "no_plan": "No plan could be read from this run's script, so only what ran is drawn.",
+        "not_planned": "not in the plan",
+        "not_planned_why": "This ran without the plan predicting it.",
+        "nothing_to_draw": "Nothing to draw yet.",
+        "partial_plan": "Plan too large to draw fully, so only its first part is shown. Everything that runs still appears below.",
+        "planned": "planned",
+        "runtime_shape": "shape decided at run time",
+        "runtime_shape_settled": "ran {{count}}"
+      },
       "workflowRunTree": {
         "checkpoint_save_failed": "Progress could not be saved. Copy any needed results before restarting. Check storage access and free space; saving retries at the next checkpoint.",
         "cancelled": "Cancelled",
@@ -953,7 +966,9 @@
         "cancel": "Cancel",
         "cancelling": "Cancelling…",
         "run_detail": "Run detail",
-        "unknown": "Unknown"
+        "unknown": "Unknown",
+        "view_graph": "Graph",
+        "view_tree": "Tree"
       }
     },
     "crewCompanion": {
@@ -1796,6 +1811,9 @@
       "terminal": "Terminal"
     },
     "chatInput": {
+      "auto_jev": "Auto (Jev)",
+      "auto_jev_desc": "Let Jev choose: act now, or run after",
+      "auto_jev_enter": "Auto (Jev) — Jev chooses whether to act now or run after (Enter)",
       "send_a_message_or_tap_the_mic_for_voice": "Send a message, or tap the mic for voice",
       "release_to_transcribe": "Release to transcribe",
       "hold_to_talk": "Hold to talk",
@@ -2929,9 +2947,12 @@
       "could_not_change_the_default_agent": "Could not change the default agent",
       "default": "Default",
       "default_agent_for_new_sessions": "Default agent for new sessions",
+      "group_members": "Crewmates",
+      "group_templates": "Agent templates",
       "manage_agents": "Manage agents…",
       "new_sessions_start_with_this_agent": "New sessions start with this agent",
-      "set_default_agent": "Set <agent/> as default agent for new sessions"
+      "set_default_agent": "Set <agent/> as default agent for new sessions",
+      "group_templates_hint": "Runs the shared template on shared memory; nothing is enrolled as a crewmate."
     },
     "agentSkillsEditor": {
       "edit_agent_config_to_change_mapping": "{{path}} — edit the agent config file to change this mapping",
@@ -3110,14 +3131,21 @@
       "not_a_repository": "Not a Git repository",
       "not_a_repository_help": "This project folder is not a Git repository. If the repository is in a subfolder, click the folder name below the message box.",
       "status_failed": "Couldn’t read the repository status. Commit history may be out of date.",
-      "status_failed_no_history": "Couldn’t read the changes list.",
+      "status_failed_no_history": "A separate problem: couldn’t read the changes list. Refresh to try again.",
       "log_failed": "Couldn’t read the commit log.",
       "uncommitted_capped": "{{count}}+ uncommitted",
       "showing_first": "first {{count}} shown",
-      "filter_refused": "This repository's Git config sets up a conversion program (such as Git LFS), so Kiro keeps these checks off here. Changes and history can't be shown, and retrying won't help.",
-      "filter_refused_title": "Kiro can't check this repository for changes",
-      "refresh_unavailable": "Refresh unavailable while these checks are off",
-      "filter_refused_unreadable": "Kiro couldn't read this repository's Git config, so it keeps these checks off here. Changes and history can't be shown until that read succeeds."
+      "filter_refused": "Git LFS or another conversion program is set up in this repository's Git config. Retrying won't help.",
+      "filter_refused_title": "Kiro can't show changes or history for this repository",
+      "filter_refused_title_changes": "Kiro can't show changes for this repository",
+      "filter_refused_title_history": "Kiro can't show history for this repository",
+      "refresh_unavailable": "Refresh can't show changes or history here",
+      "filter_refused_unreadable": "Kiro couldn't read this repository's Git config.",
+      "filter_refused_title_unreadable": "Kiro can't show changes or history right now",
+      "filter_refused_title_unreadable_changes": "Kiro can't show changes right now",
+      "filter_refused_title_unreadable_history": "Kiro can't show history right now",
+      "ask_agent_changes": "Ask the agent about the changes",
+      "ask_agent_history": "Ask the agent about the history"
     },
     "workspaceTree": {
       "status_failed": "Couldn’t read the repository status."
@@ -3339,6 +3367,9 @@
       "nothing_blocking": "Nothing is holding up a restart.",
       "load_failed": "Couldn't read what is holding up the restart",
       "clear_failed": "Couldn't clear the workers' context"
+    },
+    "modelDropdownList": {
+      "auto_jev": "Auto (Jev)"
     }
   },
   "hooks": {
@@ -3656,6 +3687,7 @@
       "back_to_live": "Back to Live",
       "versions_failed_to_load": "Versions failed to load",
       "comments_failed_to_load": "Comments failed to load",
+      "couldn_t_send_your_comments_are_still_pending": "Couldn't send — your comments are still pending.",
       "comment_action_failed": "Comment action failed",
       "activity_failed_to_load": "Activity failed to load",
       "sync_status_unavailable": "Sync status unavailable"
@@ -3716,7 +3748,12 @@
       "this_folder_is_empty_drag_artifacts_onto_it_to_f": "This folder is empty. Drag artifacts onto it to file them here.",
       "untitled_artifact_name": "Untitled",
       "more_actions": "More actions",
-      "retry": "Retry"
+      "retry": "Retry",
+      "preview_read_network_error": "Couldn't read this document — the request didn't reach the server. Check your connection and retry.",
+      "preview_read_server_error": "Couldn't read this document — the server reported an error.",
+      "preview_relative_path_body": "This document's location was recorded relative to its original project, so it can't be opened safely from here. Open it from the session that created it.",
+      "save_to_artifacts": "Save to artifacts",
+      "saved_to_library_notice": "Saved “{{name}}” to your artifacts."
     },
     "capabilitiesPage": {
       "crews_label": "Agents",
@@ -4013,6 +4050,8 @@
         "blocked_by_security_policy": "Blocked by security policy",
         "open_in_side_panel": "Open {{path}} in side panel",
         "opened_in_the_side_panel": "Opened in the side panel",
+        "app_not_viewable_here": "An app from this step is not viewable here. Ask the agent to show it again.",
+        "app_not_viewable_here_named": "The {{server}} app from this step is not viewable here. Ask the agent to show it again.",
         "wait_end_now": "End wait",
         "wait_ending": "Ending…",
         "wait_remaining": "{{time}} left",
@@ -4265,20 +4304,28 @@
         "moment_approval_decided": "approval answered"
       },
       "decisionStrip": {
+        "steer_confidence": "confidence {{p}}",
+        "steer_rate_label": "This choice",
+        "steer_chose_queue": "Jev chose: run after this turn",
+        "steer_chose_steer": "Jev chose: interrupt this turn",
+        "steer_rate_right": "Jev chose the right handling",
+        "steer_rate_wrong": "Jev chose the wrong handling",
         "agreed": "Both picked the same skills",
         "agreed_named": "Jev and word match: {{names}}",
         "agreed_short": "same pick",
         "baseline_label": "Word match",
         "baseline_named": "word match: {{names}}",
-        "batches_label": "Selection rounds",
         "candidates_label": "Skills offered",
+        "confidence_latency_title": "Jev's confidence in its own answer, from 0 to 1, and how long the answer took",
         "confidence_title": "Jev's confidence in its own answer, from 0 to 1",
         "dropped_label": "Refused",
         "error_title": "Decision failed",
         "feedback_failed": "Could not save that",
-        "history_chars_label": "Context sent (characters)",
         "jev_label": "Jev",
         "jev_named": "Jev: {{names}}",
+        "latency_label": "Jev latency",
+        "latency_title": "How long Jev took to answer",
+        "latency_value": "{{ms}} ms",
         "no_skills": "no skills",
         "point_skills_select": "skills",
         "rate_baseline": "Word match",
@@ -4288,8 +4335,43 @@
         "rate_wrong_baseline": "Word match picked the wrong skills",
         "rate_wrong_jev": "Jev picked the wrong skills",
         "saved_tokens": "saved {{tokens}} tokens",
-        "truncated_label": "Skills cut from the offer"
+        "sent_history": "history {{chars}} chars",
+        "sent_label": "Sent to Jev",
+        "sent_message": "message {{chars}} chars",
+        "history_chars_label": "Context sent (characters)",
+        "model_baseline_label": "Model without routing",
+        "model_baseline_named": "default: {{model}}",
+        "model_chosen_label": "Model used",
+        "model_default": "Built-in default",
+        "model_latency": "{{ms}} ms",
+        "model_not_applied": "not applied — ran on {{model}}",
+        "model_tier": "Jev: {{tier}}",
+        "model_tier_label": "Difficulty",
+        "model_unpinned": "(unpinned)",
+        "point_model_route": "model",
+        "rate_right_model": "Jev picked the right model",
+        "rate_wrong_model": "Jev picked the wrong model",
+        "truncated_turns_label": "Earlier turns cut short"
       },
+      "toolRiskBadge": {
+        "annotation_title": "Jev looked at this call and flagged it. That changed nothing about whether the call was allowed: this session's own permission setting decided that, and the call may still have been refused.",
+        "confidence_title": "Jev's confidence in its own answer, from 0 to 1",
+        "labelled_tier": "Jev: {{tier}}",
+        "rate_jev": "Jev",
+        "rate_right_jev": "Jev read the risk right",
+        "rate_wrong_jev": "Jev read the risk wrong",
+        "tier_caution": "worth a look",
+        "tier_risky": "risky"
+      },
+      "compactionKeep": {
+        "summary": "Jev would keep {{kept}} of {{total}} tool calls",
+        "chars_share": "up to {{percent}} of the characters",
+        "rate_label": "Rate this keep estimate",
+        "rate_right": "Jev read this compaction right",
+        "rate_wrong": "Jev read this compaction wrong",
+        "not_scored": "(+{{count}} not scored)"
+      },
+      "truncated_label": "Skills cut from the offer",
       "pinnedPrompt": {
         "minimize_pinned_prompt": "Minimize pinned turn",
         "pinned_turn": "Pinned turn",
@@ -4369,7 +4451,8 @@
       "voice_synthesis_failed_check_voice_settings_and_try_again": "Voice synthesis failed. Check Voice settings and try again.",
       "error_reading_file": "_Error reading file_",
       "unable_to_read_file": "_Unable to read file._",
-      "edit_resend_failed": "Could not resend the edited message: {{error}} Your original message was restored."
+      "edit_resend_failed": "Could not resend the edited message: {{error}} Your original message was restored.",
+      "model_auto_jev_description": "Let Jev judge each turn and run it on the model for that tier"
     },
     "chatSidebar": {
       "adopt_failed": "Could not open this session here.",
@@ -4426,7 +4509,6 @@
       "session_failed_to_switch_one": "{{count}} session failed to switch",
       "session_failed_to_switch_other": "{{count}} sessions failed to switch",
       "session_source": "Session",
-      "new": "New",
       "new_chat": "New chat",
       "new_chat_on_crew": "New chat on crew",
       "no_inactive_sessions_to_archive": "No inactive sessions to archive.",
@@ -4719,7 +4801,7 @@
       "no_checkout_found": "No {{productName}} checkout found",
       "no_checkout_found_help": "Dev Fleet manages the git worktrees of a {{productName}} source checkout. None was found in your project directory, in the checkout serving this dashboard, or in the usual clone locations.",
       "no_checkout_found_env_example": "KIROCREW_DEVFLEET_REPO=/path/to/your/checkout",
-      "no_checkout_found_action": "Set the environment variable below, or add dev_fleet.repo_path to config.json in your {{productName}} data directory (~/.kiro/crew by default) to make it stick, then restart the gateway.",
+      "no_checkout_found_action": "Add dev_fleet.repo_path to config.json in your {{productName}} data directory (~/.kiro/crew by default), and this page picks it up on its next refresh. The environment variable below works too, but a running gateway cannot see a variable set after it started, so that route needs a restart.",
       "disk_usage_unavailable": "Disk usage unavailable"
     },
     "developerPage": {
@@ -5939,7 +6021,6 @@
       "remoteCrewPanel": {
         "auto_connect": "Auto-connect crews",
         "auto_connect_desc": "When on, opening the web app connects every crew automatically, and reconnects them when you come back to the tab. Turn off to connect a crew only when you switch to it.",
-        "copy_failed": "Copy failed. Select the text and copy it manually.",
         "launch_status_unavailable": "Could not refresh the setup progress. The card below shows the last state received.",
         "copy_policy_failed": "Could not copy the policy JSON to the clipboard. Try again, or allow clipboard access for this site."
       },
@@ -6643,7 +6724,12 @@
         "decisions_point_sampled": "While this is on, Jev answers for {{percent}} of your sessions. The rest keep the word-matching rule. To change the share, set decisions.bucket in config.json in your {{productName}} data directory (~/.kiro/crew by default).",
         "decisions_point_sampled_all": "While this is on, Jev answers for all of your sessions. To narrow that to a share, set decisions.bucket in config.json in your {{productName}} data directory (~/.kiro/crew by default).",
         "decisions_config_unavailable": "Could not read the settings, so this switch is not offered. Reload to try again.",
-        "decisions_save_failed": "Could not save this setting. The switch is showing the saved value again."
+        "decisions_save_failed": "Could not save this setting. The switch is showing the saved value again.",
+        "decisions_tool_args": "Also send tool-call arguments so Jev can flag risky calls",
+        "decisions_tool_args_desc": "In a session that approves its own tool calls, this also sends the name and arguments of each call to Jev, which then puts a note on the ones it thinks are worth a look. Passwords and keys are replaced before anything is sent. It changes nothing about which tool calls are allowed. Off until you turn it on, even if the switch above is already on.",
+        "decisions_compaction": "Also send the conversation and tool-call inputs so Jev can score compaction",
+        "decisions_compaction_desc": "Every time context fills up and {{productName}} compacts a session automatically, this sends that conversation and the inputs of the tool calls in it to Jev, and asks which ones would have been worth keeping. Tool OUTPUT is never sent — only how many characters it was. Passwords and keys are replaced before anything is sent. It is a measurement: the compaction happens exactly as it does now whatever Jev answers, and the answer appears as one line on the compaction notice. This is the widest of the three, so it is off until you turn it on, even if the switches above are already on.",
+        "decisions_point_compaction_keep": "Which tool calls a compaction would keep (measured only)"
       },
       "kiroSignInCard": {
         "title": "Kiro sign-in",

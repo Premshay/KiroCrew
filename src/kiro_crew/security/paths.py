@@ -400,6 +400,26 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``workspace/`` was itself replaceable with one ``ln -s``, and the app opens the
     # path directly (as keystone writers must), so it would have followed the link.
     "trust",
+    # Retained V1 member-memory binding records. The leaf name says "bindings",
+    # but a binding FILE carries the RAW session key it binds: a record on disk
+    # holds ``{"version": 1, "session_key": <raw>, "memory_store": ...}`` under
+    # ``sessions/<digest>/`` and ``pids/``, so reading the directory hands over a
+    # usable key rather than a digest of one. Memory V2 writes no such record and
+    # migrates none, so an upgraded install keeps every one it already has and the
+    # READ side needs this floor rather than write protection alone.
+    #
+    # ``sandbox._CREW_CHILD_WITHHELD_LEAVES`` classifies the leaf as one no child
+    # may read; this entry is what makes that classification enforceable, because
+    # ``agent_sdk.tool_gate.adapter_hidden_credential_dirs`` projects THIS floor
+    # into an enforced adapter's OS mask rather than that list.
+    #
+    # The one legitimate reader, ``subagent_persistence.read_run_execution``,
+    # opens the path directly in the gateway -- the keystone-reader pattern every
+    # reader of a floor leaf uses -- so cold continuation of a retained V1 run is
+    # unaffected. Crew's own sandbox keeps the directory OS-readable through
+    # ``sandbox._CREW_READONLY_LEAVES``, which this entry does not touch: the
+    # reader it fences is the AGENT'S OWN FILE TOOLS.
+    "member-memory-bindings",
     "security_events.jsonl",
     # Rotated SEL segments. sel.py closes the live log at a size cap and renames
     # it into this directory, so a segment holds exactly the same audit records
@@ -748,6 +768,14 @@ _CREW_SECRET_LEAVES: list[str] = [
     # ``identity_stores`` and opens it directly, not through this gate.
     AUTH_SQLITE_DB,
     *(f"{AUTH_SQLITE_DB}{suffix}" for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES),
+    # Published crew webview RECORDS (agent_panel.py). Fenced because the record
+    # is an OWNERSHIP claim the store reads back to refuse a colliding write, and
+    # because it is the REDACTED copy of untrusted text: a direct write would
+    # forge another crew's panel past both the ownership check and the redactors
+    # in one step, and the drawer would render the result. The sandbox masks the
+    # same leaf (sandbox._CREW_HIDDEN_LEAVES) so a runtime-constructed path inside
+    # a sandboxed command cannot reach around this gate either.
+    "crew-panels",
     # Managed memory uses bound tools. This directory guard keeps ordinary raw
     # file operations away from DB/WAL/SHM and manual context publication files;
     # glob-based project guidance skips it. It is a best-effort path guard, not
@@ -849,15 +877,20 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
     # turn the browser sandbox OFF for every later browse, and the change persists
     # until the next gateway start re-converges the file. Kiro Crew generates it
     # directly and does NOT route through this gate, so its own write still works.
-    # Cold continuation restores app ownership from canonical run records, or
-    # the retained V1 sidecar. Gateway writers bypass this tool gate; agents
-    # may read results but cannot turn an app-owned run into a personal run.
+    # subagents: the canonical run records a cold continuation restores app
+    # ownership from. Gateway writers bypass this tool gate; an agent may read a
+    # run's results but cannot turn an app-owned run into a personal run. Its
+    # retained V1 companion ``member-memory-bindings`` belongs on the read+write
+    # floor above instead, because a legacy binding record carries a raw session
+    # key while a V2 run's results live in the run record here -- so the agent may
+    # NOT read that leaf, and an entry on this tier as well would make
+    # ``security_posture`` publish "Reads allowed" for a path the read gate
+    # refuses.
     for leaf in (
         "config.json",
         "config.local.json",
         "playwright-cli-config.json",
         "subagents",
-        "member-memory-bindings",
     )
 ] + [
     # Ops Mission Control's on-call schedule. WRITE-protected, not read+write
@@ -1136,6 +1169,32 @@ _WRITE_PROTECTED_HOME_PATHS += [
 # the crew secrets.
 _KIRO_AGENTS_DIR = ".kiro/agents"
 _WRITE_PROTECTED_HOME_PATHS += [_KIRO_AGENTS_DIR]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # Operator-authored panel templates (agent_panel.py). WRITE-protected rather
+    # than read+write sensitive, and the asymmetry is the whole point: a crew's
+    # webview is a human-authored TEMPLATE filled with crew-published DATA, and
+    # that split is the containment story -- layout is reviewed, only data is
+    # untrusted, so data can be escaped at one boundary. What must be refused is
+    # an agent AUTHORING markup here: its auto-approved file tools could otherwise
+    # drop a .html in and collapse the split, handing a hostile issue body a path
+    # into a rendered document.
+    #
+    # The read must stay alive, which is why this entry is not on the floor above.
+    # The file holds no secret: it is human-authored, versioned, reviewed content,
+    # and it is the profile the write-only tier exists for -- routinely read, and
+    # an input to a security decision. Fencing the READ would take the override
+    # away from the operator who wrote it, since the same gate string reaches
+    # ``fs_read``, the dashboard file viewer and knowledge indexing. Its sandbox
+    # disposition already says the same thing from the other side: the launcher
+    # seals the leaf READ-ONLY (``sandbox._CREW_READONLY_LEAVES``) rather than
+    # masking it, so the two halves now agree.
+    #
+    # ``agent_panel.py`` loads the override directly and does not route through
+    # this gate, so template rendering is unaffected; only the agent's own
+    # file-edit tool is refused.
+    f"{prefix}/panel-templates"
+    for prefix in _CREW_HOME_PREFIXES
+]
 
 #: Longest command ``is_sensitive_bash_command`` will scan. Longer input is
 #: REFUSED, not skipped and not scanned: both detectors the gate runs are linear
@@ -1896,6 +1955,16 @@ def _home_dir_targets_uncached(
     secrets. On POSIX a single-segment entry splits to a 1-element list, so
     this is a no-op there.
     """
+    # Both supported Crew home prefixes map to the same override leaves.
+    # Resolve each identical spelling once within this build; never carry these
+    # answers across builds or cache keys, so root and leaf freshness is unchanged.
+    resolved_paths: dict[str, str | None] = {}
+
+    def resolve_target(path: str) -> str | None:
+        if path not in resolved_paths:
+            resolved_paths[path] = _realpath_or_none(path)
+        return resolved_paths[path]
+
     resolved = roots if roots is not None else _resolved_root_key()
     home = resolved.home
     crew_home = resolved.crew_home
@@ -1944,14 +2013,14 @@ def _home_dir_targets_uncached(
     if os_home:
         for d in home_dirs:
             sensitive_targets |= _anchor_both_separators(os_home, d)
-        os_home_real = _realpath_or_none(os_home) or os_home
+        os_home_real = resolve_target(os_home) or os_home
         if os_home_real.casefold() != os_home.casefold():
             for d in home_dirs:
                 sensitive_targets |= _anchor_both_separators(os_home_real, d)
     # ``home`` arrives RESOLVED from the cache key, so this is normally a no-op;
     # it still opens the directory on Windows, which is why the whole rebuild
     # runs off the loop.  None degrades to the lexical anchors already in the set.
-    home_real = _realpath_or_none(home) or home
+    home_real = resolve_target(home) or home
     if home_real.casefold() != home.casefold():
         sensitive_targets |= {_anchor(home_real, d) for d in home_dirs}
     # ``home`` arrives RESOLVED (the cache is keyed on the resolved roots), so
@@ -1985,7 +2054,7 @@ def _home_dir_targets_uncached(
                     sensitive_targets.add(full.casefold())
                     # Also add the resolved form in case the env value itself has
                     # symlinks (matches the home/home_real duality above).
-                    full_real = _realpath_or_none(full)
+                    full_real = resolve_target(full)
                     if full_real is not None:
                         sensitive_targets.add(full_real.casefold())
                     break
@@ -2005,7 +2074,7 @@ def _home_dir_targets_uncached(
     if kiro_home_override and _KIRO_AGENTS_DIR in home_dirs:
         agents_full = os.path.join(kiro_home_override, "agents")
         sensitive_targets.add(agents_full.casefold())
-        agents_real = _realpath_or_none(agents_full)
+        agents_real = resolve_target(agents_full)
         if agents_real is not None:
             sensitive_targets.add(agents_real.casefold())
     # An ACP adapter's OAuth token follows that adapter's own home override, so
@@ -2024,7 +2093,7 @@ def _home_dir_targets_uncached(
                 continue
             _full = os.path.join(_root, *_leaf_segments(_under_root))
             sensitive_targets.add(_full.casefold())
-            _full_real = _realpath_or_none(_full)
+            _full_real = resolve_target(_full)
             if _full_real is not None:
                 sensitive_targets.add(_full_real.casefold())
     return sensitive_targets
@@ -2078,6 +2147,9 @@ def _home_dir_targets_uncached(
 _HOME_TARGETS_TTL_SECS = 0.1
 # key -> (expiry_monotonic, targets)
 _home_targets_cache: dict[tuple[object, ...], tuple[float, set[str]]] = {}
+# Only off-loop bulk readers acquire this lock. Event-loop gates retain their
+# bounded resolver and must never wait for an inline filesystem rebuild.
+_home_targets_inline_lock = threading.Lock()
 
 
 class _ResolvedRoots(NamedTuple):
@@ -2325,7 +2397,23 @@ def _home_dir_targets(home_dirs: list[str], *, inline: bool = False) -> set[str]
     # reads file one root's targets under the other root's key — a fail-OPEN
     # TOCTOU, pinned by the regression test
     # test_roots_are_resolved_once_for_key_and_build.
-    roots = _resolve_root_anchors(str(Path.home())) if inline else _resolved_root_key()
+    if inline:
+        roots = _resolve_root_anchors(str(Path.home()))
+        cached = _home_targets_cache.get((tuple(home_dirs),) + roots)
+        if cached is not None and time.monotonic() < cached[0]:
+            return cached[1]
+        with _home_targets_inline_lock:
+            # Resolve after acquiring: a queued worker must not reuse anchors
+            # captured before another worker's potentially slow rebuild.
+            roots = _resolve_root_anchors(str(Path.home()))
+            return _cached_home_dir_targets(home_dirs, roots, inline=True)
+    return _cached_home_dir_targets(home_dirs, _resolved_root_key(), inline=False)
+
+
+def _cached_home_dir_targets(
+    home_dirs: list[str], roots: _ResolvedRoots, *, inline: bool
+) -> set[str]:
+    """Share the target cache while coalescing inline builders at the caller."""
     key = (tuple(home_dirs),) + roots
     now = time.monotonic()
     cached = _home_targets_cache.get(key)
@@ -2569,8 +2657,9 @@ def is_sensitive_resolved_path(resolved: str) -> bool:
     prove containment, and only then asks whether the entry is fenced.
 
     Why a separate entry point rather than "just call the pool anyway": the pool
-    is sized for the event loop (two workers, so a wedged mount can pin at most
-    two threads), and it is FIFO. A walk over a thousand skill directories, each
+    is sized for the event loop (two workers by default --
+    ``executors._MAX_PATH_RESOLVE_WORKERS`` -- so a wedged mount can pin at most
+    that many threads), and it is FIFO. A walk over a thousand skill directories, each
     submitting a resolution the walk had already performed plus an anchor
     resolution per call, fills that queue from worker threads while the loop's
     own latency-critical resolutions wait behind it -- not for a slow disk, for
@@ -2583,9 +2672,10 @@ def is_sensitive_resolved_path(resolved: str) -> bool:
     calling thread inside ``realpath``, exactly as that thread's own walk of the
     same mount would. Nothing is admitted while it blocks.
     """
-    return _path_in_home_dirs(
-        resolved, _SENSITIVE_HOME_DIRS, pre_resolved=True
-    ) or _is_keystone_publish_artifact(resolved, pre_resolved=True)
+    return _path_in_home_dirs(resolved, _SENSITIVE_HOME_DIRS, pre_resolved=True) or (
+        resolved.casefold().endswith(_KEYSTONE_ARTIFACT_SUFFIXES)
+        and _is_keystone_publish_artifact(resolved, pre_resolved=True)
+    )
 
 
 #: The fixed opening of an unverifiable-path refusal. Consumers tell a stall from a

@@ -35,6 +35,7 @@ from kiro_crew.computer_use.types import (
 from kiro_crew.computer_use.types import DEFAULT_SCREENSHOT_MAX_PX as _CU_DEFAULT_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import DEFAULT_TEXT_LIMIT as _CU_DEFAULT_TEXT_LIMIT
 from kiro_crew.config.resolution import _OBSERVED_DEGRADED_SECTIONS, DEGRADED_TAILSCALE
+from kiro_crew.constants import DEFAULT_SUBAGENT_MAX_TURNS as _DEFAULT_SUBAGENT_MAX_TURNS
 from kiro_crew.constants import SUBAGENT_TIMEOUT_MAX as _SUBAGENT_TIMEOUT_MAX
 from kiro_crew.constants import SUBAGENT_TIMEOUT_MIN as _SUBAGENT_TIMEOUT_MIN
 from kiro_crew.constants import SUBAGENT_TIMEOUT_SECS as _SUBAGENT_TIMEOUT_SECS
@@ -1117,6 +1118,21 @@ class AgentConfig:
             "re-consent before code execution.",
         ),
     )
+    apps_ui_stream_timeout_secs: int = field(
+        default=30,
+        metadata=_meta(
+            "App UI Stream Timeout",
+            "Total transfer deadline, in seconds, for ONE response body on the "
+            "unauthenticated /apps/{name}/ui/ route. Clamped to 5..600; a value "
+            "that is not a whole number loads as 30. Read per request, so an "
+            "edit applies without a restart. There is no off switch: the route "
+            "holds eight descriptor permits, and this deadline is what stops a "
+            "client that quits draining its socket from holding one for as long "
+            "as it stays connected — eight such clients would otherwise stop "
+            "every app UI on the host. Raise it only when a real transfer on "
+            "this host needs longer than the default allows.",
+        ),
+    )
     jail: str = field(
         default=JAIL_MODE_AUTO,
         metadata=_meta(
@@ -1460,8 +1476,26 @@ class AgentConfig:
         metadata=_meta(
             "Adaptive Initial Cap",
             "Execution cap a fresh gateway starts at, bounded by max_subagents. "
-            "The controller raises it one step per clean window once work "
-            "completes. Clamped to 1..64.",
+            "Healthy work and queued demand let the controller raise it; see "
+            "adaptive_slow_start for growth rules. Clamped to 1..64.",
+        ),
+    )
+    adaptive_slow_start: bool = field(
+        default=True,
+        metadata=_meta(
+            "Adaptive Slow Start",
+            "Until the gateway first meets corroborated host pressure, let the "
+            "execution cap DOUBLE per clear 5-second window (on one completion "
+            "and real demand) instead of climbing +1 per clear 30-second window, "
+            "bounded by max_subagents and by what this host's memory and CPU "
+            "size the cap at. The first pressure ends slow start for the life "
+            "of the process. Set false to climb +1 per clear 30-second window "
+            "from the start. Slow start earns an increase on one completion plus "
+            "real demand; congestion avoidance earns each +1 after one full wave "
+            "of the CURRENT cap completes (at most 20 runs). Alternatively, "
+            "fresh stream progress with queued work and measured headroom can "
+            "earn one probe slot per clear window without a completion; this "
+            "never earns doubling or relaxes the initialization gate.",
         ),
     )
     controller_sample_secs: int = field(
@@ -1643,15 +1677,21 @@ class AgentConfig:
         ),
     )
     subagent_spawn_stagger_secs: float = field(
-        default=2.0,
+        default=0.25,
         metadata=_meta(
             "SubAgent Spawn Stagger (seconds)",
             "Delay between successive subagent spawns (initial fill and queued "
-            "drain) to bound cold-start CPU/memory spikes.",
+            "drain) to bound cold-start CPU/memory spikes. Starts stay "
+            "serialized; the interval only decides how fast a wide fan-out "
+            "fills. Raise it if this "
+            "host or the model provider is the bottleneck -- a spawn still has "
+            "to clear spawn_min_memory_gb and the host budget, and the adaptive "
+            "controller cuts the cap on real pressure, so this is a smoothing "
+            "interval rather than the memory guard.",
         ),
     )
     subagent_max_turns: int = field(
-        default=100,
+        default=_DEFAULT_SUBAGENT_MAX_TURNS,
         metadata=_meta("SubAgent Max Turns", "Default tool-call budget per subagent."),
     )
     subagent_timeout_secs: int = field(
@@ -2029,8 +2069,12 @@ class MemoryConfig:
         metadata=_meta(
             "Embedding Threads",
             "CPU threads for an explicit memory query or user-started re-embedding. "
-            "Defaults to 4; explicit settings are honoured up to the machine's "
-            "core count. All memory stores share one model and inference worker. "
+            "Defaults to 4, capped one core below the machine's core count -- never "
+            "below one thread, so a single-core host still embeds -- to leave the "
+            "event loop a core wherever there is one to spare; 4 means that default, "
+            "so pinning threads on a 4-core host takes another number. Any other "
+            "setting is honoured up to the core count. All memory stores share one "
+            "model and inference worker. "
             "V2 message context does not run an embedding search; V1 retains "
             "its session-start retrieval.",
         ),
@@ -3978,16 +4022,20 @@ class SkillsConfig:
             "per-turn word-overlap trigger matching.",
         ),
     )
-    # ── Lazy skill injection (opt-in, like MCP prewarm) ──
+    # ── Skill index mode ──
     lazy_load: bool = field(
-        default=False,
+        default=True,
         metadata=_meta(
             "Lazy Skill Injection",
-            "When true, show a bounded usage-ranked index of on-demand skills instead "
-            "of the default short skill_search discovery entry. Both modes use the "
-            "same Crew background budget, independent of model window size. Pinned "
-            "instructions, native skill mappings, explicit loading and trigger gates "
-            "are preserved.",
+            "When true (the default), show a bounded usage-ranked index of on-demand "
+            "skills, each with its path, plus a line naming the families the index "
+            "leaves out. Set to false for the shorter entry that names only the eight "
+            "hottest skills and points at skill_search for the rest. Both modes use the "
+            "same Crew background budget, independent of model window size, and neither "
+            "applies to an agent with its own skill:// mapping, which gets a bounded "
+            "directory of mapped skills with complete search, paginated listing and exact "
+            "reads on demand. Required pinned instructions share an explicit startup "
+            "capacity; explicit loading and trigger gates are preserved.",
         ),
     )
     # ── Auto skill creation ──
@@ -5831,6 +5879,49 @@ DECISION_PROVIDER_MODEL_DEFAULT = "jev-latest"
 # conversation sent raises this themselves.
 DECISION_HISTORY_BUDGET_DEFAULT = 0
 
+# The tiers ``model.route`` may answer with, and the model each maps to by default.
+# The keys are the point's CLOSED answer domain
+# (``decisions.points.model_route.TIERS``): a key outside it is dropped, because a
+# tier the question never offers can never be answered and a map that accepted one
+# would read as configured while routing nothing.
+#
+# The values are ordinary model ids and grant nothing on their own -- the point
+# validates each against what the provider advertises to this account and keeps the
+# session's current model when an id is not there -- so this stays a config value
+# rather than a keystone one.
+DECISION_MODEL_ROUTE_TIERS: tuple[str, ...] = ("simple", "medium", "complex")
+
+# Every tier defaults to ``""`` -- INHERIT, i.e. the turn keeps the model its
+# session is already on. No concrete model id is named here, and none may be: a
+# hardcoded id fails at runtime -- silently, until the first prompt -- for every
+# account not entitled to it, so
+# ``docs/system-specs/common/model-selection.md`` allows ids to be pinned only in
+# an operator-written map and keeps code defaults at ``""`` / ``"auto"``.
+# ``code-review.yml`` gates on it.
+#
+# The three keys are PRESENT and empty rather than absent, which is the same
+# shape ``agent.role_models``'s roles take: "this tier exists and is unpinned" is
+# a state the log and the strip report ("complex -> (unpinned)"), so it needs a
+# spelling of its own rather than being inferred from a missing key.
+DECISION_MODEL_ROUTE_DEFAULT: dict[str, str] = {tier: "" for tier in DECISION_MODEL_ROUTE_TIERS}
+
+
+def coerce_model_route(raw: object) -> dict[str, str]:
+    """Normalize ``decisions.model_route`` from a hand-edited config.
+
+    Always returns all three tiers. Each value goes through
+    :func:`normalize_agent_model`, exactly as :func:`coerce_role_models` does, so
+    ``"auto"`` and a non-string both collapse to ``""`` -- "inherit" has ONE
+    spelling, and a tier set to ``"auto"`` keeps inheriting instead of hard-pinning
+    the backend's own default.
+
+    A tier outside the three is dropped: the question never offers it, so it could
+    never be answered, and a map that accepted one would read as configured while
+    routing nothing.
+    """
+    section = raw if isinstance(raw, dict) else {}
+    return {tier: normalize_agent_model(section.get(tier)) for tier in DECISION_MODEL_ROUTE_TIERS}
+
 
 @dataclass
 class DecisionProviderConfig:
@@ -5892,8 +5983,10 @@ class DecisionsConfig:
     same placement as ``computer_use.json`` and ``aws_service_consent.json``. This
     section carries only the knobs that grant nothing on their own: the sampling
     share, the prior-conversation budget (0 by default, so raising it is a choice),
-    and the provider. There is no per-point arm and no shadow mode: one point ships
-    (``skills.select``).
+    the tier-to-model map ``model.route`` reads, and the provider. There is no
+    per-point arm and no shadow mode: two points ship (``skills.select``,
+    ``model.route``), each reached only through its own owner-made choice --
+    a non-zero ``skills.max_triggered`` and the picker's ``Auto (Jev)`` entry.
 
     Every field is hot-applied (no ``restart=True`` anywhere): the gate reads the
     live snapshot per call, so a bucket change takes effect on the next decision
@@ -5924,6 +6017,26 @@ class DecisionsConfig:
             "reviewed, which names the message excerpt and the candidate "
             "descriptions; raising this widens what leaves the machine, so it is a "
             "choice rather than an upgrade. A negative value reads as 0.",
+        ),
+    )
+    model_route: dict[str, str] = field(
+        default_factory=lambda: dict(DECISION_MODEL_ROUTE_DEFAULT),
+        metadata=_meta(
+            "Model per difficulty tier",
+            "Which model answers a chat turn Jev put in each difficulty tier, for "
+            "a session whose model is set to 'Auto (Jev)' in the chat model "
+            "picker. Keys are the three tiers the question offers -- 'simple', "
+            "'medium', 'complex' -- and each value is a model id the provider "
+            "advertises to your account, exactly as the chat model picker spells "
+            "it. Every tier is EMPTY by default, which means inherit: the turn "
+            "keeps the model its session is already on, and the decision is still "
+            "recorded so you can see which tier Jev chose before you pin anything. "
+            "No model id is named for you, because an id your account is not "
+            "offered would fail on the first prompt. 'auto' means the same as empty. "
+            "An id your account cannot run keeps the session's model too and "
+            "records why in the decision log. Routing a turn to a dearer model "
+            "costs more, which is why it happens only for a session whose owner "
+            "picked 'Auto (Jev)' -- a manual model choice is never overridden.",
         ),
     )
     provider: DecisionProviderConfig = field(
@@ -6005,6 +6118,11 @@ class DecisionsConfig:
                 DECISION_HISTORY_BUDGET_DEFAULT,
                 0,
             ),
+            # Per-TIER fallback rather than per-map: see `coerce_model_route`. An
+            # absent section and one naming no known tier both read as the shipped
+            # map, since this key cannot widen anything -- every id is still held
+            # against the provider's advertised list at routing time.
+            model_route=coerce_model_route(section.get("model_route")),
             provider=provider,
         )
 

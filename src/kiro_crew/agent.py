@@ -954,7 +954,7 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     MCP server (``kirocrew-cron`` / ``kirocrew-core``).
 
     Prefers a standalone ``kirocrew`` binary when one resolves. Falls back
-    to ``<interpreter> [-s] -m kiro_crew <subcommand>`` when
+    to ``<interpreter> [-s] -P -m kiro_crew <subcommand>`` when
     :func:`_resolve_kirocrew_bin` cannot find a usable standalone binary --
     e.g. an install whose launcher is not on the service PATH (the gateway
     running as a systemd user service is the common case): there
@@ -963,12 +963,13 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     ``kirocrew.json`` on every config refresh.
 
     ``sys.executable`` is the absolute path of the running interpreter, so it
-    needs no PATH entry and ignores any broken launcher. ``python -m
-    kiro_crew`` dispatches the same CLI as the ``kirocrew`` console script.
+    needs no PATH entry and ignores any broken launcher. ``python -P -m
+    kiro_crew`` dispatches the same CLI as the ``kirocrew`` console script
+    while keeping the spawn CWD off ``sys.path``.
 
     A resolved ``bin\\kirocrew.cmd`` (the Windows bundle's relocatable shim,
     see :func:`_kirocrew_bin_subpath`) is unwrapped to the sibling
-    interpreter — ``<root>\\python.exe -P -s -m kiro_crew <sub>`` — instead of
+    interpreter — ``<root>\\python.exe -s -P -m kiro_crew <sub>`` — instead of
     being emitted verbatim. This mirrors ``website/electron/main.js``, which
     refuses to spawn the shim it resolved (Node's ``spawn()`` rejects
     ``.cmd``/``.bat`` without ``shell:true``, CVE-2024-27980 hardening) and
@@ -981,25 +982,21 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     """
     bin_path = _resolve_kirocrew_bin()
     if bin_path == "kirocrew":  # unresolved sentinel from _resolve_kirocrew_bin
-        argv = platform_compat.isolated_python_argv("-m", "kiro_crew", subcommand)
+        argv = platform_compat.isolated_python_argv("-P", "-m", "kiro_crew", subcommand)
         return argv[0], argv[1:]
     if bin_path.endswith(".cmd"):
         interpreter = Path(bin_path).parent.parent / "python.exe"
         if _interpreter_runnable(interpreter):
-            # ``-P`` (safe path, 3.11+) keeps the spawn CWD off ``sys.path``:
-            # kiro-cli spawns managed servers with the user's project as CWD,
-            # so with ``-m`` alone a cloned repo carrying a ``kiro_crew/``
-            # package would shadow the real one and run unconfined. Safe to
-            # pin here because this interpreter is always the bundle's own
-            # python-build-standalone 3.12 (packaging/build-desktop.sh); the
-            # generic ``sys.executable`` fallbacks below and above stay
-            # ``-P``-free because the project still supports Python 3.10,
-            # which lacks the flag.
+            # ``-P`` keeps the spawn CWD off ``sys.path`` on every supported
+            # interpreter, so a project package cannot shadow this install.
+            # The bundle also pins ``-s`` because its package never relies on
+            # per-user site-packages. Keep the shared ``-s -P -m`` order used
+            # whenever the helper adds user-site isolation to a fallback.
             argv = platform_compat.isolated_python_argv(
-                "-P", "-s", "-m", "kiro_crew", subcommand, executable=interpreter
+                "-s", "-P", "-m", "kiro_crew", subcommand, executable=interpreter
             )
             return argv[0], argv[1:]
-        argv = platform_compat.isolated_python_argv("-m", "kiro_crew", subcommand)
+        argv = platform_compat.isolated_python_argv("-P", "-m", "kiro_crew", subcommand)
         return argv[0], argv[1:]
     return bin_path, [subcommand]
 
@@ -1258,6 +1255,26 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
         "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-crew-log"),
         "opt_in": True,
     },
+    # Agent panels (an agent publishes DATA describing its own state; the
+    # dashboard renders it with a human-authored template in a sandboxed frame).
+    # ``opt_in`` for the same reason the dashboard set is: this is an assignable
+    # capability for long-running agents, and a default session must spend no
+    # context on a tool it will never call.
+    #
+    # Its own server rather than a tool added to ``kirocrew-dashboard``, because
+    # assignment is per server and that set is ratcheted to folder organization
+    # plus session control. Publishing a document is neither, and folding it in
+    # would widen a set the user granted for something else.
+    #
+    # No ``autoApprove`` key, for the reason the two sets above have none: an
+    # autoApproved MCP tool is approved inside kiro-cli and never reaches
+    # ``hooks.on_tool_call``, so the deny floor and governance ceiling would be
+    # bypassed -- and this tool's input is derived from text the agent read
+    # unattended.
+    "kirocrew-panel": {
+        "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-panel"),
+        "opt_in": True,
+    },
 }
 
 
@@ -1308,7 +1325,7 @@ def _extra_mcp_servers() -> dict[str, dict]:
     return dict(extra) if extra else {}
 
 
-def managed_mcp_spec_entry(name: str) -> dict[str, Any] | None:
+def managed_mcp_spec_entry(name: str, *, include_opt_in: bool = False) -> dict[str, Any] | None:
     """The kiro-spec ``mcpServers`` entry a fresh build would emit for *name*.
 
     One entry, resolved live (``invocation_fn`` + the pinned data home), for a
@@ -1317,6 +1334,14 @@ def managed_mcp_spec_entry(name: str) -> dict[str, Any] | None:
     assignable set is granted by a spec, never minted here) or when its
     ``spec_gate`` is closed — the same predicate the two spec writers use, so a
     caller cannot resurrect a server emission withholds.
+
+    ``include_opt_in`` resolves an ``opt_in`` entry's invocation anyway, and exists
+    for the ONE caller that is not asking the emission question:
+    ``mcp_gateway.gatewayd._spawns_own_control_plane``, which compares a spawn's
+    binary and argv against the invocation this name is DEFINED as. A closed
+    ``spec_gate`` still yields ``None`` under the flag; the branch below says why the
+    two disqualifiers part company there. It grants nothing on its own, because
+    neither spec writer passes it: an opt-in entry a writer omits is still omitted.
 
     ``autoApprove`` is deliberately NOT carried, unlike the emit loop in
     :func:`build_agent_config`. The flag is kiro-cli's local approval, and the
@@ -1331,7 +1356,18 @@ def managed_mcp_spec_entry(name: str) -> dict[str, Any] | None:
     spec = _MANAGED_MCP_SERVERS.get(name)
     if not isinstance(spec, dict):
         return None
-    if not _mcp_server_emission_eligible(name, spec):
+    if include_opt_in:
+        # The control-plane check asks what this name's INVOCATION is, not whether
+        # a rebuild would GRANT it, and ``_mcp_server_emission_eligible`` answers
+        # the second question. Its two disqualifiers part company here: ``opt_in``
+        # means "never auto-emitted, assigned per agent", so an opt-in server that
+        # IS running was legitimately granted and its invocation is still ours to
+        # compare against; a CLOSED ``spec_gate`` means the opposite -- the gate
+        # exists to keep that backend unspawned, so a spawn under its name is
+        # anomalous and must not be handed a token. Skip the first, keep the second.
+        if not _mcp_spec_gate_open(name, spec):
+            return None
+    elif not _mcp_server_emission_eligible(name, spec):
         return None
     try:
         if "invocation_fn" in spec:
@@ -4390,68 +4426,25 @@ def _app_owned_mcp_keys() -> _AppOwnership:
         # kiro_crew.apps imports back into agent/security, so a module-level
         # import here would close a cycle.
         from kiro_crew.apps.manager import (
-            INSTALLED_META_FILENAME,
             app_enabled_state,
-            apps_dir,
             get_app_manifest,
-            list_apps,
+            list_apps_with_skips,
         )
     except Exception:  # noqa: BLE001 — apps subsystem unavailable
         return _AppOwnership(owned, False)
     try:
-        apps = list_apps()
+        # ``list_apps`` drops an app whose installed record does not read, and drops
+        # it SILENTLY rather than raising, so the returned list on its own cannot
+        # separate "no such app" from "that app's claim went missing".
+        # ``list_apps_with_skips`` answers the second case, and it lives in
+        # ``apps.manager`` because the rules it applies -- the installed-record
+        # filename, which root entries the listing skips, how presence is judged
+        # without resolving a path -- all belong to that module. Reconstructing them
+        # here would go stale silently the first time the listing changed.
+        apps, _claims_complete = list_apps_with_skips()
     except Exception:  # noqa: BLE001 — an unreadable registry claims nothing KNOWABLE
         return _AppOwnership(owned, False)
-    _named = {app.get("name") for app in apps if isinstance(app, dict)}
-    try:
-        # ``list_apps`` drops an app whose installed record does not read, and
-        # drops it SILENTLY rather than raising, so the returned list on its own
-        # cannot separate "no such app" from "that app's claim went missing". A
-        # directory still holding the record file it reads, under a name the list
-        # does not carry, is the second case.
-        #
-        # Presence is judged WITHOUT resolving the path. ``Path.exists`` follows a
-        # symlink, so a dangling ``installed.json`` link reads absent while
-        # ``list_apps`` still drops that app for failing to read it -- and the two
-        # answers together say "no such app" about an app that is on disk.
-        # ``is_symlink`` does not close it either: it is False for a Windows
-        # directory junction, so a dangling junction stays invisible to every
-        # predicate that resolves its target. Anything uninspectable counts as
-        # present, the same fail-to-unknown direction :func:`_absence_is_genuine`
-        # takes in ``apps.manager``.
-        def _occupied(_p: Path) -> bool:
-            try:
-                return _p.exists() or _p.is_symlink() or platform_compat.is_link_or_junction(_p)
-            except OSError:
-                return True
-
-        # ``list_apps`` skips a root entry that is not a readable DIRECTORY, so the
-        # same blindness exists one level up: an app root replaced by a dangling
-        # junction is not a dir, is not listed, and its record is unreachable, so
-        # the app would read as absent. A link-ish or uninspectable entry therefore
-        # counts as an unread claim on its own.
-        #
-        # An entry that inspects cleanly as a plain FILE is deliberately NOT counted.
-        # It cannot be told apart from an ordinary non-app file in this directory,
-        # and treating every such file as an unread claim would leave ownership
-        # permanently incomplete -- which narrows the exemption for every unclaimed
-        # name on every rebuild. An app root overwritten by a plain file is the
-        # residue that leaves.
-        def _entry_hides_a_claim(_e: Path) -> bool:
-            try:
-                if _e.is_dir():
-                    return _occupied(_e / INSTALLED_META_FILENAME)
-                return _e.is_symlink() or platform_compat.is_link_or_junction(_e)
-            except OSError:
-                return True
-
-        _root = apps_dir()
-        _skipped = _root.is_dir() and any(
-            _e.name not in _named and _entry_hides_a_claim(_e) for _e in _root.iterdir()
-        )
-    except Exception:  # noqa: BLE001 — an unreadable root cannot vouch for the list
-        _skipped = True
-    if _skipped:
+    if not _claims_complete:
         fully_read = False
     for app in apps:
         name = app.get("name") if isinstance(app, dict) else None

@@ -3,13 +3,25 @@
 ## 1. Purpose
 
 A session's crew log is an append-only file (`crew-log-core.md`). Every view of it
-is a FOLD: `status`, `usage`, `timeline`, `tools` and `approvals` -- the session
-side panel of the RFC's section 5 table. This module is those five folds, the two
-read routes that serve them, and the frame that pushes a fold when the file grows.
+is a FOLD: `status`, `usage`, `timeline`, `tools`, `approvals` and `class` -- the
+session side panel of the RFC's section 5 table, plus the one fold a READER of
+another unit's log consults rather than a panel. This module is those five advertised folds, the internal `class` fold, the
+slot-keyed `ledger` fold, the two read routes that serve them, and the frame that
+pushes a fold when the file grows.
 
 The split it implements is RFC NFR-2: the backend folds and cuts pages, the
 frontend renders and pages and never folds. A client that folded the log would
 need the whole file to show one number.
+
+The five panel folds each read ONE session unit and are the set the growth push
+sends, so `PROJECTION_NAMES` holds those five. The `ledger` fold is keyed by a
+SLOT rather than by one unit: a slot owns one ACP session id at a time, so the
+work it accrues over its life is spread across a unit per id it ran under, and
+answering for it means joining them. `SLOT_PROJECTION_NAMES` holds `ledger` and
+is kept OUT of `PROJECTION_NAMES` for that reason -- the growth push and the side
+panel address a session, and pushing a slot-wide value under one session's id
+would report a partial answer as the whole one. `FOLD_NAMES` is the union of the
+two, and the import-time registry check compares a requested name against it.
 
 Scope: the SESSION kind. The crew-kind projections (`roster`, `activity`,
 `board`, `budget`, ...) are out of scope here because the crew kind has no writer
@@ -39,7 +51,8 @@ the file to say which is right.
 may store it and continue later. The state is deliberately NOT the rendered
 value: a fold keeps bookkeeping a reader has no use for -- the open tool calls it
 is matching by `call_id`, the attempt an open turn is on -- and keeping the two
-apart is what lets the value stay the surface the dashboard reads.
+apart is what lets the value stay the surface the dashboard reads. Writing that
+state to disk is section 7.
 
 `advance(checkpoint, entries)` does not touch its input. It copies the state
 first, because these are frozen records and a returned one sharing a mutable dict
@@ -135,10 +148,16 @@ read for any session -- so the pass is taken `FOLD_CHUNK_ENTRIES` at a time: one
 pass over the file, with what is held bounded. Folding a span in pieces is the
 same value as folding it whole, because `advance` is seq-anchored and each chunk
 is strictly after the last, and each checkpoint takes only the part of a chunk it
-has not already consumed -- which is what lets one chunk serve five folds sitting
+has not already consumed -- which is what lets one chunk serve every fold sitting
 at different seqs.
 
-## 3. The five projections
+## 3. The projections
+
+### The panel folds, and `class` beside them
+
+Each reads ONE session unit, and these FIVE are what the growth push sends. ``class``
+is registered alongside them but is not advertised and is not pushed: no panel draws it
+and its one caller asks the registry for it by name.
 
 | projection | what it answers |
 |---|---|
@@ -147,19 +166,57 @@ at different seqs.
 | `timeline` | The newest turn, lifecycle and cost MOMENTS, oldest first. Message, step and tool entries are deliberately absent: they are the bulk of a log, the page route and `tools` already serve them, and including them would make the timeline a second copy of the file. |
 | `tools` | Calls matched to completions by `call_id`: totals, per name, open calls, unmatched completions. An error is `status` in `refused`/`error`/`failed` OR `is_error` true -- two independent signals, and an absent `is_error` is not a claim that the call worked. |
 | `approvals` | Requests matched to decisions by `approval_id`: pending, decided, the decision tally, the last decision. No emitter writes these types yet; the fold is against the declared shape. |
+| `class` (INTERNAL -- not advertised, not pushed) | What KIND of session this log belongs to, over the log's WHOLE LIFE: the memory mode, the owning app, and whether the conversation was ever published to a channel. Each of those three is held at the most RESTRICTIVE value the log ever recorded, from the `class` object on the log's first `session/opened` plus every later `session/class` move, so a session published to a channel for one turn keeps reading as channel-published after the link is dropped -- that turn's content is still in this log. It also carries `workspace`, which folds differently because it is an IDENTITY rather than a restriction: there is no more-restrictive workspace to keep, so the FIRST one stated is held and a later different one sets `workspace_moved`, which is itself the restrictive fact -- a log whose content spans two workspaces is owned by neither. `recorded` says a class was stated at all and `complete` says the history has a beginning, and a reader deciding an authorization question refuses on either being false. The only fold whose consumer is a READER of another unit rather than a panel, which is why it is held restrictive rather than current: a fold that reported the present value would answer a question nobody asks of a log. |
+
+### The slot-keyed ledger fold
+
+| projection | what it answers |
+|---|---|
+| `ledger` | The session work ledger's state record: goal, phase, resumable next step, rejected approaches, artifact pointers, and a bounded event tail. It interprets only `ledger/recorded` and renders the ten fields every reader of that record expects (`session-work-ledger.md`). |
+
+This fold is the module's ONE exception to FR-4, and it is stated rather than
+assumed, because a reader has to know which kind of fold it holds. A slot owns one
+ACP session id at a time rather than for its whole life, so the record it answers
+for is spread over a unit per id the slot ran under. `fold_slot_checkpoint` folds
+those units oldest first, RE-BASING the seq guard at each one: a seq is comparable
+only within one file, so the second unit's entries all sit at or below the first
+unit's seq, and `advance` would refuse the whole file as a re-fold. The state
+carries forward across the boundary while the seq restarts. `fold_slot` renders the
+result. The units it joins are still exactly one slot's own, so nothing reads across
+slots.
+
+`session_units_for_slot` supplies that list. It names the units whose HEADER can be
+PROVED to belong to the store holding it, ordered by the header's `createdAt` and
+then by unit id so a tie is stable -- which is the order the units were opened in,
+and therefore the order their entries happened in, so a later update wins over an
+earlier one. A caller that cannot tolerate a clock's ordering re-orders the list
+itself: the ledger's `crew_log_units` applies its own append-order log and drops the
+units a permanent delete excluded before folding, because a backward clock step
+would otherwise apply a retired session's goal over a later one's
+(`session-work-ledger.md`). `read_slot_projection` is the slot-keyed read, and
+`slot_of_session` resolves a session-addressed request to the slot recorded in that
+session's header: the header rather than a session mapping, because it is written
+once inside the fenced tree and cannot be made to name another conversation's slot.
+
+A reader that folds on every loop wake would re-walk the whole log each time, since
+the fold interprets only its own entry type but still reads every line to find it.
+So the ledger's caller keeps the checkpoint per slot and advances it over what
+arrived since, through this module's own `advance`. A changed unit list, a newest
+unit whose seq went backwards, or a cold cache each force a full rebuild, because
+each would otherwise be a wrong answer rather than a slow one.
 
 ## 4. Reads
 
 | route | answers |
 |---|---|
 | `GET /api/sessions/{id}/crew-log?from=&to=` | The entries in a seq range, oldest first, with every `ref` on the page resolved (FR-4). |
-| `GET /api/sessions/{id}/crew-log/projection/{name}` | One fold's `value` and the `seq` it folded through. |
+| `GET /api/sessions/{id}/crew-log/projection/{name}` | One fold's `value` and the `seq` it folded through. A name in `SLOT_PROJECTION_NAMES` is served from the same route: the slot is resolved from that session's own header first, and the fold then joins every unit the slot ran under. A session whose slot cannot be proved gets the empty fold, never another slot's. |
 | `GET /api/sessions/{id}/crew-log/projections` | Every fold, keyed by name, from ONE resolution and ONE pass over the unit, so a caller showing them together cannot be handed a mix from two units. Each fold keeps its own `seq`, which differs by design: an entry advances the folds it belongs to and leaves the rest. |
 
 **The BATCH read answers two things the folds cannot.** A fold says what it holds;
 it cannot say why it holds nothing, nor whether it was read mid-write. Both fields
-are on `/crew-log/projections` alone, because both exist for a surface showing five
-folds at once and no caller of the per-name route reads either -- and the settle one
+are on `/crew-log/projections` alone, because both exist for a surface showing folds
+TOGETHER and no caller of the per-name route reads either -- and the settle one
 of them needs is a wait charged to every request that carries it. The per-name and
 page reads resolve their id the same way; they simply do not report these:
 
@@ -241,8 +298,108 @@ already holds. A second, unit-keyed door serves the `kirocrew-crew-log` MCP serv
 over the same `read_page` and projection reads, on the strict internal transport
 only: `GET /api/crew-log/sessions` lists units, `GET /api/crew-log/resolve` answers
 which unit a caller's key lands in, and `GET /api/crew-log/units/{unit}/page` and
-`/projection/{name}` are the unit-keyed forms of the two above. Their gate, and the
-argument for granting them to an agent at all, is in
+`/projection/{name}` are the unit-keyed forms of the two above.
+
+That second door asks for a valid strict session identity and then a SCOPE: a
+session reads its own unit, the unit of any session it dispatched -- transitively,
+from the creator edge recorded on the dispatched session's own `session/opened`
+entry -- and, when it is the owner at a dashboard tab whose own caller class allows
+it, any unit. The listing carries
+the same scope as a filter, because an unscoped listing would name every session on
+the host and a per-unit gate cannot refuse that after the fact. A conductor reading
+the crew logs of the sub-sessions it dispatched is the ordinary shape of the work,
+and the lineage record already says which session created which, so the entitlement
+comes from a recorded fact. Issues #11963 and #12025 were closed as not planned for
+that reason.
+
+The lineage is not the whole entitlement, because it OUTLIVES a workspace switch: the
+creator edge is written on the dispatched session and nothing rewrites it, so a
+conductor that dispatched a child and then moved workspace still names that child in
+its tree. Both doors therefore compare the caller's workspace against the one the
+target's class recorded. The per-unit door refuses the read; the listing drops the row,
+so a boundary the read door enforces for content cannot be walked around by reading
+the enumeration instead. A row admitted as the caller's OWN, and an owner's unscoped
+view, are not asked -- the same two cases the per-unit door answers before any target
+test.
+
+The maintainer decision this implements is the DISPATCH fence, not an unrestricted
+read. The wider premise -- that
+sessions on one gateway belong to one operator, so any may read any other -- was
+put forward and does not hold, because it does
+not reach a channel-linked session, whose conversation is a Slack or Telegram thread
+several allow-listed people read and prompt-injectable content enters. Nor does
+parity with `session_read_message` support it: that tool's own gate
+(`session_control.authorize_target`) refuses precisely those caller classes, so it is
+narrower than an unrestricted read rather than an example of one. So the CALLER
+classes it refuses -- unattended, app-scoped,
+incognito, channel-linked or mirrored -- are mirrored here from that module's own
+constants, and each of those callers keeps its own unit while being refused another
+session's. The owner's dashboard arm is held to the same caller classes, because a
+dashboard session mirrored to a channel republishes every turn and would otherwise be
+the one caller entitled to read every log and publish it. The door also refuses a
+caller off the internal transport, a request
+naming another component, and a session the gateway cannot name -- that last one is
+what keeps the audit record of WHICH session read a log worth having.
+
+The fence keys on SLOTS. A slot outlives its ACP session, so a gateway restart gives
+the same tab a new session id and a new unit; keying on `parent.sid` would hand a
+re-attached conductor a chain naming the unit it used to write to and lock it out of
+children it had dispatched minutes earlier. The transitive walk is section 6's own
+fold rather than a second slot map, so the fence and the tree cannot disagree.
+
+The target side is mirrored in TWO tests, because the question is asked about
+sessions that no longer exist. The first reads the class recorded on the target's own
+`session/opened` entry -- the memory mode, the owning app, whether its conversation
+is published to a channel -- which is what makes a CLOSED child decidable; a log
+carrying no such record is REFUSED rather than assumed unrestricted, so every unit
+opened before the field existed is outside a cross-session read. The second reads the
+target's live slot, which is the only thing that can see a class the session acquired
+after it opened. Either refuses. A CLOSED session is otherwise admitted: reading a
+finished child's recorded work is what this door is for, and `authorize_target`
+answers 404 for it.
+
+Both the CALLER's class and the TARGET's are asked again after the entries are read. A
+read of another session's log is decided on the loop and then performed off it, and
+that offload is a suspension point: the caller can acquire a channel link or a mirror
+while the entries are being gathered, and so can the target. The caller half stops one
+act exactly, and claims no more than it: the route does not hand another session's
+content to a caller that is publishing AT THE HANDOFF. That is the scenario of a prompt
+to paste a dispatched child's log, a mirror bound while the read is suspended, and a
+reply that publishes the private log. The target's RECORDED class
+is folded again, and for its own reason
+rather than as belt and braces: that fold reads the log's WHOLE life, so a
+``session/class`` move appended while the payload was being gathered makes it answer
+more restrictively than it did at the grant, and the words of a channel turn the
+target took during the read would otherwise come back. What makes the re-fold exact is
+where the class is RECORDED: every surface that commits a change to it records the
+change at the moment it commits, not at the next sample, so a class that governs any
+content in the log is already stated in the log ahead of that content. A record is
+therefore never later than what it governs -- which is the property the re-fold needs,
+and one no amount of sampling supplies. Because each member is held at the most
+restrictive value ever recorded, a
+re-fold can only withdraw a grant, never widen one. It is incremental, so a log that
+did not move costs nothing.
+
+One residual is KNOWN and stated rather than papered over: a caller entitled at the
+handoff that acquires a channel link AFTERWARDS holds the payload in context and can
+publish it on a later turn. Nothing at turn emission inspects a turn for another
+session's log content -- the gateway has no provenance tracking on delivered content --
+so no refusal in this route can claw that back. The two cases differ in kind rather than
+in timing: the first is the gateway delivering content INTO a published session, which
+this route performs and therefore controls; the second is a session becoming published
+while holding content it was entitled to receive. Closing the second needs provenance on
+delivered content and is not in this module's scope. A LISTING is re-checked by
+recomputing its scope and comparing, since its rows were gathered under the scope the
+caller held at the gate. The CREATOR EDGE is the one input not asked again: it
+comes from an entry that cannot be rewritten, and an append-only store can only gain
+descendants, never take back a unit the caller was already placed above. What the
+grant leaves on the request is therefore a MARK naming which arm granted, never data:
+the re-check can re-derive every value, but not which target test it owes, since the
+owner arm owes none. A read of the caller's own unit is exempt on the
+same ground the first arm is: the classes govern reading past one's own record. The
+denial is audited under the operation name the grant was, so the audit log carries the
+true sequence rather than a grant quietly withdrawn. The argument in full, including
+why the fence's integrity guarantee is untouched, is in
 `docs/reference/crew-log/reading-from-an-agent.md`.
 
 A page reports the tail it OBSERVED, not the one its handle remembers. `last_seq`
@@ -325,7 +482,7 @@ would close an import cycle and put a reader's name in the writer's code.
 
 The publisher runs the reading half on the event loop, never on the writer
 thread: `notify` hands the id to the loop and returns. It then coalesces for
-`COALESCE_SECONDS`, folds all five projections from ONE incremental read of the
+`COALESCE_SECONDS`, folds every advertised projection from ONE incremental read of the
 entries that arrived, and sends a frame only for a projection whose `seq` moved --
 re-sending an unchanged value would spend a socket write to say nothing.
 
@@ -363,14 +520,31 @@ can tell exactly what happened. Only `turn/completed` closes a turn.
 
 ## 6. The session tree -- the one fold across logs
 
-Every fold above reads its own unit's file and nothing else (FR-4). The session
-tree (`crew_log/tree.py`) is the one reader that looks across logs, and it is a
-different kind of thing on purpose: the `session_create` edge is recorded on the
-CHILD (`crew-log-core.md` section 5), so "which session opened which" is not in
-any one log. It is a fold over the collection, the shape dsh's `flattenLineage`
-takes over its per-session `parentSession` header field: the record lives on the
-child, the tree is a pure function over all the records, and an orphan or a cycle
-degrades to root rather than to an error.
+Every fold above reads its own unit's file and nothing else (FR-4). Two readers
+look across logs, and they read the SAME recorded edge for different questions:
+the session tree here, and the dispatch fence in section 5. The `session_create`
+edge is recorded on the CHILD (`crew-log-core.md` section 5), so "which session
+opened which" is not in any one log.
+
+The tree (`crew_log/session_tree.py`) folds EVERY log and keys the result by
+SLOT, because it answers "what does the whole tree look like" for a display, and
+the live row a child nests under is the slot's -- a slot outlives its ACP
+session. The fence (`crew_log/read.py`, `dispatch_view`) keys on SLOT for the
+same reason, and does not fold the collection a second time: it calls
+`session_tree.SessionTree.records` and `session_tree.fold_tree` and adds only the
+unit-to-slot map a read needs, because a request names a unit while the lineage
+is recorded between slots. So the two readers share one fold and cannot disagree
+about who dispatched whom -- an earlier sid-keyed walk here could not, since a
+restart gives a tab a new session id and the recorded `parent.sid` then named a
+unit the re-attached creator no longer writes to. `sid` stays on the entry as the
+audit citation for which log held the creating call, which is what the module
+docstring means by a reader of the logs themselves; neither reader keys on it.
+
+The tree is a different kind of thing from a fold in the sections above on purpose.
+It is a fold over the collection, the shape dsh's `flattenLineage` takes over its
+per-session `parentSession` header field: the record lives on the child, the tree is
+a pure function over all the records, and an orphan or a cycle degrades to root
+rather than to an error.
 
 **What is read.** For every unit directory under the session root
 (`store.unit_dirs`), the HEADER and the FIRST ENTRY of the oldest surviving
@@ -473,7 +647,7 @@ scan on the executor beside its other filesystem work, and the page polls every
 5 s, so a store at the cap costs about 2% of one core while the Sessions tab is
 open and nothing while it is not. The cap is far above any population retention leaves; a
 store that reaches it usually has retention disabled, though a store with more
-than that many unexpired logs reaches it too. `test_crew_log_tree.py` measures
+than that many unexpired logs reaches it too. `test_crew_log_session_tree.py` measures
 the invariant rather than reading it off the code: a scan handed ten times the
 cap in absent ids makes exactly the cap's worth of probes, a store three times
 the cap is examined for cap + 1 candidates, and the cache never exceeds the cap.
@@ -510,11 +684,533 @@ row has nothing else that says it. The table re-checks the edge it is handed --
 a key naming no row in the payload, or a chain returning to its own start --
 because a table must never fail to paint on a payload it did not produce.
 
-## 7. Deliberately not here
+## 7. Savepoints on disk
 
-- **Checkpoints on disk** (`projections/<key>.json`). State is kept in memory,
-  keyed by session, and the shape is already the one a checkpoint file would
-  carry, so persistence is additive.
+A fold is cheap per entry and unbounded in total, so folding from seq 1 makes the
+projection route cost what the session's whole history costs. The push avoids that
+with the in-memory bundle above, but that cache dies with the process and holds
+`MAX_CACHED_SESSIONS` sessions, so a restart and an eviction each pay for the file
+again. `crew_log/checkpoint.py` is RFC NFR-1's answer: each fold's state written
+beside the log it came from and resumed on the next read. Measured on a
+10,001-entry (1.48 MB) log, all five projections, best of five runs on one host:
+184.4 ms to fold cold, 44.8 ms to resume with nothing new to fold, 105.5 ms to
+resume with a short tail, 197.1 ms on the read that also earns a new savepoint,
+and 24 KB of files. Read those as ratios on one host rather than as portable
+constants.
+
+An earlier revision of that sentence said 3.2 ms to resume. It was measured before
+the prefix digest existed and is no longer true of any resume: the digest is
+verified on the way in and rechecked after the pass, and those two hashes are
+essentially the whole of the 44.8 ms. Section 6 gives the attribution.
+
+One file per fold, inside the unit's own directory, which the RFC's section 3
+already names:
+
+```
+<store dir>/projections/<fold>.json
+{"v", "unit", "origin", "first_seq", "fold", "seq", "prefix_sha", "prefix_records", "state"}
+```
+
+One file per fold rather than one for all five, so a payload this build cannot
+read costs that fold its savepoint instead of costing all of them, and so a caller
+asking for one projection writes one file. The name is a fold name that passed
+`require_name`, so it can only ever be one of the five words this package
+declares. The store reads its segments by name (`log.jsonl`, `log.<first_seq>.jsonl`)
+and ignores every other neighbour, and removal deletes the unit's whole directory,
+so the files need no registration on either side.
+
+**Disposable, and that is the property to keep.** Every failure -- no file, a
+truncated one, a payload from a build this one does not understand, a store the
+file no longer describes -- is answered by folding from seq 1, which reaches the
+same value at more cost. `load` and `save` therefore never raise: nothing a reader
+is served depends on a savepoint existing or being current, and the tests state
+each rejection as "the fold still lands on the cold answer".
+
+**An append-only prefix never invalidates one.** The entries a savepoint consumed
+cannot change, so folding what came after reaches what a cold fold reaches -- the
+section 2 equality, now with a file behind it. Four things break it, and each is
+checked before a file is used:
+
+| check | what it catches |
+|---|---|
+| `origin` | a unit removed and recreated under the same id. Its seqs start again, so once the new file grows past the stored seq a seq check alone passes. It is the same value `SessionProjections.origin` compares, spelled once in `log_origin`, because two spellings of "same log" could disagree and the lenient one would fold a retired file's state onto a live file's bytes. |
+| `first_seq` | the log lost its FRONT. Retention deletes whole segments off the oldest end, so a cold fold now folds a window while the savepoint still counts entries that are gone. The savepoint's answer is the one no reader can reproduce, so it is the one that is retired. |
+| `seq` vs the log's end | a store SHORTER than the savepoint. Mostly caught by the two above, and checked on its own because a fold resumed past the end of a file is the one state no later read recovers from. |
+| `prefix_sha` | an entry BELOW the savepoint's seq that changed after it was folded. The three checks above read the log's identity, its front and its length, and none of them reads the consumed prefix -- so without this one a savepoint and a cold fold disagree in exactly one case, and the savepoint is the answer that looks clean. `store._iter_entries` documents that a damaged interior line is SKIPPED on purpose, so a cold fold silently omits that entry while the savepoint keeps the value it folded. The digest is over the RAW RECORD BYTES of the consumed prefix, so it catches a rewritten line, a newly damaged one, and a newly readable one alike. It is checked TWICE on a read that resumes: once before the pass, and again after it, because the pass consumes entries above the prefix and damage landing in between would otherwise leave the served state carrying a record the file no longer yields. The second check is the same one -- `checkpoint.resumed_prefix_still_verifies` re-runs the load rather than re-implementing the comparison -- and a mismatch retries cold through the same path an identity change uses. |
+
+**The identity is also read AFTER the pass, and a change discards the fold.**
+`iter_from` opens the log by NAME, so a unit removed and recreated between the
+identity read and the read of the entries hands the fold a different file's
+entries while it holds the first file's state -- and the seqs do not say so,
+because a recreated log starts its own again. `fold_session` therefore folds once
+more from scratch, and on a second change reports `origin: None`, which is
+"unknown identity": it is what stops a caller reusing the bundle and stops it
+being written, since both compare against that field and neither accepts `None`.
+The value is still served, because refusing to render a session that exists is the
+worse answer.
+
+That after-check is only as good as the identity it compares, so `log_origin` reads
+BOTH signals from the file on disk: the file's device and inode, and its `createdAt`
+through `store.unit_header_created_at`, which parses the header line itself. Neither
+comes from the handle's own parsed header. That header is read once when the handle
+is opened, so a handle held across a recreation would keep reporting the retired
+file's stamp -- leaving device and inode as the only live signal, and those agree
+whenever the new file lands on the freed inode, which is the common case rather than
+a rare one. An earlier revision of this section said the savepoint FILES were exempt
+because `load` and `save` hold a freshly opened handle. That was wrong: both take
+the handle their caller passes, which is the handle `fold_session` folds with, so
+the disk read is what protects them too.
+
+**The prefix digest is what makes "a consumed entry cannot change" checkable rather
+than assumed, and it is affordable because folding is not the same work as reading.**
+`CrewLog.raw_prefix_digest` walks the unit's segments in the order
+`segment_paths` gives them, skips each segment's header record, and hashes the next
+`prefix_records` raw records. Three things follow from doing it that way. It decodes
+no JSON, which is the point: on the log section 7 measures, hashing the whole prefix
+is 20.6 ms against a 184.4 ms cold fold of all five projections. That ratio is the
+weaker of the two honest readings, though, because a cold fold is not the read the
+guard runs on. On a RESUME it is not a rounding error: the digest is verified on the
+way in and rechecked after the pass, which is why an otherwise idle resume spends
+44.8 ms almost entirely on two hashes, and a resume that also earns a write resolves
+the record count and hashes again -- 66.6 ms for `prefix_witness`, 20.6 ms for the
+recheck -- and lands at 197.1 ms, about what folding cold costs. The savepoint still
+wins on the reads that dominate, the ones with nothing or little to fold, but by
+roughly 1.7x to 4x rather than by an order of magnitude. An earlier revision of this
+section quoted 343.6 ms for that cold fold and called the guard 6% of it; that figure
+disagreed with section 7's own measurement of the same log, and both are replaced by
+the one run quoted there. The boundary it is handed is a RECORD count,
+and the FOLD resolves that count, from the last seq it read before its pass, through
+`CrewLog.raw_records_through`, which is the one place a seq is read. And the framing is
+the store's own rather than a second copy in the savepoint module, because this is the
+path that decides whether damaged bytes are trusted.
+
+**The digest is read BEFORE the pass, and the write persists that reading instead of
+taking one of its own.** A digest read at write time covers whatever the file holds
+THEN, which need not be what the fold consumed: a consumed record that changed in
+between would be hashed together with state folded from its earlier value, and because
+the recorded digest and the recorded state would then agree with EACH OTHER, every
+later resume would recompute those same changed bytes, match, and serve state a cold
+fold disagrees with -- for the life of the unit, since nothing rechecks a digest that
+verifies. So `_fold_attempt` reads it through `checkpoint.prefix_witness` before it
+consumes anything, `held_still` asks `checkpoint.prefix_unchanged` once the pass is
+done, and `save` writes the value it was handed. A pass that ends at some other
+boundary, because the file grew under it or because the handle's own seq was stale,
+matches no fold in the bundle and writes nothing: that costs the savepoint, never the
+answer the read serves.
+
+**Only a read that folded the prefix ITSELF may write a savepoint, so an incremental
+read serves from its caller's bundle and persists nothing.** The custody the paragraph
+above describes has to reach across calls as well as across a pass. A read that resumed
+from DISK carries it transitively: the savepoint records the digest its own writer read
+before folding, and `checkpoint.resumed_prefix_still_verifies` checks that recording
+again, so the digest on disk is still evidence about the bytes the state came from. A
+`since=` bundle carries no digest -- `SessionProjections` has no such field -- and the
+bytes below its seq were consumed by a call that has already returned, so nothing the
+new pass can read is evidence about them. A digest taken then would be honest about the
+file and wrong about the state beside it, which is exactly the pairing that makes a
+wrong answer permanent. So `_fold_attempt` takes no witness on that path, and `save`
+writes nothing without one. The cost is that a hot incremental reader -- the dashboard
+push loop in `dashboard/handlers/crew_log.py`, whose `MAX_CACHED_SESSIONS` bundles are
+folded with `since=` on every publish -- brings its savepoint forward on the next read
+that folds the prefix instead of on every read, which is the lag the section below
+already allows for.
+
+An earlier revision of this section derived the boundary as `last_seq - first_seq + 1`
+and justified it by saying the log is append-only with contiguous seqs, so a count
+names the same boundary and a damaged line still occupies its slot. That was wrong,
+and a reviewer caught it. A SUBSTITUTED damaged line does occupy its slot, but a blank
+or unparseable line that the entry reader skips is still a record to the raw walk, so
+the entry span and the record count diverge by one per such line. Handed the entry
+span, the walk stopped that many records short, and the trailing records the fold HAD
+consumed fell outside the digest -- where damage to them passed every guard, since
+identity, first seq and length all still matched. `raw_records_through` decodes a
+record per line, so only a fold that owes a write calls it; a savepoint is written
+rarely, and the reader is handed the resolved count, which keeps verification
+decode-free.
+
+The honest cost of this, corrected after a reviewer caught the first version of this
+sentence overclaiming: a savepoint saves the FOLD work, not the parse. `iter_from`
+walks `_iter_segments` and drops entries below the requested seq AFTER constructing
+them, so a resumed read that has anything to fold still decodes the prefix it skips
+folding. What the digest adds on top is a second pass over the same bytes, hashing
+only, which is why it is cheap next to folding and not free. The header record is
+excluded because `origin` already compares creation identity and including it would
+blur which guard fired. The three cheap checks stay in front of the digest even though
+it would catch their cases too: they are O(1) comparisons, and a rejection should not
+pay a pass over the whole file.
+
+**A savepoint is allowed to LAG, and that is what keeps the write off the hot
+path.** One is written only once the bundle has advanced `MIN_ADVANCE_ENTRIES`
+past what is on disk; resuming from an older one replays the tail and reaches the
+same value. Without the threshold the push would rewrite five files each time a
+session grew by one entry, which is the cost this removes rather than relocates.
+It also means a short session leaves no file at all: folding it from the start is
+already cheap. `SessionProjections.saved_seq` carries what is on disk, so a caller
+reusing a bundle decides from what it holds instead of reading the files to find
+out.
+
+**The payload is ASCII-only.** A crew log's own JSON admits a lone surrogate, so a
+fold can retain one in a label -- and a serializer that passes it through makes the
+UTF-8 encode raise out of a function that promises never to. Escaping every
+non-ASCII character round-trips the surrogate and cannot fail, which is what the
+store's own serializer does.
+
+**No fsync.** A savepoint a crash leaves unpersisted is an older savepoint or no
+savepoint, and both are answered by folding further, so a flush per write would
+buy nothing the cold fold does not give for free. The rename is still atomic,
+which is what keeps a reader from seeing half a payload.
+
+**The write goes through the unit's lease, non-sole.** Nothing here needs
+ownership to be correct against another READER: each file names the log and the
+seq it describes, so any writer's version is a valid savepoint of the same
+append-only bytes. Removal is the different case. It takes the lease `sole`, which
+`acquire` refuses while any other hold exists, so holding a shared one across the
+create, the write and the final check is what stops a removal starting in the
+middle of them -- and a removal already in progress refuses the reader instead,
+which is the answer that leaves the removal whole. Contention is a reason to skip,
+never to wait: the read the fold was for is already served.
+
+Two more rules close the ends the lease cannot. Establishing the identity stats
+the newest segment, so a removed unit fails there -- BEFORE the lease, which would
+otherwise create a lease file inside a directory removal has already emptied. And
+after the write, a unit with no segment has everything just written deleted again,
+the unit directory included: `atomic_write` creates its target's parents, so a
+write that landed after a removal emptied the tree rebuilt that directory too, and
+nothing else collects an empty one, because the retention sweep decides from a
+unit's own entries and a unit with no segments has none.
+
+The size cap is a BACKSTOP on section 2's bounds, not a bound itself: a fold that
+grew unbounded state loses its savepoint instead of writing an unbounded file on
+every read.
+
+**Changing what a fold stores bumps `CHECKPOINT_VERSION`, and a test enforces
+it.** `CHECKPOINT_VERSION` and `_state_matches_fold` both check the payload's
+SHAPE, so the case neither sees is a fold whose MEANING changes while its keys do
+not -- a counting fix in `usage` or `status` being the likely one. The old build's
+savepoint then resumes onto the new logic, and the long sessions this exists to
+speed up are the ones that keep serving pre-fix numbers for the life of the unit,
+with no in-product way to retire the file because the tree is fenced from the
+agent. So the rule is: any change to what a fold's `start` or `step` stores bumps
+the version, which retires every savepoint to a cold fold at one refold each. The
+rule is not left as this paragraph --
+`test_changing_what_a_fold_stores_forces_the_savepoint_version_to_move` digests
+each fold's stored state over a fixed script with the clock frozen, so a changed
+fold reddens CI with the bump named in the failure. One global number over a
+per-fold one is deliberate: it over-retires, and over-retiring costs a refold
+while under-retiring serves a wrong number.
+
+## 8. The pull-request holders -- the second fold across logs
+
+`crew_log/holders.py`. The session tree above answers "who created whom". This
+answers "which session is holding pull request X", and it is a separate reader
+because neither the tree nor a single log's fold can answer it alone: the
+question needs the references (a scan of prose) AND the lineage (the tree's
+fold), combined under one rule.
+
+**Why recency alone is wrong, and why the rule lives here.** A reader that takes
+the session with the newest mention gets the wrong answer whenever a conductor is
+involved: a conductor names the pull request every time it checks on the worker it
+dispatched through `session_create`, so by recency it owns every row it supervises
+and the worker actually holding the work is never named. Mention count does not
+rescue it -- a conductor patrolling on a timer out-mentions a worker that pushed
+twice. So the lineage is applied BEFORE the ranking (`fold_holders`, pure):
+
+1. The candidates for a reference are the sessions whose text NAMED it.
+2. Any candidate that is an ANCESTOR of another candidate is dropped. A conductor
+   supervising a worker that named the same pull request is that worker's
+   ancestor, so it leaves the running. A conductor that named a pull request NO
+   descendant of its own named is NOT dropped: it is then the only session that
+   knows about it, and reporting nobody would be worse than reporting the session
+   that actually spoke.
+3. The newest mention among the survivors wins, ties falling to the larger count
+   and then to the slot key, so two scans of the same files agree.
+
+Ancestry is the TREE's relation and not a second opinion about it: an edge is
+followed only where `fold_tree` followed it -- onto a slot with a log of its own
+-- and a slot the fold marked as lying on a cycle is never walked through. That is
+why this module imports the tree instead of re-reading `session/opened`: two
+readers with two folds would disagree about who created whom, and a person moving
+between the pages that use them would see two answers. The answer carries the
+owner's CITED creator even where the tree could not follow that citation, for the
+same reason `TreeNode` retains it -- the citation is the child's own record, not
+the fold's verdict on it.
+
+**What counts as a reference.** Text entries only: `message/received.text`,
+`message/sent.text` and `message/chunk.delta`. Tool arguments are hashed in this
+store (section 2), so a pull request named only inside a tool call is not
+recoverable from the log and is deliberately not guessed at. ONE spelling is read:
+the full pull-request URL, whose `/pull/<number>` path says the number is a pull
+request. The short forms are both refused. A bare `#number` names no repository,
+and numbers are per-repository, so it would join a session to whichever repository
+happened to share it. `owner/repo#number` names a repository and still does not
+say what the number IS: the forge spells an issue and a pull request identically
+in that form, and only an API call it cannot make could tell them apart, so
+reading it would attribute a holder to an issue -- a reference to a pull request
+that does not exist. A wrong kind, like a wrong owner, is worse than no answer.
+
+The number must END its own path token, and the scheme must BEGIN one. The pattern
+is applied to arbitrary prose and matches anywhere in it, so each end needs the
+same boundary: without the trailing one, `/pull/123abc` -- which addresses no pull
+request -- reads as a reference to 123, and without the leading one
+`xhttps://github.com/o/r/pull/42`, an ordinary typo, matches one character in and
+names a pull request the text does not address. One refused class covers both: the
+characters that CONTINUE a token, being letters, digits, `_`, `-`, `~` and the `%`
+of an escape. Everything else ends or leads a token and is not read, which keeps
+`/pull/123/files`, `/pull/123#discussion_r1`, `/pull/123.diff`, a link at the end of
+a sentence, and one led by a space, a bracket or a quote. The trailing refusal
+includes a following DIGIT, so a run longer than the number bound cannot be re-cut
+into a shorter valid number to satisfy the boundary: it arrives whole at the bound
+that refuses it.
+
+A repository's identity is CASE-INSENSITIVE at the forge, so owner and repository
+are lowercased where a reference is constructed. That is one place rather than
+two: normalising in the parser and again in each lookup lets a later call site
+forget, and the failure is silent both ways -- two casings of one pull request fold
+as two references, and a caller spelling it differently finds no holder for a
+reference that was found.
+
+A reference is stitched across an oversize body's slices. A body too large for one
+line is written as a run of `message/chunk` entries (section 2), and a URL can
+straddle any two of them, so scanning each slice alone loses it while reporting a
+complete answer. Each slice therefore carries forward the tail of the slice before
+it, `REFERENCE_STITCH_CHARS` of it, which is longer than the longest reference the
+bounds below admit. The carry is kept with the segment's read position, so a scan
+that stopped on its byte budget resumes the stitch rather than dropping the pair it
+stopped between. It is reset at every record that does not continue the same run --
+a different `turn` or `step`, an entry of another type, the citing entry itself --
+because two unrelated bodies joined end to end could spell a reference that
+neither of them contains, and a fabricated holder is the same defect as a lost one
+wearing the other sign.
+
+A run of slices with NOTHING after it is held rather than folded. The store writes a
+body's slices and the entry citing their seqs as one group, so a run with anything
+after it was completed, and a TRAILING run is a group whose citing entry never
+landed -- `store._orphan_chunk_offset` calls exactly that run unreachable and drops
+it, because no entry names those seqs and the message the body belongs to has no
+record at all. Folding it would report a holder for a message with no record, and
+report it complete. The run is HELD and not discarded: its references accumulate
+apart from the segment, and they are kept ACROSS scans rather than for the duration
+of one read, so a scan that caught a group mid-write folds it on the next call.
+Discarding would lose an ordinary oversize body's references for good, which is a
+worse answer than the one the hold prevents; rewinding the read position to the
+run's first slice instead would stall the scan outright, because a body can be
+larger than a whole scan's byte budget and every later scan would re-read the same
+bytes without ever reaching the citing entry. The position advances past a held
+run; what is held is what it contributed.
+
+A record this reader SKIPPED does not close a run. A damaged but terminated line
+carries no type, so it says nothing about whether the citing entry landed, and
+treating it as the end of the group commits exactly the unreachable slices the hold
+is for.
+
+Each name is bounded too, at the forge's own limits (39 characters for an
+owner, 100 for a repository), and that bound is a RETENTION bound rather than a
+parsing nicety: a reference is cached for as long as its segment exists and the
+cache bounds only the COUNT per segment, so without it one entry of untrusted
+prose is a single 60 KiB reference and a segment's worth would pin tens of
+megabytes in a scanner every reader shares.
+
+**Bounds.** Unlike the tree, this reader cannot answer from a log's head, because
+a reference can be named on any line. It is bounded by RESUMING instead. Each
+segment's read position is cached with that segment's identity, so an untouched
+segment costs one `stat` and a live session's appends cost only the bytes
+appended -- `SCAN_BYTES_PER_SEGMENT` of them per scan, so a cold log of any size
+is absorbed over several scans rather than blocking one. A scan that left bytes
+unread says so, so a partial answer never reads as a complete one, and the unit
+listing is the tree's own capped listing, so the two readers admit the same
+population. That completeness flag travels IN the reading the scan returns
+(`ReferenceReading`, `HolderReading`) and is computed under the same lock that
+produced the data. It is deliberately not a property of the scanner: one scanner
+instance serves every reader in the process, so a flag read in a second, unlocked
+call could be another reader's, and a truncated answer would then be handed over
+labelled complete. Over the unit cap counts as incomplete for the same reason a
+byte budget does -- a truncated set of units and a truncated set of bytes both
+mean the answer is not the whole store. A store fault is reported as an empty
+answer that is incomplete, because "nothing was readable" and "nobody holds
+anything" are different facts and only the second is safe to render. The same rule
+runs one level down: a unit whose segments could not be listed, a segment whose
+bytes could not be read, and a header that could not be read all make the reading
+incomplete, while a header that WAS read and refused does not, and neither does a
+segment retention deleted off the front -- its entries are gone from the store, so
+an answer without them is complete.
+
+A fault must never arrive as an ABSENCE, and the store's own helpers are where that
+happens. A segment whose `stat` FAILS is the same rule at file level: the listing
+just returned it, so the file is there and could not be read. Only
+`FileNotFoundError` is the absence -- retention took the entries with it -- and every
+other error is a fault. Asking `exists()` instead answers False for both, reporting a
+readable-but-unread segment as one retention removed.
+
+An announce record that is THERE and unreadable is the same rule in the lineage
+fold: what it said about the session's creator is unknown rather than absent, and a
+missing creator edge is the one shape that stops the ancestor rule dropping a
+supervising conductor. The verdict is CACHED -- the log is append-only, so those
+bytes cannot become readable and re-reading them every scan buys nothing -- and it is
+served as a fault every time, which a cached absence would not be.
+
+The store REFUSING to name a unit is the same fault, and it costs that unit alone.
+The refusal is not an `OSError`, so it left the reference fold entirely and the outer
+guard answered with no holders at all -- one unreadable unit throwing away every
+healthy unit's work. It is reachable two ways. A header can hold an id the store will
+not address, since a unit directory is named with a readable fold of the id plus a
+digest of the whole of it and the fold turns a path separator into `_`, so a
+hand-written directory and header can agree on the name while the id stays unusable.
+And the root itself can be refused, for a data home this process may not read, which
+has nothing to do with the id.
+
+EVERY segment's own header is checked against the unit holding it, not just the
+oldest. A segment's session is otherwise taken from the DIRECTORY, so a file whose
+header names another session has its entries folded into this one's mentions while the
+reading calls itself complete -- a holder for work the session never touched. The
+oldest segment is already refused that way when its id does not fold back to its
+directory, which is what leaving the rest unchecked made uneven. The check reads the
+header from the same open file as the records rather than from a second look at the
+path, since a separate read leaves a window in which the file the header vouched for
+is not the file whose records are folded. A refusal is permanent, like a record that
+could not be delivered: the answer is a property of the bytes, so re-reading reaches
+the same one. A first record still being WRITTEN never reaches the check -- it has no
+terminator, so the read stops on it as an append in flight.
+
+Ancestry is walked to a bound of the NUMBER OF NODES, which is the longest simple
+path there can be, and repeats are refused separately. A fixed floor is wrong in the
+one direction that matters: a chain deeper than it stops the walk, the candidate is
+not recognised as an ancestor, and it survives the descendant filter to win on
+recency -- a wrong holder on an answer that still calls itself complete.
+
+A fault is reported by the read that FAILED, never by a second look. `unit_dirs`
+returns whether its listing failed alongside what it listed, and both folds take that
+flag: a reader of its own cannot stand in for it, because `iterdir` yields as it goes,
+so an error surfacing after the first entry escapes any probe that draws one entry and
+stops, and even a full re-listing answers for a different moment than the listing did.
+Whatever the listing had in hand is returned WITH the fault rather than discarded:
+those directories were read, and the flag says the answer is short.
+
+An ABSENT root is not a fault: a store with no sessions directory holds no sessions,
+and an answer without them is the whole truth. A root the store REFUSES is one,
+because resolving it is itself a read, and the refusal happens inside the listing
+call, so it arrives as that call's own fault.
+
+The same rule holds one level down, where `oldest_segment` answers an unreadable unit
+directory with the value it gives a unit that has no segment. Both folds probe there,
+on the empty path only so the ordinary case pays nothing, through one shared helper --
+two copies of that judgement would be the two folds disagreeing again.
+
+A header that could not be READ is the same rule one layer in, and the cache is
+what gives it teeth. `read_head` answers an over-cap or unparseable line 1 with the
+same "no header" it gives a file whose header has not been written yet, and that
+second case is an ordinary transient: the emitter creates the file and appends the
+opening record in two writes, so a read can land between them. The tree CACHES its
+per-unit verdict, so blurring the two turns one damaged header into a silent
+omission re-served on every later scan for as long as the file's identity holds.
+The two are told apart by asking whether the file holds any BYTES, and a faulted
+header is not cached at all. A header that parsed and was then refused is neither
+case: it was read, and the refusal is the answer it gave.
+
+Segments missing off the FRONT and missing from the MIDDLE are different facts.
+Retention deletes whole segments off the front, and those entries are gone from
+the store, so an answer without them is the whole truth available and is complete.
+A segment gone from the middle is damage: the entries around it are still here, so
+the sequence itself says some are absent, and the store puts each segment's
+first-seq in its NAME so a reader can tell the two apart from the listing alone.
+Seq runs contiguously inside one segment, so the segment following one whose
+highest entry is `max_seq` must start at `max_seq + 1`; a higher start is the
+hole, and the reading says incomplete. The number is read from the entries this
+scan already framed rather than derived from a count of them, because only the
+records know how the writer numbers a segment's header -- a count-based rule
+reported an ordinary rollover as damage, which is worse than the hole it finds.
+A segment this scan did not finish is not judged at all: its highest seq is short
+by whatever went unread, and not finishing already makes the reading incomplete.
+
+This reader asks the framing layer for records INTACT, and stops a segment at the
+first one that cannot be delivered. The alternative -- a reader that skips such a
+record -- drops it in full, terminator included, so its bytes never reach the scan
+and cannot appear in what the scan counts as consumed. Any position cached past it
+is short of the record, and every later scan reads the records after it again and
+adds their mentions a second time, inflating the very count the fold breaks ties
+on. There is no trustworthy position to cache past a record the reader never saw,
+so the segment contributes nothing, the reading says incomplete, and the segment is
+not read again: the abort repeats identically, and the log is append-only, so
+nothing ahead of that record will ever be rewritten. The writer refuses to produce
+an over-cap record, so reaching this at all means the file was written by something
+else.
+
+The question "was this unit retired between the scans" is asked of the UNIT, never
+of its slot. A slot present in the lineage says only that SOME unit holds it now,
+and a slot is reused the moment a new session takes the vacancy, so a probe keyed
+on the slot skips exactly the retirement it is looking for whenever the vacancy was
+filled -- which in Crew Mode is the normal case rather than the exception.
+
+The window is applied on the way OUT and never while caching. A read position
+advances on the bytes CONSUMED, not on the records kept, so filtering while
+caching would step past a record without storing it and no later scan could
+recover it -- one windowed call would permanently hide those references from every
+unwindowed reader sharing the scanner, and report the result as complete.
+
+For the same reason there is NO per-call narrowing of which entry types are
+scanned. `since` needs no extra cache key, because a moment is already stored per
+reference, so it can be applied on the way out. An entry-type filter cannot: the
+cache stores a reference, not the type that produced it, so narrowing on the way
+out would need the cache keyed by type and triple what it retains, and narrowing
+the SCAN instead would poison the shared cache exactly as a cached window would.
+`TEXT_TYPES` is always what is read.
+
+A unit RETIRED between the two scans is the one race the flags above do not cover,
+because neither half faults. Its mention is captured by the reference scan while
+its lineage node is missed by the later one, and a mention with no node is the one
+shape that defeats the ancestor rule -- the candidate cannot be dropped as anyone's
+descendant, so a supervising conductor survives the filter and wins on recency.
+A missing node alone does not establish it, since the ordinary cause is a log with
+no `session/opened` record at all; what separates them is whether the unit is still
+there. So the probe is one existence check per mentioning slot that has no node,
+usually none at all. Reordering the two scans is not the fix it appears to be:
+taking the lineage first trades a retirement for a unit ADDED in the same window,
+which leaves the same shape, and a session appearing is constant while a retention
+deletion is rare.
+
+The cache is validated exactly as the tree's
+head cache is and for the same reasons: the store never rewrites a written line,
+so bytes already read are immutable while the segment exists, and `(st_dev,
+st_ino)` alone is not an identity because a filesystem hands a freed inode number
+to the next file it creates. A segment SHORTER than the position we read to is not
+the file we read, whatever its inode says. A frame with no terminator is the tail
+of an append in flight: it is neither parsed nor counted, so the next scan reads
+those bytes again once they are complete.
+
+The completeness a holder answer carries is BOTH scans': this section's references
+and section 6's lineage. The lineage half matters more here than anywhere else the
+tree is read. A lineage read that faulted drops one unit's creator record silently,
+so a conductor stops being recognised as its worker's ancestor, the ancestor rule
+stops dropping it, and the conductor -- which by recency almost always wins -- is
+reported as the holder. That is a confident WRONG owner rather than a missing one,
+and it is why the tree reports the completeness of its own scan
+(`SessionTree.reading`) rather than only its nodes. `snapshot` keeps returning the
+nodes alone for the pages that render lineage as decoration, where a missing edge
+reads as "no creator known" and costs nothing.
+
+**The readers.** Both are synchronous and blocking by construction: they list
+directories and read files. A caller on an event loop hands the scan to a worker
+thread. The scanner guards its own state with a lock, so nothing further is needed
+to share one instance between callers.
+
+## 9. Deliberately not here
+
+- **A savepoint that survives a segment rollover.** `origin` carries the newest
+  segment's inode, so a log that rolls over retires its savepoints once. No writer
+  creates a second segment today, and whoever adds one has to revisit `log_origin`
+  anyway -- the in-memory bundle reuses the same identity and has the same
+  weakness. The cost of leaving it is one cold fold per rollover.
+
+- **An app-facing grant for the holder projection.** A `permissions.prHolders`
+  key and an `AppContext` reach would be public app-kit schema: once released a
+  third-party manifest may declare it, so the payload shape is fixed from that
+  moment and a first consumer wanting a different one gets a version rather than a
+  fix. No in-tree consumer exists yet, so nothing would exercise the shape it
+  committed to. The grant lands with the first consumer that reads through it,
+  where the shape is answerable rather than guessed.
+- **A savepoint on disk for THIS fold.** Section 7's savepoints carry a fold's
+  state beside the log it came from; this scan's state is a per-segment read
+  position and reference set held in memory and keyed by session, which is
+  already the shape such a file would carry, so persistence stays additive.
 - **Crew-kind folds.** No crew writer exists.
 - **Subagent lineage and fork pointers.** A `subagent/spawned` entry's `ref` is
   resolved on the page like any other citation. The session tree (section 6)

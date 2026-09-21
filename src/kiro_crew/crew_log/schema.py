@@ -116,6 +116,16 @@ TYPE_OWNERSHIP: dict[str, frozenset[str]] = {
             # The session's own task list, a fold a reader builds rather than
             # reads.
             "plan",
+            # The session's durable work state. ``session_ledger_record`` appends
+            # one ``ledger/recorded`` entry per call and every reader folds those
+            # entries, so this domain is what makes the session ledger a
+            # projection of the crew log rather than a second document beside it.
+            "ledger",
+            # The observed state of an object OUTSIDE the session -- a pull request a
+            # probe watches on the session's behalf. Owned by the session because the
+            # observation is made for it and lands in its own history; the producer
+            # that made it is named on the entry, never inferred from prose.
+            "object",
             "write",
         }
     ),

@@ -1015,6 +1015,7 @@ _MANAGED_SERVER_SUBCOMMANDS = {
     "kirocrew-dashboard": "mcp-dashboard",
     "kirocrew-work": "mcp-work",
     "kirocrew-crew-log": "mcp-crew-log",
+    "kirocrew-panel": "mcp-panel",
 }
 _MANAGED_SERVER_NAMES = set(_MANAGED_SERVER_SUBCOMMANDS)
 
@@ -1028,6 +1029,7 @@ _MANAGED_SERVER_TOOL_MODULES = {
     "kirocrew-dashboard": "kiro_crew.mcp_dashboard",
     "kirocrew-work": "kiro_crew.mcp_work",
     "kirocrew-crew-log": "kiro_crew.mcp_crew_log",
+    "kirocrew-panel": "kiro_crew.mcp_panel",
 }
 
 
@@ -1060,6 +1062,7 @@ _MANAGED_SERVERS_CALLER_AWARE: frozenset[str] = frozenset(
         "kirocrew-dashboard",
         "kirocrew-work",
         "kirocrew-crew-log",
+        "kirocrew-panel",
     }
 )
 
@@ -1165,10 +1168,10 @@ def _fix_stale_managed_command(name: str, spec: dict) -> None:
     source of truth for the managed invocation. That handles every layout:
     a standalone ``bin/kirocrew`` (POSIX) / ``Scripts\\kirocrew.exe`` (Windows
     pip install) console script when one resolves, the Windows bundle's
-    ``bin\\kirocrew.cmd`` shim (unwrapped to ``<root>\\python.exe -P -s -m
-    kiro_crew <sub>``), and otherwise the ``<interpreter> [-s] -m kiro_crew
+    ``bin\\kirocrew.cmd`` shim (unwrapped to ``<root>\\python.exe -s -P -m
+    kiro_crew <sub>``), and otherwise the ``<interpreter> [-s] -P -m kiro_crew
     <sub>`` fallback. Both ``command`` AND ``args`` are rewritten — the fallback
-    needs its optional isolation prefix plus ``["-m", "kiro_crew", <sub>]``,
+    needs its optional isolation prefix plus ``["-P", "-m", "kiro_crew", <sub>]``,
     so re-resolving the command
     alone (the old behavior) silently dropped the args and spawned a bare
     ``kirocrew`` that isn't on PATH (Windows: ``command not found: kirocrew``;

@@ -604,6 +604,15 @@ Changes to any of them select the native macOS suite on each push without
 requiring a label or a sample hit. The lane remains advisory; a Linux simulation
 is not evidence of native APFS behavior.
 
+The native contracts in `test/test_darwin_native_provider_reap.py` and their
+`session_pid`, `session_lifecycle`, `session_cleanup`, and `session_pool` callers
+are explicit on-demand paths. They exercise real Darwin process identities,
+zombie-root reaping, reaped-root group recovery, escaped descendants, and three
+rounds each of idle expiry, pool-health TTL and claim-time TTL cleanup. Only the
+provider protocol and clock are simulated; every process belongs to the test,
+and fixture cleanup is independent of the production reaper. These are native
+regression tests, not a live-gateway soak or a before/after memory measurement.
+
 Details worth knowing:
 
 - **CodeBuild-hosted runner (pilot).** `cfn-lint` is the first job whose
@@ -1556,6 +1565,13 @@ screenshot, title, commit message or filename attempting to grant leniency is
 ignored, and screenshot polish never waives a lens). `screenshot-evidence.yml`, the
 gate that requires evidence on a UI diff, accepts the same URLs.
 
+A diff that changes an Electron-only surface -- the application menu, its
+accelerator captions, the window chrome -- cannot be photographed by any of the
+`website/scripts/capture-*.mjs` scripts, which all drive the web app in Chromium.
+`website/scripts/capture-electron-shell.mjs` shoots those surfaces by launching
+real Electron; the recipe is in
+[worktree verification recipes](../guides/worktree-verification-recipes.md).
+
 ### `UX Review` reads the screenshots blind before it reads the diff
 
 On same-repo PRs the lane is two model calls with a context wall between them.
@@ -2065,7 +2081,20 @@ Nothing the fork controls can influence these reviews:
   a data file), never built, installed or executed.
 - `step-security/harden-runner` with `egress-policy: block` and a narrow endpoint
   allowlist, plus short-lived Bedrock-only OIDC credentials, bound the blast radius
-  of any prompt injection.
+  of any prompt injection. That allowlist is coupled to the reviewer's own setup, not
+  just to the model call: `allowed_non_write_users` auto-enables the action's
+  bubblewrap isolation, which the action bootstraps over apt, so the ubuntu archive
+  hosts are load-bearing -- and it then installs the CLI itself over `claude.ai`
+  and `downloads.claude.ai`, so those are too. The two phases are sequential, so an
+  allowlist carrying only the first still never reaches the model: a green apt phase
+  is not evidence the bootstrap resolves. Remove either and the install exits before
+  any model call --
+  the blocking lane then goes red, and an **advisory** lane publishes `review
+  incomplete` as a *neutral* check, which is how three reviewers can stop reviewing
+  every fork PR without turning anything red (#12099). The endpoints for both that
+  bootstrap and the bun release asset are pinned by tests in
+  `test/test_ai_review_workflows.py`, because a `workflow_run` lane always executes
+  the default branch's yaml and so cannot exercise its own change pre-merge.
 
 **`fork-workflow-guard.yml`** blocks a fork PR that modifies anything under
 `.github/**`, the vector a fork would use to fake basic-CI results (rewrite `ci.yml`
