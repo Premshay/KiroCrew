@@ -23,6 +23,11 @@ reproducing tests, full-suite gates, compile/lint, benchmark measurements, and c
 The default is Gateway Python; an explicit interpreter or an operator-owned repository
 runner can be selected per repository. Branch switches keep the selection.
 
+Environment checks, calibration and run startup refresh the selected branch from
+the validated repository URL, without enabling the clone's remotes. A failed fetch,
+uncommitted files, or unpublished/divergent local commits stop preparation instead
+of silently testing stale code or discarding work. Saved findings remain untouched.
+
 Readiness runs after checkout and isolation checks, before agent creation/discovery:
 the interpreter must start, pytest must import, and baseline collection must exit
 successfully with at least one test. Calibration and direct profile discovery use

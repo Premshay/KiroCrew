@@ -390,7 +390,9 @@ async def _handle_environment_check(request: web.Request) -> web.StreamResponse:
                 ):
                     raise ValueError("repository isolation failed — re-run repository setup")
                 stage = "checkout"
-                ok, note = clone_setup.checkout_branch(root, str(config.get("branch") or "main"))
+                ok, note = clone_setup.checkout_branch(
+                    root, str(config.get("branch") or "main"), config=config
+                )
                 if not ok:
                     raise ValueError(f"could not check out the selected branch: {note}")
                 stage = "profile"

@@ -1636,7 +1636,7 @@ class TestCheckoutPrecedesProfileBuild:
 
         order: list[str] = []
 
-        def _checkout(path, branch):
+        def _checkout(path, branch, **kwargs):
             order.append("checkout")
             return True, "ok"
 
@@ -1664,7 +1664,7 @@ class TestCheckoutPrecedesProfileBuild:
         from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
         from kiro_crew.apps.builtins.auto_improvement.backend.runner import RunSupervisor
 
-        monkeypatch.setattr(clone_setup, "checkout_branch", lambda p, b: (False, "no such ref"))
+        monkeypatch.setattr(clone_setup, "checkout_branch", lambda p, b, **kw: (False, "no such ref"))
         # UNSCOPED must now refuse too.
         with pytest.raises(RuntimeError, match="wrong revision"):
             RunSupervisor()._build_driver({"clone": str(tmp_path), "branch": "feat/x"})
