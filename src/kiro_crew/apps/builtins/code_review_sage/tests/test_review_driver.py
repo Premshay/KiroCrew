@@ -1,4 +1,5 @@
 """Unit tests for the code-enforced two-stage review driver (gap A + phase switch)."""
+import json
 import re
 import shutil
 import sys
@@ -413,6 +414,38 @@ class TestReviewDriver(unittest.TestCase):
         self.assertIn("DESIGN dimension", task)
         self.assertIn("spawn further subagents", task)
         self.assertIn("github.com/o/r/pull/7", task)
+
+    def test_review_task_carries_the_exact_result_envelope(self):
+        # The adoption path validates the envelope against the values the driver
+        # itself derives, so the prompt must embed them as exact literals — not
+        # ask the model to re-derive them.
+        link = "https://github.com/o/r/pull/7"
+        task = D.build_review_task(link)
+        self.assertIn("top-level envelope", task)
+        literal = re.search(r"copied EXACTLY as `([^`]+)`", task).group(1)
+        envelope = json.loads(literal)
+        self.assertEqual(
+            envelope,
+            {
+                "schema": "code-review-sage-result",
+                "version": 1,
+                "change_id": "GH-o-r-7",
+                "platform": "github",
+                "repo_identity": "github.com/o/r",
+            },
+        )
+
+    def test_legacy_token_gets_an_honest_envelope(self):
+        task = D.build_review_task("CR-1")
+        self.assertIn('"change_id": "CR-1"', task)
+        self.assertIn('"repo_identity": "unknown/unknown/unknown"', task)
+        self.assertIn('"platform": "github"', task)
+
+    def test_followup_prompt_preserves_the_envelope(self):
+        followup = D.build_review_followup_task("https://github.com/o/r/pull/7")
+        self.assertIn("top-level envelope keys", followup)
+        self.assertIn("`schema`", followup)
+        self.assertIn("`repo_identity`", followup)
 
     def test_review_task_has_inline_learning(self):
         task = D.build_review_task("CR-8")

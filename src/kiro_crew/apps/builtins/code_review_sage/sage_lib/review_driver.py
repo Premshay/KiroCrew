@@ -245,6 +245,37 @@ def reviewed_key_for(link: str) -> str:
         return results.safe_change_id(link)
 
 
+def _result_envelope(link: str) -> dict:
+    """Top-level envelope keys the result contract requires (``schema``,
+    ``version``, ``change_id``, ``platform``, ``repo_identity``), carrying the
+    EXACT values the driver itself derives on the adoption path.
+
+    The review prompt hands these literals to the worker to copy verbatim, and
+    ``adopt_from_shared`` validates the envelope (``validate_result``) and
+    matches ``change_id`` byte-exact against ``_cid``, so the literal must equal
+    the driver's own derivation. The envelope is dispatch metadata, not review
+    content: it must never come from the model's own reasoning — a missing or
+    drifted key is what left a completed review unadoptable ("review produced no
+    result record").
+    """
+    try:
+        host, owner, repository, _number = pipeline.adapters.github_pr_ref(link)
+    except pipeline.adapters.AdapterError:  # pragma: no cover - bad link
+        host = owner = repository = ""
+    repo_identity = (
+        f"{host}/{owner}/{repository}"
+        if host and owner and repository
+        else "unknown/unknown/unknown"
+    )
+    return {
+        "schema": "code-review-sage-result",
+        "version": 1,
+        "change_id": _cid(link),
+        "platform": "github",
+        "repo_identity": repo_identity,
+    }
+
+
 def _confirmed_host(link: str) -> str:
     """The link's validated GitHub host, or ``""`` for a bare legacy change
     token that names no host at all.
@@ -395,12 +426,14 @@ def _accepts_activity(dispatch: Callable[..., Any]) -> bool:
 def build_review_task(change_link: str) -> str:
     """Single-pass review prompt: ONE isolated session does the WHOLE review —
     design reasoning AND every code-level dimension — in a single turn, and writes
-    the complete result record (phase1 design fields + findings + counts +
-    ship_summary + a coverage signal). Design is one dimension of the review, not a
-    separate gated stage; the driver runs neither a gate turn nor a convergence
-    loop. The session RECORDS findings only — it never posts (the driver builds the
-    Python-redacted bodies and a separate poster publishes them verbatim)."""
+    the complete result record (the dispatch envelope + phase1 design fields +
+    findings + counts + ship_summary + a coverage signal). Design is one dimension
+    of the review, not a separate gated stage; the driver runs neither a gate turn
+    nor a convergence loop. The session RECORDS findings only — it never posts (the
+    driver builds the Python-redacted bodies and a separate poster publishes them
+    verbatim)."""
     py = python_command()
+    envelope_json = json.dumps(_result_envelope(change_link), sort_keys=True)
     return (
         "You are a Code Review Sage reviewer running in an ISOLATED, CLEAN session. "
         "Do the COMPLETE review of EXACTLY ONE change in a SINGLE thorough pass: "
@@ -445,7 +478,11 @@ def build_review_task(change_link: str) -> str:
         "every changed file — otherwise set it false (the driver will run ONE "
         "targeted follow-up on the remainder). Do not pad the list; report honestly.\n"
         "  7. RECORD ONLY — do NOT post any comments. Write data/results/<id>.json: "
-        "phase1 (gate_verdict, design_risk, criticality, design_headline, problem, "
+        "first the top-level envelope, copied EXACTLY as `"
+        + envelope_json
+        + "` — do not re-derive, reorder, rename, or omit any key (the driver "
+        "adopts the record only when these match its own values byte-for-byte); "
+        "then phase1 (gate_verdict, design_risk, criticality, design_headline, problem, "
         "why_it_matters, solution_assessment) + blast_radius; `findings` (each with "
         "file, line, severity 🔴/🟡, dimension, headline, observation, consequence, "
         "suggestion, snippet, lang); `counts` {red,yellow}; `ship_summary` (ONE straightforward "
@@ -503,7 +540,9 @@ def build_review_followup_task(change_link: str) -> str:
         "{red,yellow} over "
         "the FULL list; refresh `ship_summary`; extend `files_covered` to include "
         "every changed file and set `coverage_complete=true`; keep deep_reviewed=true "
-        "and PRESERVE the phase1 block. You MUST NOT call any comment tool.\n"
+         "and PRESERVE the phase1 block AND the top-level envelope keys (`schema`, "
+         "`version`, `change_id`, `platform`, `repo_identity`) exactly as the first "
+         "pass recorded them. You MUST NOT call any comment tool.\n"
         "Do NOT spawn further subagents. Execute; do not ask questions."
     )
 
