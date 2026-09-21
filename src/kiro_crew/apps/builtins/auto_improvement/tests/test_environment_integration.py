@@ -88,7 +88,8 @@ def test_supervisor_checks_after_checkout_before_agent(tmp_path, monkeypatch):
     for name in ("_repository_is_safe", "_push_disabled"):
         monkeypatch.setattr(runner.clone_setup, name, lambda path: True)
 
-    def checkout(*args):
+    def checkout(*args, config):
+        assert config["clone"] == str(tmp_path)
         events.append("checkout")
         return True, "ready"
 
@@ -243,7 +244,8 @@ async def test_check_uses_selected_environment_without_saving(tmp_path, monkeypa
     monkeypatch.setattr(routes.clone_setup, "_repository_is_safe", lambda path: True)
     monkeypatch.setattr(routes.clone_setup, "_push_disabled", lambda path: True)
 
-    def checkout(path, branch):
+    def checkout(path, branch, *, config):
+        assert config["branch"] == branch
         events.append(branch)
         return True, "ready"
 

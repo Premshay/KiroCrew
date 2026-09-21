@@ -591,7 +591,7 @@ class RunSupervisor:
             # requested — there, a failed checkout would compute the scope against the
             # wrong HEAD, and silently running unscoped is the outcome the operator was
             # trying to avoid by setting it.
-            ok, note = clone_setup.checkout_branch(clone_path, branch)
+            ok, note = clone_setup.checkout_branch(clone_path, branch, config=config)
             if not ok:
                 # RAISE on any failed checkout, not only when scopeDiffBase is set.
                 # `checkout_branch` already tries the remote-tracking ref AND a local ref
@@ -857,7 +857,7 @@ class RunSupervisor:
                         Path(clone_dir)
                     ) or not clone_setup._push_disabled(Path(clone_dir)):
                         raise PermissionError("refusing to calibrate: repository isolation failed")
-                    ok, note = clone_setup.checkout_branch(Path(clone_dir), branch)
+                    ok, note = clone_setup.checkout_branch(Path(clone_dir), branch, config=config)
                     if not ok:
                         # RAISE rather than calibrate against an arbitrary HEAD: a ruler proven
                         # on the wrong branch's code is misleading, and `checkout_branch` only

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -64,6 +66,61 @@ def _setup(bare: Path, root: Path) -> tuple[dict, str]:
         return clone_setup.setup_safe_clone("https://github.com/o/r", root)
 
 
+@pytest.mark.parametrize("obstacle", ["", "dirty", "untracked", "ahead", "offline", "invalid"])
+@pytest.mark.parametrize("local_path", [False, True])
+def test_refresh_same_branch_preserves_work_and_disabled_remotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, obstacle: str, local_path: bool
+) -> None:
+    bare = _seeded_bare(tmp_path)
+    result, error = _setup(bare, tmp_path / "root")
+    assert not error, result
+    clone = tmp_path / "root" / "o--r"
+
+    def git(root: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.test", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        ).stdout.strip()
+
+    old = git(clone, "rev-parse", "HEAD")
+    seed = tmp_path / "seed"
+    (seed / "f.txt").write_text("updated\n", encoding="utf-8")
+    git(seed, "commit", "-am", "advance remote")
+    git(seed, "push", "origin", "HEAD:main")
+    latest = git(seed, "rev-parse", "HEAD")
+    if obstacle == "dirty":
+        (clone / "f.txt").write_text("local edit", encoding="utf-8")
+    if obstacle == "untracked":
+        (clone / "untracked.txt").write_text("keep", encoding="utf-8")
+    if obstacle == "ahead":
+        (clone / "local.txt").write_text("unpublished", encoding="utf-8")
+        git(clone, "add", "local.txt")
+        git(clone, "commit", "-m", "local only")
+        old = git(clone, "rev-parse", "HEAD")
+    source = tmp_path / "missing.git" if obstacle == "offline" else bare
+    remote = str(source) if local_path else source.as_uri()
+    monkeypatch.setattr(
+        clone_setup, "resolve_origin_url", lambda config: "" if obstacle == "invalid" else remote
+    )
+    ok, note = clone_setup.checkout_branch(
+        clone, "origin/main", config={"target_url": "https://github.com/o/r"}
+    )
+    assert ok is (not obstacle), note
+    assert git(clone, "rev-parse", "HEAD") == (old if obstacle else latest)
+    assert clone_setup._origin_urls(clone, push=False) == [DISABLED_NO_PUSH]
+    assert clone_setup._origin_urls(clone, push=True) == [DISABLED_NO_PUSH]
+    if obstacle == "dirty":
+        assert (clone / "f.txt").read_text(encoding="utf-8") == "local edit"
+    if obstacle == "untracked":
+        assert (clone / "untracked.txt").read_text(encoding="utf-8") == "keep"
+    if obstacle == "ahead":
+        assert (clone / "local.txt").read_text(encoding="utf-8") == "unpublished"
+
+
 def test_second_setup_reuses_the_neutralized_clone(tmp_path: Path) -> None:
     bare = _seeded_bare(tmp_path)
     root = tmp_path / "root"
@@ -77,6 +134,68 @@ def test_second_setup_reuses_the_neutralized_clone(tmp_path: Path) -> None:
     clone = root / "o--r"
     assert clone_setup._origin_urls(clone, push=False) == [DISABLED_NO_PUSH]
     assert clone_setup._origin_urls(clone, push=True) == [DISABLED_NO_PUSH]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Git maintenance hook uses POSIX shell quoting")
+def test_refresh_cannot_run_repository_maintenance_hook(tmp_path, monkeypatch):
+    bare = _seeded_bare(tmp_path)
+    result, error = _setup(bare, tmp_path / "root")
+    assert not error, result
+    clone = tmp_path / "root" / "o--r"
+    run = subprocess.run
+
+    def git(*args, **kwargs):
+        return run(
+            [
+                "git",
+                "-C",
+                str(clone),
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.test",
+                *args,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            **kwargs,
+        ).stdout.strip()
+
+    git("repack", "-ad")
+    (clone / "local.txt").write_text("unpublished", encoding="utf-8")
+    git("add", "local.txt")
+    git("commit", "-m", "local")
+    git("repack", "-d")
+    assert len(list((clone / ".git" / "objects" / "pack").glob("*.pack"))) >= 2
+    obj = git("hash-object", "-w", "--stdin", input="unreachable")
+    os.utime(clone / ".git" / "objects" / obj[:2] / obj[2:], (1, 1))
+    marker = tmp_path / "maintenance-ran"
+    script = f"from pathlib import Path; Path({str(marker)!r}).write_text('executed')"
+    git("config", "gc.recentObjectsHook", f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}")
+    git("config", "gc.autoPackLimit", "1")
+    git("config", "gc.autoDetach", "false")
+    monkeypatch.setattr(clone_setup, "resolve_origin_url", lambda config: bare.as_uri())
+
+    ok, note = clone_setup.checkout_branch(clone, "main", config={})
+    assert not ok and "unpublished" in note
+    assert not marker.exists()
+
+    # The control reaches the same fetch with suppression removed: prove the hook is live.
+    def without_suppression(args, **kwargs):
+        if "fetch" in args:
+            args = [
+                arg
+                for arg in args
+                if arg not in ("--no-auto-maintenance", "--no-write-commit-graph")
+            ]
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(clone_setup.subprocess, "run", without_suppression)
+    clone_setup.checkout_branch(clone, "main", config={})
+    assert marker.read_text(encoding="utf-8") == "executed"
 
 
 def test_clone_start_failure_returns_controlled_error_without_cleanup(tmp_path: Path) -> None:

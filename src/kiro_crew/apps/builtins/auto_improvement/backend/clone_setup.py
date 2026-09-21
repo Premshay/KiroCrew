@@ -1105,7 +1105,9 @@ def _disable_push(repo: Path) -> None:
         )
 
 
-def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[bool, str]:
+def checkout_branch(
+    clone: Path, branch: str, *, timeout_s: int = 120, config: dict | None = None
+) -> tuple[bool, str]:
     """Put the clone's working tree on ``branch`` before a run reads its HEAD.
 
     A fresh clone sits on the repo's DEFAULT branch (usually ``main``). The run,
@@ -1119,7 +1121,11 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
     ``branch`` may be given as ``origin/x`` or bare ``x`` (the config stores the
     former); both resolve to the same local branch tracking ``origin/x``.
 
-    Fail-soft: if the fetch fails (offline) but a local ref already exists, check
+    With ``config``, refresh from its validated URL even when already on the branch.
+    Refuse stale fallback and preserve uncommitted work or divergent local commits.
+    Without ``config``, this is an explicitly offline branch-selection helper.
+
+    Offline mode: if the fetch fails but a local ref already exists, check
     that out rather than aborting the run; only a branch we can locate NOWHERE is a
     hard error. Push stays disabled throughout — this never contacts the push URL.
     """
@@ -1136,7 +1142,9 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
     if not disabled:
         return False, "clone is not push-disabled"
 
-    def _run(*args: str, tmo: int = timeout_s) -> subprocess.CompletedProcess:
+    def _run(
+        *args: str, tmo: int = timeout_s, network_protocol: str = ""
+    ) -> subprocess.CompletedProcess:
         # Harden every host-side git over this clone: `checkout -B` below runs `post-checkout`
         # hooks and `git` consults `core.fsmonitor`, and this clone may already hold a tree a
         # prior agent pass edited — a repo-planted hook/fsmonitor program would execute
@@ -1160,11 +1168,66 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
             capture_output=True,
             timeout=tmo,
             shell=False,
-            env=_git_env(),
+            env=_git_env(network_protocol=network_protocol),
             **UTF8_TEXT,
         )
 
-    # Already there? Nothing to do — avoids a needless network fetch every run.
+    if config is not None:
+        from ..profiles.github_repo.pr_recipe import _prefer_authenticated_remote
+
+        remote = resolve_origin_url(config)
+        if not remote:
+            return False, "no validated repository URL configured — re-run repository setup"
+        remote = _prefer_authenticated_remote(remote)
+        protocol = "ssh" if remote.startswith("git@") else (urlparse(remote).scheme or "file")
+        base_ref = "refs/auto-improvement/run-base"
+        try:
+            status = _run("status", "--porcelain", "--untracked-files=all")
+            if status.returncode or status.stdout.strip():
+                return (
+                    False,
+                    "repository has uncommitted files or cannot be inspected; refresh refused",
+                )
+            fetched = _run(
+                "-c",
+                "credential.helper=!gh auth git-credential",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-auto-maintenance",
+                "--no-write-commit-graph",
+                remote,
+                f"+refs/heads/{bare}:{base_ref}",
+                network_protocol=protocol,
+            )
+            if fetched.returncode:
+                return (
+                    False,
+                    f"could not refresh {bare}: {redact_via_context(fetched.stderr or '')[:160]}",
+                )
+            local_ref = f"refs/heads/{bare}"
+            exists = _run("show-ref", "--verify", "--quiet", local_ref)
+            if exists.returncode not in (0, 1):
+                return False, f"could not inspect local branch {bare}"
+            if exists.returncode == 0:
+                ancestor = _run("merge-base", "--is-ancestor", local_ref, base_ref)
+                if ancestor.returncode:
+                    return (
+                        False,
+                        f"local branch {bare} has unpublished or divergent commits; refresh refused",
+                    )
+            checkout = _run("checkout", "--no-overwrite-ignore", "-B", bare, base_ref)
+            if checkout.returncode:
+                return (
+                    False,
+                    f"could not check out {bare}: {redact_via_context(checkout.stderr or '')[:160]}",
+                )
+            return True, f"refreshed {bare} from the configured repository"
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"repository refresh failed: {redact_via_context(str(exc))[:160]}"
+
+    # Offline callers may explicitly select an already-cloned revision without config.
     cur = _run("rev-parse", "--abbrev-ref", "HEAD", tmo=30)
     if (cur.stdout or "").strip() == bare:
         return True, f"already on {bare}"

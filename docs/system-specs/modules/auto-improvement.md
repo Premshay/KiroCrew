@@ -1379,6 +1379,14 @@ end `no_defect` — an honest "no defect" is a pass; a *fabricated* fix is a fai
 
 ## Repository test environments
 
+Before an environment check, calibration, or run, the app refreshes the selected
+branch using the validated URL in operator configuration. Fetch and push URLs in
+the agent-writable clone remain disabled. Fetch failures stop preparation; a cached
+branch is not silently substituted. Uncommitted files and local commits absent from
+the fetched branch block checkout rather than being overwritten. This preparation
+does not modify saved findings or queued patches. The config-free checkout helper
+retains offline branch selection for callers that explicitly need cached refs.
+
 `testEnvironment.kind` is `gateway` (default), `python`, or `runner`. Python mode
 requires an absolute `pythonExecutable`; runner mode defaults it to `python` and
 requires an absolute `runnerExecutable`. Non-secret `variables` are shared by every

@@ -88,7 +88,7 @@ async def test_environment_check_carries_app_identity(monkeypatch):
     monkeypatch.setattr(store, "read_json", lambda *args: {"clone": "fixture", "app": "forged"})
     monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda root: True)
     monkeypatch.setattr(clone_setup, "_push_disabled", lambda root: True)
-    monkeypatch.setattr(clone_setup, "checkout_branch", lambda *args: (True, ""))
+    monkeypatch.setattr(clone_setup, "checkout_branch", lambda *args, **kwargs: (True, ""))
 
     def check():
         seen.append(current_app_execution())
