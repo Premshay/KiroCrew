@@ -25,6 +25,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -160,7 +161,10 @@ def supervisor() -> R.RunSupervisor:
 # ── refusals ────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.skipif(not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(), reason="requires unprivileged user namespaces (sandbox backend)")
+@pytest.mark.skipif(
+    not __import__("kiro_crew.sandbox", fromlist=["userns_available"]).userns_available(),
+    reason="requires unprivileged user namespaces (sandbox backend)",
+)
 class TestStartRefusals:
     def test_refuses_without_a_configured_repository(self, supervisor: R.RunSupervisor) -> None:
         with pytest.raises(ValueError, match="no repository configured"):
@@ -611,7 +615,10 @@ class TestSingleton:
 # ── end to end, with a fake agent ───────────────────────────────────────────
 
 
-@pytest.mark.skipif(not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(), reason="requires unprivileged user namespaces (sandbox backend)")
+@pytest.mark.skipif(
+    not __import__("kiro_crew.sandbox", fromlist=["userns_available"]).userns_available(),
+    reason="requires unprivileged user namespaces (sandbox backend)",
+)
 class TestBoundedRunWithFakeAgent:
     """One real spine cycle, bounded, with the agent runner INJECTED as a fake."""
 
@@ -751,6 +758,8 @@ class TestCalibrationWritesToTheLaunchedWorkspace:
             noise_floor = 0.0
 
         class _Profile:
+            isolation = SimpleNamespace(push_disabled=lambda: True)
+            require_environment = staticmethod(lambda: None)
             ruler = _Ruler()
             calibration = _Cal()
 
@@ -810,6 +819,9 @@ class TestCalibrationRespondsToStop:
             noise_floor = 0.0
 
         class _Profile:
+            isolation = SimpleNamespace(push_disabled=lambda: True)
+            require_environment = staticmethod(lambda: None)
+
             def __init__(self) -> None:
                 self.ruler = ruler
                 self.calibration = _Cal()
@@ -997,13 +1009,7 @@ class TestCalibrationRespondsToStop:
         stopper.join(timeout=10.0)
         _join_calibration(supervisor)
 
-        ruler_path = (
-            store.data_dir()
-            / "repos"
-            / store.workspace_key(cfg)
-            / "ruler"
-            / "ruler.json"
-        )
+        ruler_path = store.data_dir() / "repos" / store.workspace_key(cfg) / "ruler" / "ruler.json"
         assert not ruler_path.is_file(), "a stopped calibration wrote a ruler.json"
 
     def test_stopping_a_recalibration_preserves_the_prior_ruler(
@@ -1022,13 +1028,7 @@ class TestCalibrationRespondsToStop:
         # reads the live-config workspace) inspects the ruler this test seeds.
         (store.data_dir() / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
 
-        ruler_path = (
-            store.data_dir()
-            / "repos"
-            / store.workspace_key(cfg)
-            / "ruler"
-            / "ruler.json"
-        )
+        ruler_path = store.data_dir() / "repos" / store.workspace_key(cfg) / "ruler" / "ruler.json"
         ruler_path.parent.mkdir(parents=True, exist_ok=True)
         # A prior, fully-proven ruler from an earlier calibration.
         prior = {"status": "calibrated"}
@@ -1058,9 +1058,9 @@ class TestCalibrationRespondsToStop:
         _join_calibration(supervisor)
 
         assert ruler_path.is_file(), "the prior ruler.json was destroyed by a stopped recalibration"
-        assert json.loads(ruler_path.read_text(encoding="utf-8")) == prior, (
-            "the prior ruler was mutated by a stopped recalibration"
-        )
-        assert progress_mod.ruler_calibrated() is True, (
-            "the workspace stopped reporting calibrated after a stopped recalibration"
-        )
+        assert (
+            json.loads(ruler_path.read_text(encoding="utf-8")) == prior
+        ), "the prior ruler was mutated by a stopped recalibration"
+        assert (
+            progress_mod.ruler_calibrated() is True
+        ), "the workspace stopped reporting calibrated after a stopped recalibration"

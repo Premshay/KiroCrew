@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.platform.app_execution import authenticated_app_execution
 from kiro_crew.security import redact
 
 from ..profiles.github_repo.pr_recipe import GitHubPRRecipe
@@ -67,6 +68,7 @@ _CONFIG_WRITABLE = frozenset(
         "directCommit",
         "measureReps",
         "calibrationReps",
+        "testEnvironment",
         "bandCapMs",
         "forceBugSeeds",
         "autoDraftPr",
@@ -294,6 +296,13 @@ async def _handle_get_config(_request: web.Request) -> web.StreamResponse:
 async def _handle_put_config(request: web.Request) -> web.StreamResponse:
     patch = await _json_body(request)
     rejected = sorted(set(patch) - _CONFIG_WRITABLE)
+    if "testEnvironment" in patch:
+        from ..profiles.github_repo.environment import normalize_test_environment
+
+        try:
+            patch["testEnvironment"] = normalize_test_environment(patch["testEnvironment"])
+        except ValueError as exc:
+            return web.json_response({"code": "invalid_config", "error": str(exc)}, status=400)
 
     # Refuse while a run is live: `branch` is WRITABLE and `store.workspace_key()` reads config
     # FRESH, keying on `target_url` + `branch` — so a mid-run edit moves the whole artifact set
@@ -318,10 +327,14 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
                 return None
             current = store.read_json(store.config_path(), {}) or {}
             current.update({k: v for k, v in patch.items() if k in _CONFIG_WRITABLE})
+            store.remember_test_environment(current)
             store.write_json_atomic(store.config_path(), current)
             return current
 
-    config = await asyncio.to_thread(_apply)
+    try:
+        config = await asyncio.to_thread(_apply)
+    except ValueError as exc:
+        return web.json_response({"code": "invalid_config", "error": str(exc)}, status=400)
     if config is None:
         return web.json_response(
             {
@@ -335,6 +348,76 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
 
 
 # ── repository setup (choose the repo a run works on) ────────────────────────
+
+
+@authenticated_app_execution(store.APP_NAME)
+async def _handle_environment_check(request: web.Request) -> web.StreamResponse:
+    patch = await _json_body(request)
+    from ..profiles import build_profile
+    from ..profiles.github_repo.environment import normalize_test_environment
+
+    try:
+        selection = (
+            normalize_test_environment(patch["testEnvironment"])
+            if "testEnvironment" in patch
+            else None
+        )
+    except ValueError as exc:
+        return web.json_response({"code": "invalid_config", "error": str(exc)}, status=400)
+    if busy := await _refuse_while_running("checking the test environment uses the clone."):
+        return busy
+
+    def check():
+        from kiro_crew.platform.context import redact_via_context
+
+        with commit_mod.clone_lock():
+            if _run_is_active():
+                return None
+            config = store.read_json(store.config_path(), {}) or {}
+            if selection is not None:
+                config["testEnvironment"] = selection
+            environment = config.get("testEnvironment") or {"kind": "gateway"}
+            stage = "configuration"
+            try:
+                environment = normalize_test_environment(environment)
+                clone = str(config.get("clone") or "").strip()
+                if not clone:
+                    raise ValueError("no repository configured — run setup-clone first")
+                root = Path(clone)
+                stage = "isolation"
+                if not clone_setup._repository_is_safe(root) or not clone_setup._push_disabled(
+                    root
+                ):
+                    raise ValueError("repository isolation failed — re-run repository setup")
+                stage = "checkout"
+                ok, note = clone_setup.checkout_branch(root, str(config.get("branch") or "main"))
+                if not ok:
+                    raise ValueError(f"could not check out the selected branch: {note}")
+                stage = "profile"
+                profile = build_profile(config)
+                environment = profile.environment.identity
+                if not profile.isolation.push_disabled():
+                    raise ValueError("repository isolation failed — re-run repository setup")
+                return profile.check_environment()
+            except (ValueError, OSError, RuntimeError) as exc:
+                return {
+                    "ok": False,
+                    "environment": environment,
+                    "diagnostic": {
+                        "stage": stage,
+                        "returncode": None,
+                        "stdout": "",
+                        "stderr": redact_via_context(str(exc))[:4000],
+                    },
+                }
+
+    result = await asyncio.to_thread(check)
+    if result is None:
+        return web.json_response(
+            {"code": "run_in_progress", "error": "a run started while the check was waiting"},
+            status=409,
+        )
+    return web.json_response(result)
 
 
 async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
@@ -367,6 +450,7 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
     # visible instead of scope-dependent.
     def _persist(result: dict) -> dict[str, Any]:
         current = store.read_json(store.config_path(), {}) or {}
+        store.remember_test_environment(current)
         retargeted = str(current.get("target_url") or "") != url
         current["clone"] = result["clone"]
         current["target_url"] = url
@@ -377,6 +461,7 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
         # this setup path.
         current["origin_url"] = str(result.get("origin_url") or "")
         current["target_display"] = result["display"]
+        store.restore_test_environment(current)
         if retargeted:
             # A branch belongs to the repo it came from. Carrying it across a retarget
             # leaves config naming a branch that does not exist in the NEW clone — the
@@ -474,7 +559,10 @@ async def _handle_pr_status(request: web.Request) -> web.StreamResponse:
     if status.get("ok"):
         return web.json_response(status, status=200)
     return web.json_response(
-        {"code": "pr_status_unavailable", "error": _redact_for_display(str(status.get("error") or ""))},
+        {
+            "code": "pr_status_unavailable",
+            "error": _redact_for_display(str(status.get("error") or "")),
+        },
         status=502,
     )
 
@@ -1237,6 +1325,7 @@ async def _handle_purge_dead(request: web.Request) -> web.StreamResponse:
     return web.json_response(result)
 
 
+@authenticated_app_execution(store.APP_NAME)
 async def _handle_calibrate(_request: web.Request) -> web.StreamResponse:
     """Run Phase 1 — prove the ruler — before any improvement cycle.
 
@@ -1366,6 +1455,7 @@ async def _handle_health(_request: web.Request) -> web.StreamResponse:
 # ── the run engine (start / status / stop) ───────────────────────────────────
 
 
+@authenticated_app_execution(store.APP_NAME)
 async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
     """Start a run from the config ON DISK.
 
@@ -1391,9 +1481,7 @@ async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
         # sandbox-launcher failure, not a config/state conflict — a distinct
         # `code` so a UI branching on it does not render the misleading
         # push-isolation guidance. The message is the actionable part.
-        return web.json_response(
-            {"code": "sandbox_launcher_failed", "error": str(exc)}, status=409
-        )
+        return web.json_response({"code": "sandbox_launcher_failed", "error": str(exc)}, status=409)
     except (RuntimeError, ValueError, PermissionError) as exc:
         # Already running / no repository configured / push not disabled — all three are
         # "the request conflicts with current state", all three are user-fixable, and the
@@ -1436,6 +1524,7 @@ def register_routes(app: web.Application) -> None:
     add("GET", f"{_PREFIX}/health", _require_enabled(_handle_health))
     add("GET", f"{_PREFIX}/config", _require_enabled(_handle_get_config))
     add("PUT", f"{_PREFIX}/config", _require_enabled(_handle_put_config))
+    add("POST", f"{_PREFIX}/environment/check", _require_enabled(_handle_environment_check))
     add("POST", f"{_PREFIX}/setup-clone", _require_enabled(_handle_setup_clone))
     add("GET", f"{_PREFIX}/branches", _require_enabled(_handle_branches))
     add("GET", f"{_PREFIX}/pr-status", _require_enabled(_handle_pr_status))

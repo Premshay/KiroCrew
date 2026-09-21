@@ -82,7 +82,10 @@ export const CHUNK_BUDGETS = {
   // lazy import() boundary can move a catalog string out of `all`, which is why
   // shrinking is not an option here. Back to the 5% convention over the
   // measurement that includes this branch (11,930,130 B).
-  all: 12240 * KB, // measured 11650.5 KB on fix/gatewayd-overload-liveness 2026-09-16 (5.1% headroom)
+  // Repository test-environment labels add 18,100 B across the shipped catalogs.
+  // The 2026-09-21 build measures 12,535,962 B; restore the documented 5%
+  // headroom for translated copy without changing other chunk limits.
+  all: 12855 * KB,
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because

@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from kiro_crew.platform.app_execution import capture_app_execution
+
 from . import clone_setup, store
 
 logger = logging.getLogger(__name__)
@@ -620,6 +622,10 @@ class RunSupervisor:
                 "refusing to start: the clone's push is not disabled — re-run repository setup"
             )
 
+        readiness = getattr(profile, "require_environment", None)
+        if callable(readiness):
+            readiness()
+
         caps = BudgetCaps(
             max_cycles=_pos_int(config.get("maxCycles"), DEFAULT_MAX_CYCLES),
             max_hours=_pos_float(config.get("maxHours"), DEFAULT_MAX_HOURS),
@@ -750,7 +756,7 @@ class RunSupervisor:
                     }
                 )
             thread = threading.Thread(
-                target=self._run_loop,
+                target=capture_app_execution(self._run_loop),
                 args=(driver,),
                 name=f"auto-improvement-{run_id}",
                 daemon=True,  # never block gateway shutdown on a long measurement
@@ -795,7 +801,7 @@ class RunSupervisor:
                 {"t": time.time(), "note": f"calibration {run_id} starting"}
             )
             thread = threading.Thread(
-                target=self._calibrate_loop,
+                target=capture_app_execution(self._calibrate_loop),
                 args=(dict(config or {}),),
                 name=f"auto-improvement-{run_id}",
                 daemon=True,
@@ -847,6 +853,10 @@ class RunSupervisor:
                 clone_dir = str(config.get("clone") or "").strip()
                 branch = str(config.get("branch") or "").strip() or "main"
                 if clone_dir:
+                    if not clone_setup._repository_is_safe(
+                        Path(clone_dir)
+                    ) or not clone_setup._push_disabled(Path(clone_dir)):
+                        raise PermissionError("refusing to calibrate: repository isolation failed")
                     ok, note = clone_setup.checkout_branch(Path(clone_dir), branch)
                     if not ok:
                         # RAISE rather than calibrate against an arbitrary HEAD: a ruler proven
@@ -859,6 +869,11 @@ class RunSupervisor:
                         )
 
                 profile = build_profile(config)
+                if not profile.isolation.push_disabled():
+                    raise PermissionError("refusing to calibrate: repository isolation failed")
+                readiness = getattr(profile, "require_environment", None)
+                if callable(readiness):
+                    readiness()
                 # Duck-wire the supervisor's stop flag onto the ruler so a Stop click
                 # can interrupt calibration between measurement reps, exactly as the
                 # driver does for the Phase-1 preflight path (`Driver._preflight`).

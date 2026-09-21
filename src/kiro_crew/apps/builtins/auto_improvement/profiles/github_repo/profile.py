@@ -14,12 +14,10 @@ seam fields of :mod:`...spine.profile` for a target that is *just a git repo*:
 
 ## Why a repo target is the *easy* case for four of the six fields
 
-A repo has no runtime to boot, no container split, no bind mounts, and no frozen
-component tree: a fresh ``pytest`` process IS the measurement. So ``single_environment``
-is True (build and measure are co-located — the spine skips its cross-environment
-sha assertion), ``frozen_components`` is empty, and ``measurement_boot()`` is a
-documented no-op. Those are honest answers to the protocol, not stubs: see each
-member's docstring for why the degenerate answer is the *correct* one here.
+Build and measurement share the selected environment, so ``single_environment``
+is True and ``frozen_components`` is empty. Gateway and Python selections need no
+runtime boot. Repository runners own service startup and cleanup, so their
+``measurement_boot()`` executes a minimal Python command through the same adapter.
 
 ## Where the spine hands us ``<tree>/src`` unconditionally
 
@@ -68,10 +66,12 @@ which never calibrates or consults the ruler at all.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import re
-import shutil
+import shlex
 import statistics
 import subprocess
 import sys
@@ -97,6 +97,7 @@ from ...spine.contracts import (
     StageBreakdown,
 )
 from ...spine.profile import CalibrationParams, ProfileFieldAliases
+from .environment import TestEnvironment, normalize_test_environment
 from .pr_recipe import GitHubPRRecipe
 
 logger = logging.getLogger(__name__)
@@ -248,6 +249,8 @@ def _repo_root(tree: Path) -> Path:
     above.
     """
     tree = Path(tree)
+    if tree.name == "src" and (tree.parent / ".git").exists():
+        return tree.parent
     if tree.is_dir() and _has_tests(tree):
         return tree
     parent = tree.parent
@@ -384,8 +387,8 @@ _MEASURE_ENV_PASSTHROUGH = (
     "TERM",  # some suites probe it; absent TERM makes output differ between arms
     "SYSTEMROOT",  # Windows: CPython needs it to initialize
     "COMSPEC",  # Windows
-    # Memory-aware cap for xdist's ``-n auto`` (_XDIST_ARGV below adds it
-    # unconditionally when xdist is importable). Seeded at the agent spawn
+    # Memory-aware cap for xdist's ``-n auto`` when the selected environment
+    # supplies the plugin. Seeded at the agent spawn
     # boundary (see resource_status.inject_xdist_auto_cap); without this
     # passthrough the allowlist would strip it and the suite would size to the
     # CPU count regardless of memory. Same value for both A/B arms, so arm
@@ -450,22 +453,29 @@ def _measure_env(tree: Path) -> dict[str, str]:
 from ...spine.push_policy import strip_credential_env  # noqa: E402
 
 
-def _xdist_argv() -> tuple[str, ...]:
-    """``-n auto`` when pytest-xdist is importable, else empty.
-
-    Probed once at import: the full-suite STAYGREEN run needs parallelism (see
-    :meth:`PytestBugRunner.run_suite`), but a target repo without xdist installed
-    must still run — passing ``-n`` there is a usage error that would look like a
-    red suite.
-    """
-    try:
-        import xdist  # noqa: F401
-    except Exception:  # noqa: BLE001 — absent/broken plugin → run serially
+def _xdist_argv(environment: TestEnvironment, root: Path) -> tuple[str, ...]:
+    probe = (
+        "import sys\n"
+        "try: import xdist\n"
+        "except ModuleNotFoundError as exc:\n"
+        " if exc.name != 'xdist': raise\n"
+        " print('KIRO_XDIST_ABSENT'); sys.exit(3)\n"
+    )
+    proc = environment.run(
+        environment.python_argv("-c", probe),
+        cwd=root,
+        timeout=_QUICK_TIMEOUT_S,
+        env=_measure_env(root),
+    )
+    if proc.returncode == 0:
+        return ("-n", "auto")
+    if proc.returncode == 3 and (proc.stdout or "").strip() == "KIRO_XDIST_ABSENT":
         return ()
-    return ("-n", "auto")
+    raise RuntimeError(
+        "Could not check pytest-xdist; repair the selected test environment and check again: "
+        + json.dumps(_diagnostic("xdist", proc))
+    )
 
-
-_XDIST_ARGV: tuple[str, ...] = _xdist_argv()
 
 #: Substrings that mean xdist itself failed to run, as opposed to tests failing.
 #: They trigger a serial retry of the suite so the gate still gets a real verdict.
@@ -547,40 +557,14 @@ def _suite_scope_for_globs(clone: Path, globs: list[str] | None) -> list[str]:
         walk.pop()
 
 
-def _pytest_argv(*args: str) -> list[str]:
-    """``<this interpreter> -m pytest`` plus ``args``.
-
-    Deliberately the RUNNING interpreter rather than a ``pytest`` found on PATH: the
-    interpreter executing the gateway is the one with the app's dependencies
-    installed, and a PATH ``pytest`` from a different environment is the classic
-    source of "collection error" verdicts that look like a real RED but are not.
-    ``-p no:cacheprovider`` keeps pytest from writing ``.pytest_cache`` into the tree
-    (a write the do-not-pollute discipline would rightly flag). ``--color=no`` keeps
-    the summary machine-readable: pytest colorizes ``FAILED``/``ERROR`` lines — and the
-    test name INSIDE the nodeid — whenever color is on, and a nodeid carrying escape
-    sequences cannot be handed back to pytest to re-run.
-
-    ``-o addopts=`` is load-bearing: the TARGET repo's own ini ``addopts`` otherwise
-    apply to every invocation we make, and a repo that ships coverage + ``-n auto``
-    makes each gate step pay whole-package instrumentation and full xdist worker
-    startup. Measured on this repo, collecting ONE trivial test: **73.9s with the
-    repo's addopts, 0.17s with them overridden** — a ~430x difference, and it also
-    wrote a coverage report into the tree. That cost is charged FOUR times per
-    candidate (T2 collect, RED, GREEN, STAYGREEN), so a valid candidate could blow the
-    180s quick timeout and be recorded as "reproducing test does not collect" — a
-    harness artifact reported as a defect in the agent's test. It also protects
-    MEASUREMENT VALIDITY: coverage instrumentation and xdist scheduling are exactly
-    the variance the A/B noise band exists to exclude, so paying them inside a timed
-    arm measures the harness, not the change.
-
-    Note ``-o addopts=`` and NOT ``PYTEST_ADDOPTS=""``: an env ``PYTEST_ADDOPTS`` is
-    APPENDED to the ini value rather than replacing it, so the empty string is inert
-    (verified — coverage still ran). Overriding the ini key is what actually drops them.
-    """
+def _pytest_argv(*args: str, environment: TestEnvironment | None = None) -> list[str]:
+    """Run the selected interpreter with deterministic pytest options."""
     return [
-        sys.executable,
-        "-m",
-        "pytest",
+        *(
+            environment.python_argv("-m", "pytest")
+            if environment
+            else [sys.executable, "-m", "pytest"]
+        ),
         "-p",
         "no:cacheprovider",
         "--color=no",
@@ -591,7 +575,12 @@ def _pytest_argv(*args: str) -> list[str]:
 
 
 def _time_suite(
-    tree: Path, *, extra: tuple[str, ...] = (), timeout: float = _SUITE_TIMEOUT_S
+    tree: Path,
+    *,
+    extra: tuple[str, ...] = (),
+    timeout: float = _SUITE_TIMEOUT_S,
+    environment: TestEnvironment | None = None,
+    run: Callable | None = None,
 ) -> tuple[float, bool]:
     """Wall-clock one full suite run in ``tree``. Returns ``(seconds, passed)``.
 
@@ -600,11 +589,13 @@ def _time_suite(
     regress), and pytest's summary excludes them.
     """
     root = _repo_root(tree)
-    argv = _pytest_argv("-q", *extra)
+    argv = _pytest_argv("-q", *extra, environment=environment)
     t0 = time.perf_counter()
     try:
-        proc = _run(argv, cwd=root, timeout=timeout, env=_measure_env(root))
-    except (OSError, subprocess.SubprocessError):
+        proc = (run or (environment.run if environment else _run))(
+            argv, cwd=root, timeout=timeout, env=_measure_env(root)
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
         # A timeout/spawn failure is not a slow run — it is no measurement at all.
         return float("nan"), False
     elapsed = time.perf_counter() - t0
@@ -613,7 +604,9 @@ def _time_suite(
     return elapsed, proc.returncode == 0
 
 
-def _collected_count(tree: Path) -> int:
+def _collected_count(
+    tree: Path, environment: TestEnvironment | None = None, run: Callable | None = None
+) -> int:
     """Number of tests pytest collects in ``tree``, or -1 when it cannot be read.
 
     This is the RH guard's raw material: a candidate that made the suite faster by
@@ -621,13 +614,15 @@ def _collected_count(tree: Path) -> int:
     """
     root = _repo_root(tree)
     try:
-        proc = _run(
-            _pytest_argv("-q", "--collect-only"),
+        proc = (run or (environment.run if environment else _run))(
+            _pytest_argv("-q", "--collect-only", environment=environment),
             cwd=root,
             timeout=_QUICK_TIMEOUT_S,
             env=_measure_env(root),
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return -1
+    if proc.returncode != 0:
         return -1
     stdout = _ANSI_RE.sub("", proc.stdout or "")
     match = _COLLECTED_RE.search(stdout)
@@ -663,7 +658,63 @@ def _failing_nodeids(stdout: str) -> list[str]:
 # ── ① the ruler: wall-clock seconds of the repo's own test suite ─────────────
 
 
-class SuiteRuler:
+def _diagnostic(stage: str, result) -> dict:
+    def clean(value) -> str:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        return redact_via_context(str(value or ""))[:4000]
+
+    return {
+        "stage": stage,
+        "returncode": getattr(result, "returncode", None),
+        "stdout": clean(getattr(result, "stdout", "")),
+        "stderr": clean(
+            getattr(result, "stderr", "") or (str(result) if isinstance(result, Exception) else "")
+        ),
+    }
+
+
+class _EnvironmentAdapter:
+    environment: TestEnvironment | None = None
+    diagnostic: dict | None = None
+
+    def _environment(self, root: Path) -> TestEnvironment:
+        if self.environment is None:
+            self.environment = TestEnvironment(normalize_test_environment(None), root, _run)
+        return self.environment
+
+    def _pytest(self, *args: str) -> list[str]:
+        return _pytest_argv(*args, environment=self.environment)
+
+    def _execute(self, argv, *, cwd, timeout, env=None, stage=None):
+        self.diagnostic = None
+        stage = stage or (
+            "collect"
+            if "--collect-only" in argv
+            else next(
+                (name for name in ("compileall", "ruff", "pyflakes", "pytest") if name in argv),
+                "test",
+            )
+        )
+        try:
+            proc = self._environment(cwd).run(argv, cwd=cwd, timeout=timeout, env=env)
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+            self.diagnostic = _diagnostic(stage, exc)
+            raise
+        if proc.returncode != 0:
+            self.diagnostic = _diagnostic(stage, proc)
+        return proc
+
+    def _xdist(self, root: Path) -> tuple[str, ...]:
+        self.diagnostic = None
+        try:
+            return _xdist_argv(self._environment(root), root)
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+            self.diagnostic = _diagnostic("xdist", exc)
+            raise
+
+
+class SuiteRuler(_EnvironmentAdapter):
     """Field ① — the primary metric is the suite's wall-clock time, minimized.
 
     Why the test suite and not a microbenchmark: it is the one workload every Python
@@ -683,8 +734,12 @@ class SuiteRuler:
     substages = [STAGE_SUITE, STAGE_COLLECT]
     guardrails = [GUARDRAIL_TESTS_PASS]
     rh_guards = [RH_TEST_COUNT]
+    require_environment: Callable[[], None] | None = None
 
-    def __init__(self, *, benchmark_cmd: str = "") -> None:
+    def __init__(
+        self, *, benchmark_cmd: str = "", environment: TestEnvironment | None = None
+    ) -> None:
+        self.environment = environment
         #: Optional repo-supplied benchmark command (config ``benchmarkCommand``).
         #: When set it replaces the suite as the timed workload; it is split on
         #: whitespace and run WITHOUT a shell, so no shell metacharacters are honored.
@@ -692,11 +747,14 @@ class SuiteRuler:
         #: The byte-identical incidental conditions. Off-limits to the agent and
         #: recorded so a later run can tell whether it is comparable to this one.
         self.measurement_constants: dict[str, str] = {
-            "interpreter": sys.executable,
+            "interpreter": shlex.join(environment.python_argv()) if environment else sys.executable,
             "PYTHONHASHSEED": "0",
             "PYTHONDONTWRITEBYTECODE": "1",
             "runner": self.benchmark_cmd or "python -m pytest -q",
             "timer": "time.perf_counter around the subprocess",
+            "environment": json.dumps(
+                environment.identity if environment else {"kind": "gateway"}, sort_keys=True
+            ),
         }
         #: Baseline medians captured during calibration; they DERIVE the guardrail
         #: tolerance the driver adopts (see :meth:`guardrail_tolerances`).
@@ -713,17 +771,30 @@ class SuiteRuler:
             root = _repo_root(tree)
             t0 = time.perf_counter()
             try:
-                proc = _run(
-                    self.benchmark_cmd.split(),
+                argv = shlex.split(self.benchmark_cmd)
+                executable = Path(argv[0]).name if argv else ""
+                if argv and (
+                    argv[0] == self._environment(root).python_argv()[0]
+                    or re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable)
+                ):
+                    argv = self._environment(root).python_argv(*argv[1:])
+                elif executable in {"pytest", "pytest.exe", "py.test"}:
+                    argv = self._environment(root).python_argv("-m", "pytest", *argv[1:])
+                else:
+                    raise RuntimeError(
+                        "benchmarkCommand must start with Python or pytest so it uses the selected test environment"
+                    )
+                proc = self._execute(
+                    argv,
                     cwd=root,
                     timeout=_SUITE_TIMEOUT_S,
                     env=_measure_env(root),
                 )
-            except (OSError, subprocess.SubprocessError):
+            except (OSError, subprocess.SubprocessError, ValueError):
                 return float("nan"), False
             return time.perf_counter() - t0, proc.returncode == 0
         extra = ("--collect-only",) if collect_only else ()
-        return _time_suite(tree, extra=extra)
+        return _time_suite(tree, extra=extra, environment=self.environment, run=self._execute)
 
     def _sample(self, tree: Path) -> tuple[float, bool, float]:
         """One arm of an A/B: ``(wall_seconds, passed, collect_seconds)``.
@@ -759,7 +830,9 @@ class SuiteRuler:
         # count could not be read on one side, which we treat as "cannot verify" →
         # NOT ok, because an unverifiable RH guard is indistinguishable from a
         # defeated one and this is the highest-value cheat against a suite ruler.
-        base_n, cand_n = _collected_count(base_src), _collected_count(cand_src)
+        base_n, cand_n = _collected_count(
+            base_src, self.environment, self._execute
+        ), _collected_count(cand_src, self.environment)
         rh_capability_ok = base_n >= 0 and cand_n >= 0 and cand_n >= base_n
 
         return Measurement(
@@ -797,6 +870,9 @@ class SuiteRuler:
         spine surfaces as a :class:`CalibrationError` when it is too short to have a
         spread; that is the correct outcome (a stopped run has no proven ruler).
         """
+        readiness = getattr(self, "require_environment", None)
+        if callable(readiness):
+            readiness()
         out: list[float] = []
         for _ in range(max(int(reps), 2)):
             check = self.stop_check
@@ -906,7 +982,7 @@ class SuiteRuler:
 # ── ② the build gate: the repo's own pytest run ──────────────────────────────
 
 
-class PytestBuildGate:
+class PytestBuildGate(_EnvironmentAdapter):
     """Field ② — ``pytest -q`` in the candidate worktree. Boolean + the gated sha.
 
     ``single_environment = True``: for a repo target the gate and the measurement run
@@ -918,7 +994,10 @@ class PytestBuildGate:
 
     single_environment = True
 
-    def __init__(self, *, suite_scope: list[str] | None = None) -> None:
+    def __init__(
+        self, *, suite_scope: list[str] | None = None, environment: TestEnvironment | None = None
+    ) -> None:
+        self.environment = environment
         #: Repo-relative test paths to run instead of the whole tree. Set when the
         #: operator narrowed the edit allowlist — see _suite_scope_for_globs.
         self.suite_scope: list[str] = list(suite_scope or [])
@@ -932,30 +1011,31 @@ class PytestBuildGate:
         worktree and carries it forward onto this result.
         """
         root = _repo_root(src if Path(src).exists() else worktree)
+        xdist = self._xdist(root)
         try:
             # PARALLEL: this is the full suite (T0 build/import smoke), which on a large
             # repo — 21,901 tests here — cannot finish serially inside the timeout. See
             # run_suite for the same reasoning; the targeted RED/GREEN runs stay serial.
-            proc = _run(
-                _pytest_argv("-q", *_XDIST_ARGV, *self.suite_scope),
+            proc = self._execute(
+                self._pytest("-q", *xdist, *self.suite_scope),
                 cwd=root,
                 timeout=_SUITE_TIMEOUT_S,
                 env=_measure_env(root),
             )
         except subprocess.TimeoutExpired:
             return GateResult(passed=False, detail=f"suite timed out after {_SUITE_TIMEOUT_S:.0f}s")
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
             return GateResult(passed=False, detail=f"could not run the suite: {exc}")
         # Retry serially if xdist itself failed to start, so a missing/broken plugin
         # reads as "run serially", not "suite red".
         if (
             proc.returncode != 0
-            and _XDIST_ARGV
+            and xdist
             and _looks_like_xdist_failure(proc.stdout or "", proc.stderr or "")
         ):
             try:
-                proc = _run(
-                    _pytest_argv("-q", *self.suite_scope),
+                proc = self._execute(
+                    self._pytest("-q", *self.suite_scope),
                     cwd=root,
                     timeout=_SUITE_TIMEOUT_S,
                     env=_measure_env(root),
@@ -964,7 +1044,7 @@ class PytestBuildGate:
                 return GateResult(
                     passed=False, detail=f"suite timed out after {_SUITE_TIMEOUT_S:.0f}s"
                 )
-            except (OSError, subprocess.SubprocessError) as exc:
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
                 return GateResult(passed=False, detail=f"could not run the suite: {exc}")
         failing = _failing_nodeids(proc.stdout or "")
         if proc.returncode == 0:
@@ -983,7 +1063,7 @@ class PytestBuildGate:
 # ── ②b the bug runner: deterministic RED/GREEN primitives ───────────────────
 
 
-class PytestBugRunner:
+class PytestBugRunner(_EnvironmentAdapter):
     """Field ②b — the deterministic primitives the spine's RED/GREEN gate composes.
 
     The gate discipline (static-triage ladder → doubled RED → GREEN → STAYGREEN) is
@@ -991,7 +1071,10 @@ class PytestBugRunner:
     Each method is a bounded subprocess whose result the gate cannot argue past.
     """
 
-    def __init__(self, *, suite_scope: list[str] | None = None) -> None:
+    def __init__(
+        self, *, suite_scope: list[str] | None = None, environment: TestEnvironment | None = None
+    ) -> None:
+        self.environment = environment
         #: Repo-relative test paths the STAYGREEN full-suite run is confined to, when
         #: the operator narrowed the edit allowlist. See _suite_scope_for_globs.
         self.suite_scope: list[str] = list(suite_scope or [])
@@ -999,20 +1082,30 @@ class PytestBugRunner:
     def build_imports_ok(self, *, src: Path) -> bool:
         """T0: every Python module in the tree imports (the compile-equivalent smoke).
 
-        Byte-compiling with ``compileall`` rather than importing each module: importing
+        Compile source in memory rather than importing each module: importing
         executes module-level code, which for an arbitrary repo can open sockets, read
         credentials, or block. Compilation catches the same class of defect (syntax and
         obvious structural breakage) with no side effects.
         """
         root = _repo_root(src)
         try:
-            proc = _run(
-                [sys.executable, "-m", "compileall", "-q", "-x", r"(\.venv|node_modules)", "."],
+            proc = self._execute(
+                self._environment(root).python_argv(
+                    "-c",
+                    "import os, pathlib\n"
+                    "for root, dirs, files in os.walk('.'):\n"
+                    "    dirs[:] = [d for d in dirs if d not in {'.venv', 'node_modules', '.git'}]\n"
+                    "    for name in files:\n"
+                    "        if name.endswith('.py'):\n"
+                    "            p = pathlib.Path(root) / name\n"
+                    "            compile(p.read_bytes(), str(p), 'exec')\n",
+                ),
+                stage="compile",
                 cwd=root,
                 timeout=_QUICK_TIMEOUT_S,
                 env=_measure_env(root),
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, ValueError):
             return False
         return proc.returncode == 0
 
@@ -1034,28 +1127,26 @@ class PytestBugRunner:
         # (measured: F401/F841/F403 all became ""). The env belt-and-braces plus the
         # _ANSI_RE strip below cover a repo config that forces color back on.
         for argv in (
-            ["ruff", "check", "--output-format=concise", "--color=never", "."],
             [
-                sys.executable,
-                "-m",
-                "ruff",
+                *self._environment(root).python_argv("-m", "ruff"),
                 "check",
                 "--output-format=concise",
                 "--color=never",
                 ".",
             ],
-            [sys.executable, "-m", "pyflakes", "."],
+            self._environment(root).python_argv("-m", "pyflakes", "."),
         ):
-            if argv[0] == "ruff" and shutil.which("ruff") is None:
-                continue
-            try:
-                proc = _run(argv, cwd=root, timeout=_QUICK_TIMEOUT_S, env=_measure_env(root))
-            except (OSError, subprocess.SubprocessError):
-                continue
+            proc = self._execute(argv, cwd=root, timeout=_QUICK_TIMEOUT_S, env=_measure_env(root))
             # A missing module exits non-zero with an import error and no findings —
             # distinguish that from "linter ran and found problems".
-            if "No module named" in (proc.stderr or ""):
+            module = argv[argv.index("-m") + 1]
+            if proc.returncode != 0 and re.search(
+                rf"No module named ['\"]?{re.escape(module)}['\"]?\s*$",
+                proc.stderr or "",
+            ):
                 continue
+            if proc.returncode not in {0, 1}:
+                raise RuntimeError(f"{module} could not run: {self.diagnostic}")
             findings: set[str] = set()
             for raw_line in (proc.stdout or "").splitlines():
                 # Strip SGR sequences BEFORE splitting: they sit inside the path and
@@ -1073,6 +1164,8 @@ class PytestBugRunner:
                 rest = parts[3] if len(parts) > 3 else ""
                 code = (rest.strip().split(" ", 1)[0] or "?").rstrip(":")
                 findings.add(f"{path}:{code}")
+            if proc.returncode == 1 and not findings:
+                raise RuntimeError(f"{module} failed without parseable findings: {self.diagnostic}")
             return findings
         return None
 
@@ -1085,26 +1178,31 @@ class PytestBugRunner:
         fall back to :meth:`build_imports_ok` (byte-compilation), which is a weaker but
         honest signal rather than a fabricated pass.
         """
+        self.diagnostic = None
         cand = self._lint_findings(cand_src)
         if cand is None:
             return self.build_imports_ok(src=cand_src)
+        candidate_diagnostic = self.diagnostic
         base = self._lint_findings(base_src) or set()
-        return not (cand - base)
+        clean = not (cand - base)
+        self.diagnostic = None if clean else candidate_diagnostic
+        return clean
 
     def test_collects(self, *, src: Path, test_path: str) -> bool:
         """T2: the reproducing test file collects. A non-collecting test cannot be RED."""
+        self.diagnostic = None
         root = _repo_root(src)
         target = (test_path or "").strip()
         if not target:
             return False
         try:
-            proc = _run(
-                _pytest_argv("-q", "--collect-only", target),
+            proc = self._execute(
+                self._pytest("-q", "--collect-only", target),
                 cwd=root,
                 timeout=_QUICK_TIMEOUT_S,
                 env=_measure_env(root),
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, ValueError):
             return False
         return proc.returncode == 0
 
@@ -1118,18 +1216,19 @@ class PytestBugRunner:
         than accepting it as RED, which is what stops a test that merely fails to
         import from masquerading as a reproduction.
         """
+        self.diagnostic = None
         root = _repo_root(src)
         nodeid = (test_id or "").strip()
         if not nodeid:
             return None
         try:
-            proc = _run(
-                _pytest_argv("-q", nodeid),
+            proc = self._execute(
+                self._pytest("-q", nodeid),
                 cwd=root,
                 timeout=_QUICK_TIMEOUT_S,
                 env=_measure_env(root),
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, ValueError):
             return None
         if proc.returncode == 0:
             return True
@@ -1153,8 +1252,9 @@ class PytestBugRunner:
         sentinel makes :class:`BugGate` fall back to its conservative verdict.
         """
         root = _repo_root(src)
+        xdist = self._xdist(root)
         try:
-            proc = _run(
+            proc = self._execute(
                 # PARALLEL, unlike the single-test runs. ``-o addopts=`` drops the repo's
                 # coverage (which we do not want) but also its ``-n auto`` (which we DO,
                 # here only). This repo collects 21,901 tests: serial they cannot finish
@@ -1165,27 +1265,27 @@ class PytestBugRunner:
                 # targeted RED/GREEN/collect runs stay serial, where worker startup would
                 # be pure overhead on one test. ``-p xdist`` is not assumed: fall back to a
                 # serial run when the plugin is missing (a bare target repo).
-                _pytest_argv("-q", *_XDIST_ARGV, *self.suite_scope),
+                self._pytest("-q", *xdist, *self.suite_scope),
                 cwd=root,
                 timeout=_SUITE_TIMEOUT_S,
                 env=_measure_env(root),
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, ValueError):
             return False, ["<unparsed-suite-failure>"]
         if proc.returncode == 0:
             return True, []
         # An xdist-side startup failure (plugin absent, worker crash) is not a test
         # failure: retry serially so a real verdict is still produced rather than the
         # conservative "regressed" the sentinel would force.
-        if _XDIST_ARGV and _looks_like_xdist_failure(proc.stdout or "", proc.stderr or ""):
+        if xdist and _looks_like_xdist_failure(proc.stdout or "", proc.stderr or ""):
             try:
-                proc = _run(
-                    _pytest_argv("-q", *self.suite_scope),
+                proc = self._execute(
+                    self._pytest("-q", *self.suite_scope),
                     cwd=root,
                     timeout=_SUITE_TIMEOUT_S,
                     env=_measure_env(root),
                 )
-            except (OSError, subprocess.SubprocessError):
+            except (OSError, subprocess.SubprocessError, ValueError):
                 return False, ["<unparsed-suite-failure>"]
             if proc.returncode == 0:
                 return True, []
@@ -1217,8 +1317,14 @@ class PytestBugRunner:
         """The exact test command the gate itself uses, handed to the fix-authoring
         agent. Without it the agent burns ~20 minutes per candidate hunting for an
         interpreter that has the dependencies — this one already does."""
+        root = _repo_root(Path(worktree) / "src")
+        environment = self._environment(root)
+        command = shlex.join(environment.python_argv("-m", "pytest", "-q"))
         return (
-            f"cd {_repo_root(Path(worktree) / 'src')} && {sys.executable} -m pytest -q <test_path>"
+            f"Test environment: {json.dumps(environment.identity)}. "
+            f"Checked-out source: {root}. Inside this selected environment, run: {command} <test_path>. "
+            "Do not fall back to the gateway interpreter or install dependencies. "
+            "Repository runners receive this exact source path and own service setup and cleanup."
         )
 
 
@@ -1359,18 +1465,22 @@ class RepoEditAllowlist:
 class RepoIsolation:
     """Field ④ — the push-disabled clone, the pinned base ref, the pollute path set.
 
-    ``frozen_components`` is empty and :meth:`measurement_boot` is a no-op. Both are
-    correct answers for a repo target rather than omissions: there is no separate
-    layer to hold byte-identical (the whole repo is the layer under optimization,
-    fenced by the edit allowlist instead), and there is no runtime to boot — a fresh
-    ``pytest`` process IS the measurement, spawned per rep inside the worktree.
+    Repository runners execute their startup and cleanup inside the pollution check.
+    Gateway and Python selections have no separate service lifecycle to exercise.
     """
 
     frozen_components: list[str] = []
 
-    def __init__(self, *, clone_path: Path, base_ref: str = "origin/main") -> None:
+    def __init__(
+        self,
+        *,
+        clone_path: Path,
+        base_ref: str = "origin/main",
+        environment: TestEnvironment | None = None,
+    ) -> None:
         self.clone_path = Path(clone_path)
         self.base_ref = base_ref or "origin/main"
+        self.environment = environment
 
     def push_disabled(self) -> bool:
         """True iff BOTH of origin's urls are mechanically neutralized.
@@ -1401,7 +1511,7 @@ class RepoIsolation:
         return _repository_is_isolated(self.clone_path)
 
     def do_not_pollute_paths(self) -> list[Path]:
-        """Host paths the spine snapshots around the (no-op) measurement boot.
+        """Host paths the spine snapshots around the measurement boot.
 
         The app's own data dir and the user's Kiro Crew home: the two places a leak
         would actually land if the measured workload wrote outside its worktree. We do
@@ -1441,18 +1551,21 @@ class RepoIsolation:
             return []
 
     def measurement_boot(self) -> Callable[[], None]:
-        """A documented no-op: a repo target has no measurement runtime to boot.
+        """Exercise runner startup and cleanup; propagate any failed boot."""
+        environment = self.environment
+        if environment is None or environment.identity["kind"] != "runner":
+            return lambda: None
 
-        The protocol explicitly blesses this ("A profile with no measurement runtime
-        to boot … returns a no-op callable (``lambda: None``); the test then degenerates
-        to 'the spine touched nothing', which is still a true zero-diff"). The reason it
-        is TRUE here and not a dodge: the measured workload is a fresh ``pytest``
-        subprocess spawned per rep inside the throwaway worktree, with
-        ``-p no:cacheprovider`` and ``PYTHONDONTWRITEBYTECODE=1`` so it writes neither
-        a pytest cache nor ``.pyc`` files. There is no long-lived runtime whose startup
-        could touch a host path, so there is nothing for a boot callable to bracket.
-        """
-        return lambda: None
+        def boot() -> None:
+            result = environment.run(
+                environment.python_argv("-c", "pass"),
+                cwd=self.clone_path,
+                timeout=_QUICK_TIMEOUT_S,
+                env=_measure_env(self.clone_path),
+            )
+            result.check_returncode()
+
+        return boot
 
 
 # ── the assembled profile ───────────────────────────────────────────────────
@@ -1486,8 +1599,12 @@ class GitHubRepoProfile(ProfileFieldAliases):
         baseline_reps: int = 5,
         noise_floor_s: float = 0.25,
         log_dir: Path | None = None,
+        test_environment: dict | None = None,
     ) -> None:
         self.clone_path = Path(clone_path)
+        self.environment = TestEnvironment(
+            normalize_test_environment(test_environment), self.clone_path, _run
+        )
         self.track = track
         #: The ``scopeDiffBase`` ref: when set, discovery and the edit fence are both
         #: narrowed to the change set this branch introduced.
@@ -1520,7 +1637,8 @@ class GitHubRepoProfile(ProfileFieldAliases):
             )
         self._log_dir = Path(log_dir) if log_dir else None
 
-        self.ruler = SuiteRuler(benchmark_cmd=benchmark_cmd)  # ①
+        self.ruler = SuiteRuler(benchmark_cmd=benchmark_cmd, environment=self.environment)  # ①
+        self.ruler.require_environment = self.require_environment
         # Confine the gate's FULL-suite runs (T0 build smoke + STAYGREEN) to the test
         # dir nearest a NARROWED edit allowlist. On a monorepo the whole-repo suite
         # cannot finish inside the timeout (21,901 tests here, vs 28s for the app's own
@@ -1535,8 +1653,12 @@ class GitHubRepoProfile(ProfileFieldAliases):
                 self.id,
                 ", ".join(suite_scope),
             )
-        self.build_gate = PytestBuildGate(suite_scope=suite_scope)  # ②
-        self.bug_runner = PytestBugRunner(suite_scope=suite_scope)  # ②b
+        self.build_gate = PytestBuildGate(
+            suite_scope=suite_scope, environment=self.environment
+        )  # ②
+        self.bug_runner = PytestBugRunner(
+            suite_scope=suite_scope, environment=self.environment
+        )  # ②b
         # ``allowed_globs`` narrows WHICH files the agent may edit — e.g. confine a
         # run to one subdirectory so it cannot touch the rest of a large repo (the
         # blast-radius control used when dogfooding against a repo the app itself
@@ -1550,7 +1672,9 @@ class GitHubRepoProfile(ProfileFieldAliases):
         #: "the only fixable region". Only a genuinely NARROWED allowlist should steer
         #: reads, so discovery keys off this raw value (see ``discover``).
         self._user_edit_globs = list(allowed_globs) if allowed_globs else None
-        self.isolation = RepoIsolation(clone_path=self.clone_path, base_ref=base_ref)  # ④
+        self.isolation = RepoIsolation(
+            clone_path=self.clone_path, base_ref=base_ref, environment=self.environment
+        )  # ④
         self.pr_recipe = GitHubPRRecipe(  # ⑤ — reused verbatim
             user=user,
             clone_path=self.clone_path,
@@ -1580,6 +1704,62 @@ class GitHubRepoProfile(ProfileFieldAliases):
         #: bounded per-cycle read budget samples a different slice each cycle.
         self._discovery_rotate = 0
 
+    def check_environment(self) -> dict:
+        root = self.clone_path.resolve()
+        result = {"ok": False, "environment": self.environment.identity, "diagnostic": None}
+        for stage, argv in (
+            (
+                "interpreter",
+                self.environment.python_argv("-c", "import sys; print(sys.executable)"),
+            ),
+            (
+                "pytest",
+                self.environment.python_argv("-c", "import pytest; print(pytest.__version__)"),
+            ),
+            (
+                "collection",
+                _pytest_argv(
+                    "-q",
+                    "--collect-only",
+                    *self.bug_runner.suite_scope,
+                    environment=self.environment,
+                ),
+            ),
+        ):
+            try:
+                proc = self.environment.run(
+                    argv, cwd=root, timeout=_QUICK_TIMEOUT_S, env=_measure_env(root)
+                )
+            except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+                result["diagnostic"] = _diagnostic(stage, exc)
+                return result
+            if proc.returncode != 0:
+                result["diagnostic"] = _diagnostic(stage, proc)
+                return result
+            if stage == "collection":
+                output = _ANSI_RE.sub("", proc.stdout or "")
+                match = _COLLECTED_RE.search(output)
+                count = (
+                    int(match.group(1))
+                    if match
+                    else sum("::" in line for line in output.splitlines())
+                )
+                result["tests_collected"] = count
+                if count <= 0:
+                    result["diagnostic"] = _diagnostic(stage, proc)
+                    return result
+        result["ok"] = True
+        result["environment"] = self.environment.identity
+        return result
+
+    def require_environment(self) -> None:
+        result = self.check_environment()
+        if not result["ok"]:
+            raise RuntimeError(
+                "test environment is not ready; provision its interpreter and dependencies, then check again: "
+                + json.dumps(result)
+            )
+
     # ── Phase A: discovery ───────────────────────────────────────────────────
 
     def discover(
@@ -1600,6 +1780,7 @@ class GitHubRepoProfile(ProfileFieldAliases):
         """
         if agent_runner is None:
             return DiscoveryResult(candidates=[], notes="no agent runner wired — offline, no seeds")
+        self.require_environment()
         surfaces = agent_discovery.discover_surfaces_via_agent(
             agent_runner,
             clone=self.clone_path,
@@ -1741,9 +1922,7 @@ class GitHubRepoProfile(ProfileFieldAliases):
             raw = store.profiles_dir() / f"{fp}.pstats"
             raw.parent.mkdir(parents=True, exist_ok=True)
             argv = [
-                sys.executable,
-                "-m",
-                "cProfile",
+                *self.environment.python_argv("-m", "cProfile"),
                 "-o",
                 str(raw),
                 "-m",
@@ -1759,11 +1938,51 @@ class GitHubRepoProfile(ProfileFieldAliases):
                 # scope keeps it affordable.
                 *self.suite_scope_for_profiling,
             ]
-            _run(argv, cwd=root, timeout=_SUITE_TIMEOUT_S, env=_measure_env(root))
+            if self.environment.identity["kind"] == "runner":
+                code = (
+                    "import base64,cProfile,os,runpy,sys,tempfile; "
+                    "fd,path=tempfile.mkstemp(suffix='.pstats'); os.close(fd); "
+                    "sys.argv=['pytest',*sys.argv[1:]]; profiler=cProfile.Profile(); "
+                    "profiler.enable()\n"
+                    "try: runpy.run_module('pytest',run_name='__main__')\n"
+                    "except SystemExit: pass\n"
+                    "finally:\n profiler.disable(); profiler.dump_stats(path); "
+                    "print('KIRO_PSTATS:'+base64.b64encode(open(path,'rb').read()).decode())"
+                )
+                proc = self.environment.run(
+                    self.environment.python_argv(
+                        "-c",
+                        code,
+                        "-q",
+                        "-p",
+                        "no:cacheprovider",
+                        "-o",
+                        "addopts=",
+                        *self.suite_scope_for_profiling,
+                    ),
+                    cwd=root,
+                    timeout=_SUITE_TIMEOUT_S,
+                    env=_measure_env(root),
+                )
+                encoded = next(
+                    (
+                        line.removeprefix("KIRO_PSTATS:")
+                        for line in (proc.stdout or "").splitlines()
+                        if line.startswith("KIRO_PSTATS:")
+                    ),
+                    "",
+                )
+                if proc.returncode != 0 or not encoded:
+                    return None
+                raw.write_bytes(base64.b64decode(encoded, validate=True))
+            else:
+                self.environment.run(
+                    argv, cwd=root, timeout=_SUITE_TIMEOUT_S, env=_measure_env(root)
+                )
             if not raw.is_file() or raw.stat().st_size == 0:
                 return None
             return PN.capture_profile(fp, raw, scenario="suite")
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, ValueError):
             return None
 
     @property
@@ -1827,4 +2046,5 @@ def build_profile(config: dict) -> GitHubRepoProfile:
         baseline_reps=int(cfg.get("calibrationReps") or 5),
         noise_floor_s=float(cfg.get("noiseFloorSeconds") or 0.25),
         log_dir=store.logs_dir(),
+        test_environment=cfg.get("testEnvironment"),
     )

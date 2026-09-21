@@ -16261,5 +16261,29 @@
     "resolve_explanation": "Mantenha o valor atual. Aplicar registra esta decisão e encerra as propostas pendentes.",
     "forget_count": "Esquecer memórias selecionadas: {{count}}",
     "retry_preview_page": "Tentar página de prévia novamente"
+  },
+  "testEnvironment": {
+    "absolutePath": "Insira um caminho absoluto para o executável Python.",
+    "blocked": "Bloqueado",
+    "check": "Verificar ambiente",
+    "checking": "Verificando…",
+    "executable": "Executável Python (caminho absoluto)",
+    "failed": "Falha na solicitação (HTTP {{status}}).",
+    "gateway": "Python do gateway (legado)",
+    "isolation": "As verificações usam cópias de trabalho isoladas. O ambiente selecionado determina onde os testes são executados.",
+    "python": "Ambiente Python",
+    "ready": "Pronto",
+    "save": "Salvar ambiente",
+    "saved": "A verificação valida esta seleção sem salvar nem iniciar uma execução.",
+    "title": "Ambiente de teste",
+    "unchecked": "Não verificado",
+    "unsaved": "Alterações não salvas. Salve antes de iniciar uma execução.",
+    "variables": "Variáveis não secretas (NAME=value, uma por linha)",
+    "variablesInvalid": "Use um NAME=value por linha com nomes únicos. Não inclua segredos.",
+    "runner": "Executor do repositório",
+    "runnerExecutable": "Executável do executor (caminho absoluto)",
+    "runnerPython": "Executável Python (opcional; padrão: python)",
+    "runnerPath": "Insira o caminho absoluto do executável do executor.",
+    "runnerHint": "O executor selecionado realiza verificações em cada cópia de trabalho isolada e deve fornecer o ambiente de testes do repositório, incluindo a preparação e limpeza dos serviços. O isolamento por contêiner depende do executor."
   }
 }

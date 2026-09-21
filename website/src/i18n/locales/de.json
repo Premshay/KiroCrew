@@ -16060,5 +16060,29 @@
     "resolve_explanation": "Aktuellen Wert behalten. Anwenden speichert diese Entscheidung und schließt ausstehende Vorschläge.",
     "forget_count": "Ausgewählte Erinnerungen vergessen: {{count}}",
     "retry_preview_page": "Vorschauseite erneut laden"
+  },
+  "testEnvironment": {
+    "absolutePath": "Geben Sie einen absoluten Pfad zum Python-Programm ein.",
+    "blocked": "Blockiert",
+    "check": "Umgebung prüfen",
+    "checking": "Prüfung läuft…",
+    "executable": "Python-Programm (absoluter Pfad)",
+    "failed": "Anfrage fehlgeschlagen (HTTP {{status}}).",
+    "gateway": "Gateway-Python (bisherig)",
+    "isolation": "Prüfungen verwenden isolierte Checkouts. Die gewählte Umgebung bestimmt, wo Tests ausgeführt werden.",
+    "python": "Python-Umgebung",
+    "ready": "Bereit",
+    "save": "Umgebung speichern",
+    "saved": "Die Prüfung validiert diese Auswahl, ohne zu speichern oder einen Lauf zu starten.",
+    "title": "Testumgebung",
+    "unchecked": "Ungeprüft",
+    "unsaved": "Ungespeicherte Änderungen. Vor dem Start speichern.",
+    "variables": "Nicht geheime Variablen (NAME=value, eine pro Zeile)",
+    "variablesInvalid": "Verwenden Sie ein NAME=value pro Zeile mit eindeutigen Namen. Keine Geheimnisse eingeben.",
+    "runner": "Repository-Runner",
+    "runnerExecutable": "Runner-Programm (absoluter Pfad)",
+    "runnerPython": "Python-Programm (optional; Standard: python)",
+    "runnerPath": "Gib einen absoluten Pfad zum Runner-Programm ein.",
+    "runnerHint": "Der gewählte Runner führt Prüfungen in jedem isolierten Checkout aus und muss die Testumgebung des Ziel-Repositorys einschließlich Einrichtung und Abbau der Dienste bereitstellen. Die Container-Isolation hängt vom Runner ab."
   }
 }

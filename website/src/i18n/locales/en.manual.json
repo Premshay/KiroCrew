@@ -7253,5 +7253,29 @@
     "resolve_explanation": "Keep the current value. Applying records this decision and closes its pending proposals.",
     "forget_count": "Forget selected memories: {{count}}",
     "retry_preview_page": "Retry preview page"
+  },
+  "testEnvironment": {
+    "title": "Test environment",
+    "gateway": "Gateway Python (legacy)",
+    "python": "Python environment",
+    "isolation": "Checks use isolated checkouts. The selected environment determines where tests execute.",
+    "executable": "Python executable (absolute path)",
+    "variables": "Nonsecret variables (NAME=value, one per line)",
+    "variablesInvalid": "Use one NAME=value per line with unique variable names. Do not include secrets.",
+    "absolutePath": "Enter an absolute path to the Python executable.",
+    "save": "Save environment",
+    "check": "Check environment",
+    "unchecked": "Unchecked",
+    "checking": "Checking…",
+    "ready": "Ready",
+    "blocked": "Blocked",
+    "unsaved": "Unsaved changes. Save before starting a run.",
+    "saved": "Check validates this selection without saving or starting a run.",
+    "failed": "Request failed (HTTP {{status}}).",
+    "runner": "Repository runner",
+    "runnerExecutable": "Runner executable (absolute path)",
+    "runnerPython": "Python executable (optional; default: python)",
+    "runnerPath": "Enter an absolute path to the runner executable.",
+    "runnerHint": "The selected runner runs checks on each isolated checkout and must provide the target repository’s test environment, including service setup and teardown. Container isolation depends on the runner."
   }
 }

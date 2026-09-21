@@ -5399,6 +5399,8 @@ class TestCalibrationHoldsTheCloneLock:
             reached.set()
             return True, "ok"
 
+        monkeypatch.setattr(runner_mod.clone_setup, "_repository_is_safe", lambda _p: True)
+        monkeypatch.setattr(runner_mod.clone_setup, "_push_disabled", lambda _p: True)
         monkeypatch.setattr(runner_mod.clone_setup, "checkout_branch", _mark_reached)
         from kiro_crew.apps.builtins.auto_improvement import profiles as profiles_pkg
 

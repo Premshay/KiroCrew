@@ -16262,5 +16262,29 @@
     "resolve_explanation": "Conservez la valeur actuelle. Appliquer enregistre cette décision et clôt ses propositions en attente.",
     "forget_count": "Oublier les souvenirs sélectionnés : {{count}}",
     "retry_preview_page": "Réessayer la page d’aperçu"
+  },
+  "testEnvironment": {
+    "absolutePath": "Saisissez le chemin absolu de l’exécutable Python.",
+    "blocked": "Bloqué",
+    "check": "Vérifier l’environnement",
+    "checking": "Vérification…",
+    "executable": "Exécutable Python (chemin absolu)",
+    "failed": "Échec de la requête (HTTP {{status}}).",
+    "gateway": "Python de la passerelle (historique)",
+    "isolation": "Les vérifications utilisent des copies de travail isolées. L’environnement sélectionné détermine où les tests s’exécutent.",
+    "python": "Environnement Python",
+    "ready": "Prêt",
+    "save": "Enregistrer l’environnement",
+    "saved": "La vérification valide ce choix sans enregistrer ni lancer d’exécution.",
+    "title": "Environnement de test",
+    "unchecked": "Non vérifié",
+    "unsaved": "Modifications non enregistrées. Enregistrez avant de lancer une exécution.",
+    "variables": "Variables non secrètes (NAME=value, une par ligne)",
+    "variablesInvalid": "Utilisez un NAME=value par ligne avec des noms uniques. Ne saisissez aucun secret.",
+    "runner": "Exécuteur du dépôt",
+    "runnerExecutable": "Exécutable de l’exécuteur (chemin absolu)",
+    "runnerPython": "Exécutable Python (facultatif ; défaut : python)",
+    "runnerPath": "Saisissez le chemin absolu de l’exécutable de l’exécuteur.",
+    "runnerHint": "L’exécuteur sélectionné lance les vérifications sur chaque copie de travail isolée et doit fournir l’environnement de test du dépôt cible, y compris la préparation et le nettoyage des services. L’isolation par conteneur dépend de l’exécuteur."
   }
 }

@@ -57,6 +57,51 @@ Two refusals you may hit, both deliberate:
 Changing repositories clears `branch` and `scopeDiffBase`, because a branch belongs to the
 repository it came from.
 
+### Select and check the test environment
+
+The default **Gateway Python** uses the interpreter running Kiro Crew. Choose
+**Python executable** for a pre-provisioned interpreter such as an absolute virtualenv
+Python path. Choose **Repository runner** to reuse your repository's environment recipe.
+The runner receives `--source ABSOLUTE_CHECKOUT -- PYTHON_EXECUTABLE ARG...`
+as separate arguments, with the same checkout as its working directory. It must
+run that exact source and owns its services, isolation and cleanup, including on
+failure or timeout. The app does not manage Compose or install dependencies.
+
+The selection is saved per repository. Changing branches retains it; switching to
+another repository restores that repository's selection (Gateway Python initially).
+Use **Check environment** after choosing the base branch. A successful check means
+that the selected interpreter starts, pytest imports, and the actual checked-out
+source collects at least one baseline test with a successful exit. Partial collection
+followed by an import error is a failure. Runs and calibration repeat this check
+before spending agent work. This is collection readiness, not proof all tests pass.
+
+Install the runner outside the app's managed checkout tree, without symlink aliases
+or hard links. Keep its code and dependencies operator-controlled; do not load
+measurement control logic from candidate files. Its recorded hash and file identity
+must remain unchanged throughout a run. A runner's Docker client sandbox does not
+confine daemon-launched workloads. The recipe must provide that isolation; configured
+filesystem or network policies that cannot be enforced across delegation refuse
+runner mode with a concrete scope diagnostic. No daemon access is granted by the app.
+
+Runners receive `KIROCREW_RUNNER_DEADLINE` (Unix epoch seconds) and
+`KIROCREW_RUNNER_CLEANUP_SECONDS` (30). Bound setup and tests by the deadline,
+then stop and remove owned resources within the cleanup allowance. The app's
+hard timeout includes that allowance; it cannot clean up a recipe's daemon-owned
+resources itself. Runners must report failed cleanup as failure, never success.
+
+Additional variables must be non-secret string values; credential and runtime-control
+variables are rejected. No shell interpolation or template language is supported.
+
+API: `PUT /api/apps/auto-improvement/config` accepts `testEnvironment` with `kind`
+(`gateway`, `python`, or `runner`), `pythonExecutable` (absolute in Python mode,
+`python` by default in runner mode), absolute `runnerExecutable` (runner only),
+and `variables`. Legacy container selections and invalid values reject the whole
+patch. `POST /api/apps/auto-improvement/environment/check` accepts `{}` for the saved
+selection or `{"testEnvironment": {...}}` to check an unsaved selection. It returns
+`ok`, `environment`, `diagnostic`, and, on successful collection, `tests_collected`.
+Failure diagnostics include stage, return code, and bounded redacted stdout/stderr.
+Both operations refuse during an active run; checks also hold the clone lock.
+
 ---
 
 ## 3. Calibrate the ruler (do this first)

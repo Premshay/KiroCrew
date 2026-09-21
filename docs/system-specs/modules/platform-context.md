@@ -1346,3 +1346,11 @@ out-of-tree companion that composes it today would fail to compose), so the
 slots are kept and marked rather than deleted. None of this warrants a
 `CONTRACT_VERSION` bump: no field is added, removed, or renamed, and no
 interface semantics change — the version stays pinned at 1 pre-launch.
+
+## Authenticated app execution
+
+`platform.app_execution` carries frozen app, user and optional session provenance
+from middleware-authenticated routes to their owned worker threads. Neither config
+nor request bodies mint authority. The carrier grants no permissions; callers pass
+its app and session explicitly to existing governance evaluators. Auto Improvement
+uses it to admit repository runners through its existing strict sandbox executor.

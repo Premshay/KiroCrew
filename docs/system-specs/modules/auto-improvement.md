@@ -1376,3 +1376,36 @@ Run config:
 **Acceptance:** ≥1 finding reaches `filed`/`committed` with a real draft PR or commit,
 **and** its detail panel explains the defect. A run that legitimately finds nothing must
 end `no_defect` — an honest "no defect" is a pass; a *fabricated* fix is a failure.
+
+## Repository test environments
+
+`testEnvironment.kind` is `gateway` (default), `python`, or `runner`. Python mode
+requires an absolute `pythonExecutable`; runner mode defaults it to `python` and
+requires an absolute `runnerExecutable`. Non-secret `variables` are shared by every
+verification path. Legacy container configurations fail explicitly.
+
+The runner receives `--source ABSOLUTE_CHECKOUT -- PYTHON_EXECUTABLE ARG...` as
+literal argv, with the exact base or linked candidate checkout as cwd and source.
+It owns its repository recipe, services, isolation and cleanup. No shell templates,
+Compose lifecycle, image controller or path remapping are supplied by the app.
+The runner receives an empty `PYTHONPATH` so candidate modules cannot shadow its
+control code; the recipe sets target import paths after selecting the source.
+The executable must be outside the managed checkout tree, without symlink aliases
+or hard links. Its hash and file identity are recorded in ruler configuration and
+checked before and after each launch, so a changed runner cannot supply an accepted
+sample. These checks do not freeze host files against concurrent trusted writers or
+pin the runner's transitive dependencies; install recipes in operator-controlled
+locations and do not source their control logic from candidate files.
+
+The do-not-pollute preflight runs a minimal Python command through the selected
+repository runner, bracketing its real startup and cleanup with host snapshots.
+Nonzero exits, timeouts and admission failures abort preflight. Gateway and Python
+selections retain their no-op boot because they have no separate service lifecycle.
+
+All readiness, gates, ruler, benchmark and profiler calls share the adapter and
+existing bounded strict executor. Runner mode keeps authenticated app provenance,
+policy admission and critical audit. A sandbox around a Docker client does not
+confine the daemon's workload. Runners must enforce downstream isolation themselves;
+configured filesystem or egress restrictions that this adapter cannot enforce
+across delegation refuse execution, naming the scope. The app does not grant daemon
+access or relax platform policy. See [governance](governance.md#repository-runner-admission).

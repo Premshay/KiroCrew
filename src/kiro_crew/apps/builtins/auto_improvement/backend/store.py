@@ -107,6 +107,36 @@ def workspace_key(config: dict | None = None) -> str:
     return f"{readable}__{digest}"
 
 
+def repository_key(config: dict) -> str:
+    """Environment identity is repository-wide, independent of the artifact branch."""
+    repo = (
+        str(config.get("target_url") or config.get("target_display") or config.get("clone") or "")
+        .strip()
+        .lower()
+        .rstrip("/")
+    )
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    return hashlib.sha256(repo.encode("utf-8")).hexdigest()
+
+
+def remember_test_environment(config: dict) -> None:
+    from ..profiles.github_repo.environment import normalize_test_environment
+
+    environment = normalize_test_environment(config.get("testEnvironment"))
+    config["testEnvironment"] = environment
+    saved = dict(config.get("repositoryTestEnvironments") or {})
+    saved[repository_key(config)] = environment
+    config["repositoryTestEnvironments"] = saved
+
+
+def restore_test_environment(config: dict) -> None:
+    from ..profiles.github_repo.environment import normalize_test_environment
+
+    saved = config.get("repositoryTestEnvironments") or {}
+    config["testEnvironment"] = normalize_test_environment(saved.get(repository_key(config)))
+
+
 def workspace_dir() -> Path:
     """The per-repository+branch root all run artifacts hang off.
 

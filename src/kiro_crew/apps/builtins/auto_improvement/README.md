@@ -16,6 +16,20 @@ engineering overview; the manual is the operator's guide.
 
 [manual]: docs/MANUAL.md
 
+## Test environment contract
+
+One environment is bound to each repository profile and shared by collection,
+reproducing tests, full-suite gates, compile/lint, benchmark measurements, and cProfile.
+The default is Gateway Python; an explicit interpreter or an operator-owned repository
+runner can be selected per repository. Branch switches keep the selection.
+
+Readiness runs after checkout and isolation checks, before agent creation/discovery:
+the interpreter must start, pytest must import, and baseline collection must exit
+successfully with at least one test. Calibration and direct profile discovery use
+the same check. The authenticated, enabled-app `POST /environment/check` route takes
+the clone lock and rechecks active-run state. It never provisions dependencies or
+services. See the [operator setup instructions][manual].
+
 ## How a run works
 
 **Phase 1 — build and prove the ruler.** Calibrate a noise band from ~30
