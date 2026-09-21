@@ -338,7 +338,8 @@ def test_all_python_adapters_use_selected_interpreter(tmp_path, monkeypatch):
     )
     assert profile.build_gate.build_and_test(worktree=tmp_path, src=tmp_path).passed
     assert profile.ruler._time_once(tmp_path)[1]
-    assert profile.ruler._time_once(tmp_path, collect_only=True)[1]
+    suite_ruler = gp.SuiteRuler(environment=profile.environment)
+    assert suite_ruler._time_once(tmp_path, collect_only=True)[1]
     assert gp._collected_count(tmp_path, profile.environment) == 1
     assert all(argv[0] == "/selected/bin/python" for argv in calls)
     assert any("benchmark" in argv for argv in calls)
@@ -497,8 +498,9 @@ def test_custom_benchmark_uses_selected_python(tmp_path, monkeypatch, command):
 def test_custom_benchmark_refuses_ambiguous_launcher(tmp_path, monkeypatch):
     profile, calls = make_profile(tmp_path, monkeypatch, [])
     profile.ruler.benchmark_cmd = "env python -m pytest"
-    with pytest.raises(RuntimeError, match="selected test environment"):
-        profile.ruler._time_once(tmp_path)
+    with pytest.raises(ValueError, match="commands must start with Python or pytest"):
+        profile.ruler._benchmark_once(tmp_path, profile.ruler.benchmark_cmd)
+    assert profile.ruler._time_once(tmp_path)[1] is False
     assert not calls
 
 

@@ -1332,8 +1332,8 @@ class TestPostAgentRepositorySafety:
         assert push.index("self._prepush_review_clean(") < push.index(
             'self._retire_if_unsafe("pre-push review")'
         ) < push.index('if not sha or sha == "-"')
-        assert "elif pushed is False" in inspect.getsource(Driver._apply_verdict)
-        assert "elif pushed is False" in inspect.getsource(Driver._apply_bug_winner)
+        assert "elif pushed is False" in inspect.getsource(Driver._apply_verdict_owned)
+        assert "elif pushed is False" in inspect.getsource(Driver._apply_bug_winner_owned)
 
         from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import CrPipeline
 
@@ -1939,7 +1939,7 @@ class TestThePerfTrackKeepsItsEvolutionaryHead:
 
         from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
-        src = inspect.getsource(Driver._apply_verdict)
+        src = inspect.getsource(Driver._apply_verdict_owned)
         filed_arm = src[
             src.index('"kind": "perf"') : src.index("        else:", src.index('"kind": "perf"'))
         ]
@@ -1955,7 +1955,7 @@ class TestThePerfTrackKeepsItsEvolutionaryHead:
 
         from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
-        src = inspect.getsource(Driver._apply_bug_winner)
+        src = inspect.getsource(Driver._apply_bug_winner_owned)
         filed_arm = src[
             src.index("cr_filed={") : src.index("        else:", src.index("cr_filed={"))
         ]
@@ -1980,7 +1980,7 @@ class TestEachBugPRCarriesOnlyItsOwnFix:
 
         from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
-        src = inspect.getsource(Driver._apply_bug_winner)
+        src = inspect.getsource(Driver._apply_bug_winner_owned)
         # Assert the reset appears on the SUCCESS path, not merely that some threshold of
         # resets exists. A `count(...) >= 2` check passed before the fix too — there were
         # already resets on the direct-push-failed and not-filed paths — so it proved nothing.
@@ -2451,23 +2451,24 @@ class TestAQueuedChangeIsNotRecordedAsFiled:
         assert led.known("def") is True, "a filed PR must stay deduped"
         assert led.filed_crs() == ["https://github.com/o/r/pull/7"]
 
-    def test_the_pipeline_branches_on_the_queued_prefix(self) -> None:
-        """Structural, and it pins the subtle half: the KEEP must survive.
-
-        `filed=False` would also roll the provisional commit back and decrement `kept`,
-        discarding a change that passed RED x2 -> GREEN -> STAYGREEN merely because `gh` was
-        missing. Measured while writing this: flipping it took a bounded run's `kept` 1 -> 0.
-        So the ledger status is retryable while `filed` stays True.
-        """
-        import inspect
+    def test_queued_publication_does_not_accept_the_provisional_baseline(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
 
         from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import CrPipeline
 
-        src = inspect.getsource(CrPipeline)
-        i = src.index('startswith("QUEUED:")')
-        branch = src[i : i + 1400]
-        assert "STATUS_ERROR" in branch, "a queued change is still recorded as filed"
-        assert "filed=True" in branch, "filed=False would throw away the verified win"
+        pipeline = object.__new__(CrPipeline)
+        pipeline.direct_commit = False
+        pipeline.ledger = Mock()
+        pipeline.log = Mock()
+        profile = SimpleNamespace(pr_recipe=SimpleNamespace(draft=Mock(return_value="QUEUED:abc")))
+        outcome = pipeline._draft_and_record(
+            profile=profile, fp="abc", kind="perf", target="a.py", summary="fix",
+            description="fix", diff="patch", note="verified",
+        )
+        assert outcome.filed is False
+        assert outcome.committed_ready is False
+        assert outcome.status == "error"
 
 
 class TestAgentTestsCannotWriteKiroCrewConfig:
@@ -3232,8 +3233,8 @@ class TestWinnerIsInTheTreeBeforeDrafting:
         from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
         for src_fn, stage, emit in (
-            (Driver._apply_verdict, "_commit_winner_provisional(", "emit_perf("),
-            (Driver._apply_bug_winner, "_commit_bug_winner_provisional(", "emit_bug("),
+            (Driver._apply_verdict_owned, "_commit_winner_provisional(", "emit_perf("),
+            (Driver._apply_bug_winner_owned, "_commit_bug_winner_provisional(", "emit_bug("),
         ):
             src = inspect.getsource(src_fn)
             assert stage in src, f"{src_fn.__name__} never commits the winner before drafting"
@@ -4282,6 +4283,7 @@ class TestQueuedDiffTransport:
 
         monkeypatch.setattr(commit_mod, "resolve_origin_url", lambda config: "")
         monkeypatch.setattr(commit_mod, "_git", _git)
+        monkeypatch.setattr(commit_mod, "_repository_is_isolated", lambda clone: True)
         return calls
 
     @pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"])
@@ -7352,7 +7354,7 @@ class TestAFailedBugPushDoesNotCorruptTheKeptCounter:
 
         from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
-        src = inspect.getsource(Driver._apply_bug_winner)
+        src = inspect.getsource(Driver._apply_bug_winner_owned)
         # The failed-push arm must still roll back the provisional commit …
         assert "_reset_provisional(pre_sha)" in src, (
             "the rollback on a refused bug push was removed — a commit left at HEAD leaks into "
@@ -7373,7 +7375,7 @@ class TestAFailedBugPushDoesNotCorruptTheKeptCounter:
 
         from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
-        src = inspect.getsource(Driver._apply_verdict)
+        src = inspect.getsource(Driver._apply_verdict_owned)
         assert "self.stats.kept += 1" in src, "the perf path no longer increments kept eagerly"
         assert "stats.kept -= 1" in src, (
             "the perf path's balancing decrement is gone — the eager increment is now unreversed "
@@ -8007,7 +8009,7 @@ class TestBugPrRecordsTheTestedBaseNotTheFix:
 
         from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
-        src = inspect.getsource(Driver._apply_bug_winner)
+        src = inspect.getsource(Driver._apply_bug_winner_owned)
         # The bug-arm emit_bug call must anchor on the pre-commit sha, not the live HEAD.
         assert "base_anchor=f\"{self.branch} @ {self.head_sha()[:12]}\"" not in src, (
             "the bug PR anchors its base on post-commit HEAD — the fix commit — so its "
@@ -8018,19 +8020,32 @@ class TestBugPrRecordsTheTestedBaseNotTheFix:
             "fix commit"
         )
 
-    def test_pre_sha_is_captured_before_the_provisional_commit(self) -> None:
-        """The premise: `pre_sha` must be read BEFORE HEAD moves, or anchoring on it is no
-        better than anchoring on HEAD."""
-        import inspect
+    @pytest.mark.parametrize("focused", [False, True])
+    def test_pre_sha_is_captured_before_the_provisional_commit(
+        self, tmp_path, monkeypatch, focused
+    ) -> None:
+        from ..spine import driver as driver_mod
+        from .test_release_integration import publication_driver
 
-        from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
-
-        src = inspect.getsource(Driver._apply_bug_winner)
-        i_pre = src.index("pre_sha = _git")
-        i_commit = src.index("_commit_bug_winner_provisional")
-        assert i_pre < i_commit, (
-            "pre_sha is captured after the provisional commit, so it already reflects the fix"
+        driver, apply, _ = publication_driver(
+            tmp_path, monkeypatch, "bug", focused=focused, draft=True
         )
+        head = {"sha": "tested-base"}
+        monkeypatch.setattr(
+            driver_mod, "_git",
+            lambda *args: subprocess.CompletedProcess([], 0, head["sha"], ""),
+        )
+
+        def commit_winner(winner):
+            head["sha"] = "fix-commit"
+            return True
+
+        driver._commit_bug_winner_provisional.side_effect = commit_winner
+        apply()
+        driver._commit_bug_winner_provisional.assert_called_once()
+        assert head["sha"] == "fix-commit"
+        assert driver.pr_pipeline.emit_bug.call_args.kwargs["base_anchor"] == "feature @ tested-base"
+        driver._reset_provisional.assert_called_once_with("tested-base")
 
     def test_the_perf_twin_still_anchors_on_its_base(self) -> None:
         """Guard against a copy-paste 'fix' that breaks the perf path, which was already
@@ -8039,7 +8054,7 @@ class TestBugPrRecordsTheTestedBaseNotTheFix:
 
         from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
-        src = inspect.getsource(Driver._apply_verdict)
+        src = inspect.getsource(Driver._apply_verdict_owned)
         assert "base_anchor=f\"{self.branch} @ {base_sha[:12]}\"" in src, (
             "the perf path's base anchor changed shape — it must keep using base_sha"
         )

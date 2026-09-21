@@ -60,7 +60,11 @@ its own collection takes, skipping every test saves nothing measurable — there
 win to force, so the canary returns ``ok=False`` with that stated in the note. It does
 NOT return a delta whose sign the noise chose. Such a repo is simply not a target a
 wall-clock suite ruler can prove a perf win on; configuring ``benchmarkCommand`` to
-point at a real workload is the fix. Such a repo can still be used for the BUG track,
+point at a real workload, with an explicit ``benchmarkCanaryCommand`` slowed control,
+is the fix. Custom controls prove sensitivity only on the unchanged baseline; they
+never substitute for candidate correctness gates. ``benchmarkResultMode=structured``
+measures reported inner workload seconds and retains outer elapsed seconds separately.
+Such a repo can still be used for the BUG track,
 which never calibrates or consults the ruler at all.
 """
 
@@ -69,6 +73,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -97,6 +102,12 @@ from ...spine.contracts import (
     StageBreakdown,
 )
 from ...spine.profile import CalibrationParams, ProfileFieldAliases
+from .benchmark_result import (
+    BenchmarkResult,
+    benchmark_harness_globs,
+    normalize_benchmark_protected_paths,
+    parse_benchmark_result,
+)
 from .environment import TestEnvironment, normalize_test_environment
 from .pr_recipe import GitHubPRRecipe
 
@@ -737,13 +748,31 @@ class SuiteRuler(_EnvironmentAdapter):
     require_environment: Callable[[], None] | None = None
 
     def __init__(
-        self, *, benchmark_cmd: str = "", environment: TestEnvironment | None = None
+        self,
+        *,
+        benchmark_cmd: str = "",
+        benchmark_canary_cmd: str = "",
+        benchmark_result_mode: str = "wall",
+        environment: TestEnvironment | None = None,
     ) -> None:
         self.environment = environment
         #: Optional repo-supplied benchmark command (config ``benchmarkCommand``).
         #: When set it replaces the suite as the timed workload; it is split on
         #: whitespace and run WITHOUT a shell, so no shell metacharacters are honored.
         self.benchmark_cmd = (benchmark_cmd or "").strip()
+        if benchmark_result_mode not in ("wall", "structured"):
+            raise ValueError("benchmarkResultMode must be wall or structured")
+        self.benchmark_canary_cmd = (benchmark_canary_cmd or "").strip()
+        self.benchmark_result_mode = benchmark_result_mode
+        if not self.benchmark_cmd and (
+            self.benchmark_canary_cmd or benchmark_result_mode != "wall"
+        ):
+            raise ValueError("custom benchmark options require benchmarkCommand")
+        self._benchmark_identity: tuple[str, str, str] | None = None
+        if self.benchmark_cmd:
+            self.primary_name = "benchmark_seconds"
+            self.substages = ["benchmark"]
+            self.rh_guards = ["benchmark_identity"]
         #: The byte-identical incidental conditions. Off-limits to the agent and
         #: recorded so a later run can tell whether it is comparable to this one.
         self.measurement_constants: dict[str, str] = {
@@ -751,7 +780,13 @@ class SuiteRuler(_EnvironmentAdapter):
             "PYTHONHASHSEED": "0",
             "PYTHONDONTWRITEBYTECODE": "1",
             "runner": self.benchmark_cmd or "python -m pytest -q",
-            "timer": "time.perf_counter around the subprocess",
+            "timer": (
+                "AUTO_IMPROVEMENT_METRIC"
+                if benchmark_result_mode == "structured"
+                else "time.perf_counter around the subprocess"
+            ),
+            "benchmarkResultMode": benchmark_result_mode,
+            "sensitivity_control": self.benchmark_canary_cmd,
             "environment": json.dumps(
                 environment.identity if environment else {"kind": "gateway"}, sort_keys=True
             ),
@@ -767,34 +802,105 @@ class SuiteRuler(_EnvironmentAdapter):
 
     def _time_once(self, tree: Path, *, collect_only: bool = False) -> tuple[float, bool]:
         """One timed run of the workload in ``tree``. Returns ``(seconds, passed)``."""
-        if self.benchmark_cmd and not collect_only:
-            root = _repo_root(tree)
-            t0 = time.perf_counter()
+        if self.benchmark_cmd:
+            if collect_only:
+                raise ValueError("custom benchmarks do not use collection as a measurement")
             try:
-                argv = shlex.split(self.benchmark_cmd)
-                executable = Path(argv[0]).name if argv else ""
-                if argv and (
-                    argv[0] == self._environment(root).python_argv()[0]
-                    or re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable)
-                ):
-                    argv = self._environment(root).python_argv(*argv[1:])
-                elif executable in {"pytest", "pytest.exe", "py.test"}:
-                    argv = self._environment(root).python_argv("-m", "pytest", *argv[1:])
-                else:
-                    raise RuntimeError(
-                        "benchmarkCommand must start with Python or pytest so it uses the selected test environment"
-                    )
-                proc = self._execute(
-                    argv,
-                    cwd=root,
-                    timeout=_SUITE_TIMEOUT_S,
-                    env=_measure_env(root),
-                )
+                result = self._benchmark_once(tree, self.benchmark_cmd)
             except (OSError, subprocess.SubprocessError, ValueError):
                 return float("nan"), False
-            return time.perf_counter() - t0, proc.returncode == 0
+            return result.value, True
         extra = ("--collect-only",) if collect_only else ()
         return _time_suite(tree, extra=extra, environment=self.environment, run=self._execute)
+
+    def _benchmark_once(self, tree: Path, command: str) -> BenchmarkResult:
+        root = _repo_root(tree)
+        argv = shlex.split(command)
+        executable = Path(argv[0]).name if argv else ""
+        if argv and (
+            argv[0] == self._environment(root).python_argv()[0]
+            or re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable)
+        ):
+            argv = self._environment(root).python_argv(*argv[1:])
+        elif executable in {"pytest", "pytest.exe", "py.test"}:
+            argv = self._environment(root).python_argv("-m", "pytest", *argv[1:])
+        else:
+            raise ValueError("benchmark commands must start with Python or pytest")
+        started = time.perf_counter()
+        proc = self._execute(argv, cwd=root, timeout=_SUITE_TIMEOUT_S, env=_measure_env(root))
+        result = parse_benchmark_result(
+            proc, time.perf_counter() - started, self.benchmark_result_mode
+        )
+        if self._benchmark_identity is not None and result.identity != self._benchmark_identity:
+            raise ValueError(
+                "benchmark metric/unit/workload_id changed; restore the configured workload"
+            )
+        self._benchmark_identity = result.identity
+        return result
+
+    def _measure_benchmark(self, base_src: Path, cand_src: Path) -> Measurement:
+        try:
+            base = self._benchmark_once(base_src, self.benchmark_cmd)
+            candidate = self._benchmark_once(cand_src, self.benchmark_cmd)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return Measurement(
+                ok=False,
+                note="invalid benchmark sample; check command exit and metric identity/schema",
+            )
+        delta = candidate.value - base.value
+        return Measurement(
+            ok=True,
+            primary_base=base.value,
+            primary_cand=candidate.value,
+            primary_delta=delta,
+            stages=StageBreakdown(stages={"benchmark": delta}),
+            guardrails={GUARDRAIL_TESTS_PASS: 0.0},
+            secondary={
+                "base_outer_seconds": base.outer_seconds,
+                "cand_outer_seconds": candidate.outer_seconds,
+            },
+            rh_capability_ok=True,
+            rh_functional_ok=True,
+            note="custom benchmark completed; candidate correctness is enforced by the build/test gates",
+        )
+
+    def _benchmark_canary(self, base_src: Path) -> Measurement:
+        if not self.benchmark_canary_cmd:
+            return Measurement(
+                ok=False, note="custom benchmark requires benchmarkCanaryCommand (slowed control)"
+            )
+        normal, control = [], []
+        try:
+            for _ in range(_CANARY_REPS):
+                if self.stop_check and self.stop_check():
+                    return Measurement(ok=False, note="canary interrupted by Stop")
+                normal.append(self._benchmark_once(base_src, self.benchmark_cmd))
+                if self.stop_check and self.stop_check():
+                    return Measurement(ok=False, note="canary interrupted by Stop")
+                control.append(self._benchmark_once(base_src, self.benchmark_canary_cmd))
+            if self.stop_check and self.stop_check():
+                return Measurement(ok=False, note="canary interrupted by Stop")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return Measurement(
+                ok=False,
+                note="invalid sensitivity sample; check both commands and metric identity/schema",
+            )
+        base = statistics.median(sample.value for sample in control)
+        candidate = statistics.median(sample.value for sample in normal)
+        delta = candidate - base
+        return Measurement(
+            ok=delta < 0,
+            primary_base=base,
+            primary_cand=candidate,
+            primary_delta=delta,
+            stages=StageBreakdown(stages={"benchmark": delta}),
+            guardrails={GUARDRAIL_TESTS_PASS: 0.0},
+            secondary={
+                "base_outer_seconds": statistics.median(s.outer_seconds for s in control),
+                "cand_outer_seconds": statistics.median(s.outer_seconds for s in normal),
+            },
+            note="sensitivity only: normal workload vs configured slowed control on unchanged baseline; not a candidate improvement",
+        )
 
     def _sample(self, tree: Path) -> tuple[float, bool, float]:
         """One arm of an A/B: ``(wall_seconds, passed, collect_seconds)``.
@@ -820,6 +926,8 @@ class SuiteRuler(_EnvironmentAdapter):
         the spine skips its cross-environment sha assertion (07_*.md §1.2). The sha is
         recorded in the note so a result row is still traceable to an artifact.
         """
+        if self.benchmark_cmd:
+            return self._measure_benchmark(base_src, cand_src)
         base_wall, base_pass, base_collect = self._sample(base_src)
         cand_wall, cand_pass, cand_collect = self._sample(cand_src)
 
@@ -878,7 +986,11 @@ class SuiteRuler(_EnvironmentAdapter):
             check = self.stop_check
             if callable(check) and check():
                 break
-            wall, _passed = self._time_once(base_src)
+            wall, passed = self._time_once(base_src)
+            if self.benchmark_cmd and (not passed or not math.isfinite(wall) or wall <= 0):
+                raise ValueError(
+                    "invalid baseline benchmark sample; check command exit and metric identity/schema"
+                )
             if wall == wall:  # skip NaN (a failed/timed-out rep is not a sample)
                 out.append(wall)
         if out:
@@ -904,28 +1016,23 @@ class SuiteRuler(_EnvironmentAdapter):
         so a monotonic host drift (thermal, a background build starting) biases both
         arms the same way instead of loading it all onto the second arm.
 
-        The forced win is ``--collect-only`` vs a full pytest run — which only means
-        anything when the workload IS pytest. With a custom ``benchmarkCommand`` configured,
-        ``_time_once`` runs the benchmark for the base arm but STILL runs ``pytest
-        --collect-only`` for the candidate arm, so ``delta`` would compare a benchmark against
-        pytest collection — two unrelated workloads. Any benchmark slower than collection
-        yields ``delta < 0`` and clears the sensitivity check without the ruler ever being
-        exercised. There is no mechanically-known win for an arbitrary command, so refuse to
-        certify: ``ok=False`` -> preflight reports the canary did not clear and the run halts
-        rather than optimizing an unproven ruler. Raised by the Opus review.
+        Custom benchmarks use an operator-configured slowed control on the unchanged
+        baseline. That comparison proves sensitivity only, never a candidate win.
         """
         if self.benchmark_cmd:
-            return Measurement(
-                ok=False,
-                note="no mechanically-known win exists for a custom benchmarkCommand — "
-                "the --collect-only canary only proves sensitivity for a pytest workload",
-            )
+            return self._benchmark_canary(base_src)
         base_samples: list[float] = []
         cand_samples: list[float] = []
         base_pass = True
         for _ in range(_CANARY_REPS):
+            if self.stop_check and self.stop_check():
+                return Measurement(ok=False, note="canary interrupted by Stop")
             b_wall, b_pass = self._time_once(base_src)
+            if self.stop_check and self.stop_check():
+                return Measurement(ok=False, note="canary interrupted by Stop")
             c_wall, _ = self._time_once(base_src, collect_only=True)
+            if self.stop_check and self.stop_check():
+                return Measurement(ok=False, note="canary interrupted by Stop")
             if b_wall != b_wall or c_wall != c_wall:  # NaN: no measurement at all
                 return Measurement(ok=False, note="canary workload did not complete")
             base_samples.append(b_wall)
@@ -976,7 +1083,7 @@ class SuiteRuler(_EnvironmentAdapter):
 
     def guardrail_baselines(self) -> dict[str, float]:
         """Baseline medians for the UI's measurement battery (display only)."""
-        return {"suite_wall_seconds": self._baseline_median or 0.0}
+        return {self.primary_name: self._baseline_median or 0.0}
 
 
 # ── ② the build gate: the repo's own pytest run ──────────────────────────────
@@ -1352,12 +1459,14 @@ class RepoEditAllowlist:
         allowed: list[str] | None = None,
         scope: set[str] | None = None,
         track: str = TRACK_BUG,
+        protected_globs: list[str] | None = None,
     ) -> None:
+        self.protected_globs = list(protected_globs or [])
         #: Source globs the agent MAY edit. Defaults cover both repo layouts
         #: (``src/`` package and flat module) since we cannot know which we have.
         self.allowed: list[str] = list(allowed or ["src/**/*.py", "*.py", "**/*.py", "lib/**/*.py"])
         #: Extends — never relaxes — the spine's default-deny categories.
-        self.off_limits: list[str] = list(_ALWAYS_OFF_LIMITS)
+        self.off_limits: list[str] = [*_ALWAYS_OFF_LIMITS, *self.protected_globs]
         #: Which track this fence serves. Only the BUG track may ADD a reproducing test; the
         #: perf track may not touch the suite at all, because the suite is the ruler's own
         #: measurement subject. Defaults to the bug track so an omitted argument is the
@@ -1403,6 +1512,8 @@ class RepoEditAllowlist:
         # Checked BEFORE the artifact ignore so a crafted ``.kiro/../../etc`` cannot
         # slip through by matching an ignore glob.
         if path.startswith("/") or ".." in Path(path).parts:
+            return True
+        if any(fnmatch(path, pattern) for pattern in self.protected_globs):
             return True
         # Agent-tooling debris is not part of the change under test — ignore it
         # instead of failing the candidate over it.
@@ -1571,6 +1682,59 @@ class RepoIsolation:
 # ── the assembled profile ───────────────────────────────────────────────────
 
 
+def normalize_measurement_config(config: dict) -> dict:
+    paths = config.get("focusedTestPaths", [])
+    if not isinstance(paths, list) or any(
+        not isinstance(path, str)
+        or not path
+        or path.startswith("-")
+        or Path(path).is_absolute()
+        or ".." in Path(path).parts
+        or any(char in path for char in "\\:*?[]\n\r\x00")
+        for path in paths
+    ):
+        raise ValueError(
+            "focusedTestPaths must contain explicit repository-relative pytest paths, not options, globs or node IDs"
+        )
+    if paths:
+        variables = normalize_test_environment(config.get("testEnvironment")).get("variables", {})
+        if any(key.upper() == "PYTEST_ADDOPTS" and value for key, value in variables.items()):
+            raise ValueError(
+                "focusedTestPaths requires empty PYTEST_ADDOPTS; remove it from test-environment variables so full regression cannot be narrowed"
+            )
+    timeout = config.get("fullRegressionTimeoutSeconds", 900)
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not 0 < timeout <= sys.float_info.max
+    ):
+        raise ValueError("fullRegressionTimeoutSeconds must be positive and finite")
+    track = config.get("track", "bug")
+    if track not in ("bug", "perf"):
+        raise ValueError("track must be bug or perf")
+    mode = config.get("benchmarkResultMode", "wall")
+    if mode not in ("wall", "structured"):
+        raise ValueError("benchmarkResultMode must be wall or structured")
+    commands = {}
+    for key in ("benchmarkCommand", "benchmarkCanaryCommand"):
+        command = config.get(key, "")
+        if not isinstance(command, str) or any(ord(c) < 32 for c in command):
+            raise ValueError(f"{key} must be a single-line command")
+        commands[key] = command.strip()
+    if not commands["benchmarkCommand"] and (commands["benchmarkCanaryCommand"] or mode != "wall"):
+        raise ValueError("custom benchmark options require benchmarkCommand")
+    return dict(
+        commands,
+        track=track,
+        benchmarkResultMode=mode,
+        benchmarkProtectedPaths=normalize_benchmark_protected_paths(
+            config.get("benchmarkProtectedPaths", [])
+        ),
+        focusedTestPaths=list(paths),
+        fullRegressionTimeoutSeconds=float(timeout),
+    )
+
+
 class GitHubRepoProfile(ProfileFieldAliases):
     """The reference Target Profile: any Python GitHub repo with a pytest suite.
 
@@ -1594,17 +1758,36 @@ class GitHubRepoProfile(ProfileFieldAliases):
         origin_url: str = "",
         track: str = TRACK_BUG,
         benchmark_cmd: str = "",
+        benchmark_canary_cmd: str = "",
+        benchmark_result_mode: str = "wall",
+        benchmark_protected_paths: list[str] | None = None,
         scope_base: str = "",
         allowed_globs: list[str] | None = None,
         baseline_reps: int = 5,
         noise_floor_s: float = 0.25,
         log_dir: Path | None = None,
         test_environment: dict | None = None,
+        focused_test_paths: list[str] | None = None,
+        full_regression_timeout_s: float = 900,
     ) -> None:
         self.clone_path = Path(clone_path)
         self.environment = TestEnvironment(
             normalize_test_environment(test_environment), self.clone_path, _run
         )
+        settings = normalize_measurement_config(
+            {
+                "focusedTestPaths": focused_test_paths or [],
+                "benchmarkProtectedPaths": (
+                    [] if benchmark_protected_paths is None else benchmark_protected_paths
+                ),
+                "fullRegressionTimeoutSeconds": full_regression_timeout_s,
+                "testEnvironment": test_environment,
+            }
+        )
+        self.benchmark_protected_paths = settings["benchmarkProtectedPaths"]
+        self.focused_test_paths = settings["focusedTestPaths"]
+        self.full_regression_timeout_s = settings["fullRegressionTimeoutSeconds"]
+        self.final_regression_required = bool(self.focused_test_paths)
         self.track = track
         #: The ``scopeDiffBase`` ref: when set, discovery and the edit fence are both
         #: narrowed to the change set this branch introduced.
@@ -1637,7 +1820,12 @@ class GitHubRepoProfile(ProfileFieldAliases):
             )
         self._log_dir = Path(log_dir) if log_dir else None
 
-        self.ruler = SuiteRuler(benchmark_cmd=benchmark_cmd, environment=self.environment)  # ①
+        self.ruler = SuiteRuler(
+            benchmark_cmd=benchmark_cmd,
+            benchmark_canary_cmd=benchmark_canary_cmd,
+            benchmark_result_mode=benchmark_result_mode,
+            environment=self.environment,
+        )
         self.ruler.require_environment = self.require_environment
         # Confine the gate's FULL-suite runs (T0 build smoke + STAYGREEN) to the test
         # dir nearest a NARROWED edit allowlist. On a monorepo the whole-repo suite
@@ -1645,7 +1833,9 @@ class GitHubRepoProfile(ProfileFieldAliases):
         # subtree), and a timeout is reported as an unidentifiable failure -> every
         # candidate "regressed". Empty when no allowlist is set: unchanged whole-tree
         # behavior. Logged below so a narrowed gate is never silent.
-        suite_scope = _suite_scope_for_globs(self.clone_path, allowed_globs)
+        suite_scope = self.focused_test_paths or _suite_scope_for_globs(
+            self.clone_path, allowed_globs
+        )
         if suite_scope:
             logger.info(
                 "%s: gate suite scoped to %s (edit allowlist is narrowed); "
@@ -1664,7 +1854,14 @@ class GitHubRepoProfile(ProfileFieldAliases):
         # blast-radius control used when dogfooding against a repo the app itself
         # lives in). The off-limits fence (tests/config/CI) still applies on top.
         self.edit_allowlist = RepoEditAllowlist(
-            allowed=allowed_globs, scope=self._scope, track=track
+            allowed=allowed_globs,
+            scope=self._scope,
+            track=track,
+            protected_globs=benchmark_harness_globs(
+                self.clone_path,
+                [self.ruler.benchmark_cmd, self.ruler.benchmark_canary_cmd],
+                self.benchmark_protected_paths,
+            ),
         )  # ③
         #: The USER-SUPPLIED edit globs, or None when unset. Distinct from
         #: ``edit_allowlist.allowed``, which fills in a repo-wide default when unset —
@@ -1692,7 +1889,11 @@ class GitHubRepoProfile(ProfileFieldAliases):
             # takes seconds are host jitter, not optimization, and a deceptively quiet
             # calibration window would otherwise let them through.
             floor=float(noise_floor_s),
-            canary_id="collect_only_vs_full_suite",
+            canary_id=(
+                "custom_slowed_control_sensitivity"
+                if benchmark_cmd
+                else "collect_only_vs_full_suite"
+            ),
             anchors=[],
             drift_reanchor_cycles=5,
             heldout=[],
@@ -1704,10 +1905,21 @@ class GitHubRepoProfile(ProfileFieldAliases):
         #: bounded per-cycle read budget samples a different slice each cycle.
         self._discovery_rotate = 0
 
+    def full_regression(self, *, timeout: float) -> bool:
+        proc = self.environment.run(
+            _pytest_argv("-q", ".", environment=self.environment),
+            cwd=self.clone_path,
+            timeout=timeout,
+            env=_measure_env(self.clone_path),
+        )
+        if proc.returncode != 0:
+            logger.warning("final regression failed: %s", _diagnostic("full regression", proc))
+        return proc.returncode == 0
+
     def check_environment(self) -> dict:
         root = self.clone_path.resolve()
         result = {"ok": False, "environment": self.environment.identity, "diagnostic": None}
-        for stage, argv in (
+        checks = [
             (
                 "interpreter",
                 self.environment.python_argv("-c", "import sys; print(sys.executable)"),
@@ -1725,7 +1937,10 @@ class GitHubRepoProfile(ProfileFieldAliases):
                     environment=self.environment,
                 ),
             ),
-        ):
+        ]
+        if self.ruler.benchmark_cmd:
+            checks = checks[:2]
+        for stage, argv in checks:
             try:
                 proc = self.environment.run(
                     argv, cwd=root, timeout=_QUICK_TIMEOUT_S, env=_measure_env(root)
@@ -1748,6 +1963,12 @@ class GitHubRepoProfile(ProfileFieldAliases):
                 if count <= 0:
                     result["diagnostic"] = _diagnostic(stage, proc)
                     return result
+        if self.ruler.benchmark_cmd:
+            try:
+                self.ruler._benchmark_once(root, self.ruler.benchmark_cmd)
+            except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+                result["diagnostic"] = _diagnostic("benchmark", exc)
+                return result
         result["ok"] = True
         result["environment"] = self.environment.identity
         return result
@@ -2013,7 +2234,8 @@ def build_profile(config: dict) -> GitHubRepoProfile:
     """
     from ...backend import store
 
-    cfg = config or {}
+    cfg = dict(config or {})
+    cfg.update(normalize_measurement_config(cfg))
     clone = str(cfg.get("clone") or "").strip()
     if not clone:
         raise ValueError("no repository configured — run setup-clone first")
@@ -2036,6 +2258,9 @@ def build_profile(config: dict) -> GitHubRepoProfile:
         base_ref=base_ref,
         track=str(cfg.get("track") or TRACK_BUG),
         benchmark_cmd=str(cfg.get("benchmarkCommand") or ""),
+        benchmark_canary_cmd=str(cfg.get("benchmarkCanaryCommand") or ""),
+        benchmark_result_mode=cfg.get("benchmarkResultMode", "wall"),
+        benchmark_protected_paths=cfg["benchmarkProtectedPaths"],
         scope_base=str(cfg.get("scopeDiffBase") or ""),
         origin_url=_resolve_origin_url(cfg),
         allowed_globs=(
@@ -2047,4 +2272,6 @@ def build_profile(config: dict) -> GitHubRepoProfile:
         noise_floor_s=float(cfg.get("noiseFloorSeconds") or 0.25),
         log_dir=store.logs_dir(),
         test_environment=cfg.get("testEnvironment"),
+        focused_test_paths=cfg["focusedTestPaths"],
+        full_regression_timeout_s=cfg["fullRegressionTimeoutSeconds"],
     )

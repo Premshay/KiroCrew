@@ -1477,3 +1477,48 @@ confine the daemon's workload. Runners must enforce downstream isolation themsel
 configured filesystem or egress restrictions that this adapter cannot enforce
 across delegation refuse execution, naming the scope. The app does not grant daemon
 access or relax platform policy. See [governance](governance.md#repository-runner-admission).
+
+## Bounded measurements and finalist regression
+
+Repository measurement settings are exposed with the test environment in Setup:
+`track`, `benchmarkCommand`, `benchmarkCanaryCommand`, `benchmarkResultMode`
+(`wall` or `structured`), `benchmarkProtectedPaths`, `focusedTestPaths`, and
+`fullRegressionTimeoutSeconds`.
+They are remembered per repository. Changes invalidate calibration and the UI's
+readiness result. The benchmark control proves sensitivity, not correctness.
+
+Explicit focused paths only narrow iteration checks. An opted-in finalist is
+provisionally committed, then runs unrestricted `pytest .` through the selected
+isolated environment before any kept record, queue entry or publication. Only
+exit zero qualifies; there are no baseline-failure waivers or serial retries.
+The independent regression timeout defaults to 900 seconds. The driver reserves
+that timeout plus 30 seconds of runner cleanup inside the remaining run budget,
+and checks Stop, budget, isolation and unchanged tree afterward. Stop does not
+interrupt the subprocess, but prevents acceptance when it returns.
+
+Direct-push rebases repeat full regression on the changed tree. Publication
+rechecks the verified tree and budget. Profiles without explicit focused paths
+retain their existing checks without an extra full-suite invocation.
+
+The driver releases provisional rollback ownership after a confirmed push or draft.
+A later ledger or commit-message failure retains the landed SHA or draft reference,
+reports the bookkeeping error and stops publication for the run. Reconcile the
+ledger before restarting; a missing durable row cannot prevent rediscovery.
+Rollback ownership belongs to each winner, never a previous winner’s push state.
+
+Manual queued draft/commit publication of focused finalists uses the existing
+supervisor worker, authenticated execution capture, status and Stop controls.
+Both manual handlers bind middleware-authenticated app identity before launching
+the worker, preserving runner admission without granting additional permissions.
+HTTP 202 means pending, not published. Under the shared clone lock it materializes
+the queued diff on a fresh base, commits, runs full regression, and checks the
+exact revision, clean tree, deadline, Stop and isolation before publication.
+Failures retain the queue and roll back safely; failed or unsafe rollback
+quarantines the clone. A durable marker requires regression even after focused
+paths are cleared. Queued drafts never count as filed or advance the baseline.
+
+HTTP and MCP share the validated ruler reader. Calibration binds normalized
+settings (including protected benchmark paths, noise floor and band cap) to the
+measured source revision and execution identity. Interpreter and trusted runner
+content hashes detect replacement without relying on file timestamps. Missing,
+changed or unavailable provenance requires recalibration.

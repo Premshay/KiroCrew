@@ -1,4 +1,10 @@
 {
+  "autoImprovementCalibration": {
+    "action": "보정",
+    "warning": "먼저 환경을 저장하고 확인하세요. 보정을 반복할 때마다 설정된 작업을 실행하고 리소스를 사용합니다. 총 소요 시간은 측정하기 전까지 알 수 없습니다.",
+    "calibrating": "보정 중…",
+    "stopping": "중지 중…"
+  },
   "appChatLaunch": {
     "unsent": "{{error}}\n\n메시지가 전송되지 않았습니다. 복사한 후 다시 시도하세요:\n{{message}}",
     "cancelled": "세션을 전환하여 전송이 취소되었습니다.",
@@ -16053,5 +16059,22 @@
     "runnerPython": "Python 실행 파일 (선택 사항; 기본값: python)",
     "runnerPath": "러너 실행 파일의 절대 경로를 입력하세요.",
     "runnerHint": "선택한 러너는 각 독립 체크아웃에서 검사를 실행하며 서비스 준비와 정리를 포함한 대상 저장소의 테스트 환경을 제공해야 합니다. 컨테이너 격리는 러너에 따라 달라집니다."
+  },
+  "boundedMeasurement": {
+    "publishing": "게시 전 전체 회귀 테스트 확인 중",
+    "published": "게시됨",
+    "benchmarkProtectedPaths": "보호할 벤치마크 파일 또는 디렉터리 (줄마다 저장소 상대 경로 하나)",
+    "title": "측정",
+    "bug": "버그 수정",
+    "perf": "성능",
+    "track": "모드",
+    "benchmarkCommand": "벤치마크 명령 (선택 사항)",
+    "benchmarkCanaryCommand": "느린 대조군 명령",
+    "wall": "경과 시간",
+    "structured": "구조화된 소요 시간",
+    "resultMode": "벤치마크 결과",
+    "focusedTestPaths": "대상 pytest 경로 (줄당 하나)",
+    "fullRegressionTimeoutSeconds": "전체 회귀 테스트 제한 시간 (초)",
+    "hint": "보정 전에 저장하고 확인하세요. 대조군은 측정 민감도를 확인합니다. 집중 테스트의 최종 후보는 승인 전에 실행 예산 내에서 전체 테스트를 통과해야 합니다. 이러한 후보는 대기열에서 수동으로 게시할 수 없습니다."
   }
 }

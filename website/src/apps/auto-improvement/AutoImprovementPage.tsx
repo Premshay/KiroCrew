@@ -300,6 +300,7 @@ export default function AutoImprovementPage() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['auto-improvement-findings'] })
       qc.invalidateQueries({ queryKey: ['auto-improvement-finding'] })
+      qc.invalidateQueries({ queryKey: ['auto-improvement-run'] })
     },
   })
 

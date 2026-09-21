@@ -382,6 +382,7 @@ class RunSupervisor:
                 started_at=_pos_float(record.get("started_at"), 0.0),
                 finished_at=_pos_float(record.get("finished_at"), 0.0),
                 offline_reason=str(record.get("offline_reason") or ""),
+                stats=record.get("publication_result") or {},
             )
         except Exception:  # noqa: BLE001 -- see docstring: must not break every run route
             logger.warning(
@@ -763,6 +764,97 @@ class RunSupervisor:
             raise
         return {"run_id": run_id, "status": STATUS_RUNNING}
 
+    def publish(self, operation) -> dict[str, Any]:
+        from .commit import clone_lock
+
+        with clone_lock():
+            record_path = _terminal_record_path()
+            with self._lock:
+                if self._in_flight():
+                    raise RuntimeError("A run is already active")
+                run_id = f"publish-{time.time_ns()}"
+                self._driver = None
+                self._stop_requested = False
+                self._state = RunState(
+                    status=STATUS_RUNNING,
+                    run_id=run_id,
+                    started_at=time.time(),
+                    stage="full_regression",
+                    record_path=record_path,
+                    stats={"publication": "pending"},
+                )
+                thread = threading.Thread(
+                    target=capture_app_execution(self._publish_loop),
+                    args=(operation,),
+                    name=f"auto-improvement-{run_id}",
+                    daemon=True,
+                )
+                self._thread = thread
+                self._reserved = True
+            try:
+                thread.start()
+            except BaseException as exc:
+                with self._lock:
+                    self._reserved = False
+                self._fail(exc)
+                raise
+        return {"run_id": run_id, "status": STATUS_RUNNING, "publication": "pending"}
+
+    def _publish_loop(self, operation) -> None:
+        from .commit import _git, clone_lock, run_publication_regression, safe_rollback
+
+        with self._lock:
+            self._reserved = False
+        result = None
+        try:
+            with clone_lock():
+                config = store.read_json(store.config_path(), {}) or {}
+                clone = Path(str(config.get("clone") or ""))
+                if not config.get("clone") or not clone_setup._repository_is_isolated(clone):
+                    raise RuntimeError("Publication repository isolation is unavailable")
+                head = _git(clone, "rev-parse", "HEAD")
+                if head.returncode or not head.stdout.strip():
+                    raise RuntimeError("Publication rollback revision is unavailable")
+                result = None
+                try:
+                    self._raise_if_stopped()
+                    result = operation(
+                        lambda cfg: run_publication_regression(cfg, self._stop_check)
+                    )
+                finally:
+                    if not result or result.get("ok") is not True:
+                        safe_rollback(clone, head.stdout.strip())
+                if result.get("ok") is not True:
+                    raise RuntimeError(
+                        str(result.get("error") or result.get("detail") or "Change stays queued")
+                    )
+                if result.get("sha"):
+                    from . import ledger_admin
+
+                    ledger_admin.record_committed(
+                        str(result["fp"]), branch=str(result["branch"]), sha=str(result["sha"])
+                    )
+                with self._lock:
+                    self._state.stats = {"publication": "published", **_redact_activity(result)}
+                    self._state.status = STATUS_DONE
+                    self._state.stage = ""
+                    self._state.finished_at = time.time()
+                if result.get("cleanupError"):
+                    self._fail(RuntimeError(str(result["cleanupError"])))
+        except _CalibrationStopped:
+            with self._lock:
+                self._state.stats = {"publication": "queued"}
+            self._mark_stopped()
+        except BaseException as exc:
+            with self._lock:
+                if result and result.get("ok") is True:
+                    self._state.stats = {"publication": "published", **_redact_activity(result)}
+                else:
+                    self._state.stats = {"publication": "queued"}
+            self._fail(exc)
+        finally:
+            self._persist_terminal_state()
+
     def calibrate(self, config: dict[str, Any]) -> dict[str, Any]:
         """Run Phase 1 — prove the ruler — on a worker thread.
 
@@ -786,7 +878,10 @@ class RunSupervisor:
                 raise RuntimeError(f"a run is already active (run_id={self._state.run_id})")
             self._stop_requested = False
             self._state = RunState(
-                status=STATUS_CALIBRATING, run_id=run_id, started_at=time.time(), stage="calibrate"
+                status=STATUS_CALIBRATING,
+                run_id=run_id,
+                started_at=time.time(),
+                stage="calibrate",
             )
             self._state.activity.append(
                 {"t": time.time(), "note": f"calibration {run_id} starting"}
@@ -885,6 +980,7 @@ class RunSupervisor:
                 # at every phase boundary and abort cleanly.
                 self._raise_if_stopped()
                 self._note(f"collecting {reps} baseline sample(s)")
+                provenance = store_mod.measurement_provenance(config)
                 samples = profile.ruler.baseline_samples(base_src=clone, reps=reps)
                 # A stop lands as a short/empty sample list from the ruler's own
                 # between-rep check; treat that as the stop it is, not as the genuine
@@ -938,7 +1034,11 @@ class RunSupervisor:
                     "label": getattr(profile.ruler, "primary_name", ""),
                 }
                 median = sorted(samples)[len(samples) // 2]
+                if store_mod.measurement_provenance(config) != provenance:
+                    raise RuntimeError("Measurement provenance changed during calibration")
                 ruler_doc = {
+                    "provenance": provenance,
+                    "measurementConfig": store_mod.measurement_identity(config),
                     "status": status,
                     "primary": primary,
                     "noiseBand": {
@@ -1112,6 +1212,7 @@ class RunSupervisor:
                 "started_at": st.started_at,
                 "finished_at": st.finished_at,
                 "offline_reason": st.offline_reason,
+                "publication_result": st.stats if st.run_id.startswith("publish-") else {},
             }
         try:
             store.write_json_atomic(path or _terminal_record_path(), record)
@@ -1184,7 +1285,7 @@ class RunSupervisor:
             # transition, but the run still had no agent runner, and reporting the same lie
             # here would just move it one branch over.
             status = st.status
-            if status in (STATUS_RUNNING, STATUS_STOPPING) and not alive:
+            if status in (STATUS_RUNNING, STATUS_STOPPING) and not alive and not self._reserved:
                 clean = not st.error and not st.offline_reason
                 status = STATUS_DONE if clean else STATUS_ERROR
             return {

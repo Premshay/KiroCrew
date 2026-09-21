@@ -69,6 +69,13 @@ _CONFIG_WRITABLE = frozenset(
         "measureReps",
         "calibrationReps",
         "testEnvironment",
+        "track",
+        "benchmarkCommand",
+        "benchmarkCanaryCommand",
+        "benchmarkResultMode",
+        "benchmarkProtectedPaths",
+        "focusedTestPaths",
+        "fullRegressionTimeoutSeconds",
         "bandCapMs",
         "forceBugSeeds",
         "autoDraftPr",
@@ -318,8 +325,23 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
             if _run_is_active():
                 return None
             current = store.read_json(store.config_path(), {}) or {}
+            previous = dict(current)
             current.update({k: v for k, v in patch.items() if k in _CONFIG_WRITABLE})
+            from ..profiles.github_repo.profile import normalize_measurement_config
+
+            current.update(normalize_measurement_config(current))
             store.remember_test_environment(current)
+            if store.measurement_identity(previous) != store.measurement_identity(
+                current
+            ) or previous.get("branch") != current.get("branch"):
+                store.write_json_atomic(
+                    store.data_dir()
+                    / "repos"
+                    / store.workspace_key(current)
+                    / "ruler"
+                    / "ruler.json",
+                    {"status": "uncalibrated"},
+                )
             store.write_json_atomic(store.config_path(), current)
             return current
 
@@ -612,9 +634,7 @@ async def _handle_delete_session(request: web.Request) -> web.StreamResponse:
 
 
 async def _handle_ruler(_request: web.Request) -> web.StreamResponse:
-    ruler = await asyncio.to_thread(
-        store.read_json, store.ruler_dir() / "ruler.json", {"status": "uncalibrated"}
-    )
+    ruler = await asyncio.to_thread(progress.read_ruler)
     return web.json_response(ruler or {"status": "uncalibrated"})
 
 
@@ -824,7 +844,8 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
     detail = await asyncio.to_thread(_gather)
     if not detail:
         return web.json_response(
-            {"code": "finding_not_found", "error": f"no finding with fingerprint {fp}"}, status=404
+            {"code": "finding_not_found", "error": f"no finding with fingerprint {fp}"},
+            status=404,
         )
     # Redact the WHOLE tree, not just the fields enumerated in `_gather`. The per-field
     # calls above are defense-in-depth, but the endpoint also returns blocks assembled
@@ -835,6 +856,7 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
     return web.json_response({"finding": _redact_tree(detail)})
 
 
+@authenticated_app_execution(store.APP_NAME)
 async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     """Draft (or re-draft) a pull request for a finding already in the queue.
 
@@ -869,7 +891,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     ):
         return busy
 
-    def _draft() -> dict[str, Any]:
+    def _draft(regression=None) -> dict[str, Any]:
         queue = store.pr_queue_dir()
         body_path = queue / f"{fp}.pr.md"
         diff_path = queue / f"{fp}.diff"
@@ -877,6 +899,11 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
             return {"ok": False, "error": f"no queued change for fingerprint {fp}"}
 
         config = store.read_json(store.config_path(), {}) or {}
+        if commit_mod.manual_regression_required(config, fp) and regression is None:
+            return {
+                "ok": False,
+                "error": "Publication requires the supervised full-regression worker",
+            }
         clone = str(config.get("clone") or "").strip()
         if not clone:
             return {"ok": False, "error": "no repository configured"}
@@ -931,7 +958,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
 
         def _rollback() -> None:
             if base:
-                commit_mod._git(Path(clone), "reset", "--hard", base)
+                commit_mod.safe_rollback(Path(clone), base)
 
         committed = commit_mod.commit_staged_for_draft(
             clone=Path(clone), body_path=body_path, fp=fp
@@ -954,6 +981,8 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
             fetch_url=clone_setup.resolve_origin_url(config) or None,
         )
         try:
+            if regression is not None:
+                recipe.publication_guard = regression(config)
             ref = recipe.draft(
                 summary=summary,
                 description=body,
@@ -965,6 +994,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
             _rollback()
             raise
         drafted = ref.startswith("http")
+        cleanup_error = ""
         # The reset runs on BOTH arms, so it lives in `finally` rather than being duplicated:
         # the ledger append is the only thing that differs, and it must not be able to SKIP the
         # reset by raising. D-79 deliberately ordered the row before the reset so a reset could
@@ -996,9 +1026,16 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
             # commit must not stay behind either; the durable queue copy a retry works from is
             # untouched. Unlike the perf loop's deliberate non-reset (D-71), a manual draft is
             # one discrete publish action with no cumulative-measurement story.
-            _rollback()
+            try:
+                _rollback()
+            except Exception as exc:
+                if not drafted:
+                    raise
+                cleanup_error = _redact_for_display(str(exc))
+                logger.exception("Draft published but clone cleanup failed; clone quarantined")
         return {
             "ok": drafted,
+            "cleanupError": cleanup_error,
             "fp": fp,
             "pr": ref,
             "detail": (
@@ -1027,6 +1064,9 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         with commit_mod.clone_lock():
             if _run_is_active():
                 return _RUN_STARTED
+            config = store.read_json(store.config_path(), {}) or {}
+            if commit_mod.manual_regression_required(config, fp):
+                return runner.get_supervisor().publish(_draft)
             return _draft()
 
     result = await asyncio.to_thread(_draft_serialized)
@@ -1040,6 +1080,8 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
             status=409,
         )
     assert isinstance(result, dict)
+    if result.get("publication") == "pending":
+        return web.json_response(result, status=202)
     if result.get("ok"):
         return web.json_response(result, status=200)
     return web.json_response(
@@ -1167,7 +1209,8 @@ async def _handle_watcher_start(request: web.Request) -> web.StreamResponse:
     rows = [f for f in await asyncio.to_thread(progress.read_findings) if f.get("fp") == fp]
     if not rows:
         return web.json_response(
-            {"code": "finding_not_found", "error": f"no finding with fingerprint {fp}"}, status=404
+            {"code": "finding_not_found", "error": f"no finding with fingerprint {fp}"},
+            status=404,
         )
     finding = rows[0]
     pr_ref = str(finding.get("pr") or "")
@@ -1257,7 +1300,8 @@ async def _handle_profile(request: web.Request) -> web.StreamResponse:
         return web.json_response({"code": "invalid_request", "error": str(exc)}, status=400)
     if tree is None:
         return web.json_response(
-            {"code": "profile_not_found", "error": f"no profile for fingerprint {fp}"}, status=404
+            {"code": "profile_not_found", "error": f"no profile for fingerprint {fp}"},
+            status=404,
         )
     # Scan the frame tree before it reaches the browser: its function/module/file names come
     # from the target repo's code, so a credential-shaped identifier would otherwise be served
@@ -1284,7 +1328,10 @@ async def _handle_forget(request: web.Request) -> web.StreamResponse:
     if result.get("ok"):
         return web.json_response(result, status=200)
     return web.json_response(
-        {"code": "finding_not_found", "error": _redact_for_display(str(result.get("error") or ""))},
+        {
+            "code": "finding_not_found",
+            "error": _redact_for_display(str(result.get("error") or "")),
+        },
         status=404,
     )
 
@@ -1302,7 +1349,10 @@ async def _handle_purge(request: web.Request) -> web.StreamResponse:
     if result.get("ok"):
         return web.json_response(result, status=200)
     return web.json_response(
-        {"code": "finding_not_found", "error": _redact_for_display(str(result.get("error") or ""))},
+        {
+            "code": "finding_not_found",
+            "error": _redact_for_display(str(result.get("error") or "")),
+        },
         status=404,
     )
 
@@ -1344,6 +1394,7 @@ async def _handle_calibrate(_request: web.Request) -> web.StreamResponse:
         return web.json_response({"code": "watcher_conflict", "error": str(exc)}, status=409)
 
 
+@authenticated_app_execution(store.APP_NAME)
 async def _handle_commit(request: web.Request) -> web.StreamResponse:
     """Commit a queued change straight to the configured branch (the one-click
     autocommit button). Denylist-gated to a non-protected branch, same as the
@@ -1377,6 +1428,11 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
         with commit_mod.clone_lock():
             if _run_is_active():
                 return _RUN_STARTED
+            config = store.read_json(store.config_path(), {}) or {}
+            if commit_mod.manual_regression_required(config, fp):
+                return runner.get_supervisor().publish(
+                    lambda regression: commit_mod.commit_finding(fp, regression=regression)
+                )
             return commit_mod.commit_finding(fp)
 
     result = await asyncio.to_thread(_commit)
@@ -1390,6 +1446,8 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
             status=409,
         )
     assert isinstance(result, dict)
+    if result.get("publication") == "pending":
+        return web.json_response(result, status=202)
     if result.get("ok"):
         # Supersede the `filed` row: the ledger is last-write-wins per fingerprint, and
         # `filed` is what drives the PR watchers and the UI's commit button — so without
@@ -1411,7 +1469,10 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
     # showing it at the finding row, which made it a live egress path to the browser, so
     # this pass stays as the output-boundary backstop. Raised by the GPT review.
     return web.json_response(
-        {"code": "request_failed", "error": _redact_for_display(str(result.get("error") or ""))},
+        {
+            "code": "request_failed",
+            "error": _redact_for_display(str(result.get("error") or "")),
+        },
         status=400,
     )
 
@@ -1432,7 +1493,10 @@ async def _handle_deps_install(_request: web.Request) -> web.StreamResponse:
     if result.get("ok"):
         return web.json_response(result, status=200)
     return web.json_response(
-        {"code": "operation_failed", "error": _redact_for_display(str(result.get("error") or ""))},
+        {
+            "code": "operation_failed",
+            "error": _redact_for_display(str(result.get("error") or "")),
+        },
         status=500,
     )
 

@@ -18,6 +18,7 @@ def data_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(store, "workspace_dir", lambda: tmp_path / "data")
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
     store.ensure_layout()
+    monkeypatch.setattr(store, "measurement_provenance", lambda _: {"sourceRevision": "fixture"})
     return tmp_path / "data"
 
 
@@ -29,6 +30,11 @@ def _archive(root: Path, rows: list[dict]) -> None:
 
 
 def _ruler(root: Path, payload: dict) -> None:
+    payload = {
+        "measurementConfig": store.measurement_identity({}),
+        "provenance": {"sourceRevision": "fixture"},
+        **payload,
+    }
     (root / "ruler").mkdir(parents=True, exist_ok=True)
     (root / "ruler" / "ruler.json").write_text(json.dumps(payload), encoding="utf-8")
 
@@ -47,7 +53,12 @@ class TestProgressSeries:
             data_home,
             [
                 {"cycle": 1, "cand_id": "a", "status": "kept", "primary_delta": "-10"},
-                {"cycle": 2, "cand_id": "b", "status": "discarded_noise", "primary_delta": "-40"},
+                {
+                    "cycle": 2,
+                    "cand_id": "b",
+                    "status": "discarded_noise",
+                    "primary_delta": "-40",
+                },
                 {"cycle": 3, "cand_id": "c", "status": "kept", "primary_delta": "+5"},
             ],
         )
@@ -201,7 +212,12 @@ class TestMcpServer:
             mcp_server, "_audit", lambda name, **kw: seen.append({"tool": name, **kw})
         )
         mcp_server.handle(
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_status"}}
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "get_status"},
+            }
         )
         mcp_server.handle(
             {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "nope"}}
@@ -270,7 +286,12 @@ class TestMcpServer:
         # this test would silently stop exercising the broken-sink path.
         monkeypatch.setattr(mcp_server, "sel", _boom)
         out = mcp_server.handle(
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_status"}}
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "get_status"},
+            }
         )
         assert out is not None, "a tools/call must always answer something"
         assert "result" not in out, "an unauditable read was served anyway"
@@ -298,7 +319,12 @@ class TestMcpServer:
         """A tool result must not be able to blow the agent's context window."""
         monkeypatch.setattr(progress, "read_progress", lambda: {"points": [{"d": "x" * 200_000}]})
         out = mcp_server.handle(
-            {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "get_progress"}}
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {"name": "get_progress"},
+            }
         )
         assert out is not None
         assert len(out["result"]["content"][0]["text"]) <= mcp_server._MAX_RESULT_CHARS

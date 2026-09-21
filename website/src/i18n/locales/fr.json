@@ -1,4 +1,10 @@
 {
+  "autoImprovementCalibration": {
+    "action": "Étalonner",
+    "warning": "Enregistrez et vérifiez d’abord l’environnement. Chaque répétition de l’étalonnage exécute la charge configurée et consomme des ressources. La durée totale reste inconnue avant la mesure.",
+    "calibrating": "Étalonnage en cours…",
+    "stopping": "Arrêt en cours…"
+  },
   "appChatLaunch": {
     "unsent": "{{error}}\n\nMessage non envoyé. Copie-le pour réessayer :\n{{message}}",
     "cancelled": "Envoi annulé car tu as changé de session.",
@@ -16474,5 +16480,22 @@
     "runnerPython": "Exécutable Python (facultatif ; défaut : python)",
     "runnerPath": "Saisissez le chemin absolu de l’exécutable de l’exécuteur.",
     "runnerHint": "L’exécuteur sélectionné lance les vérifications sur chaque copie de travail isolée et doit fournir l’environnement de test du dépôt cible, y compris la préparation et le nettoyage des services. L’isolation par conteneur dépend de l’exécuteur."
+  },
+  "boundedMeasurement": {
+    "publishing": "Vérification complète des régressions avant publication",
+    "published": "Publié",
+    "benchmarkProtectedPaths": "Fichiers ou dossiers du benchmark protégés (un chemin relatif au dépôt par ligne)",
+    "title": "Mesures",
+    "bug": "Corrections de bugs",
+    "perf": "Performance",
+    "track": "Mode",
+    "benchmarkCommand": "Commande de benchmark (facultative)",
+    "benchmarkCanaryCommand": "Commande de contrôle ralenti",
+    "wall": "Temps écoulé",
+    "structured": "Durée structurée",
+    "resultMode": "Résultat du benchmark",
+    "focusedTestPaths": "Chemins pytest ciblés (un par ligne)",
+    "fullRegressionTimeoutSeconds": "Délai de régression complète (secondes)",
+    "hint": "Enregistrez et vérifiez avant de calibrer. Le contrôle vérifie la sensibilité des mesures. Les finalistes testés de façon ciblée doivent réussir toute la suite dans le budget du cycle avant acceptation. Leur publication manuelle depuis la file est indisponible."
   }
 }

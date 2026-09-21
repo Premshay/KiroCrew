@@ -1,4 +1,10 @@
 {
+  "autoImprovementCalibration": {
+    "action": "Calibra",
+    "warning": "Prima salva e verifica l’ambiente. Ogni ripetizione della calibrazione esegue il carico configurato e consuma risorse. La durata totale è sconosciuta fino alla misurazione.",
+    "calibrating": "Calibrazione in corso…",
+    "stopping": "Arresto in corso…"
+  },
   "appChatLaunch": {
     "unsent": "{{error}}\n\nMessaggio non inviato. Copialo per riprovare:\n{{message}}",
     "cancelled": "Invio annullato perché hai cambiato sessione.",
@@ -16473,5 +16479,22 @@
     "runnerPython": "Eseguibile Python (facoltativo; predefinito: python)",
     "runnerPath": "Inserisci il percorso assoluto dell’eseguibile dell’esecutore.",
     "runnerHint": "L’esecutore selezionato esegue i controlli su ogni copia di lavoro isolata e deve fornire l’ambiente di test del repository, incluse la preparazione e la pulizia dei servizi. L’isolamento dei container dipende dall’esecutore."
+  },
+  "boundedMeasurement": {
+    "publishing": "Verifica completa delle regressioni prima della pubblicazione",
+    "published": "Pubblicato",
+    "benchmarkProtectedPaths": "File o directory del benchmark protetti (un percorso relativo al repository per riga)",
+    "title": "Misurazioni",
+    "bug": "Correzioni di bug",
+    "perf": "Prestazioni",
+    "track": "Modalità",
+    "benchmarkCommand": "Comando benchmark (facoltativo)",
+    "benchmarkCanaryCommand": "Comando di controllo rallentato",
+    "wall": "Tempo trascorso",
+    "structured": "Durata strutturata",
+    "resultMode": "Risultato del benchmark",
+    "focusedTestPaths": "Percorsi pytest mirati (uno per riga)",
+    "fullRegressionTimeoutSeconds": "Timeout regressione completa (secondi)",
+    "hint": "Salva e verifica prima di calibrare. Il controllo verifica la sensibilità della misurazione. I finalisti con test mirati devono superare l’intera suite entro il budget di esecuzione prima dell’accettazione. La pubblicazione manuale dalla coda non è disponibile per questi finalisti."
   }
 }

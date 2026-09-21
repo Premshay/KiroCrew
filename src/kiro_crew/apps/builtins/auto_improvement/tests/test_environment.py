@@ -409,7 +409,14 @@ async def test_every_verification_path_uses_admitted_runner_and_strict_executor(
         assert profile.bug_runner.run_suite(src=root)[0]
         assert profile.build_gate.build_and_test(worktree=root, src=root).passed
         assert profile.ruler._time_once(root)[1]
-        assert profile.ruler._time_once(root, collect_only=True)[1]
+        with pytest.raises(ValueError, match="custom benchmarks do not use collection"):
+            profile.ruler._time_once(root, collect_only=True)
+        suite_profile = gp.GitHubRepoProfile(
+            clone_path=root,
+            pr_queue_dir=root.parent / "queue",
+            test_environment=state.config,
+        )
+        assert suite_profile.ruler._time_once(root, collect_only=True)[1]
         assert gp._collected_count(root, profile.environment) == 1
         profile.capture_profile(fp="runner", worktree=root)
 

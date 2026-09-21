@@ -1,4 +1,10 @@
 {
+  "autoImprovementCalibration": {
+    "action": "Calibrar",
+    "warning": "Salve e verifique o ambiente primeiro. Cada repetição da calibração executa a carga configurada e consome recursos. A duração total é desconhecida até ser medida.",
+    "calibrating": "Calibrando…",
+    "stopping": "Parando…"
+  },
   "appChatLaunch": {
     "unsent": "{{error}}\n\nMensagem não enviada. Copie-a para tentar novamente:\n{{message}}",
     "cancelled": "O envio foi cancelado porque você mudou de sessão.",
@@ -16473,5 +16479,22 @@
     "runnerPython": "Executável Python (opcional; padrão: python)",
     "runnerPath": "Insira o caminho absoluto do executável do executor.",
     "runnerHint": "O executor selecionado realiza verificações em cada cópia de trabalho isolada e deve fornecer o ambiente de testes do repositório, incluindo a preparação e limpeza dos serviços. O isolamento por contêiner depende do executor."
+  },
+  "boundedMeasurement": {
+    "publishing": "Verificando a regressão completa antes de publicar",
+    "published": "Publicado",
+    "benchmarkProtectedPaths": "Arquivos ou diretórios de benchmark protegidos (um caminho relativo ao repositório por linha)",
+    "title": "Medições",
+    "bug": "Correções de bugs",
+    "perf": "Desempenho",
+    "track": "Modo",
+    "benchmarkCommand": "Comando de benchmark (opcional)",
+    "benchmarkCanaryCommand": "Comando de controle desacelerado",
+    "wall": "Tempo decorrido",
+    "structured": "Duração estruturada",
+    "resultMode": "Resultado do benchmark",
+    "focusedTestPaths": "Caminhos pytest específicos (um por linha)",
+    "fullRegressionTimeoutSeconds": "Tempo limite da regressão completa (segundos)",
+    "hint": "Salve e verifique antes de calibrar. O controle verifica a sensibilidade da medição. Os finalistas com testes específicos devem passar em toda a suíte dentro do orçamento de execução antes da aceitação. A publicação manual pela fila não está disponível para esses finalistas."
   }
 }

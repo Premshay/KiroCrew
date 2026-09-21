@@ -21,6 +21,7 @@ const config = {
 }
 const response = (body: unknown, status = 200) => ({ ok: status < 400, status, json: async () => body }) as Response
 let status: string
+let publication: string | undefined
 let writeResponse: Response
 let checkResponse: () => Promise<Response>
 let writes: Array<{ path: string; body: Record<string, unknown> }>
@@ -43,6 +44,7 @@ async function readyToEdit() { await waitFor(() => expect(check()).not.toBeDisab
 
 beforeEach(() => {
   status = 'idle'
+  publication = undefined
   writeResponse = response({ ok: true })
   checkResponse = async () => response({ ok: true, tests_collected: 4 })
   writes = []
@@ -53,13 +55,34 @@ beforeEach(() => {
       return path.endsWith('/environment/check') ? checkResponse() : writeResponse
     }
     if (path.endsWith('/branches')) return response({ branches: ['main', 'feature'] })
-    if (path.endsWith('/run')) return response({ status, ...(status === 'error' ? { error: 'Previous run failed' } : {}) })
+    if (path.endsWith('/run')) return response({ status, stats: { publication }, ...(status === 'error' ? { error: 'Previous run failed' } : {}) })
     return response(config)
   }))
 })
 afterEach(() => vi.unstubAllGlobals())
 
 describe('test environment setup', () => {
+  it.each([
+    ['running', 'pending', 'Checking full regression before publication'],
+    ['done', 'published', 'Published'],
+  ])('shows publication outcome for %s', async (runStatus, outcome, label) => {
+    status = runStatus
+    publication = outcome
+    mount()
+    expect(await screen.findByText(label)).toBeInTheDocument()
+  })
+
+  it('persists trusted benchmark paths as repository-relative arrays', async () => {
+    mount({ ...config, benchmarkProtectedPaths: ['controls'] })
+    await readyToEdit()
+    const paths = screen.getByLabelText(/Protected benchmark files/)
+    expect(paths).toHaveValue('controls')
+    fireEvent.change(paths, { target: { value: 'controls\nbench/helpers.py' } })
+    fireEvent.click(save())
+    await waitFor(() => expect(writes).toHaveLength(1))
+    expect(writes[0].body.benchmarkProtectedPaths).toEqual(['controls', 'bench/helpers.py'])
+  })
+
   it('checks and saves gateway variables without dropping them', async () => {
     mount({ ...config, testEnvironment: { kind: 'gateway', variables: { MODE: 'test' } } })
     await readyToEdit()
@@ -83,7 +106,7 @@ describe('test environment setup', () => {
     expect(executable()).toHaveValue('/draft/python')
     fireEvent.click(save())
     await waitFor(() => expect(writes).toHaveLength(1))
-    expect(writes[0].body).toEqual({ testEnvironment: { kind: 'python', pythonExecutable: '/draft/python', variables: {} } })
+    expect(writes[0].body.testEnvironment).toEqual({ kind: 'python', pythonExecutable: '/draft/python', variables: {} })
   })
 
   it('does not copy repository A draft or readiness into repository B', async () => {
@@ -178,7 +201,7 @@ describe('test environment setup', () => {
     } }])
     fireEvent.click(save())
     await waitFor(() => expect(writes).toHaveLength(2))
-    expect(writes[1].body).toEqual(writes[0].body)
+    expect(writes[1].body.testEnvironment).toEqual(writes[0].body.testEnvironment)
   })
 
   it.each(['', 'tools/check'])('rejects runner path %j without making a request', async (path) => {
@@ -314,4 +337,17 @@ describe('test environment setup', () => {
     expect(executable()).not.toBeDisabled()
   })
 
+})
+
+
+it('saves the selected performance track and structured benchmark mode', async () => {
+  mount()
+  await readyToEdit()
+  fireEvent.change(screen.getByLabelText('Track'), { target: { value: 'perf' } })
+  fireEvent.change(screen.getByLabelText('Benchmark result'), { target: { value: 'structured' } })
+  fireEvent.change(screen.getByLabelText('Benchmark command (optional)'), { target: { value: 'python bench.py' } })
+  fireEvent.change(screen.getByLabelText('Slowed control command'), { target: { value: 'python bench.py --slow' } })
+  fireEvent.click(save())
+  await waitFor(() => expect(writes).toHaveLength(1))
+  expect(writes[0].body).toMatchObject({ track: 'perf', benchmarkResultMode: 'structured', benchmarkCommand: 'python bench.py', benchmarkCanaryCommand: 'python bench.py --slow' })
 })

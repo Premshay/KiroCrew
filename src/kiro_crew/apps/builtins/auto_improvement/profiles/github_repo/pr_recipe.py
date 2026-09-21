@@ -403,12 +403,21 @@ class GitHubPRRecipe:
         scanned, scan_note = self._scan_pushable_content()
         if not scanned:
             return False, scan_note
+        guard = getattr(self, "publication_guard", None)
+        revision = "HEAD"
+        if guard is not None:
+            if guard() is not True:
+                return False, "full regression is no longer valid; rerun the candidate"
+            head = self._git("rev-parse", "HEAD")
+            revision = (head.stdout or "").strip()
+            if head.returncode or not revision or guard() is not True:
+                return False, "full regression is no longer valid; rerun the candidate"
         try:
             proc = self._git(
                 "push",
                 "--force-with-lease",
                 url,
-                f"HEAD:refs/heads/{branch}",
+                f"{revision}:refs/heads/{branch}",
                 timeout=_PUSH_TIMEOUT_S,
             )
         except (OSError, subprocess.SubprocessError):
@@ -444,6 +453,9 @@ class GitHubPRRecipe:
         FIRST so the record survives even when pushing or ``gh`` is unavailable —
         the morning-collection workflow keeps working offline.
         """
+        guard = getattr(self, "publication_guard", None)
+        if guard is not None and guard() is not True:
+            raise RuntimeError("full regression is no longer valid; rerun the candidate")
         self.pr_queue_dir.mkdir(parents=True, exist_ok=True)
         (self.pr_queue_dir / f"{fingerprint}.diff").write_text(diff or "", encoding="utf-8")
         body_path = self.pr_queue_dir / f"{fingerprint}.pr.md"
@@ -484,6 +496,8 @@ class GitHubPRRecipe:
             logger.warning("PR draft degraded to queue for %s: %s", fingerprint, note)
             return f"QUEUED:{fingerprint}"
 
+        if guard is not None and guard() is not True:
+            return f"QUEUED:{fingerprint}"
         cmd = [
             "gh",
             *DRAFT_CMD,

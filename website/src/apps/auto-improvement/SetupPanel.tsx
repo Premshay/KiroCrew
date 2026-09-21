@@ -57,6 +57,7 @@ interface ActivityItem {
 }
 
 interface RunStatus {
+  stats?: { publication?: string }
   status: string
   run_id?: string
   cycle?: number
@@ -147,7 +148,10 @@ function RepositorySetup({ config, repo }: { config?: Record<string, unknown>; r
   const saveConfig = useMutation({
     mutationFn: (patch: Record<string, unknown>) =>
       requestJson('/config', patch, 'PUT'),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['auto-improvement-config'] }),
+    onSuccess: () => Promise.all([
+      qc.invalidateQueries({ queryKey: ['auto-improvement-config'] }),
+      qc.invalidateQueries({ queryKey: ['auto-improvement-ruler'] }),
+    ]),
   })
 
   const directCommit = Boolean(config?.directCommit)
@@ -159,6 +163,9 @@ function RepositorySetup({ config, repo }: { config?: Record<string, unknown>; r
   })
   const running = run?.status === 'running'
   const active = ['running', 'calibrating', 'stopping'].includes(run?.status ?? '')
+  useEffect(() => {
+    qc.invalidateQueries({ queryKey: ['auto-improvement-ruler'] })
+  }, [qc, run?.status])
   const [environmentBusy, setEnvironmentBusy] = useState(false)
 
   const startRun = useMutation({
@@ -276,7 +283,7 @@ function RepositorySetup({ config, repo }: { config?: Record<string, unknown>; r
 
       {/* Step 3 — run control */}
       {configured ? (
-        <div className="mt-4 flex items-center gap-3 border-t border-border pt-3">
+        <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-border pt-3">
           {active ? (
             <Btn danger onClick={() => stopRun.mutate()} disabled={stopRun.isPending || run?.status === 'stopping'}>
               <Square className="lucide-inline" size={14} /> {i18nT('autoImprovement.stopBtn')}
@@ -286,23 +293,31 @@ function RepositorySetup({ config, repo }: { config?: Record<string, unknown>; r
               <Play className="lucide-inline" size={14} /> {i18nT('autoImprovement.runBtn')}
             </Btn>
           )}
-          <span className="text-[13px] text-muted">
-            {running
+          <span role="status" aria-live="polite" className="text-[13px] text-muted">
+            {run?.stats?.publication === 'published'
+              ? i18nT('boundedMeasurement.published')
+              : run?.stats?.publication === 'pending' && running
+                ? i18nT('boundedMeasurement.publishing')
+              : running
               ? i18nT('autoImprovement.runningStatus', {
                   cycle: run?.cycle ?? 0,
                   kept: run?.kept ?? 0,
                   drafted: run?.drafted ?? 0,
                 })
-              : run?.status === 'error'
-                ? run?.error || i18nT('autoImprovement.runError')
-                : i18nT('autoImprovement.idleStatus')}
+              : run?.status === 'calibrating'
+                ? i18nT('autoImprovementCalibration.calibrating')
+                : run?.status === 'stopping'
+                  ? i18nT('autoImprovementCalibration.stopping')
+                  : run?.status === 'error' ? null : i18nT('autoImprovement.idleStatus')}
           </span>
+          {/* No hand-off: the repository URL and environment draft are unsaved. */}
+          <ErrorNotice message={run?.status === 'error' ? run.error || i18nT('autoImprovement.runError') : undefined} />
         </div>
       ) : null}
 
       {/* Live activity feed while a run is going */}
-      {running && run?.activity && run.activity.length > 0 ? (
-        <div className="mt-3 max-h-40 overflow-auto rounded border border-border bg-card p-2 font-mono text-[11px] text-muted">
+      {active && run?.activity && run.activity.length > 0 ? (
+        <div role="log" aria-live="polite" className="mt-3 max-h-40 overflow-auto rounded border border-border bg-card p-2 font-mono text-[11px] text-muted select-text">
           {run.activity.slice(-30).map((item, i) => (
             <div key={i} className="whitespace-pre-wrap">
               {activityLine(item)}

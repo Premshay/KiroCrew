@@ -1,4 +1,10 @@
 {
+  "autoImprovementCalibration": {
+    "action": "Kalibrieren",
+    "warning": "Zuerst die Umgebung speichern und prüfen. Jede Kalibrierungswiederholung führt die konfigurierte Arbeitslast aus und verbraucht Ressourcen. Die Gesamtdauer ist bis zur Messung unbekannt.",
+    "calibrating": "Kalibrierung läuft…",
+    "stopping": "Wird angehalten…"
+  },
   "appChatLaunch": {
     "unsent": "{{error}}\n\nNachricht nicht gesendet. Kopiere sie, um es erneut zu versuchen:\n{{message}}",
     "cancelled": "Senden abgebrochen, weil du die Sitzung gewechselt hast.",
@@ -16292,5 +16298,22 @@
     "runnerPython": "Python-Programm (optional; Standard: python)",
     "runnerPath": "Gib einen absoluten Pfad zum Runner-Programm ein.",
     "runnerHint": "Der gewählte Runner führt Prüfungen in jedem isolierten Checkout aus und muss die Testumgebung des Ziel-Repositorys einschließlich Einrichtung und Abbau der Dienste bereitstellen. Die Container-Isolation hängt vom Runner ab."
+  },
+  "boundedMeasurement": {
+    "publishing": "Vollständige Regressionsprüfung vor Veröffentlichung",
+    "published": "Veröffentlicht",
+    "benchmarkProtectedPaths": "Geschützte Benchmark-Dateien oder -Verzeichnisse (ein repositoryrelativer Pfad pro Zeile)",
+    "title": "Messungen",
+    "bug": "Fehlerbehebungen",
+    "perf": "Leistung",
+    "track": "Modus",
+    "benchmarkCommand": "Benchmark-Befehl (optional)",
+    "benchmarkCanaryCommand": "Befehl für verlangsamte Kontrolle",
+    "wall": "Verstrichene Zeit",
+    "structured": "Strukturierte Dauer",
+    "resultMode": "Benchmark-Ergebnis",
+    "focusedTestPaths": "Gezielte pytest-Pfade (einer pro Zeile)",
+    "fullRegressionTimeoutSeconds": "Zeitlimit für vollständige Regression (Sekunden)",
+    "hint": "Vor der Kalibrierung speichern und prüfen. Die Kontrolle prüft die Messempfindlichkeit. Finalisten mit gezielten Tests müssen vor der Annahme die vollständige Testsuite innerhalb des Laufbudgets bestehen. Manuelle Veröffentlichung aus der Warteschlange ist für diese Finalisten nicht verfügbar."
   }
 }

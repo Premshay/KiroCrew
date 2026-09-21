@@ -1,4 +1,10 @@
 {
+  "autoImprovementCalibration": {
+    "action": "校正",
+    "warning": "まず環境を保存して確認してください。校正の各反復は設定されたワークロードを実行し、リソースを消費します。合計所要時間は測定するまで不明です。",
+    "calibrating": "校正中…",
+    "stopping": "停止中…"
+  },
   "appChatLaunch": {
     "unsent": "{{error}}\n\nメッセージは未送信です。コピーして再試行してください：\n{{message}}",
     "cancelled": "セッションを切り替えたため、送信をキャンセルしました。",
@@ -16074,5 +16080,22 @@
     "runnerPython": "Python 実行ファイル（任意、既定：python）",
     "runnerPath": "ランナー実行ファイルの絶対パスを入力してください。",
     "runnerHint": "選択したランナーは各独立チェックアウトでチェックを実行し、サービスの準備と後片付けを含む対象リポジトリのテスト環境を提供する必要があります。コンテナーによる分離はランナーに依存します。"
+  },
+  "boundedMeasurement": {
+    "publishing": "公開前に全体の回帰テストを確認中",
+    "published": "公開済み",
+    "benchmarkProtectedPaths": "保護するベンチマークのファイルまたはディレクトリ（リポジトリ相対パスを1行に1つ）",
+    "title": "測定",
+    "bug": "バグ修正",
+    "perf": "パフォーマンス",
+    "track": "モード",
+    "benchmarkCommand": "ベンチマークコマンド（任意）",
+    "benchmarkCanaryCommand": "低速対照コマンド",
+    "wall": "経過時間",
+    "structured": "構造化された所要時間",
+    "resultMode": "ベンチマーク結果",
+    "focusedTestPaths": "対象のpytestパス（1行に1つ）",
+    "fullRegressionTimeoutSeconds": "完全回帰テストのタイムアウト（秒）",
+    "hint": "校正前に保存して確認してください。対照は測定感度を確認します。対象を絞ったテストの最終候補は、採用前に実行予算内で全テストに合格する必要があります。これらの候補はキューから手動公開できません。"
   }
 }

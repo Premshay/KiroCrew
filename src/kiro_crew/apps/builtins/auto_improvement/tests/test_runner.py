@@ -693,7 +693,13 @@ class TestBoundedRunWithFakeAgent:
         monkeypatch.setattr(ar.AgentRunner, "run", _boom)
 
         supervisor.start(
-            {"clone": str(clone), "branch": "main", "track": "bug", "maxCycles": 1, "maxHours": 0.2}
+            {
+                "clone": str(clone),
+                "branch": "main",
+                "track": "bug",
+                "maxCycles": 1,
+                "maxHours": 0.2,
+            }
         )
         _join(supervisor, timeout=180.0)
         assert supervisor.status()["status"] in (R.STATUS_DONE, R.STATUS_ERROR)
@@ -778,6 +784,9 @@ class TestCalibrationWritesToTheLaunchedWorkspace:
             calibration = _Cal()
 
         monkeypatch.setattr(
+            store, "measurement_provenance", lambda _: {"sourceRevision": "fixture"}
+        )
+        monkeypatch.setattr(
             "kiro_crew.apps.builtins.auto_improvement.profiles.build_profile",
             lambda cfg: _Profile(),
         )
@@ -840,6 +849,9 @@ class TestCalibrationRespondsToStop:
                 self.ruler = ruler
                 self.calibration = _Cal()
 
+        monkeypatch.setattr(
+            store, "measurement_provenance", lambda _: {"sourceRevision": "fixture"}
+        )
         monkeypatch.setattr(
             "kiro_crew.apps.builtins.auto_improvement.profiles.build_profile",
             lambda cfg: _Profile(),
@@ -1045,7 +1057,14 @@ class TestCalibrationRespondsToStop:
         ruler_path = store.data_dir() / "repos" / store.workspace_key(cfg) / "ruler" / "ruler.json"
         ruler_path.parent.mkdir(parents=True, exist_ok=True)
         # A prior, fully-proven ruler from an earlier calibration.
-        prior = {"status": "calibrated"}
+        monkeypatch.setattr(
+            store, "measurement_provenance", lambda _: {"sourceRevision": "fixture"}
+        )
+        prior = {
+            "status": "calibrated",
+            "measurementConfig": store.measurement_identity(cfg),
+            "provenance": {"sourceRevision": "fixture"},
+        }
         ruler_path.write_text(json.dumps(prior), encoding="utf-8")
         assert progress_mod.ruler_calibrated() is True, "seed did not read as calibrated"
 

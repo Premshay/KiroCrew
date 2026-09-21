@@ -1,4 +1,10 @@
 {
+  "autoImprovementCalibration": {
+    "action": "校准",
+    "warning": "请先保存并检查环境。每次校准重复都会执行配置的工作负载并消耗资源。测量前无法确定总时长。",
+    "calibrating": "正在校准…",
+    "stopping": "正在停止…"
+  },
   "appChatLaunch": {
     "unsent": "{{error}}\n\n消息未发送。复制以下内容后重试：\n{{message}}",
     "cancelled": "你切换了会话，发送已取消。",
@@ -16071,5 +16077,22 @@
     "runnerPython": "Python 可执行文件（可选；默认：python）",
     "runnerPath": "请输入运行器可执行文件的绝对路径。",
     "runnerHint": "所选运行器会在每个独立检出目录中运行检查，并须提供目标仓库的测试环境，包括服务的启动和清理。容器隔离取决于运行器。"
+  },
+  "boundedMeasurement": {
+    "publishing": "发布前正在运行完整回归测试",
+    "published": "已发布",
+    "benchmarkProtectedPaths": "受保护的基准测试文件或目录（每行一个仓库相对路径）",
+    "title": "测量",
+    "bug": "错误修复",
+    "perf": "性能",
+    "track": "模式",
+    "benchmarkCommand": "基准测试命令（可选）",
+    "benchmarkCanaryCommand": "减速对照命令",
+    "wall": "经过时间",
+    "structured": "结构化时长",
+    "resultMode": "基准测试结果",
+    "focusedTestPaths": "指定 pytest 路径（每行一个）",
+    "fullRegressionTimeoutSeconds": "完整回归超时（秒）",
+    "hint": "校准前请保存并检查。对照用于检查测量灵敏度。采用指定测试路径的最终候选项必须在运行预算内通过完整测试套件后才能被接受。这些候选项不支持从队列手动发布。"
   }
 }

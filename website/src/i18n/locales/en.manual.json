@@ -1,4 +1,10 @@
 {
+  "autoImprovementCalibration": {
+    "action": "Calibrate",
+    "warning": "Save and check the environment first. Calibration repeats execute the configured workload and consume resources. Total duration is unknown until measured.",
+    "calibrating": "Calibrating…",
+    "stopping": "Stopping…"
+  },
   "appChatLaunch": {
     "unsent": "{{error}}\n\nMessage not sent. Copy it to try again:\n{{message}}",
     "cancelled": "Send cancelled because you switched sessions.",
@@ -7363,5 +7369,22 @@
     "runnerPython": "Python executable (optional; default: python)",
     "runnerPath": "Enter an absolute path to the runner executable.",
     "runnerHint": "The selected runner runs checks on each isolated checkout and must provide the target repository’s test environment, including service setup and teardown. Container isolation depends on the runner."
+  },
+  "boundedMeasurement": {
+    "publishing": "Checking full regression before publication",
+    "published": "Published",
+    "benchmarkProtectedPaths": "Protected benchmark files or directories (one repository-relative path per line)",
+    "title": "Measurements",
+    "bug": "Bug fixes",
+    "perf": "Performance",
+    "track": "Track",
+    "benchmarkCommand": "Benchmark command (optional)",
+    "benchmarkCanaryCommand": "Slowed control command",
+    "wall": "Elapsed time",
+    "structured": "Structured duration",
+    "resultMode": "Benchmark result",
+    "focusedTestPaths": "Focused pytest paths (one per line)",
+    "fullRegressionTimeoutSeconds": "Full regression timeout (seconds)",
+    "hint": "Save and check before calibrating. The control checks measurement sensitivity. Focused finalists must pass the full suite within the run budget before acceptance. Manual queued publication is unavailable for focused finalists."
   }
 }

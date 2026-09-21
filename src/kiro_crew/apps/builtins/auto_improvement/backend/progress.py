@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
 from typing import Any
 
 from . import store
@@ -78,6 +79,21 @@ def read_ruler() -> dict[str, Any]:
     """The active ruler, or an uncalibrated placeholder."""
     data = store.read_json(store.ruler_dir() / "ruler.json")
     if isinstance(data, dict):
+        try:
+            config = store.read_json(store.config_path(), {}) or {}
+            expected = store.measurement_identity(config)
+            provenance = store.measurement_provenance(config)
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            OverflowError,
+            RuntimeError,
+            subprocess.SubprocessError,
+        ):
+            return {**data, "status": "uncalibrated"}
+        if data.get("measurementConfig") != expected or data.get("provenance") != provenance:
+            return {**data, "status": "uncalibrated"}
         return data
     return {"status": "uncalibrated"}
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from kiro_crew.platform.context import redact_via_context
@@ -105,6 +106,61 @@ def clone_lock() -> threading.RLock:
     return _CLONE_LOCK
 
 
+def manual_regression_required(config: dict, fp: str) -> bool:
+    return bool(
+        config.get("focusedTestPaths")
+        or (store.pr_queue_dir() / f"{fp}.regression-required").exists()
+    )
+
+
+def safe_rollback(clone: Path, base: str) -> None:
+    from .clone_setup import _mark_clone_quarantined, _retire_unsafe_clone
+
+    try:
+        if not _repository_is_isolated(clone):
+            raise RuntimeError("Repository isolation changed during publication")
+        if not base or _git(clone, "reset", "--hard", base).returncode:
+            raise RuntimeError("Publication rollback failed")
+    except BaseException:
+        _mark_clone_quarantined(clone, "publication rollback could not be completed safely")
+        _retire_unsafe_clone(clone)
+        raise
+
+
+def run_publication_regression(config: dict, stop_check):
+    from ..profiles import build_profile
+
+    clone = Path(config["clone"])
+    profile = build_profile({**config, "focusedTestPaths": config.get("focusedTestPaths") or ["."]})
+    timeout = profile.full_regression_timeout_s
+    deadline = time.monotonic() + timeout + 30
+
+    def tree_identity():
+        if stop_check() or time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Publication stopped or regression deadline exceeded; change stays queued"
+            )
+        if not _repository_is_isolated(clone):
+            raise RuntimeError("Repository isolation changed during publication")
+        head = _git(clone, "rev-parse", "HEAD")
+        status = _git(clone, "status", "--porcelain", "--untracked-files=all")
+        if head.returncode or not head.stdout.strip() or status.returncode or status.stdout.strip():
+            raise RuntimeError("Publication requires a clean, committed regression tree")
+        return head.stdout.strip()
+
+    revision = tree_identity()
+    profile.ruler.stop_check = stop_check
+    if profile.full_regression(timeout=timeout) is not True:
+        raise RuntimeError("Full regression failed; change stays queued")
+
+    def guard():
+        return tree_identity() == revision
+
+    if not guard():
+        raise RuntimeError("Tree changed during full regression; change stays queued")
+    return guard
+
+
 def materialize_queued_diff(
     *, clone: Path, branch: str, config: dict, diff_text: str
 ) -> dict[str, object]:
@@ -177,7 +233,7 @@ def materialize_queued_diff(
     )
     if apply_proc.returncode != 0:
         # Leave the tree clean so a retry or the draft-PR path still works.
-        _git(clone, "reset", "--hard", base_ref_local)
+        safe_rollback(clone, base_ref_local)
         stderr = (apply_proc.stderr or b"").decode("utf-8", errors="replace")
         return {
             "ok": False,
@@ -213,7 +269,7 @@ def commit_staged_for_draft(*, clone: Path, body_path: Path, fp: str) -> dict[st
     return {"ok": True, "sha": (_git(clone, "rev-parse", "HEAD").stdout or "").strip()}
 
 
-def commit_finding(fp: str) -> dict[str, object]:
+def commit_finding(fp: str, *, regression=None) -> dict[str, object]:
     """Commit the queued change for ``fp`` and push it to the configured branch.
 
     Returns ``{ok, ...}``. Refuses — without touching the repo — when the finding
@@ -225,10 +281,10 @@ def commit_finding(fp: str) -> dict[str, object]:
     scope is unmistakable — it covers everything, including the push and the rollback.
     """
     with clone_lock():
-        return _commit_finding_locked(fp)
+        return _commit_finding_locked(fp, regression=regression)
 
 
-def _commit_finding_locked(fp: str) -> dict[str, object]:
+def _commit_finding_locked(fp: str, *, regression=None) -> dict[str, object]:
     """Body of :func:`commit_finding`. Callers MUST hold :func:`clone_lock`."""
     diff_path = store.pr_queue_dir() / f"{fp}.diff"
     body_path = store.pr_queue_dir() / f"{fp}.pr.md"
@@ -236,6 +292,11 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
         return {"ok": False, "error": f"no queued change for fingerprint {fp}"}
 
     config = store.read_json(store.config_path(), {}) or {}
+    if manual_regression_required(config, fp) and regression is None:
+        return {
+            "ok": False,
+            "error": "Publication requires the supervised full-regression worker",
+        }
     clone = Path(str(config.get("clone") or ""))
     if not str(config.get("clone") or "").strip():
         return {"ok": False, "error": "no repository configured"}
@@ -281,12 +342,13 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
     message = _commit_message(body_path, fp)
     commit = _git(clone, "-c", "commit.gpgsign=false", "commit", "-m", message)
     if commit.returncode != 0:
-        _git(clone, "reset", "--hard", base_ref_local)
+        safe_rollback(clone, base_ref_local)
         return {
             "ok": False,
             "error": f"commit failed: {redact_via_context(commit.stderr or '')[:160]}",
         }
     sha = (_git(clone, "rev-parse", "HEAD").stdout or "").strip()
+    guard = regression(config) if regression is not None else None
 
     # Scan the CONTENT before it leaves the host. `_commit_message` is already redacted;
     # this is the commit itself, which is equally unwipeable once pushed and is
@@ -311,7 +373,7 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
     else:
         clean, scan_note = False, "could not read the pushable diff"
     if not clean:
-        _git(clone, "reset", "--hard", base_ref_local)
+        safe_rollback(clone, base_ref_local)
         return {
             "ok": False,
             "error": f"refusing to push: {scan_note} — the change stays in the local queue",
@@ -337,14 +399,16 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
     # has everything it needs, and the message says "queued" rather than "committed locally"
     # because after the reset that is what is true. Raised by the GPT review of this branch.
     if not url:
-        _git(clone, "reset", "--hard", base_ref_local)
+        safe_rollback(clone, base_ref_local)
         return {
             "ok": False,
             "error": "no pushable remote — the change stays queued, nothing was committed",
         }
-    push = _git(clone, "push", url, f"HEAD:refs/heads/{branch}", timeout=_PUSH_TIMEOUT_S)
+    if guard is not None and guard() is not True:
+        raise RuntimeError("Publication tree changed; change stays queued")
+    push = _git(clone, "push", url, f"{sha}:refs/heads/{branch}", timeout=_PUSH_TIMEOUT_S)
     if push.returncode != 0:
-        _git(clone, "reset", "--hard", base_ref_local)
+        safe_rollback(clone, base_ref_local)
         return {
             "ok": False,
             "error": f"push failed: {redact_via_context(push.stderr or '')[:200]}",

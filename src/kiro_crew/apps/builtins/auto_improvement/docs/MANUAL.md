@@ -170,6 +170,55 @@ Both operations refuse during an active run; checks also hold the clone lock.
 
 ---
 
+
+### Configure measurements and focused tests
+
+The **Measurements** section selects bug fixes or performance work. To measure a
+specific workload, enter its Python or pytest benchmark command and a separate
+slowed control command. **Elapsed time** measures the whole invocation;
+**Structured duration** reads exactly one stdout line in this format:
+
+```text
+AUTO_IMPROVEMENT_METRIC {"schema_version":1,"metric":"duration","unit":"seconds","value":1.25,"workload_id":"fixed-input"}
+```
+
+Keep the metric, unit and workload identity identical across normal/control and
+baseline/candidate runs. The control checks sensitivity to a known slowdown; it
+does not prove a candidate is correct. A command failure, missing marker or invalid
+sample cannot establish calibration. Leaving the benchmark command blank keeps
+the existing suite timing mode.
+
+List trusted benchmark files, imported helpers and control directories under
+**Protected benchmark files or directories**, one repository-relative path per
+line. These paths are protected from candidate edits and saved per repository.
+
+Optionally enter explicit repository-relative pytest files or directories, one
+per line, under **Focused pytest paths**. These narrow iteration checks only.
+Before accepting a finalist, the app commits it provisionally and runs unrestricted
+`pytest .` in the selected environment. All tests must pass; pre-existing failures
+are not waived. The separate **Full regression timeout** defaults to 900 seconds.
+Remove `PYTEST_ADDOPTS` from environment variables when using focused paths;
+otherwise it could silently narrow the final suite and the configuration is refused.
+Choose a timeout appropriate to your repository and allow room for it plus runner
+cleanup within the run budget. Insufficient budget refuses the finalist.
+
+Save the settings, check the environment, then calibrate. Settings are remembered
+per repository; changing them invalidates readiness and calibration. Without
+focused paths, the app retains its existing verification flow without an extra
+full regression. With a custom benchmark, the readiness check runs that workload
+instead of collecting the suite.
+
+Stop prevents acceptance after the running regression returns; it does not kill
+the test subprocess immediately. Automatic publication rechecks the tested tree,
+and a direct-push rebase repeats full regression. **Manual queued draft/commit**
+runs fresh full regression on the newly materialized commit using the same worker,
+status and Stop controls. A pending operation has not published anything yet.
+Failed regression or publication retains the queue and safely rolls back the clone;
+unsafe rollback quarantines it. Clearing focused paths does not bypass regression
+for an existing marked finalist. Source revision or runner/interpreter identity
+changes invalidate calibration, including when provenance cannot be read.
+
+
 ## 3. Calibrate the ruler (do this first)
 
 Click **Calibrate** before your first run.

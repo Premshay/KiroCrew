@@ -448,6 +448,11 @@ class Driver:
             retire_if_unsafe=self._retire_if_unsafe,
         )
         self._stop = False
+        self._run_deadline: float | None = None
+        self._regression_tree = ""
+        if getattr(self.profile, "final_regression_required", False) is True:
+            setattr(self.profile, "final_regression_guard", self._final_regression_current)
+            setattr(self.profile.pr_recipe, "publication_guard", self._final_regression_current)
         self._repository_retired = False
         #: Set when a provisional rollback FAILED. HEAD then still carries a commit that
         #: was refused and never published, and the next winner commits ON TOP of it: that
@@ -997,6 +1002,90 @@ class Driver:
     #: Attempts for a direct push: the first try, then one rebase-and-retry.
     _PUSH_ATTEMPTS = 2
 
+    def _prepare_finalist(self, winner: Proposal, commit_winner) -> str | None:
+        head = _git(["rev-parse", "HEAD"], self.clone)
+        pre_sha = head.stdout.strip()
+        if head.returncode or not pre_sha:
+            self.log.error("finalist refused: could not capture the rollback revision")
+            return None
+        ready = False
+        try:
+            ready = commit_winner(winner) and self._run_final_regression()
+        finally:
+            if (
+                not ready
+                and not self._repository_retired
+                and not getattr(self, "_probe_failure", None)
+            ):
+                if not self._retire_if_unsafe("failed finalist"):
+                    self._reset_provisional(pre_sha)
+        if ready:
+            return pre_sha
+        self._record(winner, L.STATUS_FAILED_VERIFY, "full regression incomplete or failed")
+        return None
+
+    def _regression_budget_ok(self, reserve: float = 0) -> bool:
+        deadline = self._run_deadline
+        return (
+            not self._stop
+            and deadline is not None
+            and time.monotonic() + reserve < deadline
+            and self.cost_meter() < self.caps.max_cost_usd
+        )
+
+    def _regression_tree_id(self) -> str:
+        tree = _git(["rev-parse", "HEAD^{tree}"], self.clone)
+        status = _git(["status", "--porcelain", "--untracked-files=all"], self.clone)
+        if tree.returncode or status.returncode or status.stdout.strip():
+            return ""
+        return tree.stdout.strip()
+
+    def _final_regression_current(self) -> bool:
+        if not self._regression_budget_ok():
+            self.log.warning("finalist refused: stopped or run budget exhausted")
+            return False
+        current = self._regression_tree_id()
+        if not current or current != self._regression_tree:
+            self.log.warning("finalist refused: tree changed since full regression")
+            return False
+        return self._regression_budget_ok()
+
+    def _run_final_regression(self) -> bool:
+        if getattr(self.profile, "final_regression_required", False) is not True:
+            return True
+        self._regression_tree = ""
+        timeout = getattr(self.profile, "full_regression_timeout_s", 900)
+        # Repository runners may spend another 30 seconds cleaning up their workload.
+        if not self._regression_budget_ok(timeout + 30):
+            self.log.warning(
+                "finalist refused: insufficient run budget for full regression and cleanup"
+            )
+            return False
+        if self._retire_if_unsafe("before full regression"):
+            return False
+        tree = self._regression_tree_id()
+        if not tree:
+            self.log.warning("finalist refused: regression requires a clean committed tree")
+            return False
+        self._progress(stage="full_regression")
+        if not self._regression_budget_ok(timeout + 30):
+            self.log.warning("finalist refused: budget changed during regression preflight")
+            return False
+        try:
+            passed = getattr(self.profile, "full_regression")(timeout=timeout)
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+            self.log.warning(
+                "final regression could not finish: %s", redact_log_via_context(str(exc))
+            )
+            passed = False
+        if self._retire_if_unsafe("after full regression"):
+            return False
+        if passed is not True:
+            self.log.warning("finalist refused: unrestricted regression must pass with no failures")
+            return False
+        self._regression_tree = tree
+        return self._final_regression_current()
+
     def _reverify_head(self) -> bool:
         """Re-run the profile's build gate on the clone's CURRENT tree. Fail-closed.
 
@@ -1010,6 +1099,8 @@ class Driver:
         Any error re-verifying is a refusal, not a pass: an unverifiable tree is exactly
         the case this gate exists for.
         """
+        if getattr(self.profile, "final_regression_required", False) is True:
+            return self._run_final_regression()
         try:
             res = self.profile.build_gate.build_and_test(
                 worktree=self.clone, src=self.clone / "src"
@@ -1252,6 +1343,11 @@ class Driver:
         # `HEAD` after the push: HEAD can move between the push and the read, which would put
         # an unrelated sha in the ledger for a commit that did land. Raised by the GPT review.
         self._pushed_object = src
+        if (
+            getattr(self.profile, "final_regression_required", False) is True
+            and not self._final_regression_current()
+        ):
+            return subprocess.CompletedProcess([], 1, "", "full regression no longer valid")
         push = subprocess.run(
             [
                 "git",
@@ -1495,6 +1591,11 @@ class Driver:
                 return push
             require_pinned(self.clone)
             self._pushed_object = rebased_id
+            if (
+                getattr(self.profile, "final_regression_required", False) is True
+                and not self._final_regression_current()
+            ):
+                return push
             push = subprocess.run(
                 [
                     "git",
@@ -1571,6 +1672,8 @@ class Driver:
         Raised by the GPT review of this branch; the unconditional form was the conductor's
         requirement.
         """
+        if getattr(self, "_publication_failure", None):
+            return True
         if not getattr(self, "_rollback_failed", False):
             return False
         self.log.error(
@@ -1579,9 +1682,56 @@ class Driver:
         )
         return True
 
-    def _apply_verdict(self, cycle, base_sha, verdict, archived, fresh_count, gated_sha) -> int:
+    def _publication_failed(self, publication: dict[str, str], exc: BaseException) -> None:
+        self._publication_failure = dict(publication)
+        self._stop = True
+        self.log.error(
+            "Publication succeeded (%s), but bookkeeping failed: %s. "
+            "Reconcile the ledger before starting another run; do not retry publication.",
+            publication,
+            exc,
+        )
+        self._progress(
+            stage="publication_bookkeeping_failed",
+            publication="published",
+            **publication,
+            error=str(exc),
+        )
+
+    def _apply_verdict(self, cycle, base_sha, verdict, archived, fresh_count, gated_sha):
         if self._publishing_is_halted():
             return 0
+        head = _git(["rev-parse", "HEAD"], self.clone)
+        if head.returncode or not head.stdout.strip():
+            raise RuntimeError("Cannot capture publication rollback revision")
+        publication: dict[str, str] = {}
+        try:
+            return self._apply_verdict_owned(
+                cycle, base_sha, verdict, archived, fresh_count, gated_sha, publication
+            )
+        except BaseException as exc:
+            if publication:
+                self._publication_failed(publication, exc)
+            elif not self._repository_retired and not getattr(self, "_probe_failure", None):
+                if not self._retire_if_unsafe("publication failure"):
+                    self._reset_provisional(head.stdout.strip())
+            raise
+
+    def _apply_verdict_owned(
+        self, cycle, base_sha, verdict, archived, fresh_count, gated_sha, publication
+    ) -> int:
+        if self._publishing_is_halted():
+            return 0
+        prepared_sha = None
+        if (
+            verdict.keep
+            and verdict.winner is not None
+            and getattr(self.profile, "final_regression_required", False) is True
+        ):
+            prepared_sha = self._prepare_finalist(verdict.winner, self._commit_winner_provisional)
+            if prepared_sha is None:
+                self.stats.not_kept += 1
+                return fresh_count
         # Archive ALL survivors (the whole population is evolutionary memory). The kept
         # winner's diff_ref is reused as the CR's ``diff-ref`` (06_*.md §3.1/§3.2).
         winner_diff_ref = ""
@@ -1652,8 +1802,8 @@ class Driver:
         # so this lands a PLACEHOLDER message and `_finalize_winner_commit` amends it with
         # the real numbers once the pipeline returns — and resets the branch if nothing was
         # filed, so a fluke never advances HEAD (06_*.md §1.1).
-        pre_sha = _git(["rev-parse", "HEAD"], self.clone).stdout.strip()
-        if not self._commit_winner_provisional(winner):
+        pre_sha = prepared_sha or _git(["rev-parse", "HEAD"], self.clone).stdout.strip()
+        if prepared_sha is None and not self._commit_winner_provisional(winner):
             self.ledger.record(
                 L.LedgerEntry(
                     fp=L.fingerprint(
@@ -1678,6 +1828,10 @@ class Driver:
             diff_ref=winner_diff_ref,
             base_anchor=f"{self.branch} @ {base_sha[:12]}",
         )
+        if outcome.filed:
+            publication["cr"] = outcome.cr
+            if outcome.bookkeeping_error:
+                raise RuntimeError(outcome.bookkeeping_error)
         if outcome.repository_retired:
             self.stats.kept -= 1
             return fresh_count
@@ -1699,6 +1853,7 @@ class Driver:
                 # F10 direct-commit: push the verified commit to the authorized branch and
                 # record ``committed`` with the real sha (only on a successful push — a
                 # refused/failed push already recorded ``error`` and nothing left the sandbox).
+                self.pushed_sha = ""
                 pushed = self._direct_push(
                     fp=outcome.fp, kind="perf", target=winner.candidate.target, sha=committed
                 )
@@ -1707,6 +1862,7 @@ class Driver:
                     # rewrites HEAD, and recording the pre-rebase sha would point the
                     # ledger at a commit that is not in the remote's history.
                     landed = self.pushed_sha or committed
+                    publication["landed_sha"] = landed
                     self.ledger.record(
                         L.LedgerEntry(
                             fp=outcome.fp,
@@ -1742,7 +1898,11 @@ class Driver:
                 return fresh_count
             self.stats.filed += 1
             self.log.info(
-                "cycle %d: FILED %s cr=%s commit=%s", cycle, winner.cand_id, outcome.cr, committed
+                "cycle %d: FILED %s cr=%s commit=%s",
+                cycle,
+                winner.cand_id,
+                outcome.cr,
+                committed,
             )
             # Announce the filed CR so the app can start a watcher session that keeps it
             # mergable + drives it to passing-all-checks (tasks #21/#24). Opaque to the
@@ -2552,7 +2712,26 @@ class Driver:
 
     # ── bug-track keep/draft (M4; 05_improvement_loop_bugfix.md §4) ───────────
 
-    def _apply_bug_winner(self, cycle: int, winner: Proposal, bug_res: BugGateResult) -> None:
+    def _apply_bug_winner(self, cycle: int, winner: Proposal, bug_res: BugGateResult):
+        if self._publishing_is_halted():
+            return None
+        head = _git(["rev-parse", "HEAD"], self.clone)
+        if head.returncode or not head.stdout.strip():
+            raise RuntimeError("Cannot capture publication rollback revision")
+        publication: dict[str, str] = {}
+        try:
+            return self._apply_bug_winner_owned(cycle, winner, bug_res, publication)
+        except BaseException as exc:
+            if publication:
+                self._publication_failed(publication, exc)
+            elif not self._repository_retired and not getattr(self, "_probe_failure", None):
+                if not self._retire_if_unsafe("publication failure"):
+                    self._reset_provisional(head.stdout.strip())
+            raise
+
+    def _apply_bug_winner_owned(
+        self, cycle: int, winner: Proposal, bug_res: BugGateResult, publication
+    ) -> None:
         """Accept one bug fix that passed RED ∧ GREEN ∧ STAYGREEN: archive it,
         commit-on-keep locally, draft a DRAFT-only CR with the correctness narrative,
         and record ``filed`` in the shared ledger (05_*.md §4.2; 02_arch §3.2).
@@ -2562,6 +2741,11 @@ class Driver:
         reproduction analogue, §4.1) — there is no second A/B and no noise band."""
         if self._publishing_is_halted():
             return
+        prepared_sha = None
+        if getattr(self.profile, "final_regression_required", False) is True:
+            prepared_sha = self._prepare_finalist(winner, self._commit_bug_winner_provisional)
+            if prepared_sha is None:
+                return
         diff_ref = self.archive.save_candidate(
             cand_id=winner.cand_id,
             diff=winner.diff,
@@ -2591,8 +2775,8 @@ class Driver:
         # HEAD, and HEAD is a COMMIT pointer, so a merely-staged fix is invisible to the
         # draft. Provisional message; amended once the pipeline returns, reset if nothing
         # was filed.
-        pre_sha = _git(["rev-parse", "HEAD"], self.clone).stdout.strip()
-        if not self._commit_bug_winner_provisional(winner):
+        pre_sha = prepared_sha or _git(["rev-parse", "HEAD"], self.clone).stdout.strip()
+        if prepared_sha is None and not self._commit_bug_winner_provisional(winner):
             self.ledger.record(
                 L.LedgerEntry(
                     fp=L.fingerprint(
@@ -2622,6 +2806,12 @@ class Driver:
             # already anchors on its own `base_sha` for the same reason. Raised by the GPT review.
             base_anchor=f"{self.branch} @ {pre_sha[:12]}",
         )
+        if outcome.filed:
+            publication["cr"] = outcome.cr
+            if outcome.bookkeeping_error:
+                raise RuntimeError(outcome.bookkeeping_error)
+        if outcome.repository_retired:
+            return
         if outcome.filed or outcome.committed_ready:
             committed = self._finalize_bug_winner_commit(
                 winner, bug_res=bug_res, cycle=cycle, diff_ref=diff_ref
@@ -2629,12 +2819,14 @@ class Driver:
             if outcome.committed_ready:
                 # F10 direct-commit (bug track): push the verified RED→GREEN fix to the
                 # authorized branch; record ``committed`` only on a successful push.
+                self.pushed_sha = ""
                 pushed = self._direct_push(
                     fp=outcome.fp, kind="bug", target=winner.candidate.target, sha=committed
                 )
                 if pushed is True:
                     # See the perf track: record the sha that LANDED, not the pre-rebase one.
                     landed = self.pushed_sha or committed
+                    publication["landed_sha"] = landed
                     self.ledger.record(
                         L.LedgerEntry(
                             fp=outcome.fp,
@@ -2886,6 +3078,7 @@ class Driver:
         )
 
         t0 = time.monotonic()
+        self._run_deadline = t0 + self.caps.max_hours * 3600
         # resume: recompute the cycle index from the archive (not held in memory).
         start_cycle = self.archive.cycle_count() + 1
         no_keep_streak = 0

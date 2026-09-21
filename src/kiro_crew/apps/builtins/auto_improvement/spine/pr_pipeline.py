@@ -88,6 +88,7 @@ class CrOutcome:
     # The canonical clone was retired after untrusted build/agent execution changed
     # repository safety. The driver must stop without commit/reset/teardown Git.
     repository_retired: bool = False
+    bookkeeping_error: str = ""
 
 
 class CrPipeline:
@@ -413,6 +414,28 @@ class CrPipeline:
         On a recipe EXCEPTION the spine records ``error`` and leaves the queued artifacts on
         disk for manual recovery (§5.1 ``error``; §5.3 invariant 4). MUST NOT publish/merge —
         enforced by the recipe; the spine only ever asks for a draft (§4.1)."""
+        if getattr(profile, "final_regression_required", False) is True:
+            guard = getattr(profile, "final_regression_guard", None)
+            if not callable(guard) or guard() is not True:
+                self.ledger.record(
+                    L.LedgerEntry(
+                        fp=fp,
+                        kind=kind,
+                        target=target,
+                        status=L.STATUS_FAILED_VERIFY,
+                        note="full regression is missing or no longer valid",
+                    )
+                )
+                return CrOutcome(
+                    fp=fp,
+                    status=L.STATUS_FAILED_VERIFY,
+                    note="full regression is missing or no longer valid",
+                )
+            queue = Path(profile.pr_recipe.pr_queue_dir)
+            queue.mkdir(parents=True, exist_ok=True)
+            (queue / f"{fp}.regression-required").write_text(
+                "Manual publication requires fresh full regression.\n", encoding="utf-8"
+            )
         # F10 direct-commit: skip drafting a CR entirely. The change is fully verified (every
         # gate above this point already ran); hand it back to the driver to commit + push to
         # the authorized branch. We do NOT record a ledger row here — the driver records
@@ -499,19 +522,12 @@ class CrPipeline:
                 )
             )
             self.log.warning("DRAFT CR QUEUED (no pull request opened): fp=%s (%s)", fp, note)
-            # `filed=True` even though no PR exists, and that is deliberate. In the driver
-            # `filed` means "this was a REALIZED win" — a False here also rolls the provisional
-            # commit back (`_reset_provisional`) and decrements `kept`, throwing away a change
-            # that passed RED×2 → GREEN → STAYGREEN just because `gh` was missing. Measured:
-            # flipping it to False took a bounded run's `kept` from 1 to 0. The win is real and
-            # the durable queue copy holds it; only the PUBLICATION failed, which is what the
-            # retryable ledger status above now records.
             return CrOutcome(
                 fp=fp,
                 status=L.STATUS_ERROR,
                 cr=cr,
                 note=f"queued, not filed: {note}",
-                filed=True,
+                filed=False,
                 reproduce=reproduce,
             )
 
@@ -538,13 +554,20 @@ class CrPipeline:
         Losing the row is bad; losing the row AND the outcome is worse. Logged loudly at ERROR
         because a missing row is exactly what causes that duplicate. Raised by the GPT review.
         """
+        bookkeeping_error = ""
         try:
             self.ledger.record(
                 L.LedgerEntry(
-                    fp=fp, kind=kind, target=target, status=L.STATUS_FILED, cr=cr, note=note[:200]
+                    fp=fp,
+                    kind=kind,
+                    target=target,
+                    status=L.STATUS_FILED,
+                    cr=cr,
+                    note=note[:200],
                 )
             )
-        except Exception:  # noqa: BLE001 — the PR already exists; never unpublish it by raising
+        except Exception as exc:  # noqa: BLE001 — preserve the confirmed publication
+            bookkeeping_error = f"Draft {cr} published but ledger write failed: {exc}"
             self.log.exception(
                 "DRAFT CR filed but the ledger row could NOT be written: fp=%s cr=%s — this "
                 "locus may be re-discovered and filed again",
@@ -554,5 +577,11 @@ class CrPipeline:
         else:
             self.log.info("DRAFT CR filed: fp=%s cr=%s (%s)", fp, cr, note)
         return CrOutcome(
-            fp=fp, status=L.STATUS_FILED, cr=cr, note=note, filed=True, reproduce=reproduce
+            fp=fp,
+            status=L.STATUS_FILED,
+            cr=cr,
+            note=note,
+            filed=True,
+            reproduce=reproduce,
+            bookkeeping_error=bookkeeping_error,
         )

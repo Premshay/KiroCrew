@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -120,6 +122,49 @@ def repository_key(config: dict) -> str:
     return hashlib.sha256(repo.encode("utf-8")).hexdigest()
 
 
+def measurement_identity(config: dict) -> dict:
+    from ..profiles.github_repo.environment import normalize_test_environment
+    from ..profiles.github_repo.profile import normalize_measurement_config
+
+    return {
+        **normalize_measurement_config(config),
+        "testEnvironment": normalize_test_environment(config.get("testEnvironment")),
+        "calibrationReps": config.get("calibrationReps", 5),
+        "noiseFloorSeconds": float(config.get("noiseFloorSeconds") or 0.25),
+        "bandCapMs": config.get("bandCapMs"),
+    }
+
+
+def measurement_provenance(config: dict) -> dict:
+    from .commit import _git
+    from .clone_setup import _repository_is_isolated
+    from ..profiles.github_repo.environment import TestEnvironment
+
+    clone = Path(str(config.get("clone") or ""))
+    if not config.get("clone") or not _repository_is_isolated(clone):
+        raise ValueError("Measurement repository provenance is unavailable")
+    revision = _git(clone, "rev-parse", "HEAD")
+    status = _git(clone, "status", "--porcelain", "--untracked-files=all")
+    if (
+        revision.returncode
+        or not revision.stdout.strip()
+        or status.returncode
+        or status.stdout.strip()
+    ):
+        raise ValueError("Measurement requires an identified, clean source revision")
+    environment = TestEnvironment(config.get("testEnvironment"), clone, None).identity
+    if environment["kind"] != "runner":
+        executable = shutil.which(environment.get("pythonExecutable") or sys.executable)
+        if not executable:
+            raise ValueError("Measurement interpreter provenance is unavailable")
+        path = Path(executable).resolve(strict=True)
+        environment["pythonIdentity"] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    return {"sourceRevision": revision.stdout.strip(), "execution": environment}
+
+
 def remember_test_environment(config: dict) -> None:
     from ..profiles.github_repo.environment import normalize_test_environment
 
@@ -128,6 +173,11 @@ def remember_test_environment(config: dict) -> None:
     saved = dict(config.get("repositoryTestEnvironments") or {})
     saved[repository_key(config)] = environment
     config["repositoryTestEnvironments"] = saved
+    from ..profiles.github_repo.profile import normalize_measurement_config
+
+    measurements = dict(config.get("repositoryMeasurements") or {})
+    measurements[repository_key(config)] = normalize_measurement_config(config)
+    config["repositoryMeasurements"] = measurements
 
 
 def restore_test_environment(config: dict) -> None:
@@ -135,6 +185,10 @@ def restore_test_environment(config: dict) -> None:
 
     saved = config.get("repositoryTestEnvironments") or {}
     config["testEnvironment"] = normalize_test_environment(saved.get(repository_key(config)))
+    from ..profiles.github_repo.profile import normalize_measurement_config
+
+    measurements = config.get("repositoryMeasurements") or {}
+    config.update(normalize_measurement_config(measurements.get(repository_key(config), {})))
 
 
 def workspace_dir() -> Path:

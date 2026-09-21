@@ -351,7 +351,11 @@ class TestCommitButton:
         # All three post-commit exits must roll back: a failed commit, a `draft()` that
         # degraded to "queued", and an unexpected raise.
         assert src.count("_rollback()") >= 3, "not every post-commit failure path rolls back"
-        assert 'reset", "--hard"' in src or '"reset", "--hard"' in src
+        from kiro_crew.apps.builtins.auto_improvement.backend import commit
+
+        assert "commit_mod.safe_rollback(Path(clone), base)" in src
+        rollback = inspect.getsource(commit.safe_rollback)
+        assert '_git(clone, "reset", "--hard", base)' in rollback
 
     @pytest.mark.asyncio
     async def test_retargeting_during_a_run_is_refused_with_409(

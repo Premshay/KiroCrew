@@ -1,4 +1,10 @@
 {
+  "autoImprovementCalibration": {
+    "action": "Calibrar",
+    "warning": "Guarda y comprueba primero el entorno. Cada repetición de la calibración ejecuta la carga configurada y consume recursos. La duración total se desconoce hasta medirla.",
+    "calibrating": "Calibrando…",
+    "stopping": "Deteniendo…"
+  },
   "appChatLaunch": {
     "unsent": "{{error}}\n\nMensaje no enviado. Cópialo para volver a intentarlo:\n{{message}}",
     "cancelled": "El envío se canceló porque cambiaste de sesión.",
@@ -16474,5 +16480,22 @@
     "runnerPython": "Ejecutable de Python (opcional; predeterminado: python)",
     "runnerPath": "Introduce una ruta absoluta al ejecutable del ejecutor.",
     "runnerHint": "El ejecutor seleccionado realiza las comprobaciones en cada copia de trabajo aislada y debe proporcionar el entorno de pruebas del repositorio, incluida la preparación y limpieza de servicios. El aislamiento en contenedores depende del ejecutor."
+  },
+  "boundedMeasurement": {
+    "publishing": "Comprobando la regresión completa antes de publicar",
+    "published": "Publicado",
+    "benchmarkProtectedPaths": "Archivos o directorios del benchmark protegidos (una ruta relativa al repositorio por línea)",
+    "title": "Mediciones",
+    "bug": "Corrección de errores",
+    "perf": "Rendimiento",
+    "track": "Modo",
+    "benchmarkCommand": "Comando de benchmark (opcional)",
+    "benchmarkCanaryCommand": "Comando de control ralentizado",
+    "wall": "Tiempo transcurrido",
+    "structured": "Duración estructurada",
+    "resultMode": "Resultado del benchmark",
+    "focusedTestPaths": "Rutas de pytest específicas (una por línea)",
+    "fullRegressionTimeoutSeconds": "Tiempo límite de regresión completa (segundos)",
+    "hint": "Guarda y comprueba antes de calibrar. El control comprueba la sensibilidad de la medición. Los finalistas con pruebas específicas deben superar toda la suite dentro del presupuesto de ejecución antes de aceptarse. No pueden publicarse manualmente desde la cola."
   }
 }
