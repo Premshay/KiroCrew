@@ -136,9 +136,9 @@ def measurement_identity(config: dict) -> dict:
 
 
 def measurement_provenance(config: dict) -> dict:
-    from .commit import _git
-    from .clone_setup import _repository_is_isolated
     from ..profiles.github_repo.environment import TestEnvironment
+    from .clone_setup import _repository_is_isolated
+    from .commit import _git
 
     clone = Path(str(config.get("clone") or ""))
     if not config.get("clone") or not _repository_is_isolated(clone):

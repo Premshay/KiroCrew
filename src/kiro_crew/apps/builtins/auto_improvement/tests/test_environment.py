@@ -53,6 +53,17 @@ def test_rejects_invalid_config(config):
         mod.normalize_test_environment(config)
 
 
+@pytest.mark.parametrize("kind", ["gateway", "python"])
+def test_identity_only_environment_refuses_execution(tmp_path, kind):
+    config = {"kind": kind}
+    if kind == "python":
+        config["pythonExecutable"] = sys.executable
+    adapter = mod.TestEnvironment(config, tmp_path, None)
+    assert adapter.identity["kind"] == kind
+    with pytest.raises(mod.RunnerAdmissionError, match="identity-only"):
+        adapter.run(["python", "-V"], cwd=tmp_path, timeout=1)
+
+
 def test_gateway_default_and_lexical_python(tmp_path):
     assert mod.normalize_test_environment(None) == {"kind": "gateway"}
     target = tmp_path / "python"

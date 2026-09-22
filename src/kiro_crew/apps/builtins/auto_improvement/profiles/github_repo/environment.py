@@ -105,7 +105,12 @@ def normalize_test_environment(value: object) -> dict:
 class TestEnvironment:
     __test__ = False
 
-    def __init__(self, config: dict | None, clone_path: Path, sandbox_run: Callable):
+    def __init__(
+        self,
+        config: dict | None,
+        clone_path: Path,
+        sandbox_run: Callable[..., subprocess.CompletedProcess[str]] | None,
+    ):
         self._config = normalize_test_environment(config)
         self._clone = Path(clone_path)
         self._sandbox_run = sandbox_run
@@ -149,6 +154,8 @@ class TestEnvironment:
     def run(
         self, argv: list[str], *, cwd: Path, timeout: float, env: dict | None = None
     ) -> subprocess.CompletedProcess[str]:
+        if self._sandbox_run is None:
+            raise RunnerAdmissionError("identity-only environment cannot execute commands")
         if (
             not isinstance(argv, (list, tuple))
             or not argv

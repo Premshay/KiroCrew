@@ -1484,6 +1484,8 @@ Repository measurement settings are exposed with the test environment in Setup:
 `track`, `benchmarkCommand`, `benchmarkCanaryCommand`, `benchmarkResultMode`
 (`wall` or `structured`), `benchmarkProtectedPaths`, `focusedTestPaths`, and
 `fullRegressionTimeoutSeconds`.
+The protected-path and focused-test textareas expose their translated labels as
+explicit accessible names.
 They are remembered per repository. Changes invalidate calibration and the UI's
 readiness result. The benchmark control proves sensitivity, not correctness.
 
@@ -1499,6 +1501,9 @@ interrupt the subprocess, but prevents acceptance when it returns.
 Direct-push rebases repeat full regression on the changed tree. Publication
 rechecks the verified tree and budget. Profiles without explicit focused paths
 retain their existing checks without an extra full-suite invocation.
+The PR recipe contract declares its durable queue directory. GitHub recipes expose
+an optional typed publication guard; when supplied, only literal `True` permits
+publication, and exceptions never authorize it.
 
 The driver releases provisional rollback ownership after a confirmed push or draft.
 A later ledger or commit-message failure retains the landed SHA or draft reference,
@@ -1521,4 +1526,6 @@ HTTP and MCP share the validated ruler reader. Calibration binds normalized
 settings (including protected benchmark paths, noise floor and band cap) to the
 measured source revision and execution identity. Interpreter and trusted runner
 content hashes detect replacement without relying on file timestamps. Missing,
-changed or unavailable provenance requires recalibration.
+changed or unavailable provenance requires recalibration. An identity-only test
+environment may omit its executor; attempting to run a command then raises
+`RunnerAdmissionError` before admission or execution.

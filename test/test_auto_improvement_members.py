@@ -440,6 +440,9 @@ async def test_assignments_build_real_context_from_only_their_private_store(tmp_
     from kiro_crew.memory import MemoryStore
     from kiro_crew.skills import SkillsLoader
 
+    home = tmp_path / "host-home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     agents = tmp_path / "kiro/agents"
     agents.mkdir(parents=True)
     monkeypatch.setenv("KIRO_HOME", str(agents.parent))

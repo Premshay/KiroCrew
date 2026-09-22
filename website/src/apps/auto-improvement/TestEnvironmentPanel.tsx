@@ -378,6 +378,7 @@ export default function TestEnvironmentPanel({
       <label className="block text-[13px]">
         {t("boundedMeasurement.benchmarkProtectedPaths")}
         <textarea
+          aria-label={t("boundedMeasurement.benchmarkProtectedPaths")}
           value={measurement.benchmarkProtectedPaths}
           onChange={(e) =>
             editMeasurement({ benchmarkProtectedPaths: e.target.value })
@@ -390,6 +391,7 @@ export default function TestEnvironmentPanel({
       <label className="block text-[13px]">
         {t("boundedMeasurement.focusedTestPaths")}
         <textarea
+          aria-label={t("boundedMeasurement.focusedTestPaths")}
           value={measurement.focusedTestPaths}
           onChange={(e) =>
             editMeasurement({ focusedTestPaths: e.target.value })

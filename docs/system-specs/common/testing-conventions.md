@@ -159,6 +159,9 @@ registry leaf lets repeated session keys leak routing state between tests.
 Member execution fixtures must provision their own V2 memory before resolving
 bindings. Use `provision_member_memory` inside the isolated test home; do not
 bypass ownership checks to exercise an unrelated model or scheduling assertion.
+Member context tests must also pin `Path.home()` to a test-owned home when using
+a temporary project. Otherwise a scratch root beneath the operator's managed
+home makes that project a managed source, independent of `KIROCREW_HOME`.
 Mocked conversation logs must return a concrete metadata dictionary and its
 readability status. Inject member persistence failures at `persist_member_config`
 or its config writer, so rollback tests reach the current publication path.

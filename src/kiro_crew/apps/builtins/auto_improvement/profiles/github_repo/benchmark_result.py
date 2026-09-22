@@ -100,15 +100,15 @@ def benchmark_harness_globs(
 ) -> list[str]:
     protected = []
     root = root.resolve()
-    for path in normalize_benchmark_protected_paths(
+    for protected_path in normalize_benchmark_protected_paths(
         [] if protected_paths is None else protected_paths
     ):
-        resolved = (root / path).resolve()
+        resolved = (root / protected_path).resolve()
         if not resolved.is_relative_to(root) or resolved == root:
             raise ValueError("benchmarkProtectedPaths must stay inside the repository")
         relative = resolved.relative_to(root).as_posix()
         normalize_benchmark_protected_paths([relative])
-        for spelling in dict.fromkeys((path, relative)):
+        for spelling in dict.fromkeys((protected_path, relative)):
             protected.extend([spelling, spelling + "/**"])
     for command in commands:
         argv = shlex.split(command)

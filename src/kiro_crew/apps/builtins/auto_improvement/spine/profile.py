@@ -371,6 +371,7 @@ class PRRecipe(Protocol):
     #: the user's personal namespace draft reviews land in (e.g. ``share/<user>``);
     #: display/metadata only — the spine never parses it.
     namespace: str
+    pr_queue_dir: Path
 
     def draft(
         self,

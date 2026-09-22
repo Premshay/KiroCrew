@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 from .. import profiles
@@ -74,6 +75,8 @@ async def test_http_and_mcp_reader_invalidate_changed_provenance(monkeypatch):
     assert progress.ruler_calibrated()
     current["sourceRevision"] = "changed"
     response = await routes._handle_ruler(make_mocked_request("GET", "/ruler"))
+    assert isinstance(response, web.Response)
+    assert isinstance(response.body, bytes)
     assert json.loads(response.body)["status"] == "uncalibrated"
     assert not progress.ruler_calibrated()
 
@@ -204,8 +207,9 @@ def test_interpreter_content_change_invalidates_provenance_without_timestamp_cha
     import os
 
     executable = tmp_path / "python"
-    executable.write_bytes(b"first interpreter")
+    executable.touch(mode=0o700)
     executable.chmod(0o700)
+    executable.write_bytes(b"first interpreter")
     config = {
         "clone": str(tmp_path),
         "testEnvironment": {"kind": "python", "pythonExecutable": str(executable)},
@@ -513,8 +517,10 @@ async def test_authenticated_http_publication_admits_runner(
                 },
             )
             assert response.status == 202, await response.text()
-            await asyncio.to_thread(supervisor._thread.join, 10)
-            assert not supervisor._thread.is_alive()
+            thread = supervisor._thread
+            assert thread is not None
+            await asyncio.to_thread(thread.join, 10)
+            assert not thread.is_alive()
             assert supervisor.status()["status"] == "done", supervisor.status()
     finally:
         if supervisor._thread is not None:
@@ -522,6 +528,7 @@ async def test_authenticated_http_publication_admits_runner(
         token_auth._state.clear_all()
     assert len(observed) == 1
     execution, thread_name = observed[0]
+    assert execution is not None
     assert execution.user == "publication-tester" and execution.app == store.APP_NAME
     assert thread_name.startswith("auto-improvement-publish-")
     assert len(state.calls) == 1

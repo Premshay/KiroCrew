@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 from ..backend import commit, routes, store
@@ -39,6 +40,8 @@ async def test_config_roundtrip_invalidates_calibration(monkeypatch):
     store.write_json_atomic(store.ruler_dir() / "ruler.json", {"status": "calibrated"})
     response = await routes._handle_put_config(request(SETTINGS))
     assert response.status == 200
+    assert isinstance(response, web.Response)
+    assert isinstance(response.body, bytes)
     assert json.loads(response.body)["rejected"] == []
     saved = store.read_json(store.config_path())
     assert all(saved[key] == value for key, value in SETTINGS.items())
@@ -80,11 +83,12 @@ async def test_invalid_config_preserves_previous_value(patch, monkeypatch):
 
 def test_focused_iteration_and_unrestricted_final_regression(tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setattr(
-        gp,
-        "_run",
-        lambda argv, **kw: calls.append((argv, kw)) or subprocess.CompletedProcess(argv, 0, "", ""),
-    )
+
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(gp, "_run", run)
     profile = gp.GitHubRepoProfile(
         clone_path=tmp_path,
         pr_queue_dir=tmp_path / "queue",
@@ -112,15 +116,15 @@ def make_driver(tmp_path, monkeypatch, passed=True):
     d._run_deadline = time.monotonic() + 5000
     d._regression_tree = ""
     d.cost_meter = lambda: 0
-    d.caps = SimpleNamespace(max_cost_usd=50)
+    d.caps = drv.BudgetCaps(max_cost_usd=50)
     d.profile = SimpleNamespace(
         final_regression_required=True,
         full_regression_timeout_s=900,
         full_regression=Mock(return_value=passed),
     )
-    d._retire_if_unsafe = Mock(return_value=False)
-    d._progress = Mock()
-    d._regression_tree_id = Mock(return_value="tree")
+    monkeypatch.setattr(d, "_retire_if_unsafe", Mock(return_value=False))
+    monkeypatch.setattr(d, "_progress", Mock())
+    monkeypatch.setattr(d, "_regression_tree_id", Mock(return_value="tree"))
     monkeypatch.setattr(drv, "_git", lambda *args: subprocess.CompletedProcess([], 0, "base", ""))
     return d
 
@@ -189,22 +193,27 @@ def test_rebase_must_repeat_regression_on_new_tree(tmp_path, monkeypatch):
 def test_full_regression_precedes_every_kept_record_and_emit(tmp_path, monkeypatch, kind, passed):
     d = make_driver(tmp_path, monkeypatch, passed)
     events = []
-    d.profile.full_regression.side_effect = lambda **kw: events.append("regression") or passed
+
+    def record(event, result):
+        events.append(event)
+        return result
+
+    d.profile.full_regression.side_effect = lambda **kw: record("regression", passed)
     d.archive = Mock()
-    d.archive.save_candidate.side_effect = lambda **kw: events.append("archive") or "diff"
+    d.archive.save_candidate.side_effect = lambda **kw: record("archive", "diff")
     d.archive.append_row.side_effect = lambda row: events.append(row["status"])
     d.stats = SimpleNamespace(kept=0, not_kept=0)
     d.measurer = SimpleNamespace(reps=1)
     d.ledger = Mock()
     d._reset_provisional = Mock()
-    d._commit_winner_provisional = Mock(side_effect=lambda _: events.append("commit") or True)
+    d._commit_winner_provisional = Mock(side_effect=lambda _: record("commit", True))
     d._commit_bug_winner_provisional = d._commit_winner_provisional
     d.pr_pipeline = Mock()
     outcome = SimpleNamespace(
         repository_retired=True, filed=False, committed_ready=False, status="failed_verify"
     )
-    d.pr_pipeline.emit_perf.side_effect = lambda **kw: events.append("emit") or outcome
-    d.pr_pipeline.emit_bug.side_effect = lambda **kw: events.append("emit") or outcome
+    d.pr_pipeline.emit_perf.side_effect = lambda **kw: record("emit", outcome)
+    d.pr_pipeline.emit_bug.side_effect = lambda **kw: record("emit", outcome)
     winner = Proposal(
         cand_id="candidate",
         candidate=Candidate(kind=kind, target="a.py"),

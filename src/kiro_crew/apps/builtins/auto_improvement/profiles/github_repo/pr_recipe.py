@@ -41,6 +41,7 @@ import logging
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from kiro_crew.platform.context import redact_log_via_context
@@ -207,6 +208,7 @@ class GitHubPRRecipe:
         #: The real remote URL to push the one generated ref to. The clone's push
         #: remote stays DISABLED_NO_PUSH; see the module docstring.
         self.fetch_url = fetch_url
+        self.publication_guard: Callable[[], bool] | None = None
 
     # ── internals ────────────────────────────────────────────────────────────
 
@@ -403,7 +405,7 @@ class GitHubPRRecipe:
         scanned, scan_note = self._scan_pushable_content()
         if not scanned:
             return False, scan_note
-        guard = getattr(self, "publication_guard", None)
+        guard = self.publication_guard
         revision = "HEAD"
         if guard is not None:
             if guard() is not True:
@@ -453,7 +455,7 @@ class GitHubPRRecipe:
         FIRST so the record survives even when pushing or ``gh`` is unavailable —
         the morning-collection workflow keeps working offline.
         """
-        guard = getattr(self, "publication_guard", None)
+        guard = self.publication_guard
         if guard is not None and guard() is not True:
             raise RuntimeError("full regression is no longer valid; rerun the candidate")
         self.pr_queue_dir.mkdir(parents=True, exist_ok=True)
