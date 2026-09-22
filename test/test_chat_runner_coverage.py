@@ -59,9 +59,10 @@ from kiro_crew.trust_patterns import canonical_non_shell_trust_key, exact_trust_
 
 def _slot(key: str = "chat-cov-1") -> _ChatSlot:
     slot = _ChatSlot(key)
-    # Titled on purpose: an untitled slot makes the end-of-turn cycle spawn
-    # _maybe_auto_title, which is a real LLM path. maybe_refresh_title (the
-    # titled branch) self-guards and returns without a call.
+    # Titled on purpose: the end-of-turn cycle routes titling through
+    # title_then_refresh, and a titled slot makes both halves self-guard
+    # (_maybe_auto_title no-ops, maybe_refresh_title returns not-due) without
+    # a real LLM call.
     slot._titled = True
     return slot
 
@@ -1140,13 +1141,13 @@ class TestMarkKiroSignedOut:
         chat_runner._mark_kiro_signed_out(state)
 
 
-class TestDeliverAuthErrorToSlack:
+class TestDeliverLinkedSlackMessage:
     @pytest.mark.asyncio
     async def test_no_slack_client_is_a_noop(self, tmp_path):
         state = _state(tmp_path)
         state.slack_client = None
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, _slot(), state.sessions, "dashboard:x", "signed out"
         )
 
@@ -1155,7 +1156,7 @@ class TestDeliverAuthErrorToSlack:
         state = _state(tmp_path)
         state.slack_client = AsyncMock()
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, _slot(), state.sessions, "dashboard:x", "signed out"
         )
 
@@ -1167,7 +1168,7 @@ class TestDeliverAuthErrorToSlack:
         state.slack_client = AsyncMock()
         state.sessions.get_slack_link = MagicMock(return_value=("111.222", "C123"))
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, _slot(), state.sessions, "dashboard:x", "signed out"
         )
 
@@ -1182,7 +1183,7 @@ class TestDeliverAuthErrorToSlack:
         slot._slack_thread_ts = "1.2"
         slot._slack_channel = "C1"
 
-        await chat_runner._deliver_auth_error_to_slack(
+        await chat_runner._deliver_linked_slack_message(
             state, slot, state.sessions, "dashboard:x", "signed out"
         )
 
@@ -3016,7 +3017,7 @@ class TestFinishQueueCycle:
 
         with (
             patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush,
-            patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()),
+            patch.object(chat_runner, "title_then_refresh", new=AsyncMock()),
         ):
             await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
@@ -3027,7 +3028,7 @@ class TestFinishQueueCycle:
     async def test_idle_cycle_emits_done_and_refreshes_the_sidebar(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
-        with patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()):
+        with patch.object(chat_runner, "title_then_refresh", new=AsyncMock()):
             await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 

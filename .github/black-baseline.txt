@@ -234,7 +234,6 @@ src/kiro_crew/knowledge/spend.py
 src/kiro_crew/knowledge/store.py
 src/kiro_crew/knowledge/sync.py
 src/kiro_crew/knowledge/watcher.py
-src/kiro_crew/mcp_cleanup.py
 src/kiro_crew/mcp_gateway/abort.py
 src/kiro_crew/mcp_gateway/app_call.py
 src/kiro_crew/mcp_gateway/apps.py
@@ -582,7 +581,6 @@ test/test_file_stream.py
 test/test_file_watch.py
 test/test_fire_tool_hooks.py
 test/test_fixtures_helper.py
-test/test_folder_store_writer.py
 test/test_folder_watch_handlers.py
 test/test_folder_watcher.py
 test/test_frontend_dist_resolve.py
@@ -617,7 +615,6 @@ test/test_image_artifacts.py
 test/test_inbound_unbind_notice.py
 test/test_installer_distro.py
 test/test_installer_node_floor.py
-test/test_installer_shim_and_cleanup.py
 test/test_instance_credential_pairing.py
 test/test_instances_search_federation.py
 test/test_interactions_shortcut.py
@@ -710,7 +707,6 @@ test/test_mcp_probe_treadmill.py
 test/test_mcp_probe_warn_once.py
 test/test_mcp_registry_governance.py
 test/test_mcp_seed.py
-test/test_mcp_server_alias.py
 test/test_mcp_shareability.py
 test/test_mcp_shared.py
 test/test_mcp_shared_cache.py
@@ -900,7 +896,6 @@ test/test_socketsec.py
 test/test_source_providers.py
 test/test_source_providers_comment_guard.py
 test/test_source_summary.py
-test/test_spawn_followup.py
 test/test_spawn_list_redaction.py
 test/test_stable_release_gate.py
 test/test_stale_asset_watchdog.py
@@ -938,7 +933,6 @@ test/test_theme_authoring_skill.py
 test/test_theme_css_security.py
 test/test_theme_install.py
 test/test_thread_parent_context.py
-test/test_title_refresh.py
 test/test_to_dict_board_fields.py
 test/test_toolbox_migration.py
 test/test_trusted_apps_api.py

@@ -1009,6 +1009,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.minimap-location",
+    "label": "Minimap location",
+    "labelKey": "pages.settings.chatPanel.minimap_location",
+    "description": "When located on the right edge, the minimap replaces the scroll bar.",
+    "tab": "chat",
+    "type": "buttonGroup",
+    "occurrence": 1
+  },
+  {
     "id": "chat.pin-the-latest-turn",
     "label": "Pin the latest turn",
     "labelKey": "pages.settings.chatPanel.pin_last_prompt",
@@ -1365,6 +1374,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
   },
   {
+    "id": "developer.also-send-snippets-of-recalled-memories-so-jev-can-drop-the-ones-that-do-not-help",
+    "label": "Also send snippets of recalled memories so Jev can drop the ones that do not help",
+    "labelKey": "pages.developer.featurePreviewsTab.decisions_memory_text",
+    "description": "When the assistant asks its own memory a question, the entries closest in wording come back. This also sends each one's id and the first 200 characters of its text to Jev, which then says which ones to keep. It can only remove them — never add one, never reorder them — and if it is slow or unreachable they all come back as before. Passwords and keys are replaced before anything is sent. Off until you turn it on, even if the switch above is already on.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "developer.also-send-the-conversation-and-tool-call-inputs-so-jev-can-score-compaction",
     "label": "Also send the conversation and tool-call inputs so Jev can score compaction",
     "labelKey": "pages.developer.featurePreviewsTab.decisions_compaction",
@@ -1681,6 +1699,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "When the agent proactively messages you outside a chat"
   },
   {
+    "id": "notifications.show-a-banner-for-new-notifications",
+    "label": "Show a banner for new notifications",
+    "labelKey": "pages.settings.notificationsPanel.show_banner_for_new_notifications",
+    "description": "A card slides in under the top bar when a notification arrives, then tucks into the bell.",
+    "tab": "notifications",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "notifications.sound-category-skills",
     "labelKey": "pages.settings.notificationsPanel.category_skills",
     "tab": "notifications",
@@ -1908,7 +1935,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.auto-submit-when-i-finish-speaking",
     "label": "Auto-submit when I finish speaking",
     "labelKey": "pages.settings.sttSettings.endpointing",
-    "description": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming providers only.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1,
@@ -1954,7 +1980,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.dictation-panel",
     "label": "Dictation panel",
     "labelKey": "pages.settings.sttSettings.dictation_panel",
-    "description": "Show an animated panel while recording instead of the thin status bar. Falls back to the bar when the browser lacks WebGL2 or your system requests reduced motion.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1
@@ -1963,7 +1988,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.enabled",
     "label": "Enabled",
     "labelKey": "pages.settings.sttSettings.enabled",
-    "description": "Transcribe voice into the message box when you click the mic",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1
@@ -1995,20 +2019,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "stt.language_code"
   },
   {
-    "id": "voice.live-transcript-refresh-ms",
-    "label": "Live transcript refresh (ms)",
-    "labelKey": "pages.settings.sttSettings.partial_interval_ms",
-    "description": "How often the transcript is redrawn while you speak. Lower feels more immediate and costs more processing.",
-    "tab": "voice",
-    "type": "stepper",
-    "occurrence": 1,
-    "configKey": "stt.partial_interval_ms"
-  },
-  {
     "id": "voice.microphone",
     "label": "Microphone",
     "labelKey": "pages.settings.sttSettings.microphone",
-    "description": "Input device used to capture your voice",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
@@ -2017,21 +2030,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.model",
     "label": "Model",
     "labelKey": "pages.settings.sttSettings.model",
-    "description": "Models download on demand. Select one and click Download now; the desktop app already includes every other runtime dependency.",
     "tab": "voice",
     "type": "select",
     "occurrence": 1,
     "configKey": "stt.model"
-  },
-  {
-    "id": "voice.pause-that-ends-a-phrase-ms",
-    "label": "Pause that ends a phrase (ms)",
-    "labelKey": "pages.settings.sttSettings.silence_ms",
-    "description": "How much silence commits what you just said. Lower reacts sooner; higher tolerates thinking pauses.",
-    "tab": "voice",
-    "type": "stepper",
-    "occurrence": 1,
-    "configKey": "stt.silence_ms"
   },
   {
     "id": "voice.piper-binary",
@@ -2055,7 +2057,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.provider",
     "label": "Provider",
     "labelKey": "pages.settings.sttSettings.provider",
-    "description": "Local speech recognition runs on this machine and sends nothing anywhere. Transcribe uploads your audio to AWS.",
     "tab": "voice",
     "type": "select",
     "occurrence": 1,
@@ -2109,7 +2110,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.streaming",
     "label": "Streaming",
     "labelKey": "pages.settings.sttSettings.streaming",
-    "description": "Show the transcript in the input box as you speak, instead of only when you stop.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1,
@@ -2123,6 +2123,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "voice",
     "type": "stepper",
     "occurrence": 1
+  },
+  {
+    "id": "voice.tidy-up-transcripts-with-ai",
+    "label": "Tidy up transcripts with AI",
+    "labelKey": "pages.settings.sttSettings.polish",
+    "description": "Sends the finished text, never the audio, to the AI model you already chat with, which fixes punctuation and capitalisation. Your words are never changed.",
+    "tab": "voice",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "stt.polish"
   },
   {
     "id": "voice.voice",

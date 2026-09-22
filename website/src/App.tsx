@@ -97,6 +97,7 @@ import NotificationsPage from './pages/NotificationsPage'
 const SessionsPage = lazy(() => import('./pages/SessionsPage'))
 import NotificationDetailPanel from './components/notifications/NotificationDetailPanel'
 import NotificationFeed from './components/notifications/NotificationFeed'
+import NotificationBanner from './components/notifications/NotificationBanner'
 import LogsPage from './pages/LogsPage'
 import HooksPage from './pages/HooksPage'
 import WebhooksPage from './pages/WebhooksPage'
@@ -1101,8 +1102,9 @@ function NotificationsBellButton() {
    *
    * `scrim: null` because the sheet's column scrim is its own CHILD and travels
    * with it; there is no separate backdrop to fade in lockstep. Safe against
-   * registerDrawerTargets' projection precondition because nothing under
-   * `components/notifications/` imports framer-motion at all.
+   * registerDrawerTargets' projection precondition because nothing rendered
+   * INSIDE the sheet uses framer-motion (`NotificationBanner` does, but it is
+   * portalled beside the sheet, never within it).
    */
   useEffect(() => registerDrawerTargets(sheetX, {
     panel: () => sheetRef.current,
@@ -1151,6 +1153,14 @@ function NotificationsBellButton() {
     animateDrawer(sheetX, 0)
     recordEvent('notifications_open', { source: 'topbar' })
   }, [sheetX, parkedOffset])
+
+  // The banner's "open on this note" path: the same open as the bell, then
+  // the selection — one state owner, so the popover's auto-ack effect and its
+  // detail panel work for a banner tap exactly as for a row tap.
+  const openPanelOn = useCallback((ts: string) => {
+    openPanel()
+    setSelectedTs(ts)
+  }, [openPanel])
 
   // See NC_CLOSE_BACKSTOP_MS: `animateDrawer`'s arrival callback owns the
   // unmount, and this only rescues a phase that never heard back at all.
@@ -1208,9 +1218,16 @@ function NotificationsBellButton() {
     return () => { document.removeEventListener('pointerdown', onPointerDown); document.removeEventListener('keydown', onKey) }
   }, [open, selectedTs, closePanel])
 
-  // Auto-mark-read when opening a notification's detail
+  // Auto-mark-read when opening a notification's detail -- ONCE per
+  // selection. A rejected ack flips the row back to unread
+  // (`ackNotification.rejected`), and re-asking on that flip would loop the
+  // request forever; the detail panel's own "Mark read" is the retry.
+  const autoAckedTsRef = useRef<string | null>(null)
   useEffect(() => {
-    if (selected && !selected.acked) dispatch(ackNotification(selected.ts))
+    if (!selected) { autoAckedTsRef.current = null; return }
+    if (selected.acked || autoAckedTsRef.current === selected.ts) return
+    autoAckedTsRef.current = selected.ts
+    dispatch(ackNotification(selected.ts))
   }, [selected, dispatch])
 
   return (
@@ -1332,6 +1349,18 @@ function NotificationsBellButton() {
           )}
           </ErrorBoundary>
         </div>,
+        document.body
+      )}
+      {/* Live-arrival banner. Portalled like the sheet so a transformed
+          ancestor in the top bar cannot capture its `fixed` positioning; it
+          borrows the bell for its exit vector and this component's open/select
+          mechanics rather than holding any selection of its own. */}
+      {createPortal(
+        <NotificationBanner
+          bellRef={bellRef}
+          popoverOpen={phase !== 'closed'}
+          onOpenNote={openPanelOn}
+        />,
         document.body
       )}
     </div>
@@ -3450,8 +3479,8 @@ export default function App() {
           the strip it was summoned by, so hover and clicks land on the chrome's own
           surface handlers and the strip never has to resize or opt out of
           hit-testing — a hit target that changes under a resting pointer is what
-          made this flicker open/closed indefinitely. `focus-peek-strip` carries `-webkit-app-region:no-drag`, which
-          is load-bearing on the TOP one: Electron injects a 42px drag bar on
+          made this flicker open/closed indefinitely. `.focus-peek-top` / `.focus-peek-rail`
+          (index.css) carry `-webkit-app-region:no-drag`, which is load-bearing on the TOP one: Electron injects a 42px drag bar on
           document.body, and an ordinary div inside it becomes a window-drag
           region whose hover never reaches React. */}
       {focusActive && (
@@ -3460,14 +3489,14 @@ export default function App() {
             ref={topPeekTrigger}
             data-testid="focus-peek-top"
             aria-hidden="true"
-            className="focus-peek-strip focus-peek-top absolute left-0 right-0 top-0 z-[61]"
+            className="focus-peek-top absolute left-0 right-0 top-0 z-[61]"
             {...topPeek.triggerProps}
           />
           <div
             ref={railPeekTrigger}
             data-testid="focus-peek-rail"
             aria-hidden="true"
-            className="focus-peek-strip focus-peek-rail absolute left-0 bottom-0 z-[61]"
+            className="focus-peek-rail absolute left-0 bottom-0 z-[61]"
             // Starts below the top strip so the two tile the corner rather than
             // overlapping, where whichever won would be arbitrary.
             style={{ top: FOCUS_INSET }}

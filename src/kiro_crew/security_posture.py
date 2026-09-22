@@ -166,6 +166,22 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "single-call `tool_args` scope describes it.",
     ),
     (
+        "Recalled-memory questions sent to the decision judge",
+        "decisions/points/memory_recall.py",
+        "A snippet of each memory vector similarity recalled for this turn, sent to "
+        "the third-party judge that decides which of them are worth their place in "
+        "the prompt. Like the three points above it this module EMITS its redacted "
+        "bytes rather than refusing: a recalled episode is text the agent wrote down "
+        "turns or days ago, so refusing on a single episode that happens to quote an "
+        "env file would stop the point firing on that store at all. Both scanners "
+        "run over each snippet in FULL, credential then URL, and the clip to 200 "
+        "characters is taken AFTER them -- a cut placed first can halve a secret into "
+        "a fragment neither pattern matches, the same order `tool_risk.scrubbed` "
+        "states; a scanner that fails yields the empty string rather than the input, "
+        "and the gate's own scan still refuses the whole request for a spelling this "
+        "pass missed.",
+    ),
+    (
         "Member capability editor responses",
         "agent_capabilities.py",
         "Owner-facing capability rows, Parent-change previews and impact summaries. "
@@ -1437,6 +1453,19 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "all: it cannot be read back by a later reader, cannot survive in halves "
         "across the record's byte ceiling, and is not left on disk for the next "
         "reader that forgets to scrub.",
+    ),
+    (
+        "Member event-log projection broadcast",
+        "eventlog/service.py",
+        "Folded member projection views pushed to the browser over the "
+        "member-projection WS on every change. A projection carries "
+        "agent-authored free-text (an activity record's `project`, message "
+        "previews) that would otherwise cross to the dashboard verbatim, the "
+        "same class the sibling `/activity` HTTP read redacts. "
+        "`_redact_projection_value` runs the shared exfiltration-URL then "
+        "credential chain over the view before broadcast; it is applied at the "
+        "network boundary rather than the fold so the stored projection keeps "
+        "its raw value for server-side folds while nothing leaves unredacted.",
     ),
 )
 

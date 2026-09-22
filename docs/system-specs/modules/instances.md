@@ -907,6 +907,7 @@ its real jobs.
 | `GET /api/cloud/launch` | List launch jobs, in progress and finished. |
 | `POST /api/cloud/launch` | Start a launch job; returns the job immediately. `409` when one is already in flight. Body `{provider_id?, profile, region, size_key}`; `provider_id` defaults to `aws_ec2`, and an id the seam does not list or cannot back answers `400 unknown_provisioner` before any job file exists. The job carries `provider_id`, and its step labels are the provisioner's. |
 | `GET /api/cloud/launch/{id}` | Poll one job: per-step state plus the device-code prompt while signing in. |
+| `GET /api/cloud/launch/{id}/task` | The current ECS state of the container task a finished Fargate launch recorded: one `describe-tasks` for that ARN, answered as `{job_id, task_arn, read_at, task}` where `task` is the sighting (cluster, task id, `last_status`, `desired_status`, `started_at`, `stopped_at`, `stopped_reason`) or `null` when ECS does not list the ARN, and `read_at` is when this read happened. Read-only and owner-only; POSIX-gated like every route here that runs the AWS CLI. Refusals name their cause: `launch_job_not_found` (404), `launch_task_not_recorded` and `unknown_provisioner` (400), `provisioner_cannot_describe` (400, a lane without this read, by capability rather than by id), `aws_call_failed` (502). |
 | `POST /api/cloud/launch/{id}/cancel` | Request cancellation; honored between steps and inside the sign-in wait. A cancel during provisioning is acted on when the deploy returns, and the stack it created is rolled back. It also stops the remote `kiro-cli login` **before** that rollback and regardless of whether the rollback confirms: teardown can end in `DELETE_FAILED`, and an instance that survives with a login still polling would sign the crew in minutes after the owner cancelled. Stopping the login is deliberately not a `logout` — the box may hold an older session the cancelled attempt never touched. |
 | `POST /api/cloud/launch/{id}/signin` | Acknowledge the device-code prompt (`409` when none is pending). |
 | `POST /api/cloud/launch/{id}/signin/restart` | Re-run **only** the sign-in step on a crew that already exists, for a launch that finished unsigned: a fresh device code, run with the job's stored `login_target` so a company-SSO crew is not retried through a Builder ID prompt. Owner-only; never re-provisions. `400` when the job never created a crew, `409` while any launch or sign-in is already running on it. The RUNNING transition is persisted under the launch lock that admitted the request, so a second restart arriving in that window cannot pass the same check. |
@@ -2094,11 +2095,13 @@ image: `ssm_target_matches()` is the shared SSM-transport charset and admits the
 ECS shape, so before that check the `ssm` arm asks `split_ecs_target()` and
 raises `InvalidInstanceError` (naming the `fargate` method) when the target is
 an ECS task. Without that refusal an ECS target could be stored under `ssm`, and
-its connect would forward and then fail at the mint.
+its connect would forward and then fail at the mint; a record that was stored
+before the refusal existed is caught by the connect-time mirror in 16.2.
 
 `validate()` runs from `add()` and `update()` (and from the edit handler's
 pre-check on the proposed record), never from the loader, so a record already on
-disk is not dropped on load; it is refused the next time it is written. A record
+disk is not dropped on load; it is refused the next time it is written, and an
+`ssm` record carrying an ECS target is also refused at connect (16.2). A record
 migrates from `ssm` to `fargate` in one `update()` call that changes both
 `connection_method` and `ssm_target`, because `update()` applies every change and
 then validates the whole record.
@@ -2107,7 +2110,13 @@ then validates the whole record.
 
 `_resolve_transport` validates the target with `validate_ssm_target` and then
 requires `split_ecs_target` to succeed, so an EC2 id on a `fargate` record is
-refused before any command line is built. `_TransportParams.forwards_over_ssm`
+refused before any command line is built. The `ssm` arm asks the same splitter
+and refuses when it succeeds, raising `SsmValidationError` naming the `fargate`
+method: this is the connect-time mirror of the registry's write-side refusal
+(16.1), for records written before that refusal existed, which would otherwise
+forward to a task with no SSM agent and fail at the mint with a generic error.
+`connect()` reports it as an error status, spawns no forwarder and mints
+nothing. `_TransportParams.forwards_over_ssm`
 is true for both `ssm` and `fargate`, and `tunnel_kwargs()` hands the child the
 `ssm` transport: the forwarder argv is identical to the `ssm` method's, and what
 differs lives on the manager, not in the child.

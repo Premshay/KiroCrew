@@ -120,6 +120,12 @@ from kiro_crew.dashboard.handlers._shared import (
     apply_skill_mapping,
     read_bounded_json,
 )
+from kiro_crew.dashboard.handlers.agent_templates import (
+    TEMPLATE_DEFINITION_KEYS,
+    apply_definition_patch,
+    read_only_reason_for_path,
+    validate_definition_patch,
+)
 from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
@@ -3546,7 +3552,23 @@ async def api_agent_detail(request: web.Request) -> web.Response:
     # directory must not stall every other request on the loop. Only the specs
     # that claim *name* come back, in scan order, so the body below keeps its
     # skip-to-next-file shape over exactly the files it would have acted on.
-    for f, spec in await asyncio.to_thread(_agent_detail_candidates, name):
+    candidates = await asyncio.to_thread(_agent_detail_candidates, name)
+    if request.method == "PATCH" and patch_body is not None and len(candidates) > 1:
+        # A PATCH rewrites ONE file -- model, skills, prompt, tools alike. Two
+        # files claiming the name (``atlas.json`` beside ``SomePkg-atlas.json``,
+        # or a hand-edited declared name colliding with another file's stem)
+        # would be resolved by unordered scan order, so the file the roster
+        # showed and the file overwritten could differ. Refused for every key,
+        # like the fork/publish resolvers refuse ``_AmbiguousTemplateName``;
+        # the same check runs again under the write lock below.
+        return web.json_response(
+            {
+                "error": f"'{name}' matches more than one template file; rename one first.",
+                "code": "ambiguous_template_name",
+            },
+            status=409,
+        )
+    for f, spec in candidates:
         # Two-step so ``data`` stays typed ``dict`` for the PATCH branch's
         # re-read below, which reassigns it from a raw ``json.loads``.
         data = spec
@@ -3591,6 +3613,28 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                         return web.json_response(
                             {"error": f"at most {MAX_AGENT_SKILLS} skills per agent"},
                             status=400,
+                        )
+                if TEMPLATE_DEFINITION_KEYS & patch_body.keys():
+                    # The templates tab's definition edit (prompt, description,
+                    # tools). Shape-checked here; refused for a spec the tab
+                    # cannot own -- a package or runtime file would be reverted
+                    # on its next install, a private copy belongs to its crew's
+                    # pane. ``model`` / ``skills`` keep their existing reach: the
+                    # crew pane writes those onto private copies.
+                    problem = validate_definition_patch(patch_body)
+                    if problem is not None:
+                        return web.json_response(
+                            {"error": problem, "code": "invalid_definition"}, status=400
+                        )
+                    read_only = await asyncio.to_thread(read_only_reason_for_path, f)
+                    if read_only is not None:
+                        return web.json_response(
+                            {
+                                "error": f"Template '{name}' is read-only ({read_only})",
+                                "code": "template_read_only",
+                                "reason": read_only,
+                            },
+                            status=409,
                         )
                 mapped: list[str] = []
                 loop = asyncio.get_running_loop()
@@ -3684,6 +3728,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                         # before persisting (same contract as
                         # _write_spec_file and the PUT handler).
                         with agents_spec_lock(f.parent):
+                            # The pre-lock ambiguity check re-run where it
+                            # decides: a second claimant that landed after the
+                            # scan (a package install) must refuse, not let
+                            # the stale single match be overwritten.
+                            if [c for c, _spec in _agent_detail_candidates(name)] != [f]:
+                                raise _AmbiguousTemplateName(name)
                             fresh = _read_agent_spec(
                                 f, operation="api_agent_detail", source="dashboard"
                             )
@@ -3702,6 +3752,7 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                                     clear_model_pin(data, agent_name)
                                 else:
                                     agent_state.set_model_managed(agent_name, False)
+                            apply_definition_patch(data, patch_body)
                             agent_state.lift_and_strip_bookkeeping(data, agent_name)
                             for key, value in data.items():
                                 if key not in before_patch or before_patch[key] != value:
@@ -3721,6 +3772,15 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                     except CapabilityError as exc:
                         return web.json_response(
                             {"error": exc.code, "code": exc.code}, status=exc.status
+                        )
+                    except _AmbiguousTemplateName:
+                        return web.json_response(
+                            {
+                                "error": f"'{name}' matches more than one template file; "
+                                "rename one first.",
+                                "code": "ambiguous_template_name",
+                            },
+                            status=409,
                         )
                     except FileNotFoundError:
                         return web.json_response(
@@ -5231,6 +5291,17 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             )
         # Captured BEFORE any mutation: what the effort chain reads today.
         effort_inputs_before = _effort_inputs(agent)
+        # Best-effort per-member event log: snapshot the config-derived roster
+        # fields before mutation so member/config can report which changed.
+        _ev_before = {
+            "kiro_agent": agent.kiro_agent,
+            "workspace": agent.workspace,
+            "memory_store": agent.memory_store,
+            "model": agent.model,
+            "source": agent.source,
+            "starred": bool(agent.starred),
+            "avatar": agent.avatar,
+        }
         changed: list[str] = []
         if "kiro_agent" in body:
             try:
@@ -5417,6 +5488,50 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             await _drained_to_thread(_commit_promoted_avatar, name, _avatar_pin)
         if _remove_files_after_save:
             await _drained_to_thread(_remove_avatar_files, name)
+        # Best-effort per-member event log: the save succeeded, so emit a
+        # config snapshot with the list of fields that actually changed.
+        try:
+            from kiro_crew import eventlog_hooks
+            from kiro_crew.dashboard.handlers.members import normalize_member_source
+            from kiro_crew.eventlog.types import MEMBER_CONFIG
+            from kiro_crew.members import member_slug
+
+            _ev_after = {
+                "kiro_agent": agent.kiro_agent,
+                "workspace": agent.workspace,
+                "memory_store": agent.memory_store,
+                "model": agent.model,
+                # Bounded to the roster vocabulary, matching the roster row and
+                # ``_config_snapshot_for_agent`` — ``source`` is agent-writable
+                # free text, so a credential- or URL-shaped value must not reach
+                # the durable projection (which the drawer and WS ship) raw.
+                "source": normalize_member_source(agent.source),
+                "starred": bool(agent.starred),
+                "avatar": agent.avatar,
+            }
+            _ev_changed = [k for k, v in _ev_after.items() if v != _ev_before.get(k)]
+            # A save that touched none of the roster fields is not a fact worth
+            # recording: the projection would fold to the same value and emit
+            # nothing, leaving only a no-op line in the log.
+            if _ev_changed:
+                # Off the event loop: ``emit`` opens the member log and does a
+                # synchronous ``os.fsync`` append, which would otherwise stall
+                # every gateway task on this async handler.
+                await asyncio.to_thread(
+                    eventlog_hooks.emit,
+                    # member_slug, not the bare fold: a member may carry an explicit
+                    # `member_id`, and the roster keys their log by it. Folding the
+                    # name here would write this event to a DIFFERENT log than the
+                    # roster reads, so the change would never appear. `cfg` is the
+                    # config this handler already loaded, so the resolve costs no
+                    # I/O on the loop -- member_slug would otherwise load it here.
+                    member_slug(name, cfg),
+                    name,
+                    MEMBER_CONFIG,
+                    {**_ev_after, "changed": _ev_changed},
+                )
+        except Exception:
+            logger.debug("member/config event-log hook failed", exc_info=True)
     # Compared, not merely "the body carried the field": the crew form sends
     # reasoning_effort on every save (that is what makes clearing a pin possible)
     # and refresh_defaults drains the warm pool, so refreshing on presence would

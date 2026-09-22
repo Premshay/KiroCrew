@@ -36,11 +36,13 @@ import {
 } from '../store/notificationsSlice'
 import {
   dispatchMcNotification,
+  dispatchLiveNotification,
   TURN_DONE_KIND,
   APPROVAL_KIND,
   shouldChimeOnTurnDone,
 } from './notificationEvent'
 import { shouldNotifyOnChatComplete } from './chatCompleteNotify'
+import { isChatPath } from './notificationBanner'
 import { emitThemeSound } from './themeSound'
 import { streamingFlushHoldMs } from '../lib/streamHold'
 import { registerPendingChunkDrain } from '../lib/pendingChunkDrain'
@@ -110,6 +112,8 @@ import { api } from '../api/client'
 import { AUTONUDGE_LOOPS_QUERY_KEY } from '../components/autoNudgeLoop'
 import { forgetUnobservedMemberThreads } from '../api/membersQuery'
 import { observedPaneSlots } from '../api/slotMessagesQuery'
+import { MEMBERS_ROSTER_QUERY_KEY } from '../api/membersQuery'
+import { memberProjectionStore } from '../state/memberProjectionStore'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { markFirstAudio, markFirstToken } from '../utils/voiceTurnMetrics'
 import { deriveToolCallTitle } from '../utils/toolCallTitle'
@@ -153,17 +157,8 @@ type LogCallback = ((data: { level: string; msg: string }) => void) | null
  *  of the stale-badge defect. Deliberate gestures (switchSlot,
  *  mark-as-read) need no gate — they only occur on surfaces that show the
  *  slot, under real focus. */
-const isChatSurfaceVisible = (): boolean => {
-  if (typeof window === 'undefined') return false
-  const path = window.location.pathname
-  return (
-    path === '/' ||
-    path === '/chat' ||
-    path.startsWith('/chat/') ||
-    path.startsWith('/popout/chat') ||
-    path.startsWith('/embed/chat')
-  )
-}
+const isChatSurfaceVisible = (): boolean =>
+  typeof window !== 'undefined' && isChatPath(window.location.pathname)
 /** True when *slot* is the thread this window is displaying: the chat
  *  surfaces' `chat.activeSlot`, or the thread a non-chat surface (the Crew
  *  Members page) registered in `viewedThread`. The unread-marker's gate: a
@@ -2018,6 +2013,15 @@ export function useWebSocket() {
             if (!n.silenced && n.priority !== 'passive') {
               dispatchMcNotification(n.kind)
             }
+            // The in-app banner hears LIVE arrivals only. A reconnect catch-up
+            // replays every frame missed while the socket was down, and those
+            // notes are already in the bell (the reconnect refetch lands them);
+            // bannering them would re-announce history as news — the same
+            // suppression the turn-done chime applies via `reconnectingRef`.
+            // The boot snapshot never reaches here at all (it arrives through
+            // `fetchNotifications`, not this frame), so mount replay is
+            // excluded by construction.
+            if (!reconnectingRef.current) dispatchLiveNotification(n)
             break
           }
           case 'panel_published': {
@@ -2180,6 +2184,40 @@ export function useWebSocket() {
           case 'slot_agent_switch': {
             // /agent command — refresh slot metadata to pick up new agent label
             dispatch(fetchSlots())
+            break
+          }
+          case 'member_projection': {
+            // One member's projected value moved. The server wraps every
+            // broadcast as { type, data }, so the fields ride under `data`.
+            // Apply only a well-formed frame: the store's higher-seq-wins drops
+            // a stale or replayed seq, but a missing slug/key/seq is a malformed
+            // frame that must not touch the store at all.
+            const pf = (data ?? {}) as { slug?: unknown; key?: unknown; seq?: unknown; value?: unknown }
+            if (typeof pf.slug === 'string' && pf.slug && typeof pf.key === 'string' && pf.key && typeof pf.seq === 'number') {
+              memberProjectionStore.apply(pf.slug, pf.key, pf.value, pf.seq)
+            }
+            break
+          }
+          case 'members_subscribed': {
+            // Sent once per connection before any member_projection frame: the
+            // server's authoritative lastSeq per slug. Truncate held rows that
+            // ran ahead of it (a torn tail rolled back after a restart).
+            const seqs = ((data ?? {}) as { lastSeqs?: unknown }).lastSeqs
+            if (seqs && typeof seqs === 'object') {
+              const dropped = memberProjectionStore.truncateAll(
+                seqs as { [slug: string]: number },
+              )
+              if (dropped) {
+                // A drop is correct but incomplete: the row above the server's seq
+                // recorded something that did not happen, and removing it leaves the
+                // card with no value where the truth is whatever the server holds at
+                // its own seq. The store is a cache and cannot produce that, so the
+                // roster is refetched -- its rows carry each slug's baseline, and
+                // seeding is higher-seq-wins, so this restores the authoritative
+                // value without overwriting anything newer that arrives meanwhile.
+                queryClient.invalidateQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
+              }
+            }
             break
           }
           case 'chat_message':

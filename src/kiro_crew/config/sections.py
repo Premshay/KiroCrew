@@ -1195,7 +1195,11 @@ class AgentConfig:
             "when many MCP servers are configured. kiro-cli backend only. "
             "Deferral only starts once the specs cross tool_search_min_pct or "
             "tool_search_min_tokens; disabling reverts to sending full tool "
-            "specs. No effect on an alternate ACP backend.",
+            "specs. Kiro Crew's OWN servers are exempt and always send full "
+            "specs, whatever this is set to: loading one mid-turn would change "
+            "the tools list a thinking block's signature is bound to and the "
+            "provider would reject the conversation. No effect on an alternate "
+            "ACP backend.",
         ),
     )
     tool_search_min_pct: int = field(
@@ -1662,8 +1666,12 @@ class AgentConfig:
         default=1.0,
         metadata=_meta(
             "SubAgent CPU Cost (cores)",
-            "First-boot per-agent CPU-cost fallback (cores) used to auto-size the "
-            "cap until a learned value accumulates.",
+            "Deprecated and inert: the subagent cap is sized from host memory "
+            "only, because over-committing memory is an unrecoverable OOM while "
+            "over-committing CPU only slows work the adaptive controller already "
+            "backs off from. Preserved on load and save so an existing config is "
+            "not rewritten out from under the operator.",
+            deprecated=True,
         ),
     )
     subagent_auto_max: int = field(
@@ -5087,7 +5095,11 @@ class SttConfig:
             "Which speech model the local provider downloads and runs. Bigger is "
             "more accurate and a longer first-time download: `tiny` on a machine "
             "short of memory, `base` for everyone, `small` when accents or jargon "
-            "are being misheard, `large-v3-turbo` for the best accuracy available.",
+            "are being misheard, `large-v3-turbo` for the best accuracy available "
+            "-- though on a CPU-only build it can recognise slower than you speak: "
+            "an 11-second clip took 13.6 s on a 16-thread aarch64 CPU, 1.24x the "
+            "audio. The Voice panel says so beside the choice when the build it "
+            "measured has no acceleration.",
             enum=list(_VALID_STT_MODELS),
         ),
     )
@@ -5097,6 +5109,18 @@ class SttConfig:
             "Language Code",
             "Language for speech recognition (e.g. zh-CN, en-US). The local provider "
             "defaults to auto-detect; choosing a language can improve short dictation.",
+        ),
+    )
+    polish: bool = field(
+        default=False,
+        metadata=_meta(
+            "AI Cleanup",
+            "After dictation finishes, have your configured model fix punctuation "
+            "and capitalisation. Your WORDS are never changed: a "
+            "reply that altered one is discarded, so the worst case is that nothing "
+            "happens. Off by default because it sends the TRANSCRIPT (never the "
+            "audio) to that model, so a local-only setup stays local-only until you "
+            "turn this on.",
         ),
     )
     streaming: bool = field(
@@ -5646,8 +5670,13 @@ class McpConfig:
             "with a warning. These directories are prepended to the search path "
             "used by the MCP probe, the agent-config command resolver, and the "
             "broker's rewriter alike, so a binary found here is found "
-            "everywhere. They do NOT join the search for the agent runtime "
-            "itself, which must not be shadowable by a configured directory.",
+            "everywhere. They also join the PATH of the broker daemon and every "
+            "pooled MCP backend it spawns, so a wrapper script found here can "
+            "exec a bare tool name; the daemon reads this when it starts, so a "
+            "change reaches it only once it is replaced. They do NOT join the "
+            "search for the agent runtime itself, which must not be shadowable "
+            "by a configured directory.",
+            restart=True,
         ),
     )
 
@@ -7255,7 +7284,7 @@ class WeixinConfig:
     """Weixin (personal WeChat) channel via Tencent's iLink Bot API.
 
     Distinct from :class:`WeComConfig` (enterprise WeCom over WebSocket). The
-    bot ``token`` + ``account_id`` are obtained through the Settings > Channels
+    bot ``token`` + ``account_id`` are obtained through the Settings > Messaging Channels
     QR-login flow; prefer the WEIXIN_TOKEN credential over storing the token
     here.
     """
@@ -7358,7 +7387,7 @@ class WhatsAppConfig:
 
     Pairs as a linked device on the operator's own WhatsApp account — there is
     no bot token. Pairing state lives in a local session database under the
-    data home (``whatsapp/session.db``), created by the Settings > Channels QR
+    data home (``whatsapp/session.db``), created by the Settings > Messaging Channels QR
     flow. Requires the optional ``whatsapp`` dependency
     (``pip install 'neonize==0.4.3.post0'``; see :mod:`kiro_crew.extras`).
 
@@ -7372,7 +7401,7 @@ class WhatsAppConfig:
         metadata=_meta(
             "Enabled",
             "Enable the WhatsApp channel (QR-linked personal account over the "
-            "WhatsApp Web protocol). Pair a device from Settings > Channels; "
+            "WhatsApp Web protocol). Pair a device from Settings > Messaging Channels; "
             "needs the 'whatsapp' dependency extra installed.",
             tags=["whatsapp"],
         ),

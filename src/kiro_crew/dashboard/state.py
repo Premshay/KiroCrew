@@ -17,6 +17,8 @@ import time
 import traceback
 import uuid
 from collections.abc import Coroutine, Iterable, Iterator
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, TypeVar
@@ -2169,6 +2171,112 @@ def request_slot_origin(app: str) -> str:
     return SlotOrigin.APP if app else SlotOrigin.USER
 
 
+STAGE_BOUNDARY_OWNER_META_KEY = "stageBoundaryOwner"
+
+
+@dataclass
+class StageBoundary:
+    """One stage's delivery, recovery, and cancellation ownership."""
+
+    stage: int | None = None
+    consumed: bool = True
+    retry_queue_id: str = ""
+    continuation_required: bool = False
+    preserve_stop_generation: int = -1
+    parent_session_keys: set[str] = dataclass_field(default_factory=set)
+    synthetic_recovery_inflight: int = 0
+    recovery_retrigger_count: int = 0
+    report_retention_refused: str | None = None
+    cancellation_hold_refused: str | None = None
+    generation: str = ""
+    armed_at: int = 0
+
+    @property
+    def owner(self) -> str | None:
+        """The current queue-ownership token, if a boundary is armed."""
+        return self.generation if self.stage is not None and self.generation else None
+
+    def arm(self, stage: int, *, consumed: bool = False) -> None:
+        """Start a new stage boundary and mint its queue ownership token."""
+        new_boundary = self.stage != stage or self.owner is None
+        if new_boundary:
+            self.generation = uuid.uuid4().hex
+            self.report_retention_refused = None
+            self.cancellation_hold_refused = None
+        self.stage = stage
+        self.armed_at = time.monotonic_ns()
+        self.consumed = consumed
+        self.retry_queue_id = ""
+        self.continuation_required = False
+        self.preserve_stop_generation = -1
+        self.parent_session_keys.clear()
+        self.synthetic_recovery_inflight = 0
+
+    def preserve(self, stage: int, *, consumed: bool) -> None:
+        """Keep an interrupted stage armed until a later guarded Go."""
+        if self.stage != stage:
+            self.arm(stage, consumed=consumed)
+        else:
+            self.consumed = consumed
+        self.continuation_required = consumed
+
+    def mark_consumed(self, consumed: bool) -> None:
+        """Record provider consumption and retire an obsolete exact retry."""
+        self.consumed = consumed
+        if consumed:
+            self.retry_queue_id = ""
+
+    def clear(self) -> None:
+        """Atomically release every live field owned by the current boundary."""
+        self.stage = None
+        self.armed_at = 0
+        self.consumed = True
+        self.retry_queue_id = ""
+        self.continuation_required = False
+        self.preserve_stop_generation = -1
+        self.parent_session_keys.clear()
+        self.synthetic_recovery_inflight = 0
+        self.report_retention_refused = None
+        self.cancellation_hold_refused = None
+
+    def tag_meta(self, meta: dict | None = None, *, owner: str | None = None) -> dict:
+        """Copy *meta* and tag it with an explicit or current owner token."""
+        tagged = dict(meta or {})
+        actual_owner = self.owner if owner is None else owner
+        if actual_owner:
+            tagged[STAGE_BOUNDARY_OWNER_META_KEY] = actual_owner
+        return tagged
+
+    def owns_entry(self, entry: dict, *, owner: str | None = None) -> bool:
+        """Whether a queue entry belongs to the selected boundary token."""
+        meta = entry.get("meta")
+        actual_owner = self.owner if owner is None else owner
+        return bool(
+            actual_owner
+            and isinstance(meta, dict)
+            and meta.get(STAGE_BOUNDARY_OWNER_META_KEY) == actual_owner
+        )
+
+
+def stage_boundary_for(slot: object) -> StageBoundary:
+    """Return *slot*'s boundary; a minimal test double starts unarmed."""
+    boundary: StageBoundary | None = getattr(slot, "stage_boundary", None)
+    if boundary is not None:
+        return boundary
+    boundary = StageBoundary()
+    try:
+        setattr(slot, "stage_boundary", boundary)
+    except (AttributeError, TypeError):
+        if isinstance(slot, _ChatSlot):
+            raise
+        logger.warning(
+            "stage_boundary_for could not attach a boundary to non-slot object "
+            "of type %s; using an ephemeral boundary",
+            type(slot).__qualname__,
+        )
+    return boundary
+
+
 class _ChatSlot:
     """Independent chat session that runs server-side."""
 
@@ -2222,9 +2330,11 @@ class _ChatSlot:
         "_title_origin",
         "_title_epoch",
         "_title_refresh_mark",
+        "_title_low_signal",
         "_auto_tagged",
         "_title_in_flight",
         "_title_retry_pending",
+        "_title_task",
         "_summary_in_flight",
         "_summary_turn_mark",
         "_detail_render_lock",
@@ -2263,6 +2373,8 @@ class _ChatSlot:
         "_plan_cancelled",
         "_auto_run",
         "_in_stage_execution",
+        "_stage_controller_task",
+        "stage_boundary",
         "_last_turn_auth_required",
         "_recovery_chat_triggered",
         "_stage_titles",
@@ -2284,7 +2396,6 @@ class _ChatSlot:
         "_subagent_deliveries_inflight",
         "_subagents_inline_collected",
         "_subagent_delivery_pending",
-        "_recovery_retrigger_count",
         "_prompt_busy_retries",
         "_acp_pipe_death_retries",
         "_stale_recovery_retries",
@@ -2591,10 +2702,25 @@ class _ChatSlot:
         # the refresh token budget is hard-bounded. Persisted so a gateway
         # restart cannot re-spend consumed milestones.
         self._title_refresh_mark: int = 0
+        # True when the current AUTO title was derived from a low-signal first
+        # message (URL/identifier-dominated, e.g. a pasted ticket link) — the
+        # one case where the name can only restate the link. Makes the title
+        # refresh due once the first turn's transcript exists (see
+        # chat_title._TITLE_EARLY_REFRESH_MILESTONE) instead of waiting for the
+        # first ordinary milestone. Persisted as ``title_low_signal`` and
+        # rehydrated in chat_persistence; absent on legacy sessions = False.
+        self._title_low_signal: bool = False
         self._auto_tagged: bool = False  # True once auto-tag has been attempted
         # Guards against concurrent LLM auto-title attempts (on-send trigger vs
         # the end-of-turn chat_done trigger racing on the same slot).
         self._title_in_flight: bool = False
+        # Handle of the on-send auto-title task (chat_handlers), so chat_done's
+        # chained title→refresh pass can WAIT for the in-flight attempt to
+        # settle instead of bouncing off the ``_title_in_flight`` guard. Without
+        # the wait, a slow on-send attempt locks a low-signal title AFTER both
+        # chained calls returned — and a one-message session gets no later
+        # chat_done to spend its early refresh milestone. Never persisted.
+        self._title_task: asyncio.Task[None] | None = None
         # Records a chat_done retry that arrived during the on-send attempt.
         self._title_retry_pending: bool = False
         # Excludes concurrent session-summary generations for this slot. A
@@ -2764,8 +2890,16 @@ class _ChatSlot:
         # user message (chip card) even when slot.task is momentarily idle between
         # stages, and _start_next_queued_turn HOLDS user messages (recovery/system
         # still drain) until the plan ends — so autopilot reuses the normal-chat
-        # queue/chip path without changing slot.task / slot.running semantics.
+        # queue/chip path. After the controller exits, an uncancelled pending
+        # boundary keeps ``running`` true until guarded Go settles or reruns it.
         self._in_stage_execution: bool = False
+        # Outer Python stage driver, kept separately while ``task`` names the
+        # active LLM turn so slot teardown can cancel both lifetimes.
+        self._stage_controller_task: asyncio.Task[Any] | None = None
+        # Atomic owner of the active stage's delivery, recovery, parent-session,
+        # and cancellation state. Compatibility properties below expose the old
+        # names to focused tests, but production paths mutate this object.
+        self.stage_boundary = StageBoundary()
         # Set by _run_chat's teardown to that turn's ACP auth-required outcome, so
         # the orchestrator _stage_loop can mirror the "hold the queue for
         # post-login resume" guard on its end-of-plan handoff (a signed-out CLI
@@ -2819,7 +2953,6 @@ class _ChatSlot:
         # retention TTL is measured from consumption rather than from run
         # completion. See ``take_pending_subagent_deliveries``.
         self._subagent_delivery_pending: dict[str, list[str]] = {}
-        self._recovery_retrigger_count: int = 0
         self._prompt_busy_retries: int = 0
         self._acp_pipe_death_retries: int = 0
         # Auto-recovery of a genuinely-wedged (stale) turn: bumped when the ACP
@@ -4464,6 +4597,16 @@ class _ChatSlot:
         """
         return queue_persist_signature(self.durable_queue_entries()) != self._queue_persisted_sig
 
+    def track_stage_controller(self, task: asyncio.Task[Any]) -> None:
+        """Keep the outer stage driver reachable while ``task`` names a child turn."""
+        self._stage_controller_task = task
+
+        def _clear(done: asyncio.Task[Any]) -> None:
+            if self._stage_controller_task is done:
+                self._stage_controller_task = None
+
+        task.add_done_callback(_clear)
+
     @property
     def task(self) -> asyncio.Task[Any] | None:
         return self._task
@@ -4475,8 +4618,22 @@ class _ChatSlot:
         self._task = value
 
     @property
+    def turn_running(self) -> bool:
+        """Whether an active model turn or stage controller still owns the slot."""
+        task = self.task
+        controller = self._stage_controller_task
+        return bool(
+            (task is not None and not task.done())
+            or (controller is not None and not controller.done())
+        )
+
+    @property
     def running(self) -> bool:
-        return self.task is not None and not self.task.done()
+        """Admission/reservation predicate; use ``turn_running`` for execution.
+
+        See ``docs/system-specs/modules/session.md``.
+        """
+        return bool(self.turn_running or self.stage_boundary.stage is not None)
 
     @property
     def queue_depth(self) -> int:
@@ -5255,6 +5412,48 @@ class DashboardState:
         from kiro_crew.dashboard.file_index import FileIndexRegistry
 
         self.file_indexes = FileIndexRegistry()
+        # Last-seen {slot_key -> driving member name} for member-driven slots,
+        # diffed on each slots broadcast to emit slot/opened + slot/closed to
+        # the per-member event log. Best-effort, additive.
+        # slot key -> the member's identity MATERIAL, as a (slug, store) pair:
+        # a pinned DM slot yields (slug, "") and an ordinary chat slot bound to
+        # a member's private store yields ("", store), which the worker resolves
+        # to a slug. Neither is resolved here, because that reads the config and
+        # this runs on the serving loop.
+        self._member_driven_slots_seen: dict[str, tuple[str, str]] = {}
+        #: Corrections the checkpoint above owes, for appends that did NOT reach
+        #: the log. Queue acceptance is not the same claim as a completed write, so
+        #: the worker reports back here and the next broadcast applies these before
+        #: it compares.
+        #:
+        #: A MAPPING rather than a set of keys, because the two directions need
+        #: opposite corrections and a key alone can only express one of them. A
+        #: failed OPEN must leave the key absent from the checkpoint, so the next
+        #: comparison sees it in `current` and re-emits the open: value ``None``.
+        #: A failed CLOSE must put the key BACK, so the next comparison sees it in
+        #: the checkpoint and not in `current` and re-emits the close: value is the
+        #: identity it was closed with. Dropping the key, which is all a set can
+        #: say, is a no-op for a close -- the checkpoint has already moved past it.
+        self._member_slots_unconfirmed: dict[str, tuple[str, str] | None] = {}
+        # Failed SLOT_OPENED transitions, kept VERBATIM for re-emission.
+        #
+        # The map above corrects the checkpoint so the next comparison recomputes a
+        # transition, which is enough for a close but cannot express an open: popping
+        # the key only recomputes the open while the slot is STILL open. If it closed
+        # in the same window, `current` lacks the key too, the comparison comes out
+        # empty, and neither the open nor the close ever reaches the ledger -- the
+        # slot's whole episode disappears. Retrying the open verbatim does not depend
+        # on the slot's present state, and re-emitting it BEFORE any newly computed
+        # close keeps the pair in the order the log has to record them.
+        self._member_slots_retry: list[tuple[str, tuple[str, str], str, dict]] = []
+        # Wire the per-member event log's broadcast sink. Lazy import + blanket
+        # guard: the service module is filled in concurrently and may raise.
+        try:
+            from kiro_crew.eventlog.service import get_service
+
+            get_service().attach_broadcast(self.broadcast_ws)
+        except Exception:
+            logger.debug("eventlog attach_broadcast failed", exc_info=True)
         # Runtime services share the gateway's policy, never a model-supplied mode.
         from kiro_crew.dashboard.handlers._shared import (
             live_session_memory_mode,
@@ -6870,6 +7069,52 @@ class DashboardState:
         if direct_meta and isinstance(direct_meta, dict):
             payload["meta"] = {**(payload.get("meta") or {}), **direct_meta}
         self._broadcast(payload)
+        # Best-effort per-member event log: a message in a member DM thread.
+        try:
+            from kiro_crew import eventlog_hooks
+            from kiro_crew.eventlog.types import MEMBER_MESSAGE
+
+            _mslug = eventlog_hooks.member_slug_for_slot(slot_key)
+            if _mslug is not None:
+                _raw_ts = msg.get("ts", "")
+                try:
+                    _ev_ts = float(_raw_ts)
+                except (TypeError, ValueError):
+                    _ev_ts = time.time()
+                # Same redaction chain the members roster uses, run before the
+                # length cap so a credential split by truncation cannot leak.
+                _prev = content if isinstance(content, str) else str(content or "")
+                _prev, _ = redact_exfiltration_urls(_prev)
+                _prev, _ = redact_credentials(_prev)
+                _prev = _prev[:140]
+
+                # Off the event loop: emit opens the member log and does a
+                # synchronous os.fsync append. This callback runs loop-side, so
+                # hand the write to a worker thread (fire-and-forget, best-effort
+                # like the rest of this block) rather than stalling every gateway
+                # task on the fsync.
+                def _emit_message() -> None:
+                    eventlog_hooks.emit(
+                        _mslug,
+                        None,
+                        MEMBER_MESSAGE,
+                        {"ts": _ev_ts, "preview": _prev},
+                    )
+
+                # Queued on the ordered executor either way -- see the slot
+                # emit for why a no-loop caller queues rather than writing
+                # inline.
+                #
+                # The return is deliberately not read, and this is the ONE thing
+                # that makes it safe: nothing here records that the event was
+                # written. A refused or failed append costs this path exactly the
+                # event it was given, which the queue's own ceiling documents and
+                # reports. The slot path above cannot do the same because it keeps
+                # a checkpoint, and a checkpoint that outlives a lost append turns
+                # one missing event into a view that never recovers.
+                eventlog_hooks.submit(_emit_message)
+        except Exception:
+            logger.debug("member/message event-log hook failed", exc_info=True)
 
     # ── Folder persistence ──
 
@@ -7243,6 +7488,16 @@ class DashboardState:
     async def read_folders(self, read: Callable[[list[dict[str, Any]]], _T]) -> _T:
         """Run a synchronous reader against committed folder state."""
         return await _FOLDER_REPOSITORY.read(lambda: self._folders, self._folders_lock, read)
+
+    async def hold_folders(self, section: Callable[[list[dict[str, Any]]], Awaitable[_T]]) -> _T:
+        """Hold the folder store lock across an awaitable, read-only section.
+
+        The section sees a snapshot of the committed folders and may hop off
+        the loop; no folder mutation can commit until it returns. This is how
+        a delete elsewhere excludes a concurrent folder pin (the agent
+        templates guard) without doing its file work on the loop.
+        """
+        return await _FOLDER_REPOSITORY.hold(lambda: self._folders, self._folders_lock, section)
 
     def _write_folders_confirmed(self, path: Path, snapshot: list[dict[str, Any]]) -> None:
         """Persist the complete folder value and prove it landed."""
@@ -8211,6 +8466,191 @@ class DashboardState:
                 )
             )
 
+        # Best-effort per-member event log: emit slot/opened and slot/closed
+        # for slots DRIVEN by a member (created_by is a member NAME), diffed
+        # against the last-seen set on this state object. Additive; never
+        # affects the broadcast above.
+        try:
+            from kiro_crew import eventlog_hooks
+
+            # The known-agent check must not read config.json here: this runs on
+            # the gateway serving loop, so it reads the off-loop alias snapshot
+            # (refreshed by every successful config load) instead of stat/read/
+            # parsing config synchronously and stalling every task.
+            from kiro_crew.eventlog.types import SLOT_CLOSED, SLOT_OPENED
+            from kiro_crew.members import member_slug, slug_from_dm_slot_key
+
+            # `_created_by` is `session_control`'s attribution and it holds the
+            # creator's SLOT KEY, never an agent name -- so comparing it against the
+            # alias snapshot could not match for ANY member-created slot, and every
+            # member slot event was dropped on the normal path.
+            #
+            # A member drives two kinds of slot and both are resolved, because
+            # covering only one leaves the other silently dropped:
+            #   (a) its pinned DM slot, keyed `member-<slug>`, from which the slug
+            #       is pure string work -- `slug_from_dm_slot_key` is the members
+            #       module's single spelling of that strip, including the
+            #       `.memory-<store>` suffix a reader must drop;
+            #   (b) an ordinary chat slot bound to the member's private store, whose
+            #       owner lives in the CONFIG. That read is deferred to the worker
+            #       below for the same reason the log id already is: this function
+            #       runs on the gateway serving loop and must not parse config here.
+            # So the loop collects identity MATERIAL and the worker resolves it.
+            current: dict[str, tuple[str, str]] = {}
+            for _sk, _slot in list(self._slots.items()):
+                _cb = getattr(_slot, "_created_by", "")
+                if not _cb:
+                    continue
+                _slug = slug_from_dm_slot_key(_cb)
+                if _slug:
+                    current[_sk] = (_slug, "")
+                    continue
+                _creator = self._slots.get(_cb)
+                _store = getattr(_creator, "memory_store", "") if _creator else ""
+                if _store and _store != "default":
+                    current[_sk] = ("", _store)
+            prev = self._member_driven_slots_seen
+            if self._member_slots_unconfirmed:
+                # An append the worker could not complete is not recorded, whatever
+                # the checkpoint says. Applying the corrections here is what makes
+                # the comparison below recompute exactly those transitions and
+                # nothing else. Drained rather than read, so a retry that fails
+                # again queues a fresh correction instead of looping on a stale one.
+                # Drained IN PLACE, and by repeated POP rather than copy-then-clear.
+                # The worker closure captures this dictionary by reference when it is
+                # created, so rebinding the attribute to a fresh one would leave an
+                # in-flight worker writing its failures into an object nothing reads.
+                # And a copy followed by clear() leaves a window: a failure the worker
+                # records between the two is wiped without ever being applied, so the
+                # comparison below recomputes nothing for it and the checkpoint then
+                # advances past that transition, dropping it for good. Each pop either
+                # returns an entry, which is therefore applied, or finds none and
+                # leaves later ones for the next pass -- no entry is discarded unread.
+                _lost: dict[str, tuple[str, str] | None] = {}
+                while True:
+                    try:
+                        _lkey, _lval = self._member_slots_unconfirmed.popitem()
+                    except KeyError:
+                        break
+                    _lost[_lkey] = _lval
+                prev = dict(prev)
+                for _lk, _lwho in _lost.items():
+                    if _lwho is None:
+                        prev.pop(_lk, None)
+                    else:
+                        prev[_lk] = _lwho
+                self._member_driven_slots_seen = prev
+            # Drained IN PLACE and BEFORE the comparison, for two reasons. In place,
+            # because an in-flight worker holds this list by reference exactly as it
+            # holds the map. Before, because a retry must not depend on the slots
+            # having changed: a slot whose open failed and which is still open makes
+            # `current == prev`, so anything inside the comparison below would never
+            # run and the open would wait for an unrelated slot to move.
+            _retry: list[tuple[str, tuple[str, str], str, dict]] = []
+            while self._member_slots_retry:
+                _retry.append(self._member_slots_retry.pop(0))
+            if current != prev or _retry:
+                # emit fsyncs, so collect the (member, type, data) tuples and
+                # offload the writes: _do_slots_broadcast runs on the gateway
+                # loop and a synchronous durability barrier per slot transition
+                # would stall every concurrent session. The member's LOG ID is
+                # resolved inside that worker, not here: a member may carry an
+                # explicit `member_id` and only member_slug honours it, but it
+                # reads the config, which this path must not do on the loop.
+                # Retries FIRST: a re-emitted open has to reach the log ahead of the
+                # close computed for the same key below, or the ledger records a close
+                # with no open before it.
+                _emits: list[tuple[str, tuple[str, str], str, dict]] = list(_retry)
+                for _sk, _who in current.items():
+                    if _sk not in prev:
+                        _emits.append((_sk, _who, SLOT_OPENED, {"slot_key": _sk}))
+                for _sk, _who in prev.items():
+                    if _sk not in current:
+                        _emits.append(
+                            (
+                                _sk,
+                                _who,
+                                SLOT_CLOSED,
+                                {"slot_key": _sk, "reason": "closed"},
+                            )
+                        )
+
+                def _emit_slots(
+                    events: list[tuple[str, tuple[str, str], str, dict]] = _emits,
+                    unconfirmed: dict[str, tuple[str, str] | None] = (
+                        self._member_slots_unconfirmed
+                    ),
+                    retry: list[tuple[str, tuple[str, str], str, dict]] = (
+                        self._member_slots_retry
+                    ),
+                ) -> None:
+                    def _report(
+                        _key: str, _slug_in: str, _store_in: str, _etype: str, _data: dict
+                    ) -> None:
+                        # A close goes through the checkpoint: putting the key BACK is
+                        # what makes the next comparison recompute it.
+                        if _etype == SLOT_CLOSED:
+                            unconfirmed[_key] = (_slug_in, _store_in)
+                            return
+                        # An open is retried VERBATIM and the checkpoint is left
+                        # alone. Popping the key instead only recomputes the open
+                        # while the slot is still open; if it closed in this window
+                        # the comparison computes nothing and the episode is lost for
+                        # the life of the process. Leaving the checkpoint claiming the
+                        # open means a later close is still computed normally, and
+                        # this entry is re-emitted ahead of it.
+                        retry.append((_key, (_slug_in, _store_in), _etype, _data))
+
+                    for _key, (_slug_in, _store_in), _etype, _data in events:
+                        try:
+                            _slug = _slug_in
+                            if not _slug and _store_in:
+                                # Case (b): the config read this path may not do on
+                                # the loop is safe here, in the worker.
+                                from kiro_crew.config.loader import KiroCrewConfig
+
+                                _rec = KiroCrewConfig.load().memory_stores.get(_store_in)
+                                _owner = getattr(_rec, "owner_member", "") if _rec else ""
+                                if _owner:
+                                    _slug = member_slug(_owner)
+                            # `name` is left empty on purpose: `emit` passes
+                            # `name or slug` to `ensure`, whose _resolved_name looks
+                            # the exact name up in the roster, so the name is
+                            # resolved once per member rather than per event.
+                            if not eventlog_hooks.emit(_slug, "", _etype, _data):
+                                # Reported, not swallowed. The checkpoint already
+                                # counts this transition as handed over, so without
+                                # this the loss is permanent for the life of the
+                                # process: the next broadcast compares against a
+                                # checkpoint that claims the event was written.
+                                _report(_key, _slug_in, _store_in, _etype, _data)
+                        except Exception:
+                            _report(_key, _slug_in, _store_in, _etype, _data)
+                            logger.debug("slot event-log emit failed", exc_info=True)
+
+                # The checkpoint advances only once the transitions are HANDED
+                # OVER. `submit` is bounded and can refuse, and this checkpoint is
+                # the only record of what is still unwritten: advancing it first
+                # turns a refusal into permanent staleness, because the next
+                # broadcast compares against `current` and computes no transitions
+                # to retry. Leaving it at `prev` instead means the next broadcast
+                # recomputes the same set and hands it over again.
+                if _emits:
+                    # No running-loop check: `submit` queues on the ordered
+                    # executor whether or not a loop is running, and queuing
+                    # BOTH paths is what keeps them in one order. Running a
+                    # no-loop caller inline instead would let it reach the log
+                    # ahead of an append already queued by a loop caller.
+                    if eventlog_hooks.submit(_emit_slots):
+                        self._member_driven_slots_seen = current
+                else:
+                    # A change with no open or close (a slot's store changed under
+                    # the same key) has nothing to hand over, so holding the
+                    # checkpoint back would recompute an empty set forever.
+                    self._member_driven_slots_seen = current
+        except Exception:
+            logger.debug("slot open/close event-log hook failed", exc_info=True)
+
     def push_slot_title(self, key: str, title: str, *, full: bool = True) -> None:
         """Push a targeted title update for a single slot.
 
@@ -8445,6 +8885,9 @@ class DashboardState:
 
     def register_ws(self, ws: web.WebSocketResponse, *, owner: bool = False) -> None:
         _websocket_for(self).register_ws(ws, owner=owner)
+
+    async def send_members_subscribed(self, ws: web.WebSocketResponse) -> None:
+        await _websocket_for(self).send_members_subscribed(ws)
 
     def unregister_ws(self, ws: web.WebSocketResponse) -> None:
         _websocket_for(self).unregister_ws(ws)

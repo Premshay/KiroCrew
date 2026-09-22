@@ -602,7 +602,7 @@
       "sensitive": false,
       "tags": [],
       "label": "MCP Tool Search",
-      "help": "Load MCP tool specs on demand (search-and-call) instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. kiro-cli backend only. Deferral only starts once the specs cross tool_search_min_pct or tool_search_min_tokens; disabling reverts to sending full tool specs. No effect on an alternate ACP backend.",
+      "help": "Load MCP tool specs on demand (search-and-call) instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. kiro-cli backend only. Deferral only starts once the specs cross tool_search_min_pct or tool_search_min_tokens; disabling reverts to sending full tool specs. Kiro Crew's OWN servers are exempt and always send full specs, whatever this is set to: loading one mid-turn would change the tools list a thinking block's signature is bound to and the provider would reject the conversation. No effect on an alternate ACP backend.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
@@ -1171,11 +1171,11 @@
       "kind": "core",
       "type": "number",
       "required": false,
-      "deprecated": false,
+      "deprecated": true,
       "sensitive": false,
       "tags": [],
       "label": "SubAgent CPU Cost (cores)",
-      "help": "First-boot per-agent CPU-cost fallback (cores) used to auto-size the cap until a learned value accumulates.",
+      "help": "Deprecated and inert: the subagent cap is sized from host memory only, because over-committing memory is an unrecoverable OOM while over-committing CPU only slows work the adaptive controller already backs off from. Preserved on load and save so an existing config is not rewritten out from under the operator.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 1.0
@@ -3007,6 +3007,7 @@
         "provider": "local",
         "model": "base",
         "language_code": "auto",
+        "polish": false,
         "streaming": true,
         "silence_ms": 700,
         "partial_interval_ms": 400,
@@ -3059,7 +3060,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Model",
-      "help": "Which speech model the local provider downloads and runs. Bigger is more accurate and a longer first-time download: `tiny` on a machine short of memory, `base` for everyone, `small` when accents or jargon are being misheard, `large-v3-turbo` for the best accuracy available.",
+      "help": "Which speech model the local provider downloads and runs. Bigger is more accurate and a longer first-time download: `tiny` on a machine short of memory, `base` for everyone, `small` when accents or jargon are being misheard, `large-v3-turbo` for the best accuracy available -- though on a CPU-only build it can recognise slower than you speak: an 11-second clip took 13.6 s on a 16-thread aarch64 CPU, 1.24x the audio. The Voice panel says so beside the choice when the build it measured has no acceleration.",
       "hasChildren": false,
       "enumValues": [
         "tiny",
@@ -3082,6 +3083,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "auto"
+    },
+    {
+      "path": "stt.polish",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "AI Cleanup",
+      "help": "After dictation finishes, have your configured model fix punctuation and capitalisation. Your WORDS are never changed: a reply that altered one is discarded, so the worst case is that nothing happens. Off by default because it sends the TRANSCRIPT (never the audio) to that model, so a local-only setup stays local-only until you turn this on.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "stt.streaming",
@@ -3790,10 +3805,11 @@
       "sensitive": false,
       "tags": [],
       "label": "Extra MCP Binary Directories",
-      "help": "Additional directories to search for MCP server binaries, ahead of the built-in locations. Add one when a package manager installs its MCP launchers somewhere Kiro Crew does not know about: a server declared by bare name that resolves nowhere never starts, and the session just comes up short of tools. Each entry must be a single absolute directory (``~`` is expanded); anything else is ignored with a warning. These directories are prepended to the search path used by the MCP probe, the agent-config command resolver, and the broker's rewriter alike, so a binary found here is found everywhere. They do NOT join the search for the agent runtime itself, which must not be shadowable by a configured directory.",
+      "help": "Additional directories to search for MCP server binaries, ahead of the built-in locations. Add one when a package manager installs its MCP launchers somewhere Kiro Crew does not know about: a server declared by bare name that resolves nowhere never starts, and the session just comes up short of tools. Each entry must be a single absolute directory (``~`` is expanded); anything else is ignored with a warning. These directories are prepended to the search path used by the MCP probe, the agent-config command resolver, and the broker's rewriter alike, so a binary found here is found everywhere. They also join the PATH of the broker daemon and every pooled MCP backend it spawns, so a wrapper script found here can exec a bare tool name; the daemon reads this when it starts, so a change reaches it only once it is replaced. They do NOT join the search for the agent runtime itself, which must not be shadowable by a configured directory.",
       "hasChildren": true,
       "enumValues": null,
-      "defaultValue": []
+      "defaultValue": [],
+      "requiresRestart": true
     },
     {
       "path": "mcp.extra_path_dirs.*",
@@ -5572,7 +5588,7 @@
         "whatsapp"
       ],
       "label": "Enabled",
-      "help": "Enable the WhatsApp channel (QR-linked personal account over the WhatsApp Web protocol). Pair a device from Settings > Channels; needs the 'whatsapp' dependency extra installed.",
+      "help": "Enable the WhatsApp channel (QR-linked personal account over the WhatsApp Web protocol). Pair a device from Settings > Messaging Channels; needs the 'whatsapp' dependency extra installed.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false

@@ -175,6 +175,16 @@ on demand (below) before merging.
 (default `nova-sky`); a scenario's `preconditions.seed` / `members` document what it
 needs and must agree with that boot, because the target is booted once per run.
 
+Because one seed serves every scenario, a surface that needs content gets it from the
+`rich` fixture itself rather than from a second seed: `rich` ships the three saved
+artifacts of the `artifacts-library` fixture (`release-checklist`, a widget on its
+second version; `pagination-design`, markdown; `queue-badge`, svg) so the Artifacts
+scenario reads a populated library, and the one crew on the Agents tab is the member
+`boot.sh` adds. Surfaces the seed cannot populate deterministically are read in their
+empty state instead -- the MCP Servers table (no `mcp.json` in the seeded home or the
+isolated agent home) -- or through content the gateway itself installs at boot, such as
+the packaged built-in skills the Skills tab lists.
+
 The home is a `mktemp` directory, so no scenario can spell its path. Where a flow needs
 the tester to TYPE a path -- the Knowledge "Add Source > Local Folder" form, whose
 native picker is macOS-only -- `boot.sh` stages the three markdown files under
@@ -200,7 +210,14 @@ thread, a toggle already flipped. One that changes persisted state (creates some
 switches a store) and then expects the pre-change state cannot be retried: its second
 attempt meets a precondition that no longer holds and cannot reach a verdict. Write the
 steps and expectations so both attempts read the same, or keep the mutation out of the
-scenario.
+scenario. The same boot also serves every LATER scenario in the run, through one browser
+profile, so a per-device switch (Developer Mode, Show Timestamps, a feature preview)
+that a scenario flips is still flipped when the next scenario starts. A scenario that
+flips one either puts it back before it ends or leaves a state nothing later depends on
+(the members scenarios leave the Crew Members preview on), and it words each switch step
+as the position to leave the switch in ("make sure it is ON -- click it once if it is
+off") rather than as a click, so a retry that starts from a half-finished attempt
+converges instead of inverting it.
 
 ### New-user friction: what confused the tester, beside the verdict
 
