@@ -2,6 +2,7 @@ import { useRef, useEffect } from 'react'
 import { Check, LoaderCircle } from 'lucide-react'
 
 import { JEV_ROUTE_MODEL } from '../lib/jevRoute'
+import { modelLabel } from '../lib/model'
 import { isPricedMultiplier } from '../providers/modelList'
 import type { ModelInfo } from '../providers/types'
 import { fmtNumber } from '../i18n/format'
@@ -37,8 +38,10 @@ const BASELINE = 1
  * reason Auto's description is: a string baked in at fetch time would freeze the
  * language in the React Query cache.
  */
-function rowLabel(name: string): string {
-  return name === JEV_ROUTE_MODEL ? i18nT('components.modelDropdownList.auto_jev') : name
+function rowLabel(model: ModelItem): string {
+  return model.name === JEV_ROUTE_MODEL
+    ? i18nT('components.modelDropdownList.auto_jev')
+    : modelLabel(model.name, [model])
 }
 
 /**
@@ -155,7 +158,7 @@ export default function ModelDropdownList({ models, activeModel, onSelect, loadi
               {/* `data-model-name` carries the ID, not the label: the harnesses and
                   the keyboard-nav tests select rows by the value that is sent, and a
                   translated label would make that selector locale-dependent. */}
-              <span data-model-name data-model-id={m.name} className={`text-[13px] font-mono font-semibold truncate ${active ? 'text-accent' : 'text-text'}`}>{rowLabel(m.name)}</span>
+              <span data-model-name data-model-id={m.name} className={`text-[13px] font-mono font-semibold truncate ${active ? 'text-accent' : 'text-text'}`}>{rowLabel(m)}</span>
               {active && <span className="text-accent text-[12px]"><Check className="lucide-inline" /></span>}
               {/* Credit multiplier. Rendered only when the backend reported a
                   usable one — a cold-start or pre-feature cached row has none,

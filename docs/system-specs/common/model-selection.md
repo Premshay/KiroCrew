@@ -191,6 +191,10 @@ asked for.
 - **Pickers** MUST list options from `GET /api/models`, the advertised set, never a
   static in-code list. A hand-maintained list offers models the account cannot run and
   hides the ones it can.
+- Picker rows display the advertised label through the shared `modelLabel` helper
+  and retain the advertised description. Selection and active-state comparison use
+  the unchanged model ID, including composite provider/model IDs. The Jev routing
+  row keeps its translated label rather than an advertised routing label.
 - `dashboard.model_picker_hidden_models` is a presentation preference over that
   advertised set. It filters only the interactive ChatPage and ChatPane pickers;
   `auto` and each slot's active model remain visible. Settings defaults, role and
