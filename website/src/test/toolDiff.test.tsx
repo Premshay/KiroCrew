@@ -298,23 +298,27 @@ describe("ToolCallLine diff presentation", () => {
         ],
         slotRunning: false,
       } as unknown as ChatState,
-    });
-    const { container, getByText, findByLabelText, queryByText } =
-      renderWithProviders(
-        <ToolCallLine message={editMsg()} running={false} />,
-        { store },
-      );
+    })
+    const { container } = renderWithProviders(<ToolCallLine message={editMsg()} running={false} />, { store })
+    const chip = () => container.querySelector<HTMLElement>('[data-testid="tool-diff-chip"]')!
     // Folded: the chip is the open handle.
-    expect(container.querySelector(".diff-block")).toBeNull();
-    fireEvent.click(getByText("app.py"));
-    // An OPEN card shows no chip — its own header carries the facts.
-    expect(container.querySelector(".diff-block")).toBeTruthy();
-    expect(queryByText("app.py")).toBeNull();
-    // Pierre's header (and the fold control slotted into it) mounts async.
-    fireEvent.click(await findByLabelText("Hide diff"));
-    expect(container.querySelector(".diff-block")).toBeNull();
-    expect(getByText("app.py")).toBeTruthy();
-  });
+    expect(container.querySelector('.diff-block')).toBeNull()
+    expect(chip().getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(chip())
+    // OPEN: the SAME chip is still mounted and now reads expanded — it is the
+    // close handle too. A control that unmounted on open (an earlier design put
+    // a chevron in the card header instead) left the reader hunting for the
+    // way back, and that chevron was painted over by Pierre's header anyway.
+    expect(container.querySelector('.diff-block')).toBeTruthy()
+    expect(chip()).toBeTruthy()
+    expect(chip().getAttribute('aria-expanded')).toBe('true')
+    // No second toggle in the card header: one control, one place.
+    await screen.findByTitle('Copy patch')
+    expect(container.querySelectorAll('[data-diff-toggle]')).toHaveLength(1)
+    fireEvent.click(chip())
+    expect(container.querySelector('.diff-block')).toBeNull()
+    expect(chip().getAttribute('aria-expanded')).toBe('false')
+  })
 
   it("an expansion survives unmount/remount (virtualized transcript)", () => {
     localStorage.setItem(

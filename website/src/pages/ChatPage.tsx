@@ -6151,16 +6151,11 @@ export default function ChatPage({
     [renderedDisplayItems],
   )
 
-  const navigateToTurn = useCallback(
-    (displayIndex: number) => {
-      navToDisplayIndex(displayIndex, {
-        behavior: 'smooth',
-        align: 'start',
-        offset: -24,
-      })
-    },
-    [navToDisplayIndex],
-  )
+  const navigateToTurn = useCallback((displayIndex: number, opts?: { instant?: boolean }) => {
+    // instant: used by the minimap's drag-scrub — a smooth glide would lag the
+    // pointer and queue easings on every marker crossing.
+    navToDisplayIndex(displayIndex, { behavior: opts?.instant ? 'auto' : 'smooth', align: 'start', offset: -24 })
+  }, [navToDisplayIndex])
 
   // The transcript renders the deferred `renderedTranscript` snapshot; while a
   // history page lands, live indexes lead the rows on screen. The minimap's
@@ -8543,109 +8538,91 @@ export default function ChatPage({
                         </div>
                         {/* Fold sentinel — zero-height, always mounted. Its top edge is the
                   line the pinned prompt sticks to (see updatePinnedPrompt). */}
-                        <div ref={pinFoldRef} aria-hidden className="h-0" />
-                        {pinned && (
-                          <PinnedPrompt
-                            text={pinned.text}
-                            fullText={pinned.full}
-                            images={pinned.images}
-                            bodyBeyondPreview={pinned.bodyBeyondPreview}
-                            pushUp={pinned.push}
-                            bannerH={pinned.bannerH}
-                            expanded={pinExpanded}
-                            onToggleExpanded={() => setPinExpanded((p) => !p)}
-                            onJump={() => scrollToPinnedPrompt(pinned.idx)}
-                            cardRef={pinCardRef}
-                            onCollapsedHeight={onPinCollapsedHeight}
-                          />
-                        )}
-                      </div>
-                      <ChatDropOverlay active={dragOver} />
-                      {isWelcomeState ? (
-                        <motion.div
-                          key="welcome-hero"
-                          layout
-                          className="flex-1 flex flex-col items-center justify-center gap-6 px-8 min-h-0 overflow-y-auto"
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          exit={{ opacity: 0 }}
-                          transition={{ duration: 0.18 }}
-                        >
-                          <WelcomeView
-                            mode={currentSlot?.mode || mode}
-                            setInput={setInput}
-                            memoryMode={currentSlot?.memory_mode ?? 'persistent'}
-                            onSwitchMode={async (newMode) => {
-                              if (!activeSlot) return
-                              // Create-first-then-delete: deleting the active slot first
-                              // would make deleteSlot jump focus to a sibling. Creating
-                              // first keeps the new slot active, so the delete skips the
-                              // sibling navigation. Carry agent/project/folder/color so
-                              // the recreated slot keeps its identity and placement.
-                              const old = currentSlot
-                              const opts = {
-                                agent: old?.agent || defaultAgent || undefined,
-                                model: old?.model || undefined,
-                                mode,
-                                memory_mode: newMode,
-                                folder_id: old?.folder_id ?? null,
-                                color_index: old?.color_index ?? null,
-                                color_hex: old?.color_hex ?? null,
-                                project: old?.project ?? null,
-                                instanceId: old?.instance_id || undefined,
-                              }
-                              try {
-                                await dispatch(createSlot(opts)).unwrap()
-                              } catch {
-                                return
-                              }
-                              try {
-                                await dispatch(deleteSlot(activeSlot)).unwrap()
-                              } catch {
-                                /* new slot already active */
-                              }
-                            }}
-                          />
-                        </motion.div>
-                      ) : (
-                        <>
-                          <TurnNavigationMinimap
-                            items={chatNav.sections}
-                            scrollerRef={scrollerRef}
-                            onNavigate={navigateToTurn}
-                            // The rail maps loaded turns only; while the server holds older
-                            // rows it wears an end-cap that says so and loads them (#8221).
-                            earlier={
-                              slotHasMore && cursorIsForActiveSlot
-                                ? {
-                                    loading: loadingOlder,
-                                    onLoad: handleLoadEarlier,
-                                  }
-                                : undefined
-                            }
-                          />
-                          <TranscriptScrollShell
-                            scrollerRef={scrollerRef}
-                            onScroll={onScrollPin}
-                            virt={virt}
-                            loadingOlder={loadingOlder}
-                            spinnerNearTop={spinnerNearTop}
-                            // Second half of the fade-band clearance, alongside
-                            // TRANSCRIPT_TAIL_SPACER_PX. Unlike the tail spacer this one also
-                            // applies to a transcript short enough not to scroll, so both are
-                            // needed for the last line to clear the band in every state.
-                            // `visibility` is not one of the properties the shell claims, so
-                            // adding it here is inside its documented contract. Hiding rather
-                            // than unmounting keeps the scroller's geometry and the height
-                            // cache intact -- the restore needs to WRITE scrollTop while this
-                            // is up, which a display:none element cannot do.
-                            scrollerStyle={{
-                              paddingBottom: 16,
-                              ...(virt.restoreGate ? { visibility: 'hidden' as const } : null),
-                            }}
-                            aboveRows={
-                              <>
-                                {/* Mid-switch `slotHasMore` still describes the outgoing chat, so the cursor
+              <div ref={pinFoldRef} aria-hidden className="h-0" />
+              {pinned && (
+                <PinnedPrompt
+                  text={pinned.text}
+                  fullText={pinned.full}
+                  images={pinned.images}
+                  bodyBeyondPreview={pinned.bodyBeyondPreview}
+                  pushUp={pinned.push}
+                  bannerH={pinned.bannerH}
+                  expanded={pinExpanded}
+                  onToggleExpanded={() => setPinExpanded(p => !p)}
+                  onJump={() => scrollToPinnedPrompt(pinned.idx)}
+                  cardRef={pinCardRef}
+                  onCollapsedHeight={onPinCollapsedHeight}
+                />
+              )}
+            </div>
+            <ChatDropOverlay active={dragOver} />
+            {isWelcomeState ? (
+              <motion.div
+                key="welcome-hero"
+                layout
+                className="flex-1 flex flex-col items-center justify-center gap-6 px-8 min-h-0 overflow-y-auto"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.18 }}
+              >
+                <WelcomeView
+                  mode={currentSlot?.mode || mode}
+                  setInput={setInput}
+                  memoryMode={currentSlot?.memory_mode ?? 'persistent'}
+                  onSwitchMode={async (newMode) => {
+                    if (!activeSlot) return
+                    // Create-first-then-delete: deleting the active slot first
+                    // would make deleteSlot jump focus to a sibling. Creating
+                    // first keeps the new slot active, so the delete skips the
+                    // sibling navigation. Carry agent/project/folder/color so
+                    // the recreated slot keeps its identity and placement.
+                    const old = currentSlot
+                    const opts = {
+                      agent: old?.agent || defaultAgent || undefined,
+                      model: old?.model || undefined,
+                      mode,
+                      memory_mode: newMode,
+                      folder_id: old?.folder_id ?? null,
+                      color_index: old?.color_index ?? null,
+                      color_hex: old?.color_hex ?? null,
+                      project: old?.project ?? null,
+                      instanceId: old?.instance_id || undefined,
+                    }
+                    try { await dispatch(createSlot(opts)).unwrap() } catch { return }
+                    try { await dispatch(deleteSlot(activeSlot)).unwrap() } catch { /* new slot already active */ }
+                  }}
+                />
+              </motion.div>
+            ) : (
+            <>
+            <TurnNavigationMinimap
+              items={chatNav.sections}
+              scrollerRef={scrollerRef}
+              onNavigate={navigateToTurn}
+              // The rail maps loaded turns only; while the server holds older
+              // rows its labels say "of N loaded" (#8221's disclosure).
+              windowed={slotHasMore && cursorIsForActiveSlot}
+              side={chatConfig.minimapSide}
+            />
+            <TranscriptScrollShell
+              scrollerRef={scrollerRef}
+              onScroll={onScrollPin}
+              virt={virt}
+              loadingOlder={loadingOlder}
+              spinnerNearTop={spinnerNearTop}
+              // Second half of the fade-band clearance, alongside
+              // TRANSCRIPT_TAIL_SPACER_PX. Unlike the tail spacer this one also
+              // applies to a transcript short enough not to scroll, so both are
+              // needed for the last line to clear the band in every state.
+              // `visibility` is not one of the properties the shell claims, so
+              // adding it here is inside its documented contract. Hiding rather
+              // than unmounting keeps the scroller's geometry and the height
+              // cache intact -- the restore needs to WRITE scrollTop while this
+              // is up, which a display:none element cannot do.
+              scrollerStyle={{ paddingBottom: 16, ...(virt.restoreGate ? { visibility: 'hidden' as const } : null) }}
+              aboveRows={<>
+              {/* Mid-switch `slotHasMore` still describes the outgoing chat, so the cursor
                   key gates the bar to match the paging thunk's own precondition. */}
                                 {slotHasMore && cursorIsForActiveSlot && (
                                   <EarlierMessagesBar

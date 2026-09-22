@@ -117,10 +117,9 @@ from kiro_crew.dashboard.chat_tag_grants import refresh_cache as refresh_tag_gra
 from kiro_crew.dashboard.chat_tags import resolve_board_tags
 from kiro_crew.dashboard.chat_title import (
     _extract_and_redact_plan_metadata,
-    _maybe_auto_title,
     _rephrase_plan_lite,
     _reset_auto_run_for_new_plan,
-    maybe_refresh_title,
+    title_then_refresh,
 )
 from kiro_crew.dashboard.chat_utils import (
     _BLOCKED_SLASH_COMMANDS,
@@ -154,6 +153,7 @@ from kiro_crew.dashboard.chat_utils import (
     is_post_restart_continuation_item,
     is_system_injection_item,
     mirror_is_paused,
+    owned_stage_delivery_entry,
     parse_workflow_command,
     remember_slack_options,
     slack_mirror_is_paused,
@@ -218,6 +218,7 @@ from kiro_crew.dashboard.state import (
     parse_hook_continuations,
     should_queue_hook_continuation,
     should_queue_refusal_recovery,
+    stage_boundary_for,
 )
 from kiro_crew.dashboard.steer_settle import settle_consumed_steers
 from kiro_crew.dashboard.turn_dispatch import (
@@ -342,7 +343,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.security.readonly_bash import is_read_only_bash, unsafe_bash_reason
 from kiro_crew.sel import SecurityEvent, sel, sel_is_warm
-from kiro_crew.session import SessionClosingError, SpeculativeResumeRefused
+from kiro_crew.session import SessionBusyError, SessionClosingError, SpeculativeResumeRefused
 from kiro_crew.session_agent_selection import (
     record_agent_selection,
     record_provider_agent_switch,
@@ -385,6 +386,7 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402
     EMPTY_RUNG_GIVE_UP,
     EMPTY_RUNG_REPLAY,
     MODEL_UNENTITLED_KIND,
+    STAGE_DELIVERY_KINDS,
     SUBAGENT_COMPLETION_KIND,
     SYNTHETIC_RECOVERY_KIND,
     TRANSIENT_GIVE_UP_TEXT,
@@ -4734,26 +4736,17 @@ def _mark_kiro_signed_out(state: Any) -> None:
         logger.debug("Could not latch Kiro signed-out state", exc_info=True)
 
 
-async def _deliver_auth_error_to_slack(
+async def _deliver_linked_slack_message(
     state: Any,
     slot: Any,
     sessions: Any,
     session_key: str,
     message: str,
 ) -> None:
-    """Mirror an auth-required error to a linked Slack thread.
-
-    A user driving the linked session from Slack must not be left without a
-    response when the CLI is signed out, so the auth-required error is delivered
-    to the linked thread.
-    """
-
+    """Mirror one system message to a linked Slack thread."""
     slack_client = getattr(state, "slack_client", None)
     if slack_client is None:
         return
-    # A disconnected thread is muted for turn output, and an auth failure IS turn
-    # output. The dashboard renders the same error, which is where a user who just
-    # disconnected the thread is working.
     if slack_mirror_is_paused(state, session_key):
         return
     thread_ts = getattr(slot, "_slack_thread_ts", "")
@@ -4765,10 +4758,7 @@ async def _deliver_auth_error_to_slack(
     try:
         await slack_client.post_message(channel_id, message, thread_ts)
     except Exception:
-        logger.debug(
-            "Failed to deliver Kiro auth error to linked Slack thread",
-            exc_info=True,
-        )
+        logger.debug("Failed to deliver a message to the linked Slack thread", exc_info=True)
 
 
 def cross_surface_withheld(state: Any, slot: Any) -> bool:
@@ -8348,13 +8338,29 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         )
         or in_stage
     )
+    preferred_stage_delivery = (
+        owned_stage_delivery_entry(stage_boundary_for(slot), slot._queue) if in_stage else None
+    )
+    if in_stage and preferred_stage_delivery is None:
+        # S1: an active stage may consume only delivery owned by its boundary.
+        # The generic system fallback would pull another parent's completion into
+        # this stage; leave it queued until stage execution releases the gate.
+        return False
     if hold_users:
         # During a multi-stage plan hold cron notifications too: each stage is
         # its own _run_chat whose tail-drain runs while _in_stage_execution is
         # still set, so draining a cron here starts an unrelated turn between
         # stages and scatters the plan. It drains at end-of-plan once the gate
         # clears. Sub-agent completions / recovery still flow.
-        next_msg, consumed = _dequeue_next_system_message(slot, exclude_cron=in_stage)
+        next_msg, consumed = _dequeue_next_system_message(
+            slot,
+            exclude_cron=in_stage,
+            preferred_id=(
+                str(preferred_stage_delivery.get("id") or "")
+                if preferred_stage_delivery is not None
+                else ""
+            ),
+        )
     else:
         next_msg, consumed = _dequeue_next_message(slot, merge_enabled=merge)
     if next_msg is None:
@@ -8591,11 +8597,12 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     # carry one. Recovery rows are included because a completion that failed before
     # the model consumed it is re-queued verbatim under that kind.
     _consumed: list[bool] = [False]
-    _settleable = [
-        item["content"]
-        for item in consumed
-        if item.get("kind") in (SUBAGENT_COMPLETION_KIND, SYNTHETIC_RECOVERY_KIND)
-    ]
+    _stage_delivery_entry = (
+        owned_stage_delivery_entry(stage_boundary_for(slot), consumed)
+        if slot._in_stage_execution
+        else None
+    )
+    _settleable = [item["content"] for item in consumed if item.get("kind") in STAGE_DELIVERY_KINDS]
 
     if _settleable and not slot.owes_subagent_delivery(_settleable):
         # Owes nothing (every ordinary recovery replay, and any completion whose
@@ -8642,7 +8649,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     _queue_actor = _actor_for_queue_items(consumed)
     if _queue_actor:
         _run_kwargs["_turn_actor"] = _queue_actor
-    if _settleable or delivery_callbacks:
+    if _stage_delivery_entry is not None or _settleable or delivery_callbacks:
         _run_kwargs["_on_consumed"] = _note_consumed
     if irreversible_delivery_callbacks:
         _run_kwargs["_on_irreversibly_consumed"] = _note_irreversibly_consumed
@@ -8678,6 +8685,78 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         _run_chat(state, slot, next_msg, **_run_kwargs),
     )
     slot.task = task
+    if _stage_delivery_entry is not None:
+        _delivery_stop_generation = slot._stop_generation
+
+        def _restore_failed_stage_delivery(done: "asyncio.Task[Any]") -> None:
+            # Four terminal dispositions: cancelled, consumed, already requeued,
+            # or still owed. ``_run_chat`` handles provider failures and returns
+            # normally, so ``done.exception() is None`` is not proof of delivery.
+            # Cooperative Stop is the one cancellation that preserves queued work;
+            # hard kill and teardown keep cancellation-as-discard semantics. The
+            # generation check also catches providers that absorb cancellation and
+            # make the task look normally completed.
+            if _consumed[0]:
+                return
+            _current_stop_generation = slot._stop_generation
+            _stop_changed = _current_stop_generation != _delivery_stop_generation
+            _preserve_stopped_delivery = (
+                _stop_changed
+                and stage_boundary_for(slot).preserve_stop_generation == _current_stop_generation
+            )
+            if _stop_changed and not _preserve_stopped_delivery:
+                return
+            if done.cancelled():
+                if not _preserve_stopped_delivery:
+                    return
+            else:
+                done.exception()
+            if state._slots.get(slot.key) is not slot:
+                return
+            content = str(_stage_delivery_entry.get("content", ""))
+            kind = str(_stage_delivery_entry.get("kind", ""))
+            if any(
+                entry.get("kind") in STAGE_DELIVERY_KINDS and entry.get("content") == content
+                for entry in slot._queue
+            ):
+                return
+            stage_boundary_for(slot).retry_queue_id = slot.queue_insert(
+                0,
+                content,
+                kind=kind,
+                payload=str(_stage_delivery_entry.get("payload", "")),
+                meta=(
+                    _stage_delivery_entry.get("meta")
+                    if isinstance(_stage_delivery_entry.get("meta"), dict)
+                    else None
+                ),
+                on_consumed=(
+                    _stage_delivery_entry.get("_on_consumed")
+                    if callable(_stage_delivery_entry.get("_on_consumed"))
+                    else None
+                ),
+                on_irreversibly_consumed=(
+                    _stage_delivery_entry.get("_on_irreversibly_consumed")
+                    if callable(_stage_delivery_entry.get("_on_irreversibly_consumed"))
+                    else None
+                ),
+                directive_user_origin=(_stage_delivery_entry.get("_directive_user_origin") is True),
+                directive_channel_origin=(
+                    _stage_delivery_entry.get("_directive_channel_origin") is True
+                ),
+            )
+            state.push_slots_update()
+
+        task.add_done_callback(_restore_failed_stage_delivery)
+    if is_recovery:
+        stage_boundary_for(slot).synthetic_recovery_inflight += 1
+
+        def _release_stage_recovery(_task: "asyncio.Task[Any]") -> None:
+            stage_boundary_for(slot).synthetic_recovery_inflight = max(
+                0, stage_boundary_for(slot).synthetic_recovery_inflight - 1
+            )
+
+        task.add_done_callback(_release_stage_recovery)
     if _settleable:
         # Open the retention clock on the result files this row promises — but
         # only once the turn has actually run and the model has consumed the
@@ -8850,18 +8929,20 @@ async def _finish_queue_cycle(
         # result to title or summarize. Its terminal lifecycle is complete;
         # the next landed turn owns the ordinary post-processing attempt.
         return
-    if not slot._titled:
-        title_task = asyncio.create_task(_maybe_auto_title(state, slot))
-        state._background_tasks.add(title_task)
-        title_task.add_done_callback(state._background_tasks.discard)
-    else:
-        # Already titled: re-examine an AUTO title at bounded milestones so
-        # long sessions aren't stuck with a name generated from their very
-        # first message. Self-guarding (origin/milestone/in-flight checks in
-        # maybe_refresh_title) — the common case returns without any LLM call.
-        refresh_task = asyncio.create_task(maybe_refresh_title(state, slot))
-        state._background_tasks.add(refresh_task)
-        refresh_task.add_done_callback(state._background_tasks.discard)
+    # Chain the titling attempt into a refresh check, waiting out a
+    # still-running on-send attempt first (see title_then_refresh). Both the
+    # untitled and the already-titled case go through the same chain: an
+    # already-locked title makes _maybe_auto_title a no-op, and the refresh
+    # self-guards (origin/milestone/in-flight checks in maybe_refresh_title) —
+    # the common case returns without any LLM work. Routing the titled branch
+    # through the wait matters too: an on-send attempt that locked a LOW-SIGNAL
+    # title (a URL/ticket-key echo — see chat_title._is_low_signal_title) can
+    # still hold the in-flight guard here, and a direct maybe_refresh_title
+    # would bounce off it — with no later chat_done for a one-message session
+    # to catch the early milestone.
+    title_task = asyncio.create_task(title_then_refresh(state, slot))
+    state._background_tasks.add(title_task)
+    title_task.add_done_callback(state._background_tasks.discard)
 
     # Intent summary for the chat summary panel. Self-guarding: the common case
     # (feature disabled) returns before any work, and an unchanged transcript is
@@ -9052,6 +9133,12 @@ async def _run_chat(
             _current_replay_message = None
 
     session_key = effective_session_key(slot)
+    if getattr(slot, "_in_stage_execution", False):
+        # A stage may be linked to another session while this turn runs. Its
+        # children and terminal reports stay under the key captured here, so the
+        # controller settles every captured key instead of re-deriving only the
+        # slot's newest binding after the turn.
+        stage_boundary_for(slot).parent_session_keys.add(session_key)
     sessions = getattr(state, "sessions", None)
 
     def _session_stop_generation() -> int:
@@ -9520,13 +9607,13 @@ async def _run_chat(
                         slot.key,
                         exc_info=True,
                     )
-        if _on_consumed is None or _consumed_reported == consumed:
-            return
-        _consumed_reported = consumed
-        try:
-            _on_consumed(consumed)
-        except Exception:
-            logger.debug("consumption report failed for slot %s", slot.key, exc_info=True)
+        if _consumed_reported != consumed:
+            _consumed_reported = consumed
+            if _on_consumed is not None:
+                try:
+                    _on_consumed(consumed)
+                except Exception:
+                    logger.debug("consumption report failed for slot %s", slot.key, exc_info=True)
 
     def _queue_recovery(
         index: int,
@@ -9549,6 +9636,12 @@ async def _run_chat(
         # circular import: session_control imports this package's modules at module level.
         from kiro_crew.dashboard.session_control import containment_meta
 
+        _recovery_meta = {
+            **containment_meta(state, slot),
+            **(extra_meta or {}),
+        }
+        if slot._in_stage_execution:
+            _recovery_meta = stage_boundary_for(slot).tag_meta(_recovery_meta)
         _recovery_qid = slot.queue_insert(
             index,
             content,
@@ -9560,11 +9653,7 @@ async def _run_chat(
             # cron's retry as a user turn. The requeue is the only moment that
             # actor is still known -- the drain sees a fresh queue id and, for a
             # recovery, no kind that names a producer.
-            meta={
-                **containment_meta(state, slot),
-                TURN_ACTOR_META_KEY: _crew_log_actor,
-                **(extra_meta or {}),
-            },
+            meta={**_recovery_meta, TURN_ACTOR_META_KEY: _crew_log_actor},
             on_consumed=_on_consumed if not _consumed_reported else None,
             on_irreversibly_consumed=(
                 _on_irreversibly_consumed if not _irreversible_consumption_reported else None
@@ -9572,6 +9661,8 @@ async def _run_chat(
             directive_user_origin=_directive_user_origin,
             directive_channel_origin=_directive_channel_origin,
         )
+        if slot._in_stage_execution and not _consumed_reported and content == message:
+            stage_boundary_for(slot).retry_queue_id = _recovery_qid
         if _is_refusal_retry_turn and index == 0 and content == message:
             # A verbatim requeue of the refusal retry's own message REPLACES
             # the consumed replay, whichever recovery family issued it: carry
@@ -10302,6 +10393,9 @@ async def _run_chat(
 
     _is_monitor_wake = message.startswith(MONITOR_WAKE_PREFIX)
     _acquired = False
+    # Whether this turn holds the session-switch lock (see the acquire below);
+    # read by the finally so an exit between acquire and release never leaks it.
+    _dispatch_lock_held = False
     _mirror_stream_ts: str = ""
     _mirror_chan: str | None = ""
     _mirror_active_task = ""
@@ -10313,12 +10407,27 @@ async def _run_chat(
     # for shared memory preparation, before any provider is allocated.
     client: Any = None
     try:
+        # Publish the immutable identity BEFORE the first admission await, as
+        # the first statement the enclosing finally covers. From here down the
+        # local session_key is what the turn acquires, audits and releases
+        # while slot.linked_session_key remains mutable underneath it -- and
+        # the admission awaits below are exactly where a rebind can land: a
+        # cron injection reassigns the routing with no ``running`` gate, so a
+        # key published only after admission would leave this turn's session
+        # invisible to every reader of the turn key (the cancel routes and
+        # the slot-switch busy scan, ``_switch_target_busy``) for the whole
+        # memory-preparation wait, while ``slot.task`` already says a turn is
+        # running. A turn refused at admission (timeout, Stop) leaves through
+        # the same finally, which compare-and-clears only an identity this
+        # turn actually published, so a successor's key is never wiped.
+        slot._active_turn_session_key = session_key
+
         # The gateway publishes this shared task before READY, then performs the
         # restore/open/rebuild work after READY. Wait at the one dashboard turn
-        # admission seam before expiring controls, publishing a turn identity,
-        # resolving bindings, allocating a provider or writing metadata. The
-        # turn's grace period is bounded; timeout and Stop leave the shared
-        # worker alive and retain queued intent until a later admitted turn.
+        # admission seam before expiring controls, resolving bindings,
+        # allocating a provider or writing metadata. The turn's grace period
+        # is bounded; timeout and Stop leave the shared worker alive and
+        # retain queued intent until a later admitted turn.
         from kiro_crew.memory_startup import wait_for_memory_preparation
 
         await wait_for_memory_preparation(getattr(state, "memory_startup_task", None))
@@ -10331,13 +10440,6 @@ async def _run_chat(
         # commands returned above, so they do not consume a still-valid control.
         if _prompt_depth == 0:
             await expire_slack_options(state, session_key)
-
-        # Publish the immutable identity only after every admission await. From
-        # here down the local session_key is what the turn acquires, audits and
-        # releases while slot.linked_session_key remains mutable underneath it.
-        # The enclosing finally compare-and-clears only an identity this turn
-        # actually published.
-        slot._active_turn_session_key = session_key
 
         # Resolve agent bindings early so we pass the correct kiro-cli
         # agent name (e.g. "kirocrew") instead of the KiroCrew slot name
@@ -10384,6 +10486,32 @@ async def _run_chat(
                 effective_session_key(slot),
             )
 
+        # Serialize this turn's binding capture and session registration
+        # against the slot-switch transaction of every alias on this session
+        # (the same ``slot_switch_session_lock`` the switch handlers hold
+        # across their busy scan and reset, and the refusal-fallback restore
+        # takes during the turn). Without it a switch can scan (no sibling
+        # yet), this dispatch can capture the pre-switch bindings, the reset
+        # can find no registered session and "succeed", and the session then
+        # registers on the old bindings. Under the lock the two are atomic
+        # with respect to each other: this turn either registers first (the
+        # scan then sees it and refuses) or captures after the switch's commit
+        # and reset (so it starts on the NEW bindings). Held only through the
+        # COLD-START registration inside ``get_or_create`` and released right
+        # after -- never while waiting for an existing session's turn lease
+        # (see the allocation site below) and never across the turn itself,
+        # whose refusal-fallback helpers take this same non-reentrant lock.
+        # Every await inside the span is a thread offload, a config/binding
+        # read, or a SessionManager call that takes no lock another turn holds
+        # while wanting this one. Lock order: this task holds no slot lock,
+        # so a switch handler holding ``slot._lock`` and waiting here cannot
+        # be waited on in turn. Exits between acquire and release (a binding
+        # that changed during preparation, a provider that failed to start,
+        # cancellation) reach the enclosing finally, which releases first
+        # thing.
+        _dispatch_lock = slot_switch_session_lock(session_key)
+        await _dispatch_lock.acquire()
+        _dispatch_lock_held = True
         selected_binding = _current_binding()
         registered_slot = state._slots.get(slot.key)
 
@@ -10610,6 +10738,45 @@ async def _run_chat(
         # which decides whether to send it, and the crew log's `session/opened`,
         # which records the choice.
         _requested_model = slot.model or agent_model or default_model or ""
+        _allocation_kwargs: dict[str, Any] = dict(
+            agent=kiro_agent or slot.agent or None,
+            # Same canonical crew identity as the eager-spawn path — the two
+            # must agree or an eager session and its real first turn would
+            # carry different watchdog windows.
+            crew_agent=crew_alias,
+            model=_requested_model or None,
+            cwd=slot.project or None,
+            # The persisted channel stays separate from the dashboard-owned key
+            # so provider startup can distinguish a linked dispatcher from a
+            # direct dashboard turn.
+            channel_id=_provider_channel_id or None,
+            reasoning_effort_override=slot.reasoning_effort or None,
+        )
+
+        def _release_dispatch_lock() -> None:
+            nonlocal _dispatch_lock_held
+            if _dispatch_lock_held:
+                _dispatch_lock_held = False
+                _dispatch_lock.release()
+
+        # The switch lock is held for the COLD START only: the window it
+        # closes is "no session registered yet, so the switch handlers' busy
+        # scan and reset see nothing". A session that is already registered
+        # is already visible to that scan, so the lock has nothing left to
+        # protect -- and waiting on that session's turn lease while holding it
+        # would deadlock: the lease is held by a sibling alias's live turn,
+        # whose refusal-fallback restore takes this same lock. So: registered
+        # -> release, then wait for the lease outside the lock. Not registered
+        # -> allocate under the lock but never wait for a lease there
+        # (``wait_if_busy=False``): if a session was registered by a path that
+        # does not take this lock (an eager prewarm, a channel-side turn)
+        # between the check and the claim, the busy refusal comes back
+        # instead of a wait, and the claim is retried outside the lock.
+        if state.sessions.has_session(session_key):
+            _release_dispatch_lock()
+            _wait_if_busy = True
+        else:
+            _wait_if_busy = False
         # The crew log this slot was last writing to, read BEFORE allocation
         # publishes the successor's id over it. A slot outlives its ACP session, so
         # when the session below cold-starts under a NEW id the crew log gains a new
@@ -10646,21 +10813,24 @@ async def _run_chat(
         # which a walker steps over with no signal. That is a recorded residual,
         # tracked with the superseded-tail work rather than handled here.
         slot.latch_crew_log_previous(state.sessions.mapped_sid(session_key))
-        client, is_new, resumed = await state.sessions.get_or_create(
-            session_key,
-            agent=kiro_agent or slot.agent or None,
-            # Same canonical crew identity as the eager-spawn path — the two
-            # must agree or an eager session and its real first turn would
-            # carry different watchdog windows.
-            crew_agent=crew_alias,
-            model=_requested_model or None,
-            cwd=slot.project or None,
-            # The persisted channel stays separate from the dashboard-owned key
-            # so provider startup can distinguish a linked dispatcher from a
-            # direct dashboard turn.
-            channel_id=_provider_channel_id or None,
-            reasoning_effort_override=slot.reasoning_effort or None,
-        )
+        # ONE allocation site (the crew-log latch above must sit right before
+        # it): the cold-start branch claims under the lock without waiting for
+        # a lease; a busy refusal there means a session registered underneath
+        # us, so drop the lock and claim again with the normal lease wait.
+        for _claim in (0, 1):
+            try:
+                client, is_new, resumed = await state.sessions.get_or_create(
+                    session_key, wait_if_busy=_wait_if_busy, **_allocation_kwargs
+                )
+                break
+            except SessionBusyError:
+                if _wait_if_busy or _claim:
+                    raise
+                _release_dispatch_lock()
+                _wait_if_busy = True
+        # Registered: the switch handlers' busy scan sees this session from
+        # here on, so the lock has done its job and the turn must not hold it.
+        _release_dispatch_lock()
         if is_new and not resumed:
             # This call allocated the live session, so its own selection is the
             # provenance -- overwriting whatever a previous session left behind.
@@ -15953,6 +16123,7 @@ async def _run_chat(
                 if has_plan:
                     _armed_final = True
                     _reset_auto_run_for_new_plan(slot)
+                    stage_boundary_for(slot).clear()
                     assistant_text = ensure_go_all_option(assistant_text)
                     # Store stage count for _stage_loop
                     _record_plan_timeline(slot, _extract_and_redact_plan_metadata(assistant_text))
@@ -16349,8 +16520,9 @@ async def _run_chat(
                     slot.key,
                 )
                 _reset_auto_run_for_new_plan(slot)
+                stage_boundary_for(slot).clear()
                 _record_plan_timeline(slot, _extract_and_redact_plan_metadata(_orch_plan_buf))
-        # Leaked tool-call notice (#6112): the turn ended NORMALLY with an
+        # Leaked tool-call notice: the turn ended NORMALLY with an
         # invoke block emitted as TEXT and zero tool calls — the model wrote
         # the invocation into the prose channel instead of executing it, so
         # nothing ran and, in a monitor/autonudge loop, the session silently
@@ -17264,6 +17436,44 @@ async def _run_chat(
         # Every queued prompt would hit the same wall. Popping them one by one
         # would drain the whole queue into identical failures, leaving nothing to
         # resume after the user signs in — so hold the queue intact instead.
+        # The current system input was already popped before this turn began;
+        # restore it through the ordinary recovery helper so its delivery
+        # callbacks, provenance, and containment stamp survive post-login retry.
+        # One auth failure owns one identity. Clear any older retry before this
+        # turn decides whether it produced an exact replacement row.
+        if slot._in_stage_execution:
+            stage_boundary_for(slot).retry_queue_id = ""
+        _auth_retry_kind = ""
+        if _synthetic_recovery_turn or (
+            _synthetic_payload and message == SUBAGENT_SYNTHESIS_PROMPT
+        ):
+            # A synthesis turn is runner-authored even though its ledger actor is
+            # ``subagent``. Preserve inject provenance across login; classifying
+            # from the broad actor would drain the internal prompt as user text.
+            _auth_retry_kind = SYNTHETIC_RECOVERY_KIND
+        elif _turn_actor == "subagent":
+            _auth_retry_kind = SUBAGENT_COMPLETION_KIND
+        if (
+            _auth_retry_kind
+            and not _consumed_reported
+            and not any(
+                entry.get("kind") == _auth_retry_kind and entry.get("content") == message
+                for entry in slot._queue
+            )
+        ):
+            _current_meta = (
+                _current_message.get("meta")
+                if _current_message is not None and isinstance(_current_message.get("meta"), dict)
+                else None
+            )
+            retry_queue_id = _queue_recovery(
+                0,
+                message,
+                kind=_auth_retry_kind,
+                extra_meta=_current_meta,
+            )
+            if slot._in_stage_execution:
+                stage_boundary_for(slot).retry_queue_id = retry_queue_id
         _auth_required = True
         needs_session_reset = True
         _persist_partial_reply()
@@ -17276,7 +17486,7 @@ async def _run_chat(
         # store the row stays a plain error. The prose is unchanged.
         slot.append("error", _auth_msg, "msg msg-err", meta=_terminal_error_meta(exc))
         _mark_kiro_signed_out(state)
-        await _deliver_auth_error_to_slack(state, slot, sessions, session_key, _auth_msg)
+        await _deliver_linked_slack_message(state, slot, sessions, session_key, _auth_msg)
     except AcpProcessDied as exc:
         logger.warning("ACP process died in slot %s: %s — resetting session", slot.key, exc)
         # The class this handler caught is a fact only this site holds, and the
@@ -18553,6 +18763,14 @@ async def _run_chat(
         if not (isinstance(exc, MemoryStartupUnavailable) and not _memory_preparation_admitted):
             await state.sessions.record_failure(session_key)
     finally:
+        # First: hand back the session-switch lock if this turn exited between
+        # its acquire and its post-registration release. Before anything that
+        # can await, and before the refusal-fallback restore below takes the
+        # same lock -- otherwise a turn that failed to register would block
+        # every switch on its session until the gateway restarts.
+        if _dispatch_lock_held:
+            _dispatch_lock_held = False
+            _dispatch_lock.release()
         # The turn's crew log closers, in the one order a reader can trust: every
         # `message/sent` for this turn has now been flushed, so the tool closer,
         # the last step's completion and the turn's own completion land after the

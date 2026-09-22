@@ -2581,7 +2581,12 @@ class TestEffectiveModelSection:
         target = self._tmp / "protected.json"
         target.write_text(json.dumps({"model": "leaked-value"}), encoding="utf-8")
         (agents_dir / AGENT_FILENAME).symlink_to(target)
-        monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+        # The reader asks is_sensitive_canonical_path about the RESOLVED target
+        # (is_sensitive_path in agent_discovery gates only the project dir and
+        # the list_agents cache key), so the refusal is injected at that name.
+        monkeypatch.setattr(
+            agent_discovery, "is_sensitive_canonical_path", lambda p: str(target) in str(p)
+        )
         issues: list[str] = []
 
         cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
@@ -2820,7 +2825,7 @@ class TestWhatsAppSection:
 
         out = capsys.readouterr().out
         assert "not paired yet" in out
-        assert "Settings → Channels" in out
+        assert "Settings → Messaging Channels" in out
         assert issues == [], "an unpaired channel must not fail the preflight"
 
     def test_the_reported_store_is_the_path_the_gateway_opens(

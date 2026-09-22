@@ -242,7 +242,7 @@ Widening that is a separate decision from moving the gates.
 | `testpaths-coverage` | `scripts/check_testpaths_coverage.py`, self-test first. Fails on a `test_*.py` file outside the roots `setup.cfg` pins in `testpaths` — such a file is never collected, so it is green by omission and rots against the code it claims to cover (#6577 found twelve). Whole-tree, since the backlog is zero |
 | `harness-parity` | `scripts/check_harness_parity.py`, self-test first. Fails on a newly added line that expresses "this is the Kiro harness" as the absence of another one — a shape that fails toward the permissive answer, so nothing else goes red. Diff-scoped; the whole-tree backlog is a non-failing report |
 | `memory-store-seam` | `scripts/check_memory_store_seam.py`, self-test first, with `MEMSTORE_BASE_REF` resolved to the diff base. Enforces explicit store selection on added memory-context calls. The prepare-pr floor runs both commands; the main ratchet lane classifies this as a diff-only gate because its whole-tree backlog is a non-failing report |
-| `docs-lint` | `scripts/docs_lint.py --test` then `scripts/docs-lint.sh`. Every internal link resolves, every doc is reachable from its directory index, every directory holding docs has one, no code comment cites a doc that does not exist, no doc cites a source LINE past the end of the file it names, no module spec names a source file that exists nowhere, and no doc whose filename is hardcoded in code has been renamed out from under its consumer. Four trees are walked: `docs/`, the packaged `src/kiro_crew/docs/`, `website/docs/`, and the markdown a builtin app ships under `src/kiro_crew/apps/builtins/`. Plus the fact checks below, behind a shrink-only baseline |
+| `docs-lint` | `scripts/docs_lint.py --test` then `scripts/docs-lint.sh`. Every internal link resolves, every doc is reachable from its directory index, every directory holding docs has one, no code comment cites a doc that does not exist, no doc cites a source LINE past the end of the file it names, no module spec names a source file that exists nowhere, every bare Autopilot `S<n>` ID in a source comment names a row in `autopilot.md`, and no doc whose filename is hardcoded in code has been renamed out from under its consumer. Four trees are walked: `docs/`, the packaged `src/kiro_crew/docs/`, `website/docs/`, and the markdown a builtin app ships under `src/kiro_crew/apps/builtins/`. Plus the fact checks below, behind a shrink-only baseline |
 
 Each of these runs its own self-test in the same step, ahead of the real check. A
 gate that has silently stopped matching reads as a green signal, which is worse than
@@ -1673,7 +1673,19 @@ silently (zero jobs, nothing on the PR) when any expression-bearing string excee
 /ai-review override <fable|gpt|design|ux|first-principles|scope|all> <current-head-sha>: <one-sentence reason>
 ```
 
-`scope` targets the [Security Scope Review](#security-scope-review-what-a-tightening-newly-refuses) lanes; every target maps to its like-named reviewer.
+`scope` targets the [Security Scope Review](#security-scope-review-what-a-tightening-newly-refuses) lanes. Each target names a lane by its command spelling, and `pr_status.py` resolves that spelling to a reviewer through the lane's comment key — so `gpt` is the `codex-ai-review` lane's reviewer `GPT`, and `fable` is the `claude-ai-review` lane's reviewer `OPUS`. `scope` is the exception: its lane consumes the record like any other, but it has no reviewer binding, so the script has no row to report it under.
+
+`pr_status.py` reads the marker too, and reports an accepted record as its own row —
+`GPT: OVERRIDDEN by @<actor>` — rather than as a fresh stamp. The two markers prove
+different things: `[<NAME>-REVIEWED] <sha>` is proof a **model** produced a verdict for
+this commit, and the override record is proof a **human** adjudicated it on a path where
+the model is deliberately not re-run, so no stamp exists to find. Without that, an
+accepted override turns the lane's check green while the canonical script still reports
+`stale reviewer stamp(s)` for it. The record must name the head **exactly**: it is written
+by the workflow from `.head.sha`, so the prefix-and-elision tolerance that exists for
+model-transcribed stamps does not apply. A record naming one lane also keeps that lane in
+the evaluation, so deleting the bot comment that carries a stale stamp cannot make the
+reviewer disappear from the check instead of answering for it.
 
 `issue_comment` workflows execute from the trusted default branch, never from the PR
 head. The handler validates the command shape, a 7-to-40-hex SHA that must be the

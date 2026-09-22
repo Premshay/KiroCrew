@@ -4644,21 +4644,26 @@ function ChatInput({
           while a deliberate collapse persists and therefore does — the bar
           rendered after this block is that way back. */}
       <AnimatePresence initial={false}>
-        {!showGhost && !composerCollapsed && (
-          <motion.div
-            key="input-container"
-            initial={{ opacity: 1, height: 'auto' }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            transition={{
-              type: 'spring',
-              damping: 26,
-              stiffness: 280,
-              mass: 0.7,
-            }}
-            style={{ overflow: 'hidden' }}
-          >
-            {/* File drag-and-drop target. Drag-drop is inherently pointer-only; the
+      {!showGhost && !composerCollapsed && (<motion.div
+        key="input-container"
+        initial={{ opacity: 1, height: 'auto' }}
+        animate={{ opacity: 1, height: 'auto' }}
+        exit={{ opacity: 0, height: 0 }}
+        transition={{ type: 'spring', damping: 26, stiffness: 280, mass: 0.7 }}
+        // The halo lives on THIS element, not on the bordered wrapper inside it:
+        // this element clips its content for the height:0 exit, and a child's
+        // box-shadow is content, so a halo drawn one level down is cut at the
+        // edge. An element's own shadow is outside its overflow clip. Radius
+        // mirrors the wrapper's so the halo hugs the same corners. With an
+        // approval box attached above, the wrapper has no top radius and the
+        // approval glow already lights the pair, so the halo stands down.
+        // Incognito and temporary modes paint the wrapper's border warn / aim
+        // at all times; the focus halo takes the same color there so the one
+        // control lights up in one color instead of an accent ring around a
+        // warn or aim edge.
+        className={hasApproval ? undefined : `composer-halo rounded-2xl${memoryMode === 'temporary' ? ' composer-halo-aim' : memoryMode === 'incognito' ? ' composer-halo-warn' : ''}`}
+        style={{ overflow: 'hidden' }}
+      >{/* File drag-and-drop target. Drag-drop is inherently pointer-only; the
            keyboard-accessible path is the "Attach files" button that opens the
            hidden file input above. Hence the scoped disable for the drop zone. */}
             {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
@@ -4815,13 +4820,8 @@ function ChatInput({
                 />
               )}
 
-              {optimizing && (
-                <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl">
-                  <Sparkles size={14} className="inline mr-1 text-yellow-400" />{' '}
-                  {i18nT('components.chatInput.optimizing_prompt')}
-                </span>
-              )}
-              {/* The textarea fallback is seamless for typing (draft intact), but the
+        {optimizing && <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl"><Sparkles size={14} className="inline mr-1 text-warn" /> {i18nT('components.chatInput.optimizing_prompt')}</span>}
+        {/* The textarea fallback is seamless for typing (draft intact), but the
             failure itself must be user-visible, not only a console line: the
             person who opted into the editor should know they are no longer in
             it. `askAgent` stays off — the hand-off unmounts the composer and

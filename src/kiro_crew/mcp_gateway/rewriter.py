@@ -314,14 +314,16 @@ def _resolve_target_command(
 ) -> str:
     """Resolve an MCP target command to an absolute path, or ``""``.
 
-    gatewayd spawns backends from the systemd ``--user`` environment, whose
-    ``PATH`` lacks the toolbox / user-local bin dirs a login shell has — so a
-    bare command that resolves fine for the SESSION's own exec ENOENTs on
-    every pooled spawn: 79% of all measured fallbacks. The search is
+    A bare command that resolves on no searched directory ENOENTs on every
+    pooled spawn, while kiro-cli's own spawn environment may still resolve it
+    for the SESSION's exec. The daemon's PATH carries the managed launcher
+    dirs (:func:`kiro_crew.env.mcp_runtime_path`), so a pooled backend
+    searches them too; what this pass settles is the verdict itself, once at
+    rewrite time and ahead of any spawn. The search is
     :func:`kiro_crew.env.mcp_search_path` — literally the same composition the
     MCP probe and the agent-config resolver use (spec ``env.PATH`` first, then
-    the augmented host PATH) — so a server that probes healthy on the
-    dashboard can never ENOENT in gatewayd.
+    the contributed MCP directories, then the augmented host PATH) — so a
+    server that probes healthy on the dashboard can never ENOENT in gatewayd.
 
     An absolute command is accepted only when it exists and is executable
     (the same predicate ``agent.py``'s config resolver applies). Any command
@@ -1701,7 +1703,7 @@ def _cached_rewrite_result(
     target_env: dict[str, str] = {}
     try:
         for name in sorted(overlay_sigs):
-            spec = json.loads((overlay_dir / name).read_text())
+            spec = json.loads((overlay_dir / name).read_text(encoding="utf-8"))
             servers = spec.get("mcpServers", {}) if isinstance(spec, dict) else {}
             if not isinstance(servers, dict):
                 servers = {}
@@ -1717,7 +1719,7 @@ def _cached_rewrite_result(
             if wrapped:
                 results[name] = wrapped
             _collect_target_env(servers, target_env)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
 
     logger.info(
@@ -2029,7 +2031,7 @@ def rewrite_agents(
     settings_read_transient = False
     if kiro_settings_json.is_file():
         try:
-            loaded = json.loads(kiro_settings_json.read_text())
+            loaded = json.loads(kiro_settings_json.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 settings_poolable = _injectable_settings_servers(
                     loaded, stub_set,
@@ -2047,7 +2049,7 @@ def rewrite_agents(
             notes.source_read_failed = True
             settings_read_transient = True
             logger.warning("failed to read global mcp.json: %s", exc)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             # Content problem — cacheable; a fix changes the stat signature.
             logger.warning("failed to read global mcp.json: %s", exc)
     else:
@@ -2340,8 +2342,8 @@ def rewrite_agents(
     for name in sorted(transient_keep):
         kept = overlay_dir / name
         try:
-            kept_spec = json.loads(kept.read_text())
-        except (OSError, json.JSONDecodeError):
+            kept_spec = json.loads(kept.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             continue
         if isinstance(kept_spec, dict):
             servers = kept_spec.get("mcpServers", {})

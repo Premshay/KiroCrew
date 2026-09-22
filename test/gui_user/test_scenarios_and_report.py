@@ -24,14 +24,31 @@ KNOWLEDGE_NOTES_DIR = (
 
 SHIPPED_SMOKE = {
     "apps-discover-enable-research-lab",
+    "artifacts-library-table-and-kind-filter",
     "auth-sign-in-card-signed-out",
+    "capabilities-agents-list-and-open-editor",
+    "capabilities-skills-filter-and-open-builtin",
+    "chat-activity-side-panel-toggle",
+    "chat-session-title",
+    "chat-sessions-page",
     "chat-switch-seeded-sessions",
+    "chat-turn-stats-footer",
+    "connections-services-search-and-mcp-list",
+    "memory-open-browser-from-overview",
+    "notifications-center-empty-state",
     "schedule-list-calendar-executions-views",
     "search-everywhere-jump-to-setting",
     "sessions-new-chat",
+    "settings-chat-toggle-show-timestamps",
+    "settings-developer-panel-dev-mode-toggle",
     "settings-search-jump-to-theme",
+    "settings-security-docs-section",
+    "settings-shortcuts",
+    "settings-tab-rail-navigation",
     "settings-theme-toggle",
     "sidebar-folders-and-older-sessions",
+    "sidebar-rail-collapse-expand",
+    "taskrunner-projects-page-compose",
 }
 SHIPPED = SHIPPED_SMOKE | {
     "knowledge-add-folder-source-and-scan",
@@ -49,12 +66,18 @@ class TestShippedScenarios:
         smoke = scenarios.select(scenarios.load_all(SCENARIOS_DIR), tier="smoke")
         assert {s.name for s in smoke} == SHIPPED_SMOKE
         # A smoke scenario is a core path in a handful of actions; the tier's bill is
-        # bounded by the scenarios' own limits, which the nightly tier then inherits.
+        # the sum of the scenarios' own limits, which the nightly tier then inherits.
+        # The totals are pinned, not bounded, so a new smoke scenario moves them on
+        # purpose and the cost note in docs/build/gui-user-test.md is re-read with them.
+        # Re-pin by summing `max_steps` / `max_seconds` over this `smoke` selection;
+        # the assertion messages print the live totals, so a stale pin names its fix.
         for s in smoke:
             assert len(s.steps) <= 5, s.name
             assert s.max_steps <= 14, s.name
-        assert sum(s.max_steps for s in smoke) <= 120
-        assert sum(s.max_seconds for s in smoke) <= 3000
+        smoke_steps = sum(s.max_steps for s in smoke)
+        smoke_seconds = sum(s.max_seconds for s in smoke)
+        assert smoke_steps == 255, f"smoke max_steps total is {smoke_steps}; re-pin"
+        assert smoke_seconds == 6870, f"smoke max_seconds total is {smoke_seconds}; re-pin"
 
     def test_nightly_includes_smoke(self) -> None:
         nightly = scenarios.select(scenarios.load_all(SCENARIOS_DIR), tier="nightly")
@@ -77,6 +100,39 @@ class TestShippedScenarios:
         assert any("3 supported files found" in step for step in sc.steps)
         assert any('"3 items"' in exp for exp in sc.expectations)
         assert any("/tmp/kirocrew-gui-user-test/team-notes" in step for step in sc.steps)
+
+    def test_rich_seed_artifacts_are_the_ones_the_scenario_reads(self) -> None:
+        # The Artifacts scenario names the three artifacts the `rich` seed ships and
+        # narrows the table to the one markdown artifact by slug and kind. An
+        # artifact renamed, re-kinded or dropped from the fixture without the
+        # scenario moving fails here rather than as a paid nightly run. The set is
+        # a copy of the `artifacts-library` fixture's, and the two are held equal
+        # so the copies cannot drift apart silently.
+        from kiro_crew.artifacts import ArtifactStore
+        from kiro_crew.testing.fixtures import seeded_home
+
+        def fingerprint(fixture: str) -> dict[str, tuple[str, str, int]]:
+            with seeded_home(fixture):
+                return {a.slug: (a.name, a.kind, a.version) for a in ArtifactStore().list()}
+
+        rich = fingerprint("rich")
+        assert rich == fingerprint("artifacts-library")
+        assert {slug: kind for slug, (_, kind, _) in rich.items()} == {
+            "pagination-design": "markdown",
+            "queue-badge": "svg",
+            "release-checklist": "widget",
+        }
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "artifacts-library-table-and-kind-filter.yaml")
+        first_step = sc.steps[0]
+        for name, _, _ in rich.values():
+            assert name in first_step, name
+        markdown = [(slug, *rest) for slug, rest in rich.items() if rest[1] == "markdown"]
+        assert len(markdown) == 1
+        slug, name, _, version = markdown[0]
+        assert any(
+            name in exp and f'"{slug}"' in exp and '"markdown"' in exp for exp in sc.expectations
+        )
+        assert any(f'"v{version}"' in exp for exp in sc.expectations)
 
     def test_explicit_name_selection(self) -> None:
         picked = scenarios.select(scenarios.load_all(SCENARIOS_DIR), names=["members-dm-hello"])
@@ -107,27 +163,62 @@ class TestShippedScenarios:
     def test_shipped_scenarios_group_by_feature(self) -> None:
         groups = scenarios.by_feature(scenarios.load_all(SCENARIOS_DIR))
         assert {slug: [s.name for s in g] for slug, g in groups.items()} == {
-            "chat": ["chat-switch-seeded-sessions", "sessions-new-chat"],
-            "sidebar": ["sidebar-folders-and-older-sessions"],
+            "chat": [
+                "chat-session-title",
+                "chat-switch-seeded-sessions",
+                "chat-turn-stats-footer",
+                "sessions-new-chat",
+            ],
+            "side-panel": ["chat-activity-side-panel-toggle"],
+            "sidebar": [
+                "chat-sessions-page",
+                "sidebar-folders-and-older-sessions",
+                "sidebar-rail-collapse-expand",
+            ],
             "search": ["search-everywhere-jump-to-setting"],
             "members": ["members-dm-hello", "members-private-memory-keeps-thread"],
+            "capabilities": [
+                "capabilities-agents-list-and-open-editor",
+                "capabilities-skills-filter-and-open-builtin",
+            ],
+            "connections": ["connections-services-search-and-mcp-list"],
+            "memory": ["memory-open-browser-from-overview"],
             "knowledge": ["knowledge-add-folder-source-and-scan"],
+            "artifacts": ["artifacts-library-table-and-kind-filter"],
             "apps": ["apps-discover-enable-research-lab"],
+            "task-runner": ["taskrunner-projects-page-compose"],
             "schedule": ["schedule-list-calendar-executions-views"],
+            "notifications": ["notifications-center-empty-state"],
             "auth": ["auth-sign-in-card-signed-out"],
-            "settings": ["settings-search-jump-to-theme", "settings-theme-toggle"],
+            "settings": [
+                "settings-chat-toggle-show-timestamps",
+                "settings-developer-panel-dev-mode-toggle",
+                "settings-search-jump-to-theme",
+                "settings-shortcuts",
+                "settings-tab-rail-navigation",
+                "settings-theme-toggle",
+            ],
+            "security": ["settings-security-docs-section"],
         }
         # FEATURES order, not alphabetical: chat is the product's primary surface.
         assert list(groups) == [
             "chat",
+            "side-panel",
             "sidebar",
             "search",
             "members",
+            "capabilities",
+            "connections",
+            "memory",
             "knowledge",
+            "artifacts",
             "apps",
+            "task-runner",
             "schedule",
+            "notifications",
             "auth",
             "settings",
+            "security",
         ]
 
     def test_members_scenario_holds_across_the_crew_mode_retirement(self) -> None:
@@ -474,7 +565,7 @@ class TestReport:
         md = report.render_features(catalog, _summary(), run_url="https://x/run")
         assert md.startswith("# GUI user-test feature catalog\n")
         assert (
-            f"_9 of {len(scenarios.FEATURES)} features covered · 12 scenarios (9 smoke / 3 nightly)._"
+            f"_17 of {len(scenarios.FEATURES)} features covered · 29 scenarios (26 smoke / 3 nightly)._"
             in md
         )
         assert (
@@ -496,7 +587,7 @@ class TestReport:
         )
         # Uncovered features are the backlog.
         assert "## Not yet covered" in md
-        assert "- `artifacts` Artifacts" in md
+        assert "- `files` File viewer & project files" in md
         assert "- `chat` Chat sessions" not in md
 
     def test_features_catalog_without_a_run(self) -> None:

@@ -961,6 +961,12 @@ class _Session:
     # the caller's existing stale-provider path evicts it and cold starts. Default
     # False so every existing construction site is unaffected.
     retire_on_identity_change: bool = False
+    # True while the lease is held for a LIFETIME rather than a turn -- see
+    # ``session_lifecycle._turn_in_flight``, which is what asks.
+    lifecycle_lease: bool = False
+    # Set by a lifecycle holder for the whole of its turn, INCLUDING the setup before the
+    # provider registers one. ``has_active_turn`` cannot see that window.
+    lifecycle_turn_active: bool = False
     prompt_count: int = 0
     consecutive_failures: int = 0
     # Bounded rather than plain: a release() call that lands on this object
@@ -969,6 +975,11 @@ class _Session:
     # counter above 1, which would let a second turn acquire concurrently
     # with one still in flight.
     semaphore: asyncio.BoundedSemaphore = field(default_factory=lambda: asyncio.BoundedSemaphore(1))
+    # The task that acquired the turn permit above, recorded at every acquire
+    # site and read by ``reset``: a session popped while its permit is held
+    # remembers WHO held it, so that task's later key-only ``release`` is
+    # absorbed instead of unlocking whatever successor now occupies the key.
+    turn_owner: Any = None
     approval_policy: str = ""  # "" (interactive) | "auto" (auto-approve all tools)
     agent: str = ""  # kiro agent name used for this session
     capability_member: str = ""
@@ -1677,6 +1688,33 @@ class SessionManager:
         """Resolve exact, canonical, then legacy aliases onto a live key."""
         return self._allocation_boundary()._fold_key(key)
 
+    def set_lifecycle_turn_active(self, key: str, active: bool) -> bool:
+        """Record whether a lifecycle holder is taking a turn.
+
+        A holder that keeps its lease across an idle life has to say when it is WORKING,
+        because the pre-stream setup runs before the provider registers a turn and a probe
+        reading the provider alone would tear the session down mid-setup. Returns whether a
+        registered session was updated.
+        """
+        session = self._allocation_boundary()._sessions.get(self._fold_key(key))
+        if session is None:
+            return False
+        session.lifecycle_turn_active = active
+        return True
+
+    def mark_lifecycle_lease(self, key: str) -> bool:
+        """Declare that this key's lease is held for a LIFETIME, not for one turn.
+
+        A holder that keeps the lease across an idle listening life must say so, because a
+        busy probe reading the lease alone would otherwise refuse every teardown on the key
+        for as long as the holder exists. Returns whether a registered session was marked.
+        """
+        session = self._allocation_boundary()._sessions.get(self._fold_key(key))
+        if session is None:
+            return False
+        session.lifecycle_lease = True
+        return True
+
     def has_session(self, key: str) -> bool:
         """Return whether a live session exists for the folded key."""
         return self._allocation_boundary().has_session(key)
@@ -2364,6 +2402,7 @@ class SessionManager:
         expect_session: _Session | None = None,
         skip_if_busy: bool = False,
         skip_if_injecting: bool = False,
+        refuse_only_on_active_turn: bool = False,
         clear_conversation: bool = False,
         ends_conversation: bool = False,
     ) -> bool:
@@ -2373,6 +2412,7 @@ class SessionManager:
             expect_session=cast(Any, expect_session),
             skip_if_busy=skip_if_busy,
             skip_if_injecting=skip_if_injecting,
+            refuse_only_on_active_turn=refuse_only_on_active_turn,
             clear_conversation=clear_conversation,
             ends_conversation=ends_conversation,
         )
@@ -2679,7 +2719,12 @@ class SessionManager:
         )
 
     async def discard_conversation(
-        self, key: str, *, replay: bool = True, skip_if_busy: bool = False
+        self,
+        key: str,
+        *,
+        replay: bool = True,
+        skip_if_busy: bool = False,
+        refuse_only_on_active_turn: bool = False,
     ) -> bool:
         """Drop native conversation state while retaining channel linkage.
 
@@ -2689,7 +2734,10 @@ class SessionManager:
         atomicity contract.
         """
         return await self._lifecycle_boundary().discard_conversation(
-            key, replay=replay, skip_if_busy=skip_if_busy
+            key,
+            replay=replay,
+            skip_if_busy=skip_if_busy,
+            refuse_only_on_active_turn=refuse_only_on_active_turn,
         )
 
     async def drain_active_turns(self, timeout: float | None = None) -> int:
@@ -2803,6 +2851,14 @@ class SessionManager:
     def release(self, key: str, *, cleanup: bool = False) -> None:
         """Release the key-based session lease."""
         self._allocation_boundary().release(key, cleanup=cleanup)
+
+    def absorb_orphaned_release(self, key: str) -> bool:
+        """Whether the calling task's release belongs to a session already reset."""
+        return self._lifecycle_boundary().absorb_orphaned_release(key)
+
+    def adopt_turn(self, key: str) -> None:
+        """The calling task now holds *key*'s live permit; forget any orphan record."""
+        self._lifecycle_boundary().adopt_turn(key)
 
     async def _safe_cleanup(self, provider: LLMProvider, session_id: str) -> None:
         """Best-effort cleanup of provider session files."""
@@ -3152,8 +3208,24 @@ class SessionManager:
         )
 
     def stop_generation(self, key: str) -> int:
-        """Monotonic count of :meth:`stop_turn` requests recorded for *key*."""
+        """Monotonic count of user Stop requests recorded for *key*."""
         return self._lifecycle_boundary().stop_generation(key)
+
+    def note_stop(self, key: str) -> bool:
+        """Record a user Stop for *key* without cancelling anything."""
+        return self._lifecycle_boundary().note_stop(key)
+
+    def open_replay_gap(self, key: str) -> None:
+        """Keep Stops recordable for *key* across a reset-then-replay window."""
+        self._lifecycle_boundary().open_replay_gap(key)
+
+    def close_replay_gap(self, key: str) -> None:
+        """End the window :meth:`open_replay_gap` opened."""
+        self._lifecycle_boundary().close_replay_gap(key)
+
+    async def await_replay_gap(self, key: str) -> None:
+        """Wait out another task's open replay gap on *key* before claiming."""
+        await self._lifecycle_boundary().await_replay_gap(key)
 
     async def _send_abort_for_session(self, key: str, session: Any) -> None:
         """Best-effort abort gateway work before hard session teardown."""

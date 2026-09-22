@@ -74,9 +74,18 @@ kirocrew`). Onto that base:
    manifests are authoritative and are re-derived on every rebuild, so keeping
    the previous rebuild's entry would preserve an `autoApprove` grant this pass
    had just stripped.
-2. **`~/.kiro/settings/mcp.json`** (Kiro global) via `setdefault`.
-3. **Seam-contributed provider globals** via `setdefault`, so they can only fill
-   gaps the Kiro global did not. Empty in this build.
+2. **`~/.kiro/settings/mcp.json`** (Kiro global). An absent name is added. A name
+   a PREVIOUS rebuild left behind is *reconciled*: the transport-independent keys
+   the source owns (`timeout`, `disabled`) are overwritten, and one the source has
+   since dropped is removed, so an edit to the source reaches the generated spec
+   instead of losing to the value the first rebuild froze. Every other key on the
+   entry is the user's and survives by omission, `autoApprove` included.
+   Reconciling retires the name, so a lower-priority scope cannot reconcile it
+   again. `command`/`url` and the fields dependent on them (`args`, `env`,
+   `headers`) are NOT reconciled — see the fallback's as-a-unit rule below.
+3. **Seam-contributed provider globals**, so they can only fill gaps the Kiro
+   global did not: a name step 1 or step 2 already claimed in this pass has been
+   retired, so it is left alone. Empty in this build.
 4. **`~/.kiro/crew/mcp.json`** via `update()` on an existing entry, so
    Kiro Crew's `command`/`args`/`env` win while user-set fields such as
    `autoApprove` survive.
@@ -103,7 +112,10 @@ declared `PATH` **replaces** the child's inherited one rather than extending it.
 A spec that names one directory to add would therefore hand the server a PATH
 holding only that directory. `spec_env_path()` expands a declared `env.PATH`
 into the full effective PATH — the spec's own entries first, then the augmented
-inherited PATH, deduped — before it is written out. Consequence to know about:
+inherited PATH, deduped — before it is written out. A forwarded declared `PATH`
+reaches a pooled backend the same way: `gatewayd` composes it through
+`env.mcp_search_path`, so the spec's entries LEAD that backend's PATH rather
+than being the whole of it. Consequence to know about:
 the emitted value is a snapshot of the rebuild-time environment, so it encodes
 this host's directories (mise data dir, installed Node version bins, the
 running interpreter's bin) and is not portable to another machine.
@@ -258,24 +270,30 @@ retained by design, and a name some readable source still declares. A `@` name i
 `@builtin` carries the whole built-in tool surface plus the `tool_search` loader
 — so it is never in the map and is never a leftover.
 
+An unresolved disabled source deliberately denies grants across its complete alias
+family: the canonical alias and every numeric-suffixed sibling whose final dash
+segment contains only digits. It removes those refs from `allowedTools` and blocks
+the rebuild from adding them again, while leaving `tools` and `mcpServers` intact.
+The collision allocator can hand any family alias to a distinct live server, so a
+stale grant on that name must not auto-approve the replacement. Prefix-sharing
+aliases outside the numeric-suffix family keep their grants.
+
 **App-contributed names are read twice, before and after the rebuild's work.** A
 `{app}:{server}` key is minted by an app manifest, so a disabled app's grant must
 not outlive it; but an ownership read that FAILED cannot be told from one that
-found no owner, and only the second is safe to treat as unowned. An unclaimed name
-therefore keeps its mount unconditionally, because an unrelated app's unreadable
-manifest is doubt about that app and never a licence to unmount a server whose
-binary is merely off PATH this pass, and it keeps its grant only while a readable
-source still declares the name. An app's enablement is read as a tri-state so that
-a metadata read fault is not recorded as a deliberate disable. A name no source
-claims exactly is matched by alias family rather than by equality, because
-`mcp_server_alias()` is many-to-one and a collision is resolved by suffixing, so
-a `base-2` sibling with no claim of its own has only its base's answer to
-inherit. A name that IS claimed exactly answers to its own claimant on both
-lists, because widening that to the family lets a sibling's switched-off owner
-delete a server whose own app is running. A name a
-readable source still declares outranks a switched-off app's claim on it, since
-the rebuild's own ref sync would otherwise re-add the pruned per-tool grant as a
-WHOLE-server one.
+found no owner, and only the second is safe to treat as unowned. An app's
+enablement is read as a tri-state so that a metadata read fault is not recorded
+as a deliberate disable. Ownership only ever decides the GRANT: the reconcile
+never unmounts on an ownership answer, because `mcp_server_alias()` is
+many-to-one and a collision is resolved by suffixing, so which claimant a
+`base-2` sibling came from is a guess that is unrecoverable by the next rebuild
+— dropping its `tools` ref on that guess deletes a server nothing re-adds, while
+keeping a ref costs one mount attempt against an empty name. The grant requires
+positive evidence a guess cannot supply: a name an app claims EXACTLY keeps its
+grant only while its own claimant is readably switched on, and family membership
+never lends a sibling an enabled owner's answer. A name a readable source still
+declares outranks a switched-off app's claim on it, since the rebuild's own ref
+sync would otherwise re-add the pruned per-tool grant as a WHOLE-server one.
 
 **Both outcomes are recorded where an operator can see them.** Revoking a grant
 emits `mcp_auto_approve_revoked` to SEL, the same feed as the withhold above,
@@ -1380,11 +1398,13 @@ entering the model context. See [browser](../system-specs/modules/browser.md).
 `kirocrew-core` is the surface EVERY session carries. kiro-cli reads `tools/list`
 once per session, so a tool listed there spends context in every request of every
 session for as long as the session lives — whether or not that session will ever
-use it. With `agent.tool_search` on (the default) Kiro Crew forces kiro's deferral
-always-on, so the per-request cost is a name plus a description rather than a full
-JSON schema; it is smaller, not zero, and it scales with the tool count.
+use it. `agent.tool_search` is on by default, but **Crew's own servers are exempt
+from its deferral** (see below), so a tool in core costs its FULL JSON schema in
+every request, not a name plus a description.
 
-That makes the placement question a real one rather than a matter of taste:
+That makes the placement question a real one rather than a matter of taste —
+and the exemption is why it is sharper than it looks, since core is the one
+server deferral will never shrink:
 
 - **Core** is for capabilities a session may need *without being asked* —
   subagents, messaging, memory, artifacts, session-bound directives.
@@ -1406,6 +1426,78 @@ gates nothing an unreferenced server was not already denying.
 **Granularity: the set, not the tool.** A spec that references a server gets
 every tool in it. So a capability that must be grantable *separately* belongs in
 a server of its own, not alongside a set someone might want for other reasons.
+
+### Crew's own servers are exempt from Tool Search deferral
+
+`harness._common.apply_mandatory_mcps_env` sets `ASBX_KIRO_MANDATORY_MCPS` on the
+child from `agent.crew_owned_mcp_servers()`, and **both** kiro-family harnesses call
+it from their `apply_spawn_env`. kiro-cli keeps a named server's specs in the model's
+tool list even while deferral is active, so a Crew tool is never loaded mid-turn.
+Third-party servers keep deferring: they hold most of the spec weight and are
+reached rarely.
+
+**The harness hook is the only place both kiro spawn paths meet**, which is why it
+is not done at a call site. A session-serving child is spawned by `AcpRuntime` —
+kiro is in `ACP_BACKENDS_ACP_RUNTIME`, and `_start_kiro_runtime_impl` keeps its
+`AcpClient` for config storage and never spawns it — so an `AcpClient._spawn` hook
+would set the variable on none of the processes a user talks to. The auxiliary
+`AcpClient` kiro children (the knowledge pool, connection minting) run tool-less
+agents, so deferral has nothing to defer for them either way.
+
+**The reason is correctness, not cost.** Loading a deferred spec REWRITES the
+request's `tools` array, and an extended-thinking model's thinking blocks carry a
+signature bound to the array they were minted under. Replaying one across a load
+makes the provider reject the entire request —
+
+> Invalid `signature` in `thinking` block. … The `tools` list differs from the one
+> this block was created with.
+
+— and because the rejection is of the conversation's history, **every later turn
+on that session fails the same way**: the session is bricked, not slowed. Crew's
+own servers are the ones that trigger it, because they are the infrastructure an
+agent reaches for in nearly every session (measured on one heavy install: Crew's
+servers were 82% of all deferred loads and every observed failure, third-party
+servers 2.6%). So deferring them bought little and churned the array constantly.
+
+Three consequences worth knowing:
+
+- **The env var is a THIRD channel**, next to the `cli.json` overlay and the
+  `initialize` handshake (`agent_sdk.tool_search`). kiro-cli reads it from the
+  process environment when it builds the ACP session manager, so it is fixed at
+  spawn and cannot be changed on a live child.
+- **The list is every Crew-owned name, not the emitted ones.**
+  `crew_owned_mcp_servers()` deliberately includes `opt_in` servers, which
+  `emission_eligible_mcp_servers()` drops — a granted `kirocrew-work` serves tools
+  and would otherwise still churn. Naming an absent server matches no tool, so
+  erring wide is free and erring narrow is the defect. It also carries the edition
+  seam's extras, which are contributed by an edition ADAPTER rather than user
+  config, so they are Crew's own servers in the same sense the managed map is; the
+  seam does not constrain its keys, so nothing may assume a `kirocrew-` prefix.
+- **The operator's AMBIENT value wins; a per-session OVERLAY never does.** That is
+  why the hop reads `os.environ` rather than the `env` mapping it is handed, which is
+  already `{**os.environ, **extra_env}`. An ambient value is the operator's own
+  choice and is honoured verbatim, **including an explicit empty one** — the engine
+  reads an empty variable as an absent one, so `ASBX_KIRO_MANDATORY_MCPS=""` is the
+  only way to say "exempt nothing" and take the resident schema cost back off, and
+  truthiness would leave that unexpressible. `extra_env`, by contrast, carries
+  per-session overlays: a cron job's own `env` block reaches it through
+  `cron_job_env_without_reserved`, which passes every key outside
+  `_CRON_RESERVED_ENV_KEYS`, and an app manifest's `crons[].env` can author that.
+  An overlay value is therefore **overwritten**, and **removed** when Crew has no
+  servers to name — an overlay may neither disable the exemption nor invent it.
+  Letting one through would brick that cron's sessions with no code-level recovery,
+  since the variable is fixed at spawn and the next run inherits the same manifest.
+
+**KAS is covered too, because the relay IS kiro-cli.** Crew launches it as
+`kiro-cli acp --agent-engine v3` (`kas_transport.build_kas_argv`) — the same `acp`
+subcommand the kiro path uses — and that subcommand reads the variable
+unconditionally, not gated on `--agent-engine`. KAS is the more exposed of the two:
+it takes Tool Search over the `initialize` wire and defers every MCP spec whenever
+the setting is on, with no token threshold to stay under.
+
+This does not fix the underlying client bug — kiro-cli forwards a signed block
+without checking the tool set it was signed against — it stops Crew from being
+what walks into it.
 
 **A grant is not authority over everything the tools can name.** Assignment says
 which agent may call a set; it does not say what that agent may reach. The
@@ -2059,6 +2151,49 @@ CONTAINED the refusal token, so a stop whose reason quoted that token was filed 
 refusal, skipped both the publish and the vouch, and had its genuine marker defanged
 downstream: the stop was lost. A gate against imitable content cannot itself be
 built on imitable content.
+
+### An `Error:` prose result can also be framed as an MCP error
+
+`build_tool_response` is the single exit point for every tool result, and for a
+long time it emitted only `{"content": [...]}`. That left the `"Error: …"` prefix
+carrying the entire failure signal: `mcp_shared` derives the SEL audit `outcome`
+from it (`failed` when the text starts with the prefix, `completed` otherwise),
+but nothing in the wire frame said so, and a client had to pattern-match prose to
+tell a refusal from an answer. `cron_script.McpToolClient.call_tool` raised
+`RuntimeError` on `result["isError"]` for exactly that reason — against a flag
+nobody set, so a refused cron write read back as a completed one.
+
+`build_tool_response` now takes a keyword-only `is_error`, which adds MCP's
+`"isError": True` to the frame. The prose is untouched: the flag is computed from
+the RAW result text before sanitization, so a refusal is byte-identical whether it
+is flagged or not, and the audit `outcome` derivation does not move.
+
+**The flag is per-server opt-in, not a global.** `run_mcp_stdio_loop` takes
+`error_prefix_is_error`, default off, and every `tools/call` result on that loop —
+the POSIX worker path, the Windows synchronous path, and the two tool-policy
+refusals (unresolved policy, excluded tool) — goes through one nested
+`_tool_response` helper so a server cannot be half-converted. `kirocrew-cron` is
+the only server that sets it. The other servers keep their frames unflagged
+deliberately: each has in-tree callers and model-facing prompts that read
+`"Error: …"` prose on purpose, so flipping them together would change what those
+callers see.
+
+A server that opts in owes its failure answers the prefix, and the audit half
+already held it to that: an answer without the prefix is filed `completed`. The
+sharp edge is a REFUSED durable write, because its answer sits one line below the
+committed one: a cron mutation whose store call comes back falsey — the row the
+ownership gate just saw is gone, a concurrent delete between check and write —
+frames beside `"Removed job: <id>"`, so an unprefixed answer there reads as a
+completed delete. All four such returns (`cron_update`, `cron_remove`,
+`cron_pause`, `cron_resume`) are `"Error: job not found: <id>"`, which is what
+`AUTOSDE.yaml`'s `a-refusal-is-not-a-commit` requires. Naming the row there leaks nothing: the gate
+has already proved this caller owns it, which is why `_not_found`'s
+anti-enumeration wording is deliberately NOT reused post-gate.
+
+Cron's `"Unknown tool: …"` fall-through is the apparent second exception and is not
+one — `_call_tool` rejects an unknown name at its argument validation, ahead of
+that return, with prose that does carry the prefix, so the unreachable string needs
+no marker.
 
 **A directive tool's result either carries the marker, or it is a tagged
 refusal — nothing in between.** The consumer cannot otherwise tell a decline from

@@ -418,7 +418,7 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
     await save_slot_off_loop(state, slot, force=True, best_effort=False)
 
     if message.msg_type == "mention":
-        if message.delivery == "interrupt" and slot.running and not slot._in_stage_execution:
+        if message.delivery == "interrupt" and slot.turn_running and not slot._in_stage_execution:
             client = slot._acp_client
             if client is not None and getattr(client, "supports_steer", False):
                 interrupt_text = _peer_interrupt_text(channel, message, content)

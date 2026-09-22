@@ -56,7 +56,15 @@ from kiro_crew.dashboard.chat_folders import (
     _resolve_folder_project_dir,
     _unhide_folder,
 )
-from kiro_crew.dashboard.chat_orchestrator import _stage_loop
+from kiro_crew.dashboard.chat_orchestrator import (
+    _cancel_stage_subagents,
+    _capture_stage_cancellation_scope,
+    _queue_consumed_stage_resume,
+    _release_cancelled_plan_boundary,
+    _reserve_stage_cancellation_scopes,
+    _settle_discarded_stage_deliveries,
+    _stage_loop,
+)
 from kiro_crew.dashboard.chat_persistence import (
     _FLUSH_SNAPSHOT_RETRIES,
     _TRANSIENT_ROLES,
@@ -104,7 +112,6 @@ from kiro_crew.dashboard.chat_utils import (
     _redact_meta_for_role,
     _remove_queued_by_id,
     _sync_dashboard_slots,
-    chat_done_payload,
     drained_to_thread,
     effective_session_key,
     history_corpus_unreadable,
@@ -150,20 +157,20 @@ from kiro_crew.dashboard.state import (
     _mark_permission_resolved,
     _normalize_slot_key,
     _slots_serialization_note,
-    append_and_surface,
     chat_message_frame,
     durable_row_count,
     is_stop_event_row,
     is_turn_interrupted,
     parse_cls_meta,
     request_slot_origin,
+    stage_boundary_for,
 )
 from kiro_crew.dashboard.system_notices import SESSION_RELOAD_KIND, is_system_notice
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
 from kiro_crew.history import carry_provenance, is_incognito_transcript, transcript_stems
 from kiro_crew.llm_helpers import pick_epoch_host, slot_switch_session_lock
 from kiro_crew.memory_startup import MemoryStartupUnavailable, wait_for_memory_preparation
-from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.messaging.link import canonical_key, is_channel_session_key
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.base import LLMProvider
 from kiro_crew.safety_override import (
@@ -772,7 +779,28 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             {"error": "message is required", "code": "message_required"}, status=400
         )
 
-    if slot.running or slot._in_stage_execution:
+    _pending_control_text = message.strip().lower()
+    _pending_control_words = _pending_control_text.split()
+    _widget_origin = user_meta is not None and user_meta.get("origin") == "widget"
+    _stop_words = {"stop", "cancel", "abort"}
+    _orchestrator_mode = getattr(slot, "mode", "") == "orchestrator"
+    _is_go = _pending_control_text in ("go", "go all")
+    _is_go_all = _pending_control_text == "go all"
+    tracker = slot._orch_tracker
+    _pending_escalated_stop = bool(
+        tracker is not None
+        and tracker.has_escalated
+        and not tracker.stopped
+        and _pending_control_words
+        and _pending_control_words[0] in _stop_words
+    )
+    _pending_stage_control = _orchestrator_mode and (
+        (_is_go and not _widget_origin) or _pending_escalated_stop
+    )
+    _pending_stage_boundary = (
+        stage_boundary_for(slot).stage is not None and not _pending_stage_control
+    )
+    if slot.turn_running or slot._in_stage_execution or _pending_stage_boundary:
         # Mid-turn steer: inject into the RUNNING turn instead of queueing for
         # the next turn. Gated on an explicit `steer` flag + a live, steer-capable
         # inner AcpClient that _run_chat published on the slot. App-authenticated
@@ -1195,13 +1223,10 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     # approvals live on separate endpoints a widget iframe cannot reach.
     # `is not None` (not truthiness): user_meta is normalized to dict-or-None
     # above, and with the body typed by read_bounded_json, mypy narrows the
-    # Optional only through an explicit None check.
-    _widget_origin = user_meta is not None and user_meta.get("origin") == "widget"
-    if (
-        getattr(slot, "mode", "") == "orchestrator"
-        and message.strip().lower() in ("go", "go all")
-        and _widget_origin
-    ):
+    # Optional only through an explicit None check. `_widget_origin` is computed
+    # before pending-stage admission so rejected control text cannot bypass that
+    # boundary and fall through as an ordinary turn.
+    if _orchestrator_mode and _is_go and _widget_origin:
         sel().log(
             SecurityEvent(
                 event_id=uuid.uuid4().hex,
@@ -1220,11 +1245,8 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             "Refused orchestrator auto-run escalation for widget-origin turn on slot %s",
             slot.key,
         )
-    elif getattr(slot, "mode", "") == "orchestrator" and message.strip().lower() in (
-        "go",
-        "go all",
-    ):
-        _is_auto = message.strip().lower() == "go all"
+    elif _orchestrator_mode and _is_go:
+        _is_auto = _is_go_all
         if _is_auto:
             slot._auto_run = True
             logger.info("Auto-run enabled for slot %s", slot.key)
@@ -1255,12 +1277,21 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             )
         )
         # Use Python-controlled stage loop instead of _run_chat
+        if stage_boundary_for(slot).stage is not None:
+            _queue_consumed_stage_resume(
+                state,
+                slot,
+                directive_user_origin=not bool(request.get("app", "")),
+            )
+            slot._last_turn_auth_required = False
         task = asyncio.create_task(
             _stage_loop(state, slot, auto_run=_is_auto),
             name=f"dashboard-stage:{slot.key}",
         )
+        slot.track_stage_controller(task)
         slot.task = task
-        slot._recovery_retrigger_count = 0
+        # S4: one accepted Go resets the recovery budget shared by its stages.
+        stage_boundary_for(slot).recovery_retrigger_count = 0
         state._background_tasks.add(task)
         task.add_done_callback(state._background_tasks.discard)
         state.push_slots_update()
@@ -1268,33 +1299,30 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         return web.json_response({"ok": True, "slot": slot.key})
 
     # ── Orchestrator stop detection ─────────────────────────────────
-    _stop_words = {"stop", "cancel", "abort"}
-    tracker = slot._orch_tracker
-    if (
-        tracker is not None
-        and tracker.has_escalated
-        and not tracker.stopped
-        and message.strip().lower().split()[0] in _stop_words
-    ):
+    if _pending_escalated_stop and tracker is not None:
         tracker.stop()
         # Same latch as the plan-action Cancel handler: tracker.stopped
         # alone does not survive the Slack gateway lazily re-creating a fresh
         # unstopped tracker on this slot, so without the latch a later Go could
         # resurrect a plan the user stopped by word. One revocation semantics
         # across both cancel surfaces.
+        scope = _capture_stage_cancellation_scope(slot)
         slot._plan_cancelled = True
         slot._auto_run = False
-        # Cancel running agents for this slot
-        if state.subagents:
-            session_key = f"dashboard:{slot.key}"
-            mgr = state.subagents
-            for a in mgr.running_agents_for(session_key):
-                t = mgr._tasks.get(a["id"])
-                if t and not t.done():
-                    t.cancel()
-        stop_msg = "🛑 [SYSTEM] Orchestration stopped by user."
-        append_and_surface(state, slot, "assistant", stop_msg, "msg msg-a")
-        state.broadcast_ws("chat_done", await chat_done_payload(state, slot))
+        reservation_reason = _reserve_stage_cancellation_scopes(state, scope)
+        await _cancel_stage_controller(slot)
+        release_boundary = await _cancel_stage_subagents(
+            state,
+            slot,
+            scope=scope,
+            reservation_reason=reservation_reason,
+        )
+        if release_boundary:
+            await _release_cancelled_plan_boundary(
+                state,
+                slot,
+                terminal_message="🛑 [SYSTEM] Orchestration stopped by user.",
+            )
         return web.json_response({"ok": True, "stopped": True})
 
     # ── Reset rounds after user guidance (not a stop) ───────────────
@@ -1314,6 +1342,9 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     # 60-char provisional stays as the fallback if the LLM SKIPs or errors.
     if not slot._titled and not slot._title_in_flight:
         _tt = asyncio.create_task(_maybe_auto_title(state, slot))
+        # Expose the handle so chat_done's chained title→refresh pass can wait
+        # for this attempt to settle (see _title_then_refresh in chat_runner).
+        slot._title_task = _tt
         state._background_tasks.add(_tt)
         _tt.add_done_callback(state._background_tasks.discard)
 
@@ -1394,7 +1425,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         ),
     )
     slot.task = task
-    slot._recovery_retrigger_count = 0
+    stage_boundary_for(slot).recovery_retrigger_count = 0
     state.push_slots_update()
 
     if ws_mode:
@@ -1481,6 +1512,23 @@ async def api_chat_slots(request: web.Request) -> web.Response:
     payloads = state.serialize_slots(
         include_check_status=include_check_status, dashboard_user=is_dashboard_user
     )
+    # A crew-member caller admitted here (the chat gate stamped its verified
+    # principal) sees ONLY the sessions it owns or created -- the same set the
+    # folder tree read shows it -- so admitting the session list for its folder
+    # tools to resolve its own slot does not turn the list into an enumeration
+    # of the person's and other agents' sessions. The person and app callers get
+    # the full, unchanged response (an app row is already app-scoped downstream).
+    from kiro_crew.dashboard.token_auth import MEMBER_CHAT_PRINCIPAL_KEY
+
+    if str(request.get(MEMBER_CHAT_PRINCIPAL_KEY) or "").startswith("member:"):
+        from kiro_crew.dashboard.session_control import member_owns_slot
+
+        caller_key = request.headers.get("X-Session-Key", "").strip()
+        payloads = [
+            p
+            for p in payloads
+            if member_owns_slot(state, state._slots.get(str(p.get("key") or "")), caller_key)
+        ]
     if include_check_status:
         # Only the OWNER's GET drives provider work. Both the visibility probe
         # and the status refresh run the operator's `gh`/`glab` credentials, so
@@ -4587,6 +4635,21 @@ def _app_cancel_denied(
     return _slot_not_found()
 
 
+async def _cancel_stage_controller(slot: "_ChatSlot") -> None:
+    """Cancel and boundedly join the outer Autopilot controller, if live."""
+    controller = getattr(slot, "_stage_controller_task", None)
+    if controller is None or controller is asyncio.current_task() or controller.done():
+        return
+    controller.cancel()
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(controller, return_exceptions=True),
+            timeout=2.0,
+        )
+    except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+        pass
+
+
 async def stop_slot_turn(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -4659,11 +4722,17 @@ async def stop_slot_turn(
     # timeout retry. A withheld escalation falls into the no-op branch below.
     if escalate and slot._stop_state == "soft_pending":
         slot._stop_state = "killing"
+        stage_boundary_for(slot).preserve_stop_generation = -1
         # Survives turn teardown, which resets _stop_state to "idle". Without
         # it a cooperative ack from the first press could still land and label
         # this hard kill a clean stop. Scoped to this card so it cannot defer
         # a later card's ack.
         slot._stop_escalated_card_id = slot._stop_event_id
+        await _settle_discarded_stage_deliveries(
+            state,
+            slot,
+            [str(entry.get("content", "")) for entry in slot._queue],
+        )
         slot._queue.clear()
         # Hard kill = "discard everything": drop unconsumed steers too, so the
         # end-of-turn requeue (chat_runner finally) has nothing to resurrect.
@@ -4701,13 +4770,8 @@ async def stop_slot_turn(
         # reports success and cancels nothing. The SEL record below stays on the
         # slot-derived key, which identifies the tab the operator pressed.
         await state.sessions.stop_turn(cancel_key, force=True, on_hard=_on_hard_force)
-        if task_at_stop is not None and task_at_stop is not asyncio.current_task():
-            if not task_at_stop.done():
-                task_at_stop.cancel()
-                try:
-                    await asyncio.wait_for(asyncio.shield(task_at_stop), timeout=2.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                    pass
+        await _cancel_terminal_stop_task(task_at_stop)
+        await _cancel_stage_controller(slot)
         sel().log_tool_invocation(
             session_key=_history_key_for(name),
             agent=getattr(slot, "agent", "") or "kirocrew",
@@ -4788,6 +4852,7 @@ async def stop_slot_turn(
     # pending ask_question card.
     _unblock_pending_waits(state, slot)
 
+    stage_boundary_for(slot).preserve_stop_generation = slot._stop_generation
     outcome = await state.sessions.stop_turn(
         cancel_key,
         force=False,
@@ -4800,6 +4865,7 @@ async def stop_slot_turn(
     # this slot while the provider stop was in flight.
     if outcome in {"hard", "idle"}:
         await _cancel_terminal_stop_task(task_at_stop)
+    await _cancel_stage_controller(slot)
     # Resolve orphaned card when provider reports no active turn
     if outcome == "idle":
         if slot._stop_event_id:
@@ -5310,7 +5376,7 @@ async def preempt_slot_for_channel_interrupt(state: DashboardState, slot: _ChatS
     the same cooperative cancellation lifecycle as the dashboard interrupt
     route, so the runner drains the already-promoted peer card on completion.
     """
-    if not slot.running or slot._stop_state != "idle":
+    if not slot.turn_running or slot._stop_state != "idle":
         return "queued"
 
     task_at_stop = slot.task
@@ -5967,6 +6033,29 @@ async def _close_slot(
     from kiro_crew.execution_context import read_live_session_execution
 
     closing_key = effective_session_key(slot)
+    closing_boundary = stage_boundary_for(slot)
+    closing_failure_parents = {
+        f"dashboard:{slot.key}",
+        closing_key,
+        *closing_boundary.parent_session_keys,
+    }
+    failure_scope_manager = getattr(state, "subagents", None)
+    closing_boundary_owner = closing_boundary.owner or closing_boundary.generation
+    closing_failure_scopes = (
+        tuple((parent, closing_boundary_owner) for parent in closing_failure_parents if parent)
+        if closing_boundary_owner
+        else ()
+    )
+
+    def discard_closing_failure_scopes() -> None:
+        discard_failure_scopes = getattr(
+            failure_scope_manager,
+            "discard_report_failure_scopes",
+            None,
+        )
+        if callable(discard_failure_scopes):
+            discard_failure_scopes(closing_failure_scopes)
+
     closing_execution = read_live_session_execution(closing_key)
     # Retire the auto-nudge loop BEFORE the awaits below, so no nudge can expire
     # into the session being closed and resurrect it. See
@@ -6100,10 +6189,19 @@ async def _close_slot(
     # was claimed), while a cancel landing mid-removal would interrupt
     # provider.shutdown() after the registry entry was already popped and
     # leak the process holding kiro-cli's native session lock.
-    if slot.running and slot.task is not None:
-        slot.task.cancel()
+    _teardown_tasks = {
+        task
+        for task in (slot.task, slot._stage_controller_task)
+        if task is not None and not task.done()
+    }
+    if _teardown_tasks:
+        for task in _teardown_tasks:
+            task.cancel()
         try:
-            await asyncio.wait_for(asyncio.shield(slot.task), timeout=2.0)
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(*_teardown_tasks, return_exceptions=True)),
+                timeout=2.0,
+            )
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
     # Post-pop teardown race: across the awaits above (and the app-notify awaits
@@ -6160,6 +6258,7 @@ async def _close_slot(
         _resettle_restricted_key(state, name)
         _sync_dashboard_slots(state)
         state.push_slots_update()
+        discard_closing_failure_scopes()
         if slot._app:
             # Same decision the failure arm below takes, and it must be as visible:
             # this is the MORE common hand-over, so a silent one would hide every
@@ -6209,6 +6308,7 @@ async def _close_slot(
             # arm already ends in `SlotCloseError`, so a lost tail is reported to the
             # caller either way. The drain only decides whether the rows survived.
             await _persist_handover_tail(state, name, slot)
+            discard_closing_failure_scopes()
         # Whichever way that went, the key-scoped restricted marker has to describe
         # whoever holds `name` when this frame ends — the restored original, or the
         # replacement that kept the key. This arm never reaches the discard below
@@ -6269,6 +6369,7 @@ async def _close_slot(
         # Durable, so no rollback can retract this frame — a client pruning its
         # per-slot cards on it can never be pruning a slot that comes back.
         state.push_slots_update()
+        discard_closing_failure_scopes()
     # The app was already told, and compensated if the persist above failed — see
     # the notify block before the pop and the rollback in the except branch.
     # Kill the per-tab session to free resources. Re-check identity ONE more
@@ -6930,6 +7031,68 @@ def _slot_replaced_while_queued(
     return True
 
 
+def _switch_target_busy(
+    state: DashboardState, slot: _ChatSlot, session_key: str, provider: object
+) -> bool:
+    """Whether a turn is in flight on *session_key* -- the switch handlers' pre-commit refusal.
+
+    Every switch handler that resets the live session (agent, model, bulk
+    model, reasoning effort, workspace) refuses BEFORE it commits so nothing
+    needs rolling back. The refusal reads three signals, and each one sees a
+    window the others miss:
+
+    * ``slot.running`` -- set at dispatch, BEFORE the multi-second
+      ``provider.start()`` registers a session, so a cold-starting first
+      turn dispatched through THIS slot is visible here and nowhere else.
+    * ``provider.has_active_turn()`` -- the registered provider's own view,
+      which also sees a channel-linked turn that runs under the shared key
+      without ever setting this slot's ``task``. *provider* is whatever
+      ``state.sessions.get_provider(session_key)`` answered the caller just
+      before this call (the caller reads it once and may need it afterwards).
+      ``isinstance``, not a None check: the base class documents that
+      caller-side guards defend against test doubles that are not
+      ``LLMProvider`` instances, and the base default is False so no real
+      provider is missed.
+    * every OTHER running slot's turn key -- ``_cancel_target`` of each
+      slot whose ``task`` is live: the identity its in-flight turn published
+      (``_active_turn_session_key``), falling back to its routing when the
+      turn has not published yet; compared after ``canonical_key`` so a
+      legacy bare Slack key and its ``slack:`` sibling name one session. Two alias slots can drive ONE session (a
+      channel-linked slot and its dashboard twin), and a switch issued
+      through alias A while alias B is cold-starting sees neither of the
+      first two signals: A's ``running`` is False and B's provider is not
+      registered yet. Without this scan the switch commits, resets nothing,
+      and reports success while the session comes up on B's captured (old)
+      bindings -- the header advertises one agent/model/workspace and the
+      live process runs another. The TURN key, not the routing: a rebind
+      landing on B mid-turn (a cron injection takes no ``running`` gate)
+      moves B's routing off the shared session while its turn still runs
+      there, and a scan of routings would drop B from the set exactly when
+      its turn is what the reset would tear down.
+
+    Call it INSIDE the switch locks, with the *session_key* resolved there
+    (the value the probe and the reset act on). Callers keep the atomic
+    ``skip_if_busy`` decline in ``SessionManager.reset`` as the backstop for
+    a turn that starts after this read: message dispatch takes none of the
+    switch locks, so this is a fast path, not the authority.
+    """
+    if slot.running:
+        return True
+    if isinstance(provider, LLMProvider) and provider.has_active_turn():
+        return True
+    # list(): the scan is read-only and message dispatch may register a slot
+    # while it runs (the same snapshot every other slot-table scan takes).
+    # Compared in CANONICAL spelling: a slot restored from an old transcript
+    # can carry the bare legacy Slack ``thread_ts`` while its sibling carries
+    # ``slack:<thread_ts>``; SessionManager folds both onto one session, so
+    # the comparison must too (``slot_switch_session_lock`` keys the same way).
+    target = canonical_key(session_key)
+    return any(
+        other.running and canonical_key(_cancel_target(other)) == target
+        for other in list(state._slots.values())
+    )
+
+
 async def api_chat_slot_agent(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/agent — set agent for a chat slot."""
     state: DashboardState = request.app["state"]
@@ -7084,16 +7247,12 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # and the _cancel_target subtlety): a RUNNING turn owns a captured
         # identity because ``linked_session_key`` is mutable, so the key
         # resolved above may not be the turn's — tearing it down would kill
-        # the wrong session (or the streaming turn itself). slot.running is
-        # checked first because it is set at dispatch, BEFORE provider.start()
-        # registers a session, so a cold-starting first turn is invisible to
-        # get_provider but not to slot.running. A 409 is retryable once the
-        # turn completes. Checked BEFORE the commit below, so nothing needs
-        # rolling back.
+        # the wrong session (or the streaming turn itself). The three signals
+        # and why each is needed live on _switch_target_busy. A 409 is
+        # retryable once the turn completes. Checked BEFORE the commit below,
+        # so nothing needs rolling back.
         busy_provider = state.sessions.get_provider(session_key)
-        if slot.running or (
-            isinstance(busy_provider, LLMProvider) and busy_provider.has_active_turn()
-        ):
+        if _switch_target_busy(state, slot, session_key, busy_provider):
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
             )
@@ -7437,19 +7596,6 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 status=409,
             )
 
-        # Last-instant re-probe in a NO-AWAIT window before the teardown (the
-        # model template's rule at its own reset site): the pre-commit check
-        # above is separated from this point by the resolution warm-up await,
-        # so a turn — a channel message on the linked session in particular —
-        # may have started since it ran. Message dispatch does not take
-        # slot._lock, so this fast path plus the atomic skip_if_busy decline
-        # below are what keep the teardown off a streaming turn.
-        recheck = state.sessions.get_provider(session_key)
-        if slot.running or (isinstance(recheck, LLMProvider) and recheck.has_active_turn()):
-            _rollback_switch()
-            return web.json_response(
-                {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
-            )
         # Children guard, shared with reload/model: the reset tears down the
         # runtime attached sub-agents run on, so a parent that is idle but
         # still has children must refuse rather than discard their work.
@@ -7457,6 +7603,22 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         if children_409 is not None:
             _rollback_switch()
             return children_409
+        # Last-instant re-probe in a NO-AWAIT window before the teardown (the
+        # model template's rule at its own reset site): the pre-commit check
+        # above is separated from this point by the resolution warm-up and
+        # the children probe awaits, so a turn — a channel message on the
+        # linked session, or a sibling alias cold-starting on it — may have
+        # started since it ran. Same predicate as the pre-commit check
+        # (_switch_target_busy), so the sibling window it closes there is
+        # closed here too. Message dispatch does not take slot._lock, so this
+        # fast path plus the atomic skip_if_busy decline below are what keep
+        # the teardown off a streaming turn.
+        recheck = state.sessions.get_provider(session_key)
+        if _switch_target_busy(state, slot, session_key, recheck):
+            _rollback_switch()
+            return web.json_response(
+                {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+            )
         teardown_incomplete = False
         reset_ok = True
         # The switch is COMMITTED already (slot.agent above), so a POST-POP
@@ -8253,25 +8415,20 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             state.push_slots_update()
             return web.json_response({"ok": True, "model": model_name, "jev_route": jev_route})
         provider = state.sessions.get_provider(session_key)
-        if slot.running or (isinstance(provider, LLMProvider) and provider.has_active_turn()):
+        if _switch_target_busy(state, slot, session_key, provider):
             # Never tear down an in-flight turn: _try_live_model_switch
             # declines a mid-turn live switch, so falling through would take
             # the reset fallback and kill the streaming turn for any
             # programmatic caller (the UI disables the picker mid-turn, but
             # the API has no such guard). Answer busy instead — same policy
             # as the effort handler's defer-not-reset branch and the bulk
-            # handler's skip_running default. slot.running is checked FIRST
-            # because it is set at dispatch, BEFORE the multi-second
-            # provider.start() registers a session — a cold-starting first
-            # turn is invisible to get_provider but not to slot.running
-            # (api_chat's own busy gate uses the same signal). The refusal
-            # applies to EVERY provider class with an active turn, not only
-            # the ACP one that could have gone live: the reset fallback below
-            # tears down the in-flight turn regardless of provider type, and
-            # a 409 is retryable once the turn completes. isinstance, not a
-            # None check: the base class documents that caller-side guards
-            # defend against test doubles that are not LLMProvider instances,
-            # and the base default is False so no real provider is missed.
+            # handler's skip_running default. The refusal applies to EVERY
+            # provider class with an active turn, not only the ACP one that
+            # could have gone live: the reset fallback below tears down the
+            # in-flight turn regardless of provider type, and a 409 is
+            # retryable once the turn completes. The signals it reads, and
+            # the sibling-alias window only the third one covers, are on the
+            # helper.
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
             )
@@ -8401,8 +8558,24 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             # entering it busy would falsely reject that turn's cards even
             # though the reset itself declines. Busy here → roll back and
             # answer the same 409 the pre-check gives.
+            # Children guard, shared with reload/continue: the reset tears
+            # down the runtime attached sub-agents run on, so a parent that is
+            # idle but still has children (running, queued, or with a
+            # completion event in flight) must refuse rather than discard
+            # their work. Same probe block as api_chat_slot_reload; only the
+            # rollback is added here because this handler committed first.
+            children_409 = await _subagents_attached_response(
+                state, slot, session_key, "slot_model"
+            )
+            if children_409 is not None:
+                _rollback_pick()
+                return children_409
+            # Probed AFTER the children await, so this is the NO-AWAIT window
+            # the reset needs; same predicate as the pre-check
+            # (_switch_target_busy), so a sibling alias that began
+            # cold-starting during either await is refused here too.
             recheck = state.sessions.get_provider(session_key)
-            if slot.running or (isinstance(recheck, LLMProvider) and recheck.has_active_turn()):
+            if _switch_target_busy(state, slot, session_key, recheck):
                 if _live_serves_target(recheck):
                     # The turn that slipped in runs on a session that already
                     # serves the target (set_model landed before the effort
@@ -8425,18 +8598,6 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
                 return web.json_response(
                     {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
                 )
-            # Children guard, shared with reload/continue: the reset tears
-            # down the runtime attached sub-agents run on, so a parent that is
-            # idle but still has children (running, queued, or with a
-            # completion event in flight) must refuse rather than discard
-            # their work. Same probe block as api_chat_slot_reload; only the
-            # rollback is added here because this handler committed first.
-            children_409 = await _subagents_attached_response(
-                state, slot, session_key, "slot_model"
-            )
-            if children_409 is not None:
-                _rollback_pick()
-                return children_409
             logger.info(
                 "Slot %s model switched to %r, resetting session", name, model_name or "auto"
             )
@@ -8929,27 +9090,30 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
                     routing_cleared = True
                 unchanged.append(name)
                 continue
-            if skip_running and slot.running:
-                skipped_running.append(name)
-                continue
-            # Last-instant busy re-check on the EFFECTIVE session, same as the
-            # single-slot handler: slot.running only sees turns dispatched
-            # through this slot's task, and a channel-linked slot's turn runs
-            # under its linked key without setting it. _reset_slot_session
-            # clears pending waits BEFORE its atomic decline (its docstring's
-            # safety argument assumes a caller-side busy check microseconds
-            # old), so entering it against a live linked turn would reject
-            # that turn's cards even though the reset itself declines.
-            live_now = state.sessions.get_provider(session_key)
-            if skip_running and isinstance(live_now, LLMProvider) and live_now.has_active_turn():
-                skipped_running.append(name)
-                continue
             # Children guard (api_chat_slot_reload's): the reset tears down the
             # runtime attached sub-agents run on, so a parent with children
             # running, queued, or mid-delivery is skipped rather than have
             # their work discarded — regardless of skip_running, which speaks
             # to the parent's own turn, not to its children.
             if await subagents_attached_async(state, slot, session_key, "slots_model"):
+                skipped_running.append(name)
+                continue
+            # Busy check on the EFFECTIVE session, same predicate as the
+            # single-slot handler (_switch_target_busy): slot.running only
+            # sees turns dispatched through this slot's task; a
+            # channel-linked slot's turn runs under its linked key without
+            # setting it, and a sibling alias cold-starting on the shared
+            # session has set neither. Probed AFTER the children await: the
+            # reset below is the next thing this iteration does, so this is
+            # the no-await window. _reset_slot_session clears pending waits
+            # BEFORE its atomic decline (its docstring's safety argument
+            # assumes a caller-side busy check microseconds old), so entering
+            # it against a live linked turn would reject that turn's cards
+            # even though the reset itself declines. Gated on skip_running
+            # like the atomic decline below: a caller that asked to switch
+            # running slots gets the reset regardless.
+            live_now = state.sessions.get_provider(session_key)
+            if skip_running and _switch_target_busy(state, slot, session_key, live_now):
                 skipped_running.append(name)
                 continue
             # Reset before flipping the model and isolate per-slot failures: if
@@ -9236,17 +9400,6 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             # Never tear down an in-flight turn (the model handler's policy,
             # and the _cancel_target subtlety: a RUNNING turn owns a captured
             # identity, so the key resolved above may not be the turn's).
-            # Re-probed here because the change_effort awaits above yielded
-            # the event loop; slot.running is checked first because a
-            # cold-starting first turn is invisible to get_provider. The
-            # effort-capable live provider's active turn never reaches this —
-            # the defer branch above already returned for it. A 409 is
-            # retryable once the turn completes; nothing is committed yet.
-            recheck = state.sessions.get_provider(session_key)
-            if slot.running or (isinstance(recheck, LLMProvider) and recheck.has_active_turn()):
-                return web.json_response(
-                    {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
-                )
             # Children guard, shared with reload/model: the reset tears down
             # the runtime attached sub-agents run on. Nothing is committed
             # yet, so a refusal here changes nothing.
@@ -9255,6 +9408,17 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             )
             if children_409 is not None:
                 return children_409
+            # Probed AFTER the change_effort and children awaits above, in
+            # the NO-AWAIT window before the commit and reset below; the
+            # signals and the sibling-alias window are on _switch_target_busy.
+            # The effort-capable live provider's active turn never reaches
+            # this — the defer branch above already returned for it. A 409 is
+            # retryable once the turn completes; nothing is committed yet.
+            recheck = state.sessions.get_provider(session_key)
+            if _switch_target_busy(state, slot, session_key, recheck):
+                return web.json_response(
+                    {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+                )
             # No live session (or live update failed): reset so the next cold
             # start picks up the new effort via the provider factory/overlay.
             # The effort is committed BEFORE the reset: a message send landing
@@ -9662,22 +9826,17 @@ async def api_chat_slot_workspace(request: web.Request) -> web.Response:
         if children_409 is not None:
             return children_409
         # Never tear down an in-flight turn: the model handler's early
-        # refusal, copied here. The reset
+        # refusal, shared through _switch_target_busy. The reset
         # below calls _unblock_pending_waits BEFORE SessionManager.reset's
         # atomic busy decline, so without this check a turn parked on a
         # pending approval has that approval rejected and only then gets a
-        # 409 -- the turn is altered despite the refusal. slot.running is
-        # checked FIRST because it is set at dispatch, before the multi-second
-        # provider.start() registers a session: a cold-starting first turn is
-        # invisible to get_provider but not to slot.running, and without this
-        # the switch would report success while that turn runs on the old
-        # project. isinstance, not a None check, for the reason the model
-        # handler documents. The atomic skip_if_busy decline stays as the
-        # backstop for a turn that starts after this read.
+        # 409 -- the turn is altered despite the refusal; and without the
+        # helper's third signal a switch through this slot while a sibling
+        # alias cold-starts would report success while that turn runs on the
+        # old project. The atomic skip_if_busy decline stays as the backstop
+        # for a turn that starts after this read.
         pre_provider = state.sessions.get_provider(session_key)
-        if slot.running or (
-            isinstance(pre_provider, LLMProvider) and pre_provider.has_active_turn()
-        ):
+        if _switch_target_busy(state, slot, session_key, pre_provider):
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
             )
