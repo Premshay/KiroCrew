@@ -15,6 +15,7 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers._shared import _read_session_key, requesting_slot_project
 from kiro_crew.dashboard.handlers.agents import (
     _agent_roster_row,
+    _agent_runtime_policy,
     _name_would_be_masked,
     _roster_mask,
 )
@@ -102,6 +103,16 @@ async def api_agent_catalog(request: web.Request) -> web.Response:
     for name, member in config.agents.items():
         row = _agent_roster_row(name, "global", member, redact=redact)
         row["selection_kind"] = "member"
+        # The companion's engine-map policy rides every member row, as the
+        # pre-merge catalog did: the picker treats
+        # ``runtime_policy.model == "selectable"`` as the gate for per-agent
+        # model discovery, and a row without the field falls back to the
+        # shared global list of the configured default backend.
+        policy = _agent_runtime_policy(
+            request, name, getattr(member, "kiro_agent", None) or name
+        )
+        if policy is not None:
+            row["runtime_policy"] = policy
         rows.append(row)
     rows.extend(_template_row(agent) for agent in templates)
     return web.json_response(
