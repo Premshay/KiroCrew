@@ -26,6 +26,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_DEEPSEEK,
 )
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.providers.mirrors import claude_code as claude_mirror
 from kiro_crew.providers.mirrors import registry as mirrors_registry
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
@@ -1544,3 +1545,42 @@ class TestLocalSettingsSeed:
         client = self._client(tmp_path)
         del client._claude_settings_authored
         client._reset_state()  # must not raise
+
+
+def _env_pairs(entries: list[dict]) -> dict[str, str]:
+    """One element's ACP ``env`` array as a name -> value mapping."""
+    (entry,) = entries
+    return {pair["name"]: pair["value"] for pair in entry["env"]}
+
+
+class TestSessionCapabilityElementCarriesTheSignedToken:
+    """The session capability element identifies the session by TOKEN, not by key.
+
+    The gateway's tool-policy read attests on a token and refuses as
+    ``identity_unattested`` without one. The host spawns this server itself, so the
+    element's ``env`` array is the only channel that token can arrive on. The
+    pooled broker stubs and the member-dispatch server already attach it; this
+    element carried only ``KIROCREW_SESSION_KEY``, which refused every Crew tool
+    call in every session with a signed-token gate on the gateway.
+    """
+
+    def _client(self, token: str = "t" * 64):
+        client = AcpClient.__new__(AcpClient)
+        # Not a tool-free consolidation agent, or the array is empty by design.
+        client._agent = "kirocrew-lite"
+        client._session_key = "dashboard:chat-1"
+        client._stub_session_token = token
+        return client
+
+    def test_the_element_carries_the_signed_token(self):
+        env = _env_pairs(AcpClient._session_capability_mcp_servers(self._client()))
+        assert env[STUB_SESSION_TOKEN_ENV] == "t" * 64
+
+    def test_the_env_key_rides_beside_the_token(self):
+        """Neither replaces the other: the key survives a token-less install."""
+        env = _env_pairs(AcpClient._session_capability_mcp_servers(self._client()))
+        assert env["KIROCREW_SESSION_KEY"] == "dashboard:chat-1"
+
+    def test_an_unmintable_token_leaves_the_element_unchanged(self):
+        env = _env_pairs(AcpClient._session_capability_mcp_servers(self._client(token="")))
+        assert STUB_SESSION_TOKEN_ENV not in env
