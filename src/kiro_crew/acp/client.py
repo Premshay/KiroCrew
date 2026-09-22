@@ -5599,10 +5599,19 @@ class AcpClient:
         return [] if self.backend in MIRRORS else self._pooled_broker_stubs()
 
     def _session_capability_mcp_servers(self) -> list[dict[str, Any]]:
-        """Session-bound MCP capabilities available to every ACP backend."""
+        """Session-bound MCP capabilities available to every ACP backend.
+
+        The entry carries the signed session token, not only the env key: the
+        host spawns this server itself, so the element's ``env`` is the only
+        channel the attestation can arrive on, and the gateway refuses the
+        tool-policy read without it (``identity_unattested``). The same carriage
+        the pooled broker stubs and the member-dispatch server already apply.
+        """
         if self._agent in _TOOL_FREE_CONSOLIDATION_AGENTS:
             return []
-        return session_capability_servers(self._session_key)
+        return attach_stub_session_token(
+            session_capability_servers(self._session_key), self._stub_session_token
+        )
 
     def _resolve_session_mcp_servers(self) -> list[dict[str, Any]]:
         """Translate the agent spec into this session's ``mcpServers`` array.
