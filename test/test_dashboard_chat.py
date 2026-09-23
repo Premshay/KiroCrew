@@ -5362,6 +5362,113 @@ class TestClaudeIdleEvent:
 
         assert slot.messages[-1]["meta"]["between_turn"] is True
 
+    @pytest.mark.asyncio
+    async def test_idle_text_surfaces_when_reader_attached(self, tmp_path, monkeypatch):
+        """A stranded reader flag must not freeze between-turn prose as invisible."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.providers.base import EVENT_TEXT_CHUNK, LLMEvent
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(chat_runner, "save_slot_off_loop", AsyncMock())
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.broadcast_ws = MagicMock()
+        slot = state.get_or_create_slot("s1")
+        slot._has_reader = True
+
+        await chat_runner._render_claude_idle_event(
+            state,
+            slot,
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="status update"),
+        )
+
+        # The compensating identity-carrying frame must reach other windows
+        # even though append's own live frame is suppressed under _has_reader.
+        chat_frames = [
+            call.args
+            for call in state.broadcast_ws.call_args_list
+            if call.args[0] == "chat_message"
+        ]
+        assert len(chat_frames) == 1
+        frame_type, frame = chat_frames[0]
+        assert frame["slot"] == "s1"
+        assert frame["role"] == "assistant"
+        assert frame["content"] == "status update"
+        assert frame["meta"]["between_turn"] is True
+        assert frame["meta"].get("mid")
+        # The persisted row carries the same identity as the surfaced frame.
+        assert slot.messages[-1]["meta"]["mid"] == frame["meta"]["mid"]
+
+    @pytest.mark.asyncio
+    async def test_idle_tool_surfaces_when_reader_attached(self, tmp_path, monkeypatch):
+        """Between-turn tool rows surface through append_and_surface's compensation."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.providers.base import EVENT_TOOL_CALL, LLMEvent
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(chat_runner, "save_slot_off_loop", AsyncMock())
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.broadcast_ws = MagicMock()
+        slot = state.get_or_create_slot("s1")
+        slot._has_reader = True
+
+        await chat_runner._render_claude_idle_event(
+            state,
+            slot,
+            LLMEvent(kind=EVENT_TOOL_CALL, title="read_file", tool_kind="read"),
+        )
+
+        tool_calls = [
+            call.args
+            for call in state.broadcast_ws.call_args_list
+            if call.args[0] == "tool_call"
+        ]
+        chat_frames = [
+            call.args
+            for call in state.broadcast_ws.call_args_list
+            if call.args[0] == "chat_message"
+        ]
+        assert len(tool_calls) == 1
+        assert len(chat_frames) == 1
+        frame_type, frame = chat_frames[0]
+        assert frame["slot"] == "s1"
+        assert frame["role"] == "tool"
+        assert frame["meta"]["between_turn"] is True
+        assert slot.messages[-1]["role"] == "tool"
+        assert slot.messages[-1]["meta"]["mid"] == frame["meta"]["mid"]
+
+    @pytest.mark.asyncio
+    async def test_idle_text_no_extra_frame_without_reader(self, tmp_path, monkeypatch):
+        """Without _has_reader, append's own live frame is the only surface; no manual copy."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.providers.base import EVENT_TEXT_CHUNK, LLMEvent
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(chat_runner, "save_slot_off_loop", AsyncMock())
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.broadcast_ws = MagicMock()
+        slot = state.get_or_create_slot("s1")
+        assert not getattr(slot, "_has_reader", False)
+
+        await chat_runner._render_claude_idle_event(
+            state,
+            slot,
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="status update"),
+        )
+
+        chat_frames = [
+            call.args
+            for call in state.broadcast_ws.call_args_list
+            if call.args[0] == "chat_message"
+        ]
+        assert chat_frames == []
+        # chat_segment finalize still fires on the broadcast path.
+        assert any(
+            call.args[0] == "chat_segment" for call in state.broadcast_ws.call_args_list
+        )
+
 
 class TestFlushSegment:
     """Unit tests for _flush_segment helper function."""

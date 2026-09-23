@@ -5367,6 +5367,7 @@ def _flush_segment(
     quiet_persist: bool = False,
     message_meta: dict | None = None,
     interrupted: bool = False,
+    surface_when_reader: bool = False,
 ) -> None:
     """Finalize current text block as a segment and persist it.
 
@@ -5378,6 +5379,17 @@ def _flush_segment(
     would render a DUPLICATE copy of the pre-steer text below the steer
     bubble. Normal end-of-segment flushes keep the broadcast — there the
     clients still hold a live streaming message for it to reconcile into.
+
+    ``surface_when_reader`` emits an identity-carrying ``chat_message`` frame
+    for the finalized row even when ``slot._has_reader`` is set. ``append``'s
+    own live frame is conditional on having no HTTP reader draining the slot
+    (see the turn path's compensating ``chat_segment`` at the finalize sites),
+    and the between-turn idle renderer is the one caller whose rows are
+    surfaced ONLY through that conditional frame — a stranded reader flag
+    (nothing ends a between-turn stretch, so nothing clears it) therefore
+    froze every idle row as persisted-but-invisible. ``chat_segment`` cannot
+    carry it: it is a slot-level finalize signal with no row identity, and
+    clients holding no streaming message have nothing to reconcile into.
 
     The append-only log's identity for this segment is DERIVED here, not passed
     in: the ACP session id comes from the slot's own client, the turn from the
@@ -5452,6 +5464,24 @@ def _flush_segment(
         broadcast=not quiet_persist,
         meta={**(_decisions_strip_meta(slot) or {}), **(message_meta or {})} or None,
     )
+    last_msg: dict = slot.messages[-1]
+    if surface_when_reader and getattr(slot, "_has_reader", False):
+        # Mirror append_and_surface's compensation: append's own live frame is
+        # suppressed while an HTTP reader drains the slot, so hand the
+        # finalized row to every other window through the identity-carrying
+        # door (mid included — the client's redelivery guard declines
+        # mid-less frames as duplicates rather than guessing).
+        frame: dict[str, Any] = {
+            "slot": slot.key,
+            "role": "assistant",
+            "content": redacted,
+            "ts": last_msg.get("ts", ""),
+            "cls": "msg msg-a",
+        }
+        row_meta = last_msg.get("meta")
+        if isinstance(row_meta, dict) and row_meta:
+            frame["meta"] = row_meta
+        state.broadcast_ws("chat_message", frame)
     # The append-only log's copy of the same body. Written here rather than at the
     # turn's terminal event because a turn produces SEVERAL assistant messages --
     # one per model call -- and the terminal event sees only the last. The identity
@@ -5465,7 +5495,6 @@ def _flush_segment(
         text=redacted,
         interrupted=interrupted,
     )
-    last_msg: dict = slot.messages[-1]
     # If a regenerate is pending, attach the stashed variants to this fresh assistant message.
     if slot._pending_variants:
         pending_list = [
@@ -5545,7 +5574,9 @@ async def _render_claude_idle_event(
             payload = _tool_call_ws_payload(event)
             payload["slot"] = slot.key
             state.broadcast_ws("tool_call", payload)
-            slot.append(
+            append_and_surface(
+                state,
+                slot,
                 "tool",
                 f"🔧 {payload['tool']}",
                 "msg msg-tool",
@@ -5563,7 +5594,13 @@ async def _render_claude_idle_event(
             text, creds = redact_credentials(text)
             for warning in creds:
                 logger.warning("Credential redacted in idle Claude output: %s", warning)
-            _flush_segment(state, slot, text, message_meta={"between_turn": True})
+            _flush_segment(
+                state,
+                slot,
+                text,
+                message_meta={"between_turn": True},
+                surface_when_reader=True,
+            )
         else:
             return
         await save_slot_off_loop(state, slot, best_effort=False)
