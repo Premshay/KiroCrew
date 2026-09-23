@@ -343,9 +343,14 @@ REVIEW_EFFORT = _DEFAULT_EFFORT
 def known_review_agents() -> list[str]:
     """Every agent Sage may be pointed at, for the settings picker.
 
-    Sorted, deduplicated union of installed agent specs and configured crews.
-    A filesystem read; call off the event loop (the settings route already
-    runs in a thread)."""
+    Sorted, deduplicated union of installed agent specs and configured crews,
+    minus any the platform maps to a runtime Sage cannot drive. A filesystem
+    read; call off the event loop (the settings route already runs in a thread)."""
+    return sorted(n for n in _candidate_agent_names() if not _mapped_off_review_runtime(n))
+
+
+def _candidate_agent_names() -> set[str]:
+    """Installed agent specs plus configured crews, before runtime filtering."""
     names: set[str] = set()
     if kiro_agents_dir is not None:
         try:
@@ -364,7 +369,27 @@ def known_review_agents() -> list[str]:
         names.update(str(n) for n in KiroCrewConfig.load().agents.keys())
     except Exception:
         pass
-    return sorted(names)
+    return names
+
+
+def _mapped_off_review_runtime(name: str) -> bool:
+    """Whether the platform routes *name* to an engine Sage's runtime cannot drive.
+
+    An edition that describes the agent (``agent_runtime_policy``) but offers no
+    direct-runtime binding has mapped it to a non-ACP runtime. The spawn would
+    then fall back to kiro-cli under that name and either fail (no spec) or run
+    the review on the wrong engine (a same-named spec), so the seat is refused.
+    The public edition describes no agent, so it refuses nothing.
+    """
+    try:
+        if runtime_client_binding(name):
+            return False
+        from kiro_crew.platform.context import current_context
+
+        lookup = getattr(current_context().providers, "agent_runtime_policy", None)
+        return callable(lookup) and lookup(name) is not None
+    except Exception:
+        return False
 
 
 def is_known_review_agent(name: str) -> bool:
@@ -381,7 +406,7 @@ def is_known_review_agent(name: str) -> bool:
     if not all(c.isalnum() or c in "._-" for c in name):
         return False
     try:
-        return name in known_review_agents()
+        return name in _candidate_agent_names() and not _mapped_off_review_runtime(name)
     except Exception:
         return False
 
@@ -764,7 +789,8 @@ class ReviewPool:
                 self._sema = asyncio.Semaphore(eff)
         # Same for review.agent: the singleton pool outlives a settings change,
         # so resolving once at construction kept spawning the old agent.
-        want = _resolve_review_agent() if self._auto_agent else None
+        # Off-loop: resolving reads the agents dir, config and engine map.
+        want = await asyncio.to_thread(_resolve_review_agent) if self._auto_agent else None
         self._agent = await self._holder.begin_batch(want)
 
     async def end_batch(self) -> None:

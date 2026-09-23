@@ -629,6 +629,44 @@ class TestReviewAgentSelection(unittest.TestCase):
             self.assertIn(expected, names)
         self.assertEqual(names, sorted(names))
 
+    def _roster_with_edition(self, policies: dict, bindings: dict):
+        """known_review_agents() under an edition that describes *policies*."""
+        agents_dir = self._agents_dir(["crew-headless", "plain-spec"])
+        fake_cfg = type("FakeCfg", (), {
+            "load": classmethod(lambda cls: type("C", (), {
+                "agents": {"crew-headless-atlas": {}, "crew-bound": {}}
+            })())
+        })
+        providers = type("P", (), {"agent_runtime_policy": lambda self, n: policies.get(n)})()
+        ctx = type("Ctx", (), {"providers": providers})()
+        with unittest.mock.patch.object(rp, "kiro_agents_dir", return_value=agents_dir), \
+                unittest.mock.patch("kiro_crew.config.loader.KiroCrewConfig", fake_cfg), \
+                unittest.mock.patch("kiro_crew.platform.context.current_context", return_value=ctx), \
+                unittest.mock.patch.object(rp, "runtime_client_binding",
+                                           side_effect=lambda n: bindings.get(n, {})):
+            return rp.known_review_agents(), rp.is_known_review_agent("crew-headless-atlas")
+
+    def test_seats_mapped_to_a_runtime_sage_cannot_drive_are_refused(self):
+        """Described by the edition but unbound = a non-ACP engine: the spawn would
+        fall back to kiro-cli and fail, or run a same-named spec on the wrong engine."""
+        headless = {"runtime": "Headless", "model": "selectable"}
+        names, known = self._roster_with_edition(
+            policies={"crew-headless": headless, "crew-headless-atlas": headless,
+                      "crew-bound": {"runtime": "ACP"}},
+            bindings={"crew-bound": {"acp_backend": "claude"}},
+        )
+        self.assertNotIn("crew-headless", names)          # same-named spec exists
+        self.assertNotIn("crew-headless-atlas", names)    # config crew, no spec
+        self.assertFalse(known)
+        self.assertIn("crew-bound", names)                # mapped AND bound
+        self.assertIn("plain-spec", names)                # edition says nothing
+
+    def test_an_edition_that_describes_no_agents_refuses_none(self):
+        names, known = self._roster_with_edition(policies={}, bindings={})
+        self.assertEqual(
+            names, ["crew-bound", "crew-headless", "crew-headless-atlas", "plain-spec"])
+        self.assertTrue(known)
+
     def test_reviewer_info_reports_the_bound_engine_and_agent_source(self):
         with unittest.mock.patch.object(
             rp, "_resolve_review_agent", return_value="crew-deepseek-pro"
