@@ -256,6 +256,50 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(FakeRuntime.instances), 2)   # a fresh runtime per batch
         await pool.end_batch()
 
+    async def test_changed_review_agent_applies_to_the_next_batch(self):
+        """The singleton pool outlives a settings change: a new review.agent
+        must reach the next spawn, not stay pinned to the constructor's pick."""
+        _install_fake_runtime(self)
+        agent = ["crew-old"]
+        with unittest.mock.patch.object(rp, "_resolve_review_agent",
+                                        side_effect=lambda preferred=None: preferred or agent[0]):
+            pool = ReviewPool(work_dir=_work_dir(self))
+            await pool.begin_batch()
+            await pool.end_batch()
+            agent[0] = "crew-new"
+            await pool.begin_batch()
+        self.assertEqual([r.agent for r in FakeRuntime.instances], ["crew-old", "crew-new"])
+        self.assertEqual(pool._agent, "crew-new")
+        await pool.end_batch()
+
+    async def test_agent_change_waits_for_overlapping_batches_to_drain(self):
+        _install_fake_runtime(self)
+        agent = ["crew-old"]
+        with unittest.mock.patch.object(rp, "_resolve_review_agent",
+                                        side_effect=lambda preferred=None: preferred or agent[0]):
+            pool = ReviewPool(work_dir=_work_dir(self))
+            await pool.begin_batch()
+            agent[0] = "crew-new"
+            await pool.begin_batch()          # overlapping run keeps the live runtime
+            self.assertEqual(len(FakeRuntime.instances), 1)
+            self.assertEqual(pool._agent, "crew-old")
+            await pool.end_batch()
+            await pool.end_batch()
+            await pool.begin_batch()          # drained -> the new agent lands
+        self.assertEqual(FakeRuntime.instances[-1].agent, "crew-new")
+        await pool.end_batch()
+
+    async def test_explicit_agent_is_not_replaced_by_config(self):
+        _install_fake_runtime(self)
+        with unittest.mock.patch.object(rp, "_resolve_review_agent",
+                                        side_effect=lambda preferred=None: preferred or "crew-config"):
+            pool = ReviewPool(agent="crew-pinned", work_dir=_work_dir(self))
+            await pool.begin_batch()
+            await pool.end_batch()
+            await pool.begin_batch()
+        self.assertEqual({r.agent for r in FakeRuntime.instances}, {"crew-pinned"})
+        await pool.end_batch()
+
     async def test_session_created_and_destroyed_per_task(self):
         _install_fake_runtime(self, script=[_ev(rp.EVENT_TEXT_CHUNK, text="x")])
         pool = ReviewPool(work_dir=_work_dir(self))

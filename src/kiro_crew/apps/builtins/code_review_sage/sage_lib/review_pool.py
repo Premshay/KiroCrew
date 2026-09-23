@@ -585,8 +585,19 @@ class _BatchRuntimeHolder:
         self._batches = 0
         self._lock = asyncio.Lock()
 
-    async def begin_batch(self) -> None:
+    async def begin_batch(self, agent: Optional[str] = None) -> str:
+        """Count a batch in and return the agent the shared runtime runs as.
+
+        A different ``agent`` is adopted only while no batch is open: an
+        overlapping run keeps sharing the live runtime, and the change lands
+        on the next batch that starts after it drains.
+        """
         async with self._lock:
+            if agent and agent != self._agent and self._batches == 0:
+                rt, self._runtime = self._runtime, None
+                if rt is not None:
+                    await self._kill(rt)
+                self._agent = agent
             # Ensure the runtime FIRST, then count the batch. If the spawn raises
             # (unimportable AcpRuntime / transient kiro-cli launch failure), we must
             # NOT leave _batches incremented — otherwise it can never drain back to
@@ -594,6 +605,7 @@ class _BatchRuntimeHolder:
             # defeats the batch-scoped lifecycle).
             await self._ensure_runtime_locked()
             self._batches += 1
+            return self._agent
 
     async def end_batch(self) -> None:
         async with self._lock:
@@ -723,7 +735,8 @@ class ReviewPool:
         worker_factory: Optional[object] = None,
     ) -> None:
         # None -> config review.agent (when set) -> the dedicated reviewer ->
-        # fallback; an explicit agent is honored verbatim.
+        # fallback, re-resolved per batch; an explicit agent is honored verbatim.
+        self._auto_agent = not agent
         self._agent = _resolve_review_agent(agent)
         self._work_dir = work_dir if work_dir is not None else _review_work_dir()
         # Auto mode = no explicit max_workers -> the semaphore tracks the live
@@ -749,7 +762,10 @@ class ReviewPool:
             if eff != self._max:
                 self._max = eff
                 self._sema = asyncio.Semaphore(eff)
-        await self._holder.begin_batch()
+        # Same for review.agent: the singleton pool outlives a settings change,
+        # so resolving once at construction kept spawning the old agent.
+        want = _resolve_review_agent() if self._auto_agent else None
+        self._agent = await self._holder.begin_batch(want)
 
     async def end_batch(self) -> None:
         """Close a review batch — kills the runtime once the last batch drains."""
