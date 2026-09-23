@@ -282,7 +282,8 @@ class TestCheckpointSlotProjection:
         update = _checkpoint(summary="Follow-up work.", milestone="Awaiting owner.")
         update.pop("attention", None)
         slot.set_session_checkpoint(update)
-        assert slot.session_checkpoint_payload()["attention"]["status"] == "unassigned"
+        # Omission settles the request; a stale decision must not linger.
+        assert slot.session_checkpoint_payload()["attention"]["status"] == "none"
 
     def test_checkpoint_goal_persists_until_explicitly_replaced_or_cleared(self) -> None:
         slot = _ChatSlot("checkpoint")

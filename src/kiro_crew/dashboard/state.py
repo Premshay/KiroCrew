@@ -3972,13 +3972,11 @@ class _ChatSlot:
         )
         if "goal" not in checkpoint and self._session_checkpoint is not None:
             goal = self._session_checkpoint["goal"]
-        attention = (
-            self._checkpoint_attention(checkpoint.get("attention"))
-            if "attention" in checkpoint
-            else dict(self._session_checkpoint.get("attention", {}))
-            if self._session_checkpoint is not None
-            else self._checkpoint_attention(None)
-        )
+        # Attention is part of the current view, like main_items: a checkpoint
+        # that omits it has no open request. Carrying it forward left decisions
+        # "needing you" for days after they were settled, and no one but the
+        # raising agent could clear them.
+        attention = self._checkpoint_attention(checkpoint.get("attention"))
         old_trail = self._session_checkpoint.get("trail", []) if self._session_checkpoint else []
         trail = [
             text

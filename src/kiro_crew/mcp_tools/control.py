@@ -933,7 +933,9 @@ def schemas() -> list[dict[str, Any]]:
                 "remains, include one concrete next_action; omit it only when there is "
                 "genuinely no known next step. Set attention.status to unassigned only when "
                 "the operator needs to make a decision; use kind decision and a stable "
-                "decision_key when it identifies a distinct decision. This is session-bound: "
+                "decision_key when it identifies a distinct decision. Attention is not "
+                "carried forward: repeat it on each checkpoint while the decision is "
+                "still open, and omit it once settled. This is session-bound: "
                 "it updates only the session that called the tool."
             ),
             "inputSchema": {
