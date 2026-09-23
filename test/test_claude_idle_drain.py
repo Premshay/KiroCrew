@@ -235,6 +235,27 @@ class TestStretchTail:
         assert seen == []
         assert client._claude_idle_text == ["left from before"]
 
+    @pytest.mark.asyncio
+    async def test_a_task_notification_inside_a_turn_stays_with_the_turn(self, tmp_path):
+        """chat-1917, 15:53:09: a background task finished mid-tool. Treating it as
+        an autonomous cycle swallowed the rest of the turn, including the prompt
+        response, so the turn never ended and Stop escalated to a hard kill."""
+        client = _client(tmp_path)
+        _sink(client)
+        client._claude_dispatch_depth = 1
+        notification = JsonRpcMessage(
+            method="_claude/sdkMessage",
+            params={"sessionId": "sess-1",
+                    "message": {"type": "user", "origin": {"kind": "task-notification"}}},
+        )
+
+        await client._route_claude_frame(notification)
+        await client._route_claude_frame(_tool_done_frame())
+        await client._route_claude_frame(JsonRpcMessage(id=3, result={"stopReason": "end_turn"}))
+
+        assert client._claude_autonomous_origin is None
+        assert client._claude_inbox.qsize() == 2
+
     def test_every_result_is_requested_from_the_adapter(self, tmp_path):
         client = _client(tmp_path)
         requested = client._claude_session_meta()["claudeCode"]["emitRawSDKMessages"]

@@ -1273,13 +1273,9 @@ class TestClaudeAutonomousReader:
             "observer",
             "observer-activity",
         }
-        assert {entry["origin"] for entry in filters if entry["type"] == "result"} == {
-            "task-notification",
-            "peer",
-            "coordinator",
-            "observer",
-            "observer-activity",
-        }
+        # Every result, origin-less: the end of a between-turn stretch is what
+        # flushes its closing prose, and autonomous results still match.
+        assert [entry for entry in filters if entry["type"] == "result"] == [{"type": "result"}]
         assert {entry["type"] for entry in filters} == {"user", "assistant", "result"}
 
     def test_explicit_mcp_profile_excludes_user_setting_source(self, tmp_path):

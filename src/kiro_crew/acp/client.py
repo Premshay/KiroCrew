@@ -10606,6 +10606,12 @@ class AcpClient:
         origin_data = sdk_message.get("origin")
         origin = origin_data.get("kind") if isinstance(origin_data, dict) else None
         if kind == "user" and origin in _CLAUDE_AUTONOMOUS_ORIGINS:
+            if self._claude_dispatch_depth > 0:
+                # Claude folded the message into the LIVE turn (a background
+                # task finishing mid-tool). Its frames, and the prompt response,
+                # belong to the dispatch reading the inbox; collecting them as an
+                # autonomous cycle swallowed both and the turn never ended.
+                return
             if self._claude_autonomous_origin is not None:
                 logger.error(
                     "Claude emitted autonomous %s before terminal %s; discarding partial output",
