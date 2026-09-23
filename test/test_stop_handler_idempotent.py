@@ -47,6 +47,10 @@ class _FakeSlot:
         self.messages: list[dict] = []
         self._dirty = False
         self.source_links_invalidated = 0
+        #: Mirrors _ChatSlot's `wait` sleep tracking. Default absent so
+        #: pre-existing tests keep exercising the no-wait path.
+        self._wait_state: dict | None = None
+        self._end_wait_request: str | None = None
 
     @property
     def is_remote(self) -> bool:
@@ -161,6 +165,126 @@ class TestStopHandlerIdempotent:
         assert slot._stop_state == "idle"
         assert slot._stop_event_id is None
         assert slot.source_links_invalidated == 1
+
+
+class TestStopParksWaitEarlyEnd:
+    """A stop press while the turn sits in a `wait` sleep must end the sleep
+    first, so the backend gets a boundary to acknowledge the cooperative cancel
+    on instead of the stop escalating into a hard kill."""
+
+    @pytest.mark.asyncio
+    async def test_first_press_parks_end_wait_when_wait_in_flight(self):
+        from aiohttp import web
+
+        from kiro_crew.dashboard.chat_handlers import api_chat_slot_stop
+
+        slot = _FakeSlot()
+        slot.running = True
+        slot._wait_state = {"wait_id": "w-1"}
+        state = _FakeState(slot)
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
+
+        app = web.Application()
+        app["state"] = state
+        request = MagicMock()
+        request.get = lambda key, default="": default
+        request.app = app
+        request.match_info = {"slot": "test-slot"}
+        request.query = {}
+
+        with patch("kiro_crew.dashboard.chat_handlers.sel") as mock_sel:
+            mock_sel.return_value.log_tool_invocation = MagicMock()
+            mock_sel.return_value.log = MagicMock()
+            with patch("kiro_crew.dashboard.chat_handlers._reject_pending_approvals"):
+                await api_chat_slot_stop(request)
+
+        assert slot._end_wait_request == "w-1"
+        state.sessions.stop_turn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_parking_skipped_when_end_wait_already_parked(self):
+        from aiohttp import web
+
+        from kiro_crew.dashboard.chat_handlers import api_chat_slot_stop
+
+        slot = _FakeSlot()
+        slot.running = True
+        slot._wait_state = {"wait_id": "w-1"}
+        # The End-wait button already parked this sleep's request.
+        slot._end_wait_request = "w-1"
+        state = _FakeState(slot)
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
+
+        app = web.Application()
+        app["state"] = state
+        request = MagicMock()
+        request.get = lambda key, default="": default
+        request.app = app
+        request.match_info = {"slot": "test-slot"}
+        request.query = {}
+
+        with patch("kiro_crew.dashboard.chat_handlers.sel") as mock_sel:
+            mock_sel.return_value.log_tool_invocation = MagicMock()
+            mock_sel.return_value.log = MagicMock()
+            with patch("kiro_crew.dashboard.chat_handlers._reject_pending_approvals"):
+                await api_chat_slot_stop(request)
+
+        assert slot._end_wait_request == "w-1"
+
+    @pytest.mark.asyncio
+    async def test_no_wait_state_parking_is_noop(self):
+        from aiohttp import web
+
+        from kiro_crew.dashboard.chat_handlers import api_chat_slot_stop
+
+        slot = _FakeSlot()
+        slot.running = True
+        state = _FakeState(slot)
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
+
+        app = web.Application()
+        app["state"] = state
+        request = MagicMock()
+        request.get = lambda key, default="": default
+        request.app = app
+        request.match_info = {"slot": "test-slot"}
+        request.query = {}
+
+        with patch("kiro_crew.dashboard.chat_handlers.sel") as mock_sel:
+            mock_sel.return_value.log_tool_invocation = MagicMock()
+            mock_sel.return_value.log = MagicMock()
+            with patch("kiro_crew.dashboard.chat_handlers._reject_pending_approvals"):
+                await api_chat_slot_stop(request)
+
+        assert slot._end_wait_request is None
+
+    @pytest.mark.asyncio
+    async def test_wait_state_without_id_is_ignored(self):
+        from aiohttp import web
+
+        from kiro_crew.dashboard.chat_handlers import api_chat_slot_stop
+
+        slot = _FakeSlot()
+        slot.running = True
+        slot._wait_state = {}
+        state = _FakeState(slot)
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
+
+        app = web.Application()
+        app["state"] = state
+        request = MagicMock()
+        request.get = lambda key, default="": default
+        request.app = app
+        request.match_info = {"slot": "test-slot"}
+        request.query = {}
+
+        with patch("kiro_crew.dashboard.chat_handlers.sel") as mock_sel:
+            mock_sel.return_value.log_tool_invocation = MagicMock()
+            mock_sel.return_value.log = MagicMock()
+            with patch("kiro_crew.dashboard.chat_handlers._reject_pending_approvals"):
+                await api_chat_slot_stop(request)
+
+        assert slot._end_wait_request is None
 
 
 class TestInterruptHandlerIdempotent:

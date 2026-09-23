@@ -3969,10 +3969,40 @@ async def _persist_handover_tail(
     return _HandoverDrainResult(rows_committed=True, prompts_lost=lost)
 
 
+def _park_wait_end_for_stop(slot: _ChatSlot) -> None:
+    """Park an early-end request on an in-flight `wait` sleep before cancelling.
+
+    A turn parked in the `wait` MCP tool cannot acknowledge a cooperative
+    cancel: the backend is blocked inside the tool call and stays that way
+    until the sleep elapses (up to the tool's 1800s ceiling), so the cancel's
+    grace window expires and the stop escalates into a hard kill that discards
+    the session's in-flight work. The sleep itself, however, polls
+    /api/session-keepalive every WAIT_PING_SECS (5s) and returns early when
+    ``slot._end_wait_request`` names its wait id — the same parking the End-wait
+    button performs. Ending the sleep hands the turn a boundary to acknowledge
+    the cancel on, converting the escalation into a soft stop.
+
+    Reads the wait state defensively: test fixtures and non-dashboard slots may
+    carry none of these attributes. A stale ``_wait_state`` whose sleep has
+    stopped pinging is left alone only in the sense that parking costs nothing —
+    a dead sleep never reads the request, and the next wait's mint clears it
+    rather than inheriting it.
+    """
+    wait_state = getattr(slot, "_wait_state", None)
+    if not wait_state:
+        return
+    wait_id = wait_state.get("wait_id")
+    if not wait_id or getattr(slot, "_end_wait_request", None) == wait_id:
+        # Nothing in flight, or the End-wait button already parked this sleep.
+        return
+    slot._end_wait_request = wait_id
+    logger.info("Stop: parked early-end for in-flight wait %s on slot %s", wait_id, slot.key)
+
+
 def _unblock_pending_waits(state: DashboardState, slot: _ChatSlot) -> None:
     """Unblock EVERY thing a stop/interrupt could leave the runner waiting on.
 
-    Two independent blocking waits exist per slot and both must be released or
+    Three independent blocking waits exist per slot and each must be released or
     the cooperative cancel times out into a hard kill:
 
     * pending tool approvals (:func:`_reject_pending_approvals`)
@@ -3982,15 +4012,20 @@ def _unblock_pending_waits(state: DashboardState, slot: _ChatSlot) -> None:
       socket close and the call return. Only the ``POST /api/ask-question``
       path creates such a wait; the MCP ``ask_question`` tool posts a stateless
       card and ends the turn, so it leaves nothing to release here.
+    * an in-flight `wait` tool sleep (:func:`_park_wait_end_for_stop`) — the
+      sleep runs in a separate MCP subprocess and the backend sits inside the
+      tool call for its whole duration, so the cancel can only be acknowledged
+      once the sleep has ended.
 
     They are combined here deliberately: a new blocking wait added later must
-    be released from every stop path, and three separate call sites each
-    needing their own second line is how one of them gets missed.
+    be released from every stop path, and four separate call sites each
+    needing their own extra line is how one of them gets missed.
     """
     _reject_pending_approvals(slot)
     cancelled = state.cancel_questions_for_slot(slot.key)
     if cancelled:
         logger.info("Stop: cancelled %d pending question(s) on slot %s", cancelled, slot.key)
+    _park_wait_end_for_stop(slot)
 
 
 async def _subagents_attached_response(
