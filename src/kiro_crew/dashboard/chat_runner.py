@@ -9486,6 +9486,15 @@ async def _run_chat(
         segment is finalized, so WS/SSE viewers see the complete (redacted) text
         and never a truncated stream. No-op when the buffer is empty."""
         nonlocal chunk_seq
+        if _stop_pressed():
+            # A Stop/interrupt is a segment boundary: the withheld tail was
+            # produced BEFORE it, so broadcasting now would open a phantom
+            # streaming bubble BELOW the stop card -- the same defect the steer
+            # cut prevents by dropping its own tail (_steer_segment_cut). No text
+            # is lost: `assistant_text` accumulates the whole segment and
+            # `_flush_segment` persists it (above any trailing stop card).
+            _wsred.reset()
+            return
         wire = _wsred.flush()
         if not wire:
             return
@@ -9510,6 +9519,15 @@ async def _run_chat(
     def _flush_thinking_stream() -> None:
         """Emit the thinking redactor's withheld tail when the thinking phase
         ends (any non-thinking event) or the turn completes. No-op when empty."""
+        if _stop_pressed():
+            # Same boundary rule as _flush_text_stream: the withheld tail belongs
+            # BEFORE the Stop/interrupt, so emitting it after the card re-shows
+            # pre-interruption reasoning below the interruption. Reasoning has no
+            # second copy, so this drops up to the redactor's holdback (<=512
+            # chars) of ephemeral reasoning rather than render it on the wrong
+            # side of the boundary.
+            _thinkred.reset()
+            return
         wire = _thinkred.flush()
         if wire:
             state.broadcast_ws("chat_thinking", {"slot": slot.key, "content": wire})
@@ -9544,6 +9562,13 @@ async def _run_chat(
         # accumulates the full segment independently of the wire buffer, and
         # _flush_segment persists (and re-redacts) that full text.
         _wsred.reset()
+        # The SAME boundary applies to the thinking wire stream: its withheld
+        # tail was produced BEFORE the steer, so the next flush (loop-top, or
+        # turn end) would emit it as a fresh chat_thinking frame below the steer
+        # bubble — re-showing pre-steer reasoning after the interruption. This is
+        # the only reset of `_thinkred` outside the Stop rule in
+        # `_flush_thinking_stream`.
+        _thinkred.reset()
         if assistant_text.strip():
             # quiet_persist: the clients already hold this text in their
             # frozen (pre-steer) message; the append's chat_message broadcast
