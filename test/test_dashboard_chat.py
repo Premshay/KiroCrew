@@ -5795,6 +5795,107 @@ class TestRunChatSegmentFlush:
         assert "[REDACTED: credential]" in wire
 
     @pytest.mark.asyncio
+    async def test_steer_cut_drops_withheld_pre_steer_thinking_tail(self, tmp_path, monkeypatch):
+        """A mid-turn steer must not re-broadcast the pre-steer thinking tail.
+
+        The thinking wire redactor withholds its trailing credential-class run
+        until a terminator arrives. The steer segment cut exists to close the
+        boundary; if it drops only the TEXT redactor's tail, the held-back
+        THINKING tail is emitted on the NEXT flush (loop-top or turn end) —
+        after the steer bubble — so pre-interruption reasoning reappears below
+        the interruption.
+        """
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            EVENT_THINKING_CHUNK,
+            LLMEvent,
+        )
+
+        async def _stream(msg):
+            # The tail "lef" is a credential-class run with no terminator, which
+            # the redactor withholds; a real mid-turn steer lands right here.
+            yield LLMEvent(kind=EVENT_THINKING_CHUNK, text="pre-steer Two discriminators lef")
+            slot._steer_segment_cut()
+            yield LLMEvent(kind=EVENT_THINKING_CHUNK, text="\nsecond burst ")
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="done")
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = _provider_mock()
+        client.context_usage_pct = MagicMock(return_value=10.0)
+        client.stream = _stream
+        client.stream_command = _stream
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "steer me")
+
+        thinking = [
+            call.args[1]["content"]
+            for call in state.broadcast_ws.call_args_list
+            if call.args[0] == "chat_thinking"
+        ]
+        assert "lef" not in "".join(thinking), (
+            "the withheld pre-steer thinking tail was re-broadcast after the steer cut"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_boundary_drops_withheld_tails(self, tmp_path, monkeypatch):
+        """A turn the user stopped mid-stream must not broadcast the withheld
+        pre-stop tails from its end-of-turn flushes.
+
+        With no cut at the stop boundary the redactors' buffered remainders
+        (text and thinking) are emitted as fresh chat_chunk/chat_thinking frames
+        AFTER the stop card, i.e. pre-interruption content below the
+        interruption.
+        """
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            EVENT_THINKING_CHUNK,
+            LLMEvent,
+        )
+
+        async def _stream(msg):
+            yield LLMEvent(kind=EVENT_THINKING_CHUNK, text="pre-stop Two discriminators lef")
+            slot._stopping = True  # the user pressed Stop here
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="par")
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = _provider_mock()
+        client.context_usage_pct = MagicMock(return_value=10.0)
+        client.stream = _stream
+        client.stream_command = _stream
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "stop me")
+
+        events = [call.args[0] for call in state.broadcast_ws.call_args_list]
+        thinking = "".join(
+            call.args[1]["content"]
+            for call in state.broadcast_ws.call_args_list
+            if call.args[0] == "chat_thinking"
+        )
+        chunks = "".join(
+            call.args[1]["content"]
+            for call in state.broadcast_ws.call_args_list
+            if call.args[0] == "chat_chunk"
+        )
+        violations = []
+        if "lef" in thinking:
+            violations.append("thinking tail")
+        if "par" in chunks:
+            violations.append("text tail")
+        assert not violations, f"withheld pre-stop tails crossed the boundary: {violations} ({events})"
+
+    @pytest.mark.asyncio
     async def test_text_tool_text_complete_produces_two_segments(self, tmp_path, monkeypatch):
         """Mock event stream: text → tool_call → text → complete produces
         two assistant messages and one tool message.
