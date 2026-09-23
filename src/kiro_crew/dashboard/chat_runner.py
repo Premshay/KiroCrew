@@ -5582,6 +5582,24 @@ async def _render_claude_idle_event(
                 "msg msg-tool",
                 meta={**(_tool_meta(event) or {}), "between_turn": True},
             )
+        elif event.kind == EVENT_TOOL_RESULT:
+            # Close the call's row the way the turn loop does: without this a
+            # finished tool renders as running until the next prompt.
+            _tcid = _redact_tool_field(event.tool_call_id) if event.tool_call_id else ""
+            if not _tcid:
+                return
+            _out = _redact_tool_field(event.tool_output)
+            _out, _ = redact_exfiltration_urls(_out)
+            _out, _ = redact_credentials(_out)
+            for m in slot.messages:
+                if m.get("role") == "tool" and m.get("meta", {}).get("tool_call_id") == _tcid:
+                    _meta = m.setdefault("meta", {})
+                    _meta["done"] = True
+                    if _out or "output" not in _meta:
+                        _meta["output"] = _out
+            state.broadcast_ws(
+                "tool_result", {"slot": slot.key, "tool_call_id": _tcid, "output": _out}
+            )
         elif event.kind == EVENT_TEXT_CHUNK:
             text = (event.text or "").strip()
             if not text:

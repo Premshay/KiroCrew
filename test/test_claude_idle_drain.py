@@ -20,6 +20,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
     METHOD_SESSION_UPDATE,
     JsonRpcMessage,
 )
@@ -164,6 +165,80 @@ class TestIdleRouting:
 
         # Declined rather than raised, so the frame survives for the dispatch.
         assert client._claude_inbox.qsize() == 1
+
+
+def _tool_done_frame(call_id: str = "t1", output: str = "ok") -> JsonRpcMessage:
+    return JsonRpcMessage(
+        method=METHOD_SESSION_UPDATE,
+        params={
+            "sessionId": "sess-1",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": call_id,
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": output}}],
+            },
+        },
+    )
+
+
+def _sdk_result_frame(origin: str | None = None) -> JsonRpcMessage:
+    message: dict = {"type": "result", "subtype": "success"}
+    if origin:
+        message["origin"] = {"kind": origin}
+    return JsonRpcMessage(
+        method="_claude/sdkMessage", params={"sessionId": "sess-1", "message": message}
+    )
+
+
+class TestStretchTail:
+    """chat-1918, 2026-09-23 15:29: the tools finished and the model wrote its
+    reply, but the rows stayed "running" and the reply was held back until the
+    operator's next prompt drained both into that turn."""
+
+    @pytest.mark.asyncio
+    async def test_a_tool_completion_renders_instead_of_queueing(self, tmp_path):
+        client = _client(tmp_path)
+        seen = _sink(client)
+
+        await client._route_claude_frame(_tool_frame("Terminal"))
+        await client._route_claude_frame(_tool_done_frame())
+
+        assert [e.kind for e in seen] == [EVENT_TOOL_CALL, EVENT_TOOL_RESULT]
+        assert seen[1].tool_call_id == "t1"
+        assert client._claude_inbox.qsize() == 0
+
+    @pytest.mark.asyncio
+    async def test_closing_prose_flushes_when_the_stretch_ends(self, tmp_path):
+        client = _client(tmp_path)
+        seen = _sink(client)
+
+        await client._route_claude_frame(_text_frame("Both are merged "))
+        await client._route_claude_frame(_text_frame("into v2."))
+        assert seen == []
+
+        await client._route_claude_frame(_sdk_result_frame())
+
+        assert [e.kind for e in seen] == [EVENT_TEXT_CHUNK]
+        assert seen[0].text == "Both are merged into v2."
+
+    @pytest.mark.asyncio
+    async def test_a_turn_result_does_not_flush_idle_prose(self, tmp_path):
+        """A dispatch's own result belongs to the turn consumer."""
+        client = _client(tmp_path)
+        seen = _sink(client)
+        client._claude_idle_text.append("left from before")
+        client._claude_dispatch_depth = 1
+
+        await client._route_claude_frame(_sdk_result_frame())
+
+        assert seen == []
+        assert client._claude_idle_text == ["left from before"]
+
+    def test_every_result_is_requested_from_the_adapter(self, tmp_path):
+        client = _client(tmp_path)
+        requested = client._claude_session_meta()["claudeCode"]["emitRawSDKMessages"]
+        assert {"type": "result"} in requested
 
 
 class TestDispatchHandoff:

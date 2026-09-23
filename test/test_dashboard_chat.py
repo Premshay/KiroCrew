@@ -5343,6 +5343,34 @@ class TestTitleGenerationSessionLeak:
 
 class TestClaudeIdleEvent:
     @pytest.mark.asyncio
+    async def test_idle_tool_result_closes_its_row(self, tmp_path, monkeypatch):
+        """A between-turn tool that finished must not render as still running."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.providers.base import EVENT_TOOL_CALL, EVENT_TOOL_RESULT, LLMEvent
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(chat_runner, "save_slot_off_loop", AsyncMock())
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.broadcast_ws = MagicMock()
+        slot = state.get_or_create_slot("s1")
+
+        await chat_runner._render_claude_idle_event(
+            state, slot,
+            LLMEvent(kind=EVENT_TOOL_CALL, title="Terminal", tool_call_id="toolu_1"),
+        )
+        await chat_runner._render_claude_idle_event(
+            state, slot,
+            LLMEvent(kind=EVENT_TOOL_RESULT, tool_call_id="toolu_1", tool_output="merged"),
+        )
+
+        row = next(m for m in slot.messages if m.get("role") == "tool")
+        assert row["meta"]["done"] is True
+        assert row["meta"]["output"] == "merged"
+        results = [c.args[1] for c in state.broadcast_ws.call_args_list if c.args[0] == "tool_result"]
+        assert results == [{"slot": "s1", "tool_call_id": "toolu_1", "output": "merged"}]
+
+    @pytest.mark.asyncio
     async def test_idle_text_has_a_durable_turn_boundary(self, tmp_path, monkeypatch):
         """Idle output must not be grouped with the previous user reply."""
         from kiro_crew.dashboard import chat_runner

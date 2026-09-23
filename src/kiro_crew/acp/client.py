@@ -6141,10 +6141,9 @@ class AcpClient:
                         for origin in sorted(_CLAUDE_AUTONOMOUS_ORIGINS)
                     ),
                     {"type": "assistant"},
-                    *(
-                        {"type": "result", "origin": origin}
-                        for origin in sorted(_CLAUDE_AUTONOMOUS_ORIGINS)
-                    ),
+                    # Every result, not only autonomous ones: the end of a
+                    # between-turn stretch is what flushes its closing prose.
+                    {"type": "result"},
                 ],
             }
         }
@@ -10556,9 +10555,9 @@ class AcpClient:
 
         Returning False re-queues the frame on the inbox, which is the safe
         direction: a frame the idle path does not understand still reaches the
-        next dispatch, so nothing is dropped by adding this path. Only the two
-        row-producing shapes are claimed — a tool call and assistant text —
-        because those are the whole of what "it was working" means to a reader.
+        next dispatch, so nothing is dropped by adding this path. Only the
+        row-producing shapes are claimed — a tool call, its completion and
+        assistant text — because those are what "it was working" means to a reader.
         Permission requests, usage and lifecycle frames deliberately fall
         through: answering a permission prompt outside a turn has no UI to
         answer it with, so it must stay queued for a dispatch that does.
@@ -10567,10 +10566,12 @@ class AcpClient:
         if handler is None or not msg.is_method(METHOD_SESSION_UPDATE):
             return False
         try:
-            tool_event = self._extract_tool_event(msg)
+            tool_event = self._extract_tool_event(msg) or self._extract_tool_call_update(msg)
             if tool_event is not None:
                 # Cut the accumulated prose FIRST: the text explains the step
-                # that follows it, so flushing after would invert them.
+                # that follows it, so flushing after would invert them. A
+                # completion is claimed too -- left queued, its row reads as
+                # still running until the next prompt drains it into that turn.
                 await self._flush_claude_idle_text(handler)
                 await handler(tool_event)
                 return True
@@ -10627,6 +10628,18 @@ class AcpClient:
             )
             if isinstance(message_id, str) and message_id:
                 self._claude_autonomous_message_id = message_id
+            return
+        if (
+            kind == "result"
+            and self._claude_autonomous_origin is None
+            and self._claude_dispatch_depth == 0
+        ):
+            # A between-turn stretch has ended. Its closing prose would otherwise
+            # wait for the next tool call or prompt, so a reply the model already
+            # finished stays invisible and then lands inside the operator's next turn.
+            handler = self._claude_idle_handler
+            if handler is not None:
+                await self._flush_claude_idle_text(handler)
             return
         if kind == "result" and origin == self._claude_autonomous_origin:
             turn = ClaudeAutonomousTurn(
