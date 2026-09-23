@@ -83,6 +83,7 @@ from kiro_crew.acp._dispatch import (
     parse_usage_cost,
     parse_usage_update,
     redact_text,
+    steer_discriminant,
     tool_call_content_text,
 )
 from kiro_crew.acp._frame_record import record_frame
@@ -130,7 +131,9 @@ from kiro_crew.acp.types import (
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
+    EVENT_STEER_CLEARED,
     EVENT_STEER_CONSUMED,
+    EVENT_STEER_QUEUED,
     EVENT_SUBAGENT_ACTIVITY,
     EVENT_SUBAGENT_LIST,
     EVENT_TEXT_CHUNK,
@@ -11245,7 +11248,7 @@ class AcpClient:
         """Classify a message into an action string.
 
         Actions: "complete", "error", "permission", "update", "metadata",
-        "server_request_unknown", "steer_result", "skip".
+        "server_request_unknown", "steer", "steer_result", "skip".
         """
         if msg.is_response_for(req_id):
             return "error" if msg.error else "complete"
@@ -11260,6 +11263,18 @@ class AcpClient:
 
         if msg.is_method(METHOD_REQUEST_PERMISSION):
             return "permission"
+
+        # The NOTIFICATION-shaped counterpart of the response claimed above,
+        # and claimed for the same reason: kiro-cli and dsh-acp report a steer
+        # through the ordinary session-update methods with only
+        # `update.sessionUpdate` telling it apart, so an unclassified one is
+        # swallowed by "update" below. A swallowed `steering_consumed` never
+        # reaches the slot's settlement, the steer stays pending, and the
+        # teardown requeues a message the backend already ran. ONE read, shared
+        # with AcpSessionHandle, so the two loops cannot disagree.
+        if msg.is_method(METHOD_SESSION_UPDATE) or msg.is_method(METHOD_KIRO_SESSION_UPDATE):
+            if steer_discriminant(msg.params):
+                return "steer"
 
         if msg.is_method(METHOD_SESSION_UPDATE):
             return "update"
@@ -11928,6 +11943,9 @@ class AcpClient:
                 steer_event = self._settle_steer_response(msg)
                 if steer_event is not None:
                     yield steer_event
+            elif action == "steer":
+                for steer_event in self._steer_events(msg):
+                    yield steer_event
             elif action == "update":
                 self._track_usage_update(msg)
                 provider_child = self._extract_provider_child_activity(msg)
@@ -12498,6 +12516,41 @@ class AcpClient:
         # See AcpSessionHandle.steer for why the stamp is taken at the write.
         self._last_steer_monotonic = time.monotonic()
         return True
+
+    def _steer_events(self, msg: JsonRpcMessage) -> list[AcpEvent]:
+        """Turn a mid-turn steer session-update frame into lifecycle events.
+
+        The NOTIFICATION-shaped dialect: kiro-cli's ``_session/steer`` (and the
+        ``@deepseek-ai/dsh-acp`` bridge that speaks it) reports a steer over the
+        ordinary session-update methods, with ``update.sessionUpdate`` naming
+        the phase and ``content`` carrying the text verbatim. ``consumed`` is
+        the authoritative "the backend injected this" signal the slot's steer
+        ledger settles against, so a runtime that does not surface it leaves
+        every steer pending and the turn teardown requeues text that already
+        ran. Mirrors ``AcpSessionHandle``'s steer branch, discriminant included,
+        so both runtimes report the same lifecycle.
+
+        Never trust backend-echoed steer text: redact it before it can reach any
+        surface, exactly as the shared parser then expects. An empty list is the
+        safe answer for a frame this session does not own: only a frame naming
+        THIS session may settle its ledger, or a child's echo could settle a
+        pending user steer the parent backend never consumed.
+        """
+        params = msg.params or {}
+        steer_session = str(params.get("sessionId") or "")
+        if steer_session and steer_session != self._session_id:
+            return []
+        update = params.get("update")
+        update = update if isinstance(update, dict) else {}
+        discriminant = str(update.get("sessionUpdate") or "")
+        text = redact_text(str(update.get("content") or update.get("message") or ""))
+        if discriminant in ("steering_queued", "AgentExecutionUserMessageQueued"):
+            return [AcpEvent(kind=EVENT_STEER_QUEUED, text=text)]
+        if discriminant in ("steering_consumed", "AgentExecutionSteeringInjected"):
+            return [AcpEvent(kind=EVENT_STEER_CONSUMED, text=text)]
+        if discriminant == "steering_cleared":
+            return [AcpEvent(kind=EVENT_STEER_CLEARED)]
+        return []
 
     def _settle_steer_response(self, msg: JsonRpcMessage) -> AcpEvent | None:
         """Turn a ``_session/steering`` response into a settlement echo, or None.

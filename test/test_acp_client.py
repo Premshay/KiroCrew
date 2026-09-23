@@ -3307,6 +3307,158 @@ class TestProcessMessage:
         assert client._process_message(msg, req_id=4) == "complete"
 
 
+class TestSteerLifecycleDispatch:
+    """Mid-turn steer frames on the AcpClient path.
+
+    dsh sessions run on AcpClient (``ACP_BACKENDS_ACP_RUNTIME`` excludes
+    deepseek), and its adapter reports a steer through the ordinary
+    session-update methods. Until this path classified those frames, a
+    ``steering_consumed`` was swallowed as a plain update: the slot's ledger
+    never settled the steer, teardown requeued it, and the user's message ran a
+    second time.
+    """
+
+    def _steer_msg(self, discriminant, text="the question", session_id="s1", kiro=False):
+        from kiro_crew.acp.types import (
+            METHOD_KIRO_SESSION_UPDATE,
+            METHOD_SESSION_UPDATE,
+            JsonRpcMessage,
+        )
+
+        return JsonRpcMessage(
+            method=METHOD_KIRO_SESSION_UPDATE if kiro else METHOD_SESSION_UPDATE,
+            params={
+                "sessionId": session_id,
+                "update": {"sessionUpdate": discriminant, "content": text},
+            },
+        )
+
+    def _complete_msg(self):
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        return JsonRpcMessage(id=1, result={"status": "complete"})
+
+    def test_steer_consumed_classified_before_generic_update(self):
+        client = AcpClient()
+        assert client._process_message(self._steer_msg("steering_consumed"), req_id=99) == "steer"
+
+    def test_kiro_steer_queued_classified(self):
+        client = AcpClient()
+        msg = self._steer_msg("steering_queued", kiro=True)
+        assert client._process_message(msg, req_id=99) == "steer"
+
+    def test_kas_injected_classified(self):
+        client = AcpClient()
+        msg = self._steer_msg("AgentExecutionSteeringInjected")
+        assert client._process_message(msg, req_id=99) == "steer"
+
+    def test_steer_echo_settles_the_pending_ledger(self):
+        """The live defect: an echo frame must settle the slot's ledger.
+
+        Classified as a plain update, the ``steering_consumed`` frame reached
+        neither the event kind nor the ledger, teardown requeued a steer the
+        backend had already injected, and the user's message ran twice.
+        """
+        from kiro_crew.dashboard.steer_settle import settle_consumed_steers
+
+        client = AcpClient()
+        client._session_id = "s1"
+        msg = self._steer_msg(
+            "steering_consumed", text="<user_message>\nthe question\n</user_message>"
+        )
+
+        assert client._process_message(msg, req_id=99) == "steer"
+        events = client._steer_events(msg)
+        assert [ev.kind for ev in events] == ["steer_consumed"]
+        assert settle_consumed_steers(["the question"], events[0].text) == []
+
+    def test_ordinary_session_update_still_update(self):
+        client = AcpClient()
+        msg = self._steer_msg("agent_message_chunk")
+        assert client._process_message(msg, req_id=99) == "update"
+
+    @pytest.mark.asyncio
+    async def test_steer_consumed_reaches_stream_events(self):
+        """The echo the ledger settles on must survive the dispatch loop."""
+        from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_STEER_CONSUMED, AcpEvent
+
+        client = AcpClient()
+        client._session_id = "s1"
+        wrapped = "<user_message>\nthe question\n</user_message>"
+        steer_msg = self._steer_msg("steering_consumed", text=wrapped)
+        complete_msg = self._complete_msg()
+
+        async def fake_prompt_loop(req_id, timeout):
+            yield "steer", steer_msg
+            yield "complete", complete_msg
+
+        client.ensure_ready = AsyncMock()
+        client._send_prompt = AsyncMock(return_value=1)
+        client._prompt_loop = fake_prompt_loop
+
+        events: list[AcpEvent] = []
+        async for ev in client.stream_events("test"):
+            events.append(ev)
+
+        assert [ev.kind for ev in events] == [EVENT_STEER_CONSUMED, EVENT_COMPLETE]
+        assert events[0].text == wrapped
+
+    @pytest.mark.asyncio
+    async def test_steer_queued_and_cleared_events_reach_stream_events(self):
+        from kiro_crew.acp.types import (
+            EVENT_COMPLETE,
+            EVENT_STEER_CLEARED,
+            EVENT_STEER_QUEUED,
+            AcpEvent,
+        )
+
+        client = AcpClient()
+        client._session_id = "s1"
+
+        async def fake_prompt_loop(req_id, timeout):
+            yield "steer", self._steer_msg("steering_queued")
+            yield "steer", self._steer_msg("steering_cleared")
+            yield "complete", self._complete_msg()
+
+        client.ensure_ready = AsyncMock()
+        client._send_prompt = AsyncMock(return_value=1)
+        client._prompt_loop = fake_prompt_loop
+
+        events: list[AcpEvent] = []
+        async for ev in client.stream_events("test"):
+            events.append(ev)
+
+        assert [ev.kind for ev in events] == [
+            EVENT_STEER_QUEUED,
+            EVENT_STEER_CLEARED,
+            EVENT_COMPLETE,
+        ]
+        assert events[0].text == "the question"
+
+    @pytest.mark.asyncio
+    async def test_foreign_session_steer_echo_ignored(self):
+        """Only a frame naming this session may settle its steer ledger."""
+        from kiro_crew.acp.types import EVENT_COMPLETE, AcpEvent
+
+        client = AcpClient()
+        client._session_id = "s1"
+        foreign = self._steer_msg("steering_consumed", session_id="other")
+
+        async def fake_prompt_loop(req_id, timeout):
+            yield "steer", foreign
+            yield "complete", self._complete_msg()
+
+        client.ensure_ready = AsyncMock()
+        client._send_prompt = AsyncMock(return_value=1)
+        client._prompt_loop = fake_prompt_loop
+
+        events: list[AcpEvent] = []
+        async for ev in client.stream_events("test"):
+            events.append(ev)
+
+        assert [ev.kind for ev in events] == [EVENT_COMPLETE]
+
+
 class TestStreamEventsExtension:
     """End-to-end tests for stream_events() yielding extension events."""
 

@@ -425,6 +425,40 @@ def parse_metadata(params: dict[str, Any]) -> tuple[float | None, float]:
     return pct_val, credits
 
 
+#: ``update.sessionUpdate`` discriminants of the mid-turn steer lifecycle
+#: extension. kiro-cli spells consumed twice (``steering_consumed`` on its own
+#: wire dialect, ``AgentExecutionSteeringInjected`` on the KAS one) and the
+#: bridge dsh-acp speaks the kiro-cli-dialect kind.
+STEER_UPDATE_DISCRIMINANTS = (
+    "steering_queued",
+    "steering_consumed",
+    "steering_cleared",
+    "AgentExecutionUserMessageQueued",
+    "AgentExecutionSteeringInjected",
+)
+
+
+def steer_discriminant(params: object) -> str:
+    """Return the steer discriminant of a session-update frame, or ``""``.
+
+    A steer notification rides the ordinary session-update methods and is told
+    apart only by ``update.sessionUpdate``, so every dispatch loop has to make
+    the same read before it can route one. Returns the discriminant (truthy)
+    for a steer frame and ``""`` for every other update, which lets callers ask
+    the question without repeating the shape checks.
+
+    Shared so AcpClient and AcpSessionHandle cannot drift on steer recognition:
+    a loop that misses it swallows the whole lifecycle as a plain update, and a
+    ``steering_consumed`` nobody reads leaves the steer in the slot's pending
+    list until teardown requeues it -- running the user's message twice.
+    """
+    update = params.get("update") if isinstance(params, dict) else None
+    discriminant = update.get("sessionUpdate") if isinstance(update, dict) else None
+    if isinstance(discriminant, str) and discriminant in STEER_UPDATE_DISCRIMINANTS:
+        return discriminant
+    return ""
+
+
 def classify_notification(msg: JsonRpcMessage) -> str:
     """Classify an incoming JSON-RPC notification into an action string.
 
@@ -444,15 +478,7 @@ def classify_notification(msg: JsonRpcMessage) -> str:
     # through unchanged. Shared here so AcpClient and AcpSessionHandle cannot
     # drift on steer recognition.
     if msg.is_method(METHOD_SESSION_UPDATE) or msg.is_method(METHOD_KIRO_SESSION_UPDATE):
-        _u = msg.params.get("update") if isinstance(msg.params, dict) else None
-        _disc = _u.get("sessionUpdate") if isinstance(_u, dict) else None
-        if _disc in (
-            "steering_queued",
-            "steering_consumed",
-            "steering_cleared",
-            "AgentExecutionUserMessageQueued",
-            "AgentExecutionSteeringInjected",
-        ):
+        if steer_discriminant(msg.params):
             return "steer"
     if msg.is_method(METHOD_SESSION_UPDATE):
         return "update"
@@ -2785,6 +2811,8 @@ __all__ = [
     "set_model_params",
     "parse_metadata",
     "classify_notification",
+    "steer_discriminant",
+    "STEER_UPDATE_DISCRIMINANTS",
     "GATE_ENVELOPE_MARKER",
     "build_permission_event",
     "gate_envelope",
