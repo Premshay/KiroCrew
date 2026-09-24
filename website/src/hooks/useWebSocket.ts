@@ -3614,6 +3614,16 @@ export function useWebSocket() {
     reconnectTimerRef.current = setTimeout(connect, 0)
   }, [connect])
 
+  /* The watchdog's escalation target. `forceReconnect` depends on `connect` and
+   * so on the whole socket setup, while the watchdog's interval must keep one
+   * progress stamp across renders: taking the callback through a ref keeps a
+   * new identity from restarting the interval and resetting that stamp, which
+   * a re-created callback would do often enough that the 100s rule never fires. */
+  const forceReconnectRef = useRef(forceReconnect)
+  useEffect(() => {
+    forceReconnectRef.current = forceReconnect
+  }, [forceReconnect])
+
   /* Row-delivery watchdog.
    *
    * A dropped socket already has two owners: the reconnect handler above
@@ -3675,7 +3685,41 @@ export function useWebSocket() {
       }
       if (Date.now() - stampedAt < ROW_STALL_MS) return
       stampedAt = Date.now()
-      dispatch(refreshSlot(chat.activeSlot))
+      /* What this client held when the stall was declared. A returned page that
+       * carries a durable row outside this set is proof the socket missed
+       * deliveries rather than the turn being slow: the server produced rows
+       * while the transcript sat still, over a socket that never closed.
+       * `meta.mid` identifies the server's own rows; client-only rows have none
+       * and prove nothing. */
+      const held = new Set<string>()
+      for (const row of msgs) {
+        // `meta.mid` is typed `unknown` on the row, so the string test is what
+        // makes it a usable set key -- and a row whose mid is not a string
+        // proves nothing about what the socket delivered.
+        const mid = row?.meta?.mid
+        if (typeof mid === 'string' && mid) held.add(mid)
+      }
+      void dispatch(refreshSlot(chat.activeSlot))
+        .unwrap()
+        .then((page) => {
+          const missed = (page?.messages ?? []).some((row) => {
+            const mid = row?.meta?.mid
+            return typeof mid === 'string' && !!mid && !held.has(mid)
+          })
+          if (!missed) return
+          /* Escalate to a reconnect: its catch-up re-reads every frame family
+           * this socket carries (slots, notifications, approvals, questions,
+           * workflow runs, artifacts, member threads), which is what the frozen
+           * sidebar and badges need -- this slot's rows were only the visible
+           * symptom. Gated on the proof above, so a turn that is merely slow
+           * -- the likelier reading of 100s of silence -- never pays for a
+           * socket teardown, which discards buffered partial chunks. */
+          forceReconnectRef.current()
+        })
+        .catch(() => {
+          /* A failed GET proves nothing about the socket; the next stall tick
+           * asks again, and the rows path reports its own failures. */
+        })
     }, ROW_STALL_TICK_MS)
     return () => clearInterval(id)
   }, [dispatch, appStore])

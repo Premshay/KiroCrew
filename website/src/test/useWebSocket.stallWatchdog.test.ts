@@ -28,9 +28,15 @@ vi.mock('../api/client', () => ({
   },
 }))
 
+const WS_INSTANCES: MockWebSocket[] = []
+
 class MockWebSocket {
   static OPEN = 1
   static CONNECTING = 0
+  static CLOSED = 3
+  constructor() {
+    WS_INSTANCES.push(this)
+  }
   readyState = MockWebSocket.CONNECTING
   onopen: ((ev: Event) => void) | null = null
   onmessage: ((ev: MessageEvent) => void) | null = null
@@ -46,6 +52,14 @@ describe('row-delivery stall watchdog', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.stubGlobal('WebSocket', MockWebSocket)
+    WS_INSTANCES.length = 0
+    vi.mocked(api.chatSlotDetail).mockResolvedValue({
+      messages: [],
+      running: false,
+      has_more: false,
+      total: 0,
+      queue: [],
+    })
     testStore = createTestStore({
       chat: { ...chatReducer(undefined, { type: '@@INIT' }), activeSlot: 'chat-active' },
     })
@@ -66,6 +80,7 @@ describe('row-delivery stall watchdog', () => {
   }
 
   const detailCalls = () => vi.mocked(api.chatSlotDetail).mock.calls.length
+  const socketCount = () => WS_INSTANCES.length
 
   it('re-hydrates the active slot when a running turn stops delivering rows', async () => {
     testStore.dispatch({ type: 'chat/startRemoteTurn', payload: 'chat-active' })
@@ -103,6 +118,63 @@ describe('row-delivery stall watchdog', () => {
 
     expect(detailCalls()).toBe(before)
     expect(api.chatSlots).not.toHaveBeenCalled()
+    unmount()
+  })
+
+  it('reconnects once a refresh proves the socket missed rows', async () => {
+    /* The page came back over HTTP carrying a durable row this client never
+     * held while the turn is still believed running: the socket is the broken
+     * half, so the recovery escalates to the reconnect whose catch-up re-reads
+     * every frame family, not this slot's rows alone. */
+    testStore.dispatch({ type: 'chat/startRemoteTurn', payload: 'chat-active' })
+    vi.mocked(api.chatSlotDetail).mockResolvedValue({
+      messages: [
+        { id: 'srv-1', role: 'assistant', content: 'row the socket missed', meta: { mid: 'm-1' } },
+      ],
+      running: true,
+      has_more: false,
+      total: 1,
+      queue: [],
+    })
+    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_TICK_MS)
+    })
+    const before = socketCount()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_MS + ROW_STALL_TICK_MS * 2)
+    })
+
+    expect(detailCalls()).toBeGreaterThan(0)
+    expect(socketCount()).toBeGreaterThan(before)
+    unmount()
+  })
+
+  it('does not reconnect when the refresh returns nothing this client lacked', async () => {
+    /* A slow turn is the ordinary reading of 100s of silence, and a teardown
+     * there would discard buffered partial chunks for nothing. With no row the
+     * client never held there is no proof, so the cheap re-fetch stands alone. */
+    testStore.dispatch({ type: 'chat/startRemoteTurn', payload: 'chat-active' })
+    vi.mocked(api.chatSlotDetail).mockResolvedValue({
+      messages: [],
+      running: true,
+      has_more: false,
+      total: 0,
+      queue: [],
+    })
+    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_TICK_MS)
+    })
+    const before = socketCount()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ROW_STALL_MS + ROW_STALL_TICK_MS * 2)
+    })
+
+    expect(detailCalls()).toBeGreaterThan(0)
+    expect(socketCount()).toBe(before)
     unmount()
   })
 })
