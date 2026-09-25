@@ -1748,12 +1748,19 @@ def _write_review_section(patch: dict) -> dict:
             # Empty/None clears the override (back to the dedicated reviewer).
             # A non-empty value must name a known agent: it becomes the review
             # worker's spawn identity, so raw request input must not reach it.
+            previous_agent = review.get("agent") or None
             if not a:
                 review["agent"] = None
             elif review_pool.is_known_review_agent(str(a)):
                 review["agent"] = str(a)
             else:
                 raise ValueError(f"unknown agent {str(a)!r}")
+            # A model override was chosen from the previous agent's runtime and
+            # can be one the new agent rejects (a Codex model on a Claude seat
+            # fails the review at session start), so switching agents resets it
+            # to the new agent's default unless this patch sets a model too.
+            if review["agent"] != previous_agent and "model" not in patch:
+                review["model"] = None
 
         if "model" in patch:
             m = patch["model"]
