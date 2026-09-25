@@ -587,6 +587,19 @@ class TestSettingsModelValidation(unittest.TestCase):
             review = self.mod._write_review_section({"model": None})
         self.assertIsNone(review["model"])
 
+    def test_agent_change_clears_model_override(self):
+        with unittest.mock.patch.object(
+            self.mod, "_known_models", return_value=["gpt-5.6-sol"]
+        ), unittest.mock.patch.object(
+            self.mod.review_pool, "is_known_review_agent", return_value=True
+        ):
+            self.mod._write_review_section({"agent": "codex-seat", "model": "gpt-5.6-sol"})
+            unchanged = self.mod._write_review_section({"agent": "codex-seat"})
+            self.assertEqual(unchanged["model"], "gpt-5.6-sol")
+            review = self.mod._write_review_section({"agent": "claude-seat"})
+        self.assertEqual(review["agent"], "claude-seat")
+        self.assertIsNone(review["model"])
+
     def test_repository_binding_must_reference_a_pinned_sage_repo(self):
         binding = {
             "namespace_bindings": {
