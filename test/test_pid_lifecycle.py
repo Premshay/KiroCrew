@@ -314,7 +314,9 @@ class TestSignalOrphanedRuntimeGroup:
     def test_signals_each_vouched_member_by_identity(self, monkeypatch, seam) -> None:
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a", 102: "b"})
+        monkeypatch.setattr(
+            sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a", 102: "b"}
+        )
         self._identity(monkeypatch, {101: "a", 102: "b"})
         sent = self._delivery(monkeypatch, seam)
         killpg = MagicMock()
@@ -341,7 +343,7 @@ class TestSignalOrphanedRuntimeGroup:
 
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         self._identity(monkeypatch, {101: "a"})
 
         def _refuse(pid):
@@ -367,7 +369,7 @@ class TestSignalOrphanedRuntimeGroup:
 
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         self._identity(monkeypatch, {101: "a"})
 
         def _send(fd, sig):
@@ -392,7 +394,7 @@ class TestSignalOrphanedRuntimeGroup:
         """
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         self._identity(monkeypatch, {101: "a"})
 
         def _refuse(pid):
@@ -419,7 +421,7 @@ class TestSignalOrphanedRuntimeGroup:
         """
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         live = {101: "a"}
         monkeypatch.setattr(sp.platform_compat, "get_process_start_id", lambda pid: live.get(pid))
 
@@ -451,7 +453,9 @@ class TestSignalOrphanedRuntimeGroup:
         """
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a", 102: "b"})
+        monkeypatch.setattr(
+            sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a", 102: "b"}
+        )
         self._identity(monkeypatch, {101: "a", 102: "b2"})  # 102 changed hands
         sent = self._delivery(monkeypatch, seam)
 
@@ -464,7 +468,9 @@ class TestSignalOrphanedRuntimeGroup:
         the only target."""
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a", 103: "c"})
+        monkeypatch.setattr(
+            sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a", 103: "c"}
+        )
         self._identity(monkeypatch, {101: "a", 103: "c"})
         sent = self._delivery(monkeypatch, seam)
 
@@ -485,7 +491,9 @@ class TestSignalOrphanedRuntimeGroup:
         from kiro_crew import session_pid as sp
 
         # 101 is alive but under a NEW start id: the pid was reused.
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a2", 200: "z"})
+        monkeypatch.setattr(
+            sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a2", 200: "z"}
+        )
         kill = MagicMock()
         monkeypatch.setattr(sp.os, "kill", kill)
 
@@ -499,7 +507,7 @@ class TestSignalOrphanedRuntimeGroup:
     ) -> None:
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: None})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: None})
         kill = MagicMock()
         monkeypatch.setattr(sp.os, "kill", kill)
 
@@ -510,7 +518,7 @@ class TestSignalOrphanedRuntimeGroup:
         """Nothing to compare at the instant of the signal means no signal."""
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: None})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: None})
         kill = MagicMock()
         monkeypatch.setattr(sp.os, "kill", kill)
 
@@ -520,7 +528,7 @@ class TestSignalOrphanedRuntimeGroup:
     def test_no_vouching_member_sends_nothing(self, monkeypatch) -> None:
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {})
         kill = MagicMock()
         monkeypatch.setattr(sp.os, "kill", kill)
 
@@ -532,7 +540,7 @@ class TestSignalOrphanedRuntimeGroup:
         and PID pruning. The sweep retries a refused member on its own cadence."""
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         self._identity(monkeypatch, {101: "a"})
 
         def _refused(pid, sig):
@@ -544,7 +552,7 @@ class TestSignalOrphanedRuntimeGroup:
     def test_a_member_that_exited_under_us_counts_as_nothing(self, monkeypatch) -> None:
         from kiro_crew import session_pid as sp
 
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
         self._identity(monkeypatch, {101: "a"})
 
         def _gone(pid, sig):
@@ -586,7 +594,7 @@ class TestSignalOrphanedRuntimeGroup:
 
         kill = MagicMock()
         monkeypatch.setattr(sp.os, "kill", kill)
-        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst: {101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
 
         assert sp._signal_orphaned_runtime_group(sp.os.getpgrp(), 15, "inst") == {}
         kill.assert_not_called()
@@ -665,6 +673,97 @@ class TestMarkedGroupMembers:
         assert sp._env_spawn_instance(101, root) == "abc123"
         assert sp._env_spawn_instance(202, root) is None  # marker but no instance
         assert sp._env_spawn_instance(303, root) is None  # unreadable
+
+    def test_a_caller_may_turn_off_the_runtime_identity_gate(self, tmp_path, monkeypatch) -> None:
+        """The argv gate is the ACP tree's shape, not every spawn's.
+
+        An app backend's members are whatever its manifest runs, so the default
+        gate rejects all of them and the reap would reach nothing. A caller that
+        turns the gate off keeps the group and instance checks unchanged.
+        """
+        from kiro_crew import session_pid as sp
+
+        monkeypatch.setattr(sp.sys, "platform", "linux")
+        root = self._fake_proc(tmp_path, {101: ("S", 100, "ours"), 104: ("S", 200, "ours")})
+        monkeypatch.setattr(sp, "Path", lambda p="/proc": root if p == "/proc" else Path(p))
+        real_reader = sp._env_spawn_instance
+        monkeypatch.setattr(sp, "_env_spawn_instance", lambda pid: real_reader(pid, root))
+        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid: True)
+        monkeypatch.setattr(sp, "_pid_start_token", lambda pid: f"s{pid}")
+        # The default gate is what an app backend's tree fails.
+        monkeypatch.setattr(sp, "_tracked_child_has_runtime_identity", lambda pid: False)
+
+        assert sp._marked_group_members(100, "ours") == {}
+        assert sp._marked_group_members(100, "ours", require_runtime_identity=False) == {
+            101: "s101"
+        }
+        # Turning the gate off relaxes ONLY that gate: a member of another group,
+        # or one carrying a different instance, is still refused.
+        assert sp._marked_group_members(200, "theirs", require_runtime_identity=False) == {}
+
+    def test_the_public_non_runtime_entry_point_turns_the_gate_off(self, monkeypatch) -> None:
+        """signal_orphaned_spawn_group differs from the ACP path in exactly one way."""
+        from kiro_crew import session_pid as sp
+
+        seen: dict[str, object] = {}
+
+        def _members(pgid, inst, **kwargs):
+            seen.update({"pgid": pgid, "inst": inst, **kwargs})
+            return {}
+
+        monkeypatch.setattr(sp, "_marked_group_members", _members)
+
+        assert sp.signal_orphaned_spawn_group(100, 15, "inst") == ({}, {})
+        assert seen["pgid"] == 100 and seen["inst"] == "inst"
+        assert seen["require_runtime_identity"] is False
+        # The ACP path keeps the gate ON, and says so rather than relying on a
+        # default the public entry point could change under it. It also keeps the
+        # single-map return: a refused signal changes nothing an ACP teardown does.
+        seen.clear()
+        assert sp._signal_orphaned_runtime_group(100, 15, "inst") == {}
+        assert seen["require_runtime_identity"] is True
+
+    def test_the_public_entry_point_reports_the_vouch_apart_from_the_signals(
+        self, monkeypatch
+    ) -> None:
+        """An empty signal set alone cannot say whether the group is GONE.
+
+        A caller keeping an orphan's only record has to tell "nothing is there" from
+        "everything there refused the signal" -- collapsing them is how a refusal
+        comes to read as a completed reap.
+        """
+        from kiro_crew import session_pid as sp
+
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {101: "a"})
+        monkeypatch.setattr(sp, "_pid_start_token", lambda pid: "a")
+
+        # Every signal refused: the member is still vouched, and the census says so.
+        def _refuse(pid, sig, start):
+            raise OSError(1, "Operation not permitted")
+
+        monkeypatch.setattr(sp, "_signal_pid_by_identity", _refuse)
+        assert sp.signal_orphaned_spawn_group(100, 15, "inst") == ({101: "a"}, {})
+
+        # Nothing live in the group: both maps empty, which is the only shape that
+        # means "gone".
+        monkeypatch.setattr(sp, "_marked_group_members", lambda pgid, inst, **_k: {})
+        assert sp.signal_orphaned_spawn_group(100, 15, "inst") == ({}, {})
+
+    def test_the_public_entry_point_keeps_every_other_refusal(self, monkeypatch) -> None:
+        """A relaxed argv gate must not relax the group or instance guards."""
+        from kiro_crew import session_pid as sp
+
+        members = MagicMock(return_value={101: "a"})
+        monkeypatch.setattr(sp, "_marked_group_members", members)
+        kill = MagicMock()
+        monkeypatch.setattr(sp.os, "kill", kill)
+
+        assert sp.signal_orphaned_spawn_group(0, 15, "inst") == ({}, {})
+        assert sp.signal_orphaned_spawn_group(1, 15, "inst") == ({}, {})
+        assert sp.signal_orphaned_spawn_group(100, 15, "") == ({}, {})
+        assert sp.signal_orphaned_spawn_group(os.getpgrp(), 15, "inst") == ({}, {})
+        members.assert_not_called()
+        kill.assert_not_called()
 
 
 class TestCleanupOrphanedMcpServers:
@@ -2084,8 +2183,66 @@ class TestSyncKillProviderTree:
         provider._active_proc = None
         return provider
 
-    @staticmethod
-    def _spawn_tree(*, escape_group: bool) -> tuple[subprocess.Popen, int]:
+    #: pid -> start-time identity, captured while the pid was provably ours.
+    #: ``_reap`` signals a pid only while its identity still matches this record.
+    _pinned: dict[int, str]
+
+    @pytest.fixture(autouse=True)
+    def _identity_pins(self) -> None:
+        self._pinned = {}
+
+    def _pin(self, *pids: int) -> None:
+        """Record each pid's identity NOW, at the moment it is known to be ours.
+
+        Every pid these tests hand to ``_reap`` is proven dead by the body first, and
+        a grandchild's number is held by nobody once init has collected it -- the
+        root's, too, once production's ``_reap_provider_root`` has waited on it. A
+        bare ``os.kill`` in the ``finally`` would therefore go out on every PASSING
+        run at whatever holds that number by then. The identity is read through
+        ``process_start_time`` rather than ``get_process_start_id``: several tests
+        below patch the latter (and ``kill_pid``) on ``platform_compat`` to script
+        production's view of the root, and the teardown must read the real table.
+
+        An identity that cannot be read (the macOS ``ps`` leg times out or is
+        missing) is not stored as a pin ``_reap`` would then skip: that would leave
+        the 300-second sleeper behind. This is the one moment every pid here is
+        ours by construction -- just spawned, or just reported by a root that is
+        still ours -- so the whole batch is killed on the spot and the test fails
+        on the capture, before any of it can be mistaken for a stranger later.
+        """
+        tokens = {pid: platform_compat.process_start_time(pid) for pid in pids}
+        unreadable = [pid for pid, token in tokens.items() if token is None]
+        if unreadable:
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except (ChildProcessError, OSError):
+                    pass
+            raise AssertionError(
+                f"could not read the start-time identity of {unreadable}, so the "
+                f"teardown could not have pinned the kill; killed {list(pids)} now"
+            )
+        for pid, token in tokens.items():
+            self._pinned.setdefault(pid, token)
+
+    def _spawn_isolated(self) -> subprocess.Popen:
+        """A 300-second sleeper in its own session, pinned for ``_reap``.
+
+        The stand-in for a provider root, a stray or a bystander: a direct child
+        of this process whose status production may still collect before the
+        teardown runs, so its number is not guaranteed held either.
+        """
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
+        )
+        self._pin(proc.pid)
+        return proc
+
+    def _spawn_tree(self, *, escape_group: bool) -> tuple[subprocess.Popen, int]:
         """Spawn an isolated group leader that forks one stubborn grandchild.
 
         Returns the root AND its grandchild's pid, which the root reports on
@@ -2099,6 +2256,8 @@ class TestSyncKillProviderTree:
         survived, so a grandchild still holding the default SIGTERM disposition
         breaks the premise rather than the assertion -- the tree really is gone, and
         the teardown is right to stop early.
+
+        Both pids are pinned for ``_reap`` here, while the tree is provably ours.
         """
         grandchild = _STUBBORN_GRANDCHILD.format(setsid="os.setsid()\n" if escape_group else "")
         proc = subprocess.Popen(
@@ -2112,17 +2271,19 @@ class TestSyncKillProviderTree:
             proc.kill()
             proc.wait(timeout=10)
             raise AssertionError("provider root never reported its grandchild pid")
-        return proc, int(reported)
+        gc_pid = int(reported)
+        self._pin(proc.pid, gc_pid)
+        return proc, gc_pid
 
-    @staticmethod
-    def _await_descendants(pid: int, timeout: float = 10.0) -> list[int]:
-        """Wait for the root's fork to appear; return the descendant pids."""
+    def _await_descendants(self, pid: int, timeout: float = 10.0) -> list[int]:
+        """Wait for the root's fork to appear; return the (pinned) descendant pids."""
         from kiro_crew.acp.client import _get_child_pids
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             found = _get_child_pids(pid)
             if found:
+                self._pin(*found)
                 return found
             time.sleep(0.05)
         raise AssertionError(f"grandchild of {pid} never appeared")
@@ -2287,10 +2448,39 @@ class TestSyncKillProviderTree:
         left = self._await_gone([root.pid, *descendants], timeout=_left())
         assert left == [], f"pids still held after the tree was torn down: {left}"
 
-    @staticmethod
-    def _reap(pids: list[int]) -> None:
-        """Best-effort teardown so no test process survives the run."""
+    def _reap(self, pids: list[int]) -> None:
+        """Best-effort teardown so no test process survives the run.
+
+        Each pid is signalled ONLY while it still carries the identity ``_pin``
+        recorded when it was ours. A pid the body proved dead reads a different
+        identity here and is left alone: SIGKILL at a recycled number is a signal
+        at a stranger. An unpinned pid is a test bug, not a stranger to spare --
+        fail loudly rather than leak a 300-second sleeper.
+
+        A pid that is still present but whose identity cannot be read (the macOS
+        ``ps`` leg can time out under a loaded run) is neither proven ours nor
+        proven gone. The read is retried a few times; if it never answers, the
+        teardown does not guess -- it fails the test naming the pid, so the leak
+        is reported rather than silent. The sleeper itself exits within 300 s.
+
+        ``os.kill`` directly, not ``platform_compat.kill_pid``: tests in this class
+        patch ``kill_pid`` on ``platform_compat`` to observe production's decisions,
+        and the teardown must not route through the fake it left behind.
+        """
+        unconfirmable: list[int] = []
         for pid in pids:
+            assert pid in self._pinned, f"pid {pid} was never pinned; call _pin at spawn"
+            identity = platform_compat.process_start_time(pid)
+            for _ in range(3):
+                if identity is not None or not platform_compat.pid_exists(pid):
+                    break
+                time.sleep(0.2)
+                identity = platform_compat.process_start_time(pid)
+            if identity is None and platform_compat.pid_exists(pid):
+                unconfirmable.append(pid)
+                continue
+            if identity != self._pinned[pid]:
+                continue  # already gone and possibly reissued
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
@@ -2299,6 +2489,11 @@ class TestSyncKillProviderTree:
                 os.waitpid(pid, os.WNOHANG)
             except (ChildProcessError, OSError):
                 pass
+        assert not unconfirmable, (
+            f"pids {unconfirmable} are still present but their identity could not be "
+            "read, so the teardown could not confirm they are ours to kill; they were "
+            "left running (300-second sleepers)"
+        )
 
     def test_a_zombie_descendant_does_not_count_as_running(self) -> None:
         """The state reader separates a stopped descendant from a live one.
@@ -2403,12 +2598,8 @@ class TestSyncKillProviderTree:
         from kiro_crew.session_pid import _sync_kill_provider
 
         monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.5)
-        root = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
-        stray = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
+        root = self._spawn_isolated()
+        stray = self._spawn_isolated()
         try:
             # Not a descendant of root at all — exactly the reparented case.
             provider = self._provider(root.pid, child_pids=_capture_child_records([stray.pid]))
@@ -2520,12 +2711,8 @@ class TestSyncKillProviderTree:
         from kiro_crew.session_pid import _sync_kill_provider
 
         monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
-        root = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
-        stray = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
+        root = self._spawn_isolated()
+        stray = self._spawn_isolated()
         try:
             provider = self._provider(
                 root.pid,
@@ -2558,12 +2745,8 @@ class TestSyncKillProviderTree:
         from kiro_crew.session_pid import _sync_kill_provider
 
         monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
-        root = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
-        stray = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
+        root = self._spawn_isolated()
+        stray = self._spawn_isolated()
         killpg_calls: list[tuple[int, int]] = []
         real_pgroup_of = platform_compat.pgroup_of
         seen = {"n": 0}
@@ -2652,9 +2835,7 @@ class TestSyncKillProviderTree:
 
         monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
         root, gc_pid = self._spawn_tree(escape_group=False)
-        stray = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
+        stray = self._spawn_isolated()
         real_start_id = platform_compat.get_process_start_id
         self._await_descendants(root.pid)  # the walk has something to find
         # Built BEFORE the patch: _provider reads the start id itself, and counting
@@ -2708,12 +2889,8 @@ class TestSyncKillProviderTree:
         from kiro_crew.session_pid import _sync_kill_provider
 
         monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
-        root = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
-        bystander = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
+        root = self._spawn_isolated()
+        bystander = self._spawn_isolated()
         provider = self._provider(root.pid)
         walks = {"n": 0}
 
@@ -2891,12 +3068,8 @@ class TestSyncKillProviderTree:
         from kiro_crew.session_pid import _sync_kill_provider
 
         monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.2)
-        root = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
-        bystander = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
+        root = self._spawn_isolated()
+        bystander = self._spawn_isolated()
         real_start_id = platform_compat.get_process_start_id
         provider = self._provider(root.pid)
         # Both scans report the pid, so the intersection keeps it; only the root
@@ -3008,12 +3181,8 @@ class TestSyncKillProviderTree:
 
         monkeypatch.setattr("kiro_crew.session_pid._PROVIDER_TERM_GRACE_SECONDS", 0.5)
 
-        root = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
-        bystander = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
-        )
+        root = self._spawn_isolated()
+        bystander = self._spawn_isolated()
         try:
             # A record claiming an impossible start time: the live process cannot
             # match it, so the sweep must refuse to signal that pid.
@@ -3034,14 +3203,13 @@ class TestSyncKillProviderTree:
             root.wait(timeout=10)
             bystander.wait(timeout=10)
 
-    @staticmethod
-    def _spawn_reaped_leader(ready_dir: Path) -> tuple[int, str | None, int, int]:
+    def _spawn_reaped_leader(self, ready_dir: Path) -> tuple[int, str | None, int, int]:
         """Spawn an isolated leader with two SIGTERM-ignoring children, then reap it.
 
         Returns the leader's pid, the start id recorded for it while it was alive,
-        and the two children's pids. On return the leader is gone from ``/proc``
-        while its group still holds both children -- the shape a pid alone cannot
-        tell apart from a recycled one.
+        and the two children's pids, pinned for ``_reap``. On return the leader is
+        gone from ``/proc`` while its group still holds both children -- the shape a
+        pid alone cannot tell apart from a recycled one.
 
         Both children ignore SIGTERM and touch ``ready_dir/<pid>`` once they have,
         so a caller can wait out the window in which a SIGTERM would still kill them
@@ -3085,6 +3253,7 @@ class TestSyncKillProviderTree:
             reported = output.split()
             assert len(reported) == 2, "provider root never reported both child pids"
             witness_pid, unrecorded_pid = (int(value) for value in reported)
+            self._pin(witness_pid, unrecorded_pid)
             return proc.pid, recorded_start, witness_pid, unrecorded_pid
         except BaseException:
             # Kill the GROUP, not just the root. One child can already be running

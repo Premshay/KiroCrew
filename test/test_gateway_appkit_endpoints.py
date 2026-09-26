@@ -151,7 +151,20 @@ class TestMcpServerRegistration:
 
     @asynccontextmanager
     async def _make_client(self):
-        app = web.Application()
+        # ``/api/mcp/servers`` is listed in
+        # ``dashboard.server._STRICT_INTERNAL_API_PATHS``, so the transport this
+        # class exercises is the App Kit SDK's: a loopback process presenting
+        # ``X-Internal-Secret``, which ``token_auth`` grants and marks
+        # ``internal_auth``. The handler reads that mark to tell this caller from a
+        # browser session, which must be the dashboard owner, so the fixture has to
+        # publish it the way the middleware does or every request here lands on the
+        # owner gate instead of on the registration behaviour under test.
+        @web.middleware
+        async def _internal_secret_grant(request, handler):
+            request["internal_auth"] = True
+            return await handler(request)
+
+        app = web.Application(middlewares=[_internal_secret_grant])
         app.router.add_put("/api/mcp/servers/{name}", api_mcp_server_detail)
         app.router.add_delete("/api/mcp/servers/{name}", api_mcp_server_detail)
         async with TestClient(TestServer(app)) as c:
@@ -2402,6 +2415,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default
@@ -2432,6 +2449,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default
@@ -2734,6 +2755,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default

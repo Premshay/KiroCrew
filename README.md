@@ -54,158 +54,40 @@ that prerequisite and links to the official setup guide when it is missing.
 
 ### App downloads
 
-The desktop app starts a bundled Gateway when no local Gateway is already
-running, updates itself on the channel you download, and can connect to a
-remote Gateway over an SSH tunnel. See the
-[desktop app guide](docs/build/desktop-app.md).
-
-- **macOS** (Apple Silicon/Intel): [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew.dmg) | [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew.dmg) | [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew.dmg)
-- **Windows** (x64): [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-Setup.exe) | [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-Setup.exe) | [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-Setup.exe)
-
-**On Linux, start with the one-line install** — it is the smoothest path, works
-on every distro and both architectures, and puts `kirocrew` on your `PATH`,
-which is what makes `kirocrew service install` (and the AppArmor profile the
-agent sandbox needs on Ubuntu 23.10+) reachable:
-
-```bash
-curl -fsSL https://download.crew.kiro.dev/cli.sh | sh
-```
-
-You then work in the dashboard at `http://localhost:5476`. Add a **desktop
-package** when you want what only the Electron shell gives you: an
-application-menu entry and icon, a native window, a taskbar badge, a system-wide
-hotkey, a Gateway that starts and stops with the app, and in-app updates. A
-`.deb` or `.rpm` installs to a fixed path under `/opt`, which is what lets it set
-the AppArmor profile up for you; the AppImage needs no root but needs FUSE and
-carries a manual sandbox step. `uname -m` prints which architecture you need.
-
-| Linux desktop package | x86_64 | aarch64 (Graviton, Raspberry Pi, ARM laptops) |
-|---|---|---|
-| **`.deb`** (Debian, Ubuntu) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-x86_64.deb) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-x86_64.deb) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-x86_64.deb) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-aarch64.deb) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-aarch64.deb) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-aarch64.deb) |
-| **`.rpm`** (Fedora, RHEL, CentOS Stream, Amazon Linux 2023) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-x86_64.rpm) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-x86_64.rpm) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-x86_64.rpm) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-aarch64.rpm) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-aarch64.rpm) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-aarch64.rpm) |
-| **AppImage** (no root, any distro) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-x86_64.AppImage) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-x86_64.AppImage) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-x86_64.AppImage) | [Stable](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-aarch64.AppImage) · [Insider](https://download.crew.kiro.dev/desktop/insider/latest/KiroCrew-aarch64.AppImage) · [Nightly](https://download.crew.kiro.dev/desktop/nightly/latest/KiroCrew-aarch64.AppImage) |
-
-```bash
-sudo apt install ./KiroCrew-x86_64.deb     # Debian, Ubuntu
-sudo dnf install ./KiroCrew-x86_64.rpm     # Fedora, RHEL, CentOS Stream, AL2023
-```
-
-The Linux desktop app needs **glibc 2.34 or newer** (Ubuntu 22.04+, Debian 12+,
-Fedora, CentOS Stream 9, Amazon Linux 2023). On an older host — Ubuntu 20.04,
-Debian 11, Amazon Linux 2 — use the one-line install above.
-
-Every architecture below is a first-class lane: each gets its own build, its own
-auto-update feed, and its own SLSA provenance attestation.
-
-| Install path | x86_64 | aarch64 (ARM64) |
-|---|---|---|
-| **CLI one-liner / wheel** | yes | yes (the wheel is `py3-none-any`; native libraries are vendored per architecture) |
-| **Desktop `.deb` / `.rpm` / AppImage** | yes | yes |
-| **Docker image** | yes | yes (`linux/amd64` and `linux/arm64` under every tag, so `docker pull` picks yours) |
-
-Take Stable unless you have a reason not to — the table below says who each
-channel is for.
+Use the Stable desktop package for [macOS](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew.dmg)
+or [Windows x64](https://download.crew.kiro.dev/desktop/stable/latest/KiroCrew-Setup.exe).
+On Linux, start with the one-line install below. The
+[install guide](docs/guides/install.md#install-paths) owns Insider and Nightly
+links, Linux `.deb` / `.rpm` / AppImage packages, architecture support, platform
+requirements, and sandbox setup.
 
 ### Release channels
 
-Every install path — desktop app, CLI, Docker image — offers the same three
-channels. Pick by how much churn you can absorb, not by version number:
-
-| Channel | Who it's for | Built from | Cadence |
-|---------|--------------|------------|---------|
-| **Stable** | Everyone. The default on every install path. | The Insider build that baked long enough to be promoted | On promotion, no calendar commitment |
-| **Insider** | Power users who want features days to weeks early and accept the new bugs that come with them | Release-branch release-candidate tags | Every RC |
-| **Nightly** | Us and contributors. Untested `main` HEAD — expect breakage. | `main`, 06:00 UTC daily | Daily |
-
-Stable and Insider are two update lanes of the **same** app. The desktop app
-switches between them in Settings → About, a CLI install switches by re-running
-the installer with `--channel`, and a container switches by pulling a different
-tag. Either way, the other lane's current version then arrives as an ordinary
-update.
-
-Because they are one app, keeping a Stable *and* an Insider copy side by side
-does not give you two independent installs. Both read the same desktop settings
-store, so the channel is a single value and whichever copy wrote it last wins —
-switch to Insider in one and the other follows. They share one update download
-cache as well. `KIROCREW_HOME` does not separate them either: it moves the data
-home, not the desktop settings.
-
-Nightly is a separate app with its own name and icon, so it installs *alongside*
-a Stable or Insider one rather than replacing it. That also makes it the one copy
-that keeps its own channel and its own settings store. It is not a sandbox,
-though: it reads the same `~/.kiro/crew` data home unless you point it elsewhere
-with `KIROCREW_HOME`.
-
-Running Insider or Nightly is a real contribution. When something looks wrong,
-please [open an issue](https://github.com/kirodotdev/KiroCrew/issues) so it gets
-fixed before it reaches Stable.
+Stable is the default; Insider follows release candidates, and Nightly follows
+`main`. The [release runbook](docs/build/release.md#the-three-channels) owns the
+current triggers, version shapes, promotion behavior, cadence, and update-lane
+semantics.
 
 ### One-line install
 
-Install the prebuilt, SHA-256-verified wheel from the release CDN without
-cloning the repository or running `npm` and a local build.
-
-Stable, the default:
+Install the signed Stable wheel without cloning the repository or building the
+frontend:
 
 ```bash
 curl -fsSL https://download.crew.kiro.dev/cli.sh | sh
 ```
 
-Track a faster channel, `insider` or `nightly` (see
-[Release channels](#release-channels) for who each one is for):
-
-```bash
-curl -fsSL https://download.crew.kiro.dev/cli.sh | sh -s -- --channel insider
-```
-
-Pin an exact version:
+Then open `http://localhost:5476`. Pass `--version` to pin an exact release —
+the minimum pinnable release is `0.1.2`, because `0.1.0` and `0.1.1` predate
+manifest signing and have no signed manifest to resolve:
 
 ```bash
 curl -fsSL https://download.crew.kiro.dev/cli.sh | sh -s -- --version 0.6.0
 ```
 
-Pinning resolves an immutable signed manifest, so the minimum pinnable release
-is `0.1.2`; `0.1.0` and `0.1.1` predate manifest signing and cannot be
-installed. See
-[Pinning an exact version](docs/guides/install.md#pinning-an-exact-version).
-
-**Managed Python by default.** The installer runs Kiro Crew on a fully managed
-Python instead of the system one: it fetches a SHA-256-pinned
-[uv](https://docs.astral.sh/uv/) and provisions a self-contained CPython 3.12
-into `~/.kiro/crew-python`, so the install never depends on (or breaks with)
-the system interpreter. Existing installs migrate the next time this installer
-itself runs — a staged update applied from the dashboard or the CLI's update
-command keeps its current interpreter. To run
-on the system interpreter instead:
-
-```bash
-curl -fsSL https://download.crew.kiro.dev/cli.sh | sh -s -- --system-python
-```
-
-The choice is sticky: it is recorded next to the channel, so later re-runs of
-the installer keep it without
-the flag. Opt back in with `--managed-python`. If the managed interpreter
-cannot be downloaded (no network path to the mirror), the installer falls back
-to a usable system Python 3.12+ for that run; point air-gapped hosts at a
-mirror with `KIROCREW_UV_URL` (the uv tarball) and `UV_PYTHON_INSTALL_MIRROR`
-(the interpreter archive).
-
-Open `http://localhost:5476` and start a conversation. The web dashboard works
-without messaging credentials. Add a messaging channel —
-[Slack](docs/guides/slack-setup.md),
-[Discord](src/kiro_crew/docs/discord-integration.md),
-[Telegram](src/kiro_crew/docs/telegram-integration.md),
-[Teams](src/kiro_crew/docs/teams-integration.md),
-[Webex](src/kiro_crew/docs/webex-integration.md),
-[WeCom](src/kiro_crew/docs/wecom-integration.md),
-[WeChat](src/kiro_crew/docs/weixin-integration.md),
-[WhatsApp](src/kiro_crew/docs/whatsapp-integration.md),
-[Feishu](src/kiro_crew/docs/feishu-integration.md), or
-[iMessage](src/kiro_crew/docs/imessage-integration.md) — when you want to continue
-working with the same agent away from the dashboard. Apart from Teams (which
-needs a public HTTPS webhook — see its guide) and iMessage (which talks to
-Messages.app on the same Mac), these channels connect
-outbound, so you do not need to expose the dashboard port publicly.
+The [install guide](docs/guides/install.md#a-one-line-install-fastest) owns
+channel selection, managed versus system Python, mirrors, first-run setup,
+upgrades, and recovery.
 
 ### Docker
 
@@ -223,13 +105,13 @@ the container security model.
 
 ### Build from source
 
-macOS and Linux require Python 3.12+, Node.js 22+ (24 LTS recommended), npm, and
-[`kiro-cli`](https://kiro.dev/docs/cli/). Install Kiro CLI on the Gateway host
-and run `kiro-cli login` separately before using chat. The first desktop or
-dashboard launch checks this prerequisite and links to the official setup
-guide when it is missing. Windows is supported through a native source install;
-follow the [Windows guide](docs/guides/windows-install.md) instead of the shell
-steps below.
+macOS and Linux require Python 3.12+, Node.js 22+ (24 LTS recommended), and
+npm. The default ACP backend also requires
+[`kiro-cli`](https://kiro.dev/docs/cli/): install it on the Gateway host and run
+`kiro-cli login` before using that backend. Other verified ACP harnesses have
+their own prerequisites in the [install guide](docs/guides/install.md). Windows
+is supported through a native source install; follow the
+[Windows guide](docs/guides/windows-install.md) instead of the shell steps below.
 
 ```bash
 # 1. Clone and build Kiro Crew
@@ -272,7 +154,7 @@ Discord.
 | Capability | What it gives you |
 |---|---|
 | **Persistent sessions** | Run concurrent, isolated conversations, resume them after Gateway restarts, search prior sessions, and carry recent context into new work. |
-| **Self-learning** | Turn corrections and task failures into durable lessons that change later behavior. Keep preferences, active-project context, and history scoped to the relevant workspace. Say *"no, always run the frontend checks before calling a change done"* and it becomes a workspace-scoped lesson applied in future sessions. |
+| **Self-learning** | Turn corrections and task failures into durable lessons that change later behavior. Lessons can apply globally or carry a `repo_scope` that limits them to one repository; Crew Members keep private lessons in their own memory store. |
 | **Self-evolving skills** | Synthesize reusable skills from repeated patterns, then inspect, refine, or remove them as your work changes. |
 | **Long-running tasks** | Give Kiro Crew a task spec and walk away. It plans steps, executes them, validates results, retries failures, and resumes from checkpoints. *"Implement this migration plan and stop if the tests fail"* runs as a checkpointed task with validation at each step. |
 | **Unattended autonomy** | Run scheduled agent work or deterministic scripts and commands without a model call. Monitor work until it is done, or react to messaging events and authenticated webhooks without someone at the terminal. *"Every weekday at 9, summarize the open work I should review"* becomes a timezone-aware recurring job delivered to the surface you choose. |
@@ -294,171 +176,51 @@ The complete inventory is in [Features](src/kiro_crew/docs/index.md) and
 
 ```mermaid
 flowchart TD
-    S["Desktop app · Web dashboard · CLI · Messaging channels (Slack, Discord, Telegram, Teams, Webex, WeCom, WeChat, WhatsApp, Feishu, iMessage)"]
+    S["Desktop app · Web dashboard · CLI · Messaging channels"]
     G["Gateway<br/>access · sessions · memory · schedules · approvals · apps"]
-    A["Agent sessions<br/>ACP runtime · kiro-cli · MCP tools · models"]
+    A["Agent sessions<br/>ACP runtime · selected harness · MCP tools · models"]
     S --> G --> A
 ```
 
-The Gateway separates where the agent runs from where you work with it. In the
-desktop app or web dashboard, you can work directly through parallel conversations,
-files, task runs, approvals, memory, and apps. From the CLI or any connected
-messaging channel, the Gateway routes your work to managed agent sessions under
-the same memory, tool, approval, and policy services. Apps extend the dashboard and
-Gateway APIs with focused workflows.
+The Gateway separates where the agent runs from where you work. Each
+conversation or background task is a logical agent session driven through the
+selected `agent.acp_backend`; depending on that harness and workload, the
+session uses a dedicated process or a handle on a shared ACP runtime. State,
+policy, approvals, schedules, memory, and apps remain on the Gateway host.
 
-Each active conversation or background task uses an agent session. Its session
-provider drives `kiro-cli` over ACP, streams model and tool events, and preserves
-conversation state. Depending on the workload, a session is backed by its own
-ACP process or by a session handle on a shared multiplexed ACP runtime. The
-Gateway manages these sessions along with scheduling, approvals, memory,
-security policy, messaging connections, and the dashboard.
-
-The current runtime places the Gateway, agent sessions, ACP processes, and state
-on the same host. Run Kiro Crew on your Mac, inside a container on your machine,
-or on a remote Linux host you control. Conversation history, memory, and
-knowledge indexes remain on that host. Model requests are handled by `kiro-cli`
-and follow the account and model configuration you use there.
-
-**Gateway.** The Gateway is the long-running Kiro Crew process. It routes
-messages from the desktop app, web, CLI, and the messaging surfaces listed below. It persists
-session state, injects memory and skills, starts scheduled work, coordinates
-subagents, brokers approvals, enforces runtime policy, and exposes activity in
-the dashboard.
-
-**Agent sessions.** A dashboard conversation, Slack thread, or Discord DM maps to
-an isolated agent session. Scheduled jobs, task runs, other messaging-channel
-conversations, and subagents also use managed sessions. These sessions preserve
-conversation context and can run concurrently before returning results to a
-parent session or configured surface.
-
-**ACP runtime and turns.** Kiro Crew supports both a dedicated `kiro-cli` ACP
-process for a session and a shared ACP runtime that multiplexes multiple session
-handles. During each turn, the session sends a prompt, streams model and tool
-events, resolves approvals, and returns the final result. An agent session is a
-logical isolation boundary, not necessarily one OS process.
-
-**Use the surface that fits the moment.**
-
-| Surface | Best for |
-|---|---|
-| **Desktop app** | The simplest local experience, with a bundled Gateway plus multi-tab connections to local or remote Gateways. |
-| **Web dashboard** | Parallel conversations, files, approvals, activity, memory, schedules, apps, settings, and system status at `localhost:5476`. |
-| **Slack** | Work from DMs and threads with streaming replies, approvals, notifications, and session links back to the dashboard. |
-| **Telegram** | Reach your agent from private DMs on your phone or laptop, with streaming replies, inline approvals, and commands. |
-| **Discord** | Work from DMs with streaming replies and approvals delivered as message buttons. |
-| **Teams** | Reach your agent from Microsoft Teams chats — replies arrive as complete messages, and approvals are answered by typing. |
-| **Webex** | Work from Webex direct messages with inline approvals; progress shows as edits to one message, which the finished answer replaces. |
-| **WeCom** | Chat through an outbound-connected WeCom AI bot with configured user access and streaming replies. |
-| **WeChat (Weixin)** | Reach your agent from WeChat with configured user access; a typing indicator runs while the turn works and the reply arrives as complete messages. |
-| **WhatsApp** | Reach your agent from WhatsApp with streaming replies, file exchange, and reactions. |
-| **Feishu (Lark)** | Chat from Feishu DMs and allow-listed group chats through a custom app bot on an outbound long connection — replies arrive as complete messages. |
-| **iMessage** | Chat from the Messages app on your own Mac and Apple devices, with no bot to register and no token to paste — replies arrive as complete messages. |
-| **CLI** | Fast interactive chat and direct automation with `kirocrew chat`, `run`, `cron`, `spawn`, and `security`. |
-
-**Choose how work starts.**
-
-| Mode | Use it for | Entry point |
-|---|---|---|
-| **Scheduled** | Briefings, audits, backups, and recurring maintenance | `kirocrew cron` or a natural-language request |
-| **Proactive** | Goals that need another pass without waiting for a new user message | AutoNudge and goal-loop skills |
-| **Reactive** | CI alerts, external automation, messaging-channel activity, and other events | Authenticated agent webhooks and messaging events |
-| **Task runner** | Bounded projects with explicit steps, tests, review, and checkpoint resume | `kirocrew run TASK.md` |
-| **Subagents** | Independent workstreams that can run concurrently | `kirocrew spawn run "task"` |
-
-**Memory, learning, and evolution.** Kiro Crew maintains preferences, active
-project context, decaying history summaries, and durable lessons. Corrections
-and task failures can change later behavior, while repeated patterns can become
-reusable skills. In-process embeddings add semantic retrieval for memory and
-the knowledge library. The stored state remains inspectable and editable
-from the dashboard. Incognito and temporary session modes let you opt out when
-a conversation should not persist.
-
-**Skills, MCP, and apps.** Markdown skills supply reusable workflows and can be
-loaded only when relevant. The built-in `kirocrew-core`, `kirocrew-cron` and
-`kirocrew-computer` MCP servers expose task, subagent, learning, messaging,
-scheduling, and desktop-automation tools. You
-can discover additional MCP servers from Kiro or Kiro Crew configuration. The
-App Kit adds installable interfaces and domain workflows. Apps can add dashboard
-pages, use scoped Gateway APIs, subscribe to events, and register lifecycle
-hooks.
+See the [architecture overview](docs/architecture/overview.md) for component
+boundaries, [sessions](docs/system-specs/modules/session.md) for lifecycle and
+isolation, and [MCP architecture](docs/architecture/mcp.md) for tool exposure.
 
 ## Security and control
 
-Kiro Crew gives an AI agent real tool access, so the controls are enforced at
-the runtime boundary instead of relying only on prompt instructions.
+Kiro Crew enforces approvals, OS isolation where available, sensitive-path and
+credential guards, denied-operation rules, audit records, and an optional
+policy/profile ceiling at the runtime boundary. The dashboard binds to loopback
+by default; any remote exposure requires authenticated configuration.
 
-- **Local by default.** The dashboard binds to loopback unless you explicitly
-  configure a network URL. Remote dashboards require token authentication.
-- **Interactive approvals.** Review tool requests in the dashboard or a
-  connected messaging channel like Slack, Discord, or Telegram.
-  Session-scoped trust can reduce repeated prompts without changing
-  the underlying deny and sensitive-path controls.
-- **OS sandbox.** On Linux and macOS, `kiro-cli` can run inside namespace or
-  Seatbelt isolation. Standard, strict, and off modes make the tradeoff
-  explicit. Windows offers no equivalent OS-level layer, so Kiro Crew fails
-  closed there: agent subprocesses are refused rather than run unconfined, until
-  you declare the
-  [`sandbox_allow_unsandboxed_exec` opt-in](docs/guides/windows-install.md#the-unsandboxed-exec-opt-in).
-- **Sensitive data guards.** Kiro Crew blocks direct access to protected paths,
-  strips sensitive environment variables, and redacts credential patterns from
-  output before it reaches a chat surface.
-- **Denied operations.** A bundled catalog of deny rules blocks destructive commands and
-  common exfiltration paths even when a session has broad approval.
-- **Auditability.** Security events and tool activity are recorded for review.
-  Use `kirocrew security events`, `audit`, and `verify` to inspect them.
-- **Governance ceiling.** Optional policy and profile files compose with a
-  tightest-wins model. A running app or agent can narrow the allowed scope but
-  cannot loosen the enterprise ceiling. Inspect it with `kirocrew policy show`,
-  `validate`, and `explain`.
-
-No agent security layer removes the need to protect credentials and review
-high-impact actions. Avoid pasting secrets or sensitive personal data into a
-chat. Read the [security architecture](docs/architecture/security-deep-dive.md) and use
-[SECURITY.md](SECURITY.md) for private vulnerability reporting.
+Read the canonical [security model](docs/system-specs/modules/security.md) and
+[security architecture](docs/architecture/security-deep-dive.md) before changing
+or widening those controls. Protect credentials, review high-impact actions, and
+use [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
 ## Install, configure, and operate
 
-**Installer details.** The installer verifies the wheel's SHA-256, installs through `pipx` or a
-managed virtual environment, and records the channel — `stable`, `insider`, or
-`nightly` — in `~/.kiro/crew/channel`. On Linux and macOS it provisions its own
-CPython 3.12 by default from a SHA-256-pinned `uv`; `--system-python` opts out
-and the choice is sticky across updates. The mechanics, the env vars that
-override each path, and the two `pip` forms for a published wheel (channel
-index, or one wheel pinned by hash) are in
-[Installing and Building](docs/guides/install.md#c-self-contained-pip-wheel).
+The [install guide](docs/guides/install.md) owns every install path, first-run
+step, optional dependency, upgrade, uninstall, and recovery procedure. User data
+lives under `~/.kiro/crew` by default and moves with `KIROCREW_HOME`; configuration
+keys and precedence are canonical in the
+[config spec](docs/system-specs/modules/config.md).
 
-**Semantic memory.** Semantic memory needs no setup. Embeddings run in-process, and the Gateway
-downloads its embedding model in the background on first start, verifies it,
-and stores it under `~/.kiro/crew/models`. Until the model lands, memory search
-falls back to keyword search and picks up embeddings automatically without a
-restart. Set `KIROCREW_EMBED_MODEL_URL` to point at a mirror for airgapped
-installs.
+For a new source or wheel install:
 
-See [Installing and Building](docs/guides/install.md) for wheels, desktop builds,
-Windows, optional voice dependencies, and manual setup.
+```bash
+kirocrew setup
+kirocrew doctor
+kirocrew gateway
+```
 
-**Choose where Kiro Crew runs.** The current deployment model keeps the Gateway,
-agent session runtime, ACP processes, and state together on one host. Your Apps
-and chat surfaces connect to that Gateway.
-
-| Deployment | How to run it | Where Kiro Crew and its state live |
-|---|---|---|
-| **Mac app, local** | Install or build the desktop app with `make desktop` | The app starts its bundled Gateway. Agent sessions, ACP processes, and `~/.kiro/crew` stay on your Mac. |
-| **Native local** | `make build`, or install a wheel from `make wheel` | The Gateway and agent runtime run directly on your macOS, Linux, or Windows machine. |
-| **Local container** | Run `ghcr.io/kirodotdev/kirocrew` and persist `/home/kirocrew` | The Gateway and agent runtime run inside the official multi-arch container on your machine. |
-| **Remote hardware** | Follow the [remote host guide](docs/guides/remote-and-mobile.md) and install the service | The Gateway, agent sessions, and state run continuously on your Linux server, home lab, or cloud instance. Connect the desktop app or browser through an SSH tunnel. |
-| **Windows source install** | Follow [the Windows guide](docs/guides/windows-install.md) | The Gateway, agent sessions, chat, cron, and dashboard run natively with documented feature limits. |
-
-For containers, mount the directory selected by `KIROCREW_HOME` so sessions,
-configuration, memory, and credentials survive replacement. Keep the Gateway
-port bound to loopback unless you intentionally configure authenticated remote
-access. Container isolation and the Kiro Crew OS sandbox are separate layers
-and depend on the host runtime configuration. See the
-[Docker guide](docs/guides/docker.md) for the published image and deployment details.
-
-**Keep it running.** Install a systemd service on Linux or a launchd agent on
-macOS:
+Run the Gateway as a boot-persistent service when needed:
 
 ```bash
 kirocrew service install
@@ -466,85 +228,26 @@ kirocrew service status
 kirocrew logs
 ```
 
-To bind a non-default port (for example a host where `5476` is already taken),
-set `KIROCREW_PORT` when you install the service — the value is baked into the
-unit:
+Service ports, systemd/launchd behavior, containers, and remote-host access are
+documented in the [install guide](docs/guides/install.md#running-as-a-service),
+[Docker guide](docs/guides/docker.md), and
+[remote host guide](docs/guides/remote-and-mobile.md).
 
-```bash
-KIROCREW_PORT=5477 kirocrew service install
-```
-
-To change it later without reinstalling, edit `/etc/kirocrew/kirocrew.env`
-(created by `service install`) and run `sudo systemctl restart kirocrew`. Units
-installed by releases before v0.2.0 lack the `EnvironmentFile=` directive that
-reads this file — re-run `kirocrew service install` or use a systemd drop-in;
-see [the install guide](docs/guides/install.md#setting-the-service-port).
-
-The desktop app can use this local Gateway or connect to a remote one. For an
-always-on VPS, home server, or cloud VM in your account, follow the
-[remote host guide](docs/guides/remote-and-mobile.md). Kiro Crew does not require a
-Kiro Crew-hosted control plane.
-
-**Configure it.** User data lives under `~/.kiro/crew` by default. Manage the
-main configuration with `kirocrew config get`, `set`, and `edit`.
-
-```json
-{
-  "agent": {
-    "provider": "acp",
-    "approval_mode": "interactive",
-    "sandbox": "auto"
-  },
-  "session": {
-    "timeout_secs": 1800,
-    "pool_size": 2
-  },
-  "dashboard": {
-    "bot_name": "Kiro Crew"
-  }
-}
-```
-
-`agent.provider` is fixed to `acp`. Kiro Crew drives `kiro-cli` over the Agent
-Client Protocol. Set the dashboard port with `KIROCREW_PORT` or
-`kirocrew gateway --port <n>`. Messaging-channel credentials (Slack, Discord,
-Telegram, and the rest) live in `~/.kiro/crew/.env` rather than the JSON config.
-
-**Troubleshoot quickly.** Start with `kirocrew doctor`. For an ACP timeout,
-confirm `kiro-cli` is on `PATH` and logged in, then allow extra time for the
-first MCP startup. For memory search, check that the embedding
-model finished downloading under `~/.kiro/crew/models`. For a stale MCP configuration, run
-`kirocrew setup --agent-only`, or add `--clean` to rebuild it.
-
-**Find the logs.** When you need to debug, the fastest path is
-`kirocrew logs` (tail the most recent gateway output) or `kirocrew logs -f` to
-follow it live; `kirocrew logs -n 200` prints more history. `kirocrew logs`
-reads the right source automatically — the systemd journal when the Linux
-service is installed, the launchd stdout file on macOS, or the foreground
-gateway log otherwise. Raise verbosity with `kirocrew gateway -v` (INFO:
-session lifecycle and context usage) or `-vv` (DEBUG: full ACP events and
-message traces); set the persistent default with
-`kirocrew config set agent.log_level`, or change it at runtime from the
-dashboard **Logs** page. Under `~/.kiro/crew` (or your `KIROCREW_HOME`) you can
-also read the raw files directly:
-
-| File | What it holds |
-|---|---|
-| `~/.kiro/crew/gateway.log` | Main gateway log when running in the foreground. |
-| `~/.kiro/crew/security_events.jsonl` | Append-only security and tool-access events. Inspect with `kirocrew security events`, `audit`, and `verify`. |
-| `~/.kiro/crew/audit.log` | Human-readable audit trail of privileged operations. |
-| `~/.kiro/crew/subagents/<agent_id>/result.txt` | Full transcript of a completed subagent, kept for a grace window after it finishes. |
-
-See the [Troubleshooting guide](src/kiro_crew/docs/troubleshooting.md) for the
-full log-level reference and emergency recovery steps.
+Use `kirocrew config get`, `kirocrew config set <key> <value>`, and
+`kirocrew config edit` for the main configuration. Set a process port with
+`KIROCREW_PORT` or `kirocrew gateway --port <n>`. Start troubleshooting with
+`kirocrew doctor`, then inspect `kirocrew logs` (or `kirocrew logs -f`). See the
+[troubleshooting guide](src/kiro_crew/docs/troubleshooting.md) for log sources,
+levels, diagnostics bundles, and recovery steps.
 
 ## Anonymous usage telemetry
 
 Kiro Crew sends **one anonymous heartbeat per day** so maintainers can see how
-many copies are actively running, which versions are in use, and which
-platforms and install channels to support. After a successful install or update
-from the official app catalog, it also sends one anonymous per-app receipt.
-Both signals are on by default and use the same controls below.
+many copies are actively running and which releases, Python minors, and install
+paths still need support. After a successful install or update from the official
+app catalog, it also sends one anonymous per-app receipt. Both signals are
+enabled by default, but first egress waits until the first-run privacy disclosure
+has been shown; they use the same controls below.
 
 To turn it off, flip **Settings → Privacy → Send anonymous usage heartbeat** in
 the dashboard (the same switch appears on the last step of first-run
@@ -567,23 +270,23 @@ both — when it is set, the dashboard toggle is disabled and says so.
 | Random instance id | `9c75560d…` (UUID4) | Lets us count how many copies ran on a given day. Generated once on first run and derived from nothing — not your hostname, username, MAC, IP, or any account. It identifies an installed copy, never a person. |
 | App version | `0.1.2` | Which releases are still in use. **Release number only** — build stamps like `-nightly.20260731t065756` are stripped before sending, because a per-build timestamp is near-unique and would help identify a specific machine. |
 | Python minor version | `3.12` | When the minimum can move up |
-| Install channel | `dmg` | Which install path people actually use |
-| First-run flag | `1` / `0` | New installs vs returning |
+| Install path | `dmg` | Which distribution format people actually use |
+| First-send flag | `1` / `0` | First successfully reported install vs returning |
 
 **Official-app install receipts are separate and event-based.** After a
 successful official-catalog install or update, Kiro Crew sends one GET to
 `/b/1/install/<app-slug>?t=<token>&k=<fresh|update>&v=<release>` on the same
 telemetry host. The slug is the public catalog identifier. `t` is the first 32
-hex characters of HMAC-SHA256 keyed by the local beacon install id over
-`app-install:<slug>`; the raw install id is never sent, and tokens for different
-apps cannot be linked to assemble an installed-app profile. `k` separates fresh
-installs from updates, and `v` is the same release-only Kiro Crew version clamp
-used by the heartbeat.
+hex characters of HMAC-SHA256 keyed by an independent local receipt secret over
+`app-install:<slug>`; that secret never leaves the machine, so tokens for
+different apps cannot be linked to each other or to the heartbeat install id.
+`k` separates fresh installs from updates, and `v` is the same release-only Kiro
+Crew version clamp used by the heartbeat.
 
 Receipts are emitted only for bundled or edition-provided official catalog
 entries. Apps from user-configured registries, local-directory installs, and
 self-registered apps emit nothing, so private app names never leave the machine.
-If no persistent beacon install id exists yet, the receipt is skipped.
+If the receipt-only secret cannot be persisted, the receipt is skipped.
 
 This list used to be nine fields. Release channel, OS, CPU architecture and
 governance posture were **removed** — each was coarse on its own, but the
@@ -633,23 +336,11 @@ performance metrics that never leave your machine. See
 | Trust and dependencies | [Security](docs/architecture/security-deep-dive.md), [Security policy](SECURITY.md) |
 | Project work | [Contributing](CONTRIBUTING.md), [Tenets](TENETS.md), [Governance](GOVERNANCE.md), [Maintainers](MAINTAINERS.md), [AI assistant rules](AGENTS.md), [Changelog](CHANGELOG.md) |
 
-Contributions are welcome. Create a branch from `main`, keep changes focused,
-and run the relevant checks before opening a pull request:
-
-```bash
-# Backend
-pip install -e ".[voice]" --group dev
-pytest
-
-# Frontend
-cd website
-npm ci
-npm run check
-npm run build
-```
-
-Use [GitHub Issues](https://github.com/kirodotdev/KiroCrew/issues) for bugs and
-feature requests. Do not file security vulnerabilities publicly.
+Contributions are welcome. Follow [CONTRIBUTING.md](CONTRIBUTING.md) for setup,
+change-scoped validation, commit format, and the pull-request workflow. Use
+[GitHub Issues](https://github.com/kirodotdev/KiroCrew/issues) for bugs and
+feature requests; report vulnerabilities privately through
+[SECURITY.md](SECURITY.md).
 
 
 ## Contributors
@@ -664,6 +355,7 @@ make this tool possible:
 <a href="https://github.com/0V" title="G2"><img src="https://github.com/0V.png?size=64" width="64" height="64" alt="G2" /></a>
 <a href="https://github.com/aahei" title="Ahei"><img src="https://github.com/aahei.png?size=64" width="64" height="64" alt="Ahei" /></a>
 <a href="https://github.com/abe238" title="Abe Diaz (@abe238)"><img src="https://github.com/abe238.png?size=64" width="64" height="64" alt="Abe Diaz (@abe238)" /></a>
+<a href="https://github.com/abhikarode" title="Abhijit Karode"><img src="https://github.com/abhikarode.png?size=64" width="64" height="64" alt="Abhijit Karode" /></a>
 <a href="https://github.com/abhishekdhameja" title="Abhishek Dhameja"><img src="https://github.com/abhishekdhameja.png?size=64" width="64" height="64" alt="Abhishek Dhameja" /></a>
 <a href="https://github.com/Abhishekmitra-slg" title="Abhishek Mitra"><img src="https://github.com/Abhishekmitra-slg.png?size=64" width="64" height="64" alt="Abhishek Mitra" /></a>
 <a href="https://github.com/abhishekshasthry" title="Abhishek Shasthry B M"><img src="https://github.com/abhishekshasthry.png?size=64" width="64" height="64" alt="Abhishek Shasthry B M" /></a>
@@ -788,6 +480,7 @@ make this tool possible:
 <a href="https://github.com/ConstantineWang" title="Jiacheng Wang"><img src="https://github.com/ConstantineWang.png?size=64" width="64" height="64" alt="Jiacheng Wang" /></a>
 <a href="https://github.com/coozgan" title="Joshyfruit"><img src="https://github.com/coozgan.png?size=64" width="64" height="64" alt="Joshyfruit" /></a>
 <a href="https://github.com/cplieger" title="Christopher Plieger"><img src="https://github.com/cplieger.png?size=64" width="64" height="64" alt="Christopher Plieger" /></a>
+<a href="https://github.com/crlgb" title="carl"><img src="https://github.com/crlgb.png?size=64" width="64" height="64" alt="carl" /></a>
 <a href="https://github.com/cruisercohen" title="Matt Cohen"><img src="https://github.com/cruisercohen.png?size=64" width="64" height="64" alt="Matt Cohen" /></a>
 <a href="https://github.com/CrysisDeu" title="Zezhen Xu"><img src="https://github.com/CrysisDeu.png?size=64" width="64" height="64" alt="Zezhen Xu" /></a>
 <a href="https://github.com/Csan25" title="Csan25"><img src="https://github.com/Csan25.png?size=64" width="64" height="64" alt="Csan25" /></a>
@@ -804,6 +497,7 @@ make this tool possible:
 <a href="https://github.com/darko-mesaros" title="Darko Mesaros"><img src="https://github.com/darko-mesaros.png?size=64" width="64" height="64" alt="Darko Mesaros" /></a>
 <a href="https://github.com/datoastmachine" title="datoastmachine"><img src="https://github.com/datoastmachine.png?size=64" width="64" height="64" alt="datoastmachine" /></a>
 <a href="https://github.com/datowq" title="datowq"><img src="https://github.com/datowq.png?size=64" width="64" height="64" alt="datowq" /></a>
+<a href="https://github.com/davidmages" title="davidmages"><img src="https://github.com/davidmages.png?size=64" width="64" height="64" alt="davidmages" /></a>
 <a href="https://github.com/davidtlee-amzn" title="davidtlee-amzn"><img src="https://github.com/davidtlee-amzn.png?size=64" width="64" height="64" alt="davidtlee-amzn" /></a>
 <a href="https://github.com/davihara" title="David Hara"><img src="https://github.com/davihara.png?size=64" width="64" height="64" alt="David Hara" /></a>
 <a href="https://github.com/DaxterXS" title="Davide Bisso"><img src="https://github.com/DaxterXS.png?size=64" width="64" height="64" alt="Davide Bisso" /></a>
@@ -820,9 +514,11 @@ make this tool possible:
 <a href="https://github.com/DHILIP-S-E" title="DHILIP S E"><img src="https://github.com/DHILIP-S-E.png?size=64" width="64" height="64" alt="DHILIP S E" /></a>
 <a href="https://github.com/dimwael" title="Wael"><img src="https://github.com/dimwael.png?size=64" width="64" height="64" alt="Wael" /></a>
 <a href="https://github.com/dixitrathod16" title="Dixit R Jain"><img src="https://github.com/dixitrathod16.png?size=64" width="64" height="64" alt="Dixit R Jain" /></a>
+<a href="https://github.com/djglaser" title="David Glaser"><img src="https://github.com/djglaser.png?size=64" width="64" height="64" alt="David Glaser" /></a>
 <a href="https://github.com/dkillion" title="Dave Killion"><img src="https://github.com/dkillion.png?size=64" width="64" height="64" alt="Dave Killion" /></a>
 <a href="https://github.com/dmast3r" title="Sourabh Khandelwal"><img src="https://github.com/dmast3r.png?size=64" width="64" height="64" alt="Sourabh Khandelwal" /></a>
 <a href="https://github.com/doc88129" title="Doc"><img src="https://github.com/doc88129.png?size=64" width="64" height="64" alt="Doc" /></a>
+<a href="https://github.com/dodgeblaster" title="Gary Jennings"><img src="https://github.com/dodgeblaster.png?size=64" width="64" height="64" alt="Gary Jennings" /></a>
 <a href="https://github.com/dominik-richter" title="Dom"><img src="https://github.com/dominik-richter.png?size=64" width="64" height="64" alt="Dom" /></a>
 <a href="https://github.com/donisewell" title="donisewell"><img src="https://github.com/donisewell.png?size=64" width="64" height="64" alt="donisewell" /></a>
 <a href="https://github.com/dougclauson" title="dougclauson"><img src="https://github.com/dougclauson.png?size=64" width="64" height="64" alt="dougclauson" /></a>
@@ -922,6 +618,7 @@ make this tool possible:
 <a href="https://github.com/jakeinater" title="Jake Zhao"><img src="https://github.com/jakeinater.png?size=64" width="64" height="64" alt="Jake Zhao" /></a>
 <a href="https://github.com/jakenoc" title="Jacob Nocentino"><img src="https://github.com/jakenoc.png?size=64" width="64" height="64" alt="Jacob Nocentino" /></a>
 <a href="https://github.com/janvoll" title="janvoll"><img src="https://github.com/janvoll.png?size=64" width="64" height="64" alt="janvoll" /></a>
+<a href="https://github.com/jason-depaolo" title="jason-depaolo"><img src="https://github.com/jason-depaolo.png?size=64" width="64" height="64" alt="jason-depaolo" /></a>
 <a href="https://github.com/JasonZhang1993" title="Jason Zhang's Git"><img src="https://github.com/JasonZhang1993.png?size=64" width="64" height="64" alt="Jason Zhang's Git" /></a>
 <a href="https://github.com/javenciu" title="javenciu"><img src="https://github.com/javenciu.png?size=64" width="64" height="64" alt="javenciu" /></a>
 <a href="https://github.com/jayaprakashreddy007" title="jayaprakashreddy007"><img src="https://github.com/jayaprakashreddy007.png?size=64" width="64" height="64" alt="jayaprakashreddy007" /></a>
@@ -968,6 +665,7 @@ make this tool possible:
 <a href="https://github.com/JWThewes" title="Jan Thewes"><img src="https://github.com/JWThewes.png?size=64" width="64" height="64" alt="Jan Thewes" /></a>
 <a href="https://github.com/jyuros" title="Jaden Yuros"><img src="https://github.com/jyuros.png?size=64" width="64" height="64" alt="Jaden Yuros" /></a>
 <a href="https://github.com/k33bz" title="Matthew Kastro"><img src="https://github.com/k33bz.png?size=64" width="64" height="64" alt="Matthew Kastro" /></a>
+<a href="https://github.com/kadito" title="Ricardo Bernardes"><img src="https://github.com/kadito.png?size=64" width="64" height="64" alt="Ricardo Bernardes" /></a>
 <a href="https://github.com/KaiqueGovani" title="Kaique Govani"><img src="https://github.com/KaiqueGovani.png?size=64" width="64" height="64" alt="Kaique Govani" /></a>
 <a href="https://github.com/kaizawa97" title="Kai Mitsuzawa"><img src="https://github.com/kaizawa97.png?size=64" width="64" height="64" alt="Kai Mitsuzawa" /></a>
 <a href="https://github.com/KarlLeen" title="karl4c"><img src="https://github.com/KarlLeen.png?size=64" width="64" height="64" alt="karl4c" /></a>
@@ -1050,6 +748,7 @@ make this tool possible:
 <a href="https://github.com/md-abusayeed" title="Md Abu Sayeed"><img src="https://github.com/md-abusayeed.png?size=64" width="64" height="64" alt="Md Abu Sayeed" /></a>
 <a href="https://github.com/Mdkar" title="Mihir Dhamankar"><img src="https://github.com/Mdkar.png?size=64" width="64" height="64" alt="Mihir Dhamankar" /></a>
 <a href="https://github.com/mdwyer223" title="Matthew Dwyer"><img src="https://github.com/mdwyer223.png?size=64" width="64" height="64" alt="Matthew Dwyer" /></a>
+<a href="https://github.com/megafloras" title="Imogen Reveck"><img src="https://github.com/megafloras.png?size=64" width="64" height="64" alt="Imogen Reveck" /></a>
 <a href="https://github.com/miamanav" title="miamanav"><img src="https://github.com/miamanav.png?size=64" width="64" height="64" alt="miamanav" /></a>
 <a href="https://github.com/michellemxm" title="Michelle Ma"><img src="https://github.com/michellemxm.png?size=64" width="64" height="64" alt="Michelle Ma" /></a>
 <a href="https://github.com/midega-g" title="George Midega"><img src="https://github.com/midega-g.png?size=64" width="64" height="64" alt="George Midega" /></a>
@@ -1081,6 +780,7 @@ make this tool possible:
 <a href="https://github.com/nateeklund" title="Nate Eklund"><img src="https://github.com/nateeklund.png?size=64" width="64" height="64" alt="Nate Eklund" /></a>
 <a href="https://github.com/nathanyi96" title="Nathan"><img src="https://github.com/nathanyi96.png?size=64" width="64" height="64" alt="Nathan" /></a>
 <a href="https://github.com/naveennvrgup" title="Naveen Sundar"><img src="https://github.com/naveennvrgup.png?size=64" width="64" height="64" alt="Naveen Sundar" /></a>
+<a href="https://github.com/nayan3107" title="Nayan Chopra"><img src="https://github.com/nayan3107.png?size=64" width="64" height="64" alt="Nayan Chopra" /></a>
 <a href="https://github.com/nazarenkod" title="Dmitriy"><img src="https://github.com/nazarenkod.png?size=64" width="64" height="64" alt="Dmitriy" /></a>
 <a href="https://github.com/NB3025" title="Haudi"><img src="https://github.com/NB3025.png?size=64" width="64" height="64" alt="Haudi" /></a>
 <a href="https://github.com/ndbeals" title="Nathan Beals"><img src="https://github.com/ndbeals.png?size=64" width="64" height="64" alt="Nathan Beals" /></a>
@@ -1106,6 +806,7 @@ make this tool possible:
 <a href="https://github.com/officialprosingh" title="Parwinder Singh"><img src="https://github.com/officialprosingh.png?size=64" width="64" height="64" alt="Parwinder Singh" /></a>
 <a href="https://github.com/olowosulu" title="Emmanuel Olowosulu"><img src="https://github.com/olowosulu.png?size=64" width="64" height="64" alt="Emmanuel Olowosulu" /></a>
 <a href="https://github.com/omarMokh" title="Omar Abo Mokh"><img src="https://github.com/omarMokh.png?size=64" width="64" height="64" alt="Omar Abo Mokh" /></a>
+<a href="https://github.com/omerfarukaslan" title="Omer Aslan"><img src="https://github.com/omerfarukaslan.png?size=64" width="64" height="64" alt="Omer Aslan" /></a>
 <a href="https://github.com/omerrubi-amzn" title="Omer Rubinstein"><img src="https://github.com/omerrubi-amzn.png?size=64" width="64" height="64" alt="Omer Rubinstein" /></a>
 <a href="https://github.com/OnlyOneByte" title="Rengang (Angelo) Yang"><img src="https://github.com/OnlyOneByte.png?size=64" width="64" height="64" alt="Rengang (Angelo) Yang" /></a>
 <a href="https://github.com/ophilli" title="Owen Phillips"><img src="https://github.com/ophilli.png?size=64" width="64" height="64" alt="Owen Phillips" /></a>
@@ -1118,6 +819,7 @@ make this tool possible:
 <a href="https://github.com/pepmach" title="Stan Tian"><img src="https://github.com/pepmach.png?size=64" width="64" height="64" alt="Stan Tian" /></a>
 <a href="https://github.com/peterhieuvu" title="peterhieuvu"><img src="https://github.com/peterhieuvu.png?size=64" width="64" height="64" alt="peterhieuvu" /></a>
 <a href="https://github.com/philipjk" title="philipjk"><img src="https://github.com/philipjk.png?size=64" width="64" height="64" alt="philipjk" /></a>
+<a href="https://github.com/phillip-che" title="Phillip Che"><img src="https://github.com/phillip-che.png?size=64" width="64" height="64" alt="Phillip Che" /></a>
 <a href="https://github.com/phongdh-lftv" title="Do Hoang Phong"><img src="https://github.com/phongdh-lftv.png?size=64" width="64" height="64" alt="Do Hoang Phong" /></a>
 <a href="https://github.com/pierrms" title="pierrms"><img src="https://github.com/pierrms.png?size=64" width="64" height="64" alt="pierrms" /></a>
 <a href="https://github.com/pilami" title="Sai Chaitanya Manchikatla"><img src="https://github.com/pilami.png?size=64" width="64" height="64" alt="Sai Chaitanya Manchikatla" /></a>
@@ -1149,6 +851,7 @@ make this tool possible:
 <a href="https://github.com/radical-beard" title="radical-beard"><img src="https://github.com/radical-beard.png?size=64" width="64" height="64" alt="radical-beard" /></a>
 <a href="https://github.com/RadiumGu" title="Lei"><img src="https://github.com/RadiumGu.png?size=64" width="64" height="64" alt="Lei" /></a>
 <a href="https://github.com/RahmLavon" title="RahmLavon"><img src="https://github.com/RahmLavon.png?size=64" width="64" height="64" alt="RahmLavon" /></a>
+<a href="https://github.com/rahsapr" title="rahsapr"><img src="https://github.com/rahsapr.png?size=64" width="64" height="64" alt="rahsapr" /></a>
 <a href="https://github.com/rainsupreme" title="Rain Valentine"><img src="https://github.com/rainsupreme.png?size=64" width="64" height="64" alt="Rain Valentine" /></a>
 <a href="https://github.com/raiyanlabs" title="raiyanlabs"><img src="https://github.com/raiyanlabs.png?size=64" width="64" height="64" alt="raiyanlabs" /></a>
 <a href="https://github.com/Rajnita" title="Rajnita Leichombam"><img src="https://github.com/Rajnita.png?size=64" width="64" height="64" alt="Rajnita Leichombam" /></a>
@@ -1169,6 +872,7 @@ make this tool possible:
 <a href="https://github.com/rishabh22" title="Rishabh"><img src="https://github.com/rishabh22.png?size=64" width="64" height="64" alt="Rishabh" /></a>
 <a href="https://github.com/rishabhagrawal1" title="Rishabh Agrawal"><img src="https://github.com/rishabhagrawal1.png?size=64" width="64" height="64" alt="Rishabh Agrawal" /></a>
 <a href="https://github.com/rittikg-amazon" title="rittikg-amazon"><img src="https://github.com/rittikg-amazon.png?size=64" width="64" height="64" alt="rittikg-amazon" /></a>
+<a href="https://github.com/rkeely" title="Rkee"><img src="https://github.com/rkeely.png?size=64" width="64" height="64" alt="Rkee" /></a>
 <a href="https://github.com/rlunar" title="Roberto Luna-Rojas"><img src="https://github.com/rlunar.png?size=64" width="64" height="64" alt="Roberto Luna-Rojas" /></a>
 <a href="https://github.com/rmkumari0704" title="rmkumari0704"><img src="https://github.com/rmkumari0704.png?size=64" width="64" height="64" alt="rmkumari0704" /></a>
 <a href="https://github.com/rnoack1" title="Robert Noack"><img src="https://github.com/rnoack1.png?size=64" width="64" height="64" alt="Robert Noack" /></a>
@@ -1213,6 +917,7 @@ make this tool possible:
 <a href="https://github.com/shelomo" title="Shelomo Dobkin"><img src="https://github.com/shelomo.png?size=64" width="64" height="64" alt="Shelomo Dobkin" /></a>
 <a href="https://github.com/shelseyv" title="shelseyv"><img src="https://github.com/shelseyv.png?size=64" width="64" height="64" alt="shelseyv" /></a>
 <a href="https://github.com/Ship-Loop" title="Siddartha "><img src="https://github.com/Ship-Loop.png?size=64" width="64" height="64" alt="Siddartha " /></a>
+<a href="https://github.com/shogonar" title="shogonar"><img src="https://github.com/shogonar.png?size=64" width="64" height="64" alt="shogonar" /></a>
 <a href="https://github.com/shortbloke" title="Martin Rowan"><img src="https://github.com/shortbloke.png?size=64" width="64" height="64" alt="Martin Rowan" /></a>
 <a href="https://github.com/ShortEmperor" title="Fabricio Escalante"><img src="https://github.com/ShortEmperor.png?size=64" width="64" height="64" alt="Fabricio Escalante" /></a>
 <a href="https://github.com/ShotaroKataoka" title="Shotaro Kataoka"><img src="https://github.com/ShotaroKataoka.png?size=64" width="64" height="64" alt="Shotaro Kataoka" /></a>
@@ -1250,9 +955,11 @@ make this tool possible:
 <a href="https://github.com/syncrisis" title="Syncd"><img src="https://github.com/syncrisis.png?size=64" width="64" height="64" alt="Syncd" /></a>
 <a href="https://github.com/szto" title="SoonKim"><img src="https://github.com/szto.png?size=64" width="64" height="64" alt="SoonKim" /></a>
 <a href="https://github.com/t-jones" title="Tim Jones"><img src="https://github.com/t-jones.png?size=64" width="64" height="64" alt="Tim Jones" /></a>
+<a href="https://github.com/tahodev" title="tahodev"><img src="https://github.com/tahodev.png?size=64" width="64" height="64" alt="tahodev" /></a>
 <a href="https://github.com/TakahiroIshii" title="Takahiro Ishii"><img src="https://github.com/TakahiroIshii.png?size=64" width="64" height="64" alt="Takahiro Ishii" /></a>
 <a href="https://github.com/tarikermis" title="Tarik Ermis"><img src="https://github.com/tarikermis.png?size=64" width="64" height="64" alt="Tarik Ermis" /></a>
 <a href="https://github.com/texnewmex" title="Nolan Clayton"><img src="https://github.com/texnewmex.png?size=64" width="64" height="64" alt="Nolan Clayton" /></a>
+<a href="https://github.com/th3l4ughingm4n" title="th3l4ughingm4n"><img src="https://github.com/th3l4ughingm4n.png?size=64" width="64" height="64" alt="th3l4ughingm4n" /></a>
 <a href="https://github.com/the-mann" title="Marcus Mann"><img src="https://github.com/the-mann.png?size=64" width="64" height="64" alt="Marcus Mann" /></a>
 <a href="https://github.com/therohan21" title="Rohan Rajeev"><img src="https://github.com/therohan21.png?size=64" width="64" height="64" alt="Rohan Rajeev" /></a>
 <a href="https://github.com/thethomaslane" title="Thomas Lane"><img src="https://github.com/thethomaslane.png?size=64" width="64" height="64" alt="Thomas Lane" /></a>
@@ -1303,6 +1010,7 @@ make this tool possible:
 <a href="https://github.com/wenliwyan" title="wenliwyan"><img src="https://github.com/wenliwyan.png?size=64" width="64" height="64" alt="wenliwyan" /></a>
 <a href="https://github.com/werainkhatri" title="Viren Khatri"><img src="https://github.com/werainkhatri.png?size=64" width="64" height="64" alt="Viren Khatri" /></a>
 <a href="https://github.com/william-davies" title="William Davies"><img src="https://github.com/william-davies.png?size=64" width="64" height="64" alt="William Davies" /></a>
+<a href="https://github.com/wknight1" title="wknight1"><img src="https://github.com/wknight1.png?size=64" width="64" height="64" alt="wknight1" /></a>
 <a href="https://github.com/wmaillard" title="Will Maillard"><img src="https://github.com/wmaillard.png?size=64" width="64" height="64" alt="Will Maillard" /></a>
 <a href="https://github.com/wu5bocheng" title="wu5bocheng"><img src="https://github.com/wu5bocheng.png?size=64" width="64" height="64" alt="wu5bocheng" /></a>
 <a href="https://github.com/wundram" title="wundram"><img src="https://github.com/wundram.png?size=64" width="64" height="64" alt="wundram" /></a>
@@ -1314,6 +1022,7 @@ make this tool possible:
 <a href="https://github.com/xuejinT" title="Serena Tan"><img src="https://github.com/xuejinT.png?size=64" width="64" height="64" alt="Serena Tan" /></a>
 <a href="https://github.com/Xyand" title="Albert"><img src="https://github.com/Xyand.png?size=64" width="64" height="64" alt="Albert" /></a>
 <a href="https://github.com/y2k-shubham" title="Shubham Gupta"><img src="https://github.com/y2k-shubham.png?size=64" width="64" height="64" alt="Shubham Gupta" /></a>
+<a href="https://github.com/Yangxinyee" title="Charlie Yang"><img src="https://github.com/Yangxinyee.png?size=64" width="64" height="64" alt="Charlie Yang" /></a>
 <a href="https://github.com/yashwanthkorla" title="Yashwanth Korla"><img src="https://github.com/yashwanthkorla.png?size=64" width="64" height="64" alt="Yashwanth Korla" /></a>
 <a href="https://github.com/yehuizhang" title="Yehui"><img src="https://github.com/yehuizhang.png?size=64" width="64" height="64" alt="Yehui" /></a>
 <a href="https://github.com/YifanL9" title="Yifan"><img src="https://github.com/YifanL9.png?size=64" width="64" height="64" alt="Yifan" /></a>
@@ -1322,6 +1031,7 @@ make this tool possible:
 <a href="https://github.com/yohanesss" title="Yohanes Setiawan"><img src="https://github.com/yohanesss.png?size=64" width="64" height="64" alt="Yohanes Setiawan" /></a>
 <a href="https://github.com/yoshidashingo" title="Shingo YOSHIDA 吉田真吾"><img src="https://github.com/yoshidashingo.png?size=64" width="64" height="64" alt="Shingo YOSHIDA 吉田真吾" /></a>
 <a href="https://github.com/yousefdebaz-fivexlio" title="Yousef De Baz"><img src="https://github.com/yousefdebaz-fivexlio.png?size=64" width="64" height="64" alt="Yousef De Baz" /></a>
+<a href="https://github.com/yurenji" title="0xzs95"><img src="https://github.com/yurenji.png?size=64" width="64" height="64" alt="0xzs95" /></a>
 <a href="https://github.com/yuwesu" title="Sypher Su"><img src="https://github.com/yuwesu.png?size=64" width="64" height="64" alt="Sypher Su" /></a>
 <a href="https://github.com/yystats78-uk" title="yystats78-uk"><img src="https://github.com/yystats78-uk.png?size=64" width="64" height="64" alt="yystats78-uk" /></a>
 <a href="https://github.com/yytdfc" title="yytdfc"><img src="https://github.com/yytdfc.png?size=64" width="64" height="64" alt="yytdfc" /></a>
@@ -1342,9 +1052,12 @@ make this tool possible:
 
 Listed alphabetically by GitHub username. Internal contributors appear here if they
 consented to public recognition in the contributor survey; open-source contributors are
-collected automatically from this repository's merged pull requests — both the author of
-each pull request and the people who reported the issues it closed, so a report that
-led to a real change is credited like the change itself. Contributions that leave
+collected automatically from this repository's merged pull requests — the author of
+each pull request, the linked authors and co-authors of the commits that landed via a merged
+pull request, and the people who
+reported the issues it closed, so a report that led to a real change is credited like
+the change itself, and someone whose work landed via a maintainer's replacement pull
+request is credited through their commits. Contributions that leave
 neither trace — a code review, a translation, an idea, a private security report — are
 added on request. If you contributed and would like to be
 added, corrected, or removed, please open an issue or a pull request.

@@ -1,6 +1,6 @@
 import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, screen, fireEvent, waitFor } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import { releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { safeSetItem } from '../utils/safeStorage'
@@ -390,6 +390,29 @@ describe('ChatInput', () => {
     it('disables the + menu button when uploading', () => {
       renderWithProviders(<ChatInput {...defaultProps} isMac onUploadFiles={vi.fn()} onScreenshot={vi.fn()} uploading />)
       expect(screen.getByTitle('Add files & options')).toBeDisabled()
+    })
+
+    /* #5744: while an upload is in flight every attach entry point is
+     * disabled, so without this control the only way out of a slow transfer
+     * is reloading the page. */
+    it('offers a cancel control only while uploading', () => {
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} />)
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+      unmount()
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading />)
+      expect(screen.getByRole('button', { name: 'Cancel upload' })).toBeInTheDocument()
+    })
+
+    it('renders no cancel control when the host passes no onCancelUpload', () => {
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} uploading />)
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+    })
+
+    it('calls onCancelUpload when the cancel control is pressed', () => {
+      const onCancelUpload = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={onCancelUpload} uploading />)
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel upload' }))
+      expect(onCancelUpload).toHaveBeenCalledTimes(1)
     })
   })
 
@@ -837,8 +860,83 @@ describe('ChatInput', () => {
     })
   })
 
-  // ── Reasoning effort merged into model button ──
+  // ── Independent model and reasoning effort controls ──
   describe('reasoning effort button', () => {
+    it('names the effort setting and value even on a compact shelf', () => {
+      const original = globalThis.ResizeObserver
+      let resizeShelf: ((width: number) => void) | undefined
+      globalThis.ResizeObserver = class {
+        constructor(private callback: ResizeObserverCallback) {}
+        observe(target: Element) {
+          if (target.getAttribute('data-testid') === 'composer-context-shelf') {
+            resizeShelf = width => this.callback([{ contentRect: { width } } as ResizeObserverEntry], this as unknown as ResizeObserver)
+          }
+        }
+        unobserve() {}
+        disconnect() {}
+      } as unknown as typeof ResizeObserver
+      try {
+        renderWithProviders(
+          <ChatInput {...defaultProps} modelName="gpt-6-sol" reasoningEffort="high"
+            separateEffort onModelClick={vi.fn()} onReasoningEffortClick={vi.fn()} />
+        )
+        act(() => resizeShelf?.(320))
+        const chip = screen.getByTestId('composer-effort-chip')
+        expect(chip).toHaveAttribute('title', 'Reasoning effort: High')
+        expect(chip).toHaveTextContent('Effort: High')
+        act(() => resizeShelf?.(157))
+        expect(chip).not.toHaveTextContent('Effort: High')
+        expect(chip).toHaveAttribute('title', 'Reasoning effort: High')
+        act(() => resizeShelf?.(600))
+        expect(chip).toHaveTextContent('Effort: High')
+      } finally {
+        globalThis.ResizeObserver = original
+      }
+    })
+
+    it('names the inherited setting in the resting state', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps} modelName="gpt-6-sol" reasoningEffort=""
+          separateEffort onModelClick={vi.fn()} onReasoningEffortClick={vi.fn()} />
+      )
+      expect(screen.getByTestId('composer-effort-chip')).toHaveTextContent('Effort: Default')
+    })
+
+    it('opens effort without opening the model picker', () => {
+      const onModelClick = vi.fn()
+      const onReasoningEffortClick = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          modelName="gpt-6-sol[medium]"
+          reasoningEffort="high"
+          separateEffort
+          onModelClick={onModelClick}
+          onReasoningEffortClick={onReasoningEffortClick}
+        />
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Reasoning effort' }))
+      expect(onReasoningEffortClick).toHaveBeenCalledOnce()
+      expect(onReasoningEffortClick.mock.calls[0][0]).toHaveProperty('x')
+      expect(onModelClick).not.toHaveBeenCalled()
+      expect(screen.getByTestId('composer-model-chip')).not.toHaveTextContent('High')
+    })
+    it.each(['global.anthropic.claude-opus-4-8[1m]', 'ollama/llama3.2:3b'])(
+      'keeps model and effort separate for ACP model %s', modelName => {
+        renderWithProviders(
+          <ChatInput {...defaultProps}
+            modelName={modelName}
+            reasoningEffort="high"
+            separateEffort
+            onModelClick={vi.fn()}
+            onReasoningEffortClick={vi.fn()}
+          />
+        )
+        expect(screen.getByRole('button', { name: 'Reasoning effort' })).toBeInTheDocument()
+        expect(screen.getByTestId('composer-model-chip')).toHaveTextContent(modelName)
+        expect(screen.getByTestId('composer-model-chip')).not.toHaveTextContent('High')
+      },
+    )
     it('renders for acp provider', () => {
       const onClick = vi.fn()
       renderWithProviders(

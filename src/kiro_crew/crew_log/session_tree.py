@@ -24,15 +24,31 @@ Three pieces, kept apart so each is testable on its own:
   long as the segment exists; the cache therefore needs no mtime and is dropped
   only when the segment is gone (retention, removal) or the file was replaced
   (a new inode under the same name, or a shorter file under a recycled one).
+  Asked for edges, it also reads the END of each unit's newest segment, cached
+  on the same identity plus an exact size, because that answer moves with every
+  append where the head's cannot.
 
-Only the first entry is read, and that is enough. The emitter writes ``parent``
-from a process-local mint witness that exists before the child's first turn or
-never, so the entry that CREATED the log carries the parent whenever any entry
-does, and a later re-attach in the same process can only repeat it. The fold
-still applies the wider rule -- the parent is taken from ANY record of a slot
-that carries one, and a record without one never retracts it -- so a slot whose
-later logs were opened after a gateway restart (witness gone, no ``parent``)
-folds to the parent its first log recorded.
+A session's creating edge is in its head, and that is where the head read is
+enough. The emitter writes ``parent`` from a process-local mint witness that
+exists before the child's first turn or never, so the entry that CREATED the log
+carries the parent whenever any entry does, and a later re-attach in the same
+process can only repeat it. The fold still applies the wider rule -- the parent is
+taken from ANY record of a slot that carries one, and a record without one never
+retracts it -- so a slot whose later logs were opened after a gateway restart
+(witness gone, no ``parent``) folds to the parent its first log recorded.
+
+A session can also be MOVED after it was opened, and those records are not in the
+head. ``session/adopted`` says another session took this one over and
+``session/released`` says its parent let it go, both written on the session that
+moved -- the same side the creating edge is written on, so one entry moves a whole
+subtree because descendants cite this slot rather than a path through it. They are
+:class:`EdgeRecord` rather than :class:`OpenedRecord` because they are a different
+kind of statement: an opened record says who opened the session, which stays true
+and is never rewritten, while a decision says who holds it NOW and replaces the
+citation outright. :func:`fold_tree` applies the newest decision per slot over the
+creating citations and then runs its cycle colouring over the result, which is
+what guards a takeover recorded against a reading of the tree that has since
+moved.
 
 The tree is keyed by SLOT. ``parent.sid`` on the entry is the creator's ACP
 session id at the moment of creation -- an audit citation for a reader of the
@@ -71,10 +87,14 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Final
 
+from kiro_crew.crew_log.errors import CrewLogError
 from kiro_crew.crew_log.schema import KIND_SESSION, Entry
 from kiro_crew.crew_log.store import (
+    find_last_tree_edge,
+    newest_segment,
     oldest_segment,
     read_head,
+    session_units_for_slot,
     unit_dir_for,
     unit_dirs,
 )
@@ -85,6 +105,17 @@ logger = logging.getLogger(__name__)
 
 #: The one entry type the tree reads a parent from.
 TYPE_OPENED: Final[str] = "session/opened"
+
+#: The two entry types that MOVE a slot after it was opened: one session took
+#: another over, and a parent let one go. Both are written on the session that
+#: moved -- the same side of the edge ``session/opened.parent`` is written on --
+#: so one entry moves a whole subtree, because descendants cite this slot and not
+#: a path through it.
+TYPE_ADOPTED: Final[str] = "session/adopted"
+TYPE_RELEASED: Final[str] = "session/released"
+
+#: Both of them, for a reader deciding whether an entry carries an edge at all.
+EDGE_TYPES: Final[frozenset[str]] = frozenset({TYPE_ADOPTED, TYPE_RELEASED})
 
 #: How many session-log units one scan ADMITS -- probes, lists, reads, caches
 #: and folds. The ONE bound on everything the scanner does and holds, and every
@@ -139,6 +170,30 @@ CHAIN_END_CAP: Final[str] = "cap"
 CHAIN_END_UNKNOWN: Final[str] = "unknown"
 
 
+#: This log cites a predecessor, and ``previous_sid`` names it.
+EDGE_NAMED: Final[str] = "named"
+#: The announce STATES the slot had no earlier store, so this log starts its chain.
+#: A ranking fold may pass over it, because its silence about a predecessor is a
+#: recorded conclusion rather than a missing one.
+EDGE_NONE: Final[str] = "none"
+#: The announce states a predecessor EXISTS that the writer could not determine. A
+#: ranking fold may not pass over it: doing so elects the log before it and orphans
+#: this one, which is the citation the writer declined to guess.
+EDGE_UNDECIDED: Final[str] = "undecided"
+#: There is no announce to read -- retention took the creating segment, a process died
+#: between create and announce, the log is admitted on its header alone. The RECORD is
+#: incomplete, so the fold refuses: the store was certainly opened and passing over it
+#: would orphan it, and the answer comes back as soon as the announce is readable.
+EDGE_UNREAD: Final[str] = "unread"
+#: The announce was read and says nothing about a predecessor either way. A log written
+#: before these keys existed is in this state, and so is one whose named predecessor
+#: was rejected for belonging to another slot. Its silence is equally "I am first" and
+#: "I could not tell", and unlike :data:`EDGE_UNREAD` it never becomes anything else,
+#: so refusing would be permanent. The fold hands the question to the source that still
+#: knows which store the slot is on.
+EDGE_LEGACY: Final[str] = "legacy"
+
+
 @dataclass(frozen=True)
 class OpenedRecord:
     """What one session log contributes: its header identity, the creator
@@ -149,6 +204,22 @@ class OpenedRecord:
     The two citations are on different axes and neither implies the other: a slot
     that nobody created still supersedes its own earlier logs, and a slot's first
     log still names its creator.
+
+    ``previous_edge`` is what makes that distinctness usable, because ``None`` alone
+    carries several meanings and a fold has to tell them apart:
+
+    * :data:`EDGE_NAMED` -- ``previous_sid`` is set and this log cites it.
+    * :data:`EDGE_NONE` -- the announce STATES the slot had no earlier store, so this
+      log starts its chain. A ranking fold may pass over it.
+    * :data:`EDGE_UNDECIDED` -- the announce states a predecessor exists that the
+      writer could not determine. A gap, and a ranking fold may not pass over it:
+      doing so elects the log before it and orphans this one.
+    * :data:`EDGE_UNREAD` -- there is no announce to read, so the RECORD is incomplete.
+      The fold refuses, and the answer comes back when the announce becomes readable.
+    * :data:`EDGE_LEGACY` -- the announce was read and says nothing about a predecessor.
+      A log written before these keys existed is in this state. Its silence is equally
+      "I am first" and "I could not tell", and it never becomes anything else, so the
+      fold neither ranks it nor passes over it: it hands the question to the mapping.
     """
 
     sid: str
@@ -156,6 +227,43 @@ class OpenedRecord:
     created_at: int
     parent_slot: str | None = None
     previous_sid: str | None = None
+    previous_edge: str = EDGE_UNREAD
+
+
+@dataclass(frozen=True)
+class EdgeRecord:
+    """One later DECISION about where a slot hangs: an adoption, or a release.
+
+    ``parent_slot`` is the slot the session now hangs under, and ``None`` is the
+    release -- the one record that means "no parent", as opposed to an
+    :class:`OpenedRecord` carrying no parent, which only means the entry did not
+    repeat a creator.
+
+    ``sid`` and ``seq`` order the decisions for one slot, and the pair is chosen so
+    that ordering never rests on a clock. ``seq`` is the writer-assigned position in
+    that log and it only ever increases, so two decisions in ONE log are ordered by the
+    store itself; a clock that steps backward between them -- an NTP correction, a VM
+    resume -- cannot invert them, which a timestamp comparison can. ``sid`` says WHICH
+    log, because a slot outlives its ACP session and seq starts again in the log that
+    replaces it: decisions from two different logs are ordered by which log is newer,
+    never by comparing seqs that are not comparable.
+
+    ``at`` is the entry's own millisecond and is NOT the ordering key. It is the audit
+    reading -- when this happened -- and the last resort for placing two logs whose
+    order nothing else establishes.
+
+    ``sid`` is load-bearing a third way: it is the unit this decision was read
+    from, so a projection dropping a removed unit knows which edges went with it.
+    """
+
+    slot: str
+    parent_slot: str | None
+    at: int
+    sid: str
+    #: Position in the citing log. Defaults to 0 so a hand-built record in a test or a
+    #: checkpoint written without it still compares -- 0 simply loses to any real entry
+    #: from the same log, which is the safe direction.
+    seq: int = 0
 
 
 @dataclass(frozen=True)
@@ -204,6 +312,11 @@ class TreeReading:
     #: Every provable record this scan read, unordered. Empty when the scan failed,
     #: which is the same answer ``nodes`` gives and is why it needs no separate flag.
     records: tuple[OpenedRecord, ...] = ()
+    #: Every later DECISION this scan read -- at most one per unit, the newest in
+    #: that unit's tail window. Empty when the caller did not ask for them, which is
+    #: why ``nodes`` is the value to read rather than these: a consumer cannot tell a
+    #: scan that found no adoptions from one that never looked, and does not need to.
+    edges: tuple[EdgeRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -222,7 +335,172 @@ class ChainReading:
     incomplete: bool
 
 
-def fold_tree(records: Iterable[OpenedRecord]) -> dict[str, TreeNode]:
+def edge_supersedes(
+    candidate: EdgeRecord,
+    held: EdgeRecord,
+    log_rank: Mapping[str, tuple[int, int, str]] | None = None,
+) -> bool:
+    """Whether *candidate* is the LATER decision of the two. Pure, and clock-free
+    wherever the store can answer instead.
+
+    Two cases, and they are different questions:
+
+    * **Same log.** ``seq`` decides, and only ``seq``. It is assigned by the writer and
+      only increases, so this answer cannot be inverted by a clock that steps backward
+      between the two appends -- which is an ordinary operational event (an NTP
+      correction, a VM resume), not an exotic one, and is exactly what a timestamp
+      comparison gets wrong.
+    * **Different logs.** Seqs are not comparable: a slot outlives its ACP session and
+      the log that replaces it starts its own sequence. So the newer LOG wins, and
+      *log_rank* is how a caller states which that is -- :func:`log_rank_of`, whose
+      leading term is the log's depth in the ``previous_sid`` succession chain the store
+      itself wrote, so this comparison is clock-free here too for any two logs the chain
+      relates. :func:`fold_tree` sorts its records by that same map, so the decisions
+      inherit the log order the tree is built from rather than inventing a second one. A
+      log the caller cannot rank falls back to ``(at, sid)``: it is the weakest answer
+      here and it is confined to the case where nothing better exists.
+
+    Ties answer ``False``: an equal record does not supersede, which is what keeps a
+    replay of a decision already held from being a change.
+    """
+    if candidate.sid == held.sid:
+        return candidate.seq > held.seq
+    if log_rank is not None:
+        candidate_rank = log_rank.get(candidate.sid)
+        held_rank = log_rank.get(held.sid)
+        if candidate_rank is not None and held_rank is not None:
+            return candidate_rank > held_rank
+    return (candidate.at, candidate.sid) > (held.at, held.sid)
+
+
+def latest_edges(
+    edges: Iterable[EdgeRecord], log_rank: Mapping[str, tuple[int, int, str]] | None = None
+) -> dict[str, EdgeRecord]:
+    """The newest decision per slot. Pure, and order-independent.
+
+    Newest by :func:`edge_supersedes`, which asks the store rather than the clock --
+    see there for why. Order-independence is the property that matters: the records
+    reach a fold from a checkpoint, from a tail replay and from the writer itself, in
+    whatever order those arrive, and a release that lost a race with the adoption it
+    undoes would put a session back under a parent that already let it go.
+    """
+    newest: dict[str, EdgeRecord] = {}
+    for edge in edges:
+        if not edge.slot:
+            # An edge is keyed by slot; a decision with no slot addresses nothing.
+            continue
+        held = newest.get(edge.slot)
+        if held is None or edge_supersedes(edge, held, log_rank):
+            newest[edge.slot] = edge
+    return newest
+
+
+def _chain_step(by_sid: "Mapping[str, OpenedRecord]", sid: str) -> str | None:
+    """The predecessor *sid*'s log succeeds, or ``None`` where the chain stops here.
+
+    One step, used by every walk over ``previous_sid``, because a walk that takes the
+    step differently is a walk that can disagree about which log is newer.
+
+    Three links stop the walk rather than being followed, and only one of them is an
+    ordinary shape: a log with no predecessor is the start of its chain. The other two
+    are damaged or forged records -- a predecessor that is not among *by_sid* (retention
+    has removed it, or it never existed), and a predecessor belonging to ANOTHER slot.
+    The foreign step is refused because this chain answers "which of THIS slot's logs is
+    newer": a link off the slot does not extend that history, and following it would
+    both borrow another slot's depth and let a record a different slot's writer produced
+    reorder this slot's decisions. :func:`slot_chain` refuses the same step for the same
+    reason, and reports it as ``CHAIN_END_FOREIGN``.
+    """
+    previous = by_sid[sid].previous_sid
+    if not previous:
+        return None
+    step = by_sid.get(previous)
+    if step is None or step.slot != by_sid[sid].slot:
+        return None
+    return previous
+
+
+def _succession_depth(by_sid: "Mapping[str, OpenedRecord]") -> dict[str, int]:
+    """Each log's distance from the start of the chain its ``previous_sid`` links it into.
+
+    ``session/opened`` records which session this one REPLACED, so a slot's logs form a
+    chain the store itself wrote -- and walking it is how two of them are ordered without
+    asking a clock. Depth 0 is a log whose predecessor is not among *by_sid*, which covers
+    both a first session and one whose predecessor retention has already removed: either
+    way it is the oldest log still readable, which is the only order this can be about.
+
+    Three shapes forged or damaged records can take are handled first, because each would
+    otherwise make the answer depend on which sid the walk happened to reach first, and
+    :func:`fold_tree` promises the same tree for any input order. A ``previous_sid`` cycle
+    has no start, so EVERY log on it is given depth 0 and the clock tiebreak places them --
+    breaking the loop at whichever member came first would rank them by iteration order. A
+    link naming a log that is not here is treated as absent. A link naming a log of ANOTHER
+    slot is treated as absent too: this depth orders one slot's logs against each other, so
+    a step off the slot does not measure that, and following it would let one slot's history
+    set another slot's ranks -- see :func:`_chain_step`.
+
+    Iterative, so a slot with a very long session history cannot exhaust the stack, and each
+    chain is measured once.
+    """
+    on_cycle: set[str] = set()
+    settled: set[str] = set()
+    for start in by_sid:
+        if start in settled:
+            continue
+        path: list[str] = []
+        seen_here: dict[str, int] = {}
+        cursor: str | None = start
+        while cursor is not None and cursor in by_sid and cursor not in settled:
+            if cursor in seen_here:
+                # Closed back onto this same walk: everything from that point on is a loop.
+                on_cycle.update(path[seen_here[cursor] :])
+                break
+            seen_here[cursor] = len(path)
+            path.append(cursor)
+            cursor = _chain_step(by_sid, cursor)
+        settled.update(path)
+
+    depth: dict[str, int] = {}
+    for start in by_sid:
+        if start in depth:
+            continue
+        chain: list[str] = []
+        cursor = start
+        while cursor is not None and cursor in by_sid and cursor not in depth:
+            chain.append(cursor)
+            if cursor in on_cycle:
+                cursor = None
+                break
+            cursor = _chain_step(by_sid, cursor)
+        base = depth[cursor] if cursor is not None and cursor in depth else -1
+        for step, sid in enumerate(reversed(chain)):
+            depth[sid] = 0 if sid in on_cycle else base + 1 + step
+    return depth
+
+
+def log_rank_of(records: Iterable[OpenedRecord]) -> dict[str, tuple[int, int, str]]:
+    """Each log's place in the order :func:`fold_tree` folds them in. Clock-free within a
+    succession chain.
+
+    ``sid -> (succession_depth, created_at, sid)``. The DEPTH leads, because it is the one
+    part the store wrote: ``previous_sid`` on ``session/opened`` says which session this
+    log replaced, so two logs of one slot are ordered by that link and not by a header
+    timestamp a backward clock step can invert. ``created_at`` and ``sid`` stay behind it
+    as the tiebreak for two logs the chain does not relate -- two chain starts, a
+    predecessor retention removed -- which is the weakest answer available and is now
+    confined to the case where the chain has nothing to say.
+
+    One function for this, used BOTH to sort the records and to rank the decisions, so the
+    tree cannot disagree with itself about which of its own logs is newer.
+    """
+    by_sid = {record.sid: record for record in records if record.sid}
+    depth = _succession_depth(by_sid)
+    return {sid: (depth.get(sid, 0), record.created_at, sid) for sid, record in by_sid.items()}
+
+
+def fold_tree(
+    records: Iterable[OpenedRecord], edges: Iterable[EdgeRecord] = ()
+) -> dict[str, TreeNode]:
     """Every slot's node, from the records of every session log. Pure.
 
     Input order does not matter: records are folded oldest log first, by the
@@ -231,16 +509,46 @@ def fold_tree(records: Iterable[OpenedRecord]) -> dict[str, TreeNode]:
     record with no parent never retracts it. A record whose header has no slot
     has no place in a slot-keyed tree and is dropped.
 
+    *edges* are the later decisions -- an adoption, a release -- and each one
+    REPLACES the creating citation for its slot outright rather than being merged
+    with it. The two are not rival readings of one fact: the opened entry says who
+    opened the session, which stays true and is never rewritten, and an edge says
+    who holds it now. Only the newest decision per slot is applied
+    (:func:`latest_edges`), and a release applies as "no parent" -- the one way a
+    parent is taken away.
+
+    An edge for a slot with no log of its own is dropped, for the same reason a
+    cited creator with no log is not followed: this fold's nodes ARE the slots that
+    have logs, so an edge onto anything else would name a node that does not exist.
+
     An edge is FOLLOWED only when it lands on a slot that has a log of its own.
     A cited creator with no log is a citation, not a place in the tree, so the
-    child is a root that still carries its ``parent``. A cycle -- reachable only
-    through forged or damaged records, since a child cannot have created its own
-    creator -- marks every slot on it, so a consumer nests none of them; a slot
-    hanging off a member keeps its edge to it.
+    child is a root that still carries its ``parent``. A cycle -- reachable
+    through forged or damaged records, and now also through a takeover recorded
+    against a stale reading of the tree -- marks every slot on it, so a consumer
+    nests none of them; a slot hanging off a member keeps its edge to it. The
+    guard runs HERE, over the applied edges, and not only where an edge is
+    written: the writer checks the tree as it stands at that moment, while a fold
+    sees a checkpoint and a replayed tail whose decisions can reach it in an order
+    no writer ever saw.
     """
-    ordered = sorted(records, key=lambda record: (record.created_at, record.sid))
+    # ONE order for the records and for the decisions below, from ``log_rank_of``: within a
+    # slot's succession chain it is the ``previous_sid`` link the store wrote, so neither
+    # half can be inverted by a clock that steps backward between two sessions. Sorting
+    # here by a header timestamp while ranking the decisions by the chain would be the two
+    # disagreeing orderings the decision comment below warns about.
+    #
+    # Materialised first because *records* is an ITERABLE and is now read twice -- ranking
+    # needs the whole population before any record can be placed in it. A caller handing
+    # over a generator (``reversed(...)``, a scanner's yield) would otherwise find it spent
+    # by the sort and fold an empty tree.
+    population = list(records)
+    rank = log_rank_of(population)
+    ordered = sorted(
+        population, key=lambda record: rank.get(record.sid, (0, record.created_at, record.sid))
+    )
     has_log: set[str] = set()
-    cited: dict[str, str] = {}
+    cited: dict[str, str | None] = {}
     for record in ordered:
         if not record.slot:
             continue
@@ -248,14 +556,24 @@ def fold_tree(records: Iterable[OpenedRecord]) -> dict[str, TreeNode]:
         if record.parent_slot and record.slot not in cited:
             cited[record.slot] = record.parent_slot
 
-    edge: dict[str, str] = {}
+    # The decisions are placed by the SAME log order the records above were folded in,
+    # handed to the comparison rather than re-derived inside it (see
+    # :func:`edge_supersedes`): two orderings of one slot's logs could disagree, and the
+    # tree would then contradict itself about which of its own records is newer.
+    for slot, edge in latest_edges(edges, rank).items():
+        if slot in has_log:
+            cited[slot] = edge.parent_slot
+
+    edge_of: dict[str, str] = {}
     on_cycle: set[str] = set()
     for slot, parent_slot in cited.items():
+        if not parent_slot:
+            continue
         if parent_slot == slot:
             on_cycle.add(slot)
         elif parent_slot in has_log:
-            edge[slot] = parent_slot
-    on_cycle |= _cycle_members(edge)
+            edge_of[slot] = parent_slot
+    on_cycle |= _cycle_members(edge_of)
 
     nodes: dict[str, TreeNode] = {}
     for slot in has_log:
@@ -383,6 +701,261 @@ def fold_slot_chain(records: Iterable[OpenedRecord], head_sid: str) -> SlotChain
         cursor = step
 
 
+@dataclass(frozen=True)
+class SlotHead:
+    """Which log a slot is on, and whether the record could say at all.
+
+    ``sid`` names the log when the record decides. ``sid`` empty with ``decided``
+    true means a caller may reach for another source; ``decided`` false is "this
+    record cannot say" -- a unit that would not read, more than one uncited log, a
+    cycle -- which is not the same as "no log", and a caller that treats it as one
+    reaches for a source this record was preferred over.
+
+    ``complete`` splits the two ways an empty decided answer arises, and they are
+    different facts about the same slot. The store holds NO unit of it, so the
+    absence of a predecessor is the whole truth and a caller may STATE it. Or the
+    store holds units it cannot rank -- a silence an announce carries, several logs
+    each stating they start the chain -- where the caller may consult its next
+    source but may state nothing, because an empty answer from that source means
+    only that it had nothing to give. Flattening the two lets a slot with earlier
+    logs record that it has none, in an append-only entry, which is the one claim
+    the field's own contract forbids.
+    """
+
+    sid: str
+    decided: bool
+    complete: bool = True
+
+
+#: A slot with no log at all. Definite and COMPLETE: the units were read and none
+#: belongs to this slot, so a caller may state the absence as well as act on it.
+NO_LOG: Final[SlotHead] = SlotHead(sid="", decided=True, complete=True)
+#: The store holds units of this slot and cannot rank them. A caller may consult its
+#: next source, and may state NOTHING: the units neither name a predecessor nor deny
+#: one, so an empty answer downstream is not a finding about this slot.
+HAND_OVER: Final[SlotHead] = SlotHead(sid="", decided=True, complete=False)
+#: The record cannot say which log the slot is on. Never a licence to guess.
+UNDECIDED: Final[SlotHead] = SlotHead(sid="", decided=False, complete=False)
+
+
+def fold_slot_head(records: Iterable[OpenedRecord], slot: str) -> SlotHead:
+    """*slot*'s NEWEST log among *records* -- the head :func:`fold_slot_chain` walks
+    from. Pure.
+
+    The walk above is handed its head; this is where that head comes from when the
+    caller has only the slot. The edges answer it, and ONLY the edges: a log another
+    log of this slot cites as ``previous`` has a successor, so the newest is the log
+    nothing cites. Exactly one such log is the answer.
+
+    No timestamp takes part, for the reason the walk admits none: ``created_at`` is
+    wall clock, so a backward step across a restart gives the newer log the earlier
+    stamp. Using it to pick between SEVERAL uncited logs would choose the older one
+    exactly when the clock stepped back, and the choice is written into an
+    append-only ``previous`` -- a permanent wrong citation bought to avoid an honest
+    :data:`UNDECIDED`. Succession DEPTH cannot stand in either: it orders logs inside
+    ONE chain, so a freshly created log with no edge yet (depth 0) would lose to the
+    head of a long chain (depth 5) although it is the newer store by every other
+    reading.
+
+    Several uncited logs are a record that cannot simply be read off, and what the
+    answer is depends on WHY the record is short. A cycle leaves no uncited log at
+    all and answers :data:`UNDECIDED`; only a forged or damaged record produces one.
+
+    An uncited log whose predecessor is unknown -- its announce was never read, or it
+    records one it could not determine -- settles the answer to ``UNDECIDED`` once
+    there is anything to choose BETWEEN. Its edge is a gap rather than a statement,
+    so it can neither be ranked nor passed over, and passing over it is exactly what
+    would orphan a store the slot has certainly opened, which is the defect this fold
+    exists to avoid. A slot holding just ONE uncited log needs no ranking at all and
+    answers it, gap or not: there is no other candidate to prefer over it.
+
+    Otherwise every candidate read its announce, so an absent edge is a RECORDED fact:
+    that log states it has no predecessor. Those need no ranking against each other,
+    because what ranks is the edges. Exactly one candidate with an edge is the answer;
+    several are ``UNDECIDED`` -- two genuine chain starts, which no clock may separate.
+
+    None of them carrying an edge is :data:`NO_LOG`, not ``UNDECIDED``, and this is
+    the case a store written before the edge existed is in. Nothing about it is
+    undecidable: the store simply holds no succession for this slot, so the caller's
+    next source answers, and the edge that next create writes is the first thing a
+    later read can rank by -- which is how such a store starts describing itself with
+    no backfill. ``UNDECIDED`` here would be PERMANENT instead of transient: no edge
+    would ever be written, every create would add one more unrankable log, and the
+    next source would stay suppressed for the life of the slot.
+
+    Records of other slots take no part: succession is a relation inside ONE slot,
+    and letting a foreign log either rank or CITE here would hand this slot's answer
+    to another slot's writer -- the refusal :func:`_chain_step` makes for the same
+    reason. :data:`NO_LOG` when no record names *slot*, which is a slot with no log
+    and is a different answer from one whose newest log could not be decided.
+    """
+    mine = [record for record in records if record.slot == slot and record.sid]
+    if not mine:
+        return NO_LOG
+    cited = {record.previous_sid for record in mine if record.previous_sid}
+    heads = [record for record in mine if record.sid not in cited]
+    if len(heads) == 1:
+        return SlotHead(sid=heads[0].sid, decided=True)
+    if not heads:
+        # A cycle: only a forged or damaged record leaves no uncited log at all.
+        return UNDECIDED
+    if any(record.previous_edge in (EDGE_UNDECIDED, EDGE_UNREAD) for record in heads):
+        # Either the writer reported a predecessor it could not determine, or there is
+        # no announce to read at all. Both are a store this slot certainly opened whose
+        # edge the record does not give, so it can neither be ranked nor passed over --
+        # passing over it is what orphans it. Both are also RECOVERABLE as refusals: the
+        # unread one answers when the announce lands, and the undecided one costs a
+        # single citation rather than a wrong one.
+        return UNDECIDED
+    if any(record.previous_edge == EDGE_LEGACY for record in heads):
+        # A silence the announce itself carries: a log written before these keys
+        # existed, or one whose named predecessor belonged to another slot. It is
+        # equally "I am first" and "I could not tell", so this fold cannot rank it --
+        # and it must not be passed over either, which is what elects the log before it
+        # and orphans this one. So the question goes to the source that still knows
+        # which store the slot is on. UNDECIDED here would be PERMANENT, because a
+        # legacy silence, unlike an unread announce, never becomes anything else.
+        #
+        # HAND_OVER rather than NO_LOG: units of this slot EXIST, so an empty answer
+        # from the next source is not a finding that the slot has no predecessor. The
+        # caller may act on it and may state nothing.
+        return HAND_OVER
+    # Every remaining candidate STATES its situation, so what ranks is the edges.
+    linked = [record for record in heads if record.previous_edge == EDGE_NAMED]
+    if len(linked) == 1:
+        return SlotHead(sid=linked[0].sid, decided=True)
+    if linked:
+        # Several chains, each with its own head. No clock and no depth may separate
+        # them, so nothing here can.
+        return UNDECIDED
+    # Every candidate states it has no predecessor, so the store holds no succession
+    # for this slot to read. Nothing is undecidable, so the caller's next source
+    # answers -- which is also how such a store starts describing itself, since the
+    # edge the next create writes is the first thing a later read can rank by. Units
+    # exist, so this is a HAND_OVER and not a statement the caller may repeat: several
+    # logs each claiming to start the chain is the store failing to rank them, not the
+    # slot having no earlier store.
+    return HAND_OVER
+
+
+def slot_chain_head(slot: str) -> SlotHead:
+    """*slot*'s newest crew log, read from the units on disk.
+
+    The durable answer to "which store is this slot writing". Every input is inside
+    the fenced crew log tree: the units are the ones whose own header names *slot*,
+    and the order over them comes from the ``previous`` edges those units recorded,
+    so nothing a gateway process held in memory takes part in the answer and a
+    restart reads exactly what the process before it would have.
+
+    Blocking. It lists the store -- cached against the root's identity, so a scan is
+    paid once per change to the set of units -- and reads one line pair per unit of
+    this slot, which is a handful of small reads for a slot that has superseded a
+    handful of times. A coroutine hops a thread for it.
+
+    ONE unit it cannot read answers :data:`UNDECIDED`, never a head folded from the
+    rest, and the three answers of :class:`SlotHead` exist so a caller cannot confuse
+    that with :data:`NO_LOG`. A transient ``OSError`` here is ordinary operation, not
+    an exotic combination -- a file-descriptor ceiling, a networked data home,
+    retention removing a unit between the listing and the open -- and the id this
+    returns is latched once into an append-only ``previous``. So a head taken from a
+    short record set is a WRONG citation with no second chance, and "no log at all"
+    would send the caller to a source this read was preferred over.
+
+    That applies to the LISTING as much as to the reads below it, which is why it is
+    taken strictly: a unit whose header cannot be proved while it already holds
+    entries is dropped from an ordinary listing without a word, and the unit most
+    likely to be in that state is the newest one -- exactly the one being looked for.
+
+    One strict refusal is NOT a failed read and is answered ``NO_LOG``: the store is
+    not at the name at all. Nothing can be held by a directory that is not there, so
+    "no unit" is complete rather than short -- and that is the ordinary launch, a
+    crew log switched off or one whose first unit has yet to be created. Refusing it
+    would make the mapping, the only source such a launch has, unreachable for every
+    slot for good.
+
+    ``UNDECIDED`` is not sticky. Nothing here remembers a refusal: the listing
+    re-checks a child it could not prove on every call
+    (:func:`~kiro_crew.crew_log.store.session_units_by_slot`), so the read answers
+    again as soon as the bytes do. What does not come back is a citation the emitter
+    skipped while the fault lasted -- that entry is already written -- so this is a
+    recoverable non-answer standing in for an unrecoverable wrong one.
+
+    A unit the listing proved but whose own record cannot be BUILT is different, and
+    is admitted with its identity and no edges. The ordinary case is a create whose
+    ``session/opened`` has not landed yet: the creating job writes the header first
+    and appends the announce second, so a read between the two finds a store this
+    slot has certainly opened and an edge that is merely not written yet. It then
+    makes a second uncited log, so this answers ``UNDECIDED`` rather than guessing --
+    and in that window the slot's OWN record names the store, which is why that
+    record is consulted before this read rather than replaced by it.
+    """
+    if not slot:
+        return NO_LOG
+    try:
+        units = session_units_for_slot(slot, strict=True)
+    except FileNotFoundError:
+        # No store AT THE NAME, so no unit of this slot can exist and "none" is a
+        # complete answer rather than a read that failed. It has to stay separable
+        # from the refusal below: a crew log that is off, or one whose first unit has
+        # not been created yet, is an ordinary launch, and answering UNDECIDED there
+        # would leave the mapping -- the only source such a launch has -- permanently
+        # unreachable for every slot.
+        return NO_LOG
+    except (CrewLogError, OSError):
+        # STRICT, because the ordinary listing is a READ and answers the shorter
+        # truth: a unit whose header cannot be proved while it already holds entries
+        # is left out silently, and the unit most likely to be in that state is the
+        # newest one. Dropped, it makes the unit before it look uncited, and that
+        # older head is then frozen into an append-only ``previous`` with nothing to
+        # correct it. A failed read must not become a value: strict refuses instead,
+        # and the refusal is what UNDECIDED is for.
+        return UNDECIDED
+    records: list[OpenedRecord] = []
+    for unit in units:
+        if not _bounded(unit, MAX_ACP_SESSION_ID_LEN):
+            # A unit id longer than any the gateway writes. Not skippable: it is a
+            # unit of this slot that this reader cannot account for, and a shortened
+            # id is a different name rather than a usable one.
+            return UNDECIDED
+        directory = unit_dir_for(KIND_SESSION, unit)
+        if directory is None:
+            return UNDECIDED
+        segment = oldest_segment(directory)
+        if segment is None:
+            return UNDECIDED
+        try:
+            header, entry, _announced = read_head(segment)
+        except OSError:
+            # The bytes were not seen -- a moment's fault, or retention taking the
+            # unit between the listing and this open. Either way this reader cannot
+            # say which store the slot is on, and saying it anyway from the units it
+            # did read is the wrong citation described above.
+            return UNDECIDED
+        if header is None:
+            return UNDECIDED
+        record = opened_record(directory, header, entry)
+        if record is None:
+            # Identity without edges. The listing already proved this header's own
+            # id folds back to its directory and that it names this slot, so the
+            # store exists and belongs here; what is missing is the announce, or an
+            # announce this build refuses to read. Either way the edge is UNKNOWN,
+            # which makes this a second uncited log and the fold undecided.
+            created = header.get("createdAt")
+            record = OpenedRecord(
+                sid=unit,
+                slot=slot,
+                created_at=(
+                    created if isinstance(created, int) and not isinstance(created, bool) else 0
+                ),
+            )
+        if record.slot != slot:
+            # The listing said this unit is this slot's and its own header does not.
+            # Nothing here can tell which reading is right, so neither is used.
+            return UNDECIDED
+        records.append(record)
+    return fold_slot_head(records, slot)
+
+
 def opened_record(
     directory: Path, header: Mapping[str, Any] | None, entry: Entry | None
 ) -> OpenedRecord | None:
@@ -428,6 +1001,7 @@ def opened_record(
     created = header.get("createdAt")
     parent_slot: str | None = None
     previous_sid: str | None = None
+    previous_edge = EDGE_LEGACY
     if entry.type == TYPE_OPENED:
         parent = entry.data.get("parent")
         if isinstance(parent, dict):
@@ -451,12 +1025,74 @@ def opened_record(
                 return None
             if isinstance(cited_sid, str) and cited_sid:
                 previous_sid = cited_sid
+        if previous_sid is None and entry.data.get("previous_undecided") is True:
+            # A predecessor exists and the writer could not determine it. That is not
+            # this log stating it starts the slot's chain -- a log that means THAT says
+            # so with ``previous_none`` -- so the absence here stays a gap and the fold
+            # refuses on it instead of passing over it.
+            previous_edge = EDGE_UNDECIDED
+        elif previous_sid is None and entry.data.get("previous_none") is True:
+            previous_edge = EDGE_NONE
+        elif previous_sid is not None:
+            previous_edge = EDGE_NAMED
     return OpenedRecord(
         sid=sid,
         slot=slot if isinstance(slot, str) else "",
         created_at=created if isinstance(created, int) and not isinstance(created, bool) else 0,
         parent_slot=parent_slot,
         previous_sid=previous_sid,
+        previous_edge=previous_edge if entry.type == TYPE_OPENED else EDGE_UNREAD,
+    )
+
+
+def edge_record(slot: str, sid: str, entry: Entry | None) -> EdgeRecord | None:
+    """The decision *entry* contributes for the log identified by *slot* and *sid*,
+    or ``None``.
+
+    The identity is passed IN rather than re-derived, because both callers already
+    hold it from a head they proved: the scanner has the unit's
+    :class:`OpenedRecord`, and the replay has the header it just read and folded back
+    to the directory. Re-reading the header here would double the reads on the one
+    path where reads are the cost.
+
+    Both strings are bounded anyway. This function is the door into a fold's state,
+    and a door that trusts its caller is only as safe as its least careful one; the
+    limits are the ones :func:`opened_record` applies, so no path admits a value
+    another path would refuse. Bounds REFUSE rather than truncate: a truncated slot
+    key is a different key, which matches nothing or matches another session.
+
+    An adoption must name a parent ``slot``. One that does not is refused rather
+    than read as a release: the entry that means "no parent" is
+    :data:`TYPE_RELEASED`, and taking the strongest possible meaning from a
+    malformed entry is how a fold detaches a subtree nobody asked it to.
+
+    ``previous_parent`` is not read. It is audit -- who held the session before --
+    and the current edge is stated once, by ``parent``, so a reader cannot find two
+    answers to one question inside a single entry.
+    """
+    if entry is None or entry.type not in EDGE_TYPES:
+        return None
+    if not _bounded(slot, MAX_SHORT_STRING) or not _bounded(sid, MAX_ACP_SESSION_ID_LEN):
+        return None
+    parent_slot: str | None = None
+    if entry.type == TYPE_ADOPTED:
+        parent = entry.data.get("parent")
+        if not isinstance(parent, dict):
+            return None
+        cited_slot = parent.get("slot")
+        if not _bounded(cited_slot, MAX_SHORT_STRING):
+            return None
+        parent_slot = cited_slot
+    at = entry.time
+    seq = entry.seq
+    return EdgeRecord(
+        slot=slot,
+        parent_slot=parent_slot,
+        at=at if isinstance(at, int) and not isinstance(at, bool) else 0,
+        sid=sid,
+        # The store's own position for this line, which is what orders two decisions in
+        # one log without consulting a clock.
+        seq=seq if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0 else 0,
     )
 
 
@@ -517,6 +1153,27 @@ class _Head:
     faulted: bool = False
 
 
+@dataclass(frozen=True)
+class _Edge:
+    """One unit's cached DECISION: the segment its tail was read from, that file's
+    identity, its size when read, and what the tail said -- ``None`` for a unit
+    holding no decision, cached too, so a log with none costs one read rather than
+    one per scan.
+
+    ``size`` is compared for EQUALITY here, where :class:`_Head` compares it as a
+    floor. The two lines a head read returns are immutable for as long as the file
+    exists, so growth cannot change that answer; a tail answer is about the END of
+    the file, and every append moves it. A segment that grew must be read again, and
+    one that SHRANK is a different file on a recycled inode.
+    """
+
+    segment: Path
+    dev: int
+    ino: int
+    size: int
+    record: EdgeRecord | None
+
+
 class SessionTree:
     """The scanner and its per-unit head cache. BLOCKING: it lists a directory
     and stats every unit, so call it off the event loop.
@@ -550,6 +1207,7 @@ class SessionTree:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._heads: dict[str, _Head] = {}
+        self._edges: dict[str, _Edge] = {}
         self._over_cap = False
 
     @property
@@ -569,10 +1227,10 @@ class SessionTree:
         return self._records_with_fault(preferred)[0]
 
     def _records_with_fault(
-        self, preferred: Iterable[str] = ()
-    ) -> tuple[list[OpenedRecord], bool, bool]:
-        """:meth:`records`, plus whether any unit's bytes could not be READ, plus
-        whether the population ran past the cap.
+        self, preferred: Iterable[str] = (), *, with_edges: bool = False
+    ) -> tuple[list[OpenedRecord], list[EdgeRecord], bool, bool]:
+        """:meth:`records`, plus the later decisions when asked for, plus whether any
+        unit's bytes could not be READ, plus whether the population ran past the cap.
 
         *preferred* names unit ids (the live sessions' ACP session ids) whose
         logs are admitted FIRST, whatever their place in the store's order: the
@@ -589,12 +1247,20 @@ class SessionTree:
         a gateway running more than the cap in live logged sessions does lose
         lineage on the rows past it.
 
+        ``with_edges`` is OFF by default, and that is a cost decision rather than a
+        correctness one. A decision lives at the END of a unit's log, so reading it
+        means a second ``stat`` per unit and a bounded read of every unit whose log
+        has grown -- worth paying once, on the cold start that has no checkpoint to
+        replay, and not worth paying on a succession walk, which reads a slot's own
+        chain and has no use for where that slot hangs.
+
         The fault bit is accumulated HERE, inside the lock that did the reading,
         and returned rather than stored. One tree serves every reader in the
         process, so a bit left on the instance could be read by a second,
         unlocked call and describe another reader's scan.
         """
         out: list[OpenedRecord] = []
+        edges: list[EdgeRecord] = []
         seen: set[str] = set()
         faulted = False
         with self._lock:
@@ -626,11 +1292,86 @@ class SessionTree:
                 faulted = faulted or read_faulted
                 if record is not None:
                     out.append(record)
+                if with_edges and record is not None:
+                    # Only for a unit whose head PROVED itself. An edge is keyed by
+                    # slot and the head record is where this scan learned the slot,
+                    # so a unit with no usable head has nothing to key a decision by
+                    # -- and the fold would drop such an edge anyway, since its nodes
+                    # are the slots that have logs.
+                    edge, edge_faulted = self._read_edge(directory, record)
+                    faulted = faulted or edge_faulted
+                    if edge is not None:
+                        edges.append(edge)
             # Evict what this scan did not admit: a unit that is gone, and one
             # that fell past the cap because the population grew in front of it.
             for gone in [name for name in self._heads if name not in seen]:
                 del self._heads[gone]
-        return out, faulted, over_cap
+            for gone in [name for name in self._edges if name not in seen]:
+                del self._edges[gone]
+        return out, edges, faulted, over_cap
+
+    def _read_edge(self, directory: Path, head: OpenedRecord) -> tuple[EdgeRecord | None, bool]:
+        """One unit's newest DECISION, from the cache when its newest segment is
+        byte-identical to the one read, and whether the read FAULTED. Caller holds
+        the lock.
+
+        The two values are the two facts :meth:`_read` returns and they are kept
+        apart for the same reason: "this unit records no adoption" is the store
+        answering, and "its bytes could not be read" is the store failing to. Only
+        the first is cached, and a caller that folds a tree needs to know which it
+        got, because a decision it could not see renders as the session still
+        hanging where it was.
+
+        *head* is the record :meth:`_read` produced for this unit, which is what
+        proved the header folds back to this directory and is where the slot and the
+        id come from. So no header is read here.
+
+        The read is the WHOLE log's, not one tail window. A decision the window cannot
+        reach is not a missing edge but a wrong one -- the fold falls back to the
+        creating edge and shows the session under a parent that released it -- and this
+        scan is the cold path that has no checkpoint to recover it from. The cache is
+        still keyed on the newest segment's exact size, so a unit that has not been
+        appended to since the last scan costs one ``stat``.
+        """
+        name = directory.name
+        try:
+            segment = newest_segment(directory)
+        except OSError:
+            # The listing failed, so this scan has learned NOTHING about whether the unit
+            # records a decision. Reported as incomplete and with no verdict: the cached
+            # entry is left alone, because dropping it would replace a possibly-correct
+            # edge with the creating one, and a reader that DECIDES on an edge is told the
+            # reconciliation did not complete.
+            return None, True
+        if segment is None:
+            # No surviving segment: absent or empty, which IS an answer -- nothing on disk
+            # records a decision for this unit, so a stale cached edge must not outlive it.
+            self._edges.pop(name, None)
+            return None, False
+        try:
+            stat = segment.stat()
+        except OSError:
+            return None, True
+        cached = self._edges.get(name)
+        if (
+            cached is not None
+            and cached.segment == segment
+            and cached.dev == stat.st_dev
+            and cached.ino == stat.st_ino
+            and cached.size == stat.st_size
+        ):
+            return cached.record, False
+        try:
+            entry = find_last_tree_edge(directory)
+        except (OSError, ValueError):
+            # The bytes were not seen, so there is no verdict to cache -- a moment's
+            # I/O fault, or a unit removed between the stat and the open.
+            # ``ValueError`` is caught here and not on the head read because a tail
+            # scan parses a window it may have entered mid-line.
+            return None, True
+        record = edge_record(head.slot, head.sid, entry)
+        self._edges[name] = _Edge(segment, stat.st_dev, stat.st_ino, stat.st_size, record)
+        return record, False
 
     def _read(self, directory: Path) -> tuple[OpenedRecord | None, bool]:
         """One unit's record, from the cache when its segment is unchanged, and
@@ -724,8 +1465,17 @@ class SessionTree:
         self._heads[name] = _Head(segment, stat.st_dev, stat.st_ino, stat.st_size, record)
         return record, False
 
-    def reading(self, preferred: Iterable[str] = ()) -> TreeReading:
+    def reading(self, preferred: Iterable[str] = (), *, with_edges: bool = False) -> TreeReading:
         """The tree as of this scan, WITH whether that scan saw the whole store.
+
+        ``with_edges`` also reads each admitted unit's newest tree DECISION -- an
+        adoption, a release -- from its tail, and folds it. Off by default because it
+        costs a second ``stat`` per unit and a bounded read of every unit that has
+        grown since the last scan: the caller that needs it is the projection's cold
+        start, which has no checkpoint to take those decisions from, and it runs once
+        per process. A reading taken WITHOUT it describes where every slot was
+        opened, which is a different answer from where it hangs now, so a consumer
+        that shows the tree must ask for them.
 
         Prefer this over :meth:`snapshot` wherever the answer is folded into
         something a consumer acts on. ``incomplete`` is true when a unit's bytes
@@ -742,11 +1492,14 @@ class SessionTree:
         complete one.
         """
         try:
-            records, faulted, over_cap = self._records_with_fault(preferred)
+            records, edges, faulted, over_cap = self._records_with_fault(
+                preferred, with_edges=with_edges
+            )
             return TreeReading(
-                nodes=fold_tree(records),
+                nodes=fold_tree(records, edges),
                 incomplete=faulted or over_cap,
                 records=tuple(records),
+                edges=tuple(edges),
             )
         except Exception:  # pragma: no cover -- defensive; the store calls are guarded
             logger.warning("session tree scan failed; reporting no lineage", exc_info=True)
@@ -789,7 +1542,7 @@ class SessionTree:
         is an enrichment, and a store fault must not take its page down.
         """
         try:
-            records, faulted, over_cap = self._records_with_fault([head_sid, *preferred])
+            records, _, faulted, over_cap = self._records_with_fault([head_sid, *preferred])
             return ChainReading(
                 chain=fold_slot_chain(records, head_sid), incomplete=faulted or over_cap
             )

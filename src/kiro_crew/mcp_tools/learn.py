@@ -21,7 +21,10 @@ from typing import Any
 from urllib.parse import urlencode
 
 from kiro_crew import mcp_core
-from kiro_crew.lesson_validation import LESSON_REFUSED_AT_CAPACITY
+from kiro_crew.lesson_validation import (
+    LESSON_APPLIES_INSTRUCTION,
+    LESSON_REFUSED_AT_CAPACITY,
+)
 from kiro_crew.validation import (
     LEARN_ADD_SCHEMA,
     LESSON_LIST_LIMIT,
@@ -138,21 +141,7 @@ def schemas() -> list[dict[str, Any]]:
                     "applies": {
                         "type": "string",
                         "enum": ["always", "on_topic"],
-                        "description": (
-                            "Which startup tier this correction belongs to. YOU decide "
-                            "it from what the user actually said, because nothing else "
-                            "can: 'always' is a standing rule the user wants followed in "
-                            "every session regardless of topic (a permission, a safety "
-                            "constraint, a style or workflow requirement); 'on_topic' is "
-                            "a past finding worth having only when the task touches it (a "
-                            "troubleshooting conclusion, a project detail, how one bug "
-                            "turned out). Standing rules share a small startup budget, so "
-                            "filing a finding as 'always' spends room a real rule needs, "
-                            "and filing a rule as 'on_topic' means it stops arriving "
-                            "unless the task mentions it. Do not pick by wording: 'always' "
-                            "appears in both kinds. Omit the field when you genuinely "
-                            "cannot tell -- the row is then treated as a standing rule."
-                        ),
+                        "description": LESSON_APPLIES_INSTRUCTION,
                     },
                 },
                 "required": ["rule", "category"],
@@ -311,6 +300,19 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
     d = mcp_core._post("/api/lessons", payload)
     err_val = d.get("error")
     if err_val:
+        # The gateway's 400 ``missing_session_key`` is the same missing identity
+        # ``memory_recall`` refuses on before it posts: this process resolved no
+        # session key, so the request went out without X-Session-Key and the
+        # route said exactly that. Echoing the header name sends the reader after
+        # an HTTP detail; answered instead with the established-session refusal
+        # the sibling tool uses and the same diagnosis appended, so the two
+        # tools describe one condition in one voice. Keyed on the code, which is
+        # stable, never on the wording. The decision to post is unchanged.
+        if d.get("code") == "missing_session_key":
+            return (
+                "Error: lesson was NOT saved: learn_add requires an established session"
+                + mcp_core.strict_identity_diagnosis()
+            )
         # Map the backend session-scope error to a user-actionable
         # message so the LLM can explain the situation instead of
         # leaking an opaque HTTP 400 as a "transport failed" error.
@@ -671,6 +673,14 @@ def learn_remove(name: str, args: dict[str, Any]) -> str:
                 "persisted history found for this session key). Retry "
                 "from an established session (dashboard tab or Slack "
                 "thread), or use `kirocrew learn remove` from a shell."
+            )
+        # The same 400 the create route emits when this process resolved no
+        # session key; answered like ``learn_add`` so the two lesson writers
+        # describe one condition in one voice.
+        if d.get("code") == "missing_session_key":
+            return (
+                "No lessons were removed: learn_remove requires an established session"
+                + mcp_core.strict_identity_diagnosis()
             )
         return f"Error: {err_val}"
     return f"Removed lessons matching: {query}"

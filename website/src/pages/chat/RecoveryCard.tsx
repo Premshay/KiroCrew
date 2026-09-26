@@ -33,6 +33,7 @@ export type RecoveryKind =
   | 'promise_only'
   | 'compaction'
   | 'manual'
+  | 'refusal_fallback'
   | 'hook'
   | 'hook_halted'
   | 'synthesis'
@@ -78,6 +79,12 @@ const PREFIXES: ReadonlyArray<[RecoveryKind, string]> = [
   // the same shape (an `inject` continuation the model reads), but its copy must
   // not claim an automatic recovery — a person pressed Continue.
   ['manual', '[Continue — requested by the user]'],
+  // A content-filter refusal landed after the turn had already run tools, and a
+  // fallback model is configured. The user's message is not replayed (the tools
+  // would run twice); the session is moved to the fallback model and handed the
+  // same continuation as Continue. Its copy names the filter as the cause and
+  // the other model as the remedy — nothing faulted and nobody pressed anything.
+  ['refusal_fallback', '[Content filter — continuing on the fallback model]'],
   // A Stop hook returned a block decision. Also not a recovery: the turn
   // finished and a hook asked for another, so its copy names the hook as the
   // cause rather than reporting an interruption that never happened.
@@ -241,6 +248,19 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
     }
   }
 
+  if (kind === 'refusal_fallback') {
+    // Its own copy: the turn was not interrupted by a fault (the model's filter
+    // declined it) and the user did not press anything (the gateway switched
+    // models). The continuation the fallback model reads is the expandable body.
+    return {
+      kind,
+      title: i18nT('pages.chat.recoveryCard.content_filter_declined'),
+      detail: i18nT('pages.chat.recoveryCard.fallback_model_continuing'),
+      chip: '',
+      body,
+    }
+  }
+
   if (kind === 'hook') {
     // Its own copy rather than a reused interruption label: the turn ran to
     // completion and a Stop hook asked for another, so nothing was interrupted,
@@ -359,7 +379,53 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
  * emit time — vanishes after a flush + rehydrate. Anything keyed on its absence
  * therefore mis-renders every restored row.
  */
-export type InjectKind = 'cron' | 'recovery' | 'synthesis' | 'user_replay'
+export type InjectKind = 'cron' | 'mcp_app' | 'recovery' | 'synthesis' | 'user_replay'
+
+/**
+ * Whether each gateway-stamped inject kind OPENS a turn of its own, or
+ * continues the one above it.
+ *
+ * Every kind is a queued prompt the runner drains into a dispatch (the
+ * `_inject_meta` stamp in chat_runner.py's drain, `_run_pending_synthesis`), so
+ * "a new dispatch" is not the question -- WHOSE request the dispatch carries is.
+ * A cron notification is an unrelated prompt with its own reply, and a synthesis
+ * row leads the turn that folds a fan-out into one answer (the boundary
+ * `groupDisplayItems` and `_orphan_in_current_turn` already flush on): both
+ * begin work the rows above did not ask for. A `recovery` continuation resumes
+ * the SAME turn after a stall, and a `user_replay` re-queues the SAME request
+ * verbatim when a turn emitted nothing (`build_recovery_requeue`): the reply
+ * below either one still answers the request above it.
+ *
+ * A `Record` over the union rather than a set of the openers, deliberately: a
+ * fifth kind added to `InjectKind` does not compile until it is classified
+ * here. A hand-listed set would read it as a continuation and never say so.
+ */
+export const INJECT_KIND_OPENS_TURN: Readonly<Record<InjectKind, boolean>> = {
+  cron: true,
+  synthesis: true,
+  recovery: false,
+  user_replay: false,
+  // An app message's delivery dispatches a whole new turn (both the direct
+  // dispatch and the drain), so its inject row opens that turn — without
+  // this, isFeatureRequestRefusal walks past it to an earlier user row and
+  // mis-attributes an app turn's error to that older message.
+  mcp_app: true,
+}
+
+/**
+ * True when an `inject` row begins a turn of its own (see
+ * {@link INJECT_KIND_OPENS_TURN}). A row with no stamped kind never does: a
+ * note rides the NEXT turn's context (`isNoteRow`), and the policy-block notice
+ * and the hook-halt marker are display-only rows appended into the running turn
+ * with nothing dispatched. A kind this build does not know (a newer gateway)
+ * reads the same way -- the fail-passive direction `resolveInjectCard` takes
+ * for an unmarked row.
+ */
+export function injectOpensTurn(m: { role: string; meta?: Record<string, unknown> | null }): boolean {
+  if (m.role !== 'inject') return false
+  const kind = m.meta?.injectKind
+  return typeof kind === 'string' && Object.hasOwn(INJECT_KIND_OPENS_TURN, kind) && INJECT_KIND_OPENS_TURN[kind as InjectKind]
+}
 
 /**
  * Decide which card, if any, an `inject` row gets. The single decision point
@@ -435,6 +501,7 @@ export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: P
     kind === 'promise_only' ||
     kind === 'compaction' ||
     kind === 'manual' ||
+    kind === 'refusal_fallback' ||
     kind === 'hook' ||
     kind === 'synthesis' ||
     kind === 'generic'

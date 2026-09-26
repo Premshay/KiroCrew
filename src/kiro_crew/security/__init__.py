@@ -105,7 +105,6 @@ from .argv_floor import (
     _bare_kill_raw_bodies,
     _git_publish_floor_tags,
     _git_push_args,
-    _has_self_importing_inline_program,
     _host_is_self,
     _is_credential_mint,
     _is_dev_mode_out_of_root_confirm,
@@ -134,7 +133,6 @@ from .argv_floor import (
     _process_substitution_word_is_opaque,
     _proxyjump_value_targets_self,
     _push_segment_targets_protected,
-    _python_reads_stdin,
     _resolve_own_host_names,
     _resolve_own_host_names_into_cache,
     _routing_option_key_value_targets_self,
@@ -149,8 +147,6 @@ from .argv_floor import (
     _shell_payload_sources,
     _ssh_family_verb,
     _static_substitution_output,
-    _stdin_program_text,
-    _stdin_redirect_carriers,
     _unmask_separators,
 )
 from .denied_rules import (
@@ -183,6 +179,7 @@ from .denied_rules import (
     _LEGACY_RULE_ID_BY_PATTERN,
     _LINEARIZED_AWS_FLAG_RUN,
     _LITERAL_CONCAT_RE,
+    _PERM_VERB_MENTION_PATTERNS,
     _PRINTENV_AWS_SECRET_PATTERN,
     _RULE_ID_BY_PATTERN,
     _RULES_BY_ID,
@@ -296,6 +293,7 @@ from .exfil import (
     canonicalize_ip,
     diagnose_oauth_url_credential,
     exfil_query_min_len,
+    oauth_rejection_is_endpoint_exemptible,
     oauth_url_contains_credential,
     redact_exfiltration_urls,
     scan_exfiltration_urls,
@@ -311,6 +309,7 @@ from .helpers import (
 )
 from .inline_payload import (
     _INLINE_DYNAMIC_EXEC_RE,
+    _has_self_importing_inline_program,
     _inline_payload_reaches_cli,
 )
 from .paths import (
@@ -367,6 +366,7 @@ from .paths import (
     _run_resolution_bounded,
     _stall_prefix,
     _wedged_workers,
+    canonical_path_refusal,
     crew_home_prefixes,
     is_sensitive_bash_command,
     is_sensitive_canonical_path,
@@ -380,6 +380,7 @@ from .paths import (
     sensitive_path_refusal,
     write_protected_home_paths,
 )
+from .perm_verb_mention import _perm_verb_mention_only
 from .redaction import (
     _B64_CHUNK_RE,
     _BARE_SECRET_RUN_RE,
@@ -520,6 +521,7 @@ from .shell_normalizer import (
     _push_option_matches,
     _push_token_redirection,
     _push_token_shell_read,
+    _python_reads_stdin,
     _redirect_consumes_next,
     _redirect_glue_point,
     _resolve_function_aliases,
@@ -538,6 +540,8 @@ from .shell_normalizer import (
     _split_glued_operators,
     _split_push_command_segments,
     _split_shell_words,
+    _stdin_program_text,
+    _stdin_redirect_carriers,
     _strip_redirect,
     _substitution_bodies,
     _substitution_depth_delta,
@@ -701,7 +705,8 @@ def sanitized_oauth_endpoint(url: str) -> tuple[str, str] | None:
       and a credential-bearing HOSTNAME makes the whole helper return ``None``
       — a host is an identity, so a redacted host would name nothing;
     * both components are length-capped, so a pathological URL cannot bloat a
-      banner or a log line.
+      banner or a log line; a capped component ends in ``…`` so a reader can
+      tell a chopped name from a whole one.
 
     Returns ``None`` when the URL does not parse to a hostname, so callers fall
     back to their existing unnamed message. Deliberately independent of WHY the
@@ -752,13 +757,59 @@ def sanitized_oauth_endpoint(url: str) -> tuple[str, str] | None:
         # transformed form and refuse to name it.
         if _oauth_component_is_unsafe(host):
             return None
-    host = host[:_SANITIZED_OAUTH_HOST_MAX_LEN]
+    if len(host) > _SANITIZED_OAUTH_HOST_MAX_LEN:
+        # Marked like the path below: a silently chopped host reads as a whole
+        # hostname that nothing on disk will ever match.
+        host = host[:_SANITIZED_OAUTH_HOST_MAX_LEN] + "…"
     path = parsed.path or "/"
     if _oauth_component_is_unsafe(path):
         path = _REDACTED_CREDENTIAL_TAG
     elif len(path) > _SANITIZED_OAUTH_PATH_MAX_LEN:
         path = path[:_SANITIZED_OAUTH_PATH_MAX_LEN] + "…"
     return host, path
+
+
+def sanitized_oauth_endpoint_display(url: str) -> str | None:
+    """A rejected endpoint as one copy-ready ``host/path`` string, or ``None``.
+
+    :func:`sanitized_oauth_endpoint` answers a diagnostic ``(host, path)`` pair
+    and, by contract, may hand back a component that is NOT pasteable: the
+    shared redaction tag for a credential-bearing path, or a ``…``-capped host
+    or path. A surface whose whole point is "write THIS into
+    ``oauth_endpoints.json``" must not join those into text that reads as
+    actionable and is not.
+
+    So this helper returns a string only when writing the entry would WORK:
+
+    * the host matches ``_OAUTH_EXTENSION_HOST_RE`` (lowercase DNS name with a
+      letter TLD — so ``localhost``, IP literals and a capped host are refused);
+    * the path passes ``_valid_oauth_extension_path`` (leading ``/``, no
+      ``; ? # % \\ ..`` or whitespace) and is neither redacted nor capped;
+    * the rejection is one the allowlist can clear
+      (:func:`oauth_rejection_is_endpoint_exemptible`): the gate is re-run as
+      if the endpoint were approved, and only a URL that then PASSES is named.
+      A URL refused for a fixed credential, userinfo, a fragment, path
+      parameters, heavy percent-encoding, ``http`` or an explicit port would be
+      refused again after the entry is added, so it stays unnamed rather than
+      advertise a remedy that cannot work.
+
+    Callers fall back to their unnamed message on ``None``. Because the
+    counterfactual re-runs the gate, this can stat the operator file (memoized),
+    so callers treat it like the gate itself and run it off the event loop.
+    """
+    endpoint = sanitized_oauth_endpoint(url)
+    if endpoint is None:
+        return None
+    host, path = endpoint
+    # A capped host needs no check of its own: the host rule below ends in a
+    # letter TLD, which a trailing "…" can never satisfy.
+    if path == _REDACTED_CREDENTIAL_TAG or path.endswith("…"):
+        return None
+    if not _OAUTH_EXTENSION_HOST_RE.fullmatch(host) or not _valid_oauth_extension_path(path):
+        return None
+    if not oauth_rejection_is_endpoint_exemptible(url):
+        return None
+    return f"{host}{path}"
 
 
 # ── Binary File MIME Allowlist ──
@@ -1818,6 +1869,10 @@ def is_denied(
                 component="argv-floor",
             )
 
+    # Memoizes the argv-structural mention walk per view: the same view is asked
+    # about once per matching pattern, and every opted-in pattern can match.
+    mention_cache: dict[str, bool] = {}
+
     # ── Pass 1: whole-string deny ──
     # If any pattern matches the full input AND no exception matches the
     # full input, deny outright.  A whole-string match that IS covered by an
@@ -1836,6 +1891,17 @@ def is_denied(
                 and _exception_eligible(lower)
                 and any(fnmatch.fnmatch(lower, e.lower()) for e in exceptions)
             )
+            if not whole_string_exception_match and _perm_verb_mention_narrows(
+                pattern, lower, mention_cache
+            ):
+                # Same shape as the glob exception above: a whole-string carve-out
+                # only DEFERS to Pass 2, which re-judges each segment on its own,
+                # so an embedded real invocation is still denied there.  The audit
+                # is emitted here (and GATES the carve-out) because for a search
+                # whose verb and path land in different segments Pass 2 never
+                # matches, so this is the only place the decision is recorded.
+                if _emit_deny_exception_event(tool_name, pattern, _PERM_VERB_MENTION_MECHANISM):
+                    whole_string_exception_match = True
             if not whole_string_exception_match:
                 _emit_deny_event(tool_name, pattern, lower)
                 return _reason(pattern)
@@ -1898,8 +1964,29 @@ def is_denied(
                         exceptions
                         and _exception_eligible(view)
                         and any(fnmatch.fnmatch(view, e.lower()) for e in exceptions)
-                    ):
-                        if not _emit_deny_exception_event(tool_name, pattern):
+                    ) or _perm_verb_mention_narrows(pattern, lower, mention_cache):
+                        # ``lower``, not ``view``: the mention reading is a
+                        # WHOLE-COMMAND judgement and a Pass 2 segment is not
+                        # always a command.  ``_split_segments`` is deliberately
+                        # quote-unaware, so a quoted alternation is severed
+                        # mid-literal and the tail arrives looking like an
+                        # invocation -- ``rg -n 'chmod|chown' /etc/profile.d``
+                        # yields the fragment ``chown' /etc/profile.d``, whose
+                        # first word IS the verb.  Judging that fragment refuses
+                        # a search that runs nothing.  Nothing is lost by asking
+                        # about the whole command instead: the predicate demands
+                        # that EVERY occurrence, in the command and in every
+                        # nested payload, sit at an argument position, and a
+                        # chained real invocation is exactly an occurrence in
+                        # program position -- ``_ends_argv`` cuts the argv at
+                        # ``;`` ``&&`` ``||`` ``|`` and at a subshell or brace
+                        # opener, so the embedded command's own verb leads its
+                        # own argv and refuses the whole exemption.  A newline
+                        # separator, which ``shlex`` would swallow as
+                        # whitespace, is refused outright by the predicate.
+                        if not _emit_deny_exception_event(
+                            tool_name, pattern, _perm_verb_mechanism_for(pattern)
+                        ):
                             _emit_deny_event(tool_name, pattern, view, raw_segment=seg_lower)
                             return _reason(pattern)
                         # Exception granted for this pattern on this segment;
@@ -2078,11 +2165,67 @@ def _emit_deny_event(
         )
 
 
-def _emit_deny_exception_event(tool_name: str, deny_pattern: str) -> bool:
+#: SEL ``mechanism`` value for the argv-structural inert-mention narrowing.
+#: Distinct from the glob carve-out map's ``_DENY_EXCEPTIONS`` so the audit trail
+#: can tell the two apart -- they share one emitter and nothing else.
+_PERM_VERB_MENTION_MECHANISM = "_PERM_VERB_MENTION"
+
+
+def _perm_verb_mechanism_for(pattern: str) -> str:
+    """The SEL mechanism name for the exception about to be granted.
+
+    Pass 2 reaches the emitter from a condition that is an OR of the glob
+    carve-out and the mention reading, so the branch alone cannot say which one
+    fired.  The mention reading is the narrower of the two -- it applies only to
+    the opted-in patterns -- so membership in that set decides the label.
+    """
+    if pattern in _PERM_VERB_MENTION_PATTERNS:
+        return _PERM_VERB_MENTION_MECHANISM
+    return "_DENY_EXCEPTIONS"
+
+
+def _perm_verb_mention_narrows(
+    pattern: str,
+    view: str,
+    cache: dict[str, bool],
+) -> bool:
+    """Whether *pattern* is narrowed away on *view* by an inert-mention reading.
+
+    A thin adapter over :func:`~.perm_verb_mention._perm_verb_mention_only`: it confines
+    the narrowing to the catalog patterns that opt into it, and memoizes the
+    argv walk per view.  The walk descends every nested payload, so it is the
+    expensive half of this check while the membership test is a set lookup --
+    and ``is_denied`` asks the same question once per matching pattern.
+
+    Returns False for every other pattern, which is what keeps this from
+    touching any rule outside the derived set.  The set's size is deliberately
+    not written down here: it is derived from the catalog, so a count in prose
+    goes stale the next time a row is added or renamed.
+    """
+    if pattern not in _PERM_VERB_MENTION_PATTERNS:
+        return False
+    verdict = cache.get(view)
+    if verdict is None:
+        verdict = _perm_verb_mention_only(view)
+        cache[view] = verdict
+    return verdict
+
+
+def _emit_deny_exception_event(
+    tool_name: str,
+    deny_pattern: str,
+    mechanism: str = "_DENY_EXCEPTIONS",
+) -> bool:
     """Emit an SEL audit event when a deny exception is applied.
 
     Returns True if the event was logged successfully, False otherwise.
     The caller must NOT grant the exception if this returns False.
+
+    *mechanism* names WHICH narrowing granted the exception.  Two unrelated ones
+    reach this emitter -- the glob carve-out map and the argv-structural
+    inert-mention reading -- and recording both under one value makes the audit
+    trail unable to answer "why was this allowed", which is the only question it
+    exists for.  The default keeps the glob path's historical value.
     """
     try:
         sel = SecurityEventLog()
@@ -2097,7 +2240,7 @@ def _emit_deny_exception_event(tool_name: str, deny_pattern: str) -> bool:
                 operation=tool_name,
                 outcome="allowed",
                 resources=f"deny_pattern={deny_pattern}",
-                metadata={"deny_pattern": deny_pattern, "mechanism": "_DENY_EXCEPTIONS"},
+                metadata={"deny_pattern": deny_pattern, "mechanism": mechanism},
             )
         )
         return True

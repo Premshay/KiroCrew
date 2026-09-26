@@ -6,8 +6,8 @@
  * logged in" — fixable only from a terminal that dashboard does not have. Five
  * states, because the recovery is only legible if all five read correctly:
  *
- *  1. The unsigned crew in Your instances — the `Needs sign-in` badge, the held
- *     Connect, the row-level way to get a code, and the hint that says what that
+ *  1. The unsigned crew in Your crews — the `Needs sign-in` badge, a Connect
+ *     that stays usable, the row-level way to get a code, and the hint that says what that
  *     button produces. The state the old flow reported as done and green.
  *  2. A LIVE code — and deliberately no replace button, because restarting the
  *     login mid-approval retires the code the reader is typing into a browser.
@@ -74,7 +74,7 @@ const STEPS_REGISTERED = [
     key: 'connect',
     label: 'Connect',
     state: 'done',
-    detail: 'Added to your instances. Finish the Kiro sign-in before connecting.',
+    detail: 'Added to Your crews. Sign in to Kiro on the crew after you connect.',
   },
 ]
 
@@ -146,8 +146,8 @@ const AWAITING_NO_CODE_JOB = { ...AWAITING_JOB, id: 'j-awaiting-nocode', signin:
 
 /**
  * An initial launch still creating its instance: nothing is registered, so the
- * cancel here removes the instance being created. This is the OTHER half of the
- * cancel split -- frames 2-5 show only "Stop sign-in, keep the instance".
+ * cancel here removes the crew being created. This is the OTHER half of the
+ * cancel split -- frames 2-5 show only "Stop sign-in, keep the crew".
  */
 const LAUNCHING_JOB = {
   ...UNSIGNED_JOB,
@@ -185,7 +185,7 @@ const AWS_EC2_ROW = {
 
 /**
  * The fixture world, switched per frame. `jobs` decides whether a crew is
- * unsigned and whether a code is live; `instances` decides whether Your instances
+ * unsigned and whether a code is live; `instances` decides whether Your crews
  * has a row at all.
  */
 const world = { jobs: [], instances: [], signinAnswer: null }
@@ -273,12 +273,9 @@ for (const theme of ['dark', 'light']) {
 
   const rowText = await row.innerText()
   if (!/Needs sign-in/i.test(rowText)) fail(`${theme}: the unsigned crew must be badged: ${JSON.stringify(rowText)}`)
-  const held = row.getByRole('button', { name: /Connect after sign-in/i })
-  if (!(await held.isVisible())) fail(`${theme}: Connect must be held back on an unsigned crew`)
-  if (!(await held.isDisabled())) fail(`${theme}: the held Connect button must be disabled`)
-  if (await row.getByRole('button', { name: /^Connect$/ }).count()) {
-    fail(`${theme}: the ordinary Connect must not be offered on an unsigned crew`)
-  }
+  const connect = row.getByRole('button', { name: /^Connect$/ })
+  if (!(await connect.isVisible())) fail(`${theme}: an unsigned crew must still offer Connect`)
+  if (await connect.isDisabled()) fail(`${theme}: Connect must stay usable on an unsigned crew`)
   if (!(await row.getByRole('button', { name: /Start sign-in/i }).isVisible())) {
     fail(`${theme}: the crew row must offer the sign-in without going back to Set up`)
   }
@@ -286,7 +283,7 @@ for (const theme of ['dark', 'light']) {
   // flow or begins one. The hint names the outcome.
   const rowHint = row.locator('[data-testid="signin-recovery-hint"]')
   if (!(await rowHint.isVisible())) fail(`${theme}: the row's recovery button must say what it produces`)
-  if (!/Starts the sign-in on the instance and shows a new code here\./i.test(await rowHint.innerText())) {
+  if (!/Starts the sign-in on the crew and shows a new code here\./i.test(await rowHint.innerText())) {
     fail(`${theme}: the row hint must describe a fresh sign-in, not a resumed one`)
   }
   // Above the crew's name and titled "This crew", the block read as a page-level
@@ -333,17 +330,18 @@ for (const theme of ['dark', 'light']) {
   // Same button, two blast radii: this job is a registered crew, so Cancel only
   // stops the sign-in. The reader would not click a Cancel that might also throw
   // away the instance that already exists.
-  const cancel = page.getByRole('button', { name: /Stop the sign-in on kc-5e10bb and keep the instance/i })
-  if (!(await cancel.isVisible())) fail(`${theme}: Cancel must say it keeps the instance on a sign-in retry`)
-  if (!/Stop sign-in, keep the instance/i.test(await cancel.innerText())) {
+  const cancel = page.getByRole('button', { name: /Stop the sign-in on kc-5e10bb and keep the crew/i })
+  if (!(await cancel.isVisible())) fail(`${theme}: Cancel must say it keeps the crew on a sign-in retry`)
+  if (!/Stop sign-in, keep the crew/i.test(await cancel.innerText())) {
     fail(`${theme}: the visible Cancel copy must name its blast radius too`)
   }
-  // The panel calls these boxes instances everywhere else, so "crew" here read as
-  // a different, second thing the reader had to guess at.
-  if (/\bcrew\b/i.test(await cancel.innerText())) {
-    fail(`${theme}: the Cancel copy must not call the instance a crew`)
+  // The panel calls these rows crews everywhere else, so "instance" here would read
+  // as a different, second thing the reader had to guess at — that word is reserved
+  // for the EC2 machine (see stamped_ec2_note), not for the row.
+  if (/\binstance\b/i.test(await cancel.innerText())) {
+    fail(`${theme}: the Cancel copy must not call the crew an instance`)
   }
-  // Not danger-toned: this click keeps the instance and the crew row, and toning
+  // Not danger-toned: this click keeps the crew and its row, and toning
   // both would leave the tone meaning nothing.
   if (await cancel.evaluate(el => /danger/.test(el.className))) {
     fail(`${theme}: the keep-the-instance cancel must NOT wear the danger tone`)
@@ -462,7 +460,7 @@ for (const theme of ['dark', 'light']) {
   await openSetup(page)
   const prompt = page.locator('[data-testid="signin-prompt"]')
   const text = await prompt.innerText()
-  if (!/Starting the Kiro sign-in on the instance\./i.test(text)) {
+  if (!/Starting the Kiro sign-in on the crew\./i.test(text)) {
     fail(`${theme}: the starting state must say the sign-in is starting: ${JSON.stringify(text)}`)
   }
   // The CARD's badge carries "Getting your sign-in code…"; the body line says what
@@ -533,10 +531,10 @@ for (const theme of ['dark', 'light']) {
   await page.getByRole('button', { name: /Set up a new one/i }).click()
   // No instance exists yet, so this Cancel says it removes the one being created
   // -- the destructive half of the split, never shown in frames 2-5.
-  const cancel = page.getByRole('button', { name: /Cancel setup of kc-5e10bb and remove the instance/i })
+  const cancel = page.getByRole('button', { name: /Cancel setup of kc-5e10bb and remove the crew/i })
   await cancel.waitFor({ timeout: 20000 })
   await page.waitForTimeout(400)
-  if (!/Cancel and remove the instance…/.test(await cancel.innerText())) {
+  if (!/Cancel and remove the crew…/.test(await cancel.innerText())) {
     fail(`${theme}: the copy must name what it removes AND end in the panel's confirm ellipsis`)
   }
   // And it does not LOOK like the cancel that keeps the crew (frame 02): reading
@@ -546,7 +544,7 @@ for (const theme of ['dark', 'light']) {
   if (!dangerToned) {
     fail(`${theme}: the cancel that removes the instance must carry the danger tone`)
   }
-  if (await page.getByRole('button', { name: /keep the instance/i }).count()) {
+  if (await page.getByRole('button', { name: /keep the crew/i }).count()) {
     fail(`${theme}: an unregistered launch must not offer the keep-the-instance cancel`)
   }
   // Nothing to sign in to yet: no prompt block, and the card says it is setting up.
@@ -673,7 +671,7 @@ for (const theme of ['dark', 'light']) {
 
 // ---- Frame 9: the Setting-up row at phone width -----------------------------
 //
-// The row's cancel carries the long "Cancel and remove the instance" label in a
+// The row's cancel carries the long "Cancel and remove the crew" label in a
 // shrink-0 slot; the card frames (06) do not show whether it fits a narrow row.
 
 world.jobs = [LAUNCHING_JOB]
@@ -685,7 +683,7 @@ for (const theme of ['dark', 'light']) {
   await stubDashboardApi(page, { extra, theme })
   logPageProblems(page)
   await page.goto(`${base}/settings?tab=instances`, { waitUntil: 'domcontentloaded' })
-  const cancel = page.getByRole('button', { name: /Cancel setup of kc-5e10bb and remove the instance/i })
+  const cancel = page.getByRole('button', { name: /Cancel setup of kc-5e10bb and remove the crew/i })
   await cancel.waitFor({ timeout: 20000 })
   await page.waitForTimeout(400)
   const row = cancel.locator('xpath=../..')

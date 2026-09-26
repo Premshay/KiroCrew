@@ -25,7 +25,8 @@
      - Product-shape change (a changed default, what a loop/monitor/agent/command
        does by default, a removed or replaced user-facing capability): link the
        RFC under docs/request-for-change/ that records the decision. It must
-       already be on main with a non-draft status; an RFC shipped in this PR, or
+       already be on main with status `accepted`, `in-progress`, `partial`, or
+       `implemented`; an RFC shipped in this PR, or
        whose status this PR flips, does not count. Without one the First
        Principles lane BLOCKs until a maintainer records the decision with
        `/ai-review override first-principles <head-sha>: <reason>` (same-repo
@@ -57,7 +58,12 @@
 ## Screenshots / video
 
 <!-- MANDATORY for any user-visible UI change (new/changed panels, components,
-     layouts, themes); delete this section otherwise.
+     layouts, themes).
+
+     For a watched frontend path with no rendered delta, keep this section and
+     use the `no-visual-delta` marker with a `Why no screenshot` justification;
+     maintainers may instead apply the `no-screenshots` label. Delete this
+     section only when the diff does not touch a user-visible frontend surface.
 
      - Show each affected surface in its meaningful variants (e.g. desktop vs
        browser, empty vs populated, light vs dark).
@@ -75,6 +81,18 @@
          ![alt](./evidence/after.png)
          ![](./evidence/demo.mp4)   <- alone in its paragraph renders as a player
        Limits: 10 MB per image/GIF, 100 MB per video.
+     - WITHOUT write access on this repository (a fork PR), `--attach` is not
+       available to you: the upload endpoint answers read permission with a
+       404 (cli/cli#14302). Either drag the file into this box in the web UI,
+       which works with read access, or commit it -- `git add -f
+       temp-screenshots/<topic>/after.png`, forced because that directory is
+       gitignored -- and reference the repository-relative path here. The
+       review lanes read committed media the same way they read an attachment,
+       with ONE limit for a committed file: 10 MB, video included -- a bigger
+       file is skipped, not reviewed. A recording over 10 MB goes into this
+       box via the web UI, where the 100 MB video limit above applies.
+       Know the cost: a committed file merges into main's history for good;
+       the maintainer removes it from the tip afterwards, the blob stays.
      - Non-media evidence is neither attached with --attach nor committed.
        Text (a provenance JSON, a perf baseline, an assertion dump) goes in
        a fenced code block in a PR comment (65,536 characters max). A
@@ -102,7 +120,7 @@
 
 ## Checklist
 
-- [ ] At most two commits (one is the norm), with a Conventional Commits title (`feat|fix|docs|refactor|perf|test|chore|ci|build|revert: ...`)
+- [ ] At most two commits (one is the norm), with a Conventional Commits title (`feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert: ...`)
 <!-- If your branch goes stale, REBASE it. Plain-clicking the "Update branch"
      button on the PR page, or merging the base branch in, adds a merge commit,
      which counts toward the limit above and will fail PR Hygiene on a PR that

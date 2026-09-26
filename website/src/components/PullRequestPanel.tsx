@@ -45,8 +45,7 @@ import { Btn } from './ui'
 
 
 import { i18nT } from '../i18n/t'
-import { OWNER_SETTINGS_TARGET, pullRequestErrorDetails } from '../utils/pullRequestErrors'
-import { SettingsLink } from './SettingsLink'
+import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
 import ErrorNotice from './ErrorNotice'
 const CHECK_POLL_BASE_MS = 10_000
 const CHECK_POLL_MAX_MS = 60_000
@@ -371,6 +370,22 @@ const CI_LABEL_KEY: Record<NonNullable<PullRequestStatus['ci']>, string> = {
   failed: 'components.pullRequestPanel.checks_failed',
 }
 
+/** Catalog keys for a changed file's `status` — GitHub's per-file vocabulary
+ * (added|modified|removed|renamed|copied|changed|unchanged). The wire value was
+ * printed raw and CSS-capitalized: untranslated in every locale and invisible
+ * to the i18n added-lines gate. Flat and indexed inline so the key gate
+ * resolves the map, like LIFECYCLE_LABEL_KEY. `?? file_status_changed` covers a
+ * value outside the known set so an unmapped status still reads as a word. */
+const FILE_STATUS_LABEL_KEY: Record<string, string> = {
+  added: 'components.pullRequestPanel.file_status_added',
+  modified: 'components.pullRequestPanel.file_status_modified',
+  removed: 'components.pullRequestPanel.file_status_removed',
+  renamed: 'components.pullRequestPanel.file_status_renamed',
+  copied: 'components.pullRequestPanel.file_status_copied',
+  changed: 'components.pullRequestPanel.file_status_changed',
+  unchanged: 'components.pullRequestPanel.file_status_unchanged',
+}
+
 /** CI rollup glyph, tone, and catalog KEY. Keys not strings — see LIFECYCLE_META. */
 const CI_META: Record<NonNullable<PullRequestStatus['ci']>, { icon: typeof Check; tone: string; spin?: boolean }> = {
   running: { icon: Loader, tone: 'text-warn', spin: true },
@@ -474,7 +489,7 @@ function ChangeRow({ file }: { file: PullRequestFile }) {
       >
         {open ? <ChevronDown className="lucide-inline shrink-0 text-muted" /> : <ChevronRight className="lucide-inline shrink-0 text-muted" />}
         <span className="text-[13px] text-text truncate min-w-0 flex-1">{file.path}</span>
-        <span className="text-[11px] text-muted capitalize shrink-0">{file.status}</span>
+        <span className="text-[11px] text-muted shrink-0">{i18nT(FILE_STATUS_LABEL_KEY[file.status?.toLowerCase()] ?? 'components.pullRequestPanel.file_status_changed')}</span>
         <span className="text-[11px] shrink-0"><span className="text-ok">+{file.additions}</span> <span className="text-danger">-{file.deletions}</span></span>
       </Btn>
       {open && (
@@ -730,19 +745,6 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
       )}
       <ErrorNotice message={error} variant="inline" askAgent />
     </div>
-    {/* The remedy link lives OUTSIDE the action row, on its own line — never
-        as a row peer, which would push the row past the two-button cap in the
-        confirm state (Cancel + Confirm are already there). */}
-    {error && errorDetails.ownerNotConfigured && (
-      <div className="mt-1.5">
-        <SettingsLink
-          {...OWNER_SETTINGS_TARGET}
-          className="inline-flex items-center gap-1 text-[11px] text-accent hover:underline"
-        >
-          {i18nT('components.pullRequestPanel.open_slack_settings')} <ArrowRight className="lucide-inline" />
-        </SettingsLink>
-      </div>
-    )}
     </>
   )
 }

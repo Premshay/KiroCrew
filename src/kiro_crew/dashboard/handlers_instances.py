@@ -30,7 +30,12 @@ from urllib.parse import unquote
 from aiohttp import web
 
 import kiro_crew
+from kiro_crew.apps.version import versions_compatible
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard.chat_persistence import (
+    cap_effort_capability_levels,
+    register_reasoning_effort_values,
+)
 from kiro_crew.dashboard.handlers._shared import (
     SESSION_SEARCH_TEXT_FIELDS,
     _owner_denial_response,
@@ -135,17 +140,23 @@ def _guard(request: web.Request, operation: str) -> web.Response | None:
             {"error": "instances control plane is owner-only (not reachable via Slack)"},
             status=403,
         )
-    # Deny-by-default: positively confirm an authenticated owner. The dashboard's
-    # require_auth middleware sets request["user"] ONLY after validating the
-    # owner's dashboard token; its absence means the caller is unauthenticated, so
-    # we reject rather than relying on the middleware implicitly (defense in depth
-    # for this SSH-pivoting control plane).
+    # Deny-by-default in two steps, because ``request["user"]`` proves
+    # AUTHENTICATED and nothing more: ``token_auth`` publishes it for any valid
+    # dashboard token, and the messaging transports mint such a token per
+    # allow-listed user, so its presence alone admits a non-owner subject to this
+    # SSH-pivoting control plane. Step one refuses an unauthenticated caller;
+    # step two demands the positive owner identity, which is the same predicate
+    # the capabilities, federated-search, chat-slot and proxy routes in this
+    # module apply for the same reason.
     if not request.get("user"):
         _audit(operation, "denied", error="unauthenticated (no owner identity)")
         return web.json_response(
             {"error": "authentication required (owner-only control plane)"},
             status=401,
         )
+    if not is_owner_dashboard_request(request):
+        _audit(operation, "denied", error="non-owner identity rejected")
+        return _owner_denial_response(request)
     cfg = KiroCrewConfig.load()
     if not cfg.instances.enabled:
         _audit(operation, "denied", error="feature disabled")
@@ -1399,10 +1410,15 @@ async def api_instances_capabilities(request: web.Request) -> web.Response:
     )
     effort_payload = _cap_list(raw.get("effort_levels"), "effort_levels")
     effort_levels = (
-        [_cap_str(level, 32) for level in effort_payload[:_CAP_MAX_ROWS] if isinstance(level, str)]
+        cap_effort_capability_levels(effort_payload, source="peer pre-session")
         if isinstance(effort_payload, list)
         else []
     )
+    version_match = versions_compatible(kiro_crew.__version__, peer_version)
+    # The remote pre-session picker can offer these levels before a live slot
+    # reports its config. Keep the hub's POST allowlist in sync with that offer.
+    if version_match and effort_levels:
+        effort_levels = register_reasoning_effort_values(effort_levels)
 
     _audit("capabilities", "success", request_id=instance_id)
     return web.json_response(
@@ -1413,7 +1429,7 @@ async def api_instances_capabilities(request: web.Request) -> web.Response:
             # The gate the relay enforces on every dispatch, surfaced so the UI
             # can explain a refusal BEFORE the user types a message rather than
             # after their first send fails.
-            "version_match": bool(peer_version) and peer_version == kiro_crew.__version__,
+            "version_match": version_match,
             "agents": _cap_rows(
                 _cap_list(agents_payload, "agents"),
                 {"name": 128, "description": _CAP_MAX_STR, "scope": 32, "model": 128},

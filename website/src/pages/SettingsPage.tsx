@@ -53,7 +53,7 @@ function buildTabs() {
   return [
     { key: 'overview', label: i18nT('settings.tabs.overview.label'), icon: <PanelsTopLeft size={16} />, description: i18nT('settings.tabs.overview.description') },
     { key: 'imports', label: i18nT('settings.tabs.imports.label'), icon: <Import size={16} />, description: i18nT('settings.tabs.imports.description') },
-    { key: 'chat', label: i18nT('settings.tabs.chat.label'), icon: <MessageSquare size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.chat.description') },
+    { key: 'chat', label: i18nT('settings.tabs.chat.label'), icon: <MessageSquare size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.chat.description'), hostsSubNav: true },
     { key: 'display', label: i18nT('settings.tabs.display.label'), icon: <Palette size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.display.description') },
     { key: 'voice', label: i18nT('settings.tabs.voice.label'), icon: <Mic size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.voice.description') },
     { key: 'notifications', label: i18nT('settings.tabs.notifications.label'), icon: <Bell size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.notifications.description') },
@@ -179,8 +179,8 @@ export default function SettingsPage() {
     navigate({ pathname: target, search: rest ? `?${rest}` : '' }, { replace: true })
   }, [search, pathname, navigate])
 
-  // An embedded instance pane can't manage remote instances (single-level by
-  // design) — hide the Instances tab so a pane can't connect onward.
+  // An embedded instance pane can't manage remote crews (single-level by
+  // design) — hide the Remote Crew tab so a pane can't connect onward.
   const embedded = isEmbeddedPane()
   // Update nudge: dot on the About entry while an update is available. Two
   // independent sources, because they cover different installs: the Electron
@@ -220,13 +220,18 @@ export default function SettingsPage() {
       // Keyed apart from the main window: an embedded pane has a different tab
       // roster (no Instances), so the two must not restore each other's tab.
       rememberKey={embedded ? 'settings-embedded' : 'settings'}
+      // Desktop: search lives at the top of the sidebar rail (navTop), pinned
+      // while the tab list scrolls. Mobile: the same field is the floating
+      // bottom capsule (headerRight + bottom-float). Only one mounts per
+      // viewport, so passing both is not a double render.
+      navTop={<SettingsSearch />}
       headerRight={<SettingsSearch />}
       footer={<span className="text-[12px] text-muted">{i18nT('pages.settingsPage.kirocrew_v')}{version}</span>}
     >
       {tab => <>
         {tab === 'overview' && <OverviewPanel />}
         {tab === 'imports' && <ImportPanel />}
-        {tab === 'chat' && <ChatPanel />}
+        {tab === 'chat' && <ChatPanel basePath={SETTINGS_BASE_PATH} />}
         {tab === 'display' && <DisplayPanel />}
         {tab === 'voice' && <VoicePanel />}
         {tab === 'notifications' && <NotificationsPanel />}

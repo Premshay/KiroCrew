@@ -168,7 +168,7 @@ class TestReexecPythonModule:
         assert calls == [
             (
                 executable,
-                ["python.exe", "-s", "-m", "kiro_crew", "gateway", "--port", "5476"],
+                ["python.exe", "-s", "-P", "-m", "kiro_crew", "gateway", "--port", "5476"],
             )
         ]
         assert os.environ["PYTHONUTF8"] == "1"
@@ -187,7 +187,7 @@ class TestReexecPythonModule:
 
         pc.reexec_python_module("kiro_crew", ["gateway"])
 
-        assert calls == [(executable, [executable, "-s", "-m", "kiro_crew", "gateway"])]
+        assert calls == [(executable, [executable, "-s", "-P", "-m", "kiro_crew", "gateway"])]
         assert os.environ["PYTHONUTF8"] == "1"
         assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
 
@@ -212,11 +212,16 @@ class TestReexecPythonModule:
         )
         source_root = str(Path(__file__).resolve().parents[1] / "src")
         inherited_path = os.environ.get("PYTHONPATH", "")
+        # The probe directory rides on PYTHONPATH, not on the cwd: the re-exec
+        # passes -P, which keeps the successor's cwd off sys.path, so a probe
+        # found only through the cwd would vanish on the second hop.
         env = {
             **os.environ,
             "PYTHONUTF8": "0",
             "PYTHONIOENCODING": "cp1252",
-            "PYTHONPATH": os.pathsep.join(p for p in (source_root, inherited_path) if p),
+            "PYTHONPATH": os.pathsep.join(
+                p for p in (str(tmp_path), source_root, inherited_path) if p
+            ),
         }
 
         result = subprocess.run(
@@ -490,14 +495,42 @@ class TestProcessHelpers:
         ppid = pc.get_ppid(os.getpid())
         assert isinstance(ppid, int)
 
-    def test_kill_pid_nonexistent_is_safe(self):
-        # Both platforms raise on non-existent pid — same exception shape so
+    def test_kill_pid_nonexistent_is_safe(self, monkeypatch):
+        # Both platforms raise ProcessLookupError on a non-existent pid, so
         # callers' ``except (ProcessLookupError, OSError)`` handlers fire
-        # uniformly. POSIX: os.kill raises ProcessLookupError. Windows:
-        # taskkill returns rc=128 which _raise_taskkill_error re-badges as
-        # ProcessLookupError.
+        # uniformly. POSIX: os.kill raises it. Windows: taskkill's rc=128 is
+        # re-badged to it by _raise_taskkill_error.
+        #
+        # On POSIX this is a REAL SIGKILL, so "nonexistent" has to hold by
+        # construction, not by luck: any number inside the kernel's pid range
+        # can be handed to an unrelated process between the premise and the
+        # signal. Linux caps pids at PID_MAX_LIMIT (4194304) and macOS at
+        # PID_MAX (99998), so a probe pid above both is refused by the range
+        # check itself and never resolves to a process. Pinned against the
+        # running host where the ceiling is readable, so a kernel that raised
+        # it would fail here rather than turn this test into a kill at whatever
+        # holds that number.
+        #
+        # Windows exposes no readable pid ceiling, so no pid can be proven
+        # unused there and a real ``taskkill /F`` at this number could stop an
+        # unrelated process. The Windows arm therefore runs the same call with
+        # ``taskkill`` stubbed to the rc=128 it returns for a missing pid, so the
+        # contract stays asserted on the Windows shard without the real kill.
+        nonexistent = 2_000_000_000
+        if pc.IS_WINDOWS:
+            recorded: list[list[str]] = []
+
+            def _taskkill_not_found(argv, *_a, **_kw):
+                recorded.append(list(argv))
+                return types.SimpleNamespace(returncode=128, stdout=b"", stderr=b"not found")
+
+            monkeypatch.setattr(pc.subprocess, "run", _taskkill_not_found)
+        elif pc.IS_LINUX:
+            assert nonexistent > int(Path("/proc/sys/kernel/pid_max").read_text())
         with pytest.raises(ProcessLookupError):
-            pc.kill_pid(2_000_000_000, pc.SIGKILL)
+            pc.kill_pid(nonexistent, pc.SIGKILL)
+        if pc.IS_WINDOWS:
+            assert len(recorded) == 1 and str(nonexistent) in recorded[0], recorded
 
     def test_process_matches_false_for_unused_pid(self):
         assert pc.process_matches(2_000_000_000, ("kiro-cli", "claude")) is False
@@ -2036,6 +2069,17 @@ class TestPidLivenessPosix:
         monkeypatch.setattr(pc.os, "kill", fake_kill)
         assert pc.pid_liveness(os.getpid()) == pc.PID_UNSIGNALABLE
 
+    def test_pid_liveness_unsignalable_for_out_of_range_pid(self, monkeypatch):
+        """A corrupt PID stamp is unknown, never evidence that a holder died."""
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+
+        def fake_kill(pid, sig):
+            raise OverflowError("Python int too large to convert to C long")
+
+        monkeypatch.setattr(pc.os, "kill", fake_kill)
+        assert pc.pid_liveness(10**100) == pc.PID_UNSIGNALABLE
+        assert pc.pid_exists(10**100) is True
+
     def test_pid_exists_true_on_permission_error(self, monkeypatch):
         # pid_exists EPERM branch: a PID we exist-but-cannot-signal must still
         # count as existing. Force os.kill to raise PermissionError; pid_exists
@@ -2995,6 +3039,208 @@ class TestProcessDescendants:
             for handle in handles.values():
                 pc.close_process_handle(handle)
             pc.close_process_handle(root_handle)
+
+
+class TestWindowsRecycledDescendantAgeDisproof:
+    """A stranger holding a recycled PID must not make the owned tree unkillable.
+
+    Toolhelp reports numeric parent PIDs. When a genuine intermediate exits, its
+    PID can be reused by an unrelated, far older process whose stale parent field
+    still names a PID inside this tree, so the numeric walk pulls that stranger
+    in as a candidate. A termination handle on a stranger is refused, and an
+    unopenable surviving candidate is a fatal incomplete tree -- so the provider
+    returns without killing anything it actually owns.
+
+    A process that already existed before the root cannot descend from it. The
+    creation instant is readable through a query-only handle, which is granted
+    where a termination handle is refused, so that disproof is available exactly
+    when it is needed. Every other shape stays fail-closed.
+    """
+
+    ROOT_PID = 100
+    ROOT_HANDLE = 8001
+    ROOT_CREATED = 1_000
+
+    def _install(self, monkeypatch, *, first_map, fresh_map, opens, identities, query_handles):
+        """Drive the Windows branch on any host; return the observed call log."""
+
+        scans = 0
+        closed: list[int] = []
+        query_opens: list[int] = []
+        query_closed: list[int] = []
+
+        def snapshot():
+            nonlocal scans
+            scans += 1
+            return dict(first_map) if scans == 1 else dict(fresh_map)
+
+        def open_termination(child_pid, **_kwargs):
+            return opens.get(child_pid)
+
+        def open_query(child_pid):
+            query_opens.append(child_pid)
+            return query_handles.get(child_pid)
+
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_windows_process_parent_map", snapshot)
+        monkeypatch.setattr(pc, "_open_process_termination_handle", open_termination)
+        monkeypatch.setattr(
+            pc,
+            "_windows_process_handle_identity",
+            lambda handle, **_kwargs: identities.get(handle),
+        )
+        monkeypatch.setattr(pc, "_open_process_query_handle", open_query)
+        monkeypatch.setattr(pc, "_close_process_handle", query_closed.append)
+        monkeypatch.setattr(pc, "close_process_handle", closed.append)
+        monkeypatch.setattr(pc, "pid_exists", lambda _pid: False)
+        return closed, query_opens, query_closed
+
+    def test_older_unopenable_stranger_does_not_block_the_owned_tree(self, monkeypatch):
+        closed, query_opens, query_closed = self._install(
+            monkeypatch,
+            first_map={101: self.ROOT_PID, 102: 101},
+            fresh_map={101: self.ROOT_PID, 102: 101},
+            opens={101: 9001},
+            identities={
+                self.ROOT_HANDLE: (self.ROOT_PID, self.ROOT_CREATED, None),
+                9001: (101, 1_100, None),
+                7102: (102, 500, None),
+            },
+            query_handles={102: 7102},
+        )
+
+        handles = pc.descendant_termination_handles(self.ROOT_PID, {}, self.ROOT_HANDLE)
+
+        assert handles == {101: 9001}
+        assert closed == []
+        assert query_opens == [102]
+        assert query_closed == [7102]
+
+    def test_a_disproven_stranger_takes_its_own_numeric_subtree_with_it(self, monkeypatch):
+        closed, _query_opens, _query_closed = self._install(
+            monkeypatch,
+            first_map={101: self.ROOT_PID, 102: 101, 103: 102},
+            fresh_map={101: self.ROOT_PID, 102: 101, 103: 102},
+            opens={101: 9001, 103: 9003},
+            identities={
+                self.ROOT_HANDLE: (self.ROOT_PID, self.ROOT_CREATED, None),
+                9001: (101, 1_100, None),
+                9003: (103, 1_200, None),
+                7102: (102, 500, None),
+            },
+            query_handles={102: 7102},
+        )
+
+        handles = pc.descendant_termination_handles(self.ROOT_PID, {}, self.ROOT_HANDLE)
+
+        # 103's only claimed route to the root runs through a process that
+        # predates the root, so its own recent creation proves nothing.
+        assert handles == {101: 9001}
+        assert closed == [9003]
+
+    @pytest.mark.parametrize(
+        "created, query_handle",
+        [
+            pytest.param(1_000, 7102, id="equal_to_root"),
+            pytest.param(1_050, 7102, id="later_than_root"),
+            pytest.param(None, 7102, id="identity_unreadable"),
+            pytest.param(None, None, id="query_handle_refused"),
+        ],
+    )
+    def test_an_undisprovable_unopenable_candidate_stays_fail_closed(
+        self, monkeypatch, created, query_handle
+    ):
+        identities = {
+            self.ROOT_HANDLE: (self.ROOT_PID, self.ROOT_CREATED, None),
+            9001: (101, 1_100, None),
+        }
+        if created is not None:
+            identities[7102] = (102, created, None)
+        closed, _query_opens, _query_closed = self._install(
+            monkeypatch,
+            first_map={101: self.ROOT_PID, 102: 101},
+            fresh_map={101: self.ROOT_PID, 102: 101},
+            opens={101: 9001},
+            identities=identities,
+            query_handles={102: query_handle} if query_handle else {},
+        )
+
+        with pytest.raises(OSError, match="Windows descendant handles unavailable"):
+            pc.descendant_termination_handles(self.ROOT_PID, {}, self.ROOT_HANDLE)
+
+        assert closed == [9001]
+
+    def test_a_pinned_retained_identity_under_a_stranger_stays_fail_closed(self, monkeypatch):
+        closed, _query_opens, _query_closed = self._install(
+            monkeypatch,
+            first_map={101: self.ROOT_PID, 102: 101, 103: 102},
+            fresh_map={101: self.ROOT_PID, 102: 101, 103: 102},
+            opens={101: 9001},
+            identities={
+                self.ROOT_HANDLE: (self.ROOT_PID, self.ROOT_CREATED, None),
+                9001: (101, 1_100, None),
+                9003: (103, 1_200, None),
+                7102: (102, 500, None),
+            },
+            query_handles={102: 7102},
+        )
+
+        # Dropping 103 would discard authority an earlier scan already proved,
+        # so the contradiction is reported rather than resolved by guessing.
+        with pytest.raises(OSError, match="Windows descendant handles unavailable"):
+            pc.descendant_termination_handles(self.ROOT_PID, {103: 9003}, self.ROOT_HANDLE)
+
+        assert closed == [9001]
+
+    def test_a_vanished_unopenable_candidate_is_not_queried_for_its_age(self, monkeypatch):
+        closed, query_opens, _query_closed = self._install(
+            monkeypatch,
+            first_map={101: self.ROOT_PID, 102: 101},
+            fresh_map={101: self.ROOT_PID},
+            opens={101: 9001},
+            identities={
+                self.ROOT_HANDLE: (self.ROOT_PID, self.ROOT_CREATED, None),
+                9001: (101, 1_100, None),
+            },
+            query_handles={},
+        )
+
+        handles = pc.descendant_termination_handles(self.ROOT_PID, {}, self.ROOT_HANDLE)
+
+        # Fresh absence already accounts for this candidate; an exited process
+        # has no readable creation instant to disprove anything with.
+        assert handles == {101: 9001}
+        assert closed == []
+        assert query_opens == []
+
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Win32 handle-rights premise")
+    def test_a_protected_process_refuses_termination_but_answers_its_creation(self):
+        """Prove on a real kernel the premise every faked case above assumes.
+
+        The disproof only ever runs for a candidate whose termination handle was
+        refused, so it is worth nothing unless a creation instant is still
+        readable for such a process. Were that false, the disproof would never
+        fire on a real host and the recycled-PID abort would survive with every
+        faked test above still green.
+
+        The System process is the stable instance of that shape: terminating it
+        is denied to every caller, while ``PROCESS_QUERY_LIMITED_INFORMATION``
+        exists precisely so an unprivileged reader can still identify it. A
+        positive instant here also proves the read validated its own handle,
+        since an identity naming another PID is reported as unknown.
+        """
+
+        system_pid = 4
+        granted = pc._open_process_termination_handle(system_pid)
+        if granted is not None:
+            pc.close_process_handle(granted)
+        assert granted is None, "the System process granted a termination handle"
+
+        instant = pc._windows_process_query_creation(system_pid)
+        assert isinstance(instant, int) and instant > 0, (
+            "a query-only handle could not read the System process creation instant, "
+            "so the creation-order disproof cannot fire on this host"
+        )
 
 
 @pytest.mark.skipif(
@@ -5386,6 +5632,184 @@ def test_root_owned_path_declines_a_symlink_loop(tmp_path, monkeypatch):
     assert platform_compat._is_root_owned_path(str(first)) is False
 
 
+def _hop_chain(tmp_path):
+    """``trusted/aws -> writable/hop -> trusted/real``: the mid-chain hop shape."""
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    writable = tmp_path / "writable"
+    writable.mkdir()
+    target = trusted / "real"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    middle = writable / "hop"
+    middle.symlink_to(target)
+    entry = trusted / "aws"
+    entry.symlink_to(middle)
+    return entry, middle, writable, target
+
+
+def _symlinked_component_chain(tmp_path):
+    """``prefix/bin -> holder/bin``, entry ``prefix/bin/aws``: the symlinked-directory shape."""
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    real_bin = holder / "bin"
+    real_bin.mkdir()
+    leaf = real_bin / "aws"
+    leaf.write_text("#!/bin/sh\nexit 0\n")
+    leaf.chmod(0o755)
+    (prefix / "bin").symlink_to(real_bin)
+    return prefix / "bin" / "aws", prefix, holder, leaf
+
+
+def test_traversed_components_of_a_symlink_free_path_is_its_lexical_chain(tmp_path):
+    """Without a symlink the walk names exactly ``resolved.parents`` plus the target.
+
+    This is the measurement behind "strictly widening": a caller that asked its
+    question over the lexical chain asks it over the very same directories here
+    whenever no symlink is involved, in root-first order with the target last.
+    """
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX path semantics
+        pytest.skip("POSIX path semantics")
+
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    leaf = (holder / "aws").resolve()
+    leaf.write_text("#!/bin/sh\nexit 0\n")
+
+    assert platform_compat.traversed_components(leaf) == [*reversed(leaf.parents), leaf]
+    assert platform_compat.traversed_components(str(leaf)) == [*reversed(leaf.parents), leaf]
+
+
+def test_traversed_components_visits_a_hop_in_the_middle_of_a_chain(tmp_path):
+    """Both endpoints' chains are named AND the directory holding the hop.
+
+    Neither ``realpath`` then ``.parents`` nor a lexical walk over the entry names
+    ``writable``; the component walk records it because it reads it. The symlinks
+    themselves are absent: their mode is meaningless and the directory holding
+    them governs their replacement.
+    """
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX symlinks
+        pytest.skip("POSIX symlink semantics")
+
+    entry, middle, writable, target = _hop_chain(tmp_path)
+    resolved = target.resolve()
+
+    components = platform_compat.traversed_components(entry)
+
+    assert components is not None
+    assert components[-1] == resolved
+    assert writable.resolve() in components
+    assert set(resolved.parents) <= set(components), "every lexical ancestor of the target"
+    assert set(entry.resolve().parents) <= set(components)
+    assert middle not in components and entry not in components
+    assert len(components) == len(set(components)), "each directory once"
+
+
+def test_traversed_components_visits_both_sides_of_a_symlinked_directory_component(tmp_path):
+    """``prefix/bin -> holder/bin``: the link's own parent AND the target's parent are named.
+
+    A lexical walk over the entry names ``prefix`` and never ``holder``; a lexical
+    walk over the collapsed path names ``holder`` and never ``prefix``. Either
+    directory's owner can choose what the entry resolves to, so both are here.
+    """
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX symlinks
+        pytest.skip("POSIX symlink semantics")
+
+    entry, prefix, holder, leaf = _symlinked_component_chain(tmp_path)
+
+    components = platform_compat.traversed_components(entry)
+
+    assert components is not None
+    assert components[-1] == leaf.resolve()
+    assert prefix.resolve() in components
+    assert holder.resolve() in components
+    assert (holder / "bin").resolve() in components
+    assert prefix / "bin" not in components, "the symlink itself is not a component"
+
+
+def test_traversed_components_is_none_on_a_symlink_loop(tmp_path):
+    """A cycle answers ``None``, never a partial list: unknown is not a shorter walk."""
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX symlinks
+        pytest.skip("POSIX symlink semantics")
+
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    first.symlink_to(second)
+    second.symlink_to(first)
+
+    assert platform_compat.traversed_components(first) is None
+
+
+def test_traversed_components_is_none_when_a_link_cannot_be_read(tmp_path, monkeypatch):
+    """An ``OSError`` mid-walk is ``None``: the caller decides what unknown means."""
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX symlinks
+        pytest.skip("POSIX symlink semantics")
+
+    entry, _middle, _writable, _target = _hop_chain(tmp_path)
+
+    def broken_readlink(path, *a, **kw):
+        raise OSError(errno.EIO, "readlink failed")
+
+    monkeypatch.setattr(os, "readlink", broken_readlink)
+
+    assert platform_compat.traversed_components(entry) is None
+
+
+def test_root_owned_path_is_the_root_owned_predicate_over_the_walk(tmp_path, monkeypatch):
+    """The predicate is unchanged by the split: it is ``_root_owned_entry`` over the walk.
+
+    Both evasion shapes and a tight chain agree with that composition, and the
+    refusals stay refusals: the walk finds the one directory left as the test
+    user's in each shape and the predicate declines it.
+    """
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX ownership
+        pytest.skip("POSIX ownership semantics")
+
+    hop_entry, _middle, writable, _target = _hop_chain(tmp_path)
+    component_entry, _prefix, holder, _leaf = _symlinked_component_chain(tmp_path)
+    tight_dir = tmp_path / "tight"
+    tight_dir.mkdir()
+    tight = tight_dir / "aws"
+    tight.write_text("#!/bin/sh\nexit 0\n")
+    tight.chmod(0o755)
+    loose = {os.path.realpath(str(writable)), os.path.realpath(str(holder))}
+
+    real_stat = os.stat
+
+    def fake_stat(path, *a, **kw):
+        st = real_stat(path, *a, **kw)
+        if os.path.realpath(str(path)) in loose:
+            return st
+        return os.stat_result(
+            (st.st_mode & ~(stat.S_IWGRP | stat.S_IWOTH), st.st_ino, st.st_dev, st.st_nlink, 0, 0)
+            + tuple(st)[6:]
+        )
+
+    monkeypatch.setattr(os, "access", lambda path, mode, **kw: False)
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+    for entry, expected in ((hop_entry, False), (component_entry, False), (tight, True)):
+        components = platform_compat.traversed_components(entry)
+        assert components is not None
+        composed = all(platform_compat._root_owned_entry(str(c)) for c in components)
+        assert composed is expected
+        assert platform_compat._is_root_owned_path(str(entry)) is expected
+
+
 def test_root_owned_path_declines_a_symlink_into_a_writable_directory(tmp_path, monkeypatch):
     """The realpath pass is load-bearing too, for a reason the literal pass cannot see.
 
@@ -7153,7 +7577,13 @@ class TestWindowsDescendantFailureDiagnostics:
             pc.descendant_termination_handles(100, {}, 8001)
         assert "open=winerror=5" in str(exc.value)
         assert "query_unvalidated=winerror=87" in str(exc.value)
-        assert calls == [(0x101001, False, 101), (0x1000, False, 101)]
+        # Termination open, then the creation-order read that tries to disprove
+        # this candidate's ancestry, then the diagnostic's own unvalidated look.
+        assert calls == [
+            (0x101001, False, 101),
+            (0x1000, False, 101),
+            (0x1000, False, 101),
+        ]
 
     def test_diagnostics_bound_candidates_and_ancestry(self, monkeypatch):
         queried = []
@@ -7264,5 +7694,5 @@ class TestStripExtendedLengthPrefix:
             return real(path)
 
         monkeypatch.setattr(pc, "strip_extended_length_prefix", record)
-        workflow_memory._allocator_path(tmp_path / "run-ids.json")
+        workflow_memory._allocator_path(tmp_path / "run-ids.json", tmp_path)
         assert calls, "workflow_memory did not reach the shared fold"

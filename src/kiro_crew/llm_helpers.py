@@ -27,10 +27,12 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.credential_errors import is_credential_propagation_delay
 from kiro_crew.hooks import (
     _EDIT_TOOL_KIND,
+    _normalize_tool_name,
     fire_tool_hooks,
     get_global_hook_store,
     hook_gate_kwargs,
 )
+from kiro_crew.image_refs import strip_image_refs
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.platform.tool_paths import (
     command_shaped_strings,
@@ -147,6 +149,10 @@ _TRANSIENT_MARKERS = (
     "socket hang up",
     "fetch failed",
     "could not reach the model backend",
+    # kiro-cli's post-stream wrapper ("The service failed to process the
+    # request (request_id: ...)"). Matches the raw provider text and
+    # _format_acp_error's rewrite alike, since the rewrite keeps the phrase.
+    "failed to process the request",
     # IAM credential-propagation race, matched against _format_acp_error's
     # rewritten wording. The RAW provider sentence ("The security token included
     # in the request is invalid") is matched structurally instead — see the
@@ -1134,9 +1140,44 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
 _MAX_SCANNABLE_TOOL_INPUT_CHARS = MAX_SCANNABLE_COMMAND_CHARS
 
 
+def _path_tier_exempt(event: object) -> str | None:
+    """The one string of *event* the path tier does not resolve, or ``None``.
+
+    The path tier reads a PATH; a shell tool's COMMAND is command text, which the
+    gate does not match paths in because the OS sandbox holds the credential
+    stores away from the shell. Only the recovered command text
+    (``AcpEvent.shell_command``) is exempt, and only when the client classified
+    the frame as shell AND no MCP server serves it: kiro-cli can classify an
+    execute-kind frame as shell while also naming an MCP server
+    (``classify_tool_call`` carries the identity and keeps the shell verdict),
+    and an MCP-served tool runs outside the sandbox. Every OTHER string of a
+    shell frame stays path-gated -- a shell-kind tool with structured
+    parameters (kiro-cli ``use_aws``) can carry a discrete credential path as an
+    argument, and in ``standard`` sandbox mode ``~/.aws`` is visible to the
+    shell, so the path tier over that argument is the control there, not the
+    sandbox. Same condition as ``hooks.on_tool_call``; both read the client's
+    own classification, never the payload's.
+    """
+    if not bool(getattr(event, "is_shell", False)):
+        return None
+    if getattr(event, "mcp_server_name", "") or "":
+        return None
+    command = getattr(event, "shell_command", None)
+    return command if isinstance(command, str) and command else None
+
+
+def _is_exempt_command_text(text: str, exempt_command: str | None) -> bool:
+    """*text* is the exempt command, with or without a display prefix."""
+    if exempt_command is None:
+        return False
+    return text == exempt_command or _normalize_tool_name(text) == exempt_command
+
+
 def _title_denial(
     title: str,
     denied_regexes: list[str] | None,
+    *,
+    exempt_command: str | None = None,
 ) -> tuple[str, str] | None:
     """Return the always-enforced denial for the tool *title*, or ``None``.
 
@@ -1149,7 +1190,16 @@ def _title_denial(
     place. The tuple is ``(kind, reason)`` with *kind* ``"path"`` / ``"bash"`` /
     ``"regex"``; the reasons are the exact strings the on-loop checks produced.
     """
-    path_refusal = sensitive_path_refusal(title)
+    # The path tier reads a PATH. A shell tool's recovered COMMAND is command text,
+    # which the gate deliberately does not match paths in (``hooks.on_tool_call``
+    # makes the same exemption): resolving ``cd /x && grep ...`` as a filename
+    # never matched, but it spent a resolver round-trip per call and, under a
+    # stall, refused the command as a sensitive path. ``exempt_command`` is
+    # :func:`_path_tier_exempt`'s answer -- the one string that is that text; a
+    # title that is not the command stays gated.
+    path_refusal = (
+        None if _is_exempt_command_text(title, exempt_command) else sensitive_path_refusal(title)
+    )
     if path_refusal:
         # A stall is passed through as worded (recognised by its fixed prefix, which
         # the deny guidance classifies by); a match keeps this producer's wording.
@@ -1234,6 +1284,8 @@ def _edit_target_denial(
 def _first_tool_input_denial(
     strings: list[str],
     denied_regexes: list[str] | None,
+    *,
+    exempt_command: str | None = None,
 ) -> tuple[str, str, str] | None:
     """Return the first tool_input denial among *strings*, or ``None``.
 
@@ -1269,7 +1321,13 @@ def _first_tool_input_denial(
                 ),
                 s[:64],
             )
-        path_refusal = sensitive_path_refusal(s)
+        # Same exemption as ``_title_denial``: only the recovered command text is
+        # command text. A shell frame's OTHER payload strings (a structured
+        # ``use_aws`` argument naming a path) stay path-gated -- see
+        # :func:`_path_tier_exempt`.
+        path_refusal = (
+            None if _is_exempt_command_text(s, exempt_command) else sensitive_path_refusal(s)
+        )
         if path_refusal:
             if is_unverifiable_path_refusal(path_refusal):
                 return ("path", path_refusal, s)
@@ -1437,7 +1495,12 @@ async def run_bg_oneliner(
             raise RuntimeError(
                 "run_bg_oneliner(strict_model=True) requires a session with set_model()"
             )
-        async for event in session.prompt(prompt):
+        # A one-liner's prompt is text ABOUT a session (a summary, a title, a
+        # label), so any image path in it is quoted history, not an attachment.
+        # Left in, the prompt builder re-inlines every still-readable file as an
+        # image block: a session summary carried one per pasted screenshot, and
+        # a text-only background model rejected the whole request on each pass.
+        async for event in session.prompt(strip_image_refs(prompt)):
             if event.kind == EVENT_TEXT_CHUNK:
                 text += event.text
             elif event.kind == EVENT_PERMISSION_REQUEST:
@@ -2171,15 +2234,13 @@ async def stream_and_collect(
         m.strip() for m in (fallback_models or ()) if isinstance(m, str) and m.strip()
     )
     _fb_state = FallbackState(_fb_chain) if _fb_chain else None
-    # Cross-attempt tool-activity flag for the fallback chain ONLY. Case 2's
-    # same-model retry keys off ``result_text`` alone (pre-existing behavior,
-    # pinned byte-for-byte by the empty-chain regression tests), but the chain
-    # replays the ORIGINAL prompt up to FALLBACK_CANDIDATE_ATTEMPTS × len(chain)
-    # more times — a tool that completed an external mutation before any text
-    # streamed would be re-run on every one of them. Same activity predicate as
-    # the sub-agent ladder and the dashboard's ``_turn_emitted``: any fired
-    # tool call blocks the replay, text or no text.
-    _fb_tool_activity = False
+    # Cross-attempt tool activity for every retry that replays the ORIGINAL
+    # prompt. A tool can complete an external mutation before any text streams,
+    # so both the same-model retry (Case 2) and fallback chain (Case 2.75) stop
+    # once any attempt fires a tool call. Prompt-busy keeps its separate retry
+    # contract, but activity from that attempt remains sticky for a later
+    # transient error.
+    _turn_tool_activity = False
     # Sticky-restore probe (§restore policy): if an earlier turn on this
     # provider fell back, try ONCE to move back to the primary before this
     # turn streams. Quiet on success (log only); a still-throttled primary
@@ -2251,9 +2312,9 @@ async def stream_and_collect(
                 elif event.kind == EVENT_TOOL_CALL:
                     tool_call_count += 1
                     # Sticky across attempts (never reset in the retry loop):
-                    # once ANY attempt fired a tool, the fallback chain must
-                    # not replay the original prompt — see _fb_tool_activity.
-                    _fb_tool_activity = True
+                    # once ANY attempt fired a tool, a transient path must not
+                    # replay the original prompt — see _turn_tool_activity.
+                    _turn_tool_activity = True
                     if on_tool_gate:
                         executed_calls.append((event.tool_call_id or "", event.title or ""))
                     if max_turns is not None and tool_call_count > max_turns:
@@ -2343,9 +2404,12 @@ async def stream_and_collect(
             #   - `not result_text`: only retry if NO tokens have streamed yet.
             #     A partial response must not be retried — the re-run would
             #     duplicate the already-emitted output.
+            #   - `not _turn_tool_activity`: only retry if no attempt fired a
+            #     tool call. A textless tool can already have mutated state.
             if (
                 retry_transient
                 and not result_text
+                and not _turn_tool_activity
                 and acp_error_is_transient(exc)
                 and transient_attempts < _TRANSIENT_RETRIES
             ):
@@ -2376,18 +2440,14 @@ async def stream_and_collect(
             # Empty chain ⇒ this block is inert and Case 3 surfaces the error
             # exactly as before this feature existed.
             #
-            # ``not _fb_tool_activity`` is load-bearing over and above
+            # ``not _turn_tool_activity`` is load-bearing over and above
             # ``not result_text``: a tool call can complete an EXTERNAL
-            # MUTATION before any text streams, and unlike Case 2's bounded
-            # same-model retry (pre-existing semantics, deliberately
-            # untouched), the chain replays the original prompt on every
-            # candidate — re-running that mutation each time. Any fired tool
-            # across ANY attempt disables the chain for this call; the error
-            # then surfaces exactly as it did before this feature.
+            # MUTATION before any text streams. Any fired tool across ANY
+            # attempt disables every original-prompt replay for this call.
             if (
                 retry_transient
                 and not result_text
-                and not _fb_tool_activity
+                and not _turn_tool_activity
                 and _fb_state is not None
                 and acp_error_is_transient(exc)
                 and transient_attempts >= _TRANSIENT_RETRIES
@@ -2742,7 +2802,9 @@ async def _resolve_permission(
         # ``is_sensitive_path`` (which does release the GIL) and yields between
         # the strings. Title first, so a request denied on its title
         # reports the title-tier reason and mechanism exactly as before.
-        title_hit = _title_denial(normalized, _denied_regexes)
+        title_hit = _title_denial(
+            normalized, _denied_regexes, exempt_command=_path_tier_exempt(event)
+        )
         if title_hit is not None:
             return (title_hit[0], title_hit[1], normalized, "always_deny")
         if _edit_target_gated:
@@ -2759,7 +2821,9 @@ async def _resolve_permission(
                 "always_deny_input",
             )
         if _input_strings:
-            input_hit = _first_tool_input_denial(_input_strings, _denied_regexes)
+            input_hit = _first_tool_input_denial(
+                _input_strings, _denied_regexes, exempt_command=_path_tier_exempt(event)
+            )
             if input_hit is not None:
                 return (*input_hit, "always_deny_input")
         return None

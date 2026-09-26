@@ -20,6 +20,7 @@ import {
   Plus,
   Crop,
   Bot,
+  BrainCircuit,
   Mic,
   MicOff,
   Keyboard,
@@ -56,7 +57,7 @@ import { createPortal } from 'react-dom'
 import { InstantTip, useInstantTip } from './InstantTip'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useBranding } from '../hooks/useBranding'
-import { useAppSelector, useAppDispatch } from '../store'
+import { useAppStore, useAppSelector, useAppDispatch } from '../store'
 import {
   resolveByApprovalId,
   openActivityToTool,
@@ -67,6 +68,7 @@ import {
   sseSubagentDone,
   setAgentSwitchNotice,
   switchSlot,
+  selectSlotMessages,
 } from '../store/chatSlice'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import { useSlotId } from '../providers/SlotContext'
@@ -178,7 +180,11 @@ const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/
 // test_accept_list_covers_every_accepted_extension pins this set against the
 // server's, from the Python side, since a vitest cannot read the Python constant.
 const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
-const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.drawio,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
+const FILE_ACCEPT =
+  IMAGE_ACCEPT +
+  ',' +
+  VIDEO_ACCEPT +
+  ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.drawio,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
@@ -200,7 +206,13 @@ import { useComposerVoiceSlice, type ComposerVoiceInputProps } from '../chat-cor
 import SkillPickerMenu from './SkillPickerMenu'
 import { skillsCacheStaleTime } from '../lib/skillsCache'
 import ProjectSkillsTrustDialog from './ProjectSkillsTrustDialog'
-import { matchFileToken, matchPathToken, matchSkillToken, PATH_TOKEN_RE, replaceTokenAtCaret } from './composerTokens'
+import {
+  matchFileToken,
+  matchPathToken,
+  matchSkillToken,
+  PATH_TOKEN_RE,
+  replaceTokenAtCaret,
+} from './composerTokens'
 import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
 import { useMeasuredHeight } from '../hooks/useMeasuredHeight'
 
@@ -421,6 +433,15 @@ function measuredContentHeight(el: HTMLTextAreaElement): number {
   // path at the same width, and an off-screen node carrying a real placeholder
   // attribute would answer accessibility and test queries meant for the live one.
   twin.value = el.value || el.placeholder || ''
+  // A placeholder the stylesheet holds to one line must be MEASURED on one line;
+  // the copied `whiteSpace` above is the element's, which still wraps.
+  if (
+    !el.value &&
+    el.placeholder &&
+    getComputedStyle(el, '::placeholder').whiteSpace === 'nowrap'
+  ) {
+    twin.style.whiteSpace = 'nowrap'
+  }
   return twin.scrollHeight
 }
 
@@ -574,6 +595,8 @@ interface ChatInputProps {
   onUploadFiles?: (files: File[]) => void
   /** Whether file actions are in progress */
   uploading?: boolean
+  /** Abort the upload in flight; turns the upload spinner into a cancel control */
+  onCancelUpload?: () => void
   /** Pending file paths (images + non-images) for preview strip */
   pendingFiles?: string[]
   /** Pending folder references for the preview strip: RELATIVE paths with trailing slash, derived from `@rel/` composer tokens (a path reference handed to the agent, not an upload) */
@@ -631,8 +654,33 @@ interface ChatInputProps {
    * backend's served default), not a pin. The chip then carries the same
    * ` · default` marker and explanatory tooltip the agent chip uses for its
    * inherited case, so a served model does not read as something the user
-   * chose. A pinned chip has nothing to explain. */
+   * chose. A pinned chip has nothing to explain. Yields to
+   * `modelIsJevRouted` below, which describes the same unpinned slot more
+   * specifically. */
   modelIsInheritedDefault?: boolean
+  /**
+   * True when THIS turn's model is Jev's to pick: the slot names no model
+   * (`auto`, or the empty string a freshly dispatched slot carries) and the Jev
+   * preview is on, so `model.route` puts the turn in a tier and runs it on that
+   * tier's model.
+   *
+   * The chip then names the POLICY (`Auto (Jev)`) in place of `modelName`, rather
+   * than an id with a marker beside it. A routed session's model changes from turn
+   * to turn, so naming one makes a chip that reads like a pin and is stale by the
+   * next reply; the model a given turn actually ran on is on that turn's routing
+   * receipt, which is per-turn and cannot go stale. It is also the exact label the
+   * picker highlights for this slot (`jevRouteShownModel`), so the chip and the
+   * open menu say the same word for the same choice.
+   *
+   * Hosts compute it from the SAME `jevRouteOffered()` the picker's row is drawn
+   * from (`lib/jevRoute.ts`) against the slot's raw `model`, which is what the
+   * routing gate reads. One condition, so the chip cannot say Auto for a turn that
+   * routed, nor Auto (Jev) for one that did not.
+   *
+   * Wins over `modelIsInheritedDefault`: both describe a slot that pinned nothing,
+   * and this one names WHO picks instead, which is the more specific fact and the
+   * one that costs money. */
+  modelIsJevRouted?: boolean
   /**
    * Picker openers (agent, model, project, and `onSessionControlClick` below).
    * Each hands the host the chip's click-time rect AND the chip element itself:
@@ -699,7 +747,8 @@ interface ChatInputProps {
   stopState?: 'idle' | 'soft_pending' | 'killing'
   approvalMode?: string
   reasoningEffort?: string
-  onReasoningEffortClick?: (rect: DOMRect) => void
+  onReasoningEffortClick?: (rect: DOMRect, trigger: HTMLElement) => void
+  separateEffort?: boolean
   providerId?: string
   /** Invoked when an @-mention picks a file or directory. `kind` defaults to
    *  'file'. `token` is the exact composer text the pick inserted (e.g.
@@ -757,6 +806,13 @@ interface ChatInputProps {
   /** Identity of the transcript row the follow-up options were derived from.
    *  Forwarded to FollowUpBar so a chip click carries the row it acted on. */
   followUpSourceKey?: string | null
+  /** Labels whose follow-up dispatch is outstanding. Only a host that actually
+   *  dispatches a chip passes this. */
+  followUpPendingOptions?: ReadonlySet<string> | null
+  /** Labels whose click the dispatch would refuse; this is what dims. */
+  followUpRefusedOptions?: ReadonlySet<string> | null
+  /** Detail of the last failed chip dispatch, or null when none failed. */
+  followUpError?: string | null
   /** Collapsed paste blocks backing `⌜🗒 Pasted …⌟` tokens in `value`. */
   pasteBlocks?: PasteBlock[]
   /** Replace the current list of paste blocks (add/remove). */
@@ -861,13 +917,22 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
           chip grow instead of the pill wrapping. */}
       <button
         type="button"
-        aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', { fromW: resize.fromW, fromH: resize.fromH, toW: resize.toW, toH: resize.toH })}
+        aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', {
+          fromW: resize.fromW,
+          fromH: resize.fromH,
+          toW: resize.toW,
+          toH: resize.toH,
+        })}
         className="px-1.5 py-[1px] rounded-full border-0 text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default whitespace-nowrap"
         {...tipHandlers}
-      >{i18nT('components.chatInput.resized')}</button>
+      >
+        {i18nT('components.chatInput.resized')}
+      </button>
       <InstantTip tip={tip} tipId={tipId} className="w-max max-w-[calc(100vw-1rem)]">
         <div className="text-text">{i18nT('components.chatInput.resized_to_fit_model_limits')}</div>
-        <div className="text-muted">{resize.fromW}×{resize.fromH} → {resize.toW}×{resize.toH}</div>
+        <div className="text-muted">
+          {resize.fromW}×{resize.fromH} → {resize.toW}×{resize.toH}
+        </div>
       </InstantTip>
     </>
   )
@@ -880,6 +945,19 @@ const NO_VOICE: Partial<ComposerVoiceInputProps> = {}
  *  effect on every render (a fresh [] literal changes deps each time). */
 const NO_DIRS: string[] = []
 
+/** Staged attachments and folder references above the composer.
+ *
+ *  Every tile is a `role="group"` named by its FULL path. `title` shows that
+ *  path on pointer hover only -- no browser opens a native tooltip on keyboard
+ *  focus -- and a tile's visible text is the short label, so without the group
+ *  name the path reaches nobody using assistive technology. A group's name IS
+ *  announced when focus enters it, which is the reliable case and is what these
+ *  tiles have: each one holds a focusable button.
+ *
+ *  The name also tells the per-tile controls apart: their labels are bare verbs
+ *  ("Remove", "Remove folder"), so with several files staged a screen reader
+ *  announces each one inside its own file's group instead of a row of identical
+ *  buttons. */
 function FilePreviewStrip({
   files,
   dirs = NO_DIRS,
@@ -926,6 +1004,8 @@ function FilePreviewStrip({
           return (
             <div
               key={path}
+              role="group"
+              aria-label={path}
               className="group/preview shrink-0 flex flex-col items-start gap-0.5"
               title={path}
             >
@@ -990,6 +1070,9 @@ function FilePreviewStrip({
         {nonImgs.map((path) => (
           <div
             key={path}
+            role="group"
+            aria-label={path}
+            title={path}
             className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text"
           >
             <span>{path.split('/').pop()}</span>
@@ -1019,6 +1102,8 @@ function FilePreviewStrip({
             <div
               key={path}
               data-dir-chip=""
+              role="group"
+              aria-label={path}
               title={path}
               className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text"
             >
@@ -1087,6 +1172,7 @@ function ChatInput({
   onScreenshot,
   onUploadFiles,
   uploading = false,
+  onCancelUpload,
   pendingFiles = [],
   pendingDirs = [],
   resizedInfo,
@@ -1102,6 +1188,7 @@ function ChatInput({
   agentLabel,
   agentIsInheritedDefault,
   modelIsInheritedDefault,
+  modelIsJevRouted,
   agentSource,
   modelName,
   onAgentClick,
@@ -1125,6 +1212,7 @@ function ChatInput({
   approvalMode,
   reasoningEffort,
   onReasoningEffortClick,
+  separateEffort,
   providerId: _providerId,
   onFileSelect,
   onFileOpen,
@@ -1152,6 +1240,9 @@ function ChatInput({
   quickSend,
   followUpLayout,
   followUpSourceKey,
+  followUpPendingOptions,
+  followUpRefusedOptions,
+  followUpError,
   pasteBlocks = [],
   onPasteBlocksChange,
   showFullPastes = false,
@@ -1177,6 +1268,7 @@ function ChatInput({
     voiceDeviceSwitchIsLive = false,
     voiceTranscribing = false,
     voiceTranscribeActive,
+    voiceDrainCancellable = false,
     voiceBusyElsewhere = false,
     voiceBusyElsewhereSession = null,
     voiceHeldLanded = false,
@@ -1207,6 +1299,11 @@ function ChatInput({
   const disabled = disabledProp
   const dispatch = useAppDispatch()
   const slotId = useSlotId()
+  // The store handle, read at click time (not subscribed) so "Optimize prompt"
+  // can pull THIS pane's slot messages without re-rendering every composer on
+  // each streamed frame. useAppStore returns the Provider-injected store, the
+  // same pattern ChatPane uses for its at-send reads.
+  const chatStore = useAppStore()
   const pendingApprovalRaw = useAppSelector(
     (s) => selectSlotPendingApproval(s, slotId),
     shallowEqual,
@@ -1705,6 +1802,10 @@ function ChatInput({
   // which cleared 340 and overflowed -- the badge then painted over the context
   // readout. 420 covers the phone range with the labels shed.
   const shelfCompact = shelfWidth < 420
+  // A two-column split can leave under 200px per composer. Keep the value
+  // visible at ordinary compact widths, but let the title/aria label carry it
+  // when even the other shelf chips have no room for text.
+  const shelfTiny = shelfWidth < 220
   // Tooltip for the project chip. The chip itself shows the basename (plus the
   // branch when known); the tooltip carries the full path so nothing that was
   // previously discoverable is lost, and names the branch even when the label
@@ -1727,12 +1828,14 @@ function ChatInput({
     if (projectGitDirty) {
       // A capped listing makes the count a floor, so it is read as "500+" here
       // and in the badge below -- the same claim the Git panel's pill makes.
-      parts.push(i18nT(
-        projectGitDirtyTruncated
-          ? 'components.gitPanel.uncommitted_capped'
-          : 'components.gitPanel.uncommitted',
-        { count: projectGitDirty },
-      ))
+      parts.push(
+        i18nT(
+          projectGitDirtyTruncated
+            ? 'components.gitPanel.uncommitted_capped'
+            : 'components.gitPanel.uncommitted',
+          { count: projectGitDirty },
+        ),
+      )
     }
     if (projectGitAhead) parts.push('\u2191' + String(projectGitAhead))
     if (projectGitBehind) parts.push('\u2193' + String(projectGitBehind))
@@ -1747,6 +1850,30 @@ function ChatInput({
   useEffect(() => {
     if (showDictation || voiceTranscribing) composerControl()?.focus()
   }, [showDictation, voiceTranscribing, composerControl])
+
+  // Discarding a drain from the strip's own button removes the element the press
+  // happened on: the discard clears `draining`, so `voiceDrainCancellable` goes
+  // false and the strip unmounts with the focused button inside it. The effect
+  // above cannot catch that -- a streaming drain has already cleared `recording`
+  // (so `showDictation` is null) and `voiceTranscribing` is the batch flag -- and
+  // focus would land on the document body, leaving the composer deaf to the very
+  // keyboard and touch users this control was added for. Hand focus back as part
+  // of the discard rather than on an effect edge, so it is the same press.
+  //
+  // Stays `undefined` when there is no discard to run, because the strip reads
+  // the handler's presence as one of the two terms deciding whether to offer the
+  // control at all: wrapping unconditionally would put a button on screen whose
+  // only effect is to move focus.
+  const cancelVoiceDrain = useMemo(
+    () =>
+      onVoiceCancel
+        ? () => {
+            onVoiceCancel()
+            composerControl()?.focus()
+          }
+        : undefined,
+    [onVoiceCancel, composerControl],
+  )
 
   // Escape CANCELS dictation (discards the audio), from ANYWHERE. Deliberately a
   // document-level listener rather than the textarea's onKeyDown: starting a
@@ -1782,7 +1909,13 @@ function ChatInput({
     if (!voiceRecording || !cancel) return
     const handler = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.isComposing || e.defaultPrevented) return
-      if (slashMenuOpenRef.current || filePickerOpenRef.current || skillPickerOpenRef.current || pathPickerOpenRef.current) return
+      if (
+        slashMenuOpenRef.current ||
+        filePickerOpenRef.current ||
+        skillPickerOpenRef.current ||
+        pathPickerOpenRef.current
+      )
+        return
       if (document.querySelector('[role="dialog"]')) return
       e.preventDefault()
       e.stopPropagation()
@@ -1854,7 +1987,8 @@ function ChatInput({
   // not consulted: a slot that once picked Queue in the main chat must not
   // silently queue from a surface that never shows that choice.
   const steerOnly = busyMode === 'steer-only'
-  const busyChoiceAvailable = isRunning && (!stopState || stopState === 'idle') && !!canSteer && !!onSteer
+  const busyChoiceAvailable =
+    isRunning && (!stopState || stopState === 'idle') && !!canSteer && !!onSteer
   // A stored `auto` from a session where the seam WAS available resolves back to
   // the shipped default while it is not: consent can be withdrawn and a fleet can
   // pin the seam off, and a mode kept on screen after that would send a flag the
@@ -1878,26 +2012,41 @@ function ChatInput({
    * other action to flip to — the surface has no queue — so the gesture is a
    * plain steer there too.
    */
-  const fireComposer = useCallback((alternate?: unknown) => {
-    if (disabled) return
-    // A batch dictation is still transcribing: block the send so the pending
-    // transcript isn't left behind. Otherwise Enter/Send fires the current draft
-    // BEFORE the transcript lands, orphaning the dictation into the emptied
-    // composer. The transcript appends within ~1-2s, after which a normal Enter
-    // sends the complete text. Covers both Enter (handleKeyDown) and the Send
-    // button, since both route through here.
-    if (voiceTranscribing) return
-    const flip = alternate === true && busyChoiceAvailable && !steerOnly
-    const steerNow = flip ? !steerActive : steerActive
-    // A flipped send never asks: the chord is the sender answering the question
-    // themselves for this one message, so handing it to the oracle anyway would
-    // ignore the only explicit instruction on the send.
-    if (steerNow && onSteer) onSteer(steerAuto && !flip ? { auto: true } : undefined)
-    else onSend()
-  }, [disabled, voiceTranscribing, busyChoiceAvailable, steerOnly, steerActive, steerAuto, onSteer, onSend])
-  const sendFollowUp = useCallback((text?: string, sourceKeyAtClick?: string | null) => {
-    if (!disabled) onFollowUpSend?.(text, sourceKeyAtClick)
-  }, [disabled, onFollowUpSend])
+  const fireComposer = useCallback(
+    (alternate?: unknown) => {
+      if (disabled) return
+      // A batch dictation is still transcribing: block the send so the pending
+      // transcript isn't left behind. Otherwise Enter/Send fires the current draft
+      // BEFORE the transcript lands, orphaning the dictation into the emptied
+      // composer. The transcript appends within ~1-2s, after which a normal Enter
+      // sends the complete text. Covers both Enter (handleKeyDown) and the Send
+      // button, since both route through here.
+      if (voiceTranscribing) return
+      const flip = alternate === true && busyChoiceAvailable && !steerOnly
+      const steerNow = flip ? !steerActive : steerActive
+      // A flipped send never asks: the chord is the sender answering the question
+      // themselves for this one message, so handing it to the oracle anyway would
+      // ignore the only explicit instruction on the send.
+      if (steerNow && onSteer) onSteer(steerAuto && !flip ? { auto: true } : undefined)
+      else onSend()
+    },
+    [
+      disabled,
+      voiceTranscribing,
+      busyChoiceAvailable,
+      steerOnly,
+      steerActive,
+      steerAuto,
+      onSteer,
+      onSend,
+    ],
+  )
+  const sendFollowUp = useCallback(
+    (text?: string, sourceKeyAtClick?: string | null) => {
+      if (!disabled) onFollowUpSend?.(text, sourceKeyAtClick)
+    },
+    [disabled, onFollowUpSend],
+  )
   const { botName } = useBranding()
   const isMobile = useIsMobile()
   const directFilePicker = isMobile || isTouchDevice()
@@ -2176,7 +2325,14 @@ function ChatInput({
     },
     [value, onChange, composerControl],
   )
-  const chatMessages = useAppSelector((s) => s.chat.messages)
+  // The optimizer's context is the ONLY reader of this slot's message history,
+  // and only when "Optimize prompt" is clicked. Subscribing here forced every
+  // mounted composer to re-render on each streamed frame (Immer hands back a new
+  // `state.messages` reference per flush, so the `===` selector always tripped),
+  // which multiplied with N split panes. Read the slot's own messages at click
+  // time instead — `selectSlotMessages` returns THIS pane's slot (falling back
+  // to the active mirror when this pane IS active), which also fixes a bug where
+  // a non-active pane sent the *active* pane's conversation as optimizer context.
   /** The persisted drag-to-resize preference. Read `manualHeight` below instead —
    *  this is the raw stored value and is not what the composer renders at. */
   const [manualHeightPref, setManualHeight] = useState<number | null>(() => {
@@ -2356,6 +2512,48 @@ function ChatInput({
     </button>
   ) : null
   /**
+   * The exit from an upload in flight, and the reason it REPLACES the attach
+   * control rather than sitting beside it.
+   *
+   * The bottom icon row is already at `max-two-buttons-per-row`: two blocking
+   * findings drove Sketch off it and into an overflow precisely to keep it at
+   * two (see `collapseMenuRow` above), so a third sibling here would regrow the
+   * row the same rule just shrank, on the narrowest viewport, in both layouts.
+   *
+   * Replacing costs nothing, because the attach control is already inert while
+   * `uploading`: its `htmlFor` is dropped and the pointer branch is `disabled`.
+   * So the slot holds no action to displace, and the thing the user is already
+   * looking at while they wait becomes the thing they press to stop.
+   *
+   * The spinner is kept, but BEHIND the glyph rather than as a second icon.
+   * A 9px X inside an 18px spinner read to a blind reviewer as "a 'lines'
+   * icon, the kind that usually means a menu", and they said they would press
+   * it to find out what it was, which discards minutes of a 512 MB upload with
+   * no undo. So the X carries the meaning at a legible size with a destructive
+   * hover tint, and the liveness is a faint ring that cannot be mistaken for
+   * the glyph. The tint matters on the pointer path for a second reason: this
+   * slot was inert mid-upload on main, so a click that used to do nothing now
+   * ends the transfer, and the control has to stop reading as the attach
+   * button's spot doing attach things.
+   */
+  const uploadCancelControl =
+    uploading && onCancelUpload ? (
+      <button
+        type="button"
+        onClick={onCancelUpload}
+        className="relative w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all bg-transparent border-none text-muted hover:text-danger hover:bg-danger/10"
+        aria-label={i18nT('components.chatInput.cancel_upload')}
+        title={i18nT('components.chatInput.cancel_upload')}
+      >
+        <Loader2
+          size={28}
+          strokeWidth={1.5}
+          className="animate-spin absolute inset-0 m-auto opacity-30"
+        />
+        <X size={16} strokeWidth={2.5} />
+      </button>
+    ) : null
+  /**
    * Drag-to-resize is pointer-only, so on a touch device the composer always
    * auto-sizes and the persisted preference is ignored outright.
    *
@@ -2400,39 +2598,42 @@ function ChatInput({
   // Mirror the paste blocks so the undo-recording effect (keyed on
   // [value, autoFocusKey], not pasteBlocks) always snapshots the freshest set.
 
-  const handleLexicalChange = useCallback((nextValue: string) => {
-    valueFromUserRef.current = true
-    onChange(nextValue)
-    const selection = lexicalControlRef.current?.getSelection()
-    const caret = selection?.start ?? nextValue.length
-    const before = nextValue.slice(0, caret)
-    setSlashMenuOpen(typedCommandMenus && nextValue.startsWith('/'))
-    const fileQueryAtCaret = onFileSelect ? matchFileToken(before) : null
-    if (fileQueryAtCaret !== null) {
-      setFilePickerOpen(true)
-      setFileQuery(fileQueryAtCaret)
-    } else {
-      setFilePickerOpen(false)
-      setFileQuery('')
-    }
-    const skillQueryAtCaret = fileQueryAtCaret === null ? matchSkillToken(before) : null
-    if (typedCommandMenus && skillQueryAtCaret !== null) {
-      setSkillPickerOpen(true)
-      setSkillQuery(skillQueryAtCaret)
-    } else {
-      setSkillPickerOpen(false)
-      setSkillQuery('')
-    }
-    const pathQueryAtCaret = pathTokenAt(before)
-    if (pathQueryAtCaret !== null) {
-      setPathPickerOpen(true)
-      setPathQuery(pathQueryAtCaret)
-    } else {
-      setPathPickerOpen(false)
-      setPathQuery('')
-    }
-    if (selection && voiceCaretRef) voiceCaretRef.current = selection
-  }, [onChange, onFileSelect, pathTokenAt, typedCommandMenus, voiceCaretRef])
+  const handleLexicalChange = useCallback(
+    (nextValue: string) => {
+      valueFromUserRef.current = true
+      onChange(nextValue)
+      const selection = lexicalControlRef.current?.getSelection()
+      const caret = selection?.start ?? nextValue.length
+      const before = nextValue.slice(0, caret)
+      setSlashMenuOpen(typedCommandMenus && nextValue.startsWith('/'))
+      const fileQueryAtCaret = onFileSelect ? matchFileToken(before) : null
+      if (fileQueryAtCaret !== null) {
+        setFilePickerOpen(true)
+        setFileQuery(fileQueryAtCaret)
+      } else {
+        setFilePickerOpen(false)
+        setFileQuery('')
+      }
+      const skillQueryAtCaret = fileQueryAtCaret === null ? matchSkillToken(before) : null
+      if (typedCommandMenus && skillQueryAtCaret !== null) {
+        setSkillPickerOpen(true)
+        setSkillQuery(skillQueryAtCaret)
+      } else {
+        setSkillPickerOpen(false)
+        setSkillQuery('')
+      }
+      const pathQueryAtCaret = pathTokenAt(before)
+      if (pathQueryAtCaret !== null) {
+        setPathPickerOpen(true)
+        setPathQuery(pathQueryAtCaret)
+      } else {
+        setPathPickerOpen(false)
+        setPathQuery('')
+      }
+      if (selection && voiceCaretRef) voiceCaretRef.current = selection
+    },
+    [onChange, onFileSelect, pathTokenAt, typedCommandMenus, voiceCaretRef],
+  )
   const pasteBlocksRef = useRef(pasteBlocks)
   pasteBlocksRef.current = pasteBlocks
   // --- Prompt undo/redo history (per slot) ---
@@ -2667,9 +2868,12 @@ function ChatInput({
       // Picker open state is derived only in the textarea's own onChange, so the
       // parent-driven send-clear would otherwise leave a stale menu open.
       setSlashMenuOpen(false)
-      setFilePickerOpen(false); setFileQuery('')
-      setSkillPickerOpen(false); setSkillQuery('')
-      setPathPickerOpen(false); setPathQuery('')
+      setFilePickerOpen(false)
+      setFileQuery('')
+      setSkillPickerOpen(false)
+      setSkillQuery('')
+      setPathPickerOpen(false)
+      setPathQuery('')
     }
     // Exit history mode when value diverges from the recalled message
     // (user edited it, or the send pipeline cleared it).
@@ -2684,9 +2888,12 @@ function ChatInput({
   // previous tab's menu over; an unsent draft never hits the clear above.
   useEffect(() => {
     setSlashMenuOpen(false)
-    setFilePickerOpen(false); setFileQuery('')
-    setSkillPickerOpen(false); setSkillQuery('')
-    setPathPickerOpen(false); setPathQuery('')
+    setFilePickerOpen(false)
+    setFileQuery('')
+    setSkillPickerOpen(false)
+    setSkillQuery('')
+    setPathPickerOpen(false)
+    setPathQuery('')
   }, [slotId])
 
   // Record undo snapshots as the controlled value changes.
@@ -2985,7 +3192,15 @@ function ChatInput({
     // Pin the slot that owns this optimize so the overlay and the completion
     // handler stay bound to it across session switches.
     optimizeSlotRef.current = slotId
-    const context = chatMessages
+    // Read THIS pane's slot messages at click time (not via a live subscription),
+    // so a non-active pane optimizes against its own conversation, not the active
+    // pane's. When slotId is null (no SlotProvider / global composer) read the
+    // active mirror, which is exactly what the old `s.chat.messages` subscription
+    // returned; selectSlotMessages also falls back to that mirror for the active
+    // slot, so the focused composer's behavior is preserved.
+    const rootState = chatStore.getState()
+    const slotMessages = slotId ? selectSlotMessages(rootState, slotId) : rootState.chat.messages
+    const context = slotMessages
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .slice(-10)
       .map((m) => (m.content || '').slice(0, 200))
@@ -2998,7 +3213,7 @@ function ChatInput({
     const referenced = pruneBlocks(txt, pasteBlocks)
     const pastes = referenced.map((b) => ({ seq: b.seq, content: b.content }))
     runOptimize({ prompt: txt, context, pastes, slotId })
-  }, [runOptimize, chatMessages, pasteBlocks, slotId])
+  }, [runOptimize, pasteBlocks, slotId, chatStore])
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -3309,7 +3524,7 @@ function ChatInput({
         slashMenuOpenRef.current ||
         filePickerOpenRef.current ||
         skillPickerOpenRef.current ||
-      pathPickerOpenRef.current ||
+        pathPickerOpenRef.current ||
         ime.isComposing(e) ||
         e.metaKey ||
         e.ctrlKey ||
@@ -3734,6 +3949,13 @@ function ChatInput({
   /** "Is a transcription in flight at all" — see the `voiceTranscribeActive` prop
    *  doc. Falls back to the gated flag so the prop stays optional. */
   const transcribeInFlight = voiceTranscribeActive ?? voiceTranscribing
+  /** Whether the composer may say "Transcribing". False while the speech model is
+   *  still fetching or loading: the status strip directly above already names that
+   *  stage, and a placeholder asserting transcription under a line that reads
+   *  "Downloading the speech model: 40%" tells the user two different things about
+   *  the same wait. The strip is the single source of truth for it, so the
+   *  placeholder falls through to its default instead. */
+  const transcribingIsHonest = transcribeInFlight && !voiceDownload
   /** Another composer holds the microphone. Blocks STARTING here exactly like a
    *  foreign transcription does, but it is not transcription — nothing of this
    *  composer's is in flight — so it gets its own label and icon, never the
@@ -4021,6 +4243,29 @@ function ChatInput({
     voiceModeAvailable && !voiceHoldMode && !composerHasDraft && !placeholder
       ? i18nT('components.chatInput.send_a_message_or_tap_the_mic_for_voice')
       : ''
+  const activePlaceholder = !connected
+    ? i18nT('components.chatInput.gateway_offline_message_will_not_send')
+    : disabledProp
+      ? i18nT('components.chatInput.stopping')
+      : voiceRecording
+        ? i18nT('components.chatInput.recording_click_mic_to_stop')
+        : transcribingIsHonest
+          ? i18nT('components.chatInput.transcribing_please_wait')
+          : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder
+  // The sigil hint is a label and may be cut to one line. Every other
+  // placeholder here is a sentence the user needs whole, so it still wraps —
+  // including a caller's own `placeholder`, which `resolvedPlaceholder` carries.
+  const placeholderIsHint = !placeholder && activePlaceholder === resolvedPlaceholder
+  // Re-measure when the PLACEHOLDER swaps at an unchanged value: an empty composer
+  // measures its placeholder, and the value effect's deps cannot see it. The caret
+  // is NOT followed here — a placeholder only shows over an empty box, so there is
+  // no line of the user's to keep in view, and this effect also runs on a
+  // parent-driven value change, where snapping is what the seeded-prompt rule forbids.
+  useEffect(() => {
+    const el = inputRef.current
+    if (el && !dragging.current)
+      applyHeight(el, manualHeight, prefillHint, parkedRef.current, false)
+  }, [activePlaceholder, manualHeight, prefillHint])
   /** Combined height of every strip currently stacked above the textarea,
    *  MEASURED rather than predicted from the strips' Tailwind classes. The
    *  manual-resize floor and the transient height adjustment below both work off
@@ -4085,6 +4330,9 @@ function ChatInput({
           quickSend={quickSend}
           layout={followUpLayout}
           sourceKey={followUpSourceKey}
+          pendingOptions={followUpPendingOptions}
+          refusedOptions={followUpRefusedOptions}
+          error={followUpError}
         />
       )}
 
@@ -4560,36 +4808,49 @@ function ChatInput({
           // own onChange, so the token has to be handed over here.
           applyPickedToken(PATH_TOKEN_RE, kind === 'dir' ? relativePath : `${relativePath} `)
           if (kind === 'dir') setPathQuery(relativePath)
-          else { setPathPickerOpen(false); setPathQuery('') }
+          else {
+            setPathPickerOpen(false)
+            setPathQuery('')
+          }
         }}
-        onClose={() => { setPathPickerOpen(false); setPathQuery('') }}
+        onClose={() => {
+          setPathPickerOpen(false)
+          setPathQuery('')
+        }}
       />
 
-      {typedCommandMenus && <SkillPickerMenu
-        query={skillQuery}
-        anchorRef={composerAnchorRef}
-        open={skillPickerOpen}
-        sendOnEnter={sendOnEnter}
-        slotKey={skillSlotKey}
-        project={project}
-        agent={agentName}
-        onSelect={({ leaf }) => {
-          // Token left literal — backend appends the skill body; the user still
-          // sees their $token marker. Caret-relative replace via shared helper.
-          applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${leaf} `)
-          setSkillPickerOpen(false); setSkillQuery('')
-        }}
-        onTrustRequest={({ leaf }) => {
-          // An unconsented project skill: close the menu and ask, rather than
-          // inserting a token that would resolve to nothing.
-          setSkillPickerOpen(false); setSkillQuery('')
-          const requestId = nextTrustRequestIdRef.current + 1
-          nextTrustRequestIdRef.current = requestId
-          activeTrustRequestIdRef.current = requestId
-          setTrustPrompt({ requestId, leaf, slotKey: skillSlotKey, project })
-        }}
-        onClose={() => { setSkillPickerOpen(false); setSkillQuery('') }}
-      />}
+      {typedCommandMenus && (
+        <SkillPickerMenu
+          query={skillQuery}
+          anchorRef={composerAnchorRef}
+          open={skillPickerOpen}
+          sendOnEnter={sendOnEnter}
+          slotKey={skillSlotKey}
+          project={project}
+          agent={agentName}
+          onSelect={({ leaf }) => {
+            // Token left literal — backend appends the skill body; the user still
+            // sees their $token marker. Caret-relative replace via shared helper.
+            applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${leaf} `)
+            setSkillPickerOpen(false)
+            setSkillQuery('')
+          }}
+          onTrustRequest={({ leaf }) => {
+            // An unconsented project skill: close the menu and ask, rather than
+            // inserting a token that would resolve to nothing.
+            setSkillPickerOpen(false)
+            setSkillQuery('')
+            const requestId = nextTrustRequestIdRef.current + 1
+            nextTrustRequestIdRef.current = requestId
+            activeTrustRequestIdRef.current = requestId
+            setTrustPrompt({ requestId, leaf, slotKey: skillSlotKey, project })
+          }}
+          onClose={() => {
+            setSkillPickerOpen(false)
+            setSkillQuery('')
+          }}
+        />
+      )}
       <ProjectSkillsTrustDialog
         key={trustPrompt?.requestId ?? 0}
         open={trustPrompt !== null}
@@ -4644,26 +4905,32 @@ function ChatInput({
           while a deliberate collapse persists and therefore does — the bar
           rendered after this block is that way back. */}
       <AnimatePresence initial={false}>
-      {!showGhost && !composerCollapsed && (<motion.div
-        key="input-container"
-        initial={{ opacity: 1, height: 'auto' }}
-        animate={{ opacity: 1, height: 'auto' }}
-        exit={{ opacity: 0, height: 0 }}
-        transition={{ type: 'spring', damping: 26, stiffness: 280, mass: 0.7 }}
-        // The halo lives on THIS element, not on the bordered wrapper inside it:
-        // this element clips its content for the height:0 exit, and a child's
-        // box-shadow is content, so a halo drawn one level down is cut at the
-        // edge. An element's own shadow is outside its overflow clip. Radius
-        // mirrors the wrapper's so the halo hugs the same corners. With an
-        // approval box attached above, the wrapper has no top radius and the
-        // approval glow already lights the pair, so the halo stands down.
-        // Incognito and temporary modes paint the wrapper's border warn / aim
-        // at all times; the focus halo takes the same color there so the one
-        // control lights up in one color instead of an accent ring around a
-        // warn or aim edge.
-        className={hasApproval ? undefined : `composer-halo rounded-2xl${memoryMode === 'temporary' ? ' composer-halo-aim' : memoryMode === 'incognito' ? ' composer-halo-warn' : ''}`}
-        style={{ overflow: 'hidden' }}
-      >{/* File drag-and-drop target. Drag-drop is inherently pointer-only; the
+        {!showGhost && !composerCollapsed && (
+          <motion.div
+            key="input-container"
+            initial={{ opacity: 1, height: 'auto' }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ type: 'spring', damping: 26, stiffness: 280, mass: 0.7 }}
+            // The halo lives on THIS element, not on the bordered wrapper inside it:
+            // this element clips its content for the height:0 exit, and a child's
+            // box-shadow is content, so a halo drawn one level down is cut at the
+            // edge. An element's own shadow is outside its overflow clip. Radius
+            // mirrors the wrapper's so the halo hugs the same corners. With an
+            // approval box attached above, the wrapper has no top radius and the
+            // approval glow already lights the pair, so the halo stands down.
+            // Incognito and temporary modes paint the wrapper's border warn / aim
+            // at all times; the focus halo takes the same color there so the one
+            // control lights up in one color instead of an accent ring around a
+            // warn or aim edge.
+            className={
+              hasApproval
+                ? undefined
+                : `composer-halo rounded-2xl${memoryMode === 'temporary' ? ' composer-halo-aim' : memoryMode === 'incognito' ? ' composer-halo-warn' : ''}`
+            }
+            style={{ overflow: 'hidden' }}
+          >
+            {/* File drag-and-drop target. Drag-drop is inherently pointer-only; the
            keyboard-accessible path is the "Attach files" button that opens the
            hidden file input above. Hence the scoped disable for the drop zone. */}
             {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
@@ -4801,6 +5068,21 @@ function ChatInput({
                   onSelectDevice={onSelectVoiceDevice || noopSelectDevice}
                   deviceSwitchIsLive={voiceDeviceSwitchIsLive}
                   download={voiceDownload}
+                  /* The released utterance's own window. Gated on the transport of the
+               request IN FLIGHT, which is what `voiceDrainCancellable` reads: a
+               streaming drain is held against an open socket and the discard
+               closes it, while a batch transcription is already in the
+               transcriber's hands over HTTP and the strip offers it no exit
+               rather than an exit that leaves the work running.
+
+               Not on `voiceStreaming`. That is the saved setting, so it describes
+               the NEXT utterance; a setting flipped while one request is open
+               names a transport nothing in flight is using, and the control then
+               appears over a batch request whose transcript still lands. The flag
+               is ownership-gated at its source, so a composer offers the discard
+               for its OWN drain and never for a session another chat holds. */
+                  draining={voiceDrainCancellable}
+                  onCancelDrain={cancelVoiceDrain}
                   /* Visible reasons, not tooltips: why the mic is blocked, or that a
                held dictation just arrived. Only while the mic is offered at all.
                Shown in hold mode too: one message, one shape, and the name
@@ -4820,8 +5102,15 @@ function ChatInput({
                 />
               )}
 
-        {optimizing && <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl"><Sparkles size={14} className="inline mr-1 text-warn" /> {i18nT('components.chatInput.optimizing_prompt')}</span>}
-        {/* The textarea fallback is seamless for typing (draft intact), but the
+              {optimizing && (
+                <span className="optimize-overlay absolute inset-0 flex items-center justify-center backdrop-blur-md pointer-events-none z-10 rounded-2xl">
+                  <span className="optimize-overlay-pill inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium text-text">
+                    <Sparkles size={15} className="text-accent animate-pulse shrink-0" />{' '}
+                    {i18nT('components.chatInput.optimizing_prompt')}
+                  </span>
+                </span>
+              )}
+              {/* The textarea fallback is seamless for typing (draft intact), but the
             failure itself must be user-visible, not only a console line: the
             person who opted into the editor should know they are no longer in
             it. `askAgent` stays off — the hand-off unmounts the composer and
@@ -4865,19 +5154,7 @@ function ChatInput({
                         onSelectionChange={publishLexicalSelection}
                         sentMessages={sentMessages}
                         ariaLabel={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
-                        placeholder={
-                          !connected
-                            ? i18nT('components.chatInput.gateway_offline_message_will_not_send')
-                            : disabledProp
-                              ? i18nT('components.chatInput.stopping')
-                              : voiceRecording
-                                ? i18nT('components.chatInput.recording_click_mic_to_stop')
-                                : voiceTranscribing
-                                  ? i18nT('components.chatInput.transcribing_please_wait')
-                                  : continuePlaceholder ||
-                                    voiceModePlaceholder ||
-                                    resolvedPlaceholder
-                        }
+                        placeholder={activePlaceholder}
                         disabled={disabled}
                         readOnly={optimizing}
                         sendOnEnter={sendOnEnter}
@@ -4896,21 +5173,13 @@ function ChatInput({
                       spellCheck={spellCheck}
                       aria-describedby={pastePreviewPanelId ?? undefined}
                       data-composer-typo
+                      // Chromium paints no `text-overflow` on a `::placeholder`, so the cut tail
+                      // fades out instead, the way the app's other cut edges do.
                       className={
-                        /* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-hidden min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`
+                        /* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-hidden min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${placeholderIsHint ? 'placeholder:whitespace-nowrap placeholder:overflow-hidden placeholder:[mask-image:linear-gradient(to_right,black_calc(100%-1.5rem),transparent)] placeholder:[-webkit-mask-image:linear-gradient(to_right,black_calc(100%-1.5rem),transparent)]' : ''} ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`
                       }
                       style={manualHeight !== null ? { height: '100%' } : undefined}
-                      placeholder={
-                        !connected
-                          ? i18nT('components.chatInput.gateway_offline_message_will_not_send')
-                          : disabledProp
-                            ? i18nT('components.chatInput.stopping')
-                            : voiceRecording
-                              ? i18nT('components.chatInput.recording_click_mic_to_stop')
-                              : voiceTranscribing
-                                ? i18nT('components.chatInput.transcribing_please_wait')
-                                : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder
-                      }
+                      placeholder={activePlaceholder}
                       readOnly={optimizing}
                       rows={1}
                       value={value}
@@ -5058,42 +5327,43 @@ function ChatInput({
                 <div className="flex items-center gap-0.5 min-w-0">
                   {onUploadFiles && (
                     <div className="relative shrink-0" ref={plusWrapRef}>
-                      {directFilePicker ? (
-                        /* Association is intentionally absent while uploads disable the control. */
-                        <label
-                          htmlFor={uploading ? undefined : fileInputId}
-                          aria-disabled={uploading || undefined}
-                          className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all bg-transparent ${uploading ? 'opacity-30 cursor-default' : 'cursor-pointer text-muted hover:text-text hover:bg-bg-hover'}`}
-                          aria-label={i18nT('components.chatInput.attach_files')}
-                          title={i18nT('components.chatInput.attach_files')}
-                        >
-                          {uploading ? (
-                            <Loader2 size={18} className="animate-spin" />
-                          ) : (
-                            <Plus size={18} />
-                          )}
-                        </label>
-                      ) : (
-                        <button
-                          ref={plusBtnRef}
-                          className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? 'text-text bg-bg-hover' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
-                          onClick={togglePlus}
-                          disabled={uploading}
-                          aria-haspopup="menu"
-                          aria-expanded={plusOpen}
-                          aria-label={i18nT('components.chatInput.add_files_options')}
-                          title={i18nT('components.chatInput.add_files_options')}
-                        >
-                          {uploading ? (
-                            <Loader2 size={18} className="animate-spin" />
-                          ) : (
-                            <Plus
-                              size={18}
-                              className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`}
-                            />
-                          )}
-                        </button>
-                      )}
+                      {uploadCancelControl ||
+                        (directFilePicker ? (
+                          /* Association is intentionally absent while uploads disable the control. */
+                          <label
+                            htmlFor={uploading ? undefined : fileInputId}
+                            aria-disabled={uploading || undefined}
+                            className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all bg-transparent ${uploading ? 'opacity-30 cursor-default' : 'cursor-pointer text-muted hover:text-text hover:bg-bg-hover'}`}
+                            aria-label={i18nT('components.chatInput.attach_files')}
+                            title={i18nT('components.chatInput.attach_files')}
+                          >
+                            {uploading ? (
+                              <Loader2 size={18} className="animate-spin" />
+                            ) : (
+                              <Plus size={18} />
+                            )}
+                          </label>
+                        ) : (
+                          <button
+                            ref={plusBtnRef}
+                            className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? 'text-text bg-bg-hover' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
+                            onClick={togglePlus}
+                            disabled={uploading}
+                            aria-haspopup="menu"
+                            aria-expanded={plusOpen}
+                            aria-label={i18nT('components.chatInput.add_files_options')}
+                            title={i18nT('components.chatInput.add_files_options')}
+                          >
+                            {uploading ? (
+                              <Loader2 size={18} className="animate-spin" />
+                            ) : (
+                              <Plus
+                                size={18}
+                                className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`}
+                              />
+                            )}
+                          </button>
+                        ))}
                       {!directFilePicker &&
                         plusOpen &&
                         plusRect &&
@@ -5896,7 +6166,11 @@ function ChatInput({
              row scrolls rather than compressing the middle group below its own
              content -- which is what let its `shrink-0` working-tree badge paint
              over the context readout beside it. */
-          <div ref={shelfRef} className="pt-1 flex items-center gap-2 min-w-0 overflow-x-auto">
+          <div
+            ref={shelfRef}
+            data-testid="composer-context-shelf"
+            className="pt-1 flex items-center gap-2 min-w-0 overflow-x-auto"
+          >
             {/* App-contributed session controls live in their OWN group, not
               beside the agent/project chips. `max-two-buttons-per-row`
               (AUTOSDE.yaml, blocking) caps a horizontal group at 2 action
@@ -5937,80 +6211,104 @@ function ChatInput({
                       className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer ${
                         /* Open wins, so the chip you are pointing at always reads as
                    the active one; otherwise the app's own state colours it. */
-                sc.active
-                  ? 'text-accent'
-                  : sc.state === 'ok'
-                    ? 'text-ok'
-                    : sc.state === 'warn'
-                      ? 'text-warn'
-                      : 'text-muted hover:text-text'
-              }`}
-              onClick={e => onSessionControlClick?.(sc.key, e.currentTarget.getBoundingClientRect(), e.currentTarget)}
-              // Marks the chip as part of its own popover for dismissal
-              // purposes: mousedown fires before click, so without this the
-              // host's outside-click closes the popover and the chip's toggle
-              // then re-opens it — a flicker instead of a dismissal.
-              data-session-control-chip=""
-              title={chipName}
-              aria-label={chipName}
-            >
-              <AppIcon icon={sc.icon} size={13} />
-              {!shelfCompact && <span className="truncate max-w-[140px]">{sc.label}</span>}
-            </button>
-            )
-          })}
-            </div>
-          )}
-          <div className="flex items-center gap-2 flex-1">
-          {onAgentClick && agentName && (
-            /* Chrome type: an agent name is a label, not code. `font-mono` would
+                        sc.active
+                          ? 'text-accent'
+                          : sc.state === 'ok'
+                            ? 'text-ok'
+                            : sc.state === 'warn'
+                              ? 'text-warn'
+                              : 'text-muted hover:text-text'
+                      }`}
+                      onClick={(e) =>
+                        onSessionControlClick?.(
+                          sc.key,
+                          e.currentTarget.getBoundingClientRect(),
+                          e.currentTarget,
+                        )
+                      }
+                      // Marks the chip as part of its own popover for dismissal
+                      // purposes: mousedown fires before click, so without this the
+                      // host's outside-click closes the popover and the chip's toggle
+                      // then re-opens it — a flicker instead of a dismissal.
+                      data-session-control-chip=""
+                      title={chipName}
+                      aria-label={chipName}
+                    >
+                      <AppIcon icon={sc.icon} size={13} />
+                      {!shelfCompact && <span className="truncate max-w-[140px]">{sc.label}</span>}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+            <div className="flex items-center gap-2 flex-1">
+              {onAgentClick && agentName && (
+                /* Chrome type: an agent name is a label, not code. `font-mono` would
                pin `var(--mono)`, which Settings → Display → Font Family never
                writes, so it would make the shelf ignore the user's typeface. */
-            <button
-              className={`inline-flex items-center gap-1.5 h-7 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
-              onClick={e => onAgentClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
-              disabled={isRunning}
-              // Inherited default: explain what the ` . default` marker means, on
-              // hover (title) AND keyboard focus / screen readers (aria-label),
-              // because the marker alone reads as opaque (#8770 UX). No glyph, no
-              // layout change -- text on demand. A pinned chip keeps the plain
-              // switch hint; it has nothing to explain.
-              title={isRunning
-                ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
-                : agentIsInheritedDefault
-                  ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
-                  : i18nT('components.chatInput.agent', { name: agentName })}
-              aria-label={isRunning
-                ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
-                : agentIsInheritedDefault
-                  ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
-                  : i18nT('components.chatInput.agent', { name: agentName })}
-            >
-              <Bot size={13} className="shrink-0 opacity-70" />
-              {!shelfCompact && <span className="truncate max-w-[160px]">{agentLabel ?? agentName}</span>}
-            </button>
-          )}
-          {onProjectClick && (
-          /* Two sibling buttons inside one visual pill, NOT a nested button:
+                <button
+                  className={`inline-flex items-center gap-1.5 h-7 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
+                  onClick={(e) =>
+                    onAgentClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)
+                  }
+                  disabled={isRunning}
+                  // Inherited default: explain what the ` . default` marker means, on
+                  // hover (title) AND keyboard focus / screen readers (aria-label),
+                  // because the marker alone reads as opaque (#8770 UX). No glyph, no
+                  // layout change -- text on demand. A pinned chip keeps the plain
+                  // switch hint; it has nothing to explain.
+                  title={
+                    isRunning
+                      ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
+                      : agentIsInheritedDefault
+                        ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
+                        : i18nT('components.chatInput.agent', { name: agentName })
+                  }
+                  aria-label={
+                    isRunning
+                      ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
+                      : agentIsInheritedDefault
+                        ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
+                        : i18nT('components.chatInput.agent', { name: agentName })
+                  }
+                >
+                  <Bot size={13} className="shrink-0 opacity-70" />
+                  {!shelfCompact && (
+                    <span className="truncate max-w-[160px]">{agentLabel ?? agentName}</span>
+                  )}
+                </button>
+              )}
+              {onProjectClick && (
+                /* Two sibling buttons inside one visual pill, NOT a nested button:
              the folder segment opens the project picker and the branch segment
              copies. A <button> inside a <button> is invalid HTML and browsers
              collapse it, so the pill is a plain container and each segment owns
              its own click target and hover state. */
-          /* No `min-w-0` on the pill or its folder segment: the FolderOpen
+                /* No `min-w-0` on the pill or its folder segment: the FolderOpen
              glyph is `shrink-0`, so a box allowed to collapse to zero lets the
              icon bleed sideways under the git badge that follows it. Leaving the
              automatic minimum in place floors the segment at the icon, and the
              label still truncates because `truncate` zeroes its own min-content. */
-          <div className="inline-flex items-center gap-1.5 h-7 text-[12px] text-muted">
-          <button
-            className="inline-flex items-center gap-1.5 h-7 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
-            onClick={e => onProjectClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
-            disabled={isRunning}
-            title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
-            aria-label={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
-          >
-            <FolderOpen size={13} className="shrink-0 opacity-70" />
-            {/* Budget favours the branch: the folder name is also in the tooltip
+                <div className="inline-flex items-center gap-1.5 h-7 text-[12px] text-muted">
+                  <button
+                    className="inline-flex items-center gap-1.5 h-7 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
+                    onClick={(e) =>
+                      onProjectClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)
+                    }
+                    disabled={isRunning}
+                    title={
+                      isRunning
+                        ? i18nT('components.chatInput.stop_the_current_response_to_switch_project')
+                        : projectChipTitle
+                    }
+                    aria-label={
+                      isRunning
+                        ? i18nT('components.chatInput.stop_the_current_response_to_switch_project')
+                        : projectChipTitle
+                    }
+                  >
+                    <FolderOpen size={13} className="shrink-0 opacity-70" />
+                    {/* Budget favours the branch: the folder name is also in the tooltip
                 and the picker, whereas a clipped branch ("feat/pro…") is exactly
                 the ambiguity this label exists to remove. The enclosing shelf
                 group is flex-1/min-w-0, so both segments still shrink below
@@ -6164,137 +6462,137 @@ function ChatInput({
                             style={{
                               left: Math.max(
                                 8,
-                                Math.min(
-                                  ctxPopoverRect.right - 208,
-                                  window.innerWidth - 208 - 8,
-                                ),
+                                Math.min(ctxPopoverRect.right - 208, window.innerWidth - 208 - 8),
                               ),
                               bottom: window.innerHeight - ctxPopoverRect.top + 4,
                             }}
                           >
-                          <div className="flex items-center justify-between mb-2">
-                            <span className="text-[11px] font-semibold text-text">
-                              {hasKnownWindow
-                                ? i18nT('components.chatInput.context_window')
-                                : i18nT('components.chatInput.context_usage')}
-                            </span>
-                            <span
-                              className="text-[12px] font-mono font-bold"
-                              style={{ color: pctColor }}
-                            >
-                              {hasKnownWindow
-                                ? fmtPercent(contextPctClamped(contextPct) / 100)
-                                : fmtTokens(used)}
-                            </span>
-                          </div>
-                          <div className="flex flex-col gap-1 text-[11px] font-mono">
-                            <div className="flex justify-between">
-                              <span className="text-muted">
-                                {i18nT('components.chatInput.used')}
+                            <div className="flex items-center justify-between mb-2">
+                              <span className="text-[11px] font-semibold text-text">
+                                {hasKnownWindow
+                                  ? i18nT('components.chatInput.context_window')
+                                  : i18nT('components.chatInput.context_usage')}
                               </span>
-                              <span className="text-text">
-                                {approx ? '~' : ''}
-                                {fmtTokens(used)}
+                              <span
+                                className="text-[12px] font-mono font-bold"
+                                style={{ color: pctColor }}
+                              >
+                                {hasKnownWindow
+                                  ? fmtPercent(contextPctClamped(contextPct) / 100)
+                                  : fmtTokens(used)}
                               </span>
                             </div>
-                            {hasKnownWindow && (
+                            <div className="flex flex-col gap-1 text-[11px] font-mono">
                               <div className="flex justify-between">
                                 <span className="text-muted">
-                                  {i18nT('components.chatInput.remaining')}
+                                  {i18nT('components.chatInput.used')}
                                 </span>
                                 <span className="text-text">
                                   {approx ? '~' : ''}
-                                  {fmtTokens(remaining)}
+                                  {fmtTokens(used)}
                                 </span>
                               </div>
-                            )}
-                            {hasKnownWindow && (
-                              <div className="flex justify-between">
-                                <span className="text-muted">
-                                  {i18nT('components.chatInput.total')}
-                                </span>
-                                <span className="text-text">{fmtTokens(win)}</span>
-                              </div>
-                            )}
-                          </div>
-                          {modelName && (
-                            <div className="mt-2 pt-2 border-t border-border flex justify-between text-[11px] font-mono">
-                              <span className="text-muted">
-                                {i18nT('components.chatInput.model')}
-                              </span>
-                              <span className="text-text truncate max-w-[120px]" title={modelName}>
-                                {modelName}
-                              </span>
-                            </div>
-                          )}
-                          {autoCompactQuery.isLoading && (
-                            <div className="mt-2 pt-2 border-t border-border" aria-hidden="true">
-                              <div className="h-4 mb-1 rounded bg-bg-hover animate-pulse" />
-                              <div className="h-5 rounded bg-bg-hover animate-pulse" />
-                            </div>
-                          )}
-                          {autoCompactQuery.isError && !autoCompact && (
-                            <div className="mt-2 pt-2 border-t border-border">
-                              {/* No hand-off: the composer draft below is unsaved. */}
-                              <ErrorNotice
-                                variant="inline"
-                                testId="auto-compact-load-error"
-                                message={i18nT('components.chatInput.auto_compact_load_failed')}
-                              />
-                            </div>
-                          )}
-                          {autoCompactError && (
-                            <div className="mt-2 pt-2 border-t border-border">
-                              {/* No hand-off: same composer draft. The shared notice toast is
-                                  transient; the write that did not persist is reported HERE,
-                                  next to the slider whose value snapped back. */}
-                              <ErrorNotice
-                                variant="inline"
-                                testId="auto-compact-write-error"
-                                message={autoCompactError}
-                                onDismiss={() => setAutoCompactError('')}
-                              />
-                            </div>
-                          )}
-                          {autoCompact && (
-                            <div className="mt-2 pt-2 border-t border-border">
-                              <div className="flex items-center justify-between mb-1">
-                                <span className="text-[11px] text-muted">
-                                  {i18nT('components.chatInput.auto_compact_at')}
-                                </span>
-                                <span className="text-[12px] font-mono font-bold text-accent">
-                                  {fmtPercent(
-                                    Math.round(autoCompact.pct ?? autoCompact.global_pct) / 100,
-                                  )}
-                                </span>
-                              </div>
-                              <Slider
-                                value={autoCompact.pct ?? autoCompact.global_pct}
-                                onChange={(v) => pushAutoCompact(v)}
-                                min={autoCompact.min}
-                                max={autoCompact.max}
-                                step={1}
-                                formatValue={(v) => fmtPercent(v / 100)}
-                                aria-label={i18nT('components.chatInput.auto_compact_threshold')}
-                              />
-                              {autoCompact.pct != null ? (
-                                <Btn
-                                  className="mt-1 px-0 py-0 border-none text-[10px] text-muted underline hover:text-text hover:bg-transparent"
-                                  onClick={() => pushAutoCompact(null)}
-                                >
-                                  {i18nT('components.chatInput.reset_to_global', {
-                                    pct: Math.round(autoCompact.global_pct),
-                                  })}
-                                </Btn>
-                              ) : (
-                                <div className="mt-1 text-[10px] text-muted">
-                                  {i18nT('components.chatInput.following_global', {
-                                    pct: Math.round(autoCompact.global_pct),
-                                  })}
+                              {hasKnownWindow && (
+                                <div className="flex justify-between">
+                                  <span className="text-muted">
+                                    {i18nT('components.chatInput.remaining')}
+                                  </span>
+                                  <span className="text-text">
+                                    {approx ? '~' : ''}
+                                    {fmtTokens(remaining)}
+                                  </span>
+                                </div>
+                              )}
+                              {hasKnownWindow && (
+                                <div className="flex justify-between">
+                                  <span className="text-muted">
+                                    {i18nT('components.chatInput.total')}
+                                  </span>
+                                  <span className="text-text">{fmtTokens(win)}</span>
                                 </div>
                               )}
                             </div>
-                          )}
+                            {modelName && (
+                              <div className="mt-2 pt-2 border-t border-border flex justify-between text-[11px] font-mono">
+                                <span className="text-muted">
+                                  {i18nT('components.chatInput.model')}
+                                </span>
+                                <span
+                                  className="text-text truncate max-w-[120px]"
+                                  title={modelName}
+                                >
+                                  {modelName}
+                                </span>
+                              </div>
+                            )}
+                            {autoCompactQuery.isLoading && (
+                              <div className="mt-2 pt-2 border-t border-border" aria-hidden="true">
+                                <div className="h-4 mb-1 rounded bg-bg-hover animate-pulse" />
+                                <div className="h-5 rounded bg-bg-hover animate-pulse" />
+                              </div>
+                            )}
+                            {autoCompactQuery.isError && !autoCompact && (
+                              <div className="mt-2 pt-2 border-t border-border">
+                                {/* No hand-off: the composer draft below is unsaved. */}
+                                <ErrorNotice
+                                  variant="inline"
+                                  testId="auto-compact-load-error"
+                                  message={i18nT('components.chatInput.auto_compact_load_failed')}
+                                />
+                              </div>
+                            )}
+                            {autoCompactError && (
+                              <div className="mt-2 pt-2 border-t border-border">
+                                {/* No hand-off: same composer draft. The shared notice toast is
+                                  transient; the write that did not persist is reported HERE,
+                                  next to the slider whose value snapped back. */}
+                                <ErrorNotice
+                                  variant="inline"
+                                  testId="auto-compact-write-error"
+                                  message={autoCompactError}
+                                  onDismiss={() => setAutoCompactError('')}
+                                />
+                              </div>
+                            )}
+                            {autoCompact && (
+                              <div className="mt-2 pt-2 border-t border-border">
+                                <div className="flex items-center justify-between mb-1">
+                                  <span className="text-[11px] text-muted">
+                                    {i18nT('components.chatInput.auto_compact_at')}
+                                  </span>
+                                  <span className="text-[12px] font-mono font-bold text-accent">
+                                    {fmtPercent(
+                                      Math.round(autoCompact.pct ?? autoCompact.global_pct) / 100,
+                                    )}
+                                  </span>
+                                </div>
+                                <Slider
+                                  value={autoCompact.pct ?? autoCompact.global_pct}
+                                  onChange={(v) => pushAutoCompact(v)}
+                                  min={autoCompact.min}
+                                  max={autoCompact.max}
+                                  step={1}
+                                  formatValue={(v) => fmtPercent(v / 100)}
+                                  aria-label={i18nT('components.chatInput.auto_compact_threshold')}
+                                />
+                                {autoCompact.pct != null ? (
+                                  <Btn
+                                    className="mt-1 px-0 py-0 border-none text-[10px] text-muted underline hover:text-text hover:bg-transparent"
+                                    onClick={() => pushAutoCompact(null)}
+                                  >
+                                    {i18nT('components.chatInput.reset_to_global', {
+                                      pct: Math.round(autoCompact.global_pct),
+                                    })}
+                                  </Btn>
+                                ) : (
+                                  <div className="mt-1 text-[10px] text-muted">
+                                    {i18nT('components.chatInput.following_global', {
+                                      pct: Math.round(autoCompact.global_pct),
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </div>,
                           document.body,
                         )}
@@ -6314,31 +6612,40 @@ function ChatInput({
                   title={
                     isRunning
                       ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                      : modelIsInheritedDefault
-                        ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                        : i18nT('components.chatInput.model_2', {
-                            name: modelName,
-                          })
+                      : modelIsJevRouted
+                        ? i18nT('pages.chatPage.model_auto_jev_description')
+                        : modelIsInheritedDefault
+                          ? i18nT('components.chatInput.model_inherited_default', {
+                              name: modelName,
+                            })
+                          : i18nT('components.chatInput.model_2', { name: modelName })
                   }
                   aria-label={
                     isRunning
                       ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                      : modelIsInheritedDefault
-                        ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                        : i18nT('components.chatInput.model_2', {
-                            name: modelName,
-                          })
+                      : modelIsJevRouted
+                        ? i18nT('pages.chatPage.model_auto_jev_description')
+                        : modelIsInheritedDefault
+                          ? i18nT('components.chatInput.model_inherited_default', {
+                              name: modelName,
+                            })
+                          : i18nT('components.chatInput.model_2', { name: modelName })
                   }
                 >
                   {/* The full id, uncapped: the shelf scrolls now, so a long
                       provider-prefixed name costs a scroll instead of a squeeze.
                       Truncation was only ever a workaround for a row that had
                       nowhere to put the overflow. */}
-                  <span className="whitespace-nowrap">{modelName}</span>
-                  {modelIsInheritedDefault && (
-                    // Outside the truncating span: a long provider-prefixed id must
-                    // ellipsize its own tail, never the marker that tells a served
-                    // default apart from a pin.
+                  <span className="whitespace-nowrap">
+                    {modelIsJevRouted ? i18nT('components.modelDropdownList.auto_jev') : modelName}
+                  </span>
+                  {/* Outside the label span: a long provider-prefixed id must
+                  never push out the marker beside it. A routed chip
+                  takes NO marker -- its label is already the policy, and a second
+                  word next to it would be a marker on a name that is not a model.
+                  So the two unpinned states differ by KIND (a policy vs an id with
+                  a marker), not by two adjectives a reader has to tell apart. */}
+                  {!modelIsJevRouted && modelIsInheritedDefault && (
                     <>
                       <span className="opacity-30 select-none shrink-0" aria-hidden="true">
                         ·
@@ -6348,7 +6655,7 @@ function ChatInput({
                       </span>
                     </>
                   )}
-                  {onReasoningEffortClick && !shelfCompact && (
+                  {onReasoningEffortClick && !separateEffort && !shelfCompact && (
                     <>
                       <span className="opacity-30 select-none shrink-0" aria-hidden="true">
                         ·
@@ -6359,6 +6666,32 @@ function ChatInput({
                     </>
                   )}
                 </button>
+              )}
+              {separateEffort && onReasoningEffortClick && (
+                <div className="ml-1 pl-1 border-l border-border flex items-center shrink-0">
+                  <Btn
+                    type="button"
+                    className={`inline-flex items-center h-7 gap-1.5 text-[12px] text-muted hover:text-text rounded-md border-none bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors ${shelfCompact ? 'px-1' : 'px-2'}`}
+                    aria-label={i18nT('components.reasoningEffortDropdown.reasoning_effort')}
+                    title={`${i18nT('components.reasoningEffortDropdown.reasoning_effort')}: ${effortLabel(reasoningEffort || '')}`}
+                    disabled={isRunning}
+                    onClick={(e) =>
+                      onReasoningEffortClick(
+                        e.currentTarget.getBoundingClientRect(),
+                        e.currentTarget,
+                      )
+                    }
+                    data-testid="composer-effort-chip"
+                  >
+                    <BrainCircuit size={13} className="shrink-0 opacity-70" aria-hidden="true" />
+                    {!shelfTiny && (
+                      <span className="whitespace-nowrap">
+                        {i18nT('components.reasoningEffortDropdown.effort')}:{' '}
+                        {effortLabel(reasoningEffort || '')}
+                      </span>
+                    )}
+                  </Btn>
+                </div>
               )}
             </div>
           </div>

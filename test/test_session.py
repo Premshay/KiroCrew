@@ -485,6 +485,51 @@ class TestWarmPool:
         await mgr.close_all()
 
     @pytest.mark.asyncio
+    async def test_a_cold_start_captures_the_store_it_supersedes(self, cfg):
+        """The crew log a cold-started session supersedes is captured by the
+        allocation itself -- inside the registration's critical section, before the
+        new sid is mapped -- and read back after the claim. A caller reading the
+        mapping around its own ``get_or_create`` can be suspended inside the
+        allocation while a concurrent turn allocates and recycles an intermediate
+        session, and would then cite the store before that one. The capture reads
+        the mapping's live id or the stash a recycle leaves, follows every cold start,
+        and is what a warm claim reads back too."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.start_pool()
+        key = "discord:kirocrew:direct:7:gen1"
+        assert mgr.allocation_predecessor(key) == ""
+
+        # The conversation served ``sid-p0`` and a failed compaction recycled it:
+        # the pointer is emptied in place and the id stashed.
+        mgr._session_map.set(key, "sid-p0")
+        assert mgr._session_map.clear_sid(key) is True
+        provider1, is_new, _ = await mgr.get_or_create(key)
+        assert is_new is True
+        assert mgr.allocation_predecessor(key) == "sid-p0"
+        # A warm claim reads back what its live session was registered with.
+        mgr.release(key)
+        provider_again, is_new_again, _ = await mgr.get_or_create(key)
+        assert provider_again is provider1 and is_new_again is False
+        assert mgr.allocation_predecessor(key) == "sid-p0"
+        mgr.release(key)
+
+        # The successor was mapped and then recycled in turn: the next cold start
+        # cites IT, not the store before it.
+        mgr._session_map.set(key, "sid-p1")
+        mgr._sessions.pop(key)
+        assert mgr._session_map.clear_sid(key) is True
+        provider2, is_new2, _ = await mgr.get_or_create(key)
+        assert is_new2 is True and provider2 is not provider1
+        assert mgr.allocation_predecessor(key) == "sid-p1"
+        mgr.release(key)
+        # The stamp lives on the session, so its teardown releases it: nothing keyed
+        # by session key outlives the session (a ``/new`` or generation rotation
+        # mints a fresh key every time, and a table of them would only ever grow).
+        await mgr.close_all()
+        assert mgr.allocation_predecessor(key) == ""
+        assert not hasattr(mgr._allocation_boundary().state, "allocation_predecessors")
+
+    @pytest.mark.asyncio
     async def test_background_session_reused(self, cfg):
         """BACKGROUND_KEY returns the same provider on repeated calls."""
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
@@ -998,6 +1043,73 @@ class TestCancelRaceCondition:
         mgr = SessionManager(cfg, provider_factory=factory)
         await mgr.get_or_create("test-model", model="claude-sonnet")
         assert captured["model_override"] == "claude-sonnet"
+        await mgr.close_all()
+
+
+class TestAllocationRequestedModel:
+    """The model an allocation selects is readable by its caller.
+
+    A caller that pins nothing passes ``model=None``, and the allocation resolves
+    an id from config itself. ``get_or_create`` reports the provider, ``is_new``
+    and ``resumed``, so that id is otherwise invisible to the caller recording what
+    the session was asked to run.
+    """
+
+    @staticmethod
+    def _capturing_factory(captured: dict):
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            captured.update(kwargs)
+            m = AsyncMock()
+            m.start = AsyncMock()
+            m.context_usage_pct = lambda: 0.0
+            m.is_process_alive = lambda: True
+            m.is_alive.return_value = True
+            return m
+
+        return factory
+
+    @pytest.mark.asyncio
+    async def test_the_internally_resolved_id_is_the_id_the_provider_got(self, cfg):
+        """One value: the stamp is the same string the factory received."""
+        cfg.agent.model = "claude-sonnet-5"
+        captured: dict = {}
+        mgr = SessionManager(cfg, provider_factory=self._capturing_factory(captured))
+
+        await mgr.get_or_create("alloc-resolved")
+
+        assert captured["model_override"] == "claude-sonnet-5"
+        assert mgr.allocation_requested_model("alloc-resolved") == "claude-sonnet-5"
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_callers_explicit_model_is_reported_unchanged(self, cfg):
+        """An explicit model is stamped too, so one read serves both cases."""
+        captured: dict = {}
+        mgr = SessionManager(cfg, provider_factory=self._capturing_factory(captured))
+
+        await mgr.get_or_create("alloc-explicit", model="claude-haiku-5")
+
+        assert mgr.allocation_requested_model("alloc-explicit") == "claude-haiku-5"
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_an_allocation_that_resolves_nothing_reports_nothing(self, cfg):
+        """No tier resolved an id, so there is no selection to report."""
+        cfg.agent.model = ""
+        captured: dict = {}
+        mgr = SessionManager(cfg, provider_factory=self._capturing_factory(captured))
+
+        await mgr.get_or_create("alloc-blank")
+
+        assert captured["model_override"] is None
+        assert mgr.allocation_requested_model("alloc-blank") == ""
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_key_reports_nothing(self, cfg):
+        """No session, so nothing to report — never an error."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        assert mgr.allocation_requested_model("never-allocated") == ""
         await mgr.close_all()
 
 
@@ -6960,7 +7072,13 @@ class TestParentEndCancelsItsChildren:
                 self._admission = _Admission()
                 # A live record is what makes the reap reachable: the drain started this
                 # row, so there is a task to stop rather than a row to unqueue.
-                self._agents = {"started-row": SimpleNamespace(id="started-row", done=False)}
+                self._agents = {
+                    # The fields cancel_for_teardown WRITES before the reap, on
+                    # a record shaped like the real one.
+                    "started-row": SimpleNamespace(
+                        id="started-row", done=False, _reap_reason="", _stop_origin=""
+                    )
+                }
                 self._queue = []
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
@@ -7467,10 +7585,16 @@ class TestParentEndCancelsItsChildren:
         Two methods are exempt, each for a fact about itself rather than by
         convenience. ``close_all`` is gateway shutdown, where
         ``SubagentManager.cancel_all`` runs instead and additionally drains
-        follow-up watchers. ``_retire_kiro_subagent_runtimes`` reaps only IDLE
-        companion runtimes — it skips any runtime answering
-        ``has_active_or_initializing_sessions()`` — so it has no running child to
-        end, and the parent conversation it belongs to continues.
+        follow-up watchers. ``_retire_kiro_subagent_runtimes`` KILLS only IDLE
+        companion runtimes — a runtime answering
+        ``has_active_or_initializing_sessions()`` is never killed; under the
+        spawn-identity predicate a busy wrong-account one is parked to drain
+        (no process ends, its running children finish on the parked process)
+        and the kill happens on a later pass only once it answers idle — so it
+        has no running child to end, and the parent conversation it belongs to
+        continues. Narrower
+        reaps (the spawn-identity stamp gate) delegate to it with a predicate
+        rather than releasing themselves, so this exemption never widens.
 
         ``reset`` is NOT exempt: it calls both halves, under
         ``ends_conversation``. That keyword defaults to False because almost every one of
@@ -7512,7 +7636,10 @@ class TestParentEndCancelsItsChildren:
             f"thing after a rename; found {sorted(releasing)}"
         )
 
-        exempt = {"close_all", "_retire_kiro_subagent_runtimes"}
+        exempt = {
+            "close_all",
+            "_retire_kiro_subagent_runtimes",
+        }
         assert exempt <= set(releasing), (
             "an exempt method no longer releases a companion runtime, so its "
             f"exemption is now unchecked: {sorted(exempt - set(releasing))}"

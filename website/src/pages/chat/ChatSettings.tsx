@@ -4,8 +4,14 @@
  * pages/settings/ChatPanel.tsx and pages/settings/VoicePanel.tsx.
  */
 import { safeSetItem } from '../../utils/safeStorage'
+import { DEFAULT_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE, MIN_MESSAGE_FONT_SIZE } from './contentWidth'
 
 export type ContentWidth = 'compact' | 'comfortable' | 'full'
+
+/* The font-size bounds live in ./contentWidth (with the width scaling that
+ * needs them) and are re-exported here so importers of the config module keep
+ * one source for everything chat-config shaped. */
+export { DEFAULT_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE, MIN_MESSAGE_FONT_SIZE }
 
 /** Send-key mode: enter (Enter sends), ctrl-enter (Ctrl+Enter sends), enter-ctrl-newline (Enter sends, Ctrl+Enter = newline) */
 export type SendMode = 'enter' | 'ctrl-enter' | 'enter-ctrl-newline'
@@ -62,6 +68,20 @@ export interface ChatConfig {
    *  the user's call rather than something a client with no stored config
    *  inherits. Cmd/Ctrl+Shift+V remains the per-paste escape hatch either way. */
   showFullPastes: boolean
+  /** Opt in to a double-click on one of your own messages opening the editor
+   *  (#7911). Default false: the gesture takes the double-click that would
+   *  otherwise select a word in the bubble, so it is the user's call rather
+   *  than something a client with no stored config inherits. The pencil button
+   *  is the edit path either way. */
+  doubleClickToEdit: boolean
+  /** Font size in px for the conversation surface — what the user reads and
+   *  writes: message text, inline and block code, tables, follow-up chips and
+   *  the composer — clamped to [MIN_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE].
+   *  Each element keeps the ratio to body text it has at the default, and the
+   *  Compact content width scales with it (see `scaleContentWidth` in ./contentWidth). Chrome —
+   *  sidebar, session list, status lines, toolbars — is unaffected, same as
+   *  `contentWidth`. */
+  messageFontSize: number
 }
 
 export type FileChipStyle = 'expanded' | 'minimal'
@@ -81,7 +101,10 @@ const LS_KEY = 'mc-chat-config'
  *  it. The sidebar's view toggle persists this flag BEFORE creating its first
  *  column, so a deliberate board user always has an explicit `true` stored and
  *  is unaffected by the default. */
-const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, defaultAutopilot: false, pinLastPrompt: true, hideEmptyFolderBody: false, spellcheck: true, showFullPastes: false, minimapSide: 'left' }
+const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, defaultAutopilot: false, pinLastPrompt: true, hideEmptyFolderBody: false, spellcheck: true, showFullPastes: false, doubleClickToEdit: false, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE }
+
+const clampMessageFontSize = (n: number): number =>
+  Math.max(MIN_MESSAGE_FONT_SIZE, Math.min(MAX_MESSAGE_FONT_SIZE, Math.round(n)))
 
 const VALID_FILE_CHIP_STYLES: ReadonlySet<FileChipStyle> = new Set(['expanded', 'minimal'])
 const VALID_FOLLOW_UP_LAYOUTS: ReadonlySet<FollowUpLayout> = new Set(['multiline', 'scroll'])
@@ -125,7 +148,11 @@ export function loadChatConfig(): ChatConfig {
     // string turn off paste collapsing, which is the main-thread guard for a
     // very large paste.
     if (typeof cfg.showFullPastes !== 'boolean') cfg.showFullPastes = false
+    // Coerced, not trusted: a stored non-boolean must not attach the
+    // double-click gesture that replaces word selection on the bubble.
+    if (typeof cfg.doubleClickToEdit !== 'boolean') cfg.doubleClickToEdit = false
     if (cfg.minimapSide !== 'left' && cfg.minimapSide !== 'right') cfg.minimapSide = 'left'
+    cfg.messageFontSize = typeof cfg.messageFontSize === 'number' ? clampMessageFontSize(cfg.messageFontSize) : DEFAULT_MESSAGE_FONT_SIZE
     return cfg
   }
   catch { return { ...DEFAULTS } }

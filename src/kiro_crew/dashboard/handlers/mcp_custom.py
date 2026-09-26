@@ -31,6 +31,7 @@ from kiro_crew.dashboard.handlers.mcp import (
     _is_valid_mcp_name,
     _replace_kirocrew_spec,
 )
+from kiro_crew.mcp_cleanup import mcp_entry_is_muted
 from kiro_crew.mcp_discovery import MCP_REDACTED_HEADER_VALUE, redact_mcp_headers
 from kiro_crew.mcp_provenance import MARKER_KEY
 from kiro_crew.mcp_utils import (
@@ -319,6 +320,15 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
     Validates EVERY entry before writing ANY (no partial adds), and
     refuses to clobber existing servers (409 listing the conflicts).
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_custom_add")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -422,7 +432,9 @@ async def api_mcp_custom_get(request: web.Request) -> web.Response:
     if entry is None:
         return web.json_response({"error": f"server '{name}' not found"}, status=404)
 
-    enabled = not entry.get("disabled", False)
+    # The launch predicate (fail-closed), so the editor's chip and the table's
+    # Disabled row agree on a non-boolean ``disabled``.
+    enabled = not mcp_entry_is_muted(entry)
     spec = {k: v for k, v in entry.items() if k != "disabled"}
     if "headers" in spec:
         spec["headers"] = redact_mcp_headers(spec["headers"])
@@ -457,6 +469,15 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
     for management on a shared surface.  A FRESH add carries no tolerated
     keys, so a pasted block naming it is still rejected outright.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "mcp_custom_update")
+    if denied is not None:
+        return denied
     name = request.match_info.get("name", "")
     if not _is_valid_mcp_name(name):
         return web.json_response({"error": f"invalid server name '{name[:64]}'"}, status=400)

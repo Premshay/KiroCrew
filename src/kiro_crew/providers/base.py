@@ -35,6 +35,8 @@ from kiro_crew.essential_delivery import EssentialDelivery
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Type-only: this module's runtime imports are deliberately just acp.types
     # and constants, and recovery.ladder pulls in mcp_gateway + metrics.
+    from pathlib import Path
+
     from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
     from kiro_crew.recovery.ladder import InfraError
 
@@ -173,6 +175,15 @@ class LLMProvider(ABC):
 
         The safe default is False: adapters added later publish their own session
         identity normally unless they explicitly adopt the deferred-SID contract.
+        """
+        return False
+
+    @property
+    def is_kiro_backend(self) -> bool:
+        """True only when the provider positively identifies as kiro-cli.
+
+        The safe default is False: adapters added later cannot accidentally earn
+        Kiro-only behavior merely by omitting this capability.
         """
         return False
 
@@ -494,6 +505,22 @@ class LLMProvider(ABC):
         return None
 
     @property
+    def work_scratch_dir(self) -> "Path | None":
+        """The ``$KIROCREW_SCRATCH`` directory the process serving this session
+        exposes, or ``None`` when it has none.
+
+        Read by whoever spawns a process on this session's behalf (a companion
+        runtime, a dedicated sub-agent process) so that process mounts the SAME
+        directory and the session tree keeps one work directory
+        (``agent_scratch``). Declared here with a safe default rather than probed
+        off the instance (harness-parity H14): a provider that never allocated
+        scratch answers ``None`` and the child starts its own directory, exactly
+        as before the capability existed. The ACP providers answer the directory
+        their live process was spawned with.
+        """
+        return None
+
+    @property
     def manual_compact_unsupported_backend(self) -> str | None:
         """Backend id when this provider cannot serve a manual ``/compact``,
         ``None`` when the command is fine to dispatch.
@@ -585,6 +612,25 @@ class LLMProvider(ABC):
         """Backend-advertised models (``[{modelId, name, ...}]``) for the model
         picker. Default empty for a provider that advertises none."""
         return []
+
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the advertised-model snapshot before the picker narrows with it.
+
+        The model list (`/api/models`) narrows the catalog through the newest live
+        session's snapshot. When that snapshot is a startup-race default it hides
+        models the account actually has, and no explicit pick is refused to
+        trigger the refusal-path heal, so the read path must ask to revalidate.
+
+        Declared HERE rather than probed with ``getattr`` at the consumer: a probe
+        answers "cannot revalidate" for a provider that simply spells the accessor
+        differently, which is indistinguishable from a provider that genuinely has
+        no probe — and the consumer would then silently narrow on a stale snapshot,
+        the exact failure this revalidation exists to remove. A provider with no
+        way to revalidate returns its current snapshot unchanged (fail open), which
+        this default does; ``catalog_ids`` is the unfiltered catalog the picker
+        would otherwise offer, and the keep/drop verdict stays with the caller.
+        """
+        return self.available_models()
 
     def mcp_session_report(self) -> SessionMcpReport | None:
         """This session's own MCP registration report, or None if it keeps none.

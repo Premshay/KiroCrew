@@ -71,28 +71,6 @@ describe('source read retry policy', () => {
   })
 })
 
-describe('owner-not-configured mutation refusal', () => {
-  it('recognizes the code and swaps in the localized guidance', () => {
-    const denied = apiError({
-      error: 'this action needs a configured owner; set the Owner ID in Settings → Messaging Channels → Slack, then sign in again',
-      code: 'owner_not_configured',
-    })
-    const details = pullRequestErrorDetails(denied)
-    expect(details.ownerNotConfigured).toBe(true)
-    // The localized guidance replaces the server's English prose: the code,
-    // not the prose, is the contract.
-    expect(details.message).toContain('Owner Slack member ID')
-    expect(details.message).toContain('Slack')
-  })
-
-  it('leaves a generic forbidden untouched', () => {
-    const generic = apiError({ error: 'forbidden' })
-    const details = pullRequestErrorDetails(generic)
-    expect(details.ownerNotConfigured).toBe(false)
-    expect(details.message).toBe('forbidden')
-  })
-})
-
 const github: PullRequestSource = {
   provider: 'github',
   url: 'https://github.com/acme/widgets/pull/12',
@@ -172,6 +150,10 @@ describe('PullRequestPanel', () => {
     expect(await screen.findByText('Add source tabs')).toBeInTheDocument()
     expect(screen.getByText('Github', { exact: false })).toBeInTheDocument()
     expect(screen.getByText('src/panel.tsx')).toBeInTheDocument()
+    // #8487: the per-file status renders through the catalog ("Modified"), not
+    // the raw wire value ("modified") CSS-capitalized.
+    expect(screen.getByText('Modified')).toBeInTheDocument()
+    expect(screen.queryByText('modified')).toBeNull()
     expect(screen.getByText('1 File Changed')).toBeInTheDocument()
     // Diffs stay unmounted until explicitly expanded, then mount after the
     // drawer animation deferral. Row CONTENT is not asserted here: Pierre

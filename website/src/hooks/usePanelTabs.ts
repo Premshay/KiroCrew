@@ -452,6 +452,88 @@ export function openPanelView(slotKey: string | null, kind: ViewKind): void {
   mutateSlot(bucketKey(slotKey), b => upsertInBucket(b, { id: kind, kind, title: viewTitle(kind) }))
 }
 
+/** Drop every document body the panel holds in memory, in EVERY slot, so the
+ *  next look at a tab re-reads the file through `/api/file-read` under whatever
+ *  redaction pass is in force NOW. The owner's credential-redaction switch calls
+ *  this when it changes: a file opened while the switch was off holds raw
+ *  credentials in its tab body, and a react-query purge alone leaves that copy on
+ *  screen after redaction is back on.
+ *
+ *  A CLEAN file tab loses only `content`/`savedContent` and becomes the same
+ *  self-hydrating reference a reload restores (`HydratingFileTab`). A DIRTY tab
+ *  (edits the owner has not saved) is kept whole: discarding it would destroy
+ *  work silently, and its buffer is the owner's own typing, not a fresh read.
+ *  Diff tabs are closed: their bodies are not re-fetchable by shape (the persist
+ *  path drops them for the same reason). Returns how many tabs were touched. */
+/** Bumped by every `evictDocumentBodies`. A DIRECT file read -- `MarkdownPanel`'s
+ *  refresh / watch re-read, which bypasses react-query -- captures it before the
+ *  fetch and discards its result if it moved: a read that STARTED while the
+ *  owner's redaction switch was off can otherwise complete after the switch is
+ *  back on and write raw credentials into a tab the purge had just emptied. The
+ *  react-query reads (a chip click's `fetchQuery`, a hydrating tab, the cold-tab
+ *  queries) need no epoch: `purgeDocumentBodiesForRedactionChange` resets their
+ *  queries, which CANCELS an in-flight fetch, so a straddling read rejects and
+ *  never becomes a body (covered by usePanelDocumentActions.redactionEpoch.test). */
+let documentBodyEpoch = 0
+export function documentBodyEpochNow(): number { return documentBodyEpoch }
+
+export function evictDocumentBodies(): number {
+  documentBodyEpoch++
+  let touched = 0
+  for (const key of Object.keys(store)) {
+    mutateSlot(key, b => {
+      let changed = false
+      const tabs: PanelTab[] = []
+      for (const t of b.tabs) {
+        if (t.kind === 'diff') { changed = true; touched++; continue }
+        const dirty = t.kind === 'file' && t.content !== undefined && t.savedContent !== undefined && t.content !== t.savedContent
+        if (t.kind === 'file' && t.content !== undefined && !dirty) {
+          const copy = { ...t }; delete copy.content; delete copy.savedContent
+          tabs.push(copy); changed = true; touched++
+          continue
+        }
+        tabs.push(t)
+      }
+      if (!changed) return b
+      // Refocus ONLY when the focused tab was one of the dropped diff tabs. A
+      // focus that names no bucket tab at all is one of the host's leading tabs
+      // (`usePanelTabs(…, { leadingIds })` -- the Crewmates page's Notes / Work
+      // log / Dashboard), which live outside the bucket by design and must keep
+      // the focus -- the same `droppedFocus` rule `serializeBucket` applies.
+      const droppedFocus = b.activeId !== null
+        && b.tabs.some(t => t.id === b.activeId)
+        && !tabs.some(t => t.id === b.activeId)
+      const activeId = droppedFocus
+        ? (tabs.length ? tabs[tabs.length - 1].id : null)
+        : b.activeId
+      return { tabs, activeId }
+    })
+  }
+  return touched
+}
+
+/** Everything a change of the owner's credential-redaction switch must drop in
+ *  THIS document: the react-query file bodies (`['file-read', path]` and the
+ *  `['file-diff', path]` the panel compares them against) and the open tab
+ *  bodies (`evictDocumentBodies`). The queries are RESET, not removed and not
+ *  invalidated: an invalidate keeps the raw body on screen while revalidating,
+ *  and a remove drops the cache entry but leaves a MOUNTED observer (the
+ *  Library's `SessionDocPreview`, a `useQuery` on the same key) holding its
+ *  last result with nothing to re-render it, so the plaintext stays rendered
+ *  until an unrelated re-render happens to rebuild the query. A reset puts every
+ *  matching query back to its initial state -- observers see `data: undefined`
+ *  at once and re-render -- cancels an in-flight fetch exactly as a remove did,
+ *  and refetches the ACTIVE ones, so a mounted preview re-reads under the pass
+ *  now in force while an inactive entry is simply emptied. Called by the
+ *  Settings card that made the change AND by the WebSocket handler for
+ *  `credential_redaction_changed`, so a second browser tab purges too -- the
+ *  two callers share one list on purpose. */
+export function purgeDocumentBodiesForRedactionChange(qc: { resetQueries: (f: { queryKey: unknown[] }) => unknown }): void {
+  void qc.resetQueries({ queryKey: ['file-read'] })
+  void qc.resetQueries({ queryKey: ['file-diff'] })
+  evictDocumentBodies()
+}
+
 /** Strip heavy bodies (file/diff/artifact content) before persisting — those
  *  can be MBs and blow the localStorage quota. Terminal + view tabs and all
  *  tab METADATA (path / slug / sessionId / cwd / order / focus) are kept, so
@@ -473,10 +555,11 @@ function serializeBucket(b: Bucket): string {
     .filter(t => t.kind !== 'diff' && t.kind !== 'app')
     .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.binary; delete copy.revealLine; return copy })
   // If the focused tab was a DROPPED diff/app tab, refocus a surviving tab.
-  // Only then: a focus that names no stored tab at all is a host's leading tab
-  // (`usePanelTabs(…, { leadingId })` — the Members page's Crew summary), which
-  // lives outside the bucket by design and must come back as the focus on
-  // reload rather than be replaced by whatever tab happens to be last.
+  // Only then: a focus that names no stored tab at all is one of the host's
+  // leading tabs (`usePanelTabs(…, { leadingIds })` — the Crewmates page's Notes /
+  // Work log / Dashboard), which live outside the bucket by design and must come
+  // back as the focus on reload rather than be replaced by whatever tab happens
+  // to be last.
   const droppedFocus = b.activeId !== null
     && b.tabs.some(t => t.id === b.activeId)
     && !tabs.some(t => t.id === b.activeId)
@@ -588,17 +671,20 @@ export function usePanelTabs(
    *  persisted tab disappears. `[]` is a known-empty set and does hide app tabs. */
   panelTabDescriptors?: PanelTabDescriptor[],
   opts?: {
-    /** Id of a HOST-OWNED leading tab (SidePanel's `leadingTab`): a tab that
-     *  sits ahead of the pinned block, is never in the bucket, and whose body the
-     *  host renders. The bucket only ever holds it as `activeId`. Naming it here
-     *  is what lets focus fall back to it — a fresh strip opens on it rather than
-     *  on the first pinned view, and it is never "repaired" away by `syncPinned`
-     *  for not being a stored tab. */
-    leadingId?: string
+    /** Ids of the HOST-OWNED leading tabs (SidePanel's `leadingTabs`), in strip
+     *  order: tabs that sit ahead of the pinned block, are never in the bucket,
+     *  and whose bodies the host renders. The bucket only ever holds one of them
+     *  as `activeId`. Naming them here is what lets focus fall back to them — a
+     *  fresh strip opens on `leadingIds[0]` rather than on the first pinned view,
+     *  and a stored focus on any of them is never "repaired" away by `syncPinned`
+     *  for not being a stored tab. Pass a module constant: the array is a
+     *  dependency of the strip callbacks. */
+    leadingIds?: readonly string[]
   },
 ) {
   const key = bucketKey(slotKey)
-  const leadingId = opts?.leadingId
+  const leadingIds = opts?.leadingIds
+  const defaultLeadingId = leadingIds?.[0] ?? null
   const bySlot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
   const { tabs: storedTabs, activeId } = bySlot[key] ?? EMPTY_BUCKET
   // View-tab labels are re-resolved from `kind` on every read so the strip is in
@@ -640,12 +726,12 @@ export function usePanelTabs(
     () => (
       activeId !== null && prunedIds.has(activeId)
         ? (tabs.length ? tabs[tabs.length - 1].id : null)
-        // A strip with no stored focus opens on the host's leading tab (a fresh
-        // member bucket, before `syncPinned` has written one). Without a leading
-        // tab this stays the stored `null`.
-        : (activeId ?? leadingId ?? null)
+        // A strip with no stored focus opens on the host's first leading tab (a
+        // fresh crewmate bucket, before `syncPinned` has written one). Without
+        // leading tabs this stays the stored `null`.
+        : (activeId ?? defaultLeadingId)
     ),
-    [tabs, activeId, prunedIds, leadingId],
+    [tabs, activeId, prunedIds, defaultLeadingId],
   )
 
   /** Apply a bucket transform to the CURRENT slot's strip. */
@@ -697,19 +783,20 @@ export function usePanelTabs(
         k => b.tabs.find(t => t.id === k) ?? { id: k, kind: k, title: viewTitle(k) },
       )
       const nextTabs = [...pinned, ...dynamic]
-      // Refocus if the active tab was a pinned view that just went away. The
-      // host's leading tab is a valid focus even though it is never a stored
-      // tab; a strip with no usable focus lands on it (else the first pinned).
-      const activeId = b.activeId && (b.activeId === leadingId || nextTabs.some(t => t.id === b.activeId))
+      // Refocus if the active tab was a pinned view that just went away. Any of
+      // the host's leading tabs is a valid focus even though none is a stored
+      // tab; a strip with no usable focus lands on the first leading tab (else
+      // the first pinned).
+      const activeId = b.activeId && (leadingIds?.includes(b.activeId) || nextTabs.some(t => t.id === b.activeId))
         ? b.activeId
-        : (leadingId ?? (nextTabs.length ? nextTabs[0].id : null))
+        : (defaultLeadingId ?? (nextTabs.length ? nextTabs[0].id : null))
       // Bail if nothing actually changed (id sequence + focus) — avoids churn.
       const sameOrder = nextTabs.length === b.tabs.length
         && nextTabs.every((t, i) => t.id === b.tabs[i].id)
       if (sameOrder && activeId === b.activeId) return b
       return { tabs: nextTabs, activeId }
     })
-  }, [update, leadingId])
+  }, [update, leadingIds, defaultLeadingId])
 
   const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; binary?: boolean }) => {
     // `revealLine` is always present in the object, `undefined` when absent:
@@ -841,13 +928,14 @@ export function usePanelTabs(
       if (i === -1) return b
       const next = b.tabs.filter(t => t.id !== id)
       // Refocus a neighbor when closing the active tab (prefer the left one);
-      // an emptied strip falls back to the host's leading tab when there is one.
+      // an emptied strip falls back to the host's first leading tab when there
+      // is one.
       const activeId = b.activeId !== id
         ? b.activeId
-        : next.length === 0 ? (leadingId ?? null) : (next[i - 1] ?? next[i] ?? next[next.length - 1]).id
+        : next.length === 0 ? defaultLeadingId : (next[i - 1] ?? next[i] ?? next[next.length - 1]).id
       return { tabs: next, activeId }
     })
-  }, [update, leadingId])
+  }, [update, defaultLeadingId])
 
   const closeAll = useCallback(() => { update(() => ({ tabs: [], activeId: null })) }, [update])
 

@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import platform as _platform
+import posixpath
 import re
 import shutil
 import sys
@@ -59,6 +60,7 @@ from kiro_crew.apps.manager import list_apps as list_installed_apps
 from kiro_crew.apps.manager import (
     registry_source_repository,
     set_app_provenance,
+    shipped_builtin_names,
     update_app,
 )
 from kiro_crew.apps.manifest import (
@@ -70,6 +72,9 @@ from kiro_crew.apps.manifest import (
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
+    sandboxed_spawn_argv,
+    sandboxed_spawn_argv_async,
+    scrub_env,
     wrap_argv,
     wrap_argv_async,
 )
@@ -326,6 +331,92 @@ def anonymous_git_env(**extra: str) -> dict[str, str]:
     env["LC_ALL"] = _GIT_CLONE_LOCALE
     env.update(extra)
     return env
+
+
+#: Env names a ``detectInstalled`` probe may receive. Deliberately an explicit
+# KEEP set rather than ``_SAFE_ENV_KEYS`` minus a few names: that allowlist serves
+# operator-initiated spawns -- installs, app backends, lifecycle scripts -- so it
+# carries toolchain configuration an operator may legitimately have loaded with a
+# secret (``MAVEN_OPTS`` with a ``-D`` password, ``GRADLE_USER_HOME`` pointing at a
+# credential store, a ``PYTHONPATH``/``NODE_PATH`` tree that lets a probe import
+# code). Subtracting each such name as it is noticed leaves the next one in, and a
+# probe is the one spawn here whose command text is untrusted, so the axis is
+# closed instead: only location hints a ``command -v`` / ``test -x`` style check
+# needs to run, plus the Windows names a process needs to start at all (a child
+# without ``SystemRoot`` dies before ``main()``). A probe that genuinely needs a
+# toolchain variable reads it from the app's own config, not from the operator's
+# shell.
+_DETECT_PROBE_ENV_KEYS = frozenset(
+    {
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        # Windows equivalents, spelled as in `_SAFE_ENV_KEYS`.
+        "COMSPEC",
+        "PATHEXT",
+        "ProgramFiles",
+        "PROGRAMFILES",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "WINDIR",
+        # Set BY `anonymous_git_env`, not copied from the operator: the git
+        # suppression that keeps a credential helper from firing must survive the
+        # filter below, or dropping it would undo that suppression.
+        "GIT_TERMINAL_PROMPT",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_SSH_COMMAND",
+    }
+)
+
+
+def _detect_probe_env() -> dict[str, str]:
+    """Environment for a ``/bin/sh -c <detectInstalled>`` probe.
+
+    A probe's command string is NOT operator-authored: it comes from an
+    app-registry manifest, which is untrusted content, and the listing path runs it
+    automatically at browse time. So a probe gets the credential-free treatment an
+    index-originated clone gets (:func:`anonymous_git_env`), narrowed further to
+    :data:`_DETECT_PROBE_ENV_KEYS`.
+
+    What that closes, in the order the layers apply: :func:`anonymous_git_env`
+    drops the agent socket and any ``GIT_SSH``/``GIT_SSH_COMMAND`` override, so
+    manifest code cannot authenticate through the operator's keys; it disables
+    system and global git config, so a configured credential helper -- macOS ships
+    ``osxkeychain`` in its system config, and the ``cache`` helper's socket is
+    reachable through an allowlisted ``XDG_CACHE_HOME`` -- never fires for a
+    manifest-chosen remote; and it turns prompting off, so a probe fails rather
+    than asking the operator for a password. :func:`scrub_env` removes the
+    credential-bearing prefixes. The keep set then leaves only location hints, so a
+    toolchain variable carrying a secret has no route in.
+
+    All of this matters on one host shape: the sandbox launcher strips the socket
+    in every mode, so these names only ever survive where no launcher runs --
+    Windows, and a POSIX host with no sandbox backend plus
+    ``agent.sandbox_allow_unsandboxed_exec``. ``PATH`` and ``HOME`` are kept, so a
+    detect command still resolves programs and still reads its own per-user config.
+    """
+    scrubbed = scrub_env(anonymous_git_env())
+    return {k: v for k, v in scrubbed.items() if _is_probe_env_key(k)}
+
+
+def _is_probe_env_key(key: str) -> bool:
+    """Whether *key* may reach a probe, honoring Windows' case-insensitive env.
+
+    Same matching convention as :func:`_is_safe_env_key` -- exact on POSIX,
+    case-folded on Windows -- so a literal membership test cannot silently drop
+    ``SystemRoot`` there.
+    """
+    return platform_compat.env_key_allowed(key, _DETECT_PROBE_ENV_KEYS)
 
 
 # Manifest cache: fetched app.json files from repos
@@ -2421,18 +2512,55 @@ _REGISTRY_ROW_KEYS: frozenset[str] = frozenset(
 )
 
 
+def _store_asset_path(subdirectory: Any, asset_path: Any) -> Any:
+    """Repo-root-relative path of a store-card asset declared in ``app.json``.
+
+    The manifest is read from ``_contained_join(clone_dir, subdirectory)``, so
+    every art path it declares (``iconPath``, ``heroImage*``, ``screenshots*``)
+    is relative to that directory -- while ``/api/apps/blob`` resolves ``path``
+    against the repo root. This is the store-card reader's join; the field
+    itself keeps its meaning, because the installed-app reader
+    (``handle_app_art_file``) resolves the same value against the install
+    directory, where the subdirectory has already been stripped by the install.
+
+    Containment is preserved rather than re-derived: a ``subdirectory`` the
+    lexical gate :func:`_is_safe_registry_subdir` rejects (absolute, ``..``,
+    backslash) is NOT joined, so the join never manufactures a traversing path
+    -- such entries are dropped before listing anyway, and the bare path here
+    is exactly what the store built before. Empty or ``.`` means the repo root
+    (unchanged), an absolute path or URL is left untouched, and the join is a
+    plain posix join with no normalisation, so a ``..`` inside the asset path
+    still reaches the blob route's own rejection unchanged.
+    """
+    if not asset_path or not isinstance(asset_path, str) or not isinstance(subdirectory, str):
+        return asset_path
+    subdir = subdirectory.rstrip("/")
+    if subdir in ("", "."):
+        return asset_path
+    if not _is_safe_registry_subdir(subdir):
+        return asset_path
+    if asset_path.startswith("/") or "://" in asset_path:
+        return asset_path
+    return posixpath.join(subdir, asset_path)
+
+
 def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
     """Merge app.json fields into a registry entry.
 
     Registry-only fields (``_REGISTRY_ROW_KEYS``) are preserved from the entry.
     Everything else comes from app.json, with the blob proxy URL pattern
-    applied to image paths.
+    applied to image paths -- each joined under the entry's ``subdirectory``
+    first (:func:`_store_asset_path`), the directory the manifest was read from.
     """
     raw_repo = entry.get("repo", "")
     repo = _strip_git_target_userinfo(raw_repo) if isinstance(raw_repo, str) else ""
     result = {k: v for k, v in entry.items() if k in _REGISTRY_ROW_KEYS}
     if isinstance(result.get("repo"), str):
         result["repo"] = _strip_git_target_userinfo(result["repo"])
+    subdirectory = entry.get("subdirectory", "")
+
+    def _blob_url(asset_path: str) -> str:
+        return f"/api/apps/blob?repo={repo}&path={_store_asset_path(subdirectory, asset_path)}"
 
     # Top-level display fields from app.json
     for key in (
@@ -2472,7 +2600,9 @@ def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str
     if "platform" in manifest:
         result["platform"] = manifest["platform"]
 
-    # Icon — convert repo-relative path to blob proxy URL.
+    # Icon — convert a manifest-relative path to a blob proxy URL, joined under
+    # the entry's ``subdirectory`` (the directory app.json was read from) so the
+    # blob path names the file where it actually lives in the repo.
     #
     # Only ``iconPath`` (repo-relative) is honoured, never a manifest-declared
     # ``iconUrl``: an index-fetched manifest is untrusted content, and copying an
@@ -2482,13 +2612,13 @@ def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str
     # trusted-host gate.
     icon_path = manifest.get("iconPath", "")
     if icon_path and repo:
-        result["iconUrl"] = f"/api/apps/blob?repo={repo}&path={icon_path}"
+        result["iconUrl"] = _blob_url(icon_path)
     # Dark-appearance variant. Raster icons have fixed bytes, so an app that
     # must read well on both backgrounds ships two files; first-party
     # ``/app-assets/`` SVGs are inlined and repaint from theme tokens instead.
     icon_path_dark = manifest.get("iconPathDark", "")
     if icon_path_dark and repo:
-        result["iconUrlDark"] = f"/api/apps/blob?repo={repo}&path={icon_path_dark}"
+        result["iconUrlDark"] = _blob_url(icon_path_dark)
     # Lucide fallback icon from manifest extra fields
     if manifest.get("icon"):
         result["icon"] = manifest["icon"]
@@ -2496,31 +2626,29 @@ def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str
     # Screenshots — convert repo-relative paths to blob proxy URLs
     screenshots = manifest.get("screenshots", [])
     if screenshots and repo:
-        result["screenshots"] = [f"/api/apps/blob?repo={repo}&path={p}" for p in screenshots]
+        result["screenshots"] = [_blob_url(p) for p in screenshots]
 
     # Screenshots dark — convert repo-relative paths to blob proxy URLs
     screenshots_dark = manifest.get("screenshotsDark", [])
     if screenshots_dark and repo:
-        result["screenshotsDark"] = [
-            f"/api/apps/blob?repo={repo}&path={p}" for p in screenshots_dark
-        ]
+        result["screenshotsDark"] = [_blob_url(p) for p in screenshots_dark]
 
     # Hero images — convert repo-relative paths to blob proxy URLs
     hero = manifest.get("heroImage", "")
     if hero and repo:
-        result["heroImage"] = f"/api/apps/blob?repo={repo}&path={hero}"
+        result["heroImage"] = _blob_url(hero)
     hero_dark = manifest.get("heroImageDark", "")
     if hero_dark and repo:
-        result["heroImageDark"] = f"/api/apps/blob?repo={repo}&path={hero_dark}"
+        result["heroImageDark"] = _blob_url(hero_dark)
     # Detail-page hero images (wide banner ratio) — convert repo-relative paths
     # to blob proxy URLs. The detail page prefers these over the (near-square)
     # Browse-card hero so the wide banner isn't cropped.
     hero_detail = manifest.get("heroImageDetail", "")
     if hero_detail and repo:
-        result["heroImageDetail"] = f"/api/apps/blob?repo={repo}&path={hero_detail}"
+        result["heroImageDetail"] = _blob_url(hero_detail)
     hero_detail_dark = manifest.get("heroImageDetailDark", "")
     if hero_detail_dark and repo:
-        result["heroImageDetailDark"] = f"/api/apps/blob?repo={repo}&path={hero_detail_dark}"
+        result["heroImageDetailDark"] = _blob_url(hero_detail_dark)
 
     return result
 
@@ -3599,14 +3727,34 @@ async def _detect_installed_probe(
         try:
 
             base_cmd = ["/bin/sh", "-c", detect_cmd]
-            sandboxed_cmd, _cleanup = await wrap_argv_async(
-                base_cmd, mode="strict", _prepare=wrap_argv
+            # Through the single sandboxed-spawn chokepoint, not a hand-rolled
+            # wrap + cgroup pair: it applies the strict launcher, the credential
+            # scrub and the cgroup DoS ceiling, AND it forwards the systemd bus
+            # locators that the ceiling's own `systemd-run --user` wrapper needs
+            # to reach the user bus, dropping them again with an `env -u` shim
+            # inside the scope so the probe itself never sees a live bus address.
+            # A caller-built env that omits those locators makes `systemd-run`
+            # exit 1 before the command runs, which with DEVNULL stderr reads as
+            # "not installed" for every app on a cgroup-delegated host.
+            #
+            # `_detect_probe_env` is the credential-free base it scrubs on top of:
+            # no agent socket, no git credential helper, no prompt, no toolchain
+            # variable. The command string comes from a registry manifest, which
+            # is untrusted content, and `strict` mode's own scrub only runs when
+            # the launcher does -- not on Windows, and not on a host with no
+            # sandbox backend plus agent.sandbox_allow_unsandboxed_exec -- so the
+            # env handed over here is the only control left on those hosts.
+            sandboxed_cmd, probe_env, _cleanup = await sandboxed_spawn_argv_async(
+                base_cmd,
+                mode="strict",
+                env=_detect_probe_env(),
+                _prepare=sandboxed_spawn_argv,
             )
-            sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             proc = await create_subprocess_limited(
                 *sandboxed_cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                env=probe_env,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
@@ -3880,6 +4028,8 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
     snapshotted before the ``git``-installability filter below drops a
     not-yet-installable ``git`` row, so an external row can never shadow a name
     install resolves by (which would point install-by-name at the wrong repo).
+    A ``builtin`` row naming a builtin this build cannot register is dropped the
+    same way, and keeps its reservation the same way.
     """
     # Off the event loop: the first call after a cache expiry does network I/O.
     rows = await asyncio.to_thread(official_catalog.list_catalog_rows)
@@ -3919,6 +4069,15 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
         for row in rows
         if row.get("source", {}).get("type") != "git" or row.get("name") in installable_names
     ]
+    # A `builtin` row is only installable when this build ships that builtin, so a
+    # catalog ahead of this gateway would otherwise render an Install that cannot work.
+    if any(row.get("source", {}).get("type") == "builtin" for row in rows):
+        shipped = await asyncio.to_thread(shipped_builtin_names)
+        rows = [
+            row
+            for row in rows
+            if row.get("source", {}).get("type") != "builtin" or row.get("name") in shipped
+        ]
 
     # Catalog display rows intentionally carry no clone URL. Resolve the
     # consent target from the same install coordinates name-only install uses:
@@ -6897,14 +7056,34 @@ async def install_from_registry(
         try:
 
             base_cmd = ["/bin/sh", "-c", detect_cmd]
-            sandboxed_cmd, _cleanup = await wrap_argv_async(
-                base_cmd, mode="strict", _prepare=wrap_argv
+            # Through the single sandboxed-spawn chokepoint, not a hand-rolled
+            # wrap + cgroup pair: it applies the strict launcher, the credential
+            # scrub and the cgroup DoS ceiling, AND it forwards the systemd bus
+            # locators that the ceiling's own `systemd-run --user` wrapper needs
+            # to reach the user bus, dropping them again with an `env -u` shim
+            # inside the scope so the probe itself never sees a live bus address.
+            # A caller-built env that omits those locators makes `systemd-run`
+            # exit 1 before the command runs, which with DEVNULL stderr reads as
+            # "not installed" for every app on a cgroup-delegated host.
+            #
+            # `_detect_probe_env` is the credential-free base it scrubs on top of:
+            # no agent socket, no git credential helper, no prompt, no toolchain
+            # variable. The command string comes from a registry manifest, which
+            # is untrusted content, and `strict` mode's own scrub only runs when
+            # the launcher does -- not on Windows, and not on a host with no
+            # sandbox backend plus agent.sandbox_allow_unsandboxed_exec -- so the
+            # env handed over here is the only control left on those hosts.
+            sandboxed_cmd, probe_env, _cleanup = await sandboxed_spawn_argv_async(
+                base_cmd,
+                mode="strict",
+                env=_detect_probe_env(),
+                _prepare=sandboxed_spawn_argv,
             )
-            sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             proc = await create_subprocess_limited(
                 *sandboxed_cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                env=probe_env,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )

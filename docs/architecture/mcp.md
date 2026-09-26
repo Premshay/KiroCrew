@@ -24,7 +24,7 @@ own gate model is [computer-use](../system-specs/modules/computer-use.md).
 > interactive kiro-cli and Kiro IDE session the user runs outside Kiro Crew. If
 > `kirocrew-core` / `kirocrew-cron` ever appear in a provider global, that is
 > leftover state from an older install: clean it from the dashboard MCP panel,
-> or run `kirocrew cli-setup`, which calls the narrowly-scoped
+> or run `kirocrew setup`, whose setup path calls the narrowly scoped
 > `mcp_cleanup.clean_stale_managed_mcp()` helper.
 
 ## Config file hierarchy
@@ -36,8 +36,9 @@ own gate model is [computer-use](../system-specs/modules/computer-use.md).
 | `~/.kiro/crew/mcp.json` | User, via the dashboard MCP panel | specific to Kiro Crew additions and per-server tool disables | Kiro Crew gateway only |
 
 `rebuild_agent_config()` writes exactly **one** file, `~/.kiro/agents/kirocrew.json`.
-There is no second rendered agent file and no agent-file renderer for any other
-provider: Kiro Crew is KiroACP-only.
+There is no second rendered agent file: Kiro Crew's provider is ACP-only, and
+non-kiro ACP harnesses consume projected configuration rather than another Kiro
+agent file.
 
 ### Provider-global scopes come from the platform seam, not the core
 
@@ -142,13 +143,20 @@ app agent). Plain kiro-cli agents outside Kiro Crew keep kiro-cli's own default.
 
 ### Managed servers
 
-`agent._MANAGED_MCP_SERVERS` holds the three servers the gateway owns end to
-end: `kirocrew-cron`, `kirocrew-core`, `kirocrew-computer`. Each is refreshed on
-every rebuild by `_refresh_dynamic_fields()`, which rewrites `command`/`args`
-from the live `kirocrew` binary, strips stale remote-transport fields (`url`,
-`headers`) left by older builds, and re-pins `env.KIROCREW_HOME` to the home the
-gateway is actually running under while preserving the user's own env keys.
-User customizations such as `autoApprove` are preserved.
+`agent._MANAGED_MCP_SERVERS` holds the eight servers the gateway owns end to
+end: the always-on `kirocrew-cron` and `kirocrew-core`, the gated
+`kirocrew-computer`, and the opt-in `kirocrew-dashboard`, `kirocrew-work`,
+`kirocrew-crew-log`, `kirocrew-debug` and `kirocrew-panel`. Every emitted or
+explicitly granted entry is refreshed on every rebuild by
+`_refresh_dynamic_fields()`, which rewrites `command`/`args` from the live
+`kirocrew` binary, strips stale remote-transport fields (`url`, `headers`) left by
+older builds, and re-pins `env.KIROCREW_HOME` to the home the gateway is actually
+running under while preserving the user's own env keys.
+User customizations are preserved, with one exception: an `autoApprove` list no
+server spec declares is dropped, because kiro-cli approves those tools locally and
+Crew never sees a permission request for them. Set `mcp.honour_auto_approve` to
+keep a hand-added one. A verb a managed or edition spec declares is unaffected,
+and a governance ceiling strips the key whatever the setting says.
 
 For KAS native managed servers, session projection supplies the actual gateway
 listener port and the allocation-time caller session key. These values come
@@ -215,7 +223,7 @@ loops, so a keystone flip landing mid-rebuild cannot produce a spec that emits o
 server's entry under the old decision and another's under the new one.
 
 Under an enterprise MCP registry, `_refresh_dynamic_fields()` also maintains a
-`"type": "registry"` marker on these three entries — added when
+`"type": "registry"` marker on these managed entries — added when
 `agent.mcp_registry_mode` is declared, and REMOVED when it is not. The marker is
 maintained rather than preserved because it tracks the account the gateway is
 signed in to, not a user preference, and because the client's filter is
@@ -313,7 +321,8 @@ before writing is filter the whole assembled `allowedTools` list through one
 predicate: a ref the governance ceiling has an opinion about loses its blanket
 grant and its calls go through the gate, where the per-argument rule actually
 applies; a ref the ceiling is silent about is kept. `mcpServers[*].autoApprove`
-gets the same treatment on the final map. `tools` is deliberately left intact,
+gets the same treatment on the final map, plus a local floor: a verb no server spec
+declares is dropped unless `mcp.honour_auto_approve` is set. `tools` is deliberately left intact,
 because mounting a tool is not auto-approving it. Withheld grants are recorded
 in SEL as `mcp_auto_approve_withheld` so an operator can see why a template tool
 now prompts.
@@ -437,7 +446,7 @@ Probes run from `POST /api/mcp/probe`:
   stylistic: from Python 3.14 that method swallows every `OSError` and answers
   `False`, so a permission error or a stalled mount would be indistinguishable
   from "nothing was ever written". This package declares `requires-python >=
-  3.10` with no ceiling, so a build on 3.14 would silently collapse the middle
+  3.12` with no ceiling, so a build on 3.14 would silently collapse the middle
   answer and tell the owner of an authorized server to sign in again — the exact
   harm the three-valued design exists to prevent. Two spellings over the same
   artifacts is how one of them loses that answer, which is why the probe and the
@@ -502,10 +511,11 @@ Probes run from `POST /api/mcp/probe`:
   remedy paragraph warns once per server name
   (`_warn_probe_sandbox_unavailable_once`) and demotes repeats to DEBUG.
   - **A managed server FALLS BACK to its declared tool list when — and only when —
-    the sandbox refuses.** `kirocrew-core` / `-cron` / `-computer` declare their
-    tools statically in this package (`mcp_core._list_tools()` and friends, the very
-    functions the stdio shim answers `tools/list` from), so
-    `_managed_tools_in_process` can serve the listing with no subprocess at all.
+    the sandbox refuses.** Every server in
+    `mcp_discovery._MANAGED_SERVER_TOOL_MODULES` declares its tools statically in
+    this package (the same `_list_tools()` functions the stdio shims answer
+    `tools/list` from), so `_managed_tools_in_process` can serve the listing with
+    no subprocess at all.
     That is what removes the `agent.sandbox_allow_unsandboxed_exec` opt-in for a
     read-only listing on a backendless host.
     - **Fallback, never primary.** When a backend exists the real spawn still runs,
@@ -1102,15 +1112,35 @@ the caller block and the policy read sends it, so its calls do not land there. T
 for admitting a reason here is that it means ONE thing, because a refusal derived from an
 ambiguous reason is wrong for half the callers it hits.
 
-`resolution_failed` -- no usable answer, meaning nothing came back or a `5xx` said the
-gateway is broken -- passes that test and is still permissive, which is the one place
-this contract says something different from what the security argument alone would say.
-Refusing on it was implemented and measured, and the repository's real-MCP end-to-end
-lane will not run a legitimate first tool call under it: five heads with it refusing all
-fail that lane and the two with it permissive both pass. So in this deployment an
-ordinary call reaches that arm, and refusing there does not cost an attacker a tool call,
-it costs an ordinary caller every tool call. It stays permissive and audited until the
-gateway can say why a real call lands there, which is a gateway-side question.
+One missing identity reaches a reader through three refusals -- this
+`identity_unattested` text when a key is declared, the strict-identity diagnosis behind
+`memory_recall` and every other reflexive tool when none is, and the lesson writers'
+(`learn_add`, `learn_remove`) answer to the gateway's `400 missing_session_key` (mapped
+onto the same established-session refusal instead of echoing the header name). When the
+process carries neither the session token nor a launcher host pid
+(`mcp_shared.spawned_without_gateway_identity`), nothing the gateway does at spawn
+happened to it, and all three append the same `mcp_shared.external_client_identity_note`:
+a server started outside a Kiro Crew session (an editor's own MCP config) has no identity
+channel and its identity-bearing tools are not supported; `KIROCREW_SESSION_KEY` is a
+gateway-injected fallback, not a credential, and set by hand it turns the partial
+refusals into `identity_unattested` on every call; the read-only tools work without it;
+the supported editor direction is connecting into a Kiro Crew session rather than
+spawning the server, and that server's entry in `~/.kiro/settings/mcp.json` is the
+leftover state the design invariant at the top of this document names. The note
+decorates a denial and never grants: which calls are refused is unchanged, and a server
+the gateway did spawn keeps its existing wording (token present, or the quoted spawn
+denial below).
+
+`resolution_failed` -- no usable answer, meaning nothing came back, a `5xx` said the
+gateway is broken, or the resolve itself raised -- passes that test and refuses. Every
+`4xx` returns before that arm, decided by status class, so the reason means the policy
+could not be READ and never that the gateway made a decision about this caller. An
+operator exclusion may exist while the process holding it cannot answer for it, so the
+empty set that arrives with this reason is unknown rather than permissive, and serving it
+as a permission is exactly how an excluded tool runs. The refusal is bounded at both
+ends: a session that resolves its policy once is served from the per-session cache and
+never reaches a failure path again, and for one that has not, the refusal lasts at most
+the 60s negative-cache window.
 
 The other reasons stay permissive, each because no operator exclusion is known to exist
 for that caller or because refusal would be permanent rather than a window that closes. `agent_not_resolved` is the `404`, returned both for a session still
@@ -1160,6 +1190,41 @@ there is no timeout to debounce, and both negative
 clocks are process-global, so caching one session's malformed spec there would
 refuse calls for every sibling session in a pooled backend.
 
+The `409` body's `reason` names the file. Every `policy_unreadable` refusal the
+gateway writes -- the directory-wide guard (`_refuse_if_any_spec_is_unreadable`),
+the direct `<agent>.json`/`.md` read, the two shape checks on a direct read and the
+duplicate-name arm (`_ambiguous_spec_reason`, built from
+`AmbiguousAgentSpecError.paths`) -- carries the offending spec's filename (`repr`'d: it is untrusted input from a
+user-writable directory and the text reaches a terminal), the failure kind in
+words (`not valid JSON`, `not UTF-8 text`, `markdown frontmatter the spec parser
+refuses`, `an AppleDouble sidecar`, `larger than the spec size cap`, `resolves to a
+path the spec reader refuses`, `not a plain readable file` for the pinned open's
+refusal, `unreadable (...)` for any other `OSError`) and one remedy
+sentence: move, fix, remove or rename that file in the agents directory, no
+restart needed. Never `str(exc)` verbatim, and never the directory's path: the
+strict reader's own messages and the duplicate-name exception's message quote
+the full path, and this text crosses the wire into the model-visible refusal.
+Two arms have no file to name: the directory walk itself raised (class-name-only
+text, as before), and a wrong-shape `managedToolPolicy` in a spec the declared-name
+scan resolved -- the scan returns a parse, not a path, so that refusal names the
+agent (`managedToolPolicy for '<agent>' is <type>, not an object`), which identifies
+the spec since exactly one declares the name, and carries the same remedy. The SEL `denied` row carries the same `reason` (the
+duplicate-name arm's row keeps the exception's full-path message: the audit
+trail is local); the gateway log carries the FULL path at `WARNING`, once per
+`(path, mtime)` -- the client re-asks on every `tools/call`, so a line per
+refusal would repeat for as long as the file stays broken. The MCP side reads
+`reason` off the body into `ToolPolicy.detail` (text only; the decision is the
+status and `code`, unchanged); the one client-side `policy_unreadable` -- a 200 whose
+`exclude` is malformed -- fills `detail` with its own shape diagnosis. The refusal
+appends `detail` to the `policy_unreadable` refusal
+as `Gateway reason: ...` after `neutralize_markers`, `redact_via_context` and
+`redact_local_paths` (the credential redactor has no path rule, and an older
+gateway's duplicate-name `reason` quotes full paths) -- then bounds the scrubbed
+result at `_POLICY_DETAIL_MAX_CHARS`. The bound comes AFTER the scrubbers: a cut
+made first can land inside a token, and the fragment left behind fails the
+length-floored credential patterns and would be echoed. With no `reason` in the
+body -- an older gateway -- the refusal is byte-identical to what it was.
+
 ## The MCP-first rule
 
 **A new LLM-facing capability MUST ship as an MCP tool, not only as a CLI
@@ -1177,13 +1242,24 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 
 | Server | Process | Tools |
 |--------|---------|-------|
-| `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger` |
+| `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger`, `cron_secret_request` |
 | `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
-| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `session_create`, `session_send`, `session_read_message`, `session_stop`, `session_close` |
+| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `session_create`, `session_fork`, `session_send`, `session_read_message`, `session_stop`, `session_close` |
 | `kirocrew-work` | `kirocrew mcp-work` (`mcp_work.py`) | `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_record` |
 | `kirocrew-crew-log` | `kirocrew mcp-crew-log` (`mcp_crew_log.py`) | `crew_log_list`, `crew_log_read`, `crew_log_projection` |
+| `kirocrew-debug` | `kirocrew mcp-debug` (`mcp_debug.py`) | `debug_gateway`, `debug_refusals`, `debug_threads`, `debug_processes`, `debug_snapshots` |
 | `kirocrew-panel` | `kirocrew mcp-panel` (`mcp_panel.py`) | `panel_publish`, `panel_templates` |
+
+`kirocrew-panel` is opt-in and reaches a crew member's DM session the way
+`kirocrew-dashboard` does: as a session-level `mcpServers` entry carrying that
+session's identity (`members.member_panel_session_server`), plus
+`@kirocrew-panel` in `tools` and `_MEMBER_PANEL_GRANTS` in `allowedTools` on the
+KAS projection. Neither the Capabilities editor nor any emitted spec can grant
+it -- that list is built from configured connections, and an opt-in managed
+server is not one -- so this mount is the only path to it. The operator ceiling
+is `agent.crew_panel`; see the session-control module spec for the grant
+reasoning and the fail-closed behaviour.
 
 `kirocrew-dashboard` is one transport carrying **two** authorization models, which is
 what makes its assignment decision larger than its name suggests. The
@@ -1196,7 +1272,7 @@ is their spec and carries that reasoning.
 The consequence to know before granting: an agent handed the whole server for folder
 organization has the session verbs too. Whether they prompt depends on how the grant
 is spelled — `_mcp_pattern` maps a bare `@kirocrew-dashboard` entry to a one-level
-glob, so it auto-approves all ten, while naming tools individually leaves the rest
+glob, so it auto-approves all fifteen, while naming tools individually leaves the rest
 to `hooks.on_tool_call`. `_CONDUCTOR_DASHBOARD_GRANTS` and
 `_MEMBER_DASHBOARD_GRANTS` (`agent.py`) are the shipped examples of the individual
 form, and they differ from each other on exactly this axis: the member's list
@@ -1300,7 +1376,8 @@ answers `tools/list` from):
 - **Monitor read:** `monitor_inspect` (strict authenticated session
   identity only; no ancestor fallback; reports a structured monitor or a legacy
   timer loop's presence reading, whichever the session holds)
-- **Crew routing:** `select_crew`
+- **Crew routing:** `route_crew`, `select_crew`
+- **Session work ledger:** `session_ledger_read`, `session_ledger_record`
 - **Sessions and history:** `list_sessions`, `get_chat_session`,
   `search_chat_history`
 - **Artifacts:** `artifact_list`, `artifact_get`, `artifact_save`,
@@ -1310,13 +1387,16 @@ answers `tools/list` from):
   `artifact_get_comments`, `artifact_post_comment`, `artifact_reply_comment`,
   `artifact_delete_comment`, `artifact_mark_review`, `deploy_artifact`
 - **Knowledge and skills:** `local_knowledge_search`, `knowledge_add_document`,
-  `skill_discover`, `skill_search`, `skill_fetch`,
-  `browse_outline`, `browse_search`. (`knowledge_dedup` and
+  `skill_discover`, `skill_search`, `skill_fetch`. (`knowledge_dedup` and
   `knowledge_list_sources` have CLI twins — see the table above.)
-- **Workflows and hooks:** `workflow_author`, `workflow_list`,
+- **Workflows and hooks:** `workflow_author`, `workflow_run`,
+  `workflow_library_list`, `workflow_status`, `workflow_result`, `workflow_list`,
   `workflow_cancel`, `workflow_rerun_subtree`, `register_hook`
-- **Diagnostics:** `resource_status`, `issue_radar_record_investigation`,
-  `kiro_cli_logs` — a redacted tail of kiro-cli's own mcp/lsp protocol logs, so
+- **App bridges:** `issue_radar_record_investigation`,
+  `ops_mission_control_api`, `pod_up`, `pod_down`, `pod_status`, `pod_ls`,
+  `issue_radar_crew_read`, `issue_radar_crew_record`
+- **Browser:** `browser`
+- **Diagnostics:** `resource_status`, `kiro_cli_logs` — a redacted tail of kiro-cli's own mcp/lsp protocol logs, so
   the agent can self-diagnose a rejected turn. Reads log files only: never the
   fenced identity/token stores, and never the conversation-bearing sources
   (`kiro-chat.log`, session transcripts), each of which is one shared host file
@@ -1388,10 +1468,13 @@ normalization pass rewrites slash-containing keys to kiro-safe aliases: kiro-cli
 splits an agent `@server` reference on `/`, so a slash-containing key is
 mis-parsed as `@server/tool` and exposes none of the server's tools.
 
-**Browsing is deliberately not an MCP server.** The agent drives a browser by
-running `playwright-cli` commands on its ordinary shell path, so no tool schemas
-are re-sent per request and the accessibility tree stays on disk instead of
-entering the model context. See [browser](../system-specs/modules/browser.md).
+**Browsing has one core MCP entry point.** The `browser` tool forwards one
+operation to the dashboard's native Browser panel. It accepts public HTTP(S)
+navigation only; localhost, private, and link-local targets stay on the
+approval-gated `playwright-cli` path. When no native panel is attached, or the
+operator disables it, the tool returns fallback guidance rather than starting a
+second browser. Full CLI snapshots and accessibility trees still stay on disk.
+See [browser](../system-specs/modules/browser.md).
 
 ## What belongs in `kirocrew-core`, and what does not
 
@@ -1906,7 +1989,8 @@ gatewayd spawns a pooled backend from its OWN environment, so the per-session
 token the stub carries never reaches the backend's `os.environ`. That is right
 for a third-party server, which has no business proving a session to anyone.
 `kirocrew-core`, `kirocrew-cron` and the opt-in Crew servers (`kirocrew-dashboard`,
-`kirocrew-work`, `kirocrew-crew-log`, `kirocrew-panel`) are different: they
+`kirocrew-work`, `kirocrew-crew-log`, `kirocrew-debug`, `kirocrew-panel`) are
+different: they
 post back to the gateway over loopback (`/api/crons/tools`, the memory routes,
 the session and folder routes) on behalf of the session they act for, and every
 one of them reads the session's tool policy through `mcp_shared`, a read the
@@ -1921,8 +2005,20 @@ and `mcp_core._session_token_header` reads the gateway-injected caller's token
 before falling back to `KIROCREW_STUB_SESSION_TOKEN`. The name alone does not
 earn the token: the server name arrives in the stub's register frame while the
 spawn target resolves separately from the spec-derived
-`KIROCREW_MCP_TARGET_<NAME>` mapping, so a spec could declare a third-party
-command under a reserved name. At spawn, `gatewayd._spawns_own_control_plane`
+`KIROCREW_MCP_TARGET_<NAME>` mapping. That mapping is not the spec's word for a
+reserved name, though. The rewriter re-derives every stubbed `kirocrew-*` entry,
+whether an agent spec declares it or `settings/mcp.json` injects it, from
+`agent.managed_mcp_spec_entry` before it resolves, hashes or bakes anything
+(`rewriter._repair_control_plane_entry`), and holds the entry's
+declared `env` to the managed-entry ownership rule the disk writer
+(`agent._enforce_managed_mcp_ownership`) and the ACP element
+(`session_mcp._managed_element_env`) apply -- reserved `KIROCREW_*` keys, loader
+channels, home-deriving and launcher-exec keys dropped. So a spec that spells the
+launcher the only way a hand can (`"command": "kirocrew"`, which resolves to the
+shared Toolbox dispatcher, not the versioned binary) or pins a path an upgrade
+has since reaped still runs our binary, and a third-party command declared under
+a reserved name runs our binary too, never its own. The gate below is unchanged;
+the repair is what makes an honest spec pass it. At spawn, `gatewayd._spawns_own_control_plane`
 compares the command actually exec'd (by real path) and its args against the
 invocation `agent.managed_mcp_spec_entry` emits for that name and records the
 verdict as `Backend.control_plane`; the handler forwards the token on that flag
@@ -1992,7 +2088,13 @@ spec entry, a different binary, different args, a non-empty `PYTHON*` / `LD_*` /
 or a root that shadows `kiro_crew` (named in the message, so per-user site-packages
 is distinguishable from the local one) — so an
 install that trips the check has more to read than every cron tool answering
-403.
+403. The same reason rides to the denied backend itself: the spawn site records it
+as `Backend.control_plane_denial`, `_caller_for_backend` copies it onto the frames
+it forwards to that backend as `CallerContext.identity_denial` (`identityDenial`
+in the caller block, emitted only when set), and the backend's
+`identity_unattested` refusal quotes it. Without that channel the only record was
+`logs/mcp-gatewayd.stdout`, which no session surfaces, and the refusal's generic
+text pointed at the token and the spec when the cause was neither.
 
 `CONTROL_PLANE_BACKENDS` is named in gatewayd itself (importing
 `acp.session_mcp` would put `kiro_crew.agent` on the daemon's boot path; the

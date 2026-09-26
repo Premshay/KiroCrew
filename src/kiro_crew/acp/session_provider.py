@@ -161,6 +161,7 @@ class AcpSessionProvider(LLMProvider):
             cwd=self._runtime._work_dir,
             agent=self._runtime._agent or None,
             memory_mode=self.memory_mode,
+            session_key=self._session_key,
         )
         # Re-apply the configured non-default model to the fresh session. A new
         # session/new reverts to the agent-config default model, so a warm worker
@@ -233,6 +234,11 @@ class AcpSessionProvider(LLMProvider):
             logger.debug("set_keep_transcript: handle rejected attribute", exc_info=True)
 
     @property
+    def work_scratch_dir(self) -> Path | None:
+        """The session tree's ``$KIROCREW_SCRATCH`` directory (see ``AcpRuntime.work_scratch_dir``)."""
+        return self._runtime.work_scratch_dir
+
+    @property
     def child_fidelity_aware(self) -> bool:
         """See AcpSessionHandle.child_fidelity_aware."""
         return getattr(self._handle, "child_fidelity_aware", False)
@@ -250,6 +256,11 @@ class AcpSessionProvider(LLMProvider):
           then destroy the handle only.
         """
         if self._owns_runtime:
+            # A runtime kill cancels only its reader tasks, so the handle's own
+            # in-flight hook executions are stopped here first.
+            cancel_hooks = getattr(self._handle, "_cancel_hook_tasks", None)
+            if callable(cancel_hooks):
+                cancel_hooks()
             try:
                 if self.memory_mode != "persistent":
                     try:
@@ -617,6 +628,7 @@ class AcpSessionProvider(LLMProvider):
         self._channel_id = channel_id
         self._runtime._crew_agent = crew_agent
         self._handle.rebind_watchdog(crew_agent, settings=watchdog)
+        self._handle.bind_session_key(session_key)
         self._runtime._last_activity = time.monotonic()
         # Parity with AcpClient.rekey: the handle's prompt stats describe the
         # session this runtime served BEFORE the handoff; leaking them lets
@@ -881,8 +893,11 @@ class AcpSessionProvider(LLMProvider):
         advertised = acp_config_option_values(self.acp_config_options, "model")
         advertised.extend(advertised_model_ids(self._handle.available_models))
         if model_is_unusable(model_id, advertised):
+            # A user's explicit pick must earn a FRESH probe, not be refused on a
+            # recent no-evidence failure the picker read path may have cached
+            # (force=True skips the failure/empty attempt-clock replay).
             fresh = advertised_model_ids(
-                await self._guarded(self._handle.refresh_available_models())
+                await self._guarded(self._handle.refresh_available_models(force=True))
             )
             if model_is_unusable(model_id, fresh or advertised):
                 raise AcpModelUnavailable(model_id, fresh or advertised)
@@ -947,6 +962,23 @@ class AcpSessionProvider(LLMProvider):
     def available_models(self) -> list[dict[str, str]]:
         """Models advertised by the backend."""
         return self._handle.available_models
+
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the advertised-model snapshot on the read path.
+
+        The read-path counterpart to the refresh-before-refuse in
+        :meth:`set_model`: the dashboard picker filter narrows the catalog
+        through this session's snapshot, and an unconfirmed startup-race snapshot
+        would hide models the account actually has with no explicit pick to
+        trigger the refusal-path heal. Delegates the staleness decision and the
+        single-flight probe to
+        :meth:`AcpSessionHandle.maybe_refresh_available_models`, and propagates
+        its contract: on the read deadline it raises
+        :class:`~kiro_crew.acp.session_handle.EntitlementRevalidating` (the probe
+        keeps running); on a probe FAILURE it returns the current snapshot (fail
+        open).
+        """
+        return await self._guarded(self._handle.maybe_refresh_available_models(catalog_ids))
 
     def pop_pending_oauth_requests(self) -> list[dict[str, str]]:
         """Drain OAuth requests captured while the shared session initialized."""

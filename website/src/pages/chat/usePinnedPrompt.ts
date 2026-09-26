@@ -1,9 +1,11 @@
-import { type RefObject, useCallback, useRef, useState } from 'react'
+import { type RefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import type { DisplayItem } from './types'
 import type { PasteBlock } from '../../utils/pasteTokens'
 import {
   DEFAULT_PINNED_CARD_H,
+  ROW_PAD_Y,
+  computeLiveCardH,
   computePinPush,
   findNextPromptIdx,
   findPinnedPromptIdx,
@@ -62,6 +64,16 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
   const onPinCollapsedHeight = useCallback((h: number) => {
     if (h > 0) pinCollapsedHRef.current = h
   }, [])
+  // Scroll the transcript on the card's behalf. The card is interactive so its text
+  // stays selectable and its buttons keep working, but it sits in a
+  // `pointer-events-none` overlay that is a SIBLING of this scroller, so a wheel
+  // over it finds no scrollable ancestor and the transcript would not move at all.
+  // The card reports the delta and this applies it, because the scroller is ours.
+  const scrollTranscriptBy = useCallback((dy: number) => {
+    const el = scrollerRef.current
+    if (!el || !dy) return
+    el.scrollTop += dy
+  }, [scrollerRef])
   // Recompute which prompt is pinned, and how far the incoming prompt has
   // pushed it out, from the current scroll position.
   const updatePinnedPrompt = useCallback(() => {
@@ -75,24 +87,35 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
     const items = el.querySelectorAll('[data-display-index]')
     const foldY = pinFoldRef.current?.getBoundingClientRect().top
       ?? el.getBoundingClientRect().top
-    // A prompt hands over to the banner only once it is entirely behind the band
-    // (bottom edge at or above the band's bottom), so a prompt taller than the
-    // band scrolls away line by line instead of collapsing the moment it is sent.
-    const handoffY = pinHandoffY(foldY, pinCollapsedHRef.current)
-    // First row whose bottom is still below that line = the topmost row not yet
-    // fully scrolled behind the band. The row must also REACH the line. A far
-    // jump or fast upward fling can leave unmounted spacer between the viewport
-    // and the first mounted row for one commit; treating that later row as the
-    // hand-off would select a prompt below what the reader can see.
+    // A prompt hands over to the banner once its row TOP has risen above the
+    // card's own resting top, so the bubble stops travelling at the pixel the
+    // card occupies. Independent of the card's height — see pinHandoffY.
+    const handoffY = pinHandoffY(foldY)
+    // First row whose top has NOT yet reached that line = the topmost row still
+    // below it. STRICT `>`, and that is load-bearing rather than a taste: the
+    // outgoing card is dropped the moment the incoming row's top reaches the fold
+    // (`push >= pinPushTravel`, below), so a row sitting exactly ON the line must
+    // already be pinnable. With `>=` it was not, and the banner disappeared
+    // entirely for the frames where the gap was zero — one hand-off replaced by a
+    // blink. The two predicates are the same instant by construction.
+    //
+    // The row must also REACH the line: a far jump or fast upward fling can leave
+    // unmounted spacer between the viewport and the first mounted row for one
+    // commit, and treating that later row as the hand-off would select a prompt
+    // below what the reader can see. With a top-edge rule that shows up as the
+    // FIRST mounted row already sitting below the line — every contiguous case has
+    // a mounted row above the boundary.
     let handoffIdx = -1
+    let first = true
     for (const item of items) {
       const htmlItem = item as HTMLElement
       const rect = htmlItem.getBoundingClientRect()
-      if (rect.bottom > handoffY) {
-        if (requiresMountedHandoff && rect.top > handoffY) { setPinned(null); return }
+      if (rect.top > handoffY) {
+        if (requiresMountedHandoff && first) { setPinned(null); return }
         handoffIdx = parseInt(htmlItem.getAttribute('data-display-index') || '0', 10)
         break
       }
+      first = false
     }
 
     if (!pinEnabledRef.current || handoffIdx < 0) { setPinned(null); return }
@@ -110,6 +133,125 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
       ? el.querySelector(`[data-display-index="${nextIdx}"]`) as HTMLElement | null
       : null
     const nextTop = nextEl ? nextEl.getBoundingClientRect().top : null
+    const pinEl = el.querySelector(`[data-display-index="${pinIdx}"]`) as HTMLElement | null
+    // The pinned row is `visibility: hidden` while the card stands in for it, so
+    // it keeps its layout box and stays measurable — which is what makes the
+    // progressive fold possible.
+    //
+    // The BUBBLE, not the row, for both the ceiling and the fold's bottom edge. A
+    // user row is not just padding around its bubble: UserMessage puts an action
+    // row (copy / copy-link / pin / edit / timestamp) beneath it, so the row's
+    // box overshoots the bubble by that strip's height (26px measured) plus its
+    // 4px gap. The card stands in for the bubble alone — the strip is re-shown in
+    // place under the hidden row (index.css `[data-pinned-standin]`), so a card
+    // folding down to the ROW's bottom would cover exactly the controls that
+    // hand-off leaves visible. `.message-bubble` is the theming contract's hook
+    // for the bubble box (website/docs/theming-contract.md), carried by the
+    // plain `.user-bubble` and by a steer's accent bubble alike, so a pinned
+    // steer measures its bubble too instead of falling back to the row. Falls
+    // back to the row's content box when a host renders no bubble node.
+    const pinBubble = pinEl?.querySelector('.message-bubble') as HTMLElement | null
+    // The row's own user root: UserMessage's `div[data-role="user"]`, the parent
+    // of the bubble and of the action strip. Reached from the bubble by walking
+    // UP, never by searching the row down, because the rendered message body is
+    // inside the bubble and MarkdownRenderer admits `data-*` on it — a
+    // `<div data-role="user">` minted by a prompt would be found first by a
+    // `querySelector`, but can never be an ANCESTOR of the bubble it sits in.
+    // The two markers below are read off this root and its direct children for
+    // the same reason: a `[data-message-…]` search over the whole row subtree
+    // put a forged marker inside the bubble ahead of the real one.
+    const userRoot = pinBubble?.closest('[data-role="user"]') ?? null
+    // A row being edited is never the stand-in. Editing swaps the bubble for a
+    // textarea + Cancel/Send tree (UserMessage's `if (editing)` render), and the
+    // stand-in state hides the whole row: an edit opened BEFORE the row reached
+    // the fold would then carry on inside an invisible field — keystrokes landing
+    // where nothing can be seen, and a Send below the viewport that scrolling can
+    // never reveal. A card over an editor would also be a copy of text the reader
+    // is changing. Editing state lives inside UserMessage, so the hook reads its
+    // `data-message-editing` marker off the DOM it already measures. The editing
+    // render has NO bubble, so there is no root to walk up from; the fallback
+    // searches the row for a user root that carries the marker, which is safe
+    // only because MarkdownRenderer reserves `data-message-*` (isAllowedAttr) —
+    // a body can mint `data-role`, but never that pair.
+    const editing = userRoot
+      ? userRoot.hasAttribute('data-message-editing')
+      : !!pinEl?.querySelector('[data-role="user"][data-message-editing]')
+    if (editing) { setPinned(null); return }
+    const pinRect = pinEl?.getBoundingClientRect()
+    const bubbleRect = pinBubble?.getBoundingClientRect()
+    // The fold's ceiling: the card's NATURAL height, i.e. from its own top to the
+    // bubble's bottom at the hand-off frame. The card's top sits ROW_PAD_Y under
+    // the row's top (both put that padding above their content), so this is the
+    // bubble's height for a plain bubble — and more for a steer, whose accent
+    // bubble starts under its badge (20px line + 4px gap): a ceiling of the
+    // bubble's own height there stopped the card 24px short of the bubble's
+    // bottom, a blank band above the re-shown strip that only closed once the
+    // reader had scrolled that far. Measured from the row rather than assumed,
+    // so whatever a host renders above its bubble is accounted for.
+    const standinH = (bubbleRect && pinRect)
+      ? bubbleRect.bottom - pinRect.top - ROW_PAD_Y
+      : (pinRect ? Math.max(0, pinRect.height - ROW_PAD_Y * 2) : null)
+    // The edge the fold tracks: the bubble's own bottom (the strip and the reply
+    // begin below it), or the row's content-box bottom in the no-bubble fallback.
+    const bubbleBottom = bubbleRect
+      ? bubbleRect.bottom
+      : (pinRect ? pinRect.bottom - ROW_PAD_Y : null)
+    // Height for THIS frame. Derived from the row and the settled resting height,
+    // never from the live card, so the card's own size is not an input to the
+    // geometry that sets it (see computeLiveCardH).
+    //
+    // Reported ONLY while it exceeds the resting height, i.e. while there is
+    // actually a fold in progress. At rest it is left undefined so the card goes
+    // back to being content-driven and its own expand / peek morph owns the height.
+    // The threshold lives here because this is where the resting height lives;
+    // duplicating it in the card would let the two disagree about "at rest".
+    const restingH = pinCollapsedHRef.current
+    const liveRaw = (bubbleBottom != null && standinH != null)
+      ? computeLiveCardH(bubbleBottom - foldY, restingH, standinH)
+      : undefined
+    const liveH = liveRaw != null && liveRaw > restingH + 0.5 ? liveRaw : undefined
+    // Whether the row's re-shown action strip is still UNCOVERED — any of it
+    // below the card's bottom, i.e. on screen. This is what the hosts write as
+    // the `folding` value of the row's `data-pinned-standin` marker (the value
+    // index.css re-shows the strip on), and it is derived from occlusion, NOT
+    // from the fold: the fold ends when the card reaches its clamp, but the
+    // strip hangs under the bubble's bottom, so at that frame the whole strip is
+    // still on screen below the card and slides under it over the next
+    // strip's-height of scroll (its `mt-1` gap plus its buttons). Keyed on
+    // `liveH` the marker dropped at the clamp — copy / copy-link / pin vanished
+    // under the pointer and that band went blank for those last pixels. The
+    // strip's OWN rect, so whatever a host renders there is measured rather than
+    // assumed. A row without a strip falls back to the fold itself. The strip is
+    // a direct child of the user root (UserMessage renders it beside the
+    // bubble), never something found inside the bubble — see `userRoot`.
+    const strip = userRoot
+      ? Array.from(userRoot.children).find(c => c.hasAttribute('data-message-actions')) ?? null
+      : null
+    const stripBottom = strip ? strip.getBoundingClientRect().bottom : null
+    // Against the card's LIVE bottom — the one read of the live card this
+    // geometry makes. The resting-height rule below exists because the card's
+    // size must not feed the geometry that SETS the card's size; this flag only
+    // decides the strip's visibility and feeds neither the fold nor the push
+    // (both keep reading pinCollapsedHRef), so the peek/push oscillation
+    // documented there cannot run through it. The live bottom is what keeps the
+    // flag honest at rest: the hover peek and the expansion grow the card down
+    // over the strip's last pixels — growth the row cannot show, and an opaque
+    // card over a strip left `visible` is a Tab stop nobody can see and a click
+    // meant for Copy swallowed by the card — while a card with nothing to reveal
+    // does not grow, so a host's `expanded` flag outliving the prompt it was set
+    // on (hosts reset it per session, not per prompt) cannot hide a shorter
+    // prompt's still-uncovered strip. While folding, the bottom is the height
+    // THIS frame sets, which sits on the bubble's bottom by construction: the
+    // card's rect still carries the previous frame's fold, and a downward scroll
+    // faster than the strip's height per frame would read the strip as under a
+    // card that is about to shrink past it. The growth at rest arrives with no
+    // scroll to run this recompute, so the card is observed for size below.
+    const cardBottom = liveH != null
+      ? foldY + ROW_PAD_Y + liveH
+      : (pinCardRef.current?.getBoundingClientRect().bottom ?? (foldY + ROW_PAD_Y + restingH))
+    const stripUncovered = stripBottom != null
+      ? stripBottom > cardBottom + 0.5
+      : liveH != null
     // The SETTLED resting height, never the live card rect.
     //
     // The card grows past its resting size in two states — the hover peek
@@ -152,8 +294,27 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
       pastes: (pinItem.msg.meta?.pastes as PasteBlock[] | undefined) || [],
       push,
       bannerH,
+      liveH,
+      stripUncovered,
     }))
   }, [requiresMountedHandoff, scrollerRef])
+  // The card grows at rest with no scroll to run the recompute — the hover peek
+  // and the expansion — and the strip test above reads the card's live bottom,
+  // so it has to re-run when that bottom moves. Observe the card's size for as
+  // long as one is pinned: the observer fires once per committed size change
+  // (each frame of the 150ms morph, then quiet), and a recompute that changes
+  // nothing returns the same state, so it never re-enters itself. Keyed on the
+  // pinned message because the card mounts and unmounts with it, and the ref is
+  // attached before this effect runs. This replaces a callback the card would
+  // otherwise have to report through every host; an environment without
+  // ResizeObserver keeps the scroll-driven recompute alone.
+  useEffect(() => {
+    const card = pinCardRef.current
+    if (!card || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => { updatePinnedPrompt() })
+    observer.observe(card)
+    return () => observer.disconnect()
+  }, [pinned?.ts, updatePinnedPrompt])
   // rAF-throttle the per-scroll recompute: updatePinnedPrompt does a
   // querySelectorAll + getBoundingClientRect loop (a forced layout read), and a
   // fling fires scroll dozens of times/sec. Coalesce to at most once per frame,
@@ -266,6 +427,7 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
     pinExpanded,
     setPinExpanded,
     onPinCollapsedHeight,
+    scrollTranscriptBy,
     updatePinnedPrompt,
     onScrollPin,
     pinnedJumpChrome,

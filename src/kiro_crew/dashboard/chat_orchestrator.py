@@ -1262,11 +1262,12 @@ async def _stage_loop(
     if pending_stage is not None and not 1 <= pending_stage <= total:
         pending_stage = None
         stage_boundary_for(slot).clear()
-    start_idx = (
-        pending_stage - 1
-        if pending_stage is not None
-        else (tracker.current_stage if tracker._stage_rounds else 0)
-    )
+    if pending_stage is not None:
+        start_idx = pending_stage - 1
+    elif tracker._stage_rounds:
+        start_idx = tracker.current_stage
+    else:
+        start_idx = 0
     # A consumed final-stage boundary still has to emit the one completion
     # summary; an ordinary Go after completion must not emit it again.
     plan_had_work = start_idx < total
@@ -1997,6 +1998,7 @@ async def api_chat_plan_action(request: web.Request) -> web.Response:
     # controller remains ``turn_running`` and queues this approval.
     if slot.turn_running:
         # circular import: session_control imports this package's modules at module level.
+        from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY
         from kiro_crew.dashboard.session_control import containment_meta
 
         # Provenance follows the CALLER — the same request-identity split as
@@ -2007,10 +2009,17 @@ async def api_chat_plan_action(request: web.Request) -> web.Response:
         # kind is a structural origin tag, not bare content: _exit_cancelled_plan
         # drops revoked approvals by this tag, and queue_append's contract names
         # metadata (never content equality) as the classification mechanism.
+        _go_meta = containment_meta(state, slot)
+        if request.get("app", ""):
+            # The actor, not only the origin flag. `plan_approval` maps to nothing in
+            # `_QUEUE_KIND_ACTORS`, so without this stamp the drain falls through to
+            # `user` and an app's relayed approval runs as the person's turn -- which
+            # is the same fallback every consumer of that field then reads.
+            _go_meta[TURN_ACTOR_META_KEY] = "app"
         slot.queue_append(
             "Go",
             kind="plan_approval",
-            meta=containment_meta(state, slot),
+            meta=_go_meta,
             directive_user_origin=not bool(request.get("app", "")),
         )
         return web.json_response({"ok": True, "queued": True})

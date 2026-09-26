@@ -23,7 +23,7 @@ from kiro_crew import crew_log as lg
 from kiro_crew import sandbox
 from kiro_crew.config import paths
 from kiro_crew.config.paths import data_home, ensure_data_home
-from kiro_crew.crew_log import CrewLog, CrewLogError, Ref, store
+from kiro_crew.crew_log import CrewLog, CrewLogError, Ref, lease, store
 from kiro_crew.security.paths import is_sensitive_path
 from kiro_crew.session_ledger import _store_name
 
@@ -302,6 +302,50 @@ def test_seq_starts_at_one_after_the_header_and_time_is_epoch_ms():
     assert first.time > 1_600_000_000_000
 
 
+def test_append_if_writes_nothing_once_the_tail_is_past_the_callers_seq():
+    crew = _crew()
+    crew.append("item/opened", {"item": "pr-1"}, src="gateway")
+    before = _log_bytes(lg.KIND_CREW, CREW)
+
+    declined = crew.append_if("item/opened", {"item": "pr-2"}, src="gateway", max_tail_seq=0)
+
+    assert declined is None
+    assert _log_bytes(lg.KIND_CREW, CREW) == before, "a declined append rewrote the file"
+    assert crew.last_seq == 1
+
+
+def test_append_if_writes_and_keeps_the_seq_contract_when_the_tail_still_matches():
+    # CONTROL. A bound that never matched would satisfy the test above while
+    # silently dropping every closer in the system.
+    crew = _crew()
+    crew.append("item/opened", {"item": "pr-1"}, src="gateway")
+
+    written = crew.append_if("item/opened", {"item": "pr-2"}, src="gateway", max_tail_seq=1)
+
+    assert written is not None
+    assert (written.seq, crew.last_seq) == (2, 2)
+
+
+def test_append_if_compares_against_the_tail_read_back_under_the_lock():
+    """The file decides, not the handle's cached idea of it.
+
+    A second handle -- standing in for another process -- commits an entry this
+    handle never saw. The bound must be judged against THAT tail, or a caller
+    deciding from a stale cache appends after an entry it never accounted for.
+    """
+    crew = _crew()
+    crew.append("item/opened", {"item": "pr-1"}, src="gateway")
+    CrewLog.open(lg.KIND_CREW, CREW).append("item/opened", {"item": "foreign"}, src="gateway")
+
+    # The caller's decision reached seq 1; the file is already at 2.
+    declined = crew.append_if("item/opened", {"item": "pr-2"}, src="gateway", max_tail_seq=1)
+    assert declined is None, "the foreign entry was not seen, so a stale decision was written"
+
+    # Accounting for it lets the same append through, at the seq after it.
+    written = crew.append_if("item/opened", {"item": "pr-2"}, src="gateway", max_tail_seq=2)
+    assert written is not None and written.seq == 3
+
+
 def test_seq_stays_contiguous_across_a_reopen():
     crew = _crew()
     for index in range(3):
@@ -426,6 +470,9 @@ def test_the_ownership_registry_is_the_documented_partition():
         "write",
         "ledger",
         "object",
+        "radar",
+        "work",
+        "panel",
     }
 
 
@@ -463,6 +510,9 @@ SESSION_VOCABULARY: tuple[str, ...] = (
     "write/dropped",
     "ledger/recorded",
     "object/observed",
+    "radar/recorded",
+    "work/recorded",
+    "panel/published",
 )
 
 
@@ -2120,6 +2170,16 @@ def test_a_chmod_refusing_filesystem_warns_once_not_once_per_append(monkeypatch,
     # The appends themselves still succeed: the restriction is best-effort.
     body = _log_bytes("session", "flood-check").decode("utf-8").splitlines()
     assert len([line for line in body if '"turn/started"' in line]) == 5
+    # The one warning carries the traceback as TEXT. It is raised inside
+    # ``CrewLog.append``, so an ``exc_info`` triple would hold the frame whose
+    # ``self`` is this handle -- and the captured record would then keep the
+    # handle, and its write lease, alive for the rest of the worker.
+    assert "Traceback (most recent call last)" in warnings[0].getMessage()
+    assert warnings[0].exc_info is None
+    lease_path = str(log.path.parent / lease.LEASE_FILE)
+    assert lease_path in lease._held, "the open handle should hold its lease"
+    del log
+    assert lease_path not in lease._held, "dropping the handle must release the lease at once"
 
 
 def test_an_already_restricted_directory_is_not_chmodded_again():

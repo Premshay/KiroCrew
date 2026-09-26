@@ -58,7 +58,10 @@ export interface SettingEntryScore {
  * re-append it.
  */
 /**
- * Registry id of the Decisions (Jev) toggle.
+ * Registry id of the Decisions (Jev) main toggle — the card's own switch.
+ *
+ * The card carries more rows than this one; :data:`DECISIONS_SETTING_IDS` below is
+ * the whole governed set, and the predicate reads that.
  *
  * The registry is CODEGEN'd from the static settings tree, so it lists every entry
  * the build ships regardless of whether the running gateway offers it. This one is
@@ -69,6 +72,36 @@ export interface SettingEntryScore {
  */
 export const DECISIONS_SETTING_ID = 'developer.decisions-jev'
 
+/**
+ * Every registry id the Decisions (Jev) card owns, the main toggle included.
+ *
+ * The card is one governed unit: `capabilities.decisions` withdraws the WHOLE card,
+ * so a search that knows the feature is denied must withhold the address field and
+ * the credential row too. Withholding only the toggle left the rest reachable, and a
+ * result row is a promise that the page has the control — landing a user on a
+ * section where the card was never rendered reads as a broken page.
+ *
+ * Spelled out rather than derived, because the registry carries no source-file
+ * field: `settingsSearchGovernance.test.ts` extracts `DecisionsCard.tsx` with the
+ * real extractor and asserts every label it finds has its id in here, so a control
+ * added to the card without a line here is a red test rather than a live leak.
+ */
+export const DECISIONS_SETTING_IDS: ReadonlySet<string> = new Set([
+  DECISIONS_SETTING_ID,
+  'developer.jev-api-key',
+  'developer.earlier-conversation-one-decision-may-carry-in-characters',
+  // The per-point consent switches. Declared in `settingsManual` because the card draws
+  // them from one component labelled by scope, so the extractor cannot see them -- but
+  // they are the card's rows and the fleet ceiling withdraws them with it.
+  'developer.also-send-tool-call-arguments-so-jev-can-flag-risky-calls',
+  'developer.also-send-the-conversation-and-tool-call-inputs-so-jev-can-score-compaction',
+  'developer.also-send-snippets-of-recalled-memories-so-jev-can-drop-the-ones-that-do-not-help',
+])
+
+/** With `dashboard.tips_enabled` off the rail can drop Discovery, and `sub=discovery`
+ *  then self-heals to the first group -- so an offered hit would land without its control. */
+export const FEATURE_TIPS_SETTING_ID = 'chat.feature-tips'
+
 /** The governance answers the search needs, as the two surfaces resolve them. */
 export interface SettingsSearchGovernance {
   /**
@@ -78,6 +111,11 @@ export interface SettingsSearchGovernance {
    * withholds the row.
    */
   decisionsEnabled: boolean
+  /**
+   * Whether the Feature Tips entry may be offered. Same shape: true unless the
+   * `['tipsStatus']` read SUCCEEDED and said `enabled_config === false`.
+   */
+  tipsEnabled: boolean
 }
 
 /**
@@ -99,7 +137,8 @@ export function settingEntryOffered(
   entry: SettingEntry,
   governance: SettingsSearchGovernance,
 ): boolean {
-  if (entry.id !== DECISIONS_SETTING_ID) return true
+  if (entry.id === FEATURE_TIPS_SETTING_ID) return governance.tipsEnabled
+  if (!DECISIONS_SETTING_IDS.has(entry.id)) return true
   return governance.decisionsEnabled
 }
 

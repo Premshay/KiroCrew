@@ -9,8 +9,10 @@ patched ``_available_memory_gb``.
 
 from __future__ import annotations
 
+import time
 import types
 from io import StringIO
+from typing import Any
 
 import pytest
 
@@ -272,6 +274,31 @@ def _mgr(*, running: int, max_concurrent: int, last_ts: float, stagger: float = 
     return m
 
 
+class _PinnedClock:
+    """``time`` stand-in whose ``monotonic()`` is frozen; everything else forwards."""
+
+    def __init__(self, now: float) -> None:
+        self._now = now
+
+    def monotonic(self) -> float:
+        return self._now
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+def _pin_pump_clock(monkeypatch, now: float) -> None:
+    """Freeze the clock the spawn gate and the drain pump read at ``now``.
+
+    Both read ``time.monotonic()`` through ``kiro_crew.subagent``'s globals (the
+    admission ``*_impl`` functions are rebound onto that namespace), so swapping
+    that one ``time`` name pins them. The process-wide module stays untouched:
+    ``asyncio.run()`` keeps reading it for its own scheduling, and ``_mgr()`` may
+    take seconds of real I/O on a loaded runner without moving this clock.
+    """
+    monkeypatch.setattr(subagent, "time", _PinnedClock(now))
+
+
 class TestStaggerGate:
     """_should_stagger_queue: capacity + stagger gate (initial-fill burst guard)."""
 
@@ -311,13 +338,14 @@ class TestStaggerGate:
 class TestDrainPump:
     """_drain_queue: one start per interval, reschedules when too soon."""
 
-    def test_too_soon_does_not_pop(self) -> None:
+    def test_too_soon_does_not_pop(self, monkeypatch) -> None:
         import asyncio
-        import time as _t
         from unittest.mock import MagicMock
 
+        now = 1_000.0
+        _pin_pump_clock(monkeypatch, now)
+
         async def run() -> None:
-            now = _t.monotonic()
             m = _mgr(running=0, max_concurrent=16, last_ts=now, stagger=2.0)
             m._queue = [
                 {
@@ -542,6 +570,106 @@ class TestQueuedDepthWiring:
         assert ("dashboard:s1", 1) in events
 
 
+class TestQueuedReasonOnTheEvent:
+    """``subagent_queued`` names WHY the rows wait. The count alone made every
+    UI say "queued behind the concurrency limit", including for a row the
+    memory guard parked (F20). The gate's verdicts are untouched: each branch
+    only labels the wait it already decided on."""
+
+    @staticmethod
+    def _capture(m) -> list:
+        events: list = []
+
+        async def on_event(etype, info, extra):
+            if etype == "subagent_queued":
+                events.append(dict(extra))
+
+        m._on_event = on_event
+        return events
+
+    def test_capacity_queue_is_labelled_concurrency_limit(self, monkeypatch) -> None:
+        import asyncio
+        import time as _t
+
+        import kiro_crew.subagent as sub
+
+        monkeypatch.setattr(sub, "_vet_spawn_governance", lambda *a, **k: None)
+
+        async def run() -> list:
+            m = _mgr(running=2, max_concurrent=2, last_ts=_t.monotonic())
+            events = self._capture(m)
+            info = m.spawn(task="x", parent_session_key="dashboard:s1")
+            assert info is not None and info.queued is True
+            assert info.queued_reason == "concurrency_limit"
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return events
+
+        events = asyncio.run(run())
+        assert events and events[-1] == {"queued": 1, "reason": "concurrency_limit"}
+
+    def test_adaptive_cap_at_zero_is_labelled_as_such(self, monkeypatch) -> None:
+        """Cap 0 is the one queue the concurrency text cannot explain: nothing is
+        running, the configured cap still reads 4, and the row waits anyway."""
+        import asyncio
+        import time as _t
+
+        import kiro_crew.subagent as sub
+
+        monkeypatch.setattr(sub, "_vet_spawn_governance", lambda *a, **k: None)
+
+        async def run() -> list:
+            m = _mgr(running=0, max_concurrent=4, last_ts=_t.monotonic() - 10.0)
+            m.set_effective_cap(0)
+            events = self._capture(m)
+            info = m.spawn(task="x", parent_session_key="dashboard:s1")
+            assert info is not None and info.queued is True
+            assert info.queued_reason == "adaptive_cap_zero"
+            # Answered to callers as a deferral, so it carries a sentence, not
+            # the bare kind.
+            assert "dispatch paused" in info.queued_reason_detail
+            assert "effective cap 0" in info.queued_reason_detail
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return events
+
+        events = asyncio.run(run())
+        assert events and events[-1]["reason"] == "adaptive_cap_zero"
+
+    def test_a_re_emit_keeps_the_last_reason_until_the_parent_drains(self) -> None:
+        """The drain re-emits the depth with no verdict of its own. It must not
+        flip a memory-deferred wave back to the concurrency text, and a depth of
+        0 must carry no reason at all -- an old client reads a bare count and a
+        new one must not show a stale one."""
+        import asyncio
+        import time as _t
+
+        async def run() -> list:
+            m = _mgr(running=0, max_concurrent=4, last_ts=_t.monotonic())
+            events = self._capture(m)
+            m._queue = [{"task": "a", "parent_session_key": "dashboard:s1"}]
+            m._emit_queue_depth(
+                "dashboard:s1",
+                wait={"reason": "low_memory", "available_gb": 3.2, "required_gb": 4.5},
+            )
+            m._emit_queue_depth("dashboard:s1")  # a drain-style re-emit, no verdict
+            m._queue = []
+            m._emit_queue_depth("dashboard:s1")  # parent drained
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return events
+
+        events = asyncio.run(run())
+        assert events[0] == {
+            "queued": 1,
+            "reason": "low_memory",
+            "available_gb": 3.2,
+            "required_gb": 4.5,
+        }
+        assert events[1] == events[0]
+        assert events[2] == {"queued": 0}
+
+
 class TestQueuedIdentityRoundTrip:
     """A queued member must START under the id its caller was handed.
 
@@ -557,22 +685,23 @@ class TestQueuedIdentityRoundTrip:
 
     def test_drained_spawn_reuses_the_announced_id(self, monkeypatch) -> None:
         import re
-        import time as _t
         from unittest.mock import MagicMock
 
         import kiro_crew.subagent as sub
 
         monkeypatch.setattr(sub, "_vet_spawn_governance", lambda *a, **k: None)
 
-        m = _mgr(running=1, max_concurrent=16, last_ts=_t.monotonic(), stagger=2.0)
+        now = 1_000.0
+        _pin_pump_clock(monkeypatch, now)
+        m = _mgr(running=1, max_concurrent=16, last_ts=now, stagger=2.0)
         info = m.spawn(task="x", parent_session_key="dashboard:s1")
 
         assert info is not None and info.queued is True
-        assert re.fullmatch(r"[0-9a-f]{8}", info.id), "queued id must be a real agent id"
+        assert re.fullmatch(r"[0-9a-f]{16}", info.id), "queued id must be a real agent id"
 
         # Drain: the gate is open now (stagger elapsed, slot free), so the
         # popped entry must be re-spawned under the SAME id.
-        m._last_spawn_ts = _t.monotonic() - 10.0
+        m._last_spawn_ts = now - 10.0
         m.spawn = MagicMock()  # type: ignore[method-assign]
         m._drain_queue()
 

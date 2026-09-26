@@ -12,11 +12,14 @@ import hmac
 import json
 import logging
 import re
+import secrets
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from threading import RLock
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -38,6 +41,7 @@ from kiro_crew.dashboard.state import (
     POST_RESTART_CONTINUATION_KIND,
     POSTTOKEN_RECOVERY_PREFIX,
     PROMISE_ONLY_RECOVERY_PREFIX,
+    REFUSAL_FALLBACK_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIXES,
     DashboardState,
     _ChatSlot,
@@ -46,10 +50,11 @@ from kiro_crew.dashboard.state import (
     parse_cls_meta,
 )
 from kiro_crew.history import transcript_sort_key
-from kiro_crew.hooks import safe_read_file
+from kiro_crew.hooks import _HOST_READ_ONLY_BUILTIN_TOOLS, safe_read_file
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key
 from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.security import (
+    _exempt_exact_hosts,
     oauth_url_contains_credential,
     redact_credentials,
     redact_exfiltration_urls,
@@ -148,18 +153,25 @@ async def run_config_write(fn, /, *args, **kwargs):
         return result
 
 
-async def drained_to_thread(fn, /, *args):
-    """``asyncio.to_thread`` that a cancellation cannot abandon mid-mutation.
+async def run_to_completion(aw):
+    """Await *aw* so that a cancellation cannot abandon it part-way.
 
-    A plain ``await to_thread(...)`` raises ``CancelledError`` at the await
-    while the worker THREAD keeps running — a handler that then performs
-    cleanup (releasing a lock, removing a staging directory) races its own
-    still-running worker. Shielding the task keeps the await alive until the
-    worker actually finishes, then re-raises the cancellation, so control only
-    ever returns with no mutation in flight. Shared by the agents handler's
-    config writers and the files handler's workspace-copy staging.
+    The awaitable runs as its own task behind ``asyncio.shield``; a
+    ``CancelledError`` delivered to the CALLER is remembered and the caller
+    keeps waiting until the task finishes, then the cancellation is re-raised.
+    The loop, not a single re-await, is what makes that hold under repeated
+    cancellation (a graceful shutdown escalating after its timeout): each
+    re-shield absorbs one more cancel, and only a finished task ends it.
+
+    For a multi-phase write -- a channel saver's config.json commit followed by
+    its ``.env`` credential write, the MCP gateway toggle's persist followed by
+    its live apply -- a cancellation between the phases would leave the stored
+    state and the effective state disagreeing; wrapping the whole transaction
+    here is what keeps the pair consistent. Cancellation is deferred, never
+    swallowed: the caller still unwinds with ``CancelledError`` afterwards, and
+    an exception from the task propagates as usual.
     """
-    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    task = asyncio.ensure_future(aw)
     cancelled: asyncio.CancelledError | None = None
     while True:
         try:
@@ -168,12 +180,26 @@ async def drained_to_thread(fn, /, *args):
         except asyncio.CancelledError as exc:
             if task.cancelled():
                 raise
-            # OUR await was cancelled, not the worker: remember it, keep
-            # draining the still-running thread.
+            # OUR await was cancelled, not the task: remember it, keep waiting
+            # for the still-running work.
             cancelled = exc
     if cancelled is not None:
         raise cancelled
     return result
+
+
+async def drained_to_thread(fn, /, *args):
+    """``asyncio.to_thread`` that a cancellation cannot abandon mid-mutation.
+
+    A plain ``await to_thread(...)`` raises ``CancelledError`` at the await
+    while the worker THREAD keeps running — a handler that then performs
+    cleanup (releasing a lock, removing a staging directory) races its own
+    still-running worker. :func:`run_to_completion` keeps the await alive until
+    the worker actually finishes, then re-raises the cancellation, so control
+    only ever returns with no mutation in flight. Shared by the agents handler's
+    config writers and the files handler's workspace-copy staging.
+    """
+    return await run_to_completion(asyncio.to_thread(fn, *args))
 
 
 # Per-turn compaction-failure backoff. See
@@ -348,6 +374,10 @@ _SLASH_COMMANDS = frozenset(
     }
 )
 
+# Blocked on the kiro path ONLY: the KiroACP harness does not implement /todos
+# and rejects it with an "unknown variant" error, while Claude Code has its own.
+_KIRO_ONLY_BLOCKED_SLASH_COMMANDS = frozenset({"/todos"})
+
 # Commands that exist in kiro-cli's interactive TUI but cannot work in the
 # dashboard (they drive a local terminal: quitting it, pasting from its
 # clipboard, opening an editor, or toggling checkpoint modes the dashboard's
@@ -356,10 +386,9 @@ _SLASH_COMMANDS = frozenset(
 # GET /api/slash-commands suggestion payload, so every surface hides them at
 # once — advertising a command that only yields a warning teaches a gesture
 # that does not work.
-# /todos was removed because the KiroACP harness does not implement it and
-# rejects it with an "unknown variant" error.
-_BLOCKED_SLASH_COMMANDS = frozenset(
-    {"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/tangent", "/todos"}
+_BLOCKED_SLASH_COMMANDS = (
+    frozenset({"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/tangent"})
+    | _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
 )
 
 # Single source of truth for slash-command descriptions surfaced by the
@@ -616,7 +645,7 @@ def _emit_agent_assignment(slot_key: str, agent: str, outcome: str = "applied") 
     )
 
 
-def _validate_tool_name(tool_name: str, *, is_shell: bool = False) -> str:
+def _validate_tool_name(tool_name: str, *, is_shell: bool = False, canonical_name: str = "") -> str:
     """Validate and sanitize tool display names for hook matching.
 
     ``is_shell`` is the provider-agnostic signal (set at the provider boundary)
@@ -625,11 +654,22 @@ def _validate_tool_name(tool_name: str, *, is_shell: bool = False) -> str:
     on this flag rather than a hardcoded set of provider tool_kind literals
     (e.g. "execute"/"Bash") stops the cap from silently re-breaking long shell
     commands on every engine migration or tool rename.
+
+    ``canonical_name`` is the adapter-authored tool identity that travelled
+    beside the title (``AcpEvent.tool_name``, read from the harness's own
+    ``_meta`` channel, never from the title or the model's ``description``).
+    The length cap protects the case where the title IS the only identity a
+    hook can match on; when a canonical identity is present the title is
+    content (a ``read`` title embeds the paths it reads, exactly as a shell
+    title embeds its command line), so the cap is skipped for it as it is for
+    ``is_shell``. Sanitisation and the empty check apply regardless: only the
+    length predicate is relaxed. A backend that publishes no identity leaves
+    ``canonical_name`` empty and keeps the loud refusal.
     """
     sanitized = sanitize_string(tool_name)
     if not sanitized:
         raise ValueError("Tool name cannot be empty")
-    if not is_shell and len(sanitized) > MAX_TOOL_NAME_LEN:
+    if not is_shell and not canonical_name and len(sanitized) > MAX_TOOL_NAME_LEN:
         raise ValueError(f"Tool name exceeds max length {MAX_TOOL_NAME_LEN}")
     return sanitized
 
@@ -1679,9 +1719,7 @@ def _sync_dashboard_slots(state: "DashboardState") -> None:
 def _redact_value(v):  # type: ignore[no-untyped-def]
     """Recursively redact any value (str, dict, list/tuple, or passthrough)."""
     if isinstance(v, str):
-        v, _ = redact_exfiltration_urls(v)
-        v, _ = redact_credentials(v)
-        return v
+        return _redact_for_display(v)
     if isinstance(v, dict):
         return _redact_meta(v)
     if isinstance(v, (list, tuple)):
@@ -1749,11 +1787,114 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
     return _redact_meta(meta)
 
 
+# One process-local LRU shared by HTTP snapshot renders and live WS emission.
+# It retains at most _DISPLAY_REDACTION_CACHE_MAX_ENTRIES entries and 16 MiB of
+# key-input plus output payload; least-recently-used entries leave first, and an
+# individually oversized value bypasses the cache. Each entry retains exactly a
+# fixed-size key -- the 32-byte SHA-256 digest and the input byte length -- plus
+# the redacted output, and every one of those is counted against the byte cap;
+# nothing else, and never the raw credential-bearing key material.
+#
+# The digest covers every input the battery's OUTPUT depends on, not just the
+# text: ``redact_exfiltration_urls`` also reads the active PlatformContext's
+# exempt-host set, which changes mid-process (a companion loads after boot, a
+# policy tightens). Keyed on content alone, a hot entry computed under the old set
+# kept being served -- a tenant link stayed ``[REDACTED]`` after its host was
+# exempted, or a URL the tightened policy now redacts kept displaying in plaintext
+# until eviction. The host set is folded INTO the digest rather than carried as a
+# key component: a container per entry would sit outside the byte cap, and with
+# a large tenant list it would dwarf the payload the cap is declared to bound.
+#
+# The entry cap counts individual STRINGS, and a rendered row costs several --
+# ``_prepare_messages`` redacts the content plus every meta string (a row's
+# unique ``meta.mid`` alone takes a slot) plus each variant. The backend page
+# ceiling is ``SLOT_DETAIL_MAX_LIMIT`` rows, so the cap must hold one full page with headroom:
+# below that, a page's oldest-to-newest pass evicts its own head before the
+# next render reaches it, and the hit rate on exactly the multi-MB sessions this
+# cache exists for collapses to near zero. The 16 MiB byte cap is the real bound.
+#
+# ONE literal for the slot-detail page ceiling. The handler clamps ``?limit=`` to
+# it and the cache cap is derived from it, so raising the page size cannot leave
+# the cache sized for the old one. The frontend mirrors it as
+# ``SLOT_DETAIL_MAX_LIMIT`` in ``website/src/store/chatSlice.ts``.
+SLOT_DETAIL_MAX_LIMIT = 500
+_DISPLAY_REDACTION_STRINGS_PER_ROW = 8
+_DISPLAY_REDACTION_CACHE_MAX_ENTRIES = (
+    SLOT_DETAIL_MAX_LIMIT * _DISPLAY_REDACTION_STRINGS_PER_ROW * 2
+)
+_DISPLAY_REDACTION_CACHE_MAX_BYTES = 16 * 1024 * 1024
+_DisplayRedactionKey = tuple[bytes, int]
+# Per-process HMAC key for the cache digest. The digested text is credential-bearing
+# (the battery exists to redact it), so the key is a keyed MAC rather than a bare
+# hash: a retained digest cannot be checked offline against a guessed plaintext.
+# Random at import, never persisted, never logged; a fresh key per process only
+# means the cache starts cold, which it does anyway.
+_DISPLAY_REDACTION_SALT: bytes = secrets.token_bytes(32)
+_display_redaction_cache: OrderedDict[_DisplayRedactionKey, tuple[str, int]] = OrderedDict()
+_display_redaction_cache_bytes = 0
+_display_redaction_cache_lock = RLock()
+
+
+def _display_redaction_cache_key(text: str) -> tuple[_DisplayRedactionKey, int]:
+    """Digest the exact string entering the battery together with the exempt-host set it reads.
+
+    The key is fixed-size: a 32-byte digest and the input byte length. The host set
+    is sorted and folded into the MAC input behind a NUL separator (a host never
+    contains NUL), so a changed set yields a different key while no per-entry
+    container is retained. The length component constrains a digest collision.
+    The digest is an HMAC under the per-process ``_DISPLAY_REDACTION_SALT``: one
+    hash per lookup, so the cache stays cheaper than the battery it fronts.
+    """
+    raw = text.encode("utf-8", errors="surrogatepass")
+    hosts = "\0".join(sorted(_exempt_exact_hosts())).encode("utf-8", errors="surrogatepass")
+    digest = hmac.new(_DISPLAY_REDACTION_SALT, raw + b"\0" + hosts, hashlib.sha256).digest()
+    return (digest, len(raw)), len(raw)
+
+
+def _clear_display_redaction_cache() -> None:
+    """Reset the process-local cache for deterministic tests."""
+    global _display_redaction_cache_bytes
+    with _display_redaction_cache_lock:
+        _display_redaction_cache.clear()
+        _display_redaction_cache_bytes = 0
+
+
+def _display_redaction_cache_info() -> tuple[int, int]:
+    """Return ``(entries, accounted_bytes)`` for invariant tests."""
+    with _display_redaction_cache_lock:
+        return len(_display_redaction_cache), _display_redaction_cache_bytes
+
+
 def _redact_for_display(text: str) -> str:
-    """Apply all redaction passes for dashboard/WS display."""
-    text, _ = redact_exfiltration_urls(text)
-    text, _ = redact_credentials(text)
-    return text
+    """Apply all display redactors, reusing only an exact content-hash match."""
+    global _display_redaction_cache_bytes
+    key, input_bytes = _display_redaction_cache_key(text)
+    with _display_redaction_cache_lock:
+        cached = _display_redaction_cache.get(key)
+        if cached is not None:
+            _display_redaction_cache.move_to_end(key)
+            return cached[0]
+
+    redacted, _ = redact_exfiltration_urls(text)
+    redacted, _ = redact_credentials(redacted)
+    entry_bytes = len(key[0]) + input_bytes + len(redacted.encode("utf-8", errors="surrogatepass"))
+    if entry_bytes > _DISPLAY_REDACTION_CACHE_MAX_BYTES:
+        return redacted
+
+    with _display_redaction_cache_lock:
+        cached = _display_redaction_cache.get(key)
+        if cached is not None:
+            _display_redaction_cache.move_to_end(key)
+            return cached[0]
+        _display_redaction_cache[key] = (redacted, entry_bytes)
+        _display_redaction_cache_bytes += entry_bytes
+        while (
+            len(_display_redaction_cache) > _DISPLAY_REDACTION_CACHE_MAX_ENTRIES
+            or _display_redaction_cache_bytes > _DISPLAY_REDACTION_CACHE_MAX_BYTES
+        ):
+            _, (_, evicted_bytes) = _display_redaction_cache.popitem(last=False)
+            _display_redaction_cache_bytes -= evicted_bytes
+    return redacted
 
 
 def redact_display_content(content: Any) -> str:
@@ -1785,9 +1926,7 @@ def redact_display_content(content: Any) -> str:
     if isinstance(redacted, str):
         return redacted
     wire = serialize_wire_content(redacted)
-    wire, _ = redact_exfiltration_urls(wire)
-    wire, _ = redact_credentials(wire)
-    return wire
+    return _redact_for_display(wire)
 
 
 def serialize_wire_content(content: Any) -> str:
@@ -1817,10 +1956,21 @@ def serialize_wire_content(content: Any) -> str:
 
 
 def _remove_queued_by_id(messages: list[dict], queue_id: str) -> bool:
-    """Remove a 'queued' placeholder by queue_id stored in cls JSON."""
+    """Remove a 'queued' placeholder by its queue id.
+
+    Two spellings, matching the two twin shapes: the cron twin stores
+    ``queue_id`` in a JSON ``cls``, while the app twin wears a plain CSS
+    ``cls`` and carries ``queueId`` in ``meta`` (the hydration spelling) —
+    a cls-only match leaves an unreapable ghost row for every app message
+    queued behind a live turn.
+    """
     for i, m in enumerate(messages):
         if m.get("role") != "queued":
             continue
+        meta = m.get("meta")
+        if isinstance(meta, dict) and meta.get("queueId") == queue_id:
+            del messages[i]
+            return True
         try:
             cls = json.loads(m.get("cls", "{}"))
             if cls.get("queue_id") == queue_id:
@@ -2650,6 +2800,97 @@ def classify_empty_turn(activity: EmptyTurnActivity) -> str:
     return EMPTY_CAUSE_OTHER
 
 
+# A current-turn blocker the model can only have invented.  Kiro Crew receives
+# real tool failures through a refusal/error/result frame; a normal end_turn that
+# follows a successful read/search call carries no runtime signal that tools were
+# disabled.  Match the complete terminal response, not just its prefix: otherwise
+# untrusted content could append an action and mint a synthetic action turn.
+_FALSE_CURRENT_TOOL_BLOCKER_RE = re.compile(
+    r"^\s*(?:"
+    r"i(?:'|’)m blocked from further tool execution in the resumed session: "
+    r"the screenshot delivery tools are no longer callable here\."
+    r"|i(?:'|’)m proceeding, but this turn(?:'|’)s tool budget was exhausted "
+    r"immediately after loading the workflow\. "
+    r"No publish or deployment has happened yet\."
+    r")\s*$",
+    re.IGNORECASE,
+)
+_FALSE_CURRENT_TOOL_BLOCKER_NEAR_MISS_RE = re.compile(
+    r"^\s*i(?:'|’)?m\b"
+    r"(?=[^\n]*(?:tool|read|search|fetch))"
+    r"(?=[^\n]*(?:block|unavail|inaccess|no\s+longer|budget|exhaust))"
+    r"[^\n]+$",
+    re.IGNORECASE,
+)
+# Replay additionally admits two first-party discovery tools whose contracts are
+# read-only but which are not auto-approval candidates. Keep the shared host
+# builtins sourced from the approval gate so those identities cannot drift.
+_READ_ONLY_PREPARATION_TOOLS = _HOST_READ_ONLY_BUILTIN_TOOLS | frozenset(
+    {"introspect", "tool_search"}
+)
+
+
+def is_false_current_tool_blocker(final_segment_text: str) -> bool:
+    """Whether the assistant falsely claims THIS turn lost tool execution.
+
+    This is deliberately narrower than a generic ``budget`` search.  A model may
+    legitimately explain a subagent cap or quote an earlier failure; only a
+    first-person claim about the live turn is actionable here.
+    """
+    return bool(_FALSE_CURRENT_TOOL_BLOCKER_RE.search(final_segment_text or ""))
+
+
+def is_false_current_tool_blocker_near_miss(final_segment_text: str) -> bool:
+    """Whether blocker-adjacent text missed the replay grammar.
+
+    Diagnostic only: this predicate never grants replay authority. It lets the
+    runner count wording drift without logging model text or widening the two
+    incident statements accepted by :func:`is_false_current_tool_blocker`.
+    """
+    text = final_segment_text or ""
+    return not is_false_current_tool_blocker(text) and bool(
+        _FALSE_CURRENT_TOOL_BLOCKER_NEAR_MISS_RE.search(text)
+    )
+
+
+def tool_calls_are_read_only_preparation(
+    turn_tool_calls: int,
+    turn_tool_identities: tuple[tuple[str, str, str, bool], ...],
+    successful_tool_call_ids: frozenset[str],
+    *,
+    builtin_identity_trusted: bool,
+) -> bool:
+    """True when every dispatch is a proven successful read-only builtin.
+
+    Each identity is ``(tool_call_id, mcp_server_name, tool_name,
+    tool_identity_trusted)``. The caller must positively prove the serving
+    backend is Kiro, and every name must carry extractor provenance rather than
+    merely being non-empty. MCP tools are excluded even when their names look
+    read-only; their schemas are not owned by this host. Missing provenance,
+    duplicate ids, absent identity, an unknown builtin, an incomplete/failed
+    result, or any count mismatch fails closed.
+    """
+    if not builtin_identity_trusted:
+        return False
+    if turn_tool_calls <= 0 or len(turn_tool_identities) != turn_tool_calls:
+        return False
+    call_ids: list[str] = []
+    for call_id, server_name, tool_name, identity_trusted in turn_tool_identities:
+        if not all(isinstance(value, str) for value in (call_id, server_name, tool_name)):
+            return False
+        if (
+            not call_id
+            or server_name
+            or identity_trusted is not True
+            or tool_name not in _READ_ONLY_PREPARATION_TOOLS
+        ):
+            return False
+        call_ids.append(call_id)
+    if len(set(call_ids)) != len(call_ids):
+        return False
+    return frozenset(call_ids) == successful_tool_call_ids
+
+
 def should_recover_promise_only(
     *,
     stop_reason: str,
@@ -2661,13 +2902,17 @@ def should_recover_promise_only(
     is_cancelled: bool,
     refusal_reasons: list,
     turn_tool_calls: int = 0,
+    turn_tool_identities: tuple[tuple[str, str, str, bool], ...] = (),
+    successful_tool_call_ids: frozenset[str] = frozenset(),
+    builtin_identity_trusted: bool = False,
+    directive_user_origin: bool = False,
     in_stage_execution: bool = False,
     stop_in_progress: bool = False,
     stop_generation_unchanged: bool = True,
     queue_empty: bool = True,
     no_pending_steers: bool = True,
 ) -> bool:
-    """Decide whether to inject ONE promise-only continuation.
+    """Decide whether to inject ONE unacted-turn continuation.
 
     All must hold (each guards a distinct failure mode):
       * NO Stop is in progress (``stop_in_progress`` is the runner's
@@ -2696,22 +2941,26 @@ def should_recover_promise_only(
         those have their own paths and must stay unchanged;
       * it produced visible output (a promise IS visible output) and is not the
         empty-response case (that path owns ``not produced_visible_output``);
-      * the turn made NO tool calls (``turn_tool_calls == 0``). The segment-buffer
-        reset at each tool boundary is not an airtight "never replay an executed
-        action" proxy on its own: a turn that completed a side-effecting tool
-        (e.g. ``send_message``) and then emitted trailing promise-shaped text
-        ("I'll send that now") still matches the detector, and the continuation
-        would REISSUE the completed action (duplicate external message). The
-        promise-only bug is by definition a turn that announced an action and made
-        NO tool call, so requiring a zero tool-call count closes the replay hole
-        directly. A turn that ran a read then promised a further action is excluded
-        too — a false negative, which is the safe direction;
-      * the final segment is a terminal promise-to-act
-        (:func:`is_promise_only_terminal`). Because the runner resets its segment
-        buffer at every tool boundary, ``final_segment_text`` is exactly the text
-        AFTER the last tool call — so a turn that executed a tool and then
-        summarised has a summary here, not a promise; the ``turn_tool_calls`` gate
-        above is the airtight backstop for the same guarantee;
+      * ordinary promise-only recovery still requires ZERO tool calls. A second,
+        narrower shape may contain calls only when every dispatch has a unique id,
+        the runner positively identified the serving backend as Kiro, the provider
+        supplied a canonical non-MCP builtin identity carrying explicit extractor
+        provenance, that identity is one of the fixed read/search/fetch tools,
+        and a final
+        ``status=completed`` result arrived for exactly the same id set. Display
+        ``tool_kind`` and name non-emptiness are never authorization evidence.
+        Unknown/MCP/missing/untrusted identity,
+        duplicate ids, incomplete or failed calls, and every count/status mismatch
+        fail closed. The tool-bearing shape also requires
+        ``directive_user_origin``: the runner replays the authenticated user's
+        exact message, never the model-authored blocker or an announced action.
+        This lets a skill read or deferred-tool search retry without replaying a
+        completed mutation or minting authority from fetched content;
+      * the final segment is either a terminal promise-to-act
+        (:func:`is_promise_only_terminal`) on a zero-call turn, or the narrowly
+        full-matched false current-tool blocker above after read-only preparation.
+        Because the runner resets its segment buffer at every tool boundary,
+        ``final_segment_text`` is exactly the text AFTER the last tool call;
       * this is NOT a stage-execution turn (``in_stage_execution``). A turn run by
         the orchestrator's stage loop must not spawn async recovery: the loop
         records the stage complete and advances before the continuation finishes,
@@ -2731,7 +2980,14 @@ def should_recover_promise_only(
         return False
     if is_cancelled or refusal_reasons:
         return False
-    if turn_tool_calls != 0:
+    if turn_tool_calls != 0 and not tool_calls_are_read_only_preparation(
+        turn_tool_calls,
+        turn_tool_identities,
+        successful_tool_call_ids,
+        builtin_identity_trusted=builtin_identity_trusted,
+    ):
+        return False
+    if turn_tool_calls and not directive_user_origin:
         return False
     if in_stage_execution:
         return False
@@ -2741,6 +2997,8 @@ def should_recover_promise_only(
         return False
     if prompt_depth != 0 or promise_only_retries >= 1:
         return False
+    if turn_tool_calls:
+        return is_false_current_tool_blocker(final_segment_text)
     return is_promise_only_terminal(final_segment_text)
 
 
@@ -2874,6 +3132,33 @@ _MANUAL_CONTINUE_MSG = (
     "request is genuinely complete, say so in one line instead of inventing "
     "further work."
 )
+# Injected INSTEAD of the user's message when a content-filter refusal landed
+# after the turn had already dispatched tool calls and agent.refusal_fallback_model
+# names a different model (chat_runner._refusal_fallback_retry). Replaying the
+# message would run those tool calls a second time, so the session -- moved to
+# the fallback model -- is asked to carry on from the completed work, which is
+# what a person gets by pressing Continue. The nudge goes to the SAME harness
+# session the refused turn ran on (the retention every Continue relies on), and
+# Kiro Crew itself never re-sends the message once a tool ran. Unlike
+# ``_MANUAL_RESUME_MSG`` it offers no restart clause: it is sent only when the
+# turn dispatched a tool, so "nothing was done yet" is never true of it, and a
+# model that cannot see the partial turn (a session that did not keep it) is
+# told to stop rather than start over -- failing safe instead of re-running the
+# writes.
+#
+# Deliberately silent about the content filter and the model swap: the FALLBACK
+# model reads this body, and telling it the request was just declined primes it
+# to decline too. The user learns both from the retry notice card beside it.
+# Not in ``_SYNTHETIC_RECOVERY_MSGS``: the retry turn is recognized by its queue
+# id, not by text, and the turn-start re-arm already skips recovery-kind entries.
+_REFUSAL_FALLBACK_RESUME_MSG = (
+    f"{REFUSAL_FALLBACK_RECOVERY_PREFIX}\n"
+    "The previous turn ended before it finished. Look at the conversation above, "
+    "work out what was already completed, and finish the user's most recent "
+    "request from there. Do NOT re-run steps or tools that already completed "
+    "successfully. If the completed work is not visible in the conversation "
+    "above, do NOT start the request over — say so and stop."
+)
 
 
 class ResetCause(str, Enum):
@@ -2953,6 +3238,11 @@ def is_system_injection(content: str) -> bool:
 #: Structural queue-entry kind for runner-injected recovery instructions.
 SYNTHETIC_RECOVERY_KIND = "synthetic_recovery"
 
+#: Structural kind for a false-tool-blocker retry whose TEXT is the authenticated
+#: user's original request.  It is recovery orchestration (so it breaks merges and
+#: can be purged), but its ``RecoveryPayload.ORIGINAL`` remains user-authored.
+FALSE_TOOL_BLOCKER_REPLAY_KIND = "false_tool_blocker_replay"
+
 #: Row-level kind for the `error` notice appended when a recovery has ALREADY
 #: been queued, so the frontend can tell a pending retry from a terminal failure.
 TRANSIENT_RETRY_KIND = "transient_retry"
@@ -2997,11 +3287,51 @@ MODEL_UNENTITLED_KIND = "model_unentitled"
 #: backend formatted it.
 AUTH_REQUIRED_KIND = "auth_required"
 
+#: Row-level kind for the terminal `error` row a SPENT PLAN ALLOWANCE produces
+#: ("The monthly usage limit has been reached"). Like the two above, no
+#: recovery is queued -- the allowance does not come back until it resets, so a
+#: retry reproduces the rejection -- and the prose stays as the backend
+#: formatted it. The kind exists so a surface that has a NON-inference way to
+#: finish what the turn was for can offer it on the row: the header's "Request
+#: a Feature" action is an agent turn by design, and without this tag the one
+#: moment a user has no inference left was the one moment that action
+#: dead-ended (the frontend must never infer the limit from the prose, which a
+#: copy edit or a translation moves).
+USAGE_LIMIT_KIND = "usage_limit"
+
+#: Row-level kind for the terminal `error` row a SESSION START that never
+#: answered produces (``session/new`` / ``session/load`` timed out -- the
+#: ``session_start_failed`` tag both ACP exception families carry). Unlike the
+#: three kinds above a retry CAN help here once: a cold start under load is
+#: host weather, so the first Resume keeps its button and its behaviour. What
+#: the kind exists for is the SECOND failure in a row. A start that timed out
+#: registered no session, so ``SessionManager.record_failure`` has nothing to
+#: count against and every Resume re-issued the identical ``session/new`` with
+#: no exit condition -- the transcript IS the count. The Continue endpoint
+#: refuses the re-run once two tagged rows sit at the tail with nothing but
+#: recovery rows between them, and the error card swaps Resume for the remedy
+#: (restart the gateway). Decided from the exception's tag, never from the
+#: prose, which a reword or a translation moves.
+SESSION_START_FAILED_KIND = "session_start_failed"
+
 #: Structural queue-entry kinds for system injections.  Classification by kind
 #: tag — set at enqueue time — is unforgeable: a user typing the same prefix
 #: text will not have the kind tag and will correctly classify as plain input.
 SUBAGENT_COMPLETION_KIND = "subagent_completion"
 CRON_NOTIFICATION_KIND = "cron_notification"
+#: An embedded MCP App's ui/message delivery (SEP-1865 return channel) — see
+#: ``dashboard.handlers.mcp_apps.api_mcp_apps_message``. System injection like
+#: the two above: app-authored, never user speech, must break user-message
+#: merges (folding it into a merged user turn would flip server-authored text
+#: into user-authored, persisted, channel-mirrored history).
+MCP_APP_MESSAGE_KIND = "mcp_app_message"
+
+#: Provenance banner wrapped around every app-originated message. Structural
+#: classification is by the queue entry's ``kind`` tag (unforgeable, set at
+#: enqueue time); the banner exists for the MODEL and the transcript reader,
+#: so the turn's text says who authored it. Mirrors ``CRON_NOTIFY_PREFIX``.
+APP_MESSAGE_PREFIX = "[MCP app message from "
+APP_MESSAGE_END = "[End of MCP app message]"
 
 #: Queue-entry kinds whose turns must settle before an Autopilot stage advances.
 STAGE_DELIVERY_KINDS = frozenset((SUBAGENT_COMPLETION_KIND, SYNTHETIC_RECOVERY_KIND))
@@ -3023,20 +3353,41 @@ def owned_stage_delivery_entry(boundary: Any, entries: list[dict]) -> dict | Non
 # MERGE-REVIEW: Peer and restart deliveries still carry trusted queue metadata;
 # upstream's stage-delivery set covers only subagent completions and recovery.
 _SYSTEM_INJECTION_KINDS = STAGE_DELIVERY_KINDS | frozenset(
-    (CRON_NOTIFICATION_KIND, PEER_CHANNEL_REQUEST_KIND, POST_RESTART_CONTINUATION_KIND)
+    (
+        CRON_NOTIFICATION_KIND,
+        PEER_CHANNEL_REQUEST_KIND,
+        POST_RESTART_CONTINUATION_KIND,
+        MCP_APP_MESSAGE_KIND,
+        FALSE_TOOL_BLOCKER_REPLAY_KIND,
+    )
 )
 
 
-def is_synthetic_recovery_item(item: dict) -> bool:
-    """True when a queue ENTRY is a runner-injected synthetic recovery
-    instruction (post-transient CONTINUE / empty-response nudge).
+def app_inject_row(label: str) -> tuple[str, str, dict]:
+    """The ONE builder for an app-delivery transcript row.
 
-    Classification is structural — the ``kind`` tag set at ``queue_insert``
-    time — never content equality: metadata survives any queue transformation
-    (merge, prefixing, truncation) and cannot collide with a user pasting the
-    transcript-visible recovery text verbatim (which must classify as a plain
-    user message)."""
-    return item.get("kind") == SYNTHETIC_RECOVERY_KIND
+    Both delivery paths (direct dispatch in ``handlers/mcp_apps.py`` and the
+    queue drain in ``chat_runner.py``) call this, so the row cannot diverge
+    between them. ``cls`` is a plain CSS class — NEVER a JSON payload: a JSON
+    ``cls`` makes ``_prepare_messages`` replace the stored meta with the
+    cls-derived dict on the HTTP rebuild path, silently dropping
+    ``injectKind`` and with it the row's collapse/fold exemptions. The label
+    travels in ``meta`` only, and is never re-derived from the banner text.
+    """
+    return "inject", "msg msg-inject", {"injectKind": "mcp_app", "appLabel": label}
+
+
+def is_synthetic_recovery_item(item: dict) -> bool:
+    """True when a queue ENTRY is runner-injected recovery orchestration.
+
+    The false-tool-blocker replay carries the authenticated user's own text, but
+    its distinct kind still identifies the runner-owned retry for queue ordering
+    and late-cancellation purge. Payload provenance remains a separate question.
+    """
+    return item.get("kind") in (
+        SYNTHETIC_RECOVERY_KIND,
+        FALSE_TOOL_BLOCKER_REPLAY_KIND,
+    )
 
 
 def is_peer_channel_request_item(item: dict) -> bool:
@@ -3053,10 +3404,10 @@ class RecoveryPayload(str, Enum):
     """Whether a recovery entry's TEXT is runner-authored or the user's own words.
 
     ``build_recovery_requeue`` already draws this line — a continuation once the
-    turn emitted output, the original request before that — but both re-queue
-    under ``SYNTHETIC_RECOVERY_KIND``, because both must render as an inject row
-    rather than a second user bubble. The kind therefore cannot also answer
-    whether the text may be mirrored to a linked thread as user speech.
+    turn emitted output, the original request before that. Most re-queue under
+    ``SYNTHETIC_RECOVERY_KIND``; false-tool-blocker user replays use their own
+    purgeable kind. Neither kind can answer whether text may be mirrored to a
+    linked thread as user speech, so payload remains the authority classifier.
 
     ``str`` mixin (not ``StrEnum``) for Py3.10 compat, matching ``ResetCause``.
     """
@@ -3084,10 +3435,17 @@ def is_synthetic_payload_item(item: dict) -> bool:
     errors are not symmetric: mirroring runner text as if the user typed it
     misattributes machine orchestration, while suppressing a mirror only loses an
     echo of something the user can already see.
+
+    An MCP-App message entry (``MCP_APP_MESSAGE_KIND``) is synthetic by the same
+    asymmetry: its text is app-authored (server-authored), so mirroring it to a
+    linked channel as the human's own words would attribute machine speech to a
+    person.
     """
     payload = item.get("payload")
     if payload:
         return payload == RecoveryPayload.CONTINUATION
+    if item.get("kind") == MCP_APP_MESSAGE_KIND:
+        return True
     return is_synthetic_recovery_item(item)
 
 

@@ -186,10 +186,15 @@ It includes markdown/plain-text (`.md`/`.txt`/`.org`), source-code extensions, a
 **`.pptx` is intentionally out of `SUPPORTED`** even though `_read_pptx` exists: python-pptx is not declared in `setup.cfg`, so the format is kept off the allowlist (the comment at `readers.py` documents this). Reachable only if `.pptx` were re-added to `SUPPORTED`.
 
 **Binary/optional-dep readers** degrade gracefully — a missing optional import returns an `{'format': 'error'}` meta with an install hint rather than raising:
-- `_read_pdf` — pdfplumber; concatenates per-page `extract_text()`, records `page_count`,
-  and releases each page immediately after extraction so its parsed-layout cache does not
-  remain resident until the whole document closes (`Page.close()` when available, with
-  `flush_cache()` compatibility for pdfplumber 0.10).
+- `_read_pdf` — pdfplumber, run in a memory-bounded child (`kiro_crew.pdf_extract`,
+  `extractor` rlimit profile: `RLIMIT_AS` 1 GiB / `RLIMIT_CPU` 60 s; the file handle is the
+  child's stdin). Concatenates per-page text, records `page_count` (pages opened), and caps
+  the document at `_PDF_MAX_CHARS` characters / `PDF_MAX_PAGES` pages / `_PDF_WALL_SECS`
+  wall seconds, setting `truncated: True` when a cap cut it. A child stopped by its ceiling
+  is the ordinary `format: 'error'` result, which `ingest_file` records as a per-file
+  failure. The child releases each page immediately after extraction (`Page.close()` when
+  available, `flush_cache()` for pdfplumber 0.10). Shared with file-grep's document pass
+  (`file-search.md`) so the two call sites cannot drift in what they bound.
 - `_read_docx` — python-docx; converts `Heading N` paragraph styles to `#`-prefixed markdown (`content_type: 'markdown'`), records `paragraph_count`.
 - `_read_html` — html2text when importable (`ignore_images=True`, `ignore_links=False`); otherwise a regex fallback strips `<script>`/`<style>` and tags.
 
@@ -651,6 +656,7 @@ migrating it.
 - **The search branch's candidate load runs off the event loop** — a scoped search escalates its candidate pool, so `_load_items_by_id` (batch `SELECT` plus per-row serialization) and the `source_counts` aggregate both run via `asyncio.to_thread`. `store.db` is a per-thread connection, so each worker thread uses its own. Run inline, either can stall the loop past the watchdog threshold on a large KB.
 - **Frontend selection is bounded to on-screen items** — in source-first mode item data lives in per-`SourceGroup` caches, so bulk actions read the items each expanded group reports as rendered, and selected IDs are pruned when a group collapses or pages away. Reading the react-query cache directly would let a bulk Delete reach a retained cache for a source the user can no longer see.
 - **Per-source caches are keyed under the `knowledge-items` prefix** — `['knowledge-items', 'source-items', ...]` and `['knowledge-items', 'source-counts', ...]` so every existing `invalidateQueries(['knowledge-items'])` call site reaches them. Consequently any `setQueriesData` on that prefix must guard on the payload shape, since the counts entry has no `items` array.
+- **A connection belongs to the thread that opened it; production closes the others by exiting** — `store.db` hands each thread its own SQLite connection through a thread-local (the constructor's on the loop thread, one per `asyncio.to_thread` / embed-pool worker that touches the store). `close()` releases the CALLING thread's connection and nothing else, which `test_knowledge_cross_thread.py::test_close_only_releases_calling_threads_connection` pins; there is no production moment at which every thread is provably idle short of process exit, so no production path closes another thread's handle. Tests have that moment, and need it: on CPython 3.11+ an unclosed `sqlite3.Connection` is a reference cycle (its statement cache is an `lru_cache` over the connection), so a dropped store holds `db` + `-wal` + `-shm` per thread until the cyclic collector runs. `_close_all_for_tests()` is that test-only seam: it closes every connection the store ever opened, on any thread (the rootdir test conftest flips the module flag `_ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS` once per session; under it a connection is opened `check_same_thread=False` through the `_ThreadAffineTestConnection` factory, which re-applies the thread-affinity guard in Python on every statement entry point the store uses (`cursor`, `execute*`, `commit`, `rollback`), leaving only `close()` cross-thread, and is registered for the teardown close. Production connections keep SQLite's native guard, register nothing -- so no exited thread's handle is pinned -- and the seam raises `RuntimeError` when the flag is off: `test_knowledge.py::TestKnowledgeStore::test_production_keeps_the_thread_guard_and_the_seam_refuses_without_the_flag` and `::test_the_test_mode_connection_still_refuses_another_threads_use`), bumps a generation so a thread whose handle was closed from elsewhere reopens lazily on its next `db` take, and is idempotent — `test_knowledge.py::TestKnowledgeStore::test_close_all_releases_every_threads_connection_and_reopens_lazily`. The dashboard harness and every store fixture call it at teardown (tenth hygiene pass). Nothing in production may.
 
 ## Graph internals
 

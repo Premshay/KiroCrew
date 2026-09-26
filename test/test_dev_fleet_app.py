@@ -2089,6 +2089,58 @@ def test_build_env_excludes_credentials(monkeypatch):
     assert mod._build_env(with_credentials=True)["PATH"] == mod._TRUSTED_PATH
 
 
+def test_build_env_passes_npm_registry_but_drops_credential_shaped_keys(monkeypatch):
+    """NPM_CONFIG_REGISTRY is a registry URL, not a credential -- it must reach
+    every Dev Fleet npm step (preflight AND the real ``npm ci``/``npm run
+    build``) so both resolve against the same registry. A credential-shaped
+    variable next to it must still be dropped by the same allowlist.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setenv("NPM_CONFIG_REGISTRY", "https://registry.npmjs.org")
+    monkeypatch.setenv("NPM_CONFIG__AUTHTOKEN", "npm-secret-token")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-secret")
+
+    for env in (mod._build_env(), mod._build_env(with_credentials=True)):
+        assert env["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org"
+        assert "NPM_CONFIG__AUTHTOKEN" not in env
+        assert "SLACK_BOT_TOKEN" not in env
+
+
+def test_build_env_rejects_npm_registry_values_that_smuggle_credentials(monkeypatch):
+    """``NPM_CONFIG_REGISTRY`` is forwarded only when it is a bare
+    ``http``/``https`` registry URL with no userinfo, query, fragment, or
+    embedded whitespace -- URL syntax otherwise permits a credential-bearing
+    value (``https://user:token@host/``) or a smuggled second value to reach
+    a worktree-controlled build script through this allowlist entry. A value
+    that fails validation is dropped outright (fail closed), never rewritten,
+    and an unrelated credential-shaped variable next to it is still dropped
+    too.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    dropped = (
+        "https://u:tok@registry.example/",  # userinfo
+        "https://registry.example/?x=1",  # query
+        "https://registry.example/#f",  # fragment
+        "file:///etc/passwd",  # non-http(s) scheme
+        "",  # empty
+        "https://registry.npmjs.org ",  # embedded whitespace
+    )
+    for value in dropped:
+        monkeypatch.setenv("NPM_CONFIG_REGISTRY", value)
+        monkeypatch.setenv("NPM_CONFIG__AUTHTOKEN", "npm-secret-token")
+        monkeypatch.setenv("NPM_TOKEN", "npm-secret-token-2")
+        env = mod._build_env()
+        assert "NPM_CONFIG_REGISTRY" not in env, value
+        assert "NPM_CONFIG__AUTHTOKEN" not in env
+        assert "NPM_TOKEN" not in env
+
+    # A clean value right after a dropped one still passes through.
+    monkeypatch.setenv("NPM_CONFIG_REGISTRY", "https://registry.npmjs.org")
+    assert mod._build_env()["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org"
+
+
 def test_is_safe_env_key_matches_documented_spelling_on_windows():
     """A mixed-case allowlist entry must still match what ``os.environ`` yields.
 
@@ -5956,8 +6008,17 @@ def test_trusted_bin_dirs_cover_homebrew_prefixes():
 def test_trusted_bin_pins_the_resolved_target_not_the_symlink(monkeypatch, tmp_path):
     """Homebrew's `bin/gh` is a user-writable symlink into `Cellar/`. Caching the
     LINK would let it be repointed between validation and execution, so the
-    vetted real path is what gets cached and spawned."""
+    vetted real path is what gets cached and spawned.
+
+    ``_trusted_bin`` refuses any resolved target under ``Path.home()``. Whether
+    ``tmp_path`` is inside HOME is a property of the HOST (a ``TMPDIR`` under
+    ``~`` puts it there; CI and macOS keep it outside), so the home root is
+    pinned to a sibling directory that is NOT an ancestor of the fake Cellar.
+    """
     mod._TRUSTED_BIN_CACHE.clear()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     cellar = tmp_path / "Cellar" / "gh" / "1.0" / "bin"
     cellar.mkdir(parents=True)
     target = cellar / "gh"
@@ -5969,6 +6030,30 @@ def test_trusted_bin_pins_the_resolved_target_not_the_symlink(monkeypatch, tmp_p
     monkeypatch.setattr(runtime_mod, "_TRUSTED_BIN_DIRS", (str(bin_dir),))
 
     assert mod._trusted_bin("gh") == str(target.resolve())
+    mod._TRUSTED_BIN_CACHE.clear()
+
+
+def test_trusted_bin_refuses_target_under_home(monkeypatch, tmp_path):
+    """The HOME refusal is the guard the test above pins around: an otherwise
+    system-shaped target (0o555, not writable by us) whose resolved path lies
+    under ``Path.home()`` is never selected, because anything under the user's
+    home is the agent's to replace. Every platform: the refusal is decided on
+    the resolved path before any POSIX mode check, so the candidate is placed
+    directly in the trusted dir (no symlink) and the test runs on Windows too.
+    """
+    mod._TRUSTED_BIN_CACHE.clear()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    bin_dir = home / "Cellar" / "gh" / "1.0" / "bin"
+    bin_dir.mkdir(parents=True)
+    exe = "gh.exe" if platform_compat.IS_WINDOWS else "gh"
+    target = bin_dir / exe
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o555)
+    monkeypatch.setattr(runtime_mod, "_TRUSTED_BIN_DIRS", (str(bin_dir),))
+
+    assert mod._trusted_bin("gh") is None
     mod._TRUSTED_BIN_CACHE.clear()
 
 
@@ -6030,7 +6115,7 @@ def test_find_cli_is_module_invocation_only(nonbundled_python_without_user_site)
     entry (its __main__), never ``kiro_crew.cli`` (no __main__ guard -> #220)."""
     import sys as _sys
 
-    assert mod._find_cli() == [_sys.executable, "-s", "-m", "kiro_crew"]
+    assert mod._find_cli() == [_sys.executable, "-s", "-P", "-m", "kiro_crew"]
 
     import subprocess as _sp
 
@@ -6959,7 +7044,7 @@ def test_find_cli_targets_kiro_crew_package(nonbundled_python_without_user_site)
     ``kiro_crew.cli`` — the latter has no __main__ guard and no-ops silently."""
     import sys
 
-    assert mod._find_cli() == [sys.executable, "-s", "-m", "kiro_crew"]
+    assert mod._find_cli() == [sys.executable, "-s", "-P", "-m", "kiro_crew"]
 
 
 def test_kiro_crew_module_entry_actually_runs():

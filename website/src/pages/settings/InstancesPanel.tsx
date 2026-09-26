@@ -1,7 +1,7 @@
 /**
  * InstancesPanel — legacy control plane for remote Kiro Crew instances
  * reachable over SSH tunnels (add / edit / connect / disconnect / diagnose).
- * No longer routed as a settings tab: Settings → Remote Instances renders
+ * No longer routed as a settings tab: Settings → Remote Crew renders
  * RemoteCrewPanel, which reuses AddInstanceForm and StatusBadge from this
  * file. This panel is the *control plane* only — it does not
  * embed remote dashboards. Once an instance is connected here, switch into it
@@ -52,6 +52,18 @@ const STATE_DOT: Record<InstanceTunnelStatus['state'], string> = {
   disconnected: 'bg-muted',
 }
 
+/** Catalog keys for the tunnel state. The wire value was printed raw and
+ *  CSS-capitalized: untranslated in every locale and invisible to the i18n
+ *  added-lines gate. Fully typed by the state union (no fallback needed) and
+ *  indexed inline so the key gate resolves the map, like STATE_DOT above. */
+const STATE_LABEL_KEY: Record<InstanceTunnelStatus['state'], string> = {
+  connected: 'pages.settings.instancesPanel.state_connected',
+  connecting: 'pages.settings.instancesPanel.state_connecting',
+  error: 'pages.settings.instancesPanel.state_error',
+  stopped: 'pages.settings.instancesPanel.state_stopped',
+  disconnected: 'pages.settings.instancesPanel.state_disconnected',
+}
+
 /** Human-friendly duration ("3h 12m", "45m", "30s"). */
 export function humanizeSecs(secs: number): string {
   if (secs <= 0) return fmtUnit(0, 'second', { maximumFractionDigits: 0 })
@@ -67,7 +79,7 @@ export function StatusBadge({ status }: { status: InstanceTunnelStatus }) {
   return (
     <span className="inline-flex items-center gap-1.5 text-[13px] text-muted">
       <span className={`inline-block w-2 h-2 rounded-full ${dot}`} aria-hidden />
-      <span className="capitalize">{status.state}</span>
+      <span>{i18nT(STATE_LABEL_KEY[status.state])}</span>
       {/* The tunnel's own error from the backend. `askAgent` is safe: the crew
           record is already persisted, and every draft either host holds (the
           add form here, the add/edit forms in RemoteCrewPanel) lives in the

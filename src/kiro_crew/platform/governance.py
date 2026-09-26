@@ -4063,6 +4063,32 @@ BUILTIN_TOOL_SCOPES: Dict[str, Tuple[str, ...]] = {
     "web_search": ("network.egress",),
 }
 
+#: Builtin -> the ``capabilities.*`` gate that also governs it. A capability is
+#: not a ``tools`` rule, so the name check below cannot see it: a policy that
+#: switches spawning off, or scopes which agents may be spawned, says nothing
+#: about the tool NAME ``use_subagent``. An auto-approved spawn raises no
+#: permission request, so the per-spawn check at the gate never runs for it --
+#: which is why the grant itself is withheld while the capability restricts
+#: anything. Every ``allowedTools`` writer asks this predicate, so no backend and
+#: no channel (the wire projection, the on-disk spec) can carry the grant.
+BUILTIN_TOOL_CAPABILITIES: Dict[str, str] = {"use_subagent": "capabilities.spawn"}
+
+
+def _capability_restricts(control: object) -> bool:
+    """Whether one level's capability gate restricts anything.
+
+    ``None`` (undeclared) is no opinion. A declared gate restricts when it is off
+    or carries any scope -- a scope is a ruleset, and even an empty allow-mode one
+    denies everything. Only an enabled gate with no scopes permits every use. A
+    shape this does not recognise is treated as a restriction.
+    """
+    if control is None:
+        return False
+    if not isinstance(control, CapabilityGate):
+        return True
+    return not control.enabled or bool(control.scopes)
+
+
 # The scopes whose enforcement is an ALWAYS-ON, ceiling-independent floor applied
 # at the PreToolUse gate: sensitive-path blocking for filesystem tools and
 # denied-command rules for shell tools. A builtin mapping to any of these must
@@ -4229,9 +4255,42 @@ def may_skip_gate(ref: str, ceiling: Optional[GovernanceCeiling]) -> bool:
         # bypassed a `tools`-scope ceiling (e.g. tools.deny=["report"]). The
         # capability scopes it DOES map to add path/host granularity on top.
         scopes = ("tools",) + tuple(BUILTIN_TOOL_SCOPES.get(ref, ()))
-        return not any(_ruleset_has_an_opinion(ceiling.get(scope)) for scope in scopes)
+        if any(_ruleset_has_an_opinion(ceiling.get(scope)) for scope in scopes):
+            return False
+        capability = BUILTIN_TOOL_CAPABILITIES.get(ref)
+        return not (capability and _capability_restricts(ceiling.get(capability)))
     except Exception:  # noqa: BLE001 — see the fail-closed note above
         logger.warning("ceiling probe failed for %r; not auto-approving", ref, exc_info=True)
+        return False
+
+
+def _declared_auto_approve(emitted: Mapping[str, object]) -> Mapping[str, tuple[str, ...]]:
+    """Per server, the ``autoApprove`` verbs its own spec declares.
+
+    Fail-closed the useful way round: an unreadable owner declares nothing, so the
+    floor applies to everything rather than exempting everything.
+    """
+    try:
+        from kiro_crew.agent import declared_auto_approve
+
+        return declared_auto_approve(emitted)
+    except Exception:  # noqa: BLE001 — a lookup failure must not grant an exemption
+        logger.warning("could not read the declared autoApprove verbs", exc_info=True)
+        return {}
+
+
+def _auto_approve_is_honoured() -> bool:
+    """Whether the operator opted in to keeping an undeclared ``autoApprove``.
+
+    Fail-closed: unreadable config withholds it; the value decides whether a gate runs.
+    """
+    try:
+        from kiro_crew.config import live
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return bool((live.snapshot() or KiroCrewConfig.load()).mcp.honour_auto_approve)
+    except Exception:  # noqa: BLE001 — an unreadable config must not grant a bypass
+        logger.warning("could not read mcp.honour_auto_approve; withholding", exc_info=True)
         return False
 
 
@@ -4257,25 +4316,47 @@ def strip_ungoverned_auto_approve(
 
     Only the key is dropped, never the server: the tools stay available and go
     through the approval gate, which is where a per-tool ceiling rule is applied.
-    Unchanged on an ungoverned host.
+
+    An ungoverned host is a FLOOR, not a pass: ``may_skip_gate_now`` is always true
+    there, so a verb NO spec declares is dropped there too unless
+    ``mcp.honour_auto_approve`` is on; what a spec declares is our own emission and
+    is kept. A governed ref keeps nothing — tightest-wins. The declarations are
+    resolved here, not taken from the caller: of the six write paths reaching this
+    helper only one could name them, and the other five would erase them.
     """
+    seeded = _declared_auto_approve(servers)
+    honoured = _auto_approve_is_honoured()
     out: Dict[str, object] = {}
     for name, spec in servers.items():
         if not isinstance(spec, dict) or "autoApprove" not in spec:
             out[name] = spec
             continue
-        if may_skip_gate_now(f"@{name}"):
+        kept: list = []
+        if not may_skip_gate_now(f"@{name}"):
+            pass  # governed: nothing survives, and the enterprise path is unchanged
+        elif honoured:
             out[name] = spec
             continue
+        else:
+            asked = spec["autoApprove"]
+            declared = seeded.get(name) or ()
+            kept = [v for v in asked if v in declared] if isinstance(asked, list) else []
+            if kept == asked:
+                out[name] = spec
+                continue
         trimmed = dict(spec)
-        trimmed.pop("autoApprove", None)
+        if kept:
+            trimmed["autoApprove"] = kept
+        else:
+            trimmed.pop("autoApprove", None)
         if not audit:
             out[name] = trimmed
             continue
         logger.info(
-            "Dropped autoApprove from MCP server %s: the governance ceiling "
-            "constrains it, so its tools go through the approval gate",
+            "Withheld autoApprove verbs on MCP server %s (kept %r): the ceiling "
+            "constrains it, or no spec declared them and the opt-in is off",
             name,
+            kept,
         )
         # Revoking a gate exemption is a permission DECISION — the allowedTools
         # writers emit this same SEL event, so a silent pop here would be the one
@@ -4287,8 +4368,8 @@ def strip_ungoverned_auto_approve(
                 outcome="ok",
                 source="strip_ungoverned_auto_approve",
                 resources=(
-                    f"@{name} autoApprove removed (governance ceiling); "
-                    "calls go through the approval gate"
+                    f"@{name} autoApprove narrowed to {kept} (governance ceiling or "
+                    "the undeclared-grant floor); the rest go through the gate"
                 ),
             )
         except Exception:  # noqa: BLE001 — audit must not break the filter

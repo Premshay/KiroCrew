@@ -17,12 +17,19 @@ the turn and truncates its output.
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.session_handle import AcpSessionHandle
-from kiro_crew.acp.types import METHOD_SESSION_UPDATE, JsonRpcMessage
+from kiro_crew.acp.types import (
+    EVENT_TEXT_CHUNK,
+    EVENT_TOOL_RESULT,
+    METHOD_SESSION_UPDATE,
+    JsonRpcMessage,
+)
 
 SESSION = "sA"
 
@@ -90,9 +97,7 @@ async def test_a_failed_tool_still_arms_the_stale_clock() -> None:
 async def test_a_streamed_partial_result_does_not_arm_the_stale_clock() -> None:
     """An in-progress update is not yet the model's turn to speak."""
     handle = _handle()
-    await _drive(
-        handle, _update_msg(_tool_call()), _update_msg(_tool_result(status="in_progress"))
-    )
+    await _drive(handle, _update_msg(_tool_call()), _update_msg(_tool_result(status="in_progress")))
     assert handle._stale_eligible is False, "a still-writing tool must not meet the stale probe"
 
 
@@ -102,3 +107,187 @@ async def test_a_dispatched_tool_still_disarms_the_stale_clock() -> None:
     handle = _handle()
     await _drive(handle, _update_msg(_tool_call()))
     assert handle._stale_eligible is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["a", "b"])
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+async def test_overlapping_tools_keep_tool_watchdog_until_last_result(first, status):
+    handle = _handle()
+    second = "b" if first == "a" else "a"
+    handle._handle_update(_update_msg(_tool_call("a")))
+    handle._handle_update(_update_msg(_tool_call("b")))
+    survivor = handle._active_tool_calls[second][0]
+    handle._handle_update(_update_msg(_tool_result(first, status=status)))
+    assert handle._tool_dispatched is True
+    assert handle._stale_eligible is False
+    assert handle._inflight_tool_call_id == second
+    assert handle._inflight_tool is survivor
+
+    handle._handle_update(_update_msg(_tool_result(second, status="in_progress")))
+    handle._handle_update(
+        _update_msg(
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "still working"},
+            }
+        )
+    )
+    assert handle._tool_dispatched is True
+    assert handle._stale_eligible is False
+    assert handle._inflight_tool is survivor
+
+    handle._handle_update(_update_msg(_tool_result(second)))
+    assert handle._tool_dispatched is False
+    assert handle._stale_eligible is True
+    assert handle._inflight_tool is None
+    assert not handle._active_tool_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["a", "b"])
+async def test_client_overlapping_tools_keep_tool_watchdog(monkeypatch, first):
+    client = AcpClient()
+    second = "b" if first == "a" else "a"
+
+    async def prompt_loop(*args):
+        yield "update", _update_msg(_tool_call("a"))
+        yield "update", _update_msg(_tool_call("b"))
+        yield "update", _update_msg(_tool_result(first))
+        assert client._tool_dispatched is True
+        assert client._stale_eligible is False
+        assert client._active_tool_calls == {second}
+        yield "update", _update_msg(_tool_result(second, status="in_progress"))
+        yield "update", _update_msg(
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "still working"},
+            }
+        )
+        assert client._tool_dispatched is True
+        assert client._stale_eligible is False
+        yield "update", _update_msg(_tool_result(second))
+        assert client._tool_dispatched is False
+        assert client._stale_eligible is True
+        assert not client._active_tool_calls
+        yield "complete", JsonRpcMessage(id=1, result={"stopReason": "end_turn"})
+
+    monkeypatch.setattr(client, "_prompt_loop", prompt_loop)
+    monkeypatch.setattr(client, "_read_new_tool_results_sync", lambda: [])
+    async for _ in client._dispatch_events(req_id=1, timeout=5):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger", ["text", "thinking", "tool", "complete", "refusal", "interrupted"]
+)
+async def test_client_jsonl_result_retires_call_at_every_flush(monkeypatch, tmp_path, trigger):
+    client = AcpClient()
+    client._session_id = SESSION
+    monkeypatch.setattr("kiro_crew.acp.client.kiro_sessions_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.acp.client.error_is_refusal_terminal", lambda *_: True)
+    monkeypatch.setattr(client, "_emit_tool_interrupted_sel", lambda *_: None)
+    jsonl_path = tmp_path / f"{SESSION}.jsonl"
+
+    def publish_result():
+        jsonl_path.write_text(
+            json.dumps(
+                {
+                    "kind": "ToolResults",
+                    "data": {
+                        "content": [
+                            {
+                                "kind": "toolResult",
+                                "data": {
+                                    "toolUseId": "a",
+                                    "content": [{"kind": "text", "data": "ok"}],
+                                },
+                            }
+                        ]
+                    },
+                }
+            )
+            + "\n"
+        )
+
+    async def prompt_loop(*args):
+        yield "update", _update_msg(_tool_call("a"))
+        assert client._active_tool_calls == {"a"}
+        if trigger != "interrupted":
+            publish_result()
+        if trigger == "complete":
+            yield "complete", JsonRpcMessage(id=1, result={"stopReason": "end_turn"})
+        elif trigger == "refusal":
+            yield "error", JsonRpcMessage(id=1, error={"code": -32603, "message": "refused"})
+        elif trigger == "tool":
+            yield "update", _update_msg(_tool_call("b"))
+        else:
+            yield "update", _update_msg(
+                {
+                    "sessionUpdate": (
+                        "agent_thought_chunk" if trigger == "thinking" else "agent_message_chunk"
+                    ),
+                    "content": {
+                        "type": "text",
+                        "text": (
+                            "Tool uses were interrupted, waiting for the next user prompt"
+                            if trigger == "interrupted"
+                            else "continuing"
+                        ),
+                    },
+                }
+            )
+        yield "complete", JsonRpcMessage(id=1, result={"stopReason": "end_turn"})
+
+    monkeypatch.setattr(client, "_prompt_loop", prompt_loop)
+    results = []
+    async for event in client._dispatch_events(req_id=1, timeout=5):
+        if trigger == "interrupted" and event.kind == EVENT_TEXT_CHUNK:
+            publish_result()
+        if event.kind == EVENT_TOOL_RESULT:
+            results.append(event)
+            assert not event.tool_status
+            assert client._active_tool_calls == ({"b"} if trigger == "tool" else set())
+            assert client._tool_dispatched is (trigger == "tool")
+            assert client._stale_eligible is (trigger != "tool")
+    assert [event.tool_call_id for event in results] == ["a"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["a", "b"])
+async def test_client_jsonl_results_keep_other_calls_active(monkeypatch, first):
+    from kiro_crew.acp.types import AcpEvent
+
+    client = AcpClient()
+    second = "b" if first == "a" else "a"
+    pending = []
+
+    def read_results():
+        results = pending[:]
+        pending.clear()
+        return results
+
+    async def prompt_loop(*args):
+        yield "update", _update_msg(_tool_call("a"))
+        yield "update", _update_msg(_tool_call("b"))
+        for completed, remaining in [(first, {second}), (second, set())]:
+            pending.extend(
+                AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id=call_id, tool_output="ok")
+                for call_id in [completed, completed, "unrelated"]
+            )
+            yield "update", _update_msg(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "continuing"},
+                }
+            )
+            assert client._active_tool_calls == remaining
+            assert client._tool_dispatched is bool(remaining)
+            assert client._stale_eligible is (not remaining)
+        yield "complete", JsonRpcMessage(id=1, result={"stopReason": "end_turn"})
+
+    monkeypatch.setattr(client, "_prompt_loop", prompt_loop)
+    monkeypatch.setattr(client, "_read_new_tool_results_sync", read_results)
+    async for _ in client._dispatch_events(req_id=1, timeout=5):
+        pass

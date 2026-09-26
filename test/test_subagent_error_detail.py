@@ -164,6 +164,19 @@ class TestTombstoneResolvesRecoveryAction:
 
         assert self._recovery(agent_root, "withresult") == expected
 
+    def test_a_result_without_the_complete_flag_is_a_fragment(self, agent_root):
+        """A non-empty file without the flag is an opening sentence, not an answer."""
+        from kiro_crew.subagent_persistence import create_agent_folder
+
+        create_agent_folder("fragmented", task="t")
+        (agent_root / "fragmented" / "result.txt").write_text(
+            "an opening sentence", encoding="utf-8"
+        )
+
+        SubagentManager._write_tombstone(SubagentInfo(id="fragmented", task="t"), "error")
+
+        assert self._recovery(agent_root, "fragmented") == "partial_result"
+
     def test_no_result_still_owes_the_user_a_notification(self, agent_root):
         from kiro_crew.subagent_persistence import create_agent_folder
 

@@ -60,6 +60,7 @@ from kiro_crew.monitoring.models import (
 from kiro_crew.monitoring.registry import publicly_armable_kinds, publicly_armable_objectives
 from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
 from kiro_crew.solo_spawn import SOLO_SPAWN_REASONS
+from kiro_crew.work_vocab import WORK_ITEM_STATES, WORK_VERDICTS, WORK_WORKER_STATUSES
 
 # ── Constants ──
 
@@ -174,9 +175,28 @@ LESSON_LIST_OFFSET_MAX = 100_000_000
 # Allowed cron schedule kinds
 ALLOWED_SCHEDULE_KINDS = frozenset({"every", "cron", "at"})
 
-# Allowed hook events
+# Every event a script hook may be authored against: the five the gateway fires,
+# plus the six a Kiro Agent session owns, which are stored and fired by no event
+# (``hooks.HOOK_EVENTS_KAS_ONLY``, whose header says which of the six a Kiro
+# Agent even asks for and why Test still runs one). Spelled
+# out rather than imported from ``kiro_crew.hooks``, which imports this module --
+# ``test_hook_validation_parity`` pins the two sets equal, so a member added
+# there and forgotten here fails a test instead of silently refusing the new
+# event at the create and update schemas.
 ALLOWED_HOOK_EVENTS = frozenset(
-    {"AgentSpawn", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
+    {
+        "AgentSpawn",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "PreTaskExecution",
+        "PostTaskExecution",
+        "FileCreated",
+        "FileEdited",
+        "FileDeleted",
+        "UserTriggered",
+    }
 )
 
 # Valid agent name pattern (alphanumeric, hyphens, underscores)
@@ -1456,7 +1476,8 @@ SPAWN_STATUS_SCHEMA = ToolSchema(
     tool_name="spawn_status",
     fields=[
         FieldSpec("agent_id", str, required=True, max_len=64),
-        # Paged / filtered reads of the retained transcript (line-oriented).
+        # Paged / filtered reads of a running partial or retained full transcript
+        # (line-oriented in both states).
         FieldSpec("offset", int, min_val=0, max_val=100_000_000),
         FieldSpec("limit", int, min_val=0, max_val=2000),
         FieldSpec("grep", str, max_len=500),
@@ -1548,8 +1569,109 @@ MONITOR_START_SCHEMA = ToolSchema(
         # redaction, which is the one that governs what gets stored, because
         # redaction can grow the string.
         FieldSpec("banner", str, max_len=MAX_BANNER_CHARS),
+        # The wake judge's brief. A shape check only at this layer: the inner bounds
+        # live in validate_judge_spec, which the arm path applies, for the reason the
+        # banner cap is re-checked there -- what gets STORED is what needs bounding.
+        # Accepted and stored even when the judge's consent scope is off, so an armed
+        # loop survives the switch being granted later.
+        #
+        # ``bool`` is admitted because ``judge: false`` is the opt-out: a gated loop
+        # that names no brief is screened under the default, so refusing the judge
+        # needs a spelling of its own. Only ``false`` survives validate_judge_spec.
+        FieldSpec("judge", (dict, bool)),
     ],
 )
+
+#: Bounds for one wake-judge brief. These govern what gets STORED on the loop and
+#: therefore what leaves the machine on every tick, which is why they live beside the
+#: schema rather than only inside the point: the schema's ``dict`` check says the
+#: field is an object, and this says the object is small.
+MAX_JUDGE_TARGETS = 8
+MAX_JUDGE_TARGET_CHARS = 200
+MAX_JUDGE_CRITERION_CHARS = 500
+#: The only keys a brief may carry. Closed, and an unknown key is REFUSED rather
+#: than dropped: a misspelled ``wake_when`` that silently vanished would leave the
+#: owner believing they had armed a criterion the judge never received.
+JUDGE_SPEC_KEYS = frozenset({"targets", "wake_when", "quiet_when"})
+
+#: The normalised form of ``judge: false``. A RESERVED key, deliberately absent from
+#: :data:`JUDGE_SPEC_KEYS`, so the only spelling a caller has for the opt-out is the
+#: boolean: an owner writing ``{"off": true}`` by hand is refused as an unknown key
+#: rather than given a second way to say the same thing. The persisted loader keeps
+#: the key, because it has to reload what this function stored.
+JUDGE_OFF_KEY = "off"
+
+
+def judge_is_off(spec: object) -> bool:
+    """Whether *spec* is the stored opt-out rather than a brief. Never raises."""
+    return isinstance(spec, dict) and spec.get(JUDGE_OFF_KEY) is True
+
+
+def validate_judge_spec(raw: object) -> dict[str, object]:
+    """One wake-judge brief, normalised and bounded, or raise :class:`ValidationError`.
+
+    ``{}`` for an absent brief. An empty object is legal and means "no criteria of my
+    own": a gated loop carrying one is screened under the DEFAULT brief, so an empty
+    object is not how the judge is taken off. ``judge: false`` is -- it normalises to
+    the reserved :data:`JUDGE_OFF_KEY` marker, which the tick reads as an explicit
+    bypass.
+
+    Targets are bounded and de-duplicated but NOT resolved here -- whether a
+    ``chat-*`` key names a readable session is an authorization question, answered
+    per tick by the creator-only read, and a target that refuses is dropped then.
+    Checking it at arm time would only tell the owner what was true at arm time.
+    """
+    if raw is None:
+        return {}
+    if raw is False:
+        return {JUDGE_OFF_KEY: True}
+    if raw is True:
+        # Refused rather than read as "use the default", because the default already
+        # applies to every gated loop that names no brief. Accepting it would give one
+        # meaning two spellings, and the owner who typed it is more likely to have
+        # meant the opt-out.
+        raise ValidationError(
+            "judge", "use false to bypass the judge; the default brief needs no argument"
+        )
+    if not isinstance(raw, dict):
+        raise ValidationError("judge", "must be an object or false")
+    unknown = sorted(set(raw) - JUDGE_SPEC_KEYS)
+    if unknown:
+        raise ValidationError("judge", f"unknown key(s): {', '.join(unknown)}")
+    out: dict[str, object] = {}
+    targets = raw.get("targets")
+    if targets is not None:
+        if not isinstance(targets, (list, tuple)):
+            raise ValidationError("judge.targets", "must be a list")
+        if len(targets) > MAX_JUDGE_TARGETS:
+            raise ValidationError("judge.targets", f"at most {MAX_JUDGE_TARGETS} targets")
+        cleaned: list[str] = []
+        for item in targets:
+            if not isinstance(item, str):
+                raise ValidationError("judge.targets", "every target must be a string")
+            value = item.strip()
+            if not value:
+                continue
+            if len(value) > MAX_JUDGE_TARGET_CHARS:
+                raise ValidationError(
+                    "judge.targets", f"a target may not exceed {MAX_JUDGE_TARGET_CHARS} chars"
+                )
+            if value not in cleaned:
+                cleaned.append(value)
+        out["targets"] = cleaned
+    for key in ("wake_when", "quiet_when"):
+        criterion = raw.get(key)
+        if criterion is None:
+            continue
+        if not isinstance(criterion, str):
+            raise ValidationError(f"judge.{key}", "must be a string")
+        if len(criterion) > MAX_JUDGE_CRITERION_CHARS:
+            raise ValidationError(
+                f"judge.{key}", f"may not exceed {MAX_JUDGE_CRITERION_CHARS} chars"
+            )
+        out[key] = criterion
+    return out
+
 
 # monitor_update revises the loop already bound to the calling session. Every
 # field is optional (a no-field call is a no-op the handler rejects), and the
@@ -1571,6 +1693,11 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         # Same bound as the arm side, for the reason the comment above gives: a
         # loop must not be updatable into a state monitor_start would refuse.
         FieldSpec("banner", str, max_len=MAX_BANNER_CHARS),
+        # Same shape check as the arm side, and the same reason: revising a loop must
+        # not be a way to store a judge brief arming would have refused. ``judge:
+        # false`` is what takes the judge off a live loop; an empty object only drops
+        # the owner's own criteria, and a gated loop then runs under the default.
+        FieldSpec("judge", (dict, bool)),
     ],
 )
 
@@ -1680,10 +1807,12 @@ KIRO_CLI_LOGS_SCHEMA = ToolSchema(
     ],
 )
 
-# Absolute filesystem path. Empty string is allowed (clears the project) —
-# the validator skips the pattern check on empty values, so the regex only
-# needs to cover the non-empty case.
-_ABSOLUTE_PATH_RE = re.compile(r"^/")
+# Absolute filesystem path: POSIX "/x" and the Windows drive root "C:\x" /
+# "C:/x". Root PREFIX only, so a POSIX body may carry ":" and drive-relative
+# "C:foo" is refused. Two-backslash roots stay out: "\\host\share" resolves by
+# contacting the named host, and "\\?\D:\" carries a prefix the sensitive-path
+# fence does not fold -- see the PR. An empty string (clear) skips this check.
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:[\\/])")
 
 # 4096 = Linux PATH_MAX. The gateway endpoint enforces realpath and
 # sensitive-path checks; this schema is the MCP-layer shape gate.
@@ -2113,7 +2242,7 @@ WORKFLOW_RERUN_SCHEMA = ToolSchema(
 
 # Artifact tools — slug pattern matches kiro_crew.artifacts._SLUG_RE.
 _ARTIFACT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$")
-_ARTIFACT_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}$")
+_ARTIFACT_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}\Z")
 _ARTIFACT_KIND_RE = re.compile(r"^(widget|html|markdown|svg|json|text|image|webapp)$")
 
 # Model identifiers passed to kiro-cli ``--model`` (AcpRuntime). First char
@@ -2402,6 +2531,7 @@ ARTIFACT_GET_COMMENTS_SCHEMA = ToolSchema(
     tool_name="artifact_get_comments",
     fields=[
         FieldSpec("slug", str, required=True, max_len=80, pattern=_ARTIFACT_SLUG_RE),
+        FieldSpec("exclude_resolved", bool),
     ],
 )
 
@@ -2913,6 +3043,25 @@ _ISSUE_RADAR_CREW_SKIP_SCOPES = frozenset(
     }
 )
 
+#: Work-item fields the record tool may EMPTY through its ``clear`` list. Spelled
+#: out so the tool schema advertises them as an enum; pinned against the entry
+#: type's ``RADAR_CLEARABLE_FIELDS`` by test, so the two cannot drift.
+_ISSUE_RADAR_CREW_CLEARABLE_FIELDS = frozenset(
+    {
+        "decision",
+        "why",
+        "next",
+        "worktree",
+        "branch",
+        "base_sha",
+        "pr_number",
+        "claim_comment_id",
+        "ci_state",
+        "labels_applied",
+        "outcome",
+    }
+)
+
 # Abbreviated-or-full git object name. Bounds ``base_sha`` to something that can
 # actually be handed to git on a resume; a resumed turn checks out from this
 # value, so an arbitrary 5k string here is a resume that fails much later.
@@ -2954,9 +3103,11 @@ ISSUE_RADAR_CREW_READ_SCHEMA = ToolSchema(
 ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
     tool_name="issue_radar_crew_record",
     fields=[
-        # Bounds the number that becomes the work item's FILENAME
-        # (``crews/<crew_id>/<n>.json``) — same ENAMETOOLONG rationale as the
-        # investigation record, hence the same constant.
+        # Bounds the number the work item is KEYED by: a JSON int on one
+        # ``radar/recorded`` crew log entry and the string key the fold files the
+        # item under. The bound guards a key rather than a path, and keeps the
+        # same constant as the investigation record so a number a crew records is
+        # one every other Issue Radar surface can also hold.
         #
         # NOT required. A crew that swept its queue and took nothing has no issue
         # to name, and requiring one here left it recording the cycle against an
@@ -2965,7 +3116,7 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
         # ``sweep`` is valid ONLY without one — is enforced on the write route and
         # in the store, because it is a relation between two fields and this
         # schema validates them one at a time. Keeping the bound here still
-        # matters: when a number IS sent it is the filename.
+        # matters: when a number IS sent it is the item's key.
         FieldSpec("number", int, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER),
         FieldSpec("phase", str, max_len=32, allowed=_ISSUE_RADAR_CREW_PHASES),
         # Bounded but deliberately NOT ``allowed=``, unlike ``phase`` beside it.
@@ -2979,7 +3130,7 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
         # an enum in the tool schema, so the model is told what to pick.
         FieldSpec("skip_scope", str, max_len=32),
         # ``outcome`` is a bounded free string, NOT an enum: the store keeps it
-        # as free text (``crew_store.upsert_work_item``) and no vocabulary is
+        # as free text (``crew_store.commit_work_progress``) and no vocabulary is
         # defined anywhere in the app, so an allowlist invented here would
         # reject a legitimate terminal outcome and lose it.
         FieldSpec("outcome", str, max_len=MAX_SHORT_STRING),
@@ -3017,6 +3168,10 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
             item_max_len=MAX_SHORT_STRING,
             max_items=20,
         ),
+        # Names of work-item fields this update empties. The route checks each name
+        # against the store's clearable list and refuses an unknown one; this bound
+        # only keeps the list from being a payload.
+        FieldSpec("clear", list, item_type=str, item_max_len=32, max_items=16),
         # One public progress line. Short by design: it is rendered as a list
         # item inside the claim comment's <details> block, not as a report.
         FieldSpec("event", str, max_len=MAX_SHORT_STRING),
@@ -3173,14 +3328,39 @@ def _validate_hook_has_action(args: dict) -> None:
 
 
 def _validate_hook_create(args: dict) -> None:
-    """Validate a hook at creation time: action + regex syntax."""
+    """Validate a hook at creation time: action + regex syntax + no null enable."""
     _validate_hook_has_action(args)
     _validate_hook_regex(args)
+    _reject_null_enabled(args)
 
 
 def _validate_hook_update(args: dict) -> None:
     """Validate a hook at update time: regex syntax (action already checked by store)."""
     _validate_hook_regex(args)
+    _reject_null_enabled(args)
+
+
+def _reject_null_enabled(args: dict) -> None:
+    """Refuse an explicit ``"enabled": null``, on create and on update alike.
+
+    ``validate_field`` answers ``spec.default`` for a ``None`` value BEFORE the type
+    check, so a field with no default answers ``None`` -- and the KEY's presence puts
+    that ``None`` into the cleaned dict. Downstream, ``data.get("enabled", True)``
+    keeps it and the store's own event-aware default is skipped because the key IS
+    present, so the hook persists with ``enabled`` neither true nor false. Every
+    reader treats it as off: ``fire`` skips the hook and the row renders dimmed.
+
+    Refused rather than coerced, because both coercions lie about what was asked
+    for. Reading it as ``True`` invents a request to enable; reading it as omitted
+    discards a key the caller deliberately sent. A 400 naming the field is the only
+    answer that does not decide for them.
+
+    Both hook validators call this: the same shape is reachable through the update
+    schema, whose ``enabled`` has never carried a default, so fixing only the create
+    path would leave the identical corruption one endpoint away.
+    """
+    if "enabled" in args and args["enabled"] is None:
+        raise ValidationError("enabled", "expected bool, got null")
 
 
 def _validate_hook_regex(args: dict) -> None:
@@ -3210,7 +3390,15 @@ HOOK_CREATE_SCHEMA = ToolSchema(
         ),
         FieldSpec("skills", list, default=[], item_type=str, item_max_len=100),
         FieldSpec("timeout", int, min_val=1, max_val=300, default=30),
-        FieldSpec("enabled", bool, default=True),
+        # NO default, deliberately: `validate_tool_args` INJECTS a non-``None``
+        # default for an omitted field, and the store decides a hook's initial
+        # ``enabled`` from whether the caller named it -- a trigger no event fires
+        # is stored off unless the caller explicitly asked for on. A ``True`` here
+        # fabricates that explicit request on every create, which is the one input
+        # that made the store's rule unreachable on the dashboard's own path.
+        # ``ScriptHook.from_dict`` still defaults an absent value to True, so a
+        # hook on a live event is unaffected.
+        FieldSpec("enabled", bool),
     ],
     custom_validator=_validate_hook_create,
 )
@@ -3580,6 +3768,22 @@ SESSION_CREATE_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_FORK_SCHEMA = ToolSchema(
+    tool_name="session_fork",
+    fields=[
+        # The session to copy from: a slot key, transcript stem or exact unique
+        # title, the same three forms every ``target`` resolves. Empty means the
+        # caller's own session.
+        FieldSpec("source", str, required=False, default="", max_len=MAX_SHORT_STRING),
+        FieldSpec("title", str, required=False, default="", max_len=200),
+        FieldSpec("folder", str, required=False, default="", max_len=_ARTIFACT_FOLDER_REF_MAX),
+        # The fork point, as ``chat_fork`` counts it: an index into the source's
+        # visible (user/assistant) rows, inclusive. Bounded above only by the
+        # transcript, which the fork core checks against the corpus it reads.
+        FieldSpec("at_message_index", int, required=False, min_val=0),
+    ],
+)
+
 SESSION_STOP_SCHEMA = ToolSchema(
     tool_name="session_stop",
     fields=[
@@ -3605,6 +3809,20 @@ SESSION_SEND_SCHEMA = ToolSchema(
         # in ``validate_field`` does not apply) and defaulted false, so a caller
         # that omits it keeps the queue-or-run behaviour it has today.
         FieldSpec("steer", bool, default=False),
+    ],
+)
+
+SESSION_ADOPT_SCHEMA = ToolSchema(
+    tool_name="session_adopt",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_RELEASE_SCHEMA = ToolSchema(
+    tool_name="session_release",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
     ],
 )
 
@@ -3876,9 +4094,12 @@ def _cu_coord_field(name: str, *, required: bool = False) -> FieldSpec:
 # its args passed through raw.
 MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_create": SESSION_CREATE_SCHEMA,
+    "session_fork": SESSION_FORK_SCHEMA,
     "session_stop": SESSION_STOP_SCHEMA,
     "session_close": SESSION_CLOSE_SCHEMA,
     "session_send": SESSION_SEND_SCHEMA,
+    "session_adopt": SESSION_ADOPT_SCHEMA,
+    "session_release": SESSION_RELEASE_SCHEMA,
     "session_read_message": SESSION_READ_MESSAGE_SCHEMA,
     "chat_folder_tree": CHAT_FOLDER_TREE_SCHEMA,
     "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,
@@ -3950,6 +4171,106 @@ MCP_CREW_LOG_SCHEMAS: dict[str, ToolSchema] = {
 }
 
 
+# ── Tool Schemas (MCP Debug — server ``kirocrew-debug``) ──
+#
+# Its own registry for the same reason the crew-log one is separate: the five
+# debug tools ship on an opt-in server, and a session that is not debugging a
+# gateway must not pay for their schemas.
+#
+# What is NOT here is the load-bearing part. No schema carries a path, a pid to
+# signal, a file to write, or a flag to set: every field is a QUESTION narrowing
+# (a window, a filter, a format) so the surface cannot express an action. That is
+# a stronger guarantee than an allowlist someone has to keep correct as fields
+# are added. ``session`` is the one field naming another party, and it is a scope
+# REQUEST that the route re-decides on the caller's own forwarded identity — a
+# caller naming a session it may not read is refused there, not trusted here.
+#
+# The caps restate the server's own (``mcp_debug.MAX_SAMPLE_SECONDS``) rather than
+# importing them, because ``validation`` is imported by the gateway on every
+# request path and an MCP stdio server module is not; ``test_mcp_debug.py`` pins
+# the two together so they cannot drift.
+_DEBUG_THREAD_MODES = frozenset({"now", "sample", "dumps"})
+_DEBUG_PROCESS_FORMATS = frozenset({"tree", "flat"})
+
+#: Seconds of on-demand sampling one call may ask for. Mirrors
+#: ``mcp_debug.MAX_SAMPLE_SECONDS``; the route clamps independently.
+_DEBUG_MAX_SAMPLE_SECONDS = 60
+
+#: Characters of a free-text window or filter argument. Generous for an ISO
+#: timestamp or a '30m' window and far short of anything that could carry a
+#: payload into a route's query string.
+_DEBUG_MAX_ARG_CHARS = 128
+
+DEBUG_GATEWAY_SCHEMA = ToolSchema(tool_name="debug_gateway")
+
+DEBUG_REFUSALS_SCHEMA = ToolSchema(
+    tool_name="debug_refusals",
+    fields=[
+        FieldSpec("session", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("since", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("last", int, min_val=1, max_val=1000),
+    ],
+)
+
+DEBUG_THREADS_SCHEMA = ToolSchema(
+    tool_name="debug_threads",
+    fields=[
+        FieldSpec("mode", str, allowed=_DEBUG_THREAD_MODES),
+        FieldSpec("seconds", (int, float), min_val=0, max_val=_DEBUG_MAX_SAMPLE_SECONDS),
+        FieldSpec("hz", int, min_val=1, max_val=1000),
+        FieldSpec("deep", bool),
+        # A dump NAME, never a path: the route resolves it inside the crash-dump
+        # store's own directory, so a separator or a parent reference here cannot
+        # address a file outside it. Bounded and pattern-checked so a traversal
+        # attempt is refused at the schema rather than relied upon to fail later.
+        FieldSpec(
+            "read",
+            str,
+            max_len=_DEBUG_MAX_ARG_CHARS,
+            pattern=re.compile(r"^[A-Za-z0-9._-]+$"),
+        ),
+    ],
+)
+
+DEBUG_PROCESSES_SCHEMA = ToolSchema(
+    tool_name="debug_processes",
+    fields=[
+        FieldSpec("format", str, allowed=_DEBUG_PROCESS_FORMATS),
+        FieldSpec("kind", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("owner", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("orphan_only", bool),
+        FieldSpec("include_env", bool),
+    ],
+)
+
+DEBUG_SNAPSHOTS_SCHEMA = ToolSchema(
+    tool_name="debug_snapshots",
+    fields=[
+        FieldSpec("around", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("radius", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("since", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec("until", str, max_len=_DEBUG_MAX_ARG_CHARS),
+        FieldSpec(
+            "fields",
+            list,
+            item_type=str,
+            item_max_len=64,
+            max_items=64,
+        ),
+        FieldSpec("events_only", bool),
+        FieldSpec("cursor", str, max_len=_DEBUG_MAX_ARG_CHARS),
+    ],
+)
+
+MCP_DEBUG_SCHEMAS: dict[str, ToolSchema] = {
+    "debug_gateway": DEBUG_GATEWAY_SCHEMA,
+    "debug_refusals": DEBUG_REFUSALS_SCHEMA,
+    "debug_threads": DEBUG_THREADS_SCHEMA,
+    "debug_processes": DEBUG_PROCESSES_SCHEMA,
+    "debug_snapshots": DEBUG_SNAPSHOTS_SCHEMA,
+}
+
+
 # ── Tool Schemas (MCP Work ledger — server ``kirocrew-work``) ──
 #
 # Its own registry for the same reason the dashboard one is separate: the four
@@ -3964,9 +4285,9 @@ MCP_CREW_LOG_SCHEMAS: dict[str, ToolSchema] = {
 # a worker cannot write a conductor-owned field because no parameter carries one,
 # which is a stronger guarantee than an allowlist that must be kept correct as
 # fields are added.
-_WORK_STATUSES = frozenset({"progress", "done", "blocked", "question"})
-_WORK_VERDICTS = frozenset({"pass", "fail", "pending", "refused", "error"})
-_WORK_ITEM_STATES = frozenset({"open", "accepted", "rejected", "abandoned"})
+_WORK_STATUSES = frozenset(WORK_WORKER_STATUSES)
+_WORK_VERDICTS = frozenset(WORK_VERDICTS)
+_WORK_ITEM_STATES = frozenset(WORK_ITEM_STATES)
 #: A superset of the store's six conductor actions: ``accept`` promotes a worker's
 #: claimed ``pr`` into ``acceptance`` and is served by its own store function.
 _WORK_RECORD_ACTIONS = frozenset({"create", "bind", "decide", "verdict", "close", "goal", "accept"})
@@ -3989,6 +4310,7 @@ WORK_REPORT_SCHEMA = ToolSchema(
 )
 
 WORK_LEDGER_READ_SCHEMA = ToolSchema(tool_name="work_ledger_read")
+WORK_LEDGER_REBUILD_SCHEMA = ToolSchema(tool_name="work_ledger_rebuild")
 
 WORK_LEDGER_RECORD_SCHEMA = ToolSchema(
     tool_name="work_ledger_record",
@@ -4040,6 +4362,7 @@ MCP_WORK_SCHEMAS: dict[str, ToolSchema] = {
     "work_report": WORK_REPORT_SCHEMA,
     "work_ledger_read": WORK_LEDGER_READ_SCHEMA,
     "work_ledger_record": WORK_LEDGER_RECORD_SCHEMA,
+    "work_ledger_rebuild": WORK_LEDGER_REBUILD_SCHEMA,
 }
 
 

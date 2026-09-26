@@ -27,6 +27,7 @@ backward compatibility, so existing callers continue to work unchanged.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import stat
@@ -290,6 +291,48 @@ def shared_kiro_settings_writable() -> bool:
     return not os.environ.get("KIROCREW_POD")
 
 
+def shared_kiro_agents_writable() -> bool:
+    """False when this process must not write the SHARED kiro agents dir.
+
+    ``~/.kiro/agents`` belongs to the kiro-cli installation, like
+    ``~/.kiro/settings/mcp.json`` above, and every instance under this ``$HOME``
+    reads the same specs. ``agent.rebuild_agent_config`` stamps the writing
+    instance's own ``KIROCREW_HOME`` into every managed MCP server entry
+    (``_managed_mcp_env``), so a spec written by an instance whose data home is
+    NOT the default one poisons every other instance: their stubs resolve
+    ``config_dir()`` to the writer's home, find no ``session_pid_<pid>`` mapping
+    and a different trust root, and every strict-identity tool fails closed with
+    "signed pid mapping did not verify". The writer being durable does
+    not help — the pinned home is still wrong for the default-home audience.
+
+    Mirrors :func:`shared_kiro_settings_writable` and starts from its predicate
+    (``KIROCREW_POD``), then adds the data-home question that guard deliberately
+    does not ask: an active ``KIROCREW_HOME`` override means the specs this
+    process would write describe ITS home, not the shared audience's. An
+    override that RESOLVES to the default home is carved back in — such an
+    instance is the default-home one in substance, and refusing it would leave
+    a belt-and-braces ``export KIROCREW_HOME=~/.kiro/crew`` install with specs
+    that are never refreshed (and a fresh install with none at all).
+
+    Deciding WHETHER a given write is aimed at the shared dir — and whether a
+    refusal would protect anything — is the caller's job: this predicate only
+    answers "may THIS process own the shared one".
+    ``agent._decline_shared_agent_home`` exempts provably private targets first
+    (the ``KIRO_HOME``-derived layouts, so layout ownership is decided there,
+    not here) and refuses only when an existing shared spec is present to
+    preserve — a relocated-home install on a machine with no default-home spec
+    still writes, because there is no audience to poison and refusing would
+    leave it with no spec at all. Reads stay allowed, as with the settings
+    guard.
+    """
+    if not shared_kiro_settings_writable():
+        return False
+    override = _valid_override_home()
+    if override is None:
+        return True
+    return override == _resolve_default_home().resolve()
+
+
 def config_dir() -> Path:
     global _config_dir_memo
     override_raw = os.environ.get("KIROCREW_HOME")
@@ -416,10 +459,11 @@ def ensure_data_home() -> Path:
 
     try:
         restrict_dir_to_owner(home)
-    except OSError:
-        logger.warning(
-            "Cannot restrict the data home to owner-only; it may be readable by other users",
-            exc_info=True,
+    except OSError as exc:
+        _warn_cannot_restrict(
+            exc,
+            "Cannot restrict the data home %s to owner-only; it may be readable by other users",
+            home,
         )
     # UNCONDITIONAL, not in an `else`. The home failing to tighten is the case
     # where the crew log root's own mode matters MOST: it is the only remaining
@@ -428,6 +472,36 @@ def ensure_data_home() -> Path:
     # filesystem that refuses both still boots.
     _ensure_crew_log_root(home, restrict_dir_to_owner)
     return home
+
+
+def _warn_cannot_restrict(exc: BaseException, message: str, *args: object) -> None:
+    """Log a failed owner-only tightening as a warning that reads like one.
+
+    Both tightenings on the startup path are best-effort, so the record is a
+    warning either way; what varies is whether a traceback belongs on it. It does
+    for an error nobody expected. It does not for ``EPERM`` on macOS, which is an
+    expected, user-unclearable condition there: the kernel-protected
+    ``com.apple.provenance`` attribute on the data home denies ``chmod`` and
+    ``stat`` on the tagged paths even to their owner, even with Full Disk Access,
+    so every startup on such a machine hits it. Rendering that as a multi-line
+    traceback makes a healthy boot read as a crash and adds nothing the one line
+    does not already say, so that arm names the path, the likely cause and the
+    fact that startup continues. The same errno also means a path owned by another
+    uid (a ``sudo`` run, a root-owned volume), which ``chown`` fixes, so the line
+    names that too. The arm is gated on the platform whose quirk it describes: on
+    Linux ownership is the only common cause, so ``EPERM`` there keeps the
+    traceback like every other unexpected error.
+    """
+    if sys.platform == "darwin" and isinstance(exc, OSError) and exc.errno == errno.EPERM:
+        logger.warning(
+            message + " (%s). The likely cause is a kernel-protected provenance attribute on "
+            "the path, which denies this even to the owner and cannot be cleared; if the path is "
+            "owned by another user instead, chown fixes it. The gateway continues",
+            *args,
+            exc.strerror or "operation not permitted",
+        )
+        return
+    logger.warning(message, *args, exc_info=True)
 
 
 def _ensure_crew_log_root(home: Path, restrict: Callable[[Path], None]) -> None:
@@ -484,11 +558,11 @@ def _ensure_crew_log_root(home: Path, restrict: Callable[[Path], None]) -> None:
                 continue
             kind_root.mkdir(parents=True, exist_ok=True)
             restrict(kind_root)
-    except (OSError, RuntimeError):
-        logger.warning(
+    except (OSError, RuntimeError) as exc:
+        _warn_cannot_restrict(
+            exc,
             "Cannot restrict %s to owner-only; crew logs may be readable by other users",
             root,
-            exc_info=True,
         )
 
 

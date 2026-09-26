@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -50,7 +51,12 @@ from kiro_crew.constants import (
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.tables import render_tables, render_tables_with_metadata
 from kiro_crew.messaging.transport import TransportCapabilities
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    CREDENTIAL_REDACTION_TAGS,
+    EXFILTRATION_REDACTION_TAG_PREFIX,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 
 # Abstract output event kinds.
 TEXT_CHUNK = "text_chunk"
@@ -96,6 +102,10 @@ class OutputEvent:
     tool_input: str = ""
     context_usage_pct: float = 0.0  # compaction
     stop_reason: str = ""  # done
+    # done: the driver's empty-turn verdict (``driver.empty_turn_notice``) --
+    # the sentence to post in place of a bare placeholder when the turn closed
+    # with no assistant text, ``""`` when it produced text or was cancelled.
+    notice: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +120,7 @@ class OutputEvent:
             "request_id": self.request_id,
             "context_usage_pct": self.context_usage_pct,
             "stop_reason": self.stop_reason,
+            "notice": self.notice,
         }
 
 
@@ -374,6 +385,58 @@ def redaction_notice(cred_count: int, url_count: int) -> str:
     )
 
 
+def count_redaction_tags(text: str) -> tuple[int, int]:
+    """Count both redaction placeholder kinds in delivered text.
+
+    Returns ``(cred_count, url_count)`` — the two arguments
+    :func:`redaction_notice` takes, in its order. Every delivery surface that
+    posts a notice needs the same two tallies over the text that actually
+    shipped, and each kind counts differently: a credential tag is a CLOSED set
+    of constant strings (``CREDENTIAL_REDACTION_TAGS``), matched exactly and
+    summed so an encoded-credential-only answer is not missed, while the URL
+    tag interpolates the redacted domain and so has no constant form — it is
+    counted by ``EXFILTRATION_REDACTION_TAG_PREFIX`` prefix, never by equality.
+
+    One shared counter exists so a surface cannot adopt half the tally: a
+    site that counts credentials but forgets the URL prefix (or vice versa)
+    posts a notice worded for the wrong remedy, which is the gap the two-kind
+    notice closes. Count from the DELIVERED text rather than a redactor's
+    warnings list: chunked surfaces redact on the way out, so re-redacting the
+    assembled answer reports nothing while the placeholders are plainly
+    visible in what shipped.
+    """
+    cred_count = sum(text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
+    url_count = text.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+    return cred_count, url_count
+
+
+def repaired_after_a_sent_tail(
+    sent_tail: str, remainder: str, redactor: Callable[[str], str]
+) -> str | None:
+    """*remainder* with the span that completes a key after *sent_tail* given up.
+
+    ``None`` when the pair is clean, which is the common answer.
+
+    A streaming channel seals a chunk whose tail is a credential PREFIX. That
+    prefix matches nothing, so every scan passes it and the message is sent; the
+    characters completing the key arrive afterwards, and the reader scrolling the
+    two messages reads the key whole while neither message holds it. The sent
+    message cannot be recalled, so the side still open to repair is the one not yet
+    delivered, and giving up the span that completes the key is what closes the
+    seam: the delivered message keeps a fragment, which is not a credential.
+
+    Only that leading span is given up. Everything after it is the reply as written,
+    sliced rather than reassembled, so no break and no markup is lost anywhere else
+    in the message.
+    """
+    from kiro_crew.messaging.split import offset_clear_of_a_sent_tail
+
+    offset = offset_clear_of_a_sent_tail(sent_tail, remainder, redactor)
+    if not offset:
+        return None
+    return CREDENTIAL_REDACTION_TAGS[0] + remainder[offset:]
+
+
 def _choice_display_safe(text: str, capabilities: TransportCapabilities | None) -> str:
     """The choice-label display sink, target-aware when the target is known.
 
@@ -623,6 +686,15 @@ class Renderer(ABC):
     #: reads this instead of matching the title. ``""`` when the transport sent
     #: no identity.
     current_tool_name: str = ""
+    #: The driver's empty-turn verdict for the turn being finalized
+    #: (``OutputEvent.notice`` on ``DONE``), set by :meth:`dispatch` before
+    #: ``on_done`` runs. Non-empty means the turn closed with no assistant text
+    #: and this is the sentence the user is owed; a renderer whose body is empty
+    #: at ``on_done`` posts it where its bare placeholder would otherwise go, so
+    #: a turn that produced nothing never reads as a finished reply. ``""`` for a
+    #: turn that produced text, a cancelled turn, and every turn on a renderer
+    #: that never received a ``DONE`` (a close after an exception).
+    empty_turn_notice: str = ""
 
     def __init__(self, capabilities: TransportCapabilities) -> None:
         self.capabilities = capabilities
@@ -818,6 +890,7 @@ class Renderer(ABC):
         elif event.kind == COMPACTION:
             await self.on_compaction(event.context_usage_pct)
         elif event.kind == DONE:
+            self.empty_turn_notice = event.notice or ""
             await self.on_done(event.stop_reason)
         elif event.kind == STEER_CONSUMED:
             await self.on_steer_consumed(event.text)

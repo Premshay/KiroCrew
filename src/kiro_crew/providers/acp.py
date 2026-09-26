@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing
 from pathlib import Path
 from typing import Any, TypeGuard
@@ -37,6 +38,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
+    ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
 )
 from kiro_crew.acp.types import (
@@ -55,6 +57,8 @@ from kiro_crew.acp.types import (
     PROVIDER_LABEL_DEFAULT,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
+    effort_config_option_id,
+    effort_config_option_value,
 )
 from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
 from kiro_crew.agent_sdk import host_auth
@@ -385,6 +389,9 @@ class AcpProvider(LLMProvider):
         session_provider_label: str = "",
         member_context: bool = False,
         memory_mode: str = "persistent",
+        shared_scratch: Path | None = None,
+        on_gate_acquired: Callable[[float], None] | None = None,
+        on_gate_queued: Callable[[], None] | None = None,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -410,11 +417,29 @@ class AcpProvider(LLMProvider):
             # it.
             "permission_mode": permission_mode,
             "model_switch_method": model_switch_method,
+            # The parent session tree's work directory for a dedicated subagent
+            # process; None for a session that starts its own tree.
+            "shared_scratch": shared_scratch,
         }
         if agent:
             kwargs["agent"] = agent
         self.member_context = member_context
         self.memory_mode = memory_mode
+        # Kept on the provider, not only on the placeholder client: on the kiro
+        # path ``_start_kiro_runtime_impl`` replaces that client with an
+        # ``AcpRuntime`` it constructs itself, and a dedicated subagent's
+        # inherited work directory has to reach THAT process.
+        self._shared_scratch: Path | None = shared_scratch
+        # Forwarded to ``runtime.create_session`` on the fresh-session path only
+        # (``session/load`` takes no gate permit). Fires at ``SessionStartGate``
+        # EXIT with the queue wait in ms, so a dedicated subagent process can
+        # restart its start clock the way a session-shared one does in
+        # ``_create_shared_session``: a wait for a permit is admission's cost,
+        # not this start's. None -- every non-subagent session -- is inert.
+        self._on_gate_acquired: Callable[[float], None] | None = on_gate_acquired
+        # Its companion for gate ENTRY: the manager freezes the start clock for
+        # the span spent waiting for a permit. Same None-is-inert rule.
+        self._on_gate_queued: Callable[[], None] | None = on_gate_queued
         self._client = AcpClient(**kwargs)
         self.model_switch_method = model_switch_method
         self._session_provider_label = session_provider_label
@@ -484,6 +509,17 @@ class AcpProvider(LLMProvider):
     def client(self) -> AcpClient:
         """Expose underlying client for backward compat (e.g. is_ready check)."""
         return self._client
+
+    @property
+    def work_scratch_dir(self) -> Path | None:
+        """The session tree's ``$KIROCREW_SCRATCH`` directory (H14 capability).
+
+        Read off whichever process serves this session -- the placeholder
+        ``AcpClient`` before start, the ``AcpSessionProvider`` the kiro path
+        swaps in after -- so the answer is the directory the live process
+        actually exposes, never the one it was asked for.
+        """
+        return self._client.work_scratch_dir
 
     @property
     def child_fidelity_aware(self) -> bool:
@@ -1087,6 +1123,16 @@ class AcpProvider(LLMProvider):
         # would silently run on the agent's default.
         configured_model = getattr(self._client, "_model", "") or ""
 
+        # A restart replaces the process serving this session: the tree that
+        # process exposed (read off it, the way parent_work_scratch_dir reads
+        # it) is what the replacement joins, so the session's staged work and
+        # its children's windows survive the restart. A root's first start has
+        # nothing to read and starts its own tree.
+        if self._shared_scratch is None:
+            previous_tree = getattr(self._client, "work_scratch_dir", None)
+            if isinstance(previous_tree, Path):
+                self._shared_scratch = previous_tree
+
         runtime = AcpRuntime(
             work_dir=work_dir,
             agent=agent or "kirocrew",
@@ -1100,6 +1146,10 @@ class AcpProvider(LLMProvider):
             tool_search=self._tool_search_settings(),
             member_context=self.member_context,
             memory_mode=self.memory_mode,
+            # A dedicated subagent's inherited work directory (agent_scratch):
+            # this runtime, not the placeholder client, is the process the
+            # subagent runs in, so the second window has to be mounted HERE.
+            shared_scratch=self._shared_scratch,
         )
         _t_spawn = time.monotonic()
         try:
@@ -1243,6 +1293,9 @@ class AcpProvider(LLMProvider):
                         tool_search=self._tool_search_settings(),
                         member_context=self.member_context,
                         memory_mode=self.memory_mode,
+                        # The dead runtime's tree, for the same reason a restart
+                        # joins it (above): its sessions' work is there.
+                        shared_scratch=self._shared_scratch or runtime.work_scratch_dir,
                     )
                     try:
                         await runtime.spawn()
@@ -1264,6 +1317,8 @@ class AcpProvider(LLMProvider):
                         memory_mode=self.memory_mode,
                         session_key=self._owning_session_key(),
                         channel_id=self._owning_channel_id() or "",
+                        on_gate_acquired=self._on_gate_acquired,
+                        on_gate_queued=self._on_gate_queued,
                     )
                 except AcpRuntimeError as exc:
                     sandbox_failure = await sandbox_init_failure_for_runtime(runtime)
@@ -1316,12 +1371,42 @@ class AcpProvider(LLMProvider):
                         _namespace,
                     )
                 elif model_is_unusable(configured_model, _advertised):
-                    # A literal miss can be a stale `<namespace>::` qualifier on
-                    # a model the backend fully serves: resolve to the
-                    # advertised spelling and send THAT — same fold the display
-                    # verdict uses, so chip and wire agree. A pin absent under
-                    # either spelling still takes the withhold.
+                    # A literal miss can be a stale `<namespace>::` qualifier on a
+                    # model the backend fully serves: resolve to the advertised
+                    # spelling and send THAT — same fold the display verdict uses,
+                    # so chip and wire agree. Try the fold FIRST, against the
+                    # snapshot we already have: a qualifier-only miss resolves
+                    # here with no wire traffic and must not pay a throwaway
+                    # session/new on every cold start.
                     _send_model = resolve_pin_spelling(configured_model, _advertised)
+                    if not _send_model:
+                        # The fold found nothing, so this looks like a genuine
+                        # miss — but the snapshot was captured seconds ago at
+                        # session/new, always inside the startup race window where
+                        # an entitlement lookup racing a token refresh answers the
+                        # free-tier default. Withholding an entitled pin on that
+                        # unconfirmed answer drops the user's model for the whole
+                        # session with no retry, so revalidate ONCE against the
+                        # live backend and re-run both checks. A failed probe
+                        # leaves _advertised as it was (fail open: no evidence
+                        # never widens or narrows entitlement).
+                        try:
+                            # force=True: this is a one-shot per cold start
+                            # deciding whether to DROP a configured pin, not a
+                            # burst, so it must earn a fresh probe rather than
+                            # honour a recent no-evidence failure replay.
+                            _advertised = (
+                                advertised_model_ids(
+                                    await handle.refresh_available_models(force=True)
+                                )
+                                or _advertised
+                            )
+                        except Exception:
+                            pass
+                        if model_is_unusable(configured_model, _advertised):
+                            _send_model = resolve_pin_spelling(configured_model, _advertised)
+                        else:
+                            _send_model = configured_model
                 if not _send_model and not _foreign_scope:
                     logger.warning(
                         "Configured model %s is not available to this account; "
@@ -1365,6 +1450,16 @@ class AcpProvider(LLMProvider):
             if self._child_fidelity_aware:
                 provider.child_fidelity_aware = True
             self._client = provider  # type: ignore[assignment]
+            # The tree this session ACTUALLY has, read off the live process:
+            # the runtime drops an inherited window that was swept and falls
+            # back to its own directory, so the value handed in at
+            # construction can name a directory that is gone. A restart that
+            # re-sent it would drop it again and start a third tree, losing
+            # what this runtime staged; recording the live answer makes the
+            # next spawn join THIS directory instead.
+            live_tree = runtime.work_scratch_dir
+            if isinstance(live_tree, Path):
+                self._shared_scratch = live_tree
         except BaseException:
             # No provider owns the runtime yet — kill it so a failed session
             # setup doesn't leak an orphaned kiro-cli process. Best-effort:
@@ -1398,6 +1493,25 @@ class AcpProvider(LLMProvider):
         """Session config options advertised by the active ACP backend."""
         return list(getattr(self._client, "acp_config_options", []))
 
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the advertised-model snapshot on the picker read path.
+
+        The dashboard model list (`/api/models`) narrows the catalog through this
+        provider's snapshot. `self._client` is a plain `AcpClient` before startup
+        (NOT an `LLMProvider`, no revalidation) and becomes an `AcpSessionProvider`
+        (an `LLMProvider`) on the kiro shared-runtime path, which carries the
+        read-path revalidation. Forward when the inner client is an `LLMProvider`
+        (propagating its contract: the read deadline raises
+        :class:`~kiro_crew.acp.session_handle.EntitlementRevalidating` while the
+        probe keeps running, and a probe FAILURE returns the current snapshot,
+        fail open); otherwise return the current snapshot unchanged, so a
+        pre-startup placeholder client or a non-kiro direct client never worsens
+        the picker.
+        """
+        if isinstance(self._client, LLMProvider):
+            return await self._client.maybe_refresh_available_models(catalog_ids)
+        return self.available_models()
+
     def mcp_session_report(self) -> SessionMcpReport:
         """This session's MCP registration report, kept on the inner client.
 
@@ -1428,14 +1542,40 @@ class AcpProvider(LLMProvider):
         """
         return bool(self._client.effort_config_option_id())
 
-    def supports_effort(self) -> bool:
-        """True when the current session accepts a reasoning-effort level.
+    def _advertised_effort_levels(self) -> list[str] | None:
+        """The vocabulary this harness is the authority on, or None.
 
-        Drives the dashboard effort dropdown. On the config-option channel the
-        session's own selector decides, so a harness the model allowlist cannot
-        classify still gets the control. The kiro family advertises no selector
-        and keeps the model allowlist.
+        A member of ``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION`` advertises its
+        effort option per SESSION rather than per model, so the option it served
+        on ``session/new`` answers both which levels exist and whether any do.
+        ``None`` -- every other harness -- means the model registry answers, which
+        is right where the level rides the model.
         """
+        if self._client.backend not in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION:
+            return None
+        return self._client.get_valid_effort_levels()
+
+    def supports_effort(self) -> bool:
+        """True when this session accepts a reasoning-effort level.
+
+        Drives the dashboard effort dropdown, and the single answer the three
+        effort verbs below read -- a second copy of this question is how one of
+        them comes to offer a control the others refuse.
+
+        WHICH fact answers is per harness. Where the harness advertises the
+        option per SESSION (``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION``) the
+        option answers, because the registry carries no entry for the operator's
+        own model ids. The rest of the config-option channel answers from the
+        session's advertised selector too, so a composite-id harness the model
+        allowlist cannot classify (dsh) still gets the control. The kiro family
+        advertises no selector and keeps the model allowlist.
+        """
+        # MERGE-REVIEW: upstream's exact PI check first, then the fork's
+        # selector discovery for the rest of the config-option channel.
+        if self._client.backend in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION:
+            return self._client.supports_config_option(
+                effort_config_option_id(self._client.backend)
+            )
         if self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION:
             return self._advertised_effort()
         return model_supports_effort(self._client._model)
@@ -1453,6 +1593,11 @@ class AcpProvider(LLMProvider):
         ``change_effort`` writes the override under the same recorded spelling
         this reads, so the override path matches by construction.
         """
+        # The fold the WRITE path takes, handed in so it runs BEFORE the
+        # advertised-list check rather than after it. ``change_effort`` admits any
+        # level the dynamic validation set knows, so a stored ``max`` on a harness
+        # whose ceiling is ``xhigh`` is this harness's ``xhigh`` -- and a filter
+        # that ran first would drop the very level the live push applied.
         return resolve_effort_for_model(
             self._client._model,
             slot_overrides=self._effort_per_model,
@@ -1461,6 +1606,8 @@ class AcpProvider(LLMProvider):
                 self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
                 and self._advertised_effort()
             ),
+            levels=self._advertised_effort_levels(),
+            normalize=functools.partial(effort_config_option_value, self._client.backend),
         )
 
     def _apply_effort_overlay(self, *, timeout: float = CLI_SETTINGS_LOCK_TIMEOUT_SECS) -> bool:
@@ -1557,10 +1704,19 @@ class AcpProvider(LLMProvider):
         ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` arrives here, and the
         adapter-behaviour notes below are what that channel does in practice.
 
-        The session's advertised selector supplies the option id: adapters may
-        spell it ``effort`` or ``reasoning_effort``. The model/effort pair path
-        uses the same discovery so a live override cannot address a different
-        option from the model selection it overrides.
+        WHICH option id carries the effort is the session's advertised selector,
+        resolved by ``AcpClient.effort_config_option_id``: it tries the backend's
+        declared spelling (``effort_config_option_id``: claude-agent-acp
+        ``effort``, codex-acp ``reasoning_effort``, pi-acp ``thought_level``)
+        before the generic ones. The model/effort pair path uses the same
+        discovery so a live override cannot address a different option from the
+        model selection it overrides.
+
+        WHICH value carries the level is resolved per backend, through
+        ``effort_config_option_value``, and before the descent rather than by it:
+        a harness whose vocabulary omits one of Crew's levels is a declared fact,
+        and the descent recovers from an omission only when the refusal arrives in
+        a shape ``_is_config_value_rejection`` recognises for that adapter.
 
         claude-agent-acp validates the value against the *current model's*
         ``supportedEffortLevels`` and throws ``Invalid value for config option
@@ -1585,19 +1741,31 @@ class AcpProvider(LLMProvider):
         if not effort_option:
             logger.debug("ACP backend exposes no effort config option; skipping effort push")
             return
+        # The harness's own spelling of the level, resolved BEFORE the write for
+        # the reason ``effort_config_option_value`` gives: a vocabulary that omits
+        # one of Crew's levels is a declared fact, and the descent below can only
+        # recover from it when the refusal shape is one this tree recognises.
+        target = effort_config_option_value(self._client.backend, level)
+        if target != level:
+            logger.info(
+                "effort %r spelled %r on backend %s",
+                level,
+                target,
+                self._client.backend,
+            )
         # Descend from the requested level through lower levels (e.g.
         # max → xhigh → high). Never escalate above what was asked.
         try:
-            start = EFFORT_LEVELS.index(level)
+            start = EFFORT_LEVELS.index(target)
         except ValueError:
-            await self._client.set_config_option(effort_option, level)
+            await self._client.set_config_option(effort_option, target)
             return
         ladder = [lvl for lvl in reversed(EFFORT_LEVELS[: start + 1])]
         last_exc: Exception | None = None
         for candidate in ladder:
             try:
                 await self._client.set_config_option(effort_option, candidate)
-                if candidate != level:
+                if candidate != target:
                     logger.info(
                         "CC effort %r unsupported by model %s — applied %r instead",
                         level,
@@ -1631,6 +1799,13 @@ class AcpProvider(LLMProvider):
         so has no effort channel at all.
         """
         model = self._client._model
+        if not self.supports_effort():
+            logger.info(
+                "change_effort skipped — no effort level applies to this session (backend=%s model=%s)",
+                self._client.backend,
+                model,
+            )
+            return False
         via_config_option = self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
         via_slash_command = self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS
         if not (via_config_option or via_slash_command):
@@ -1939,6 +2114,10 @@ class AcpProvider(LLMProvider):
             # half (child_mcp_identity_trusted) for every crossing event.
             raw_params_trusted=e.raw_params_trusted,
             shell_classified=e.shell_classified,
+            # Dropping this would let a KAS spawn reach the prompt unvetted
+            # against the spawn policy on this surface.
+            spawn_target=e.spawn_target,
+            tool_identity_trusted=e.tool_identity_trusted,
             mcp_identity_trusted=e.mcp_identity_trusted,
             server_name=e.server_name,
             oauth_url=e.oauth_url,

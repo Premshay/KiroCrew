@@ -114,12 +114,14 @@ def cli_env() -> dict[str, str]:
     return env
 
 
-def _run(argv: list[str], timeout: float) -> tuple[int, str, str]:
+def _run(argv: list[str], timeout: float, *, cwd: str | None = None) -> tuple[int, str, str]:
     """Run *argv*, returning ``(returncode, stdout, stderr)``.
 
     A timeout or a missing executable is reported as a non-zero return code with
     the reason on stderr, so callers branch on one shape instead of catching
-    three exception types at every call site.
+    three exception types at every call site. *cwd* is the child's working
+    directory; ``None`` inherits the gateway's, which is right for a PATH probe
+    and wrong for the staged-copy smoke run (see :func:`_staged_node_runs`).
     """
     try:
         proc = subprocess.run(
@@ -128,6 +130,7 @@ def _run(argv: list[str], timeout: float) -> tuple[int, str, str]:
             text=True,
             timeout=timeout,
             env=cli_env(),
+            cwd=cwd,
             check=False,
         )
     except subprocess.TimeoutExpired:
@@ -199,8 +202,14 @@ def _staged_node_runs(candidate: Path) -> str | None:
     targets are not in the leaf, a binary that only links under a wrapper's
     ``LD_LIBRARY_PATH``, a build for another architecture. The reason names the
     failure so ``stage-node`` reports it instead of a later call.
+
+    "From the managed leaf" is literal: the leaf is the child's working
+    directory. The probe must not inherit the gateway's, which is whatever the
+    service manager or a test runner started it in.
     """
-    code, out, err = _run([str(candidate), "--version"], _PROBE_TIMEOUT_S)
+    code, out, err = _run(
+        [str(candidate), "--version"], _PROBE_TIMEOUT_S, cwd=str(candidate.parent)
+    )
     if code != 0:
         detail = (err or out).strip().splitlines()
         return f"exit {code}" + (f": {detail[-1]}" if detail else "")
@@ -368,9 +377,29 @@ def _managed_candidate(candidate: Path) -> tuple[Path | None, str | None]:
     return (None, common) if (common := _common_candidate_rejection(resolved)) else (resolved, None)
 
 
-def _gateway_writable_component(path: Path) -> Path | None:
-    """First executable hierarchy component writable by this gateway process."""
-    for component in (path, *path.parents):
+def _gateway_writable_component(candidate: Path, resolved: Path) -> Path | None:
+    """First executable hierarchy component writable by this gateway process.
+
+    The question ("can this process write it") is asked of every directory the
+    walk from *candidate* to *resolved* actually reads plus the target itself,
+    enumerated by :func:`kiro_crew.platform_compat.traversed_components`. A
+    lexical chain over the already-collapsed *resolved* path cannot name a
+    symlink hop in the middle of the chain, nor a symlinked directory
+    component's own parent, and both are places where whoever can write chooses
+    what executes. The whole *candidate* is the answer when the walk cannot be
+    enumerated: unknown is not shown-to-be-unwritable.
+
+    Windows keeps the lexical chain over *resolved*: the walker is POSIX-shaped
+    and the mode bits carry no information there, so ``os.access`` over the
+    resolved spelling is the check that exists.
+    """
+    if platform_compat.IS_WINDOWS:
+        components: list[Path] | None = [resolved, *resolved.parents]
+    else:
+        components = platform_compat.traversed_components(candidate)
+    if components is None:
+        return candidate
+    for component in components:
         try:
             mode = component.stat().st_mode
         except OSError:
@@ -387,7 +416,7 @@ def _system_candidate(candidate: Path) -> tuple[Path | None, str | None]:
         return None, reason
     if common := _common_candidate_rejection(resolved):
         return None, common
-    if writable := _gateway_writable_component(resolved):
+    if writable := _gateway_writable_component(candidate, resolved):
         return None, f"the executable hierarchy is writable by the gateway user at {writable}"
     return resolved, None
 
@@ -757,7 +786,7 @@ def _resolve_executable_file_for_system(candidate: Path) -> tuple[Path | None, s
         return None, "the direct launcher target is not a regular file"
     if common := _common_candidate_rejection(resolved):
         return None, common
-    if writable := _gateway_writable_component(resolved):
+    if writable := _gateway_writable_component(candidate, resolved):
         return None, f"the direct launcher hierarchy is writable by the gateway user at {writable}"
     return resolved, None
 

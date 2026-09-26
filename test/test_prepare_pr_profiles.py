@@ -229,7 +229,7 @@ def test_kirocrew_markers_load_bundled_profile(tmp_path):
     assert prof["readiness"]["status_context"] == "PR Readiness"
     models = {r["name"]: r["model"] for r in prof["reviewers"]}
     assert models["gpt"] == "gpt-5.6-sol"
-    assert models["opus"] == "claude-opus-4.8"
+    assert models["opus"] == "claude-opus-5"
 
 
 def test_opus_profile_model_matches_the_ci_workflow():
@@ -463,6 +463,11 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         # pre-push floor would make every contributor's push depend on that
         # service being up in order to print a number nobody is blocked on.
         "scripts/check_python_audit.py",
+        # Reports route coverage from the dumps the Linux-only `integration` job
+        # writes while booting real gateways in-process; it has no verdict
+        # without that run, and prepare-pr does not boot gateways in its
+        # repeated static floor -- the layer's proof stays in CI, like E2E.
+        "scripts/check_integration_route_coverage.py",
     }
 
     invoked = set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", run_text))

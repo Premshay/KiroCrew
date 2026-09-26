@@ -1158,6 +1158,146 @@ class TestCliPathTrust:
         assert "writable by the gateway user" in warning
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink and permission semantics")
+class TestGatewayWritableComponentWalksEveryDirectory:
+    """The writability question is asked of every directory the walk reads.
+
+    A lexical chain over the collapsed path never names a symlink hop in the
+    middle of a chain, nor the directory holding a symlinked directory component,
+    and either one's owner chooses what the candidate resolves to. These fixtures
+    present every component as unwritable by this process except ONE, so nothing
+    but the enumeration can decide the verdict.
+    """
+
+    @staticmethod
+    def _executable(path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    @staticmethod
+    def _writable_only(monkeypatch: pytest.MonkeyPatch, loose: Path | None) -> None:
+        """Every component reads as unwritable by this process, except *loose*."""
+        loose_real = os.path.realpath(loose) if loose is not None else None
+        real_stat = os.stat
+
+        def fake_stat(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            if os.path.realpath(str(path)) == loose_real:
+                mode = info.st_mode | 0o002
+            else:
+                mode = info.st_mode & ~0o022
+            return os.stat_result((mode, *tuple(info)[1:]))
+
+        def fake_access(path, mode, **kwargs):
+            if mode == os.X_OK:
+                return True
+            return os.path.realpath(str(path)) == loose_real
+
+        monkeypatch.setattr(os, "stat", fake_stat)
+        monkeypatch.setattr(os, "access", fake_access)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: ())
+
+    def _hop_chain(self, tmp_path: Path) -> tuple[Path, Path, Path]:
+        """``trusted/cli -> writable/hop -> trusted/real``; returns entry, writable, target."""
+        trusted = tmp_path / "trusted"
+        writable = tmp_path / "writable"
+        writable.mkdir()
+        target = self._executable(trusted / "real")
+        middle = writable / "hop"
+        middle.symlink_to(target)
+        entry = trusted / mod.CLI_BIN
+        entry.symlink_to(middle)
+        return entry, writable, target
+
+    def _symlinked_component_chain(self, tmp_path: Path) -> tuple[Path, Path, Path]:
+        """``prefix/bin -> holder/bin``; returns entry, prefix, leaf."""
+        prefix = tmp_path / "prefix"
+        prefix.mkdir()
+        leaf = self._executable(tmp_path / "holder" / "bin" / mod.CLI_BIN)
+        (prefix / "bin").symlink_to(leaf.parent)
+        return prefix / "bin" / mod.CLI_BIN, prefix, leaf
+
+    def test_a_writable_hop_in_the_middle_of_a_chain_refuses_the_candidate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        entry, writable, _target = self._hop_chain(tmp_path)
+        self._writable_only(monkeypatch, writable)
+
+        resolved, reason = mod._system_candidate(entry)
+
+        assert resolved is None
+        assert reason is not None
+        assert "writable by the gateway user" in reason
+        assert str(writable.resolve()) in reason, "must name the offending directory"
+
+    def test_a_writable_parent_of_a_symlinked_component_refuses_the_candidate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``prefix`` holds the ``bin`` link; whoever writes it re-points the whole tree.
+
+        The collapsed path's chain runs ``holder/bin``, ``holder``, ... and never
+        names ``prefix``.
+        """
+        entry, prefix, _leaf = self._symlinked_component_chain(tmp_path)
+        self._writable_only(monkeypatch, prefix)
+
+        resolved, reason = mod._system_candidate(entry)
+
+        assert resolved is None
+        assert reason is not None
+        assert "writable by the gateway user" in reason
+        assert str(prefix.resolve()) in reason, "must name the offending directory"
+
+    def test_a_chain_through_unwritable_directories_is_still_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Strictly a widening: the same hop shape with nothing writable is accepted."""
+        entry, _writable, target = self._hop_chain(tmp_path)
+        self._writable_only(monkeypatch, None)
+
+        assert mod._system_candidate(entry) == (target.resolve(), None)
+
+    def test_the_direct_launcher_file_walk_uses_the_same_enumeration(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The non-executable package-file check asks the same question over the same walk."""
+        entry, writable, _target = self._hop_chain(tmp_path)
+        self._writable_only(monkeypatch, writable)
+
+        resolved, reason = mod._resolve_executable_file_for_system(entry)
+
+        assert resolved is None
+        assert reason is not None
+        assert str(writable.resolve()) in reason
+
+    def test_a_walk_that_cannot_be_enumerated_names_the_whole_candidate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unknown is not shown-to-be-unwritable: ``None`` from the walk refuses."""
+        leaf = self._executable(tmp_path / "bin" / mod.CLI_BIN)
+        self._writable_only(monkeypatch, None)
+        monkeypatch.setattr(mod.platform_compat, "traversed_components", lambda _path: None)
+
+        assert mod._gateway_writable_component(leaf, leaf.resolve()) == leaf
+
+    def test_windows_keeps_the_lexical_chain_over_the_resolved_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The walker is POSIX-shaped; Windows asks ``os.access`` over ``resolved.parents``."""
+        leaf = self._executable(tmp_path / "bin" / mod.CLI_BIN)
+        self._writable_only(monkeypatch, leaf.parent)
+        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", True)
+
+        def never(_path):
+            raise AssertionError("the POSIX walker must not run on Windows")
+
+        monkeypatch.setattr(mod.platform_compat, "traversed_components", never)
+
+        assert mod._gateway_writable_component(leaf, leaf.resolve()) == leaf.parent.resolve()
+
+
 class TestWindowsGatewayCommand:
     @staticmethod
     def _managed_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Path]:
@@ -1211,17 +1351,24 @@ class TestWindowsGatewayCommand:
         monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", True)
         monkeypatch.setattr(mod, "config_dir", lambda: crew)
         probed: list[str] = []
-        monkeypatch.setattr(
-            mod, "_run", lambda argv, timeout: (probed.append(argv[0]), (0, "v24.18.0\n", ""))[1]
-        )
+        probe_cwds: list[str | None] = []
+
+        def fake_run(argv, timeout, *, cwd=None):
+            probed.append(argv[0])
+            probe_cwds.append(cwd)
+            return (0, "v24.18.0\n", "")
+
+        monkeypatch.setattr(mod, "_run", fake_run)
 
         staged = mod._stage_managed_node(str(source))
 
         assert staged == crew / "playwright-cli" / "node.exe"
         assert staged.read_bytes() == b"trusted node"
-        # The smoke run exercised the staged copy inside the leaf, not the source.
+        # The smoke run exercised the staged copy inside the leaf, not the source,
+        # and ran FROM the leaf rather than from wherever the gateway was started.
         assert probed and Path(probed[-1]).parent == staged.parent
         assert Path(probed[-1]) != source
+        assert probe_cwds[-1] == str(staged.parent)
 
         source.write_bytes(b"replacement node")
         replaced = mod._stage_managed_node(str(source))
@@ -2029,7 +2176,7 @@ class TestPosixGatewayCommand:
         source.chmod(0o755)
         monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
         monkeypatch.setattr(mod, "config_dir", lambda: crew)
-        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, "v24.18.0\n", ""))
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout, cwd=None: (0, "v24.18.0\n", ""))
 
         staged = mod._stage_managed_node(str(source))
 
@@ -2044,7 +2191,9 @@ class TestPosixGatewayCommand:
         relative to its own path. It copies cleanly and passes the mode checks,
         but a copy in the managed leaf points at a file that is not there. The
         smoke run is a REAL process here: the copied script runs from the leaf,
-        its target is missing, and the install refuses, naming the source."""
+        its target is missing, and the install refuses, naming the source. The
+        process is the test's own shell script, never a host ``node``, and both
+        spawns run in a directory the test owns."""
         crew = tmp_path / "crew"
         bin_dir = tmp_path / "node" / "bin"
         bin_dir.mkdir(parents=True)
@@ -2058,7 +2207,7 @@ class TestPosixGatewayCommand:
         monkeypatch.setattr(mod, "config_dir", lambda: crew)
 
         # In place the wrapper works; that is what fooled the mode checks.
-        assert mod._run([str(wrapper), "--version"], 20.0)[0] == 0
+        assert mod._run([str(wrapper), "--version"], 20.0, cwd=str(tmp_path))[0] == 0
 
         with pytest.raises(OSError) as excinfo:
             mod._stage_managed_node(str(wrapper))
@@ -2092,7 +2241,11 @@ class TestPosixGatewayCommand:
         monkeypatch.setattr(
             mod,
             "_run",
-            lambda argv, timeout: (127, "", "error while loading shared libraries: libstdc++.so.6"),
+            lambda argv, timeout, cwd=None: (
+                127,
+                "",
+                "error while loading shared libraries: libstdc++.so.6",
+            ),
         )
 
         with pytest.raises(
@@ -2112,7 +2265,9 @@ class TestPosixGatewayCommand:
         binary.chmod(0o755)
         monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
         monkeypatch.setattr(mod, "config_dir", lambda: crew)
-        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, "usage: not-node\n", ""))
+        monkeypatch.setattr(
+            mod, "_run", lambda argv, timeout, cwd=None: (0, "usage: not-node\n", "")
+        )
 
         with pytest.raises(OSError, match=r"did not report a version"):
             mod._stage_managed_node(str(binary))

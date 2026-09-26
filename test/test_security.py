@@ -10,6 +10,7 @@ import math
 import os
 import random
 import re
+import socket
 import string
 import struct
 import sys
@@ -34,6 +35,7 @@ from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
     sanitized_oauth_endpoint,
+    sanitized_oauth_endpoint_display,
     scan_exfiltration_urls,
     scan_history,
     should_record_observe_history,
@@ -2496,6 +2498,54 @@ class TestKiroCliBundledDeniedCommands:
         assert not self._is_denied("kill 12345 | tee /tmp/kirocrew.log")
 
 
+#: The peers the ssh-to-self floor's own-host seed UDP-``connect``s to learn this
+#: machine's primary outbound address per family: RFC 5737 TEST-NET-2 and the
+#: RFC 3849 documentation prefix, which no router forwards, so a datagram
+#: ``connect`` to them sends no packet. This is what the seed MUST keep pointing
+#: at; the stub below records what it pointed at instead of asking the routing
+#: table.
+_OWN_HOST_PROBE_PEERS = frozenset({("198.51.100.1", 53), ("2001:db8::1", 53)})
+#: What the stubbed probe answers as this machine's outbound address, per family:
+#: documentation addresses too, distinct from the peers, so a test can tell the
+#: seed read the STUB (these turn up in the own-name set) from a real interface.
+_STUB_OWN_ADDRESS: dict[int, str] = {
+    socket.AF_INET: "203.0.113.7",
+    socket.AF_INET6: "2001:db8::7",
+}
+
+
+class _InertDatagramSocket:
+    """A datagram socket that connects nothing.
+
+    ``connect`` records the peer instead of asking the routing table for a
+    source address; ``getsockname`` answers the documentation address for the
+    family; ``fileno`` refuses so the per-interface ioctl sweep, which needs a
+    real descriptor, contributes nothing (its own ``except`` swallows this).
+    """
+
+    def __init__(self, family: int, recorded: list[tuple[int, object]]) -> None:
+        self._family = family
+        self._recorded = recorded
+
+    def __enter__(self) -> _InertDatagramSocket:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def connect(self, peer: object) -> None:
+        self._recorded.append((self._family, peer))
+
+    def getsockname(self) -> tuple[str, int]:
+        return (_STUB_OWN_ADDRESS.get(self._family, ""), 0)
+
+    def fileno(self) -> int:
+        raise OSError("inert datagram socket has no descriptor")
+
+    def close(self) -> None:
+        return None
+
+
 class TestBuiltinDenyPatterns:
     """Tests for is_denied() from security.py BUILTIN_DENY_PATTERNS.
 
@@ -2506,21 +2556,58 @@ class TestBuiltinDenyPatterns:
     """
 
     @pytest.fixture(autouse=True)
-    def _own_host_seed_stays_local(self, monkeypatch) -> None:
+    def _own_host_seed_connects_nothing(self, monkeypatch) -> list[tuple[int, object]]:
         """The ``ssh`` cases here are the first own-host lookup in the process.
 
         ``is_denied("ssh ...")`` seeds the ssh-to-self floor's own-host set on
         first use and, once the backoff allows, starts a DNS enrichment thread.
         The seed learns this machine's outbound address with a UDP ``connect``
-        to a documentation peer -- packet-less, but a real off-loopback connect
-        the routing table has to answer -- and the worker resolves real names.
-        These tests are about the deny patterns, not about this host's identity,
-        so the seed is pinned to the hostname alone and the worker never starts.
+        to a documentation peer -- packet-less, but a real socket the routing
+        table has to answer -- and the worker resolves real names. These tests
+        are about the deny patterns, not about this host's identity, so the
+        datagram socket is stubbed at the seam production reads -- the module's
+        ``socket`` binding, datagram construction only; every other socket kind
+        passes through -- and the enrichment backoff is pushed past the test.
+        The seed still RUNS, through the stub, so the peers it names are
+        observable (``_OWN_HOST_PROBE_PEERS``) and the address it reads back is
+        the stub's. The enumeration's other layers -- the per-interface ioctl
+        sweep (its ``fileno`` is refused), ``/proc/net/if_inet6`` and the
+        Windows / macOS adapter tables -- are local reads that may still yield
+        this host's real addresses, so the enumeration's result is filtered to
+        the stub's addresses before it enters the own-name set: what the deny
+        patterns see is host-independent, and the filter admitting the stub's
+        addresses is what proves the seed read the stub.
+
+        The own-host cache is reset for the test and restored after it, so the
+        stub's addresses never become another test's idea of this machine.
         """
         from kiro_crew.security import argv_floor
 
-        monkeypatch.setattr(argv_floor, "_own_interface_addresses", set)
+        recorded: list[tuple[int, object]] = []
+        real_socket = argv_floor.socket
+        real_interface_addresses = argv_floor._own_interface_addresses
+        stub_addresses = set(_STUB_OWN_ADDRESS.values())
+
+        def _stub_addresses_only() -> set[str]:
+            return real_interface_addresses() & stub_addresses
+
+        class _SocketModule:
+            """``socket`` with datagram construction routed to the inert stub."""
+
+            def __getattr__(self, name: str):
+                return getattr(real_socket, name)
+
+            def socket(self, family: int = -1, type: int = -1, proto: int = -1, fileno=None):
+                if type == real_socket.SOCK_DGRAM:
+                    return _InertDatagramSocket(family, recorded)
+                return real_socket.socket(family, type, proto, fileno)
+
+        monkeypatch.setattr(argv_floor, "socket", _SocketModule())
+        monkeypatch.setattr(argv_floor, "_own_interface_addresses", _stub_addresses_only)
+        monkeypatch.setattr(argv_floor, "_OWN_HOST_NAMES_CACHE", None)
+        monkeypatch.setattr(argv_floor, "_OWN_HOST_RESOLVE_DONE", False)
         monkeypatch.setattr(argv_floor, "_OWN_HOST_RESOLVE_NEXT_TRY", float("inf"))
+        return recorded
 
     def test_allows_command_with_credential_in_path(self) -> None:
         """Commands in dirs like CredentialValidatorServiceCDK must not be blocked."""
@@ -2963,17 +3050,31 @@ class TestBuiltinDenyPatterns:
         # ``git remote`` referencing a remote literally named "push".
         assert is_denied("git remote show push") is None
 
-    def test_allows_ssh_remote_command_without_publish(self) -> None:
+    def test_allows_ssh_remote_command_without_publish(
+        self, _own_host_seed_connects_nothing: list[tuple[int, object]]
+    ) -> None:
         """A plain ``ssh host '<cmd>'`` whose remote command contains the word
         ``push`` (but is not a real ``git push``) must be ALLOWED.
 
         Covers the ssh symptom from the same thread: remote
         interactions starting with ``ssh xxxx`` were aborting.
+
+        The first ``ssh`` verdict in a process also seeds the own-host set. That
+        seed runs here through the inert datagram stub: the peers it names are
+        the documentation addresses (the seam kept pointing where it must), and
+        the own addresses that reached the own-name set are the STUB's: they
+        got there only because the real enumeration read them back from the
+        stubbed socket, and the fixture's filter admits nothing else.
         """
-        from kiro_crew.security import is_denied
+        from kiro_crew.security import argv_floor, is_denied
 
         assert is_denied("ssh dev-dsk 'cd /workplace && git status'") is None
         assert is_denied("ssh dev-dsk 'git commit -m \"address push-back from review\"'") is None
+        recorded = _own_host_seed_connects_nothing
+        assert {peer for _family, peer in recorded} == _OWN_HOST_PROBE_PEERS, recorded
+        assert {family for family, _peer in recorded} == {socket.AF_INET, socket.AF_INET6}
+        assert argv_floor._OWN_HOST_NAMES_CACHE is not None
+        assert set(_STUB_OWN_ADDRESS.values()) <= argv_floor._OWN_HOST_NAMES_CACHE
 
     def test_blocks_ssh_remote_real_git_push(self) -> None:
         """A real ``git push`` inside an ``ssh`` remote command stays BLOCKED."""
@@ -3692,14 +3793,26 @@ class TestSanitizedOAuthEndpoint:
         assert len(path) == security._SANITIZED_OAUTH_PATH_MAX_LEN + 1
         assert path.endswith("…")
 
-    def test_overlong_host_is_capped(self) -> None:
+    def test_overlong_host_is_capped_with_a_marker(self) -> None:
         # 30-char labels: below the 40-char bare-run floor, so the host is
-        # benign-long — it caps, not bails.
+        # benign-long — it caps, not bails, and the cap is VISIBLE: a chopped
+        # host that reads as a whole hostname names an endpoint that does not
+        # exist, which is worse than an obviously partial one.
         long_host = ".".join(["a" * 30] * 9) + ".example"
         result = sanitized_oauth_endpoint(f"https://{long_host}/authorize")
         assert result is not None
         host, _ = result
-        assert len(host) <= security._SANITIZED_OAUTH_HOST_MAX_LEN
+        assert len(host) == security._SANITIZED_OAUTH_HOST_MAX_LEN + 1
+        assert host.endswith("…")
+        assert host[:-1] == long_host[: security._SANITIZED_OAUTH_HOST_MAX_LEN]
+
+    def test_a_host_at_the_cap_is_not_marked(self) -> None:
+        # Exactly the DNS maximum is a legal hostname; only an EXCESS is chopped.
+        # 30-char labels again: no 40-char run that reads as a bare secret.
+        at_cap = ".".join(["b" * 30] * 8) + ".abcde"
+        assert len(at_cap) == security._SANITIZED_OAUTH_HOST_MAX_LEN
+        result = sanitized_oauth_endpoint(f"https://{at_cap}/authorize")
+        assert result == (at_cap, "/authorize")
 
     @pytest.mark.parametrize(
         "url",
@@ -3713,6 +3826,266 @@ class TestSanitizedOAuthEndpoint:
     )
     def test_unparseable_urls_return_none(self, url: str) -> None:
         assert sanitized_oauth_endpoint(url) is None
+
+
+def _long_state_query(*, extra: str = "") -> str:
+    """A standard front-channel query whose opaque ``state`` pushes it past the
+    long-query heuristic: rejected at any endpoint outside the allowlist, clean
+    at an allowlisted one, because every parameter is a known OAuth name."""
+    return (
+        "?client_id=client123&response_type=code"
+        "&redirect_uri=https%3A%2F%2Fexample.com%2Fcallback"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("a1B2c3D4" * 16) + extra
+    )
+
+
+class TestOAuthRejectionIsEndpointExemptible:
+    """``oauth_rejection_is_endpoint_exemptible`` answers "would the allowlist fix it?".
+
+    The counterfactual (``diagnose_oauth_url_credential(url,
+    assume_approved_endpoint=True)``) re-runs the real gate with the endpoint
+    treated as approved and nothing else relaxed. The operator-extension corpus
+    is the positive set by definition: each entry is a URL the field rejected
+    until its operator added the endpoint.
+    """
+
+    @pytest.mark.parametrize(
+        ("url", "endpoint"),
+        [(url, endpoint) for _, url, endpoint in OPERATOR_EXTENSION_OAUTH_URLS],
+        ids=[name for name, _, _ in OPERATOR_EXTENSION_OAUTH_URLS],
+    )
+    def test_corpus_urls_are_rejected_today_and_pass_once_allowlisted(
+        self, url: str, endpoint: tuple[str, str]
+    ) -> None:
+        assert security.diagnose_oauth_url_credential(url) is not None
+        assert security.diagnose_oauth_url_credential(url, assume_approved_endpoint=True) is None
+        assert security.oauth_rejection_is_endpoint_exemptible(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://idp.example.com/authorize?access_token=AKIAIOSFODNN7EXAMPLE",
+            "https://idp.example.com/authorize" + _long_state_query(extra="#frag"),
+            "https://idp.example.com/authorize;v=1" + _long_state_query(),
+            f"https://user:pw@idp.example.com/authorize{_long_state_query()}",
+            "http://idp.example.com/authorize" + _long_state_query(),
+            "https://idp.example.com:8443/authorize" + _long_state_query(),
+            "https://idp.example.com/authorize?state=" + ("%41" * 80),
+        ],
+        ids=[
+            "fixed-credential-in-query",
+            "fragment",
+            "path-params",
+            "userinfo",
+            "http-scheme",
+            "explicit-port",
+            "heavy-percent-encoding",
+        ],
+    )
+    def test_unconditional_rules_still_reject_under_the_assumption(self, url: str) -> None:
+        assert security.diagnose_oauth_url_credential(url) is not None
+        assert (
+            security.diagnose_oauth_url_credential(url, assume_approved_endpoint=True) is not None
+        )
+        assert security.oauth_rejection_is_endpoint_exemptible(url) is False
+
+    def test_a_url_the_gate_accepts_has_nothing_to_exempt(self) -> None:
+        clean = "https://idp.example.com/authorize?state=abc&code_challenge_method=S256"
+        assert security.diagnose_oauth_url_credential(clean) is None
+        assert security.oauth_rejection_is_endpoint_exemptible(clean) is False
+
+    def test_the_assumption_does_not_consult_the_operator_file(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The counterfactual is a pure re-run of the gate: no allowlist lookup,
+        so no ``oauth_endpoint_extension_used`` audit event can fire for an
+        endpoint nobody actually approved."""
+        looked_up: list[tuple[str, str]] = []
+
+        def spy(host: str, path: str) -> bool:
+            looked_up.append((host, path))
+            return False
+
+        monkeypatch.setattr(security, "_approved_oauth_authorization_endpoint", spy)
+        url = OPERATOR_EXTENSION_OAUTH_URLS[0][1]
+        assert security.diagnose_oauth_url_credential(url, assume_approved_endpoint=True) is None
+        assert looked_up == []
+        assert security.diagnose_oauth_url_credential(url) is not None
+        assert looked_up != []
+
+    def test_the_default_verdict_is_unchanged(self) -> None:
+        """``assume_approved_endpoint`` defaults off, so the boolean gate every
+        caller uses is byte-for-byte the old one."""
+        url = OPERATOR_EXTENSION_OAUTH_URLS[0][1]
+        assert security.oauth_url_contains_credential(url) is True
+
+
+class TestSanitizedOAuthEndpointDisplay:
+    """``sanitized_oauth_endpoint_display`` is the COPY-READY contract.
+
+    The diagnostic pair may legitimately carry a component that is not
+    pasteable (redaction tag, ``…`` cap) or that the ``oauth_endpoints.json``
+    loader would refuse (``localhost``, an IP literal, a percent-escape in the
+    path); and a URL may be rejected for a reason the allowlist cannot clear
+    (a fixed credential, a fragment, path parameters, ``http``, a port). A card
+    that says "add THIS to oauth_endpoints.json" must hand back a string only
+    when adding it would actually work. Every signature the helper judges is
+    enumerated here with its verdict, so a widened or narrowed rule shows up as
+    a specific row rather than a vague failure.
+    """
+
+    GITHUB_TOKEN = "ghp_" "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef12"
+    Q = _long_state_query()
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://idp.example.com/authorize" + Q, "idp.example.com/authorize"),
+            (
+                "https://IdP.Example.COM/Realms/Dev/Authorize" + Q,
+                "idp.example.com/Realms/Dev/Authorize",
+            ),
+            ("https://idp.example.com" + Q, "idp.example.com/"),
+            ("https://bücher.example/authorize" + Q, "xn--bcher-kva.example/authorize"),
+            # Operator-extension shapes the loader exists for: an Okta org, an
+            # Auth0 tenant, a Keycloak realm, a tenant-scoped Entra path.
+            (
+                "https://dev-123456.okta.com/oauth2/default/v1/authorize" + Q,
+                "dev-123456.okta.com/oauth2/default/v1/authorize",
+            ),
+            ("https://acme.us.auth0.com/authorize" + Q, "acme.us.auth0.com/authorize"),
+            (
+                "https://idp.example.com/realms/dev/protocol/openid-connect/auth" + Q,
+                "idp.example.com/realms/dev/protocol/openid-connect/auth",
+            ),
+            (
+                "https://login.microsoftonline.com/tenant-id/oauth2/v2.0/authorize" + Q,
+                "login.microsoftonline.com/tenant-id/oauth2/v2.0/authorize",
+            ),
+        ],
+        ids=[
+            "long-state-query-dropped",
+            "host-lowercased-path-case-kept",
+            "empty-path-becomes-slash",
+            "idn-host-in-a-label-form",
+            "okta-org",
+            "auth0-tenant",
+            "keycloak-realm",
+            "entra-tenant-path",
+        ],
+    )
+    def test_nameable_endpoints_come_back_as_host_slash_path(self, url: str, expected: str) -> None:
+        assert sanitized_oauth_endpoint_display(url) == expected
+
+    @pytest.mark.parametrize(
+        ("name", "url", "endpoint"),
+        OPERATOR_EXTENSION_OAUTH_URLS,
+        ids=[name for name, _, _ in OPERATOR_EXTENSION_OAUTH_URLS],
+    )
+    def test_the_operator_extension_corpus_is_named_verbatim(
+        self, name: str, url: str, endpoint: tuple[str, str]
+    ) -> None:
+        """The URLs the extension file exists for are exactly the ones the card
+        must name, and the string it names is the entry that fixes them."""
+        host, path = endpoint
+        assert sanitized_oauth_endpoint_display(url) == f"{host}{path}"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # -- the diagnostic pair itself is None --
+            "",
+            "not a url at all",
+            "https:///path-without-host",
+            f"https://{GITHUB_TOKEN}@idp.example.com/authorize" + Q,
+            "https://user%3Apass%40idp.example.com/authorize" + Q,
+            "https://AKIAIOSFODNN7EXAMPLE.example.com/authorize" + Q,
+            # -- pair is not pasteable: redaction tag / cap marker --
+            "https://idp.example.com/AKIAIOSFODNN7EXAMPLE/authorize" + Q,
+            "https://idp.example.com" + "/seg-ment" * 40 + Q,
+            "https://" + ".".join(["a" * 30] * 9) + ".example/authorize" + Q,
+            # -- the extension loader would refuse the host --
+            "https://localhost/authorize" + Q,
+            "https://10.0.0.1/authorize" + Q,
+            "https://idp.example.com./authorize" + Q,
+            "https://idp/authorize" + Q,
+            # -- the extension loader would refuse the path --
+            "https://idp.example.com/auth%20orize" + Q,
+            "https://idp.example.com/../authorize" + Q,
+            "https://idp.example.com/auth\\orize" + Q,
+            # -- the allowlist could not clear the rejection --
+            "https://idp.example.com/authorize?access_token=AKIAIOSFODNN7EXAMPLE",
+            "https://idp.example.com/authorize" + _long_state_query(extra="#frag"),
+            "https://idp.example.com/authorize;v=1" + Q,
+            "http://idp.example.com/authorize" + Q,
+            "https://idp.example.com:8443/authorize" + Q,
+            "https://idp.example.com:443/authorize" + Q,
+            # -- not rejected at all: nothing to name --
+            "https://idp.example.com/authorize?state=x&code_challenge_method=S256",
+        ],
+        ids=[
+            "empty",
+            "not-a-url",
+            "no-host",
+            "userinfo",
+            "encoded-userinfo",
+            "credential-in-host",
+            "credential-in-path-redacted",
+            "overlong-path-capped",
+            "overlong-host-capped",
+            "localhost-no-letter-tld",
+            "ipv4-literal",
+            "trailing-dot-host",
+            "single-label-host",
+            "percent-escape-in-path",
+            "dot-dot-in-path",
+            "backslash-in-path",
+            "fixed-credential-in-query",
+            "fragment",
+            "path-params",
+            "http-scheme",
+            "explicit-port",
+            "explicit-default-port",
+            "accepted-url",
+        ],
+    )
+    def test_unnameable_endpoints_return_none(self, url: str) -> None:
+        assert sanitized_oauth_endpoint_display(url) is None
+
+    def test_the_display_string_is_exactly_what_the_loader_would_accept(self) -> None:
+        """Contract closure: split the string back into (host, path) and run it
+        through the SAME validators the extension loader applies, so the two
+        can only drift together."""
+        display = sanitized_oauth_endpoint_display(
+            "https://idp.example.com/realms/dev/protocol/openid-connect/auth" + self.Q
+        )
+        assert display is not None
+        host, _, rest = display.partition("/")
+        path = "/" + rest
+        assert security._OAUTH_EXTENSION_HOST_RE.fullmatch(host)
+        assert security._valid_oauth_extension_path(path)
+        assert security._validate_operator_oauth_entries(
+            {"additional_authorization_endpoints": [{"host": host, "path": path}]}
+        ) == frozenset({(host, path)})
+
+    def test_the_raw_url_and_its_query_never_appear_in_the_display(self) -> None:
+        url = "https://idp.example.com/authorize" + self.Q
+        display = sanitized_oauth_endpoint_display(url)
+        assert display == "idp.example.com/authorize"
+        for secret in ("a1B2c3D4", "E9Melhoa2Owv", "client_id", "?", "https://"):
+            assert secret not in display
+
+    def test_a_redacted_path_is_refused_rather_than_joined(self) -> None:
+        # The diagnostic pair is (host, tag): the tag must never be glued onto
+        # the host as if it were a path a user could type.
+        url = "https://idp.example.com/AKIAIOSFODNN7EXAMPLE/authorize" + self.Q
+        assert sanitized_oauth_endpoint(url) == (
+            "idp.example.com",
+            security._REDACTED_CREDENTIAL_TAG,
+        )
+        assert sanitized_oauth_endpoint_display(url) is None
 
 
 class TestOperatorOAuthEndpointExtension:
@@ -5795,12 +6168,23 @@ class TestAdaptiveHomeTargetsExpiry:
     ) -> None:
         """The other half: without a symlink there is nothing a repoint can stale.
 
-        This is what keeps the fix above from being a blanket revert. When no
-        target's canonical form differs from its lexical one, the set holds no
-        resolution-derived entry, so reaching the stale-credential case requires
+        This is what keeps the fix above from being a blanket revert. When none of
+        the paths the build RESOLVED came back spelled differently, the set holds
+        no resolution-derived entry, so reaching the stale-credential case requires
         first CREATING a symlink inside the crew home -- a write
         ``is_sensitive_write_path`` refuses. The adaptive expiry therefore applies
         in full, which is the availability this PR is for.
+
+        The population that can report a difference is the narrow one
+        ``_BuiltTargets`` enumerates, not the built target set. This test's
+        environment sets ``KIROCREW_HOME`` here and inherits ``XDG_CONFIG_HOME``
+        from the root ``conftest``, but no declared credential leaf under either
+        root is a symlink, so nothing reports a difference. Note what that does NOT
+        say: a
+        symlinked ``goose`` directory UNDER the exported ``XDG_CONFIG_HOME`` would
+        report one, because that leaf is declared. Under this suite's root
+        ``conftest`` that variable points at a tmp dir outside ``HOME``, so
+        ``~/.config/goose`` is not the path any build resolves here.
         """
         from kiro_crew import security
 
@@ -5826,6 +6210,127 @@ class TestAdaptiveHomeTargetsExpiry:
         clock["now"] += security._home_targets_ttl(0.4, resolution_differed=False)
         security._home_dir_targets(security._SENSITIVE_HOME_DIRS)
         assert len(calls) == 2
+
+    def test_only_the_enumerated_classes_of_path_are_resolved_by_a_build(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Pin the resolve memo's population, which five prose sites enumerate.
+
+        ``resolution_differed`` is read off the memo the build fills, so WHICH
+        paths reach that memo is the flag's whole scope -- and the ``differed``
+        comment, the :class:`_BuiltTargets`, :func:`_home_targets_ttl` and
+        :func:`_report_expiry_pin` docstrings and the security spec all state that
+        scope as a closed list. That list of five is the one the failure message
+        below names, so the two stay in step.
+        Prose cannot hold a closed list shut. A future ``resolve_target`` call on a
+        sixth kind of path would widen what the flag reports while all five sites
+        went on describing the old set, which is exactly the documentation defect
+        this change exists to remove, reintroduced one call site later.
+
+        The expectation is DERIVED from the same constants the build reads rather
+        than spelled out here, so adding a sensitive LEAF keeps this passing and
+        adding a resolve CALL SITE fails it.
+        """
+        from kiro_crew.agent_sdk import host_auth
+        from kiro_crew.security import paths as gate
+
+        crew_home = tmp_path / "crew"
+        crew_home.mkdir()
+        kiro_home = tmp_path / "kiro"
+        kiro_home.mkdir()
+        os_home = tmp_path / "oshome"
+        os_home.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(crew_home))
+        monkeypatch.setenv("KIRO_HOME", str(kiro_home))
+        monkeypatch.setenv("KIROCREW_OS_HOME", str(os_home))
+        # Set EVERY harness override root this test asserts on, rather than
+        # inheriting one from an unrelated autouse fixture. The override-anchored
+        # arm only contributes where its root is set, so leaving that to a fixture
+        # written for another purpose makes the fifth class's coverage depend on a
+        # variable no reader of this test can see -- and the assertion at the end
+        # would then pass or go vacuous for reasons outside this file.
+        for _override_env in host_auth.home_override_env_vars():
+            _override_root = tmp_path / f"override-{_override_env.lower()}"
+            _override_root.mkdir(exist_ok=True)
+            monkeypatch.setenv(_override_env, str(_override_root))
+        self._clear()
+
+        # Resolve the roots BEFORE recording and pass them in, so the recorder
+        # sees the BUILD's own resolutions and not the root anchoring ahead of it.
+        roots = gate._resolved_root_key()
+        # The three lists the three callers actually hand the builder: the read
+        # gate passes ``_SENSITIVE_HOME_DIRS``, ``is_sensitive_write_path`` passes
+        # that plus ``_WRITE_PROTECTED_HOME_PATHS``, and
+        # ``_is_keystone_publish_artifact`` passes ``_KEYSTONE_ARTIFACT_PARENTS``.
+        # Both lists carrying ``_SENSITIVE_HOME_DIRS`` admit every
+        # ``_OVERRIDE_ANCHORED_LEAVES`` member, because those leaves are spliced
+        # into it; ``_WRITE_PROTECTED_HOME_PATHS`` on its own and
+        # ``_KEYSTONE_ARTIFACT_PARENTS`` each filter all of them out of BOTH the
+        # recorder and ``expected``, which is how the fifth resolved class can come
+        # to be asserted vacuously.
+        tiers = (
+            gate._SENSITIVE_HOME_DIRS,
+            gate._SENSITIVE_HOME_DIRS + gate._WRITE_PROTECTED_HOME_PATHS,
+            gate._KEYSTONE_ARTIFACT_PARENTS,
+        )
+        adapter_roots = dict(roots.adapter_roots)
+        real = gate._realpath_or_none
+        override_anchored_seen = 0
+
+        for tier in tiers:
+            self._clear()
+            asked: list[str] = []
+
+            def recording(path: str, _sink=asked) -> str | None:
+                _sink.append(path)
+                return real(path)
+
+            monkeypatch.setattr(gate, "_realpath_or_none", recording)
+            gate._home_dir_targets_uncached(tier, roots)
+
+            expected = {roots.home}
+            if roots.os_home:
+                expected.add(roots.os_home)
+            if roots.crew_home:
+                for entry in tier:
+                    for prefix in gate._CREW_HOME_PREFIXES:
+                        if entry == prefix or entry.startswith(prefix + "/"):
+                            leaf = entry[len(prefix) :].lstrip("/")
+                            expected.add(
+                                os.path.join(roots.crew_home, *gate._leaf_segments(leaf))
+                                if leaf
+                                else roots.crew_home
+                            )
+                            break
+            if roots.kiro_home and gate._KIRO_AGENTS_DIR in tier:
+                expected.add(os.path.join(roots.kiro_home, "agents"))
+            for leaf, root_envs, under_root in gate._OVERRIDE_ANCHORED_LEAVES:
+                if leaf not in tier:
+                    continue
+                for env_name in root_envs:
+                    root = adapter_roots.get(env_name)
+                    if root:
+                        expected.add(os.path.join(root, *gate._leaf_segments(under_root)))
+                        override_anchored_seen += 1
+
+            assert set(asked) == expected, (
+                "this build resolved a path outside the classes the prose enumerates, "
+                "so the flag's scope changed: update the differed comment, "
+                "_BuiltTargets, _home_targets_ttl, _report_expiry_pin and the "
+                "security spec together"
+            )
+
+        # The fifth class has to be REACHED, not merely described. Without this the
+        # override-anchored arm can contribute nothing to either side -- which is
+        # what ``_WRITE_PROTECTED_HOME_PATHS`` alone does -- and a widened flag
+        # would still pass while the prose about declared credential leaves went
+        # unasserted.
+        assert override_anchored_seen, (
+            "no declared credential leaf was re-anchored under a harness home "
+            "override, so the resolved class the prose rests on is unasserted: "
+            "check that a harness override variable is set in this environment"
+        )
 
     def test_a_builder_that_reports_nothing_gets_the_floor(self, monkeypatch, tmp_path) -> None:
         """An unknown build is treated as having traversed a symlink.
@@ -5917,18 +6422,21 @@ class TestAdaptiveHomeTargetsExpiry:
     def test_the_pin_is_reported_once_per_transition(self, caplog) -> None:
         """The diagnostic exists so the fix cannot self-disable in silence.
 
-        One line per TRANSITION, not per rebuild: a stow or chezmoi home pins the
-        floor on every build, and a per-build line would be noise that gets
-        filtered, which is the same as having none.
+        One line per TRANSITION of the shared state, not per rebuild: an install
+        whose resolved leaf under a home-override root is a symlink pins the floor
+        on every build that was handed that leaf, and a per-build line would be
+        noise that gets filtered, which is the same as having none.
         """
+        from kiro_crew import security
         from kiro_crew.security import paths as gate
 
+        read_dirs = security._SENSITIVE_HOME_DIRS
         gate._home_targets_pin_state.clear()
         with caplog.at_level(logging.INFO, logger=gate.__name__):
-            gate._report_expiry_pin(True)
-            gate._report_expiry_pin(True)
-            gate._report_expiry_pin(True)
-            gate._report_expiry_pin(False)
+            gate._report_expiry_pin(read_dirs, True)
+            gate._report_expiry_pin(read_dirs, True)
+            gate._report_expiry_pin(read_dirs, True)
+            gate._report_expiry_pin(read_dirs, False)
         lines = [record.getMessage() for record in caplog.records]
         gate._home_targets_pin_state.clear()
 
@@ -5936,6 +6444,124 @@ class TestAdaptiveHomeTargetsExpiry:
         assert "pinned to the" in lines[0]
         assert "symlink" in lines[0]
         assert "cost-tracking expiry in force" in lines[1]
+        # Both halves name the tier, so a reader diagnosing a refusal knows WHICH
+        # gate the line is about rather than reading it as the whole gate's state.
+        assert all("(read tier)" in line for line in lines), lines
+
+    def test_each_tier_dedups_on_its_own_state_not_one_shared_slot(
+        self, monkeypatch, tmp_path, caplog
+    ) -> None:
+        """A host whose builds disagree gets one line per tier, not an alternation.
+
+        The gates hand the builder different lists, so the flag can come back
+        differently for each: a symlinked write-protected crew leaf that holds no
+        secret is in the write gate's list and in neither of the others, which pins
+        the write tier while the keystone-artifact build reports no traversal and
+        selects the cost-tracking expiry. Keyed on one shared slot, each build flips
+        the key the other just set, so both messages repeat for as long as the
+        disagreement lasts and the "in force" half asserts the adaptive expiry
+        applies on a host where a gate IS pinned to the floor -- the exact wrong
+        conclusion for whoever is reading the log to find out why. Keyed per list,
+        each build transitions its own state and says it once.
+
+        Driven through :func:`_home_dir_targets` rather than the reporter, so the
+        wiring that passes the list is pinned and not only the helper.
+        """
+        from kiro_crew import security
+        from kiro_crew.security import paths as gate
+
+        crew_home = tmp_path / "crew"
+        crew_home.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(crew_home))
+        self._clear()
+        gate._home_targets_pin_state.clear()
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(security.time, "monotonic", lambda: clock["now"])
+
+        write_dirs = security._SENSITIVE_HOME_DIRS + security._WRITE_PROTECTED_HOME_PATHS
+        keystone_dirs = security._KEYSTONE_ARTIFACT_PARENTS
+
+        def disagreeing(home_dirs, roots=None):
+            """Report a traversal for the write list alone, the shape of the defect."""
+            clock["now"] += 0.4
+            built = security._BuiltTargets({str(crew_home / "sessions").casefold()})
+            built.resolution_differed = home_dirs == write_dirs
+            return built
+
+        monkeypatch.setattr(security, "_home_dir_targets_uncached", disagreeing)
+
+        with caplog.at_level(logging.INFO, logger=gate.__name__):
+            for _ in range(3):
+                security._home_dir_targets(write_dirs)
+                security._home_dir_targets(keystone_dirs)
+                # Expire both entries, so the next pass is a fresh build for each
+                # tier and reports again rather than being served from the cache.
+                clock["now"] += security._HOME_TARGETS_TTL_MAX_SECS + 1.0
+        lines = [r.getMessage() for r in caplog.records if "anchor cache" in r.getMessage()]
+        gate._home_targets_pin_state.clear()
+
+        assert len(lines) == 2, f"each tier reports once across the three passes: {lines}"
+        pinned = [line for line in lines if "pinned to the" in line]
+        adaptive = [line for line in lines if "cost-tracking expiry in force" in line]
+        assert len(pinned) == 1 and "(write tier)" in pinned[0], lines
+        assert len(adaptive) == 1 and "(keystone-artifact tier)" in adaptive[0], lines
+
+    def test_every_gate_list_handed_to_the_builder_has_a_tier_name(self) -> None:
+        """A new gate must not reach an operator's log as an ``unnamed`` tier.
+
+        :func:`_home_targets_tier` names the lists it knows and answers generically
+        for one it does not, which keeps the dedup correct either way -- so nothing
+        at runtime notices a gate that arrives with no name, and the generic answer
+        would sit in the log unchallenged. This is what notices: every list a call
+        site in the module hands the builder is resolved against the module and must
+        come back named. The expectation is derived from the call sites rather than
+        restated, so it cannot agree with a stale copy of them.
+        """
+        import ast
+
+        from kiro_crew.security import paths as gate
+
+        tree = ast.parse(Path(gate.__file__).read_text(encoding="utf-8"))
+
+        def resolve(expr: ast.expr) -> list[str] | None:
+            """The module list this expression denotes, or None if it is not one."""
+            if isinstance(expr, ast.Name):
+                value = getattr(gate, expr.id, None)
+                return value if isinstance(value, list) else None
+            if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+                left, right = resolve(expr.left), resolve(expr.right)
+                return None if left is None or right is None else left + right
+            return None
+
+        # Where the list sits in each signature: first for the builder, second for
+        # the matcher that forwards to it.
+        positions = {"_home_dir_targets": 0, "_path_in_home_dirs": 1}
+        named: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            callee = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            index = positions.get(callee)
+            if index is None or len(node.args) <= index:
+                continue
+            # A call that forwards its own parameter resolves to nothing here; the
+            # list it received is pinned at whichever call site supplied it.
+            listed = resolve(node.args[index])
+            if listed is None:
+                continue
+            tier = gate._home_targets_tier(listed)
+            assert not tier.startswith(
+                "unnamed"
+            ), f"a gate hands the builder an unnamed list: {ast.unparse(node.args[index])}"
+            named.append(tier)
+
+        assert set(named) == {
+            "read",
+            "write",
+            "keystone-artifact",
+        }, f"the scan must reach every gate, found {sorted(set(named))}"
 
     def test_repointed_home_symlink_is_not_served_from_cache_at_the_longest_expiry(
         self, monkeypatch, tmp_path
@@ -10095,6 +10721,251 @@ class TestSubstitutionCloserReadsCommandGrammar:
         """Fail-CLOSED direction: a body that reaches too far is only over-scanned."""
         (body,) = security._substitution_bodies(f"$(case x in x) printf {self.VERB}")
         assert f"printf {self.VERB}" in body, body
+
+
+class TestCaseArmingRequiresCommandPosition:
+    """``case`` is a reserved word only in COMMAND POSITION, so the
+    pattern-paren rule must not arm on the word as data. Every vector is
+    bash-verified live: the non-arming forms are ones bash reads as data (or
+    refuses outright), and the arming forms are ones bash spans."""
+
+    @pytest.mark.parametrize(
+        ("command", "body"),
+        [
+            # ``case`` as an ARGUMENT: bash closes at the first unquoted ``)``.
+            ("echo $(echo case x in y) tail", "echo case x in y"),
+            ("echo $(echo then case x in y) tail", "echo then case x in y"),
+            # A quoted spelling is data even in command position.
+            ("echo $('case' x in y) tail", "'case' x in y"),
+            # An assignment prefix removes command position (bash: syntax
+            # error at the pattern paren, the line never parses).
+            ("echo $(v=1 case x in y) tail", "v=1 case x in y"),
+            # ``command case`` / ``eval case``: operands, not the keyword.
+            ("echo $(command case x in y) tail", "command case x in y"),
+        ],
+    )
+    def test_case_as_data_no_longer_over_arms(self, command: str, body: str) -> None:
+        assert security._substitution_bodies(command) == [body]
+        assert security.is_denied(command) is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Command position hands through reserved words -- INHERITED, so
+            # each keeper must hold position itself.
+            "kill $(if true; then case x in x) : ;; esac; fi; pgrep -f kirocrew)",
+            "kill $({ case x in x) : ;; esac; }; pgrep -f kirocrew)",
+            # Both function-definition forms make the body command position.
+            "kill $(function f case x in x) : ;; esac; pgrep -f kirocrew)",
+            "kill $(f() case x in x) : ;; esac; f; pgrep -f kirocrew)",
+            "kill $(f ( ) case x in x) : ;; esac; f; pgrep -f kirocrew)",
+            # ``coproc [NAME] compound-command``.
+            "kill $(coproc c case x in x) : ;; esac; pgrep -f kirocrew)",
+            # A nested case in a clause body opens after ``)`` -> command position.
+            "kill $(case a in a) case b in b) : ;; esac ;; esac; pgrep -f kirocrew)",
+            # The MULTI-CLAUSE form: an outer pattern paren
+            # AFTER the inner esac is what a missed inner arm hands to the
+            # desynchronised counter as the closer -- this vector is red on a
+            # gate that skips the clause-body position.
+            "kill $(case a in a) case b in b) : ;; esac ;; c) : ;; esac; pgrep -f kirocrew)",
+            # ``case`` GLUED to a backtick opener: the
+            # opener both breaks the word and starts a command, so the word
+            # must still be recognised and armed.
+            "kill $(`case x in x) : ;; esac`; pgrep -f kirocrew)",
+        ],
+    )
+    def test_every_bash_spanning_form_still_arms(self, command: str) -> None:
+        (body,) = security._substitution_bodies(command)
+        assert "pgrep -f kirocrew" in body, body
+        assert security._is_self_kill(command)
+
+    def test_a_redirect_prefixed_case_is_not_armed(self) -> None:
+        """bash REFUSES a redirect prefix before a compound command (measured:
+        syntax error, the line never runs), so the exact reading closes at the
+        pattern paren rather than spanning a command that cannot execute."""
+        body, *_rest = security._substitution_bodies("echo $( > f case x in y) tail")
+        assert body == " > f case x in y", body
+
+    def test_esac_after_in_stays_safe_but_unproven(self) -> None:
+        """``$(case z in esac; echo after)`` -- bash ends the case at that
+        ``esac``, but disarming there needs subject/``in`` state the flat
+        counter deliberately does not carry: any cheaper rule (e.g. 'esac
+        after the word in') disarms on ``echo in esac`` inside a clause body,
+        which is the BYPASS direction. Pinned to the fail-closed fallback:
+        unproven span, whole remainder, extractors scan more."""
+        (body,) = security._substitution_bodies("$(case z in esac; echo after)")
+        assert "echo after" in body, body
+
+    def test_option_words_are_transparent_in_the_chain(self) -> None:
+        """Option words pass the decision through to what precedes them.
+
+        ``time -p case`` / ``time -- case``: bash's OWN substitution parser
+        refuses these spellings (measured live: syntax error, the tail prints
+        as literal text and never executes), so no executable bypass exists
+        either way -- but the grammar reads the reserved word there, and
+        arming keeps the walk uniform with the bare ``time case`` form at the
+        cost of a longer span on input bash never runs (the documented safe
+        direction). ``echo -n case`` chains to ``echo`` and stays data."""
+        from kiro_crew.security.shell_normalizer import _matching_close_paren
+
+        for text in (
+            "$(time -p case x in x) : ;; esac; pgrep -f kirocrew)",
+            "$(time -- case x in x) : ;; esac; pgrep -f kirocrew)",
+        ):
+            assert _matching_close_paren(text, 2) == (len(text), True), text
+        assert security._substitution_bodies("echo $(echo -n case x in y) tail") == [
+            "echo -n case x in y"
+        ]
+
+    def test_heredoc_bodies_extract_whole_and_the_consumer_convicts(self) -> None:
+        """A ``)`` inside heredoc DATA must not end the extracted body early.
+
+        These pins hold on this branch and on the base alike: the span is
+        unproven through the heredoc, so the extractor falls back to the whole
+        remainder (scan more, never less) and the payload after the heredoc IS
+        scanned — the self-kill consumer convicts. bash runs the tail in both
+        shapes (verified live)."""
+        for cmd in (
+            "kill $(echo <<X\ncase x in y)\nX\npgrep -f kirocrew)",
+            "kill $(cat <<X\ncase a in a) : ;; esac\nX\npgrep -f kirocrew)",
+        ):
+            (body,) = security._substitution_bodies(cmd)
+            assert "pgrep -f kirocrew" in body, body
+            assert security._is_self_kill(cmd)
+
+    def test_the_two_keyword_tables_are_cross_pinned(self) -> None:
+        """The command-position keepers and ``_SHELL_RESERVED_WORDS`` answer
+        the same 'is this word shell syntax?' question for different purposes
+        (grammar model here, fail-closed bail in the redirect skip). Every
+        membership difference is intentional and named, so an edit to one
+        table trips this pin and the editor rules on the other deliberately."""
+        from kiro_crew.security.argv_floor import _SHELL_RESERVED_WORDS
+        from kiro_crew.security.shell_normalizer import _KEEPS_COMMAND_POSITION
+
+        only_reserved = _SHELL_RESERVED_WORDS - _KEEPS_COMMAND_POSITION
+        only_keeps = _KEEPS_COMMAND_POSITION - _SHELL_RESERVED_WORDS
+        assert only_reserved == {
+            # handled structurally by the span walk, not as position-keepers:
+            "case",  # arms the pattern rule (command position gated)
+            "esac",  # disarms it (command position gated)
+            "in",  # case grammar, never hands position on
+            "function",  # name-consuming prefix, chained in _arms_case_context
+            # loop/conditional heads whose operands are NOT command position;
+            # their bodies re-enter it via do/then, which ARE in the set:
+            "for",
+            "select",
+            # bracket commands whose operands are test expressions:
+            "[[",
+            "]]",
+            # block ENDERS: bash refuses a keyword directly after each
+            # (``fi case`` / ``done case`` / ``} case`` are syntax errors,
+            # measured), so none of them hands command position on:
+            "fi",
+            "done",
+            "}",
+        }
+        assert only_keeps == set()
+
+    def test_block_enders_do_not_hand_position_on(self) -> None:
+        """``fi case`` / ``done case`` are bash SYNTAX ERRORS (measured), so
+        the exact reading closes at the first paren rather than spanning a
+        line that can never run."""
+        for command, body in (
+            ("echo $(if true; then :; fi case x in y) tail", "if true; then :; fi case x in y"),
+            (
+                "echo $(for i in 1; do :; done case x in y) tail",
+                "for i in 1; do :; done case x in y",
+            ),
+        ):
+            assert security._substitution_bodies(command)[0] == body, command
+
+    def test_a_continuation_split_keeper_still_arms(self) -> None:
+        """A keeper split by a line continuation hands command position on.
+
+        bash removes ``\\`` + newline while READING, so ``th\\`` + newline +
+        ``en case x in x) ...`` runs as ``then case ...`` (measured). The
+        backward word parser must join across the continuation the same way:
+        stopping at the raw newline reads the fragment ``en``, refuses to arm,
+        and the pattern ``)`` then closes substitution scanning early -- the
+        under-scan direction the self-protection consumers cannot afford.
+        """
+        from kiro_crew.security.shell_normalizer import _arms_case_context
+
+        for keeper_split in ("th\\\nen", "i\\\nf true; then", "d\\\no"):
+            head = {
+                "th\\\nen": f"if true; {keeper_split}",
+                "i\\\nf true; then": keeper_split,
+                "d\\\no": f"while true; {keeper_split}",
+            }[keeper_split]
+            text = f"{head} case x in x) echo BODY;; esac"
+            idx = text.rindex("case")
+            assert _arms_case_context(text, idx), text
+
+    def test_a_continuation_split_keeper_spans_the_whole_body(self) -> None:
+        """The substitution body survives the pattern ``)`` when the keeper is split."""
+        command = 'kill -9 $(if true; th\\\nen case x in x) pgrep -f "kiro""crew";; esac; fi)'
+        (body,) = security._substitution_bodies(command)
+        assert 'pgrep -f "kiro""crew"' in body, body
+        assert body.endswith("fi"), body
+        assert security.is_denied(command) is not None
+
+    def test_a_split_keeper_word_is_joined_not_fragmented(self) -> None:
+        """``_prev_word`` reads ``th\\`` + newline + ``en`` as one word.
+
+        The joined word must carry its continuation glue (so the arming walk
+        can classify it) and start at the FIRST fragment, so chained walks
+        (``then`` -> ``if``) resume before the whole keeper, not mid-word.
+        """
+        from kiro_crew.security.shell_normalizer import _prev_word
+
+        text = "th\\\nen case"
+        got = _prev_word(text, text.index("case"))
+        assert got is not None
+        word, start = got
+        assert word.replace("\\\n", "") == "then", got
+        assert start == 0, got
+
+    def test_a_keeper_word_as_function_name_still_arms(self) -> None:
+        """``function time case ...``: ``time`` is the definition NAME, not the keyword.
+
+        bash accepts any reserved word as a function name after ``function``
+        (``function do`` / ``function if`` parse, measured), and the definition
+        body is command position -- so the ``case`` there is bash's reserved
+        word and must arm.  The name-prefix check has to run BEFORE keeper
+        semantics: reading ``time`` as the keeper chains to ``function``, which
+        keeps nothing, and the refused arm truncates the substitution body at
+        the pattern ``)`` -- the under-scan direction.
+        """
+        from kiro_crew.security.shell_normalizer import _arms_case_context
+
+        for text in (
+            "function time case",
+            "function do case",
+            "function if case",
+            "coproc time case",
+        ):
+            assert _arms_case_context(text, text.rindex("case")), text
+
+    def test_a_function_named_keeper_body_spans_and_convicts(self) -> None:
+        """The review vector: the pgrep under a function-named keeper is scanned.
+
+        bash defines the function (never runs it) and the substitution result
+        still reaches the outer command (measured), so a truncated body hides
+        the pgrep from the scan while bash evaluates it.  The clause-position
+        spelling both spans and convicts.  The esac-tail spelling
+        (``... :;; esac; pgrep ...``) is pinned for SPAN only: its conviction
+        depends on how the consumer segments a command list after ``esac``,
+        which behaves the same with this gate present or absent (identical on
+        the base branch, measured) and is tracked separately.
+        """
+        clause = 'kill -9 $(function time case x in x) pgrep -f "kiro""crew";; esac)'
+        (body,) = security._substitution_bodies(clause)
+        assert 'pgrep -f "kiro""crew"' in body, body
+        assert security.is_denied(clause) is not None
+
+        tail = 'kill -9 $(function time case x in x) :;; esac; pgrep -f "kiro""crew")'
+        (body,) = security._substitution_bodies(tail)
+        assert 'pgrep -f "kiro""crew"' in body, body
 
 
 class TestSelfTokensFoldLineContinuations:

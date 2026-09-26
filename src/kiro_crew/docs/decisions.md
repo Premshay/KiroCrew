@@ -37,7 +37,7 @@ The configuration shape is:
 {
   "decisions": {
     "bucket": 10,
-    "history_budget_chars": 0,
+    "history_budget_chars": 2000,
     "model_route": {
       "simple": "claude-haiku-4.5",
       "medium": "claude-opus-4.8",
@@ -58,7 +58,7 @@ Create the API-key secret through the existing [secrets vault](secrets-vault.md)
 
 `bucket` chooses a percentage of sessions. It is a fixed sample, not a random draw per message. A session stays selected or unselected while its key and bucket remain unchanged. `0` samples none and `100` samples all otherwise eligible sessions. Its default is `100`, so with the switch on and no `bucket` set, every otherwise-eligible session is sampled. A value that is not a whole number reads as `0`, so a typo never widens the sample.
 
-`history_budget_chars` bounds how much of the conversation so far is sent with one decision, in characters, on top of the current message. **Its default is `0`: no earlier turns are sent.** Raise it and earlier user and assistant turns are added newest first until the budget is spent, with the last one admitted clipped to fit. At most the 20 most recent turns are read, so a budget far above a few thousand characters stops adding turns. Tool output is never sent, by any of the features on this page. A value that does not parse reads as `0`, so a typo never widens what leaves the machine.
+`history_budget_chars` bounds how much of the conversation so far is sent with one decision, in characters, on top of the current message. **Its default is `2000`, about the last two or three turns.** It is only what the decision ASKS for: your consent records a ceiling of its own, the smaller of the two is what goes, and that ceiling is `0` until you set one, so a fresh install still sends your new message alone. Inside the ceiling, earlier user and assistant turns are added newest first until the budget is spent, with the last one admitted clipped to fit. At most the 20 most recent turns are read, so a budget far above a few thousand characters stops adding turns. Tool output is never sent, by any of the features on this page. A value that does not parse reads as the default, and your consented ceiling clamps that too, so a typo never sends more than you reviewed.
 
 This ceiling does not govern compaction scoring, which is a separate switch and sends a whole transcript when you turn it on — see [Measuring what a compaction should keep](#measuring-what-a-compaction-should-keep) below.
 
@@ -66,7 +66,7 @@ This setting alone does not permit the transfer. Your consent record holds a **c
 
 `model_route` says which model answers a message at each difficulty level. **Every level starts empty, which means "leave it alone".** No model is named for you on purpose: accounts differ in which models they are offered, and a name you cannot use would fail on the first message rather than when you set it. The block above is the example to copy from — put in the ids your own model picker shows.
 
-An empty level does not turn the feature off. Jev is still asked, the answer is still recorded, and the reply still shows it — it reads `complex → (unpinned)`. The message just runs on the model the chat was already using. That is on purpose: you can watch which level your messages land in for a while, and then pin only the levels worth moving.
+An empty level does not turn the feature off. Jev is still asked, the answer is still recorded, and the reply still shows it — it reads `complex → (unpinned)`. The message runs on your own model: the one the chat was on before routing ever moved it, so an earlier message routed to a cheap level does not keep this one there. That is on purpose: you can watch which level your messages land in for a while, and then pin only the levels worth moving. Kiro Crew can only move a chat back to a model it can name, so a chat whose model your backend never reported stays where it is.
 
 The three keys above are the only ones read; anything else is ignored. `auto` means the same as empty. If you name a model your account cannot run, that message also stays put, and the log below says which of the two happened, so nothing is dropped silently.
 
@@ -90,7 +90,7 @@ A few things worth knowing. The choice belongs to one chat, not to the whole app
 
 ## Data and waiting time
 
-Enabling Jev allows the message excerpt to leave the machine -- with the candidate skill descriptions for a skill choice, and on its own for a model choice. It does not send your earlier turns unless you both raise `history_budget_chars` and consent to a ceiling for it, after which that many characters of earlier user and assistant turns from the same conversation leave the machine as well. Credential and suspicious-URL checks refuse matching requests, but they are not a guarantee that all private content is detected. Do not enable the feature for content that must stay local.
+Enabling Jev allows the message excerpt to leave the machine -- with the candidate skill descriptions for a skill choice, and on its own for a model choice. It does not send your earlier turns unless you consent to a ceiling for them, after which that many characters of earlier user and assistant turns from the same conversation leave the machine as well. Credential and suspicious-URL checks refuse matching requests, but they are not a guarantee that all private content is detected. Do not enable the feature for content that must stay local.
 
 A sampled selection waits for a bounded answer. `timeout_ms` controls the provider budget; its default is 1000 milliseconds, a value at or below zero is floored to 1 millisecond rather than disabling the timeout, and the wait is capped at ten seconds whatever that value says. A missing key, unavailable provider or short budget can make the feature fall back without changing the selected skills. There is no automatic retry.
 
@@ -117,7 +117,9 @@ You have to turn this on separately. The Decisions switch covers your message te
 | The second switch is off | Nothing -- no tool arguments are sent and no notes appear |
 | Asks you before each tool call | Nothing new -- you are already reading the call |
 | Trusts the session, or YOLO, and Jev says `safe` | Nothing -- the card looks as it always did |
-| Trusts the session, or YOLO, and Jev says `caution` or `risky` | The note, with a score and thumbs |
+| Trusts the session, or YOLO, and Jev says `risky`, and Jev is sure | The note, with a score and thumbs |
+| Trusts the session, or YOLO, and Jev says `caution`, is sure, and the call is not a plain file write | The note, with a score and thumbs |
+| Trusts the session, or YOLO, and Jev is hesitant, or says `caution` on a plain file write | Nothing -- the answer is still logged, just not shown |
 | Timeout, refusal or invalid answer | Nothing |
 
 A session that asks you is never annotated, because you are the one looking at the call. The note exists for the sessions where nobody is.
@@ -145,7 +147,7 @@ The mode only appears while the switch is on, your fleet permits the feature, an
 | Auto (Jev), valid answer | Jev's choice of the two |
 | Auto (Jev), timeout, refusal or invalid answer | Steer, the button's own default |
 
-Auto applies only while a turn is actually running, and only to messages you send yourself: an app, an integration or a scheduled job is never decided for. Its request carries the message you just typed. It also carries a short extract of the turn in progress -- what you asked it and the newest thing it printed -- but only as far as the same `history_budget_chars` ceiling above allows, so at the default of `0` your new message is all that leaves the machine. Anything that looks like a credential or a data-collecting URL is removed from that extract first.
+Auto applies only while a turn is actually running, and only to messages you send yourself: an app, an integration or a scheduled job is never decided for. Its request carries the message you just typed. It also carries a short extract of the turn in progress -- what you asked it and the newest thing it printed -- but only as far as the same `history_budget_chars` ceiling above allows, so with no consented ceiling your new message is all that leaves the machine. Anything that looks like a credential or a data-collecting URL is removed from that extract first.
 
 The decision appears on your own message in the transcript: one line saying what Jev chose, how sure it was and how long it took, with the same thumbs you can use on a skill decision. It says the CHOICE rather than what then happened, because the two can differ — a chosen interruption cannot always be delivered, and the message then runs after the work in progress like a queued one. A message nobody decided for shows nothing.
 
@@ -225,7 +227,7 @@ The reply carries a one-line receipt: how many entries the recall found, how man
 
 Operational records are JSONL day-files under the gateway's data home, in the `decisions` directory. That directory is read-only to agents working on your machine -- by name, so a link planted at that name does not stand in for it -- so a verdict in it is one you gave. They contain the point name, hashed session identifier, elapsed time, bounded answer data and error categories. They do not contain the message body, conversation history, candidate descriptions or credentials.
 
-A model choice writes one row for the question asked and — when the chosen model could actually be used — one further row carrying the level (`tier`), the model used (`model_chosen`), the model that would have been used (`baseline_model`) and the probability. When the level came back but could not be applied, the second row carries an error word instead: `model-not-advertised` if your account cannot run that model, `no-switch-seam` if the chat backend cannot change model mid-conversation, and `switch-failed` if it refused. Those are written on purpose, so "Jev answered and nothing happened" is visible rather than silent.
+A model choice writes one row for the question asked and — when the chosen model could actually be used — one further row carrying the level (`tier`), the model used (`model_chosen`), the model that would have been used (`baseline_model`) and the probability. When the level came back but could not be applied, the second row carries an error word instead: `model-not-advertised` if your account cannot run that model, `no-switch-seam` if the chat backend cannot change model mid-conversation, `switch-failed` if it refused, and `smaller-window-refused` if that model's context window is smaller than the one your session is on and either Jev was not confident enough, or the conversation so far would not fit in it, or your chat is on a model the backend never named so there would be nothing to go back to. Those are written on purpose, so "Jev answered and nothing happened" is visible rather than silent.
 
 A skill selection writes one row for the question asked, carrying a `turn_id` and the number of candidates, and — when a usable answer came back — one further row for the outcome, carrying both selections: `baseline` is what trigger matching would have injected, `jev` is what was injected, `agree` says whether the two sets match, `p` is the answer's probability, and `tokens_saved` estimates the skill-body characters the difference saves, divided by four. That estimate is a rough one, and a negative value means the selection cost more than trigger matching would have. `history_chars` and `truncated` say how much conversation the request carried. A refused, timed-out or unusable turn writes only the question row, with its error category, because an agreement figure needs an answer to compare against. So one selection is two rows, and a row count is not a count of decisions.
 

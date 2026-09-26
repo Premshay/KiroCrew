@@ -197,20 +197,7 @@ async def _capture(backend: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, A
     # write is neither on the wire nor this gate's business.
     monkeypatch.setattr(runtime_mod, "publish_session_token", lambda token, key: None)
 
-    # Pin the per-session identity token, for the same reason the work dir and the
-    # session ids above are pinned: it is minted from ``secrets`` on every session
-    # start, so an unpinned capture could never match a golden twice. Pinning the
-    # INPUT rather than scrubbing the output keeps the golden a byte gate on the
-    # whole element, the env pair included -- which is the part that must not
-    # change silently.
-    monkeypatch.setattr(runtime_mod, "mint_stub_session_token", lambda: _SESSION_TOKEN)
-
-    # ...and the signed mapping publication it triggers, which writes to the real
-    # data home. The capture is about the frames the runtime BUILDS; a filesystem
-    # write is neither on the wire nor this gate's business.
-    monkeypatch.setattr(runtime_mod, "publish_session_token", lambda token, key: None)
-
-    async def _fake_kas_agents(agent, *, member_dispatch=False, session_key=""):
+    async def _fake_kas_agents(agent, *, member_dispatch=False, crew_panel=False, session_key=""):
         # The real projection reads ~/.kiro/agents; the GATE it is behind is what
         # this capture is about, so the payload is pinned and the gate is not.
         from kiro_crew.acp.harness import SessionExtras

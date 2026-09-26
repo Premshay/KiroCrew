@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
-import { loadChatConfig } from '../pages/chat/ChatSettings'
+import { loadChatConfig, DEFAULT_MESSAGE_FONT_SIZE, MIN_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE } from '../pages/chat/ChatSettings'
 
 describe('loadChatConfig', () => {
   beforeEach(() => { localStorage.removeItem('mc-chat-config') })
@@ -115,5 +115,60 @@ describe('loadChatConfig', () => {
   it('repairs a non-boolean showFullPastes value to the collapsing default', () => {
     localStorage.setItem('mc-chat-config', JSON.stringify({ showFullPastes: 'yes' }))
     expect(loadChatConfig().showFullPastes).toBe(false)
+  })
+
+  it('keeps double-click-to-edit off until the user opts in', () => {
+    // OFF is the contract: the gesture replaces native double-click word
+    // selection on the bubble, so a client with no stored config (or one
+    // stored before the key existed) must never inherit it.
+    expect(loadChatConfig().doubleClickToEdit).toBe(false)
+    localStorage.setItem('mc-chat-config', JSON.stringify({ showTimestamps: false }))
+    expect(loadChatConfig().doubleClickToEdit).toBe(false)
+  })
+
+  it('respects stored doubleClickToEdit=true', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ doubleClickToEdit: true }))
+    expect(loadChatConfig().doubleClickToEdit).toBe(true)
+  })
+
+  it('repairs a non-boolean doubleClickToEdit value to the disabled default', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ doubleClickToEdit: 'yes' }))
+    expect(loadChatConfig().doubleClickToEdit).toBe(false)
+  })
+
+  it('defaults messageFontSize to the pre-setting text-sm size', () => {
+    expect(loadChatConfig().messageFontSize).toBe(DEFAULT_MESSAGE_FONT_SIZE)
+  })
+
+  it('respects a stored messageFontSize within bounds', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ messageFontSize: 18 }))
+    expect(loadChatConfig().messageFontSize).toBe(18)
+  })
+
+  it('clamps a stored messageFontSize above the max', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ messageFontSize: MAX_MESSAGE_FONT_SIZE + 50 }))
+    expect(loadChatConfig().messageFontSize).toBe(MAX_MESSAGE_FONT_SIZE)
+  })
+
+  it('clamps a stored messageFontSize below the min', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ messageFontSize: MIN_MESSAGE_FONT_SIZE - 50 }))
+    expect(loadChatConfig().messageFontSize).toBe(MIN_MESSAGE_FONT_SIZE)
+  })
+
+  it('rounds a fractional stored messageFontSize', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ messageFontSize: 15.6 }))
+    expect(loadChatConfig().messageFontSize).toBe(16)
+  })
+
+  it('repairs a non-number messageFontSize to the default', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ messageFontSize: 'huge' }))
+    expect(loadChatConfig().messageFontSize).toBe(DEFAULT_MESSAGE_FONT_SIZE)
+  })
+
+  it('adopts the default messageFontSize for a stored config that predates the setting', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ showTimestamps: false }))
+    const cfg = loadChatConfig()
+    expect(cfg.messageFontSize).toBe(DEFAULT_MESSAGE_FONT_SIZE)
+    expect(cfg.showTimestamps).toBe(false)
   })
 })

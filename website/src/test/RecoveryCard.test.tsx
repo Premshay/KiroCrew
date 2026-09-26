@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import RecoveryCard, { parseRecoveryMessage, resolveInjectCard } from '../pages/chat/RecoveryCard'
+import RecoveryCard, { INJECT_KIND_OPENS_TURN, injectOpensTurn, parseRecoveryMessage, resolveInjectCard } from '../pages/chat/RecoveryCard'
 
 // Verbatim prefixes from src/kiro_crew/dashboard/state.py. The separator is an
 // em dash, not a hyphen — a mismatch is exactly the drift this suite guards.
@@ -236,6 +236,31 @@ describe('parseRecoveryMessage', () => {
     // Hyphen instead of em dash — not the wire value.
     expect(parseRecoveryMessage('[Context compacted - automatic recovery]\nbody')).toBeNull()
   })
+
+  it('names the content filter and the fallback model, not a fault or the user', () => {
+    // Verbatim opener from chat_utils._REFUSAL_FALLBACK_RESUME_MSG: the active
+    // model's filter declined a turn that had already run tools, so the gateway
+    // moved the session to agent.refusal_fallback_model and asked it to carry
+    // on. Nothing errored and nobody pressed Continue, so neither sibling copy
+    // is true of it.
+    const fallback = parseRecoveryMessage(
+      '[Content filter — continuing on the fallback model]\nThe previous turn ended before it finished. Look at the conversation above.',
+    )
+    const manual = parseRecoveryMessage('[Continue — requested by the user]\nKeep going.')
+    expect(fallback?.kind).toBe('refusal_fallback')
+    expect(fallback?.title).toBe('Content filter declined the turn')
+    expect(fallback?.detail).toBe(
+      'switched to the fallback model · continuation sent automatically',
+    )
+    expect(fallback?.chip).toBe('')
+    expect(fallback?.body.startsWith('[')).toBe(false)
+    expect(fallback?.body).toContain('Look at the conversation above')
+    expect(fallback?.title).not.toBe(manual?.title)
+    for (const text of [fallback?.title, fallback?.detail]) {
+      expect(text?.toLowerCase()).not.toContain('error')
+      expect(text?.toLowerCase()).not.toContain('your request')
+    }
+  })
 })
 
 describe('RecoveryCard', () => {
@@ -343,7 +368,7 @@ describe('ChatPage – recovery card wiring', () => {
     // (pages/chat/transcriptRenderers.tsx) that ChatPage spreads into its host
     // list, so the imports live in the factory and the page imports the factory.
     const factory = readFileSync(resolve(__dirname, '../pages/chat/transcriptRenderers.tsx'), 'utf8')
-    expect(factory).toMatch(/import\s+RecoveryCard\s*,\s*\{\s*resolveInjectCard\s*\}\s*from\s*['"]\.\/RecoveryCard['"]/)
+    expect(factory).toMatch(/import\s+RecoveryCard\s*,\s*\{[^}]*\bresolveInjectCard\b[^}]*\}\s*from\s*['"]\.\/RecoveryCard['"]/)
     // Either quote: ChatPage.tsx is double-quoted, the factory above is not.
     expect(src).toMatch(/import \{ createTranscriptRenderers \} from ["']\.\/chat\/transcriptRenderers["']/)
   })
@@ -489,3 +514,29 @@ describe('resolveInjectCard – which inject rows become notes', () => {
     expect(card?.kind).toBe('stalled')
   })
 })
+
+describe('injectOpensTurn – which inject rows begin a turn of their own', () => {
+  // The row-kind vocabulary's OTHER half: resolveInjectCard says how a stamped
+  // row is drawn, this says whether the rows below it belong to a new turn.
+  // Both key on the persisted `meta.injectKind`, never on the row's text.
+  const row = (meta?: Record<string, unknown>) => ({ role: 'inject', content: 'x', meta })
+
+  it('classifies every stamped kind, and the table is the union', () => {
+    // A kind missing here fails to compile, so this pins the VALUES only.
+    expect(INJECT_KIND_OPENS_TURN).toEqual({ cron: true, mcp_app: true, synthesis: true, recovery: false, user_replay: false })
+    for (const [kind, opens] of Object.entries(INJECT_KIND_OPENS_TURN)) expect(injectOpensTurn(row({ injectKind: kind })), kind).toBe(opens)
+  })
+
+  it('reads an unstamped row, a kind this build does not know, and a non-inject role as "not an opener"', () => {
+    // A note, the policy-block notice and the hook-halt marker carry no kind and
+    // dispatch nothing; a newer gateway's kind reads the same way, the fail-
+    // passive direction resolveInjectCard takes for an unmarked row; a `user`
+    // row is the caller's business (TURN_OPENER_ROLES), not this predicate's.
+    expect(injectOpensTurn(row())).toBe(false)
+    expect(injectOpensTurn(row({ noteSession: 'chat-2' }))).toBe(false)
+    expect(injectOpensTurn(row({ injectKind: 'some_future_kind' }))).toBe(false)
+    expect(injectOpensTurn(row({ injectKind: 'toString' }))).toBe(false)
+    expect(injectOpensTurn({ role: 'user', content: 'x', meta: { injectKind: 'cron' } })).toBe(false)
+  })
+})
+

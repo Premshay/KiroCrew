@@ -5,24 +5,29 @@ import { type PasteBlock, expandAll } from './pasteTokens'
 
 /**
  * Geometry + selection helpers for the pinned-prompt banner (the most recent
- * user prompt that has scrolled fully behind the chat fold, shown as a sticky
- * band under the session title).
+ * user prompt that has scrolled up to the chat fold, shown as a sticky band
+ * under the session title).
  *
- * The hand-off is **bottom-edge driven**: a prompt scrolls with the transcript
- * until its bubble's BOTTOM edge reaches the bottom of the banner band, i.e.
- * until the row is entirely hidden behind the band; only then does it collapse
- * into the banner. It is then pushed out by the NEXT prompt as that prompt's top
- * border meets it (`computePinPush`) — a separate, earlier line, so a tall prompt
- * shows no banner at all while it is being read.
+ * The hand-off is **top-edge driven**: a prompt scrolls with the transcript
+ * until its bubble's TOP edge reaches the card's own resting top, and hands over
+ * there. That line is where the card sits, so the bubble stops travelling at the
+ * exact pixel the card occupies — which is the whole point. It is then pushed out
+ * by the NEXT prompt as that prompt's top border meets it (`computePinPush`).
  *
- * Why the bottom edge and not the top (the original sticky-style rule): a prompt
- * taller than the band — an essay, a pasted stack trace — satisfies "top has
- * reached the fold" the instant it is sent, so it would collapse into a one-line
- * banner before the user could read it, and its still-laid-out (but hidden) row
- * left a prompt-sized hole above the response. Tracking the bottom edge means a
- * tall prompt stays fully readable and scrolls away line by line. For a
- * one-line prompt the two rules fire on the same pixel (its bubble height equals
- * the collapsed card height), so short-prompt behaviour is unchanged.
+ * Why the top edge and not the bottom (the rule this replaced): the bottom-edge
+ * rule waited until the row was entirely behind the band, so any prompt TALLER
+ * than the card kept scrolling after it had passed the card's position, went out
+ * of sight behind the header, and the card then appeared back down at the fold —
+ * content jumping down the screen after having scrolled past its own resting
+ * place (measured at 78px for a four-line prompt against a one-line card). The
+ * top edge cannot do that: `snapBackPx` is 0 by construction.
+ *
+ * The hand-off line therefore does NOT depend on the card's height, and must not:
+ * the clamp (`PINNED_RESTING_LINES`) is a presentation choice that may change, and
+ * a hand-off derived from it moves the swap point with it. A prompt no taller than
+ * the clamp hands over with no size change at all; a taller one FOLDS in place at
+ * the line, animated by the card's own height morph (see PinnedPrompt), instead of
+ * being swapped after a journey. Both fall out of the same rule at any clamp value.
  *
  * The banner cannot be a real sticky element because the transcript is
  * virtualized — a row scrolled far above the window unmounts, so the sticky node
@@ -47,16 +52,24 @@ export const ROW_PAD_Y = 4
 export const DEFAULT_PINNED_CARD_H = 46.75
 
 /**
- * Viewport Y of the hand-off line: the BOTTOM edge of the banner band. A prompt
- * pins once its row bottom has risen to or above this line (the row is then
- * completely covered by the band, so the swap is invisible), and un-pins the
- * moment it drops back below it.
+ * Viewport Y of the hand-off line: the card's own resting TOP edge. A prompt pins
+ * once its row top has reached this line, and un-pins the moment it drops back
+ * below it.
  *
- * @param foldY         viewport Y of the fold sentinel = the band's top edge
- * @param collapsedCardH measured height of the collapsed banner card
+ * The row and the band both put `ROW_PAD_Y` above their bubble, so a row whose TOP
+ * is on the fold has its bubble on the card's top: handing over there is a swap
+ * between two boxes that start at the same pixel, whatever either one's height is.
+ *
+ * Takes no card height ON PURPOSE. The previous rule added the card's measured
+ * height to this line, which coupled the swap point to the clamp: change
+ * `PINNED_RESTING_LINES` and the hand-off moved, and any prompt taller than the
+ * clamp overshot the line by exactly the difference. Keeping the clamp out of the
+ * line is what makes the fix hold at every clamp value.
+ *
+ * @param foldY viewport Y of the fold sentinel = the band's top edge
  */
-export function pinHandoffY(foldY: number, collapsedCardH: number): number {
-  return foldY + ROW_PAD_Y * 2 + collapsedCardH
+export function pinHandoffY(foldY: number): number {
+  return foldY
 }
 
 /**
@@ -217,6 +230,48 @@ export function jumpAnchorIdx(items: DisplayItem[], target: number): number {
  */
 export function pinPushTravel(bannerH: number): number {
   return ROW_PAD_Y + bannerH
+}
+
+/**
+ * Height the pinned card should be on this frame — the progressive fold.
+ *
+ * The card's top is fixed at `foldY + ROW_PAD_Y`. Its bottom should sit on the
+ * pinned BUBBLE's bottom edge: the card is a stand-in for the bubble alone, and
+ * what follows the bubble in its row — the message's action strip, then the
+ * reply — is left in place under the hidden row (see `[data-pinned-standin]` in
+ * index.css), so matching the bubble's edge is what keeps the card from ever
+ * covering those controls while leaving no gap of its own. The height wanted is
+ * therefore the distance from the card's top to the bubble's bottom.
+ *
+ * Bounded at both ends, and each bound is load-bearing:
+ *   - never above `standinH`, the height the card has at the hand-off frame (from
+ *     its own top to the bubble's bottom), so a freshly pinned prompt is a
+ *     pixel-exact stand-in rather than a taller box that pushes the reply down.
+ *     That is the bubble's height only when the bubble starts where the card does:
+ *     a steer's accent bubble sits under its badge, so its stand-in is taller by
+ *     that offset, and a ceiling of the bubble's own height stopped the card short
+ *     of the bubble's bottom — a blank band above the strip for the first pixels
+ *     of scroll after hand-off;
+ *   - never below `restingH`, because the card cannot show less than its clamp. Past
+ *     that point the bubble's slot is smaller than the card and the strip and reply
+ *     slide under it, which is the same one-line overlap the band already has at rest.
+ *
+ * @param bubbleBottomFromFold pinned bubble's bottom edge, relative to the fold line
+ * @param restingH             settled height of the clamped card
+ * @param standinH             distance from the card's top to the bubble's bottom
+ *                             at the hand-off frame — the card's natural height
+ */
+export function computeLiveCardH(
+  bubbleBottomFromFold: number,
+  restingH: number,
+  standinH: number,
+): number {
+  // A stand-in smaller than the clamp (a one-word prompt) has nothing to fold: the
+  // card is already its resting size and the max() below would otherwise stretch
+  // it past the bubble it is copying.
+  const ceiling = Math.max(restingH, standinH)
+  const wanted = bubbleBottomFromFold - ROW_PAD_Y
+  return Math.min(ceiling, Math.max(restingH, wanted))
 }
 
 export function computePinPush(bannerH: number, foldY: number, nextTop: number | null): number {
@@ -489,6 +544,35 @@ export interface PinnedPromptState {
   bodyBeyondPreview: boolean
   push: number
   bannerH: number
+  /**
+   * Height the card should be RIGHT NOW, in px — the progressive fold.
+   *
+   * The card stands in for a row whose slot is still laid out (the row is hidden,
+   * not removed), so a card SHORTER than that slot leaves a blank gap between
+   * itself and the reply below. That gap is the size of the difference: measured
+   * at 794px in a 700px viewport for a 30-line prompt against a one-line clamp.
+   * Tracking the slot's remaining height removes the gap by construction — the
+   * card is exactly as tall as the part of the row still above the reply, and it
+   * shrinks line by line as the row scrolls away until it reaches its clamp.
+   *
+   * Computed from the ROW, never from the card (see computeLiveCardH). A height
+   * derived from measuring the card would close a loop: the card's height feeds
+   * `onCollapsedHeight`, which feeds `pinHandoffY` and `pinPushTravel`, which move
+   * the geometry that decides the height. The resting height keeps that reporting
+   * role alone.
+   */
+  liveH?: number
+  /**
+   * The hidden row's action strip is still UNCOVERED — some of it sits below the
+   * card's resting bottom, on screen. The hosts write it as the `folding` value
+   * of the row's `data-pinned-standin` marker, which is what index.css re-shows
+   * the strip on. Deliberately not `liveH != null`: the fold ends with the card
+   * at its clamp while the strip, which hangs under the bubble, is still wholly
+   * below the card, and it slides under over the next strip's-height of scroll —
+   * the marker has to hold until it has. A boolean rather than a distance, so the
+   * state only changes at the two edges where the marker flips.
+   */
+  stripUncovered?: boolean
 }
 
 /** What the scroll recompute knows before any derivation is done. */
@@ -500,6 +584,10 @@ export interface PinnedPromptInput {
   pastes: PasteBlock[]
   push: number
   bannerH: number
+  /** See `PinnedPromptState.liveH`. Recomputed every scroll frame. */
+  liveH?: number
+  /** See `PinnedPromptState.stripUncovered`. Recomputed every scroll frame. */
+  stripUncovered?: boolean
 }
 
 /**
@@ -519,10 +607,15 @@ export function nextPinnedPromptState(
   prev: PinnedPromptState | null,
   input: PinnedPromptInput,
 ): PinnedPromptState {
-  const { idx, ts, raw, pastes, push, bannerH } = input
+  const { idx, ts, raw, pastes, push, bannerH, liveH, stripUncovered } = input
   const sameMsg = prev !== null && prev.idx === idx && prev.raw === raw && prev.ts === ts
-  if (sameMsg && prev.push === push && prev.bannerH === bannerH) return prev
-  if (sameMsg) return { ...prev, push, bannerH }
+  if (sameMsg && prev.push === push && prev.bannerH === bannerH && prev.liveH === liveH
+    && prev.stripUncovered === stripUncovered) return prev
+  // `liveH` DOES move every frame — that is the fold. It is carried on the
+  // same-message path for exactly that reason, unlike `push`/`bannerH` which only
+  // change when the geometry does. `stripUncovered` flips on a later frame of
+  // the same pin (the strip slides under the resting card), so it rides here too.
+  if (sameMsg) return { ...prev, push, bannerH, liveH, stripUncovered }
   const { text, body: full, images } = derivePinnedPromptText(raw, pastes)
   return {
     idx,
@@ -536,6 +629,8 @@ export function nextPinnedPromptState(
     bodyBeyondPreview: full !== text,
     push,
     bannerH,
+    liveH,
+    stripUncovered,
   }
 }
 

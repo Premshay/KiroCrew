@@ -29,12 +29,14 @@ SHIPPED_SMOKE = {
     "capabilities-agents-list-and-open-editor",
     "capabilities-skills-filter-and-open-builtin",
     "chat-activity-side-panel-toggle",
+    "chat-files-side-panel-browse",
     "chat-session-title",
     "chat-sessions-page",
     "chat-switch-seeded-sessions",
     "chat-turn-stats-footer",
     "connections-services-search-and-mcp-list",
     "memory-open-browser-from-overview",
+    "notifications-bell-sheet-open-close",
     "notifications-center-empty-state",
     "schedule-list-calendar-executions-views",
     "search-everywhere-jump-to-setting",
@@ -43,6 +45,10 @@ SHIPPED_SMOKE = {
     "settings-developer-panel-dev-mode-toggle",
     "settings-search-jump-to-theme",
     "settings-security-docs-section",
+    "settings-security-layers-section",
+    "settings-security-rail-navigation",
+    "settings-security-rules-custom-deny",
+    "settings-security-trusted-apps-toggle",
     "settings-shortcuts",
     "settings-tab-rail-navigation",
     "settings-theme-toggle",
@@ -51,7 +57,11 @@ SHIPPED_SMOKE = {
     "taskrunner-projects-page-compose",
 }
 SHIPPED = SHIPPED_SMOKE | {
+    "crewmate-chat-clean",
+    "crewmate-panel-tabs",
+    "crewmate-reply-thread",
     "knowledge-add-folder-source-and-scan",
+    "meet-crewmates-flow",
     "members-dm-hello",
     "members-private-memory-keeps-thread",
 }
@@ -76,8 +86,8 @@ class TestShippedScenarios:
             assert s.max_steps <= 14, s.name
         smoke_steps = sum(s.max_steps for s in smoke)
         smoke_seconds = sum(s.max_seconds for s in smoke)
-        assert smoke_steps == 255, f"smoke max_steps total is {smoke_steps}; re-pin"
-        assert smoke_seconds == 6870, f"smoke max_seconds total is {smoke_seconds}; re-pin"
+        assert smoke_steps == 307, f"smoke max_steps total is {smoke_steps}; re-pin"
+        assert smoke_seconds == 8420, f"smoke max_seconds total is {smoke_seconds}; re-pin"
 
     def test_nightly_includes_smoke(self) -> None:
         nightly = scenarios.select(scenarios.load_all(SCENARIOS_DIR), tier="nightly")
@@ -176,7 +186,14 @@ class TestShippedScenarios:
                 "sidebar-rail-collapse-expand",
             ],
             "search": ["search-everywhere-jump-to-setting"],
-            "members": ["members-dm-hello", "members-private-memory-keeps-thread"],
+            "members": [
+                "crewmate-chat-clean",
+                "crewmate-panel-tabs",
+                "crewmate-reply-thread",
+                "meet-crewmates-flow",
+                "members-dm-hello",
+                "members-private-memory-keeps-thread",
+            ],
             "capabilities": [
                 "capabilities-agents-list-and-open-editor",
                 "capabilities-skills-filter-and-open-builtin",
@@ -185,10 +202,14 @@ class TestShippedScenarios:
             "memory": ["memory-open-browser-from-overview"],
             "knowledge": ["knowledge-add-folder-source-and-scan"],
             "artifacts": ["artifacts-library-table-and-kind-filter"],
+            "files": ["chat-files-side-panel-browse"],
             "apps": ["apps-discover-enable-research-lab"],
             "task-runner": ["taskrunner-projects-page-compose"],
             "schedule": ["schedule-list-calendar-executions-views"],
-            "notifications": ["notifications-center-empty-state"],
+            "notifications": [
+                "notifications-bell-sheet-open-close",
+                "notifications-center-empty-state",
+            ],
             "auth": ["auth-sign-in-card-signed-out"],
             "settings": [
                 "settings-chat-toggle-show-timestamps",
@@ -198,7 +219,13 @@ class TestShippedScenarios:
                 "settings-tab-rail-navigation",
                 "settings-theme-toggle",
             ],
-            "security": ["settings-security-docs-section"],
+            "security": [
+                "settings-security-docs-section",
+                "settings-security-layers-section",
+                "settings-security-rail-navigation",
+                "settings-security-rules-custom-deny",
+                "settings-security-trusted-apps-toggle",
+            ],
         }
         # FEATURES order, not alphabetical: chat is the product's primary surface.
         assert list(groups) == [
@@ -212,6 +239,7 @@ class TestShippedScenarios:
             "memory",
             "knowledge",
             "artifacts",
+            "files",
             "apps",
             "task-runner",
             "schedule",
@@ -232,6 +260,20 @@ class TestShippedScenarios:
             "Crew Members and Crew Mode" in preview_step
         )  # the longer title is still a valid reading
         assert any('"Crew Members" item appears in the left rail' in s for s in sc.steps)
+
+    def test_members_scenarios_hedge_the_card_label(self) -> None:
+        """A seeded member has no display name, so its card shows the id; every members scenario says so."""
+        for name in (
+            "members-dm-hello",
+            "members-private-memory-keeps-thread",
+            "crewmate-reply-thread",
+        ):
+            sc = scenarios.load_scenario(SCENARIOS_DIR / f"{name}.yaml")
+            card_steps = [s for s in sc.steps if "Nova Sky" in s]
+            assert card_steps, name
+            for step in card_steps:
+                assert 'may read "nova-sky"' in step, (name, step)
+            assert not any('named "Nova Sky"' in s for s in sc.steps), name
 
 
 def _write(tmp_path: Path, name: str, doc: dict) -> Path:
@@ -565,7 +607,7 @@ class TestReport:
         md = report.render_features(catalog, _summary(), run_url="https://x/run")
         assert md.startswith("# GUI user-test feature catalog\n")
         assert (
-            f"_17 of {len(scenarios.FEATURES)} features covered · 29 scenarios (26 smoke / 3 nightly)._"
+            f"_18 of {len(scenarios.FEATURES)} features covered · 39 scenarios (32 smoke / 7 nightly)._"
             in md
         )
         assert (
@@ -587,8 +629,9 @@ class TestReport:
         )
         # Uncovered features are the backlog.
         assert "## Not yet covered" in md
-        assert "- `files` File viewer & project files" in md
+        assert "- `terminal` Terminal panel" in md
         assert "- `chat` Chat sessions" not in md
+        assert "- `files` File viewer & project files" not in md
 
     def test_features_catalog_without_a_run(self) -> None:
         md = report.render_features(scenarios.load_all(SCENARIOS_DIR))

@@ -84,6 +84,20 @@ the peer's `POST /api/chat/slots` payload, while agent and model remain sparse
 explicit picks. Omitting the mode would let a local Incognito or Temporary row
 execute as Persistent on the peer and read or write memory the user disabled.
 
+A slot ADOPTED from a peer row (`POST /api/chat/slots` with `adopt_remote_slot`)
+inherits `agent`, `title`, `memory_mode` and `workspace` from that row
+(`remote_adopt.peer_row_metadata()`). `workspace` is a mirror of the value the
+peer committed for the session it runs, the same value the forwarded
+agent/workspace picks write back into the field afterwards, so the projection
+and the persisted record name the workspace the turns actually run in rather
+than this machine's create default. It is not a local binding: the peer-bound
+create skips this machine's agent-binding resolution, `default_project_dir` is
+still fed the local default (so `project` and `memory_store` never resolve from
+a peer's name), and the relay hands every turn to the peer before the local turn
+path reads the field. Every control in `remote_relay._PEER_CONTROL_SEGMENTS` is
+classified in `remote_adopt.ADOPT_SEEDED_CONTROLS` / `ADOPT_UNSEEDED_CONTROLS`,
+and a structural test fails for a new forwardable control until it is placed.
+
 Cross-boundary calls that were observable on `SessionManager` route back through
 the facade, and patchable module dependencies are resolved through injected
 call-time functions. Persistence remains owned by the existing `SessionMap`
@@ -122,6 +136,24 @@ ordinary owner/app permissions and governance remain in force. A malformed or
 missing member carrier reports memory unavailable and never chooses Global.
 Existing ordinary V1 sessions retain their V1 behavior; old V2 grants are not
 migrated or used as a second authority.
+
+One record shape is backfilled instead of refused: a persistent session written
+before the field existed (0.7.0.5), carrying `agent` and a `memory_store` that
+names a declared V2 store but no `execution_context`. `read_session_execution`
+derives the carrier from the store's `owner_member_id` only when that id names
+exactly one configured member, that member resolves to the same store, and the
+record's `agent` names that member by alias or id; it then writes the carrier
+into the record with a compare-and-set against the exact legacy shape it read,
+so every later read decodes it like any other session. The derived identity is
+never vouched -- the store came from the session's own record -- so the session
+stands where a member session stands after a restart. A record with no `agent`,
+an `agent` naming anyone else, an explicit template pick, a store the
+start-of-process migration could not attribute, a `member_id` marker, or a
+restricted mode is left unchanged and still refused, and the refusal names the
+remedy that works for that store: open a new chat with the same member (or
+archive this one) when the store has an attributed owner, or the legacy store
+repair `kirocrew doctor` names when the start-of-process migration could not
+attribute it. A successful backfill logs one INFO line naming the session.
 
 Persistent sessions serialize this record in their existing owner metadata.
 Incognito and Temporary sessions keep it in live session state and suppress
@@ -177,7 +209,14 @@ member memory binding, history key, caller model and approval policy. An explici
 or resumed cwd wins; otherwise the member's configured workspace is used. A cwd
 that disagrees with the saved Parent identity refuses startup.
 When no caller model is supplied, allocation resolves the member's model pin by
-its canonical alias, including members that have not enrolled capabilities.
+its canonical alias, including members that have not enrolled capabilities. The id
+it hands the provider is stamped on the registered session, because the allocation
+returns only the provider and its first-turn observation: a caller recording what
+the session was asked to run reads that stamp
+(`SessionManager.allocation_requested_model`) rather than resolving a second time,
+so the id sent and the id recorded are one value. An empty stamp means the
+allocation resolved nothing, or that a registration site which resolves no models
+made the session.
 
 Enrolled allocations bypass warm and shared processes. Full-spec loading is
 supported by the dedicated Kiro backend; other harnesses refuse explicitly rather
@@ -302,7 +341,8 @@ prevent.
 Two conditions displace the cached `_bg_runtime`: a **backend switch** and
 **staleness** (`AcpRuntime._is_stale()` → `"age"` past 6h, or `"rss"` past
 500 MiB across the descendant tree). The displacement policy has ONE
-implementation, `_detach_bg_runtime_locked(runtime, cause)`: the runtime is
+implementation, `_detach_bg_runtime_locked(runtime, cause, *, park_only=False)`:
+the runtime is
 killed if idle, and **parked on `_draining_bg_runtimes` if it has live or
 initializing handles** — parked runtimes never receive a new session (only
 `_bg_runtime` is offered to callers), their in-flight work finishes untouched
@@ -336,9 +376,34 @@ Parked runtimes stay shielded from the orphan-PID sweep
 (`_companion_runtime_pids`), block the account-identity sweep's completeness
 (`_retire_kiro_bg_runtime`) while they drain, and are reaped by a periodic
 watchdog hook (`bg_drain_reap`) as the backstop for an idle gateway where no
-other trigger runs. `close_all()` detaches both holders atomically under
+other trigger runs.
+
+That same hook carries the **idle-staleness sweep**,
+`reap_idle_stale_bg_runtime()`, and it is not housekeeping. Both displacement
+triggers above live on the REUSE path in `get_bg_session()`, and the shared
+runtime's pid is sweep-shielded for its whole life, so a runtime that stops being
+reused is never asked `_is_stale()` again and is reaped by nothing else: it lives
+until the gateway restarts. Measured on an operator host: 11 agent runtimes
+holding 6.0 GB, six of them 14.5 h old and five of those over the 500 MiB
+ceiling, against 4 live slots. The sweep asks the question off the reuse path,
+under `_bg_runtime_lock`, and retires only a runtime with NO active or
+initializing session.
+
+It PARKS rather than kills, through `_detach_bg_runtime_locked(..., park_only=True)`,
+and that flag exists for one reason: `get_bg_session()` pins the runtime under
+the lock, RELEASES the lock, and only then calls `create_session`, which is where
+`_session_inits_in_flight` rises. A kill inside that window surfaces as
+`AcpRuntimeDead` on a caller that did nothing wrong; parking cannot, because the
+drain reaper re-probes on a later tick, by which time the pinned start has either
+registered (busy — it stays parked) or failed. The slot is re-read after the
+awaited staleness probe, so a concurrent displacement that replaced it is never
+acted on with the old reading. Both probes fail toward PRESERVING the runtime: a
+session or staleness probe that raises retires nothing.
+
+`close_all()` detaches both holders atomically under
 `_bg_runtime_lock` and kills the detached snapshot; its counterpart `_closing`
-gate in `get_bg_session()` refuses to spawn or park once shutdown has started.
+gate in `get_bg_session()` — and in the idle-staleness sweep — refuses to spawn
+or park once shutdown has started.
 Note there is currently no dashboard edit surface for
 `agent.acp_backend`, but a file or CLI edit does not wait for the next gateway
 start: the config watcher dispatches it as a `_FACTORY_CONFIG_PATHS` change, so
@@ -373,12 +438,75 @@ fail with `Invalid model ID`). A reactive retry in `run_bg_oneliner`
 thin backstop for the fail-open case where the advertised set was unknown at
 send time.
 
+## Account-identity retirement (identity sweep)
+
+A kiro-backed child authenticates from the CLI credential store as its process
+starts and keeps that account for life, so an out-of-band account switch or
+logout leaves running children answering turns on the previous account. The
+retirement machinery detects and recycles them, in `session_lifecycle.py`
+(`retire_kiro_identity_sessions`) driven by the per-turn gate in
+`chat_runner.py`, against baselines owned by `KiroPrerequisiteService`.
+
+**Boot-seeded baseline** (`seed_sessions_baseline`): the running-children
+baseline is adopted from the store at gateway startup, before anything can
+spawn a kiro-backed child, so every child postdates the read. This removes the
+once-per-lifetime unset-baseline sweep, whose completion precondition (nothing
+busy, nothing mid-start) is routinely unsatisfiable on a live gateway —
+retired idle sessions are eagerly respawned by dashboard slots, the next sweep
+reads incomplete, and the baseline never advances, recycling healthy children
+forever. The seed refuses (keeping the fail-safe sweep) under `assume_ready`,
+when a baseline is already recorded, when the store cannot be fingerprinted,
+and when the read hangs past a 5s bound.
+
+**Interim latch** (`_maybe_latch_interim_identity`): a bare baseline
+comparison is blind to an A→B→A round trip, so any fresh read (status polls,
+turn gates, probes) that observes a different account than the baseline arms a
+sticky flag forcing the next turn gate to sweep even after the store switches
+back. Observations that could be transient read failures refuse to latch —
+component LOSS is indistinguishable from a blip, while a component that
+appears or changes cannot be one — so an unreadable store can never arm it.
+Each qualifying observation also bumps an observation GENERATION; the gate
+captures the generation right after its initiating read and hands it back at
+reconcile (`note_sessions_reconciled(live, observations_before=...)`), which
+keeps the latch armed when a newer observation exists: that account was
+observed after the sweep's coverage, and a child spawned under it may be
+unstamped and otherwise invisible.
+
+**Spawn-identity stamps**: every spawn site bracket-reads the store
+immediately before `start()` and after, and records the account on the
+provider (or the shared `AcpRuntime` for demuxed sessions) only when both
+reads agree — a disagreement or failed read refuses the stamp, and either read
+observing an interim account feeds the latch. Stamps are first-stamp-wins (a
+warm-pool provider keeps its fill-time record), the stamp read is shielded
+from orphan cleanup by `_starting_pids`, and every stamp await sits under a
+teardown guard so cancellation cannot leak a started child. An unstamped
+child keeps exactly the pre-stamping protections.
+
+**Per-turn stamp gate** (`flag_identity_stamp_mismatches`, before the
+unchanged early-return in the turn gate): a session whose stamp provably
+differs from the live account is flagged `retire_on_identity_change` and its
+resume sid cleared (mirroring the sweep — the flag makes `close_all` skip the
+pointer re-map, so an uncleared sid would survive restart and hand the
+replacement child the flagged account's conversation). A proven-mismatch
+companion runtime — busy or idle — is displaced out of its claimable slot
+(`_subagent_runtimes` / the `_bg` slot) and parked: `_draining_subagent_runtimes`
+for companions, the existing `_draining_bg_runtimes` for the background
+runtime. Kills happen only on a LATER drain pass, once idle and past a park
+grace (`identity_park_grace_remaining`) that outlasts the sub-second window
+where a just-claimed runtime still reads idle. The companion drain reap
+removes only the entries it actually killed — the kill awaits, and a rebuild
+from a pre-await snapshot would drop a concurrently parked runtime from the
+only list that still references it. Parked runtimes stay PID-shielded, count
+against sweep completeness, and are torn down at `close_all`.
+
 ## Key Behaviors
 
 - **Empty-response recovery ladder** (dashboard chat runner, depth-0 turns
   only): a completed turn with no visible output, no refusal reasons, and no
   cancellation is treated as a transient provider failure and recovered
-  through a bounded three-rung ladder driven by `slot._empty_response_retries`:
+  through a bounded three-rung ladder driven by `slot._empty_response_retries`,
+  with `slot._empty_episode_productive` carrying one episode-scoped fact the
+  counter cannot (rung 3 below):
   1. **first empty** → the ORIGINAL message is silently re-queued at the
      front of the slot queue (no visible card). Reached ONLY by a turn with no
      activity — see the productive-turn exclusion below;
@@ -394,19 +522,56 @@ send time.
      and suppressed while a Stop is active;
   3. **budget exhausted** (the nudges also produced nothing) → terminal notice card
      asking the user to send a message; the counter resets so the next
-     genuine user turn gets a fresh budget. The card's wording is cause-aware,
-     mirroring rung 2's split: a productive turn is told the turn ended
-     without a closing reply and that completed steps will not re-run (never
-     "returned nothing", which is false for it and — read back by the model
-     via the transcript — invites a redo of landed side effects). For
-     non-productive turns the recovery clause appears only when the counter
-     shows budget was spent, and claims only that automatic recovery was
-     attempted — the counter counts budget, not which rungs ran (with the
-     auto-continue gate off, give-up arrives at one with no auto-continue).
-     Give-up with the counter at zero is reachable non-productive only on
-     nested depth>0 turns, where the card reports only the empty turn (the
-     gate-off zero-counter path is productive by construction and takes the
-     productive wording).
+     genuine user turn gets a fresh budget. The card's sentences are the
+     constants in `messaging/empty_turn_copy.py`, shared with the channel
+     driver's empty-turn verdict so a channel thread mirrored into the dashboard
+     reads one story. The card's wording is cause-aware,
+     mirroring rung 2's split, and the split is decided per EPISODE, not per
+     turn: the card says the turn ended without a closing reply and that
+     completed steps will not re-run whenever THIS turn was productive **or**
+     any earlier turn of the same episode was (never "returned nothing", which
+     is false for such an episode and — read back by the model via the
+     transcript — invites a redo of landed side effects). The episode half is
+     what `slot._empty_episode_productive` carries: set at rung 2's productive
+     branch, and cleared BOTH beside the counter on a landed turn AND at the start
+     of any dispatch the drain did not re-queue as recovery. `_synthetic_payload` is
+     true for a CONTINUATION-tagged entry and for an untagged one, which falls through
+     to the entry's kind — so the auth-required and poisoned-conversation requeues
+     count even though they carry the user's own text. It is false for an
+     ORIGINAL-tagged verbatim replay, which only rung 1 queues, and rung 1 requires the
+     counter below 1 while the flag is only set with it at 2 or more, so the flag is
+     already clear on that path. The second clear is what makes
+     the flag independent of the several controls that discard a queued
+     continuation without landing a turn (the hard-kill Stop's queue clear, a plan
+     Cancel's owner-scoped discard, a rewind commit's rebuild). None of those
+     resets the recovery counter, so a spent counter can still route a LATER
+     request into rung 2, and that request's own turns must not inherit this
+     episode's evidence. The counter's own staleness across those controls is
+     pre-existing and not redefined here.
+
+     The episode is deliberately NOT keyed on the two continuation bodies. The
+     runner queues other recoveries of its own and can put one AHEAD of this
+     ladder's — a Stop hook's `decision: block` prepends at index 0 in the same
+     teardown that queued the ladder's continuation there — and those turns are
+     the SAME episode, whose productive first turn has already run its tools, so
+     they keep the no-rerun wording instead of inviting a resend. A body test also
+     could not be identity on its own, since the bodies are fixed runner-authored
+     strings a user can paste. The rest of the split is needed
+     because
+     the counter cannot separate the two paths that both arrive at 2 (a
+     productive turn's `= 2` jump and the plain ladder's two `+= 1` steps), and
+     the per-turn `EmptyTurnActivity` is rebuilt every turn, so a productive
+     turn whose continuation returns nothing would otherwise be described by
+     its empty continuation alone. The predicate is monotone: it can only move
+     a card from the counter wording to the productive wording, never back, so
+     no already-correct card changes. For an episode that was NEVER productive
+     the recovery clause appears only when the counter shows budget was spent,
+     and claims only that automatic recovery was attempted — the counter counts
+     budget, not which rungs ran (with the auto-continue gate off, give-up
+     arrives at one with no auto-continue). Give-up with the counter at zero is
+     reachable non-productive only on nested depth>0 turns, where the card
+     reports only the empty turn (the gate-off zero-counter path is productive
+     by construction and takes the productive wording).
 
   **A PRODUCTIVE turn never reaches rung 1.** "Empty" at this branch means only
   that the FINAL assistant segment is empty, which is not the same as "the turn
@@ -531,6 +696,64 @@ send time.
   tool-count gate (that gate protects un-landing, and there is nothing here to
   un-land) and no stage-execution gate (a notice changes no turn result the stage
   loop reads).
+- **False current-tool-blocker recovery** (dashboard chat runner, depth-0 turns
+  only): a normal turn that successfully completed only host-owned read/search/fetch
+  preparation tools and then claims that *this turn* exhausted its tool budget or
+  can no longer execute tools is not allowed to land as completed work. Kiro Crew
+  receives real tool failures through refusal/error/result frames; a call
+  lacking a terminal `status=completed` result has no final completion proof
+  and remains ineligible. With no such failure and exact completion evidence, that
+  self-referential blocker is model-authored rather than a runtime verdict. The
+  turn uses the existing promise-only one-shot continuation and non-landing
+  accounting, so the next turn tries the pending action instead of asking the user
+  to type "continue." One provider-canonical identity and call id are retained per
+  dispatch; the id set must exactly equal the final `status=completed` result set.
+  Only the fixed non-MCP builtin allow-list is eligible. Its five shared
+  read/search/fetch identities come from the host approval gate's proven
+  read-only registry; `introspect` and `tool_search` are explicit replay-only
+  discovery extensions and do not widen that auto-approval registry. This replay gate
+  deliberately does not inherit the separate approval path's `tool_kind`
+  classifier: replay can repeat an already completed turn, so it requires a
+  positive Kiro-backend capability (declared fail-closed on the provider ABC),
+  `tool_identity_trusted=true` minted from an adapter-authored canonical
+  tool-name marker (`_meta.kiro.toolName` on the eligible Kiro backend),
+  stable canonical identity, host ownership, and final-result proof.
+  A familiar non-empty `tool_name` is not provenance. The
+  allow-list is specific to Kiro's canonical builtin identities; KAS and other
+  selectable backends remain manual until they expose equivalent identities and
+  round-trip tests. Agent-influenced ACP `tool_kind`, MCP tools, unknown identity,
+  duplicate/missing ids, and every count/status mismatch fail closed. The blocker
+  must be a full match of one of the two captured incident statements; other
+  wording, appended instructions, or announced actions is ineligible, including
+  prose copied from a fetched document. Blocker-adjacent wording that misses the
+  exact grammar remains ineligible but emits a text-free WARNING after otherwise
+  proven read-only preparation, making recurrence drift observable without
+  granting replay authority.
+  Recovery is limited to authenticated-human turns and replays that exact
+  original user message, captured at runner entry before cancelled-turn,
+  subagent-failure, or silent app-context enrichment. Its provenance is
+  preserved; model-authored blocker, action text, and injected context never
+  become the next prompt or mirrored user speech. This remains safe with static
+  `allowedTools`, MCP `autoApprove`, and hook grants: those mechanisms may skip a
+  tool approval, but the retried authority is still the user's own request. The
+  queued replay preserves the triggering row's validated attachment lists so
+  `[attached_file N]` and `[attached_dir N]` markers still resolve losslessly,
+  including paths containing whitespace. It carries a distinct structural kind so
+  a Stop, follow-up, or steer arriving after enqueue purges it before dispatch and
+  resets the one-shot budget. Rebinding the slot to another session while the replay
+  waits also purges it and resets that budget. If the single replay ends in the same
+  blocker, the spent-budget arm emits a give-up notice and never queues a second replay. No
+  host-authored fresh, resumed, or compacted-session context tells the model that
+  tools became unavailable or assigns a per-turn tool budget; provider failures
+  continue to use their control frames. This remains an interim mitigation for an
+  unsupported model self-report, not a diagnosis of a resume-path provider
+  failure. Phrasings beyond the two captured full statements deliberately remain
+  manual; a new recurrence must be diagnosed before the grammar expands. Any
+  identity or completion shape outside the proven allow-list falls through to the
+  landed-turn behavior, preventing a completed mutation from being replayed. The
+  normal Stop, user-follow-up, pending-steer, stage-execution, approval/refusal,
+  and one-shot gates remain unchanged; trusted or global auto-approve sessions
+  retain the existing notice-only downgrade.
 - **Context compaction**: at ≥ configured threshold (`session.autocompact_pct`, default 70%, valid 5–90), compacts **in place** on a member of
   `ACP_BACKENDS_COMPACT` — kiro-cli, claude, codex and opencode. They divide by WHERE
   the
@@ -719,12 +942,16 @@ send time.
   without it, absence from the live set is equally true of a `cron:` fire, a
   `taskrunner:{id}:task{n}` step or a `hook:` session that is running right now
   and never had a tab, so reaping on absence alone would end live work instead
-  of finished work. Two further guards apply to this axis only, and the probe
-  call one of them makes carries a third question the RSS recycle shares. It
-  consults the
+  of finished work. One further guard applies to this axis only, the live-set
+  re-assert below; the sub-agent probe is asked on BOTH axes, and the call
+  carries a third question the RSS recycle shares. The sweep consults the
   same `CleanupDeps.has_attached_subagents` probe the RSS recycle uses,
   fail-closed, because with session sharing on a parent's children run on its
-  runtime after its own turn ends and the busy semaphore cannot see them. That
+  runtime after its own turn ends and the busy semaphore cannot see them. The
+  idle clock reaches that probe as well as the orphan test does: a long
+  sub-agent run is exactly what lets a parent's `last_used` go stale, and an
+  idle expiry that skipped the probe would fire `on_session_expire` and reset
+  the runtime the children are still working on. That
   same wrapper answers a second question FIRST, and synchronously: whether a
   completion injection is in flight for the key
   (`CleanupDeps.has_pending_injection`, installed by the gateway over its
@@ -742,12 +969,26 @@ send time.
   branches honour it: the axis that elected a session says nothing about whether
   a turn is committed to it, and the clock alone can elect a never-tabbed
   `cron:{job}` parent whose `last_used` went stale during the very sub-agent run
-  whose completion injection is in flight. For the idle branch that read is the
-  last one before its reset. The two branches that suspend on the sub-agent probe
-  -- the orphan branch and the RSS recycle -- read the counter ONCE MORE after
-  that probe, because it suspends and an injection starting inside its await is
-  invisible to any earlier read. On both, that re-read is the last statement
-  before `reset` and nothing between them suspends. Neither read is the atomic
+  whose completion injection is in flight. Every branch that resets suspends
+  on the sub-agent probe -- the sweep on both its axes and the RSS recycle --
+  so each reads the counter ONCE MORE after that probe, because an injection
+  starting inside its await is invisible to any earlier read. On the RSS
+  recycle that re-read is the last statement before `reset`. In the sweep it is
+  the first of four post-await re-judges, all synchronous and all asked about
+  the entry the scan carried out: the counter; then the incarnation, on both
+  axes (the key must still hold the session the sweep judged, because
+  `on_session_expire` consolidates the transcript ahead of `reset` and a
+  `reset` that declines on the mismatch afterwards does not undo a
+  consolidation already run over a newcomer's transcript -- and on the orphan
+  axis a departed incarnation loses its old slot-claim record only while the
+  key is still absent from the current live set; a reopened slot republishes a
+  fresh claim for its replacement, which the stale verdict must preserve);
+  then the semaphore (a turn that took it during the await is exactly as live
+  as one the scan skipped); then, on the idle axis only, the clock (a turn that
+  began AND finished inside the await released the semaphore again but bumped
+  `last_used` on its way in, so the session is not idle now -- the orphan axis
+  ignores the clock and re-asserts against the live set instead, below).
+  Nothing between the probe's return and `reset` suspends. Neither read is the atomic
   one, though: `reset` itself suspends on the registry lock before it validates
   anything, so an injection beginning while that lock is contended is invisible
   to every read a caller took first. Both resetters therefore pass
@@ -761,17 +1002,19 @@ send time.
   than exempting the key: once the counter returns to zero the next sweep expires
   it, so the runtime this axis exists to release is not held for good by a window
   that has closed.
-  Every verdict this sweep reaches is about ONE incarnation, so on this axis the
+  Every verdict this sweep reaches is about ONE incarnation, so on BOTH axes the
   reset is pinned to it: the scan carries the session object out with its key and
   passes it as `reset(expect_session=...)`, which revalidates identity under the
-  registry lock and declines on a mismatch. Two awaits separate the scan from the
-  act, so the key can change hands in between -- a cron job firing again, a tab
-  reopened and a turn taken -- and a key-only reset would hand that newcomer a
-  verdict reached about its predecessor. The record restore on a declined reset
+  registry lock and declines on a mismatch. The probe suspends on either axis,
+  and the orphan axis adds the scan's lock release ahead of it, so the key can
+  change hands before the act -- a cron job firing again, a tab reopened and a
+  turn taken -- and a key-only reset would hand that newcomer a verdict reached
+  about its predecessor; on the idle axis it would shut down exactly the
+  replacement runtime. The record restore on a declined reset
   is conditioned on the same identity, which covers both reasons for a decline:
   a session that is merely busy is the one whose claim was released, so the claim
   goes back, while a key that changed hands must not have a claim invented for
-  its new holder. The idle axis keeps its long-standing key-only reset. And
+  its new holder. On the orphan axis
   the answer is then re-asserted against the current live set. That re-assert
   must be the LAST read of the live set before `reset`, which is why it sits
   after the probe rather than before it: two awaits separate the scan from the
@@ -779,6 +1022,20 @@ send time.
   reopen in either window. Everything between the re-assert and `reset` is
   synchronous by requirement, so a check placed any earlier reopens the window
   it exists to close and a session the user has just resumed loses its runtime.
+  Fail-closed has one accepted residual: a probe that cannot answer keeps every
+  candidate it is asked about, on the idle sweep, the orphan axis and the RSS
+  recycle alike, so a probe broken system-wide holds every reap until it
+  recovers. That is the right answer for the sessions -- reaping on a probe
+  that cannot see the children is the hazard the guard exists to prevent. When
+  the probe RAISES, its visibility is a WARNING bounded by
+  `SessionCleanup.PROBE_FAILURE_WARN_INTERVAL_SECS` (at most one line per
+  interval across all keys, `CleanupState.probe_failure_warned_at`), with every
+  failure keeping its traceback at debug, so a persistent break stays visible
+  in the log without a line per candidate per tick. An unreadable task store
+  does not raise to this wrapper: `subagents_attached_async` absorbs it and
+  answers "attached" (`taskq_bridge.UNKNOWN_PENDING`), so that cause surfaces
+  only as the per-key "still has sub-agent work - left running" INFO line, not
+  as the bounded WARNING.
   While no live set has been published at all
   (`active_dashboard_slots is None`) the axis expires nothing, so a build with
   no dashboard keeps the idle timer as its only reaper. The policy is
@@ -843,7 +1100,14 @@ send time.
   only when ALL hold: (i) no member PID is tracked or a live provider; (ii-a)
   AT LEAST ONE member has positive agent-runtime argv identity — the generated
   launcher, an exact argv0 basename of `kiro-cli`, `kiro-cli-chat`,
-  `claude-agent-acp`, or `claude`, or a marked MCP launcher — which is the
+  `claude-agent-acp`, or `claude`, or a marked MCP launcher — OR EVERY member is
+  a marked toolbox sandbox credential helper (an argv0 ending
+  `/sandbox/creds_agent` carrying a `--session-id` argv token, version-independent
+  because the toolbox version sits above `sandbox/` in the path), which is a scope
+  with nothing but the helper left in it: the helper serves one runtime and
+  routinely outlives it, and each holds tens of threads while `pids.current`
+  counts tasks. It is deliberately not one of the existential identities, since
+  one helper must not authorize stopping a sibling; either arm is the
   scope-wide stop authorization; (ii-b) EVERY member is this install's own — it
   carries the `KIROCREW_SPAWNED` marker, or its `ppid` chain reaches a
   marker-bearing member without leaving the scope's member set (ownership is by
@@ -865,7 +1129,9 @@ send time.
   scopes. A no-op off Linux or without cgroup v2 delegation
   (`sandbox._probe_cgroup_scope`). Marker inheritance by itself never authorizes
   a scope-wide stop, so an intentional detached server left after its agent
-  runtime exits is preserved. The accepted fail-closed residual is that a scope
+  runtime exits is preserved — including when a credential helper survives
+  beside it, because that helper authorizes a stop only where it is the whole
+  remaining scope. The accepted fail-closed residual is that a scope
   whose runtime-anchor members have all died is never reclaimed, even if every
   survivor still has the marker or is an attributable env-cleared descendant;
   old skipped scopes are summarized at INFO by stable reason category, making
@@ -1048,7 +1314,10 @@ applier — a raised turn budget is in force on the next prompt.
    provider's cancel lands -- already see it; `prev_turn_cancelled` is set only
    after the ack and is too late for them.
 2. `clear_queue(key)` — queue drop is unconditional on first press (skipped
-   with `preserve_queue=True`).
+   with `preserve_queue=True`). Passing no ownership predicate is what makes the
+   drop whole-session, which is what a Stop button press means. A per-sender
+   stop verb passes one and drops only that principal's entries; see
+   "Hard cancel: `/stop`" in `messaging.md`.
 3. If `force=True`: skip cancel, go straight to hard kill (step 5).
 4. Send `session/cancel` via `provider.cancel(wait_ack_timeout=budget)`:
    - `"acked"` → set `session.prev_turn_cancelled = True`, call `on_soft` callback, return `"soft"`.
@@ -1159,10 +1428,10 @@ the four where `rewind` does not yet, so nobody reads them as already shared:
   something else has taken `slot.task`, committing would run this handler's turn
   alongside whatever now owns the slot — two concurrent turns writing one
   window). Any of the three refuses with a retryable 503.
-- **The durable write is NOT covered by that predicate, and the gap is open.**
-  Every call to the commit predicate above happens AFTER the save has settled, so
-  for the file it is a post-mortem: it can refuse the live commit and the
-  dispatch, and it cannot un-truncate a transcript that has already been
+- **The commit predicate does not cover the durable write; the CLOSE path orders
+  it instead.** Every call to the commit predicate above happens AFTER the save
+  has settled, so for the file it is a post-mortem: it can refuse the live commit
+  and the dispatch, and it cannot un-truncate a transcript that has already been
   replaced. The truncated window is frozen against ONE slot incarnation, and a
   same-name close-and-recreate can be published inside the executor wait, after
   every check the handler can run on the loop. Such a recreate resuming the same
@@ -1175,9 +1444,109 @@ the four where `rewind` does not yet, so nobody reads them as already shared:
   not need the replacement published before the check, only that it READS the
   file after the write commits. The save holds the per-session lock across its
   whole read-modify-write, so a replacement published during the write waits and
-  then hydrates from the truncated content. Closing it needs slot publication to
-  be ordered against the persistence commit, and no such contract exists between
-  the registry and the persistence layer today. Tracked in issue #12090.
+  then hydrates from the truncated content.
+  Closing it needs slot publication ordered against the persistence commit, and
+  that ordering exists at the retraction that hands a reused name to a
+  replacement: **`close_slot`**. It fences the slot with `begin_close`, waits for
+  the slot's registered **guarded writes** — a truncating save, meaning one
+  carrying an authorized `expected_history_key` — and only then pops the name.
+  The registry `slot._guarded_history_writes` holds the writes' executor FUTURES,
+  not a count, because a count released in an awaiter's `finally` reads zero the
+  moment that awaiter is cancelled while its worker thread runs on to the rename.
+  `save_slot_off_loop` registers every guarded write it dispatches;
+  `chat_rewind.api_chat_slot_rewind` calls `register_guarded_history_write` on
+  its own `asyncio.to_thread` save, which is the one truncating write that does
+  not go through that helper.
+  A truncating save is one that rewrites the window rather than appending to it:
+  it passes an explicit `messages` snapshot, or `rewrite=True`. EVERY one of them
+  carries an authorized transcript key, the fork's pending-rewrite flush
+  (`chat_fork`) included — without the key a truncating save skips the fence, the
+  registration AND the in-lock routing re-read, leaving it less ordered against a
+  retraction than the ones that are fenced. The enumeration is read from the
+  syntax tree by a test, so the population cannot grow quietly.
+  A registered write must never be cancelled by its own handler. Cancelling it
+  makes the task DONE, the done callback drops it from the registry, and the
+  worker thread runs on to the rename with nothing left to order against it --
+  the same hole, reached from the cancellation path instead of the dispatch one.
+  So every await on a registered task is shielded, including the awaits in a
+  cancellation drain, and each drain is bounded (`_SAVE_DRAIN_ATTEMPTS`) so a
+  cancel storm cannot spin. A task that never settles stays pending and stays
+  registered, which is what the close needs.
+  The periodic writer honours the same fence: `flush_slot_now` returns without
+  writing while `slot.is_closing`, and leaves `_dirty` armed. A fenced slot is
+  still the occupant of its name until the pop, so the five-second pass still
+  visits it, and that write is not a registered guarded write, so the
+  retraction's wait cannot see it — a tick landing between fence and pop would
+  overwrite whatever adopts the name next. A close that completes persists the
+  window itself through its archival save; a close that is abandoned lets the
+  next pass write the owed value.
+  That fence is necessary but NOT sufficient, for the same reason the whole
+  ordering exists: it is read on the flush executor thread while the retraction
+  runs on the loop, and the write reaches the transcript lock only after the
+  snapshot, routing and retention stretch. So the periodic save also passes
+  `expected_slot_name`, which decides INSIDE the lock with no await before the
+  write. It matters more here than elsewhere: a periodic save is a full metadata
+  rebuild and does not request the `rows_only` deferral that keeps another
+  holder's folder, title and tag.
+  That in-lock refusal keeps the write OWED (`_keep_owed_after_refusal`), for the
+  reason its own docstring gives: `flush_slot_now` clears `_dirty` on any return
+  that did not raise, so a guard refusing without re-arming erases the only
+  in-memory witness of an edit it never wrote. An in-place edit has no
+  substitute witness — the popped slot is outside the registry the periodic pass
+  walks, and its window length matches disk.
+  A refusal is a DEFERRAL, not a loss: it marks the slot `_dirty` so the
+  periodic flush retries the write once the fence is down. That matters because
+  the metadata-only mutations — a recreate's title, a folder filing, a tag, a pin
+  — save with `force=True`, set no `_dirty` of their own, and publish on the
+  acknowledged edit without reading the return; and a close can raise the fence
+  and then leave the slot live, since it refuses on a breached wait and the sweep
+  raises and releases the fence around a deferral. Without the arming, an edit
+  landing in that window is dropped and the old value returns after a restart.
+  The pair is decidable in BOTH directions because each dispatch seam re-reads
+  the fence with no suspension between the read and the registration: either the
+  fence is up and the write refuses, or the write is registered and the close
+  waits for it. A write that outlasts the 5-second ceiling **refuses the close**
+  (`SlotCloseError` code `history_write_running`); the tab stays open and
+  retryable rather than having its name retracted with a thread still writing.
+  `close_slot` is the only retraction that WAITS, because it is the only one
+  obliged to finish — the person asked for it.
+  The fence itself is a DEPTH, not a flag, because two retractions can overlap
+  on one slot: the close suspends inside its wait and the sweep can reach the
+  same slot meanwhile. With a shared flag, whichever finished first cleared the
+  fence for both, and the other's remaining awaits ran unfenced — which is the
+  window the fence exists to close, since the dispatch-seam re-reads read
+  exactly this value. Counting means each holder releases only its own
+  acquisition; `cancel_close` floors at zero so an unmatched release cannot make
+  a later `begin_close` read as not-closing. The sweep additionally skips a slot
+  that is already closing, BEFORE raising its own fence, since after that it
+  could not tell its acquisition from the other holder's.
+  The bulk stale-slot sweep pops each slot itself and is fenced too, but it
+  DEFERS instead of waiting. Staleness is judged from last recorded activity,
+  and a truncating save's HANDLER can be in flight far longer than its worker
+  thread — a rewind on a conversation nobody has touched for days is admitted,
+  awaits its native teardown, and only then dispatches — so a stale slot can
+  carry a guarded write. A pending guarded write is itself proof the tab is not
+  idle, whatever its timestamps say, so the sweep reads the registry
+  SYNCHRONOUSLY behind the fence and leaves such a slot for the next sweep,
+  reporting it in `failed`. Waiting there would be worse than useless: the
+  handlers that produce a guarded write publish a task on the same slot in the
+  same breath, so a wait would hold the sweep open exactly while the tab is
+  being edited and the pop after it would cancel that turn. Deferring removes
+  that window by construction, and the fence is what makes the synchronous
+  read sound: with it up no new guarded write can be dispatched, so an empty
+  reading stays empty through the pop. There is deliberately NO await between
+  that fence and that pop. The sweep also releases the fence itself where a
+  failed archive restores the slot, since it has no `close_slot` wrapper to do
+  that for it.
+  Residuals, deliberately: `_materialise_slot_from_history` publishes a slot
+  rebuilt from disk rather than retracting a live one, so it keeps only the
+  narrower in-lock `expected_slot_name` re-read. The history-delete pop in
+  `handlers/sessions.py` needs no wait for a different reason: `delete_session`
+  unlinks under the SAME `_locked` region the save takes, so the **delete-won
+  guard** refuses the write outright instead of resurrecting the transcript.
+  Making registration automatic at the `_save_slot_to_history` layer, so a new
+  truncating caller cannot opt out, and making `pop_slot` an enforced chokepoint
+  rather than a facade, are tracked in issue #12090.
 - **The periodic dirty-slot flush is excluded for the whole rewrite.** Because
   the live slot keeps the full window until the commit, a flush tick can snapshot
   that stale window, block behind the rewrite on the per-session history lock,
@@ -1192,6 +1561,12 @@ the four where `rewind` does not yet, so nobody reads them as already shared:
   *wrapper* rather than the inner future is what keeps the exclusion held: a
   cancellation reaching the shield leaves the coroutine running, so its `finally`
   cannot release the flag early.
+  That counter and `_guarded_history_writes` are different mechanisms with
+  different consumers and are not interchangeable: the counter answers
+  `flush_slot_now`, whose question is whether the periodic writer may start, and
+  an awaiter's cancellation lowering it early is the correct answer there. The
+  close's question is whether the worker THREAD has returned, which only the
+  future can answer.
 - **The cancellation drain survives REPEATED cancellation.** The worker thread
   cannot be interrupted, so once the rewrite starts it lands whether the handler
   lives or not; the handler therefore has to learn the outcome and commit to
@@ -1279,6 +1654,10 @@ The `side:` prefix is included so
 `/side` conversations never resume across KiroCrew restarts — each cold-start
 triggers `is_first_turn=True` in `build_side_message` which re-seeds the
 parent snapshot + accumulated side history.
+The `thread:` prefix (a reply thread on a crewmate chat message,
+[history](history.md#reply-threads-on-crewmate-chat-messages-dashboardchat_threadspy))
+is included for the same reason: `build_thread_message` re-seeds the whole
+envelope on a cold session.
 
 **Lifecycle:**
 - `get_or_create()`: looks up mapping → if found and `.json` file exists,
@@ -1799,9 +2178,15 @@ Off the loop (CLI, tests, worker threads) every mutation still writes inline. Lo
 flush on a crash leaves a well-formed older map, never a truncated file.
 
 **Auto-prune:** `SessionMap.get()` auto-removes entries whose `.json` file
-no longer exists (the entry drops from memory immediately; the file write rides
-the deferred flush). `SessionMap.prune()` bulk-removes all stale entries at
-startup.
+no longer exists, or whose `.jsonl` holds no turn (the entry drops from memory
+immediately; the file write rides the deferred flush). `SessionMap.prune()`
+bulk-removes all stale entries at startup. The resumability rule itself —
+kiro-cli's `.json` present and `.jsonl` at least `_RESUMABLE_JSONL_MIN_BYTES`,
+any other backend left to `session/load` — has ONE definition:
+`_RESUMABLE_JSONL_MIN_BYTES` read through `_jsonl_holds_a_turn`, which `get()`
+prunes on directly and `session_files_resumable(sid, provider)` wraps together with
+the `.json` and provider checks for a reader outside the module (the sub-agent
+orphan notice's resume hint), so the two cannot drift.
 
 **Mapped-session enumeration:** `SessionMap.mapped_sids_by_key()` returns session
 key → kiro-cli session ID for every entry that has one. Disk accounting
@@ -1988,6 +2373,15 @@ Legacy bare-thread Slack keys are unaffected — they keep the
 `canonical_key`/`legacy_key` shim. The DM channels are recent, so the key shape
 carries no prior persisted history to migrate.
 
+Slack does not use this key shape even for its own DMs. `slack.dm_single_session`
+gives a 1:1 DM one session by keying it `slack:<channel_id>`
+(`slack.transport_dispatch.flat_dm_session_key`) rather than by minting a
+four-segment bucket: a two-segment Slack key is what the existing thread keys
+already are, so the fold shim, the thread index and every caller that
+reverse-derives from a Slack key keep working unchanged. It carries no
+generation suffix, so the idle/daily rotation above does not apply — a flat DM
+relies on ordinary context compaction instead.
+
 ### Mid-turn messages (steer / queue)
 
 `SessionManager.is_busy(key)` reports whether a turn holds the session
@@ -2048,6 +2442,30 @@ so absence clears it.
   `_dirty_gen` to spot a concurrent mark: without it a refused pass would drop
   window rows it never wrote, and the queue signal cannot cover them once the
   overtaking writer has satisfied it.
+
+- **Run now dispatches an idle queued card; it does not cancel child work.**
+  `POST /api/chat/slots/{slot}/interrupt` keeps its stop-and-preserve behavior
+  while the parent turn is running. When the parent is idle, the endpoint
+  **requires** an explicit `queue_id` naming the selected card: it revalidates
+  that exact card and starts it directly. A missing, empty, or non-string
+  `queue_id` on the idle path is rejected with `400 invalid_queue_id` — the
+  bypass exists only to run a card the user chose, so it never falls back to the
+  queue front or dispatches unselected work. The running path leaves
+  `queue_id` optional: a running-parent interrupt is a stop-and-preserve, and
+  the `queue_id` there only promotes the matching card to the front, so a value
+  that matches no card is a no-op rather than a refusal.
+  This explicit action bypasses only the background-subagent user-message hold;
+  an active stage, a stop in progress, or a remote-bound slot still refuses it.
+  Attached subagents keep running, and their later completion injections use the
+  ordinary busy-slot queue. If admission revalidation removed the selected card,
+  the endpoint returns `409 queue_item_unavailable` so the client releases its
+  pending-action latch instead of treating a no-op as accepted. Interrupt requests
+  that produce a command outcome are audited to the SEL as a
+  `dashboard_interrupt` command: the idle dispatch logs `outcome="started"`, a
+  running press logs the `stop_turn` outcome (`soft` / `hard` / `idle`), and a
+  superseded or already-in-progress press logs `outcome="noop"`. Requests
+  rejected before a command outcome, including validation and idle-dispatch
+  race refusals, are recorded by the generic mutating-API audit instead.
 
 - **Only a plain user prompt is durable.** An entry carrying a `kind` is an
   injection whose producer is gone (a cron notification names an event, and a
@@ -2172,7 +2590,12 @@ only when a `mirror` `ChannelLink` exists on the dashboard-side key:
 **API:**
 - `SessionManager.set_mirror_link(key, link)` / `clear_mirror_link(key)` /
   `get_mirror_link(key)` — persist/read the outbound `ChannelLink` (Slack routes
-  to `set_slack_link` so its reverse index stays intact).
+  to `set_slack_link` so its reverse index stays intact). The read synthesizes a
+  Slack mirror from the legacy `slack_thread_ts` / `slack_channel_id` fields only
+  when a thread is named: a threadless Slack row — the bucket `set_channel` stamps
+  on a channel session's first turn, which `clear_mirror_link` leaves behind — is
+  bookkeeping nobody can deliver through and reads as `None`, so no reader needs
+  its own copy of that rule.
 - `SessionManager.clear_mirror_links_at(link)` — value-keyed sweep: clears
   EVERY session whose mirror targets that exact non-Slack location and returns
   the cleared keys. The write counterpart of `find_mirror_sessions`, and the
@@ -2197,6 +2620,27 @@ only when a `mirror` `ChannelLink` exists on the dashboard-side key:
   silences the courtesy note posted into the conversation and keeps the
   disconnect. That note is skipped entirely for an `origin` disconnect, since the
   mirror resolver addresses the EXPLICIT mirror — a different conversation.
+- **Neither `mirror-unlink` nor `mirror-pause` detaches a channel-born slot.** Both
+  act on the outbound mirror binding only (clear it, or mute delivery through it);
+  the slot's `linked_session_key` — the channel session its turns run on — is
+  untouched, inbound keeps routing to it, and nothing about what session control
+  or the work ledger decide for that slot changes. Those gates judge a channel-born
+  slot by `session_control.owner_dm_refusal`, whose one exemption is a 1:1 DM
+  whose only human is the configured owner (see
+  [session-control](session-control.md)); a thread session is refused before and
+  after either endpoint, and an owner DM is admitted before and after — a paused or
+  cleared origin mirror is still the same audience. "Cleared" is the store's word,
+  not an empty row: `clear_mirror_link` pops the `mirror` row and leaves the
+  namespaced bucket the first inbound turn's `set_channel` stamped into the legacy
+  `slack_channel_id` field, and `get_mirror_link` reads that threadless Slack row as
+  no mirror at the source (a row naming no thread is never synthesized into one),
+  so the predicate — and every other reader — sees `None`. The one dashboard action that DOES change the
+  verdict is `slack-link` on a channel-born slot: it binds the thread on the slot's
+  effective key — the channel session — beside the untouched origin mirror, and the
+  predicate reads that thread on its own (`get_slack_link`), because `get_mirror_link`
+  answers the `mirror` row alone when one exists; the owner DM is refused as
+  mirroring to a Slack thread until `slack-unlink` clears it. There is no "detach
+  from channel" action: a channel conversation stays a channel conversation.
 - **Three persisted pause markers, each keyed differently.** A mute must live and
   die with the binding the user muted, so the key follows what the flag is about:
   - `slack_paused` — the Slack thread. Cleared when the binding is REBOUND
@@ -2622,6 +3066,27 @@ a trust root on its own; publication therefore also writes a
   it would trade a disk saving against the read-then-unlink window in which a
   new owner's `publish_session_pid` can land, and losing a live mapping costs
   that session its identity until its next turn republishes.
+- **Legacy per-pid member-memory bindings**
+  (`SessionCleanup._sweep_member_pid_bindings` →
+  `member_memory_auth.prune_legacy_member_pid_bindings`):
+  `<crew home>/member-memory-bindings/pids/<pid>.json` and
+  `<pid>.namespace.json` are records a routing path this version no longer
+  carries wrote one of per agent process. Nothing deleted them and no sweep
+  collected them, so they accumulate for the install's life — measured on an
+  operator host at 165,975 files spanning nine days and 24 MB of directory
+  inode, of which 165,816 named no live process. The same periodic tick that
+  retracts session-pid mappings now collects them, on the maintenance executor
+  for the same `no-blocking-call-on-event-loop` reason (the directory is same-uid
+  agent-writable). A record goes only when it is BOTH older than
+  `_LEGACY_PID_BINDING_MIN_AGE_SECS` (24 h) AND its pid names no live process:
+  age alone would race a record just written, and a dead-pid test alone would
+  delete a record whose number has been recycled away from a still-running owner,
+  so requiring both is what makes the prune safe against pid reuse in either
+  direction. Symlinks are neither followed nor removed, unrecognised names are
+  left alone (this sweep owns exactly the shape it can attribute to a pid), and
+  each pass is capped at `_LEGACY_PID_BINDING_PRUNE_BUDGET` (2000) so a
+  six-figure backlog drains over passes instead of monopolising one maintenance
+  task.
 - **Member execution routing**: the ordinary session/run owner record carries
   the immutable member/store snapshot. Strict MCP caller identity still uses
   the existing transport token and signed `session_pid` publication. No separate
@@ -3041,6 +3506,45 @@ lane slot and its runtime is still resident. `effective_caps` and
 Each computation samples `kirocrew.taskq.depth{state}`,
 `kirocrew.taskq.oldest_wait_secs`, `kirocrew.taskq.effective_cap{lane_kind}` and
 `kirocrew.taskq.pressure_reason{reason}` -- every attribute a closed-set value.
+
+**Refresh signal.** The verdict is not only computed on request. Every
+computation goes through `handlers/sessions.py::refresh_session_health` (the
+one owner of the payload cache and of the signal), which digests the verdict
+with `health_verdict_fingerprint` and, when the digest differs from the one last
+signalled, broadcasts the WS frame `session_health_changed` with the payload
+`{"ts": <wall clock>}` and nothing else -- no slot, no session key, no count, no
+classification. The frame says only THAT the verdict moved; a subscriber
+entitled to `GET /api/sessions/health` re-reads it, and a frontend-only app whose
+manifest does not list that path refreshes the surfaces it can already read
+instead of polling an endpoint that answers it with a denial. The digest
+excludes every age, timestamp and monotonic reading (a quiet resample is not a
+change) and folds everything else in BY IDENTITY, never only by count: each
+slot's classification, which slots are stalled, each waiting and recovering
+row's identity and state, the queue's `by_state` tallies, `effective_caps` and
+`degrade_reason` -- so one row leaving a state as another enters it is a change
+even though every count stands still. The first computation after process start
+seeds the baseline silently rather than firing a refresh at every subscriber on
+every gateway restart; a broadcast that fails leaves the digest uncommitted so
+the change is retried on the next computation. The frame rides the pre-existing
+`sessions` event declaration in `ws_event_scope._GLOBAL_EVENT_DECLARATIONS`
+(`events` and `api` are independent manifest fields, which is why the frame must
+stay data-free), and delivery is judged per frame by `ws_event_allowed` against
+the live scope. Because the verdict also moves with the clock (a turn crossing
+the stall threshold, a queue draining, a cap being cut), a WebSocket connection
+whose declaration set includes `sessions` runs a per-connection timer driver
+(`ws.py::_refresh_health_loop`) that calls `refresh_session_health` at connect
+and then every `_HEALTH_REFRESH_SECS` -- the handler's own cache TTL, so the call
+is TTL-gated and single-flighted and every declaring socket together costs at
+most one computation per interval. The first tick is at connect rather than
+after one interval because the first computation in a process is the silent
+baseline: a driver that slept first would let a verdict that moved during that
+sleep become the baseline and never signal it. A connection that declared
+nothing, or something unrelated, runs no driver, and a dashboard user (not
+declaration-gated, reads the endpoint directly) drives nothing either. The app SDK's event-declaration map
+(`website/src/app-sdk/index.ts`) lists `session_health_changed` under `sessions`
+so an app author sees which declaration the frame rides. Tests:
+`test/test_session_health_signal.py`.
+
 Tests: `test/test_session_health.py`, `test/test_sessions_health_cache.py`,
 `test/test_recovery_policy.py`, `test/test_recovery_ladder.py`,
 `test/test_recovery_l1_chat_runner.py`.

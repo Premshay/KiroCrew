@@ -4,6 +4,7 @@ import AskAgentButton, { handoffErrorToAgent } from './AskAgentButton'
 import type { ErrorReport } from '../utils/errorReport'
 
 import { i18nT } from '../i18n/t'
+import { withOriginLink } from './withOriginLink'
 
 export type ErrorNoticeMenuItemComponent = ComponentType<{
   title?: string
@@ -75,8 +76,9 @@ export default function ErrorNotice({
   onDismiss,
   variant = 'block',
   askAgent = false,
-  onHandoff,
   askAgentLabel,
+  footer,
+  onHandoff,
   className = '',
   messageClassName = '',
   messageTooltip,
@@ -116,6 +118,21 @@ export default function ErrorNotice({
    */
   askAgent?: boolean
   /**
+   * Scoped label for the hand-off link ("Ask the agent about this refusal").
+   * When several notices coexist on one screen, identical default labels leave
+   * the user unable to tell which link asks about which problem. Ignored when
+   * `askAgent` is off.
+   */
+  askAgentLabel?: string
+  /**
+   * Rendered INSIDE the banner, under the message (block variant only) — for
+   * a follow-on line that answers the message above it (a resolved outcome, a
+   * next step). Outside the border it reads as a detached caption; inside,
+   * the answer visibly belongs to the question. Import ReactNode consumers
+   * pass plain elements; falsy renders nothing.
+   */
+  footer?: React.ReactNode
+  /**
    * Forwarded to the hand-off button: runs only once the hand-off has actually
    * proceeded. For a notice rendered inside an OVERLAY that would otherwise sit
    * over the chat the hand-off navigates to (a modal, the remote-crew error
@@ -123,13 +140,6 @@ export default function ErrorNotice({
    * as a dead button. Ignored when `askAgent` is off.
    */
   onHandoff?: () => void
-  /**
-   * Overrides the hand-off's shared "Ask the agent" label — for a surface that
-   * stacks several notices, where every hand-off otherwise reads as the same
-   * affordance and nothing says which failure it carries. Pass a full localized
-   * label. Ignored when `askAgent` is off.
-   */
-  askAgentLabel?: string
   className?: string
   /**
    * Classes for the `message` span only — e.g. `font-mono` when the message is
@@ -168,7 +178,7 @@ export default function ErrorNotice({
       >
         <AlertTriangle size={14} className="shrink-0" aria-hidden="true" />
         {title && <strong className="font-semibold">{title}</strong>}
-        <span className={`min-w-0 ${messageClassName}`} style={{ overflowWrap: 'anywhere' }} title={messageTooltip}>{message}</span>
+        <span className={`min-w-0 ${messageClassName}`} style={{ overflowWrap: 'anywhere' }} title={messageTooltip}>{withOriginLink(message)}</span>
         {askAgent && (
           <AskAgentButton
             report={report}
@@ -204,8 +214,9 @@ export default function ErrorNotice({
         {/* Wrapped only when asked: the bare text node is the shape every
             existing consumer's tests read. */}
         {messageClassName || messageTooltip
-          ? <span className={messageClassName} title={messageTooltip}>{message}</span>
-          : message}
+          ? <span className={messageClassName} title={messageTooltip}>{withOriginLink(message)}</span>
+          : withOriginLink(message)}
+        {footer && <div className="mt-1 font-normal">{footer}</div>}
       </div>
       {askAgent && (
         <AskAgentButton

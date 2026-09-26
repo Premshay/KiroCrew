@@ -58,7 +58,7 @@ cannot disagree with what was sent.
 | 12 | `[Steering resources]` | `_load_steering_resources` → `file://*.md` in `~/.kiro/agents/kirocrew.json` | **Claude Code backend**, `kirocrew` agent, `project` group |
 | 13 | `[THREAD CONVERSATION HISTORY]` | `compress_thread_history`, else `_recall_rows` truncation | new, non-resumed session |
 | 14 | `[PREVIOUS TURN WAS CANCELLED …]` | `_build_stop_event_notes` | recent user stop |
-| 15 | `[Memory …]` + `[Memory activity index]` + `[Memory tools]` | `memory.py` → `get_context`, `activity_index` | not temporary, `memory` group |
+| 15 | `[Memory …]` + `[Memory activity index]` + `[Memory activity]` + `[Memory tools]` | `memory.py` → `get_context`, `activity_index`, `get_activity_context` | not temporary, `memory` group; the activity block also needs `memory.inject_activity` |
 | 16 | `[Skills:]` (pinned bodies, then discovery) | `skills.py` → `get_context` | see §4 |
 | 17 | `[Learned corrections …]` | vector `get_lessons_context`, else `lessons.jsonl` | `lessons` group |
 | 18 | `## Recent Session Context` | `conversation_log.recent_with_provenance` | `memory` group |
@@ -84,16 +84,25 @@ time-to-first-token: `build_session_context` stamps `_mark(...)` per group
 ### What memory contributes at session start
 
 `build_session_context` calls `MemoryStore.get_context` with
-`include_activity=False`. That is narrower than it reads:
+`include_activity=False` for the protected half, then
+`MemoryStore.get_activity_context` for the background half:
 
 - **Preferences** — injected **complete**, not capped, while the protected set
   stays under the model-safe ceiling.
-- **Semantic memory** — only the eligible `pref.*` records
-  (`get_preferences_context`), not a query-ranked search.
-- **Projects, daily history, episodic fragments** — **not injected**. `activity_index()`
-  lands instead: a bounded index of project headings and the last three days'
-  titles (the `cap` default of `activity_index`),
-  plus a `[Memory tools]` line pointing at `memory_recall` for the bodies.
+- **Semantic memory** — the eligible `pref.*` records
+  (`get_preferences_context`) are protected; task facts arrive in the activity
+  block below, query-ranked and with the `pref.*` rows dropped
+  (`get_semantic_context(facts_only=True)`) so nothing ships twice.
+- **`activity_index()`** — protected: a bounded index of project headings and
+  the last three days' titles (the `cap` default of `activity_index`), plus a
+  `[Memory tools]` line pointing at `memory_recall` for the bodies.
+- **Projects, daily history (14 full days, then decayed summaries and counts to
+  day 180), task facts, episodic fragments** — the `[Memory activity]` block,
+  one **ordinary background part** under the section
+  caps (`projects`, `memory_history`, `semantic`, `_EPISODIC_INJECT_CAP`). The
+  admission loop admits it whole or drops it whole, so a long history can never
+  displace preferences or lessons. `memory.inject_activity: false` withholds
+  it and the `[Memory tools]` line then says so.
 
 Lessons (`learn_add`) are separate and injected for **every** agent, custom
 included. A lesson with no `repo_scope` applies everywhere; a scoped one reaches
@@ -178,7 +187,7 @@ it adds:
 | `[SLACK THREAD CONTEXT]` | thread parent / metadata | Slack threads |
 | `[PROJECT]` | the slot's project dir | every turn, `project` group |
 | `[BOARD]` | slot board tags, sanitized ids | slot carries tags |
-| `[RESOURCES]` | `resource_status.probe` | only when host memory is tight |
+| `[RESOURCES]` | `resource_status.probe` | host memory tight/critical, or the agent slice within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max` |
 | `[FOLDER]` | sidebar ancestry | once per session, and after a move |
 | `[THEME PERSONA]` / `$skill` bodies | `request_prefix_context` | dashboard-generated |
 | `[Skill: name]` bodies, `[Relevant skills for this message]` | trigger matching | see below |
@@ -232,7 +241,13 @@ re-adds, once:
 3. `[REINJECTED AFTER COMPACTION — response preferences]`, re-read from current
    config so a level changed mid-session lands;
 4. the member section, re-read from disk — so the member gets its *current*
-   briefing and permanent rules back, not the pre-compaction copy.
+   briefing and permanent rules back, not the pre-compaction copy;
+5. `[AGENT SYSTEM PROMPT]` — the managed spec prompt is a stub pointing at this
+   block, so a compaction that drops it leaves the session with no contract.
+   This one is the *session-start* copy: `{{MAX_SUBAGENTS}}` carries the reading
+   `_session_cap_figure` took when the session started, because the cap in force
+   is derived from live host conditions and a second reading would hand the
+   session a contract it never agreed to, differing in a number it never chose.
 
 If that turn does not land (cancelled, refused, errored), `rearm_reinjection` puts
 the flag back, so the context is never lost to a failed turn.
@@ -298,22 +313,29 @@ per-run model or effort override, or a member launch force the dedicated path.
 | Process | the parent's kiro-cli | its own kiro-cli |
 | Start cost | ~200ms | ~3–5s |
 | Context assembly | identical `build_message` call | identical |
-| `$KIROCREW_SCRATCH` | **the parent's** | **its own** |
+| `$KIROCREW_SCRATCH` | **the parent's** | **the parent's** (mounted as a second window) |
 
 `agent_scratch.py` → `allocate_scratch` gives each spawned agent **process**
 `<data home>/scratch/<label>-<token8>/`, and `scratch_env` points
-`TMPDIR`/`TMP`/`TEMP`/`KIROCREW_SCRATCH` at it — per process, not per session
+`TMPDIR`/`TMP`/`TEMP` at it — per process, not per session
 (`acp/client.py` for a dedicated client, `acp/runtime.py` for a runtime). It also
 pins kiro-cli's chat log there, but only where `cap_kiro_cli_logs` can bound it
 (`_CAN_CAP_LOGS`); on Windows the key is omitted and kiro-cli keeps its default
 location, since a pinned log nothing rotates is worse than the CLI's own unlink.
 
-So a **shared-session** child sees the parent's scratch dir while a
-**dedicated-process** child gets an empty one: a brief staged under
-`$KIROCREW_SCRATCH` is unreadable to a dedicated child. Reclamation is keyed on
+`$KIROCREW_SCRATCH` itself follows the **session tree**, not the process. A
+shared-session child runs in the parent's process and sees the parent's directory
+for free; a dedicated-process child and a companion runtime are spawned with the
+parent's `work_scratch_dir` as `shared_scratch`, which the spawner mounts as a
+second private window into the masked scratch root and names as the child's
+`KIROCREW_SCRATCH` (`scratch_env(own, shared=…)`). So a brief staged under
+`$KIROCREW_SCRATCH` is readable by every child, however it was placed, and a
+`_bg` runtime recycled for age or RSS hands the sessions it takes over the same
+directory (its replacement inherits and adopts it). Reclamation is keyed on
 process liveness rather than on file age — a directory is removed only once its
 recorded owner's process GROUP is dead **and** the whole tree has been idle past a
-grace window, and an ownerless directory is never deleted.
+grace window, and an ownerless directory is never deleted. The seams and the
+ownership rule: [subagent](../system-specs/modules/subagent.md#one-kirocrew_scratch-per-session-tree).
 
 ## 4. Default agent vs other agents
 
@@ -415,6 +437,27 @@ The exception: layer 3's own header claims precedence over the whole section,
 protocol included, so the user's safety boundary is never formally outranked by
 product prose.
 
+Layers 2 and 4 describe how the member runs its own desk, and only a member
+selected BY NAME gets them. When the member's store runs under an explicitly
+selected **template** — the execution record carries the member's `member_id` and
+store with `selection_kind == "template"`, the shape `session_create(agent=…)`
+and `spawn_run(agent=…)` both mint for a member caller — the session is that
+member's *delegate*, sent to do the work: `_template_selected_on_member_store`
+is the one predicate, every builder call site passes its verdict, and the section
+is layers 1 and 3 only. The delegate keeps the member's identity because the
+memory it reads and writes is that member's, and keeps `[PERMANENT RULES]`
+because the user's bounds on a member follow its memory, not its template. It is
+not handed the desk protocol — whose second item hands substantial work to a
+separate session, the loop a delegate must not enter — nor the briefing that
+protocol maintains, and no placeholder stands in for either. A member whose record
+carries no persisted `member_id` is never a delegate in this sense: it is named by
+`selection_kind == "member"` and `selection_name` alone, and no record field can
+carry "this member, under that template". The `session_create` arm keeps that
+selection and changes only the template, so its child keeps all four layers —
+losing the member would lose layer 3 with layer 1 — while the spawn gate's
+`spawn_run(agent=…)` child of such a member is a plain template run on the parent's
+store with no member section.
+
 Two failure behaviours are deliberate and opposite. A **missing** rules file reads
 as `""` (the normal unbounded-by-choice state). An **existing but unreadable** one
 raises `MemberRulesUnreadable` and **aborts the turn** — a member the user bounded
@@ -465,7 +508,10 @@ new session's agent as `agent.strip() or caller_slot.agent` — an omitted `agen
 makes the child inherit the **caller's** agent, so a session created from a
 conductor is born a conductor, with no file-writing tools and unable to do the
 work. Pass `agent="kirocrew-worker"` (or the intended implementer) explicitly, and
-a self-contained brief with `session_send`.
+a self-contained brief with `session_send`. For a member-bound caller that explicit
+template selects the child's persona, not its memory: the child keeps the caller's
+store and member identity and takes `selection_kind == "template"`, which is what
+makes it the member's delegate of §5 — identity and rules, no desk protocol.
 
 ## 6. Crew-member private files: implemented vs planned
 
@@ -495,7 +541,7 @@ per-member permission control; both exist today, in the forms above.
 | What is in the first-turn prompt, in what order | `src/kiro_crew/context.py` (`build_message`, `build_session_context`) |
 | Which block is which, and how big it was | `src/kiro_crew/context_blocks.py` (`_MARKERS`, `_CLOSERS`, `measure_prompt`) |
 | Budgets, caps, the protected ceiling | `src/kiro_crew/context.py` (`_budget`, `_resolve_caps`, `_ResolvedCaps`) |
-| Memory block contents | `src/kiro_crew/memory.py` (`get_context`, `activity_index`) |
+| Memory block contents | `src/kiro_crew/memory.py` (`get_context`, `activity_index`, `get_activity_context`) |
 | Lessons | `src/kiro_crew/learn.py`, `src/kiro_crew/vector_memory.py` |
 | Skill index, pinned bodies, discovery | `src/kiro_crew/skills.py` (`get_context`, `load_skill`) |
 | Trigger matching, and its model-picked override | `src/kiro_crew/trigger_match.py`, `src/kiro_crew/skills.py` (`get_triggered_skills`, `split_triggered`, `trigger_hint`), `src/kiro_crew/decisions/points/skills_select.py` |
