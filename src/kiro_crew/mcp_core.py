@@ -2781,4 +2781,5 @@ def run_mcp_core_server() -> None:
         # pooled all the same (nothing declines to pool one; see
         # ``rewriter.UNPOOLABLE_SERVERS``) and simply never receives an identity.
         advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
+        concurrent_sessions=True,
     )

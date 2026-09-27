@@ -892,6 +892,131 @@ def _tools_call_with_tenant(req_id, tool_name: str, nonce: str) -> dict:
     return msg
 
 
+@pytest.mark.skipif(not platform_compat.IS_POSIX, reason="stdio worker polling requires POSIX")
+class TestStdioLoopSharedDispatch:
+    def test_caller_identity_alone_does_not_enable_concurrency(self, monkeypatch):
+        call, started, release = _slow_then_echo()
+        harness = _LoopHarness(monkeypatch, call, {"advertise_caller_identity": True})
+        try:
+            harness.send(_tools_call_with_caller(1, "slow", "session-a"))
+            assert started.wait(2)
+            harness.send(_tools_call_with_caller(2, "echo", "session-b"))
+            harness.send({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+            assert harness.wait_for(lambda: any(r[0] == 3 for r in harness.responses))
+            assert [r[0] for r in harness.responses] == [3]
+            release.set()
+            assert harness.wait_for(lambda: len(harness.responses) == 3)
+            assert [r[0] for r in harness.responses] == [3, 1, 2]
+        finally:
+            release.set()
+            harness.close()
+
+    @pytest.mark.parametrize("make_request", [_tools_call_with_caller, _tools_call_with_tenant])
+    def test_other_session_completes_before_wait_and_same_session_stays_fifo(
+        self, monkeypatch, make_request
+    ):
+        from kiro_crew.mcp_caller import current_caller
+        from kiro_crew.mcp_caller import current_tenant_nonce
+
+        call, started, release = _slow_then_echo()
+        identities = []
+
+        def run(name, args):
+            def identity():
+                caller = current_caller()
+                return caller.session_key if caller else current_tenant_nonce()
+
+            before = identity()
+            result = call(name, args)
+            identities.append((name, before, identity()))
+            return result
+
+        harness = _LoopHarness(monkeypatch, run, {"advertise_caller_identity": True, "concurrent_sessions": True})
+        try:
+            harness.send(make_request(1, "slow", "session-a"))
+            assert started.wait(2)
+            harness.send(make_request(2, "same-session", "session-a"))
+            harness.send(make_request(3, "other-session", "session-b"))
+            assert harness.wait_for(lambda: any(r[0] == 3 for r in harness.responses))
+            assert [r[0] for r in harness.responses] == [3]
+            release.set()
+            assert harness.wait_for(lambda: len(harness.responses) == 3)
+            assert [r[0] for r in harness.responses] == [3, 1, 2]
+            assert identities == [
+                ("other-session", "session-b", "session-b"),
+                ("slow", "session-a", "session-a"),
+                ("same-session", "session-a", "session-a"),
+            ]
+        finally:
+            release.set()
+            harness.close()
+
+    def test_worker_count_is_bounded_and_eof_cancels_active_calls(self, monkeypatch):
+        import threading
+
+        monkeypatch.setattr(mcp_shared, "MAX_CONCURRENT_TOOL_CALLS", 2)
+        started = []
+        cancelled = []
+        tick = threading.Event()
+
+        def run(name, args):
+            started.append(name)
+            for _ in range(200):
+                if mcp_shared.is_tool_cancelled():
+                    cancelled.append(name)
+                    raise mcp_shared.ToolCancelled()
+                tick.wait(0.02)
+            raise AssertionError("EOF did not cancel worker")
+
+        harness = _LoopHarness(monkeypatch, run, {"advertise_caller_identity": True, "concurrent_sessions": True})
+        try:
+            for req_id in range(1, 4):
+                harness.send(_tools_call_with_caller(req_id, str(req_id), str(req_id)))
+            harness.send({"jsonrpc": "2.0", "id": 4, "method": "ping"})
+            assert harness.wait_for(lambda: any(r[0] == 4 for r in harness.responses))
+            assert sorted(started) == ["1", "2"]
+        finally:
+            harness.close()
+        assert sorted(cancelled) == ["1", "2"]
+
+    def test_cancel_is_local_to_request(self, monkeypatch):
+        import threading
+
+        started = {name: threading.Event() for name in ("a", "b")}
+        release = threading.Event()
+        cancelled = []
+
+        def run(name, args):
+            started[name].set()
+            for _ in range(200):
+                if mcp_shared.is_tool_cancelled():
+                    cancelled.append(name)
+                    raise mcp_shared.ToolCancelled()
+                if release.wait(0.02):
+                    return name
+            raise AssertionError("test worker was not released")
+
+        harness = _LoopHarness(monkeypatch, run, {"advertise_caller_identity": True, "concurrent_sessions": True})
+        try:
+            harness.send(_tools_call_with_caller(1, "a", "session-a"))
+            assert started["a"].wait(2)
+            harness.send(_tools_call_with_caller(2, "b", "session-b"))
+            assert started["b"].wait(2)
+            harness.send(
+                {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}
+            )
+            assert harness.wait_for(lambda: cancelled == ["a"])
+            harness.send({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+            assert harness.wait_for(lambda: any(r[0] == 3 for r in harness.responses))
+            release.set()
+            assert harness.wait_for(lambda: any(r[0] == 2 for r in harness.responses))
+            assert cancelled == ["a"]
+            assert not any(r[0] == 1 for r in harness.responses)
+        finally:
+            release.set()
+            harness.close()
+
+
 class TestStdioLoopCallerIdentity:
     def setup_method(self):
         mcp_shared._use_content_length = False
