@@ -143,6 +143,14 @@ app agent). Plain kiro-cli agents outside Kiro Crew keep kiro-cli's own default.
 
 ### Managed servers
 
+On POSIX, the shared stdio dispatcher runs up to eight tool calls concurrently
+across sessions in one backend process. Calls from the same session remain FIFO;
+unnamed broker connections use their tenant nonce, and direct calls without
+metadata retain serial execution. Caller identity and cancellation are local to
+each worker. A long `wait` therefore does not occupy the only worker serving
+other sessions. The existing bounded pending queue returns a busy error when
+full. Windows retains synchronous dispatch.
+
 `agent._MANAGED_MCP_SERVERS` holds the eight servers the gateway owns end to
 end: the always-on `kirocrew-cron` and `kirocrew-core`, the gated
 `kirocrew-computer`, and the opt-in `kirocrew-dashboard`, `kirocrew-work`,

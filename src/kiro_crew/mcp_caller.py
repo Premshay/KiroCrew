@@ -473,8 +473,8 @@ def tenant_nonce_from_meta(meta: Any) -> str:
 
 # --- Per-call current caller (stdio-loop dispatch state) --------------------
 #
-# ``run_mcp_stdio_loop`` dispatches at most ONE tool call at a time (a single
-# worker thread, joined before the next dispatch). The loop sets this from
+# ``run_mcp_stdio_loop`` dispatches independent sessions concurrently. Each
+# worker sets this from
 # the request's verified ``params._meta`` block immediately before invoking
 # the tool and clears it in the dispatch ``finally`` — tool handlers (and the
 # identity resolvers in ``mcp_core``) read it via :func:`current_caller` as
@@ -483,7 +483,7 @@ def tenant_nonce_from_meta(meta: Any) -> str:
 #
 # Held in a ``contextvars.ContextVar`` rather than a bare module global: a
 # security identity must not depend on the "dispatch is sequential" invariant
-# alone — if dispatch ever becomes concurrent, each thread/task context reads
+# alone — each thread/task context reads
 # its own value instead of bleeding another session's identity. Set and read
 # happen in the same thread today (the worker
 # sets it at its own start), so behavior is unchanged.
