@@ -1303,6 +1303,7 @@ def run_mcp_stdio_loop(
     *,
     advertise_caller_identity: bool = False,
     error_prefix_is_error: bool = False,
+    concurrent_sessions: bool = False,
 ) -> None:
     """Generic MCP stdio server loop — reads JSON-RPC from stdin, writes to stdout.
 
@@ -1312,9 +1313,9 @@ def run_mcp_stdio_loop(
     a threading.Event that cooperative tools (``wait``, ``spawn_sub_agents``)
     check periodically. The cancelled request emits no response (per MCP spec).
 
-    Caller-aware servers run independent sessions concurrently, with a bounded
-    worker count. Calls within a session remain FIFO; requests without caller
-    metadata share one serial lane. Queue overflow returns a busy error.
+    Servers opting into concurrent_sessions run independent sessions with a
+    bounded worker count. Calls within a session remain FIFO; requests without
+    caller metadata share one serial lane. Queue overflow returns a busy error.
 
     On Windows ``select.select`` cannot poll ``sys.stdin`` (it only accepts
     sockets), so tool calls dispatch synchronously exactly as the pre-worker
@@ -1342,6 +1343,7 @@ def run_mcp_stdio_loop(
             call_tool_fn,
             advertise_caller_identity=advertise_caller_identity,
             error_prefix_is_error=error_prefix_is_error,
+            concurrent_sessions=concurrent_sessions,
         )
     finally:
         set_internal_caller(_prior_caller)
@@ -1356,6 +1358,7 @@ def _run_stdio_dispatch_loop(
     *,
     advertise_caller_identity: bool = False,
     error_prefix_is_error: bool = False,
+    concurrent_sessions: bool = False,
 ) -> None:
     """Read/dispatch body of :func:`run_mcp_stdio_loop`.
 
@@ -1375,7 +1378,7 @@ def _run_stdio_dispatch_loop(
     _pending_calls: collections.deque[dict[str, Any]] = collections.deque()
 
     def _lane(req: dict[str, Any]) -> tuple[str, str]:
-        if advertise_caller_identity:
+        if concurrent_sessions and advertise_caller_identity:
             meta = req.get("params", {}).get("_meta")
             caller = CallerContext.from_meta(meta)
             if caller is not None:

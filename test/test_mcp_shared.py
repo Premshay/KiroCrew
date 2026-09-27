@@ -894,6 +894,23 @@ def _tools_call_with_tenant(req_id, tool_name: str, nonce: str) -> dict:
 
 @pytest.mark.skipif(not platform_compat.IS_POSIX, reason="stdio worker polling requires POSIX")
 class TestStdioLoopSharedDispatch:
+    def test_caller_identity_alone_does_not_enable_concurrency(self, monkeypatch):
+        call, started, release = _slow_then_echo()
+        harness = _LoopHarness(monkeypatch, call, {"advertise_caller_identity": True})
+        try:
+            harness.send(_tools_call_with_caller(1, "slow", "session-a"))
+            assert started.wait(2)
+            harness.send(_tools_call_with_caller(2, "echo", "session-b"))
+            harness.send({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+            assert harness.wait_for(lambda: any(r[0] == 3 for r in harness.responses))
+            assert [r[0] for r in harness.responses] == [3]
+            release.set()
+            assert harness.wait_for(lambda: len(harness.responses) == 3)
+            assert [r[0] for r in harness.responses] == [3, 1, 2]
+        finally:
+            release.set()
+            harness.close()
+
     @pytest.mark.parametrize("make_request", [_tools_call_with_caller, _tools_call_with_tenant])
     def test_other_session_completes_before_wait_and_same_session_stays_fifo(
         self, monkeypatch, make_request
@@ -914,7 +931,7 @@ class TestStdioLoopSharedDispatch:
             identities.append((name, before, identity()))
             return result
 
-        harness = _LoopHarness(monkeypatch, run, {"advertise_caller_identity": True})
+        harness = _LoopHarness(monkeypatch, run, {"advertise_caller_identity": True, "concurrent_sessions": True})
         try:
             harness.send(make_request(1, "slow", "session-a"))
             assert started.wait(2)
@@ -951,7 +968,7 @@ class TestStdioLoopSharedDispatch:
                 tick.wait(0.02)
             raise AssertionError("EOF did not cancel worker")
 
-        harness = _LoopHarness(monkeypatch, run, {"advertise_caller_identity": True})
+        harness = _LoopHarness(monkeypatch, run, {"advertise_caller_identity": True, "concurrent_sessions": True})
         try:
             for req_id in range(1, 4):
                 harness.send(_tools_call_with_caller(req_id, str(req_id), str(req_id)))
@@ -979,7 +996,7 @@ class TestStdioLoopSharedDispatch:
                     return name
             raise AssertionError("test worker was not released")
 
-        harness = _LoopHarness(monkeypatch, run, {"advertise_caller_identity": True})
+        harness = _LoopHarness(monkeypatch, run, {"advertise_caller_identity": True, "concurrent_sessions": True})
         try:
             harness.send(_tools_call_with_caller(1, "a", "session-a"))
             assert started["a"].wait(2)

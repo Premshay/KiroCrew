@@ -143,8 +143,9 @@ app agent). Plain kiro-cli agents outside Kiro Crew keep kiro-cli's own default.
 
 ### Managed servers
 
-On POSIX, the shared stdio dispatcher runs up to eight tool calls concurrently
-across sessions in one backend process. Calls from the same session remain FIFO;
+On POSIX, the core control-plane server opts into the shared stdio dispatcher's
+concurrency support: up to eight calls across sessions in one backend process.
+Other servers retain serial dispatch. Calls from the same session remain FIFO;
 unnamed broker connections use their tenant nonce, and direct calls without
 metadata retain serial execution. Caller identity and cancellation are local to
 each worker. A long `wait` therefore does not occupy the only worker serving
