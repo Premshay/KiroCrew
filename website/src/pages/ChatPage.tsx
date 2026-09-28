@@ -9601,7 +9601,19 @@ export default function ChatPage({
                             <EdgeFade side="top" anchor="below" />
                           </div>
                         )}
-                        {titleInTopbar && <EdgeFade side="top" anchor="below" />}
+                        {titleInTopbar && (
+                          /* Fork: the same fade as EdgeFade's `below` anchor, but while a
+                             prompt is pinned it starts 4px (the band's bottom padding)
+                             higher, so its opaque top edge sits behind the card. Hung off
+                             the band's bottom, it left a 4px strip of transcript between
+                             the card and the fade's hard top, cutting the line under the
+                             card in half. */
+                          <div
+                            aria-hidden
+                            className="absolute inset-x-0 h-6 bg-gradient-to-b from-bg to-transparent pointer-events-none"
+                            style={{ top: pinned ? 'calc(100% - 4px)' : '100%' }}
+                          />
+                        )}
                         {/* Fold sentinel — zero-height, always mounted. Its top edge is the
                   line the pinned prompt sticks to (see updatePinnedPrompt). */}
                         <div ref={pinFoldRef} aria-hidden className="h-0" />
