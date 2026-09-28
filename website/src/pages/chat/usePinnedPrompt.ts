@@ -105,13 +105,21 @@ export function usePinnedPrompt({ scrollerRef, requiresMountedHandoff = false }:
     // below what the reader can see. With a top-edge rule that shows up as the
     // FIRST mounted row already sitting below the line — every contiguous case has
     // a mounted row above the boundary.
+    //
+    // Fork override: a row hands over only once its BOTTOM has cleared the card's
+    // resting bottom, so a prompt taller than the viewport scrolls natively as a
+    // real bubble all the way through instead of being replaced by a folding card
+    // drawn over the transcript (whose text never scrolled and whose touch was
+    // forwarded, leaving long prompts unreadable on a phone). With this line the
+    // fold below never engages: by hand-off the bubble already fits the clamp.
+    const handoffBottomY = handoffY + ROW_PAD_Y * 2 + pinCollapsedHRef.current
     let handoffIdx = -1
     let first = true
     for (const item of items) {
       const htmlItem = item as HTMLElement
       const rect = htmlItem.getBoundingClientRect()
-      if (rect.top > handoffY) {
-        if (requiresMountedHandoff && first) { setPinned(null); return }
+      if (rect.bottom > handoffBottomY) {
+        if (requiresMountedHandoff && first && rect.top > handoffY) { setPinned(null); return }
         handoffIdx = parseInt(htmlItem.getAttribute('data-display-index') || '0', 10)
         break
       }

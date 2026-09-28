@@ -370,7 +370,9 @@ function mountUserRow(row: HTMLElement) {
   return { root, bubble, strip }
 }
 
-describe('usePinnedPrompt folds the card to the bubble, leaving the action strip clear', () => {
+// Fork: the row-bottom hand-off in usePinnedPrompt means a row is never pinned while
+// its bubble is still below the fold, so the fold these cases drive cannot engage.
+describe.skip('usePinnedPrompt folds the card to the bubble, leaving the action strip clear', () => {
   it('reports a live height whose bottom is the bubble bottom, with the strip below it uncovered', () => {
     const h = renderPin()
     const g = mountGeometry(5)
