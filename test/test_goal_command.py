@@ -197,7 +197,7 @@ async def test_clear_active_goal(monkeypatch: pytest.MonkeyPatch) -> None:
 
     await chat_runner._handle_goal_command(state, slot, "/goal clear")
 
-    svc.remove.assert_awaited_once_with("loop-xyz")
+    svc.remove.assert_awaited_once_with("loop-xyz", stop_reason="goal_cleared")
     slot.set_declared_goal.assert_called_once_with("")
     assert "cleared" in _last_assistant_body(slot).lower()
 

@@ -23,6 +23,7 @@ import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from dataclasses import replace as dataclasses_replace
 from pathlib import Path
@@ -207,6 +208,29 @@ class HookResult:
         return HookResult(action=HOOK_INJECT_CONTEXT, text=text)
 
 
+#: Set by :func:`uncounted_gate`; read by ``ToolHookResult._count`` and
+#: ``_audit_governance``.
+_GATE_UNCOUNTED: ContextVar[bool] = ContextVar("kirocrew_gate_uncounted", default=False)
+
+
+@contextmanager
+def uncounted_gate():
+    """Consult the gate without emitting the approval-decision counter.
+
+    For a second consultation of a request whose first one was already counted
+    (the ACP transport's permission floor). The verdict is unaffected. The
+    governance tier writes no ``governance_decision`` audit row either: this
+    consultation carries no caller identity and its caller discards a policy
+    deny, so a row here would record a denial for a call that ran. The
+    consumer's own identity-bearing consultation writes that row.
+    """
+    token = _GATE_UNCOUNTED.set(True)
+    try:
+        yield
+    finally:
+        _GATE_UNCOUNTED.reset(token)
+
+
 @dataclass
 class ToolHookResult:
     action: str  # TOOL_ALLOW, TOOL_AUTO_APPROVE, TOOL_DENY
@@ -270,7 +294,13 @@ class ToolHookResult:
         ``action`` is one of three module constants and ``security_deny`` a bool,
         so the series is bounded by construction -- no reason string, tool name or
         command reaches the recorder.
+
+        A consultation made inside :func:`uncounted_gate` is not counted: the
+        transport floor re-asks the gate for a request its consumer already
+        counted, and counting both would report one request as two decisions.
         """
+        if _GATE_UNCOUNTED.get():
+            return
         try:
             from kiro_crew.metrics.events import APPROVAL_DECISIONS, emit_counter
 
@@ -2160,6 +2190,8 @@ def _cu_read_only_auto_approve(tool_name: str) -> bool:
 
 def _audit_governance(session_key: str, agent: str, tool_name: str, decision: object) -> None:
     """Best-effort SEL audit of a governance denial (records scope/rule/layer)."""
+    if _GATE_UNCOUNTED.get():
+        return
     try:
         from kiro_crew.sel import sel
 
@@ -5317,6 +5349,7 @@ class ScriptHookStore:
         hook_continuation_count: int = 0,
         extra_hooks: Sequence[ScriptHook] = (),
         extra_hooks_cwd: str | None = None,
+        extra_hooks_tool_names: Sequence[str] | None = None,
     ) -> list[ScriptHookResult]:
         """Fire all enabled hooks matching the given event. Returns results.
 
@@ -5327,7 +5360,14 @@ class ScriptHookStore:
         ``extra_hooks_cwd`` -- the session's workspace, where the harness that
         would otherwise run them runs them -- and their payload's ``cwd`` says so.
 
-        For PreToolUse/PostToolUse, matcher filters by tool name.
+        For PreToolUse/PostToolUse, matcher filters by tool name. When
+        ``extra_hooks_tool_names`` is given, an extra hook's tool matcher is
+        compared with those names instead: the tool's identity in the vocabulary
+        the extra hooks were written in, which ``tool_name`` (the call's title)
+        does not carry. It matches when any name does, and an empty sequence
+        leaves only an unscoped (``*``) extra hook matching. The first name is
+        also the ``tool_name`` an extra hook's stdin payload reports, so a script
+        that branches on it reads the same vocabulary its matcher is written in.
         For AgentSpawn/UserPromptSubmit/Stop, all hooks for that event fire.
 
         Optional ``subagent_id``, ``parent_session_key``, and ``agent_role`` are
@@ -5376,13 +5416,25 @@ class ScriptHookStore:
             hook_event["agent_role"] = agent_role
 
         extra_ids = {id(h) for h in extra_hooks}
+        # The extra hooks' own payload: their workspace as ``cwd``, and on a tool
+        # event the tool named in their vocabulary rather than the call's title.
+        extra_event = dict(hook_event)
+        if extra_hooks_cwd:
+            extra_event["cwd"] = extra_hooks_cwd
+        if extra_hooks_tool_names:
+            extra_event["tool_name"] = extra_hooks_tool_names[0]
         for hook in [*self._hooks.values(), *extra_hooks]:
             if not hook.enabled or hook.event != event:
                 continue
             # Matcher filtering: for tool hooks, match tool name; for others, match context
             if hook.matcher:
                 if event in (HOOK_EVENT_PRE_TOOL_USE, HOOK_EVENT_POST_TOOL_USE):
-                    if not _tool_matches(hook.matcher, tool_name):
+                    if extra_hooks_tool_names is not None and id(hook) in extra_ids:
+                        if hook.matcher != "*" and not any(
+                            _tool_matches(hook.matcher, name) for name in extra_hooks_tool_names
+                        ):
+                            continue
+                    elif not _tool_matches(hook.matcher, tool_name):
                         continue
                 elif context:
                     # Offload to a thread: regex mode spawns a bounded subprocess
@@ -5455,9 +5507,9 @@ class ScriptHookStore:
                 )
                 continue
             if id(hook) in extra_ids and extra_hooks_cwd:
-                result = await run_script_hook(
-                    hook, context, {**hook_event, "cwd": extra_hooks_cwd}, cwd=extra_hooks_cwd
-                )
+                result = await run_script_hook(hook, context, extra_event, cwd=extra_hooks_cwd)
+            elif id(hook) in extra_ids:
+                result = await run_script_hook(hook, context, extra_event)
             else:
                 result = await run_script_hook(hook, context, hook_event)
             results.append(result)

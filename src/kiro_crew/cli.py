@@ -54,7 +54,7 @@ from kiro_crew.config.paths import _default_home, _legacy_home
 from kiro_crew.constants import BANNER, MIN_NODE_MAJOR, env_flag_enabled
 from kiro_crew.crash_guard import install as _install_crash_guard
 from kiro_crew.env import git_build_info
-from kiro_crew.gateway_lock import GatewayLock, GatewayLockError
+from kiro_crew.gateway_lock import LIVE_HOLDER_EXIT_CODE, GatewayLock, GatewayLockError
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.knowledge import store as knowledge_store
 from kiro_crew.knowledge.dedup import dedup_sweep
@@ -609,6 +609,29 @@ def _diagnostic_port(gw_kwargs: dict) -> int | None:
         return None
 
 
+def _diagnostic_bind_address() -> str | None:
+    """The address this gateway is configured to bind, for lock-refusal diagnosis.
+
+    The lock's serving-holder predicate (``gateway_lock.GatewayLock._serving_verdict``)
+    probes a holder of the port for HTTP at THIS address, never at one it
+    guesses. Resolved by the gateway's own resolver,
+    ``dashboard.urls.bind_address_for``: a valid ``KIROCREW_BIND`` is the bind
+    whatever ``local_only`` says, and the two fallbacks that flag chooses between
+    (loopback, the v4 wildcard) are probed at the same loopback address, so
+    ``local_only=True`` loses nothing. ``None`` only when the resolver itself
+    cannot be reached -- diagnosis only, never a reason to break the refusal
+    path it decorates; the lock then probes loopback.
+    """
+    try:
+        # Deferred import, for the same reason as ``_diagnostic_port``: importing
+        # ``dashboard.urls`` executes ``dashboard/__init__``.
+        from kiro_crew.dashboard.urls import bind_address_for
+
+        return bind_address_for(local_only=True)
+    except Exception:
+        return None
+
+
 def _knowledge_stats(args) -> None:
     """``kirocrew knowledge stats [--json]`` -- read-only counts, no repair verb."""
 
@@ -1159,6 +1182,11 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     Short-lived commands attach the file handler synchronously — they run no
     event loop, and several exec-over-self (skipping atexit), where a queued
     tail would be lost. See the inline comment at the attach site.
+
+    In every shape the ``kiro_crew`` logger is the SINGLE level gate: the file
+    handler and the queue handler carry no level of their own, so a runtime
+    ``agent.log_level`` change (``handlers/updates.py::apply_log_level``) that
+    moves the logger reaches ``gateway.log`` with nothing else to update.
     """
     if verbose >= 2:
         level = logging.DEBUG
@@ -1220,11 +1248,12 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     # later raw stderr from all retained logs.
     handler_cls = _FdTrackingRotatingFileHandler if detached else RotatingFileHandler
     fh = handler_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
-    # In detached mode the handler also serves the root logger: cap its level
-    # at WARNING so third-party WARNINGs keep flowing even when kiro_crew's
-    # own configured level is stricter (kiro_crew records below `level` are
-    # already filtered at the kiro_crew logger, so this cannot over-log).
-    fh.setLevel(min(level, logging.WARNING) if detached else level)
+    # No level on the handler: every record that can reach it is already gated
+    # by a logger level -- kiro_crew records by the kiro_crew logger set above,
+    # third-party records (root attach, detached mode) by the root logger's
+    # WARNING. The logger level is the one level a runtime agent.log_level
+    # change moves, so keeping the handler at NOTSET is what lets a raised
+    # level reach gateway.log without a restart.
     fh.setFormatter(
         logging.Formatter(
             "%(asctime)s %(levelname)s %(name)s [PID %(process)d]: %(message)s",
@@ -1265,11 +1294,13 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
             for stale in [h for h in lgr.handlers if isinstance(h, _CliLogQueueHandler)]:
                 lgr.removeHandler(stale)  # re-entrant call: orphaned producer
         log_queue: "queue.SimpleQueue[logging.LogRecord]" = queue.SimpleQueue()
+        # No level on the queue handler either, and no handler-level re-check at
+        # dequeue: the loggers decide what enters the queue, and everything that
+        # enters is written. A level here would be a second copy of `level` that
+        # the runtime applier does not move; a re-check at dequeue would judge
+        # records already queued by a level set after they were logged.
         queue_handler = _CliLogQueueHandler(log_queue)
-        # Gate at the producer: records the file handler would drop must not
-        # transit the queue at all.
-        queue_handler.setLevel(fh.level)
-        _LOG_QUEUE_LISTENER = QueueListener(log_queue, fh, respect_handler_level=True)
+        _LOG_QUEUE_LISTENER = QueueListener(log_queue, fh)
         _LOG_QUEUE_LISTENER.start()
         atexit.register(_stop_log_queue_listener)
         target_logger.addHandler(queue_handler)
@@ -3390,10 +3421,19 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # passed for diagnosis only: on refusal it lets the error say whether the
         # holder is answering on that port or is a wedged orphan squatting on it.
         try:
-            _gw_lock = GatewayLock(config_dir(), port=_diagnostic_port(gw_kwargs)).acquire()
+            _gw_lock = GatewayLock(
+                config_dir(),
+                port=_diagnostic_port(gw_kwargs),
+                bind_address=_diagnostic_bind_address(),
+            ).acquire()
         except GatewayLockError as exc:
             print(f"👻 {exc}", file=sys.stderr)
-            sys.exit(1)
+            # A live holder is a sibling gateway already serving this home, so
+            # retrying can only meet the same refusal: exit the code the systemd
+            # unit's RestartPreventExitStatus= names (service/linux.py) and let
+            # the supervisor stand down. Every other refusal is one a later
+            # attempt may find cleared, so it keeps the restartable exit 1.
+            sys.exit(LIVE_HOLDER_EXIT_CODE if exc.live_holder else 1)
         try:
             asyncio.run(_gateway(**gw_kwargs))
         finally:

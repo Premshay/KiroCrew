@@ -36,6 +36,7 @@ from kiro_crew.acp._dispatch import (
     attach_kas_custom_agents,
     build_session_new_params,
     parse_session_modes,
+    redact_backend_text,
     redact_text,
 )
 from kiro_crew.acp._dispatch import reject_option_id as _reject_option_id
@@ -44,6 +45,8 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp._frame_record import record_frame
 from kiro_crew.acp.client import (
+    _RESPONSE_WRITE_BOUND_SECS,
+    _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
     ChildRecord,
     OversizeLineUnrecoverable,
     _apply_pod_home_remap,
@@ -51,10 +54,14 @@ from kiro_crew.acp.client import (
     _drain_oversize_line,
     _get_child_pids,
     _KiroExecutableTrustError,
+    _loggable_request_id,
     apply_pod_bundle_spawn,
     finish_suspended_spawn,
     is_auth_failure_output,
     is_sandbox_init_failure_output,
+    response_write_window_secs,
+    write_notification_best_effort,
+    write_response_frame_bounded,
 )
 from kiro_crew.acp.harness import (
     HarnessAdapter,
@@ -142,6 +149,7 @@ from kiro_crew.metrics.events import (
 )
 from kiro_crew.providers.mirrors.registry import has_mirror, mirror_for
 from kiro_crew.resource_status import inject_xdist_auto_cap
+from kiro_crew.runtime_ownership import authorize_runtime_kill
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
     BoundWorkspaceMismatch,
@@ -151,8 +159,10 @@ from kiro_crew.sandbox import (
     bind_voice_safe_agent_workspace_async,
     cgroup_scope_argv,
     create_subprocess_limited,
+    name_scope_unit,
     release_bound_agent_workspace,
     resolve_bound_session_workspace,
+    scope_unit_name,
     scrub_agent_subprocess_env,
     wrap_argv,
     wrap_argv_async,
@@ -162,12 +172,14 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_pid import (
     _pgroup_has_member_besides,
     _pid_gone_or_unmanaged,
+    _pid_start_token,
     _replace_child_pids,
     _signal_orphaned_runtime_group,
     _track_pid,
     _track_session_pid,
     _untrack_child_pids,
     _untrack_pid,
+    _untrack_root_by_identity,
     _untrack_session_pid,
     group_vouching_available,
     register_protected_pid,
@@ -996,8 +1008,8 @@ _DROP_SUMMARY_INTERVAL_SECS = 60.0
 # halves of the key are backend-controlled, so an unbounded map would be a
 # memory sink; reaching the cap forces an early flush instead of growing.
 _DROP_SUMMARY_MAX_KEYS = 64
-# Backend-controlled key text is truncated before it is stored, so a
-# pathological sessionId/method (a stdout line may be up to
+# Backend-controlled key text is redacted whole and then capped before it is
+# stored, so a pathological sessionId/method (a stdout line may be up to
 # _STDOUT_BUFFER_LIMIT) cannot be retained at full length by the map either.
 _DROP_SUMMARY_KEY_MAX_CHARS = 80
 # Stands in for the sessionId half of the key on the no-sessionId broadcast
@@ -1021,6 +1033,17 @@ _ROSTER_OVERFLOW_REJECT_REASON = "roster_overflow_auto_reject"
 # roster it remembers was truncated either, so the backend genuinely never
 # announced this child to us.
 _UNREGISTERED_REJECT_REASON = "unregistered_session_auto_reject"
+
+
+class AcpRuntimeStdinStalled(AcpRuntimeDead):
+    """The shared stdin made no progress for the response-write bound.
+
+    A subclass so the off-loop auto-answer can keep its ``send_stalled`` audit
+    reason (the bound fires inside ``send_response``, ahead of that path's own
+    outer timeout) while every ``except AcpRuntimeDead`` handler keeps working.
+    """
+
+
 # Minimum seconds between throttled DEBUG summaries of repeated roster
 # truncation. A `subagent/list_update` is a backend-controlled notification
 # re-broadcast on every child status change, so above the cap the WARNING it
@@ -1078,7 +1101,10 @@ def _drop_key_part(value: object) -> str:
     """
     if not isinstance(value, str):
         return _DROP_KEY_PLACEHOLDER
-    return value[:_DROP_SUMMARY_KEY_MAX_CHARS]
+    # Redact BEFORE the retention cap: the key text is backend-authored and
+    # the flush logs it, so a slice taken first could sever a credential at
+    # the cut into a fragment that matches none of the redactor's patterns.
+    return redact_backend_text(value)[:_DROP_SUMMARY_KEY_MAX_CHARS]
 
 
 def _get_rss_mb(pid: int) -> float | None:
@@ -1693,6 +1719,10 @@ class AcpRuntime:
         # Process state
         self._process: asyncio.subprocess.Process | None = None
         self._pid: int | None = None
+        # The root's process-start identity, read once at spawn. It is what lets
+        # an OBSERVED death retire the registry lines that name this process and
+        # no other: the number alone can be recycled before the write lands.
+        self._spawn_start_token: str | None = None
         self._start_time: str | None = None
         self._spawn_monotonic: float | None = None
         # pid -> (start_id, basename): the record shape session_pid verifies a
@@ -1707,6 +1737,13 @@ class AcpRuntime:
         # compared against later. See AcpClient.process_instance for why the
         # session id cannot serve: a resume reuses it on a new process.
         self._process_instance: str = ""
+        # The scope unit name systemd ACTUALLY received for this spawn, empty when
+        # no scope was created. Held separately from the token because the token
+        # alone cannot answer that question: name_scope_unit degrades to a no-op on
+        # a host without cgroup delegation, so deriving the name from the token at
+        # log time would announce a scope that does not exist. Set from the argv
+        # the wrap returned, and cleared with the process.
+        self._scope_unit: str = ""
 
         # Single reader task — the ONLY coroutine that reads stdout
         self._reader_task: asyncio.Task | None = None  # type: ignore[type-arg]
@@ -1778,6 +1815,10 @@ class AcpRuntime:
         self._entitlement_probe_attempt_at = 0.0
         self._entitlement_probe_result: list[dict[str, str]] = []
         self._dead = False
+        # Set only after kill confirms the root exited and no tracked
+        # descendant survived. Consumers use it to decide whether a work
+        # directory is safe to reclaim.
+        self._process_tree_confirmed_dead = False
         self._death_summary: str | None = None
         # The composed summary's parts, so the post-reap amendment rebuilds the
         # line instead of editing its text -- a tail carrying this format's own
@@ -2013,6 +2054,11 @@ class AcpRuntime:
     def is_alive(self) -> bool:
         """True if the underlying process exists and has not exited."""
         return self._process is not None and self._process.returncode is None and not self._dead
+
+    @property
+    def process_tree_confirmed_dead(self) -> bool:
+        """Whether teardown confirmed the root and every tracked child exited."""
+        return self._process_tree_confirmed_dead is True
 
     def death_summary(self) -> str | None:
         """One-line death attribution, or None while alive.
@@ -2371,6 +2417,7 @@ class AcpRuntime:
         """Start the ACP runtime behind the gateway-wide cold-start admission gate."""
         if self._process is not None:
             raise AcpRuntimeError("Runtime already spawned")
+        self._process_tree_confirmed_dead = False
 
         admission = _cold_start_admission()
         wait_ms = await admission.acquire()
@@ -2486,7 +2533,19 @@ class AcpRuntime:
                 if self._native_skill_projection is not None:
                     argv = list(argv)
                     agent_position = argv.index("--agent") + 1
-                    argv[agent_position] = self._native_skill_projection.agent(self._agent)
+                    try:
+                        argv[agent_position] = self._native_skill_projection.agent(self._agent)
+                    except ValueError as exc:
+                        # The projection refused this agent's view -- a
+                        # ``kirocrew-core`` restriction authored in its spec, a
+                        # disabled ``skill_search`` -- and says so in a sentence
+                        # that names the spec and the remedy. That sentence is
+                        # the user's, so it travels as the error the startup
+                        # paths translate (``providers/acp.py`` handles
+                        # ``AcpRuntimeError`` around ``spawn()``); a bare
+                        # ``ValueError`` would leave ``spawn()`` as an internal
+                        # failure with the actionable text unread.
+                        raise AcpRuntimeError(str(exc)) from exc
         except _KiroExecutableTrustError as exc:
             raise AcpRuntimeError(str(exc)) from exc
         # The handshake declaration is the harness's constant. A host that takes
@@ -2583,6 +2642,13 @@ class AcpRuntime:
         # and the audit-or-deny step can refuse a delegation after it was chosen.
         self._sandbox_wrapped_by_crew = wrapped_by_crew_sandbox(argv)
         self._sandbox_hidden_dirs = tuple(plan.extra_hidden_dirs)
+        # The incarnation this spawn is. Minted BEFORE the cgroup wrap because
+        # two things carry it: the scope's unit name, and the child's own
+        # environment further down. One token for both is what lets a reader
+        # holding either one reach the other -- a scope resolves to the runtime
+        # incarnation inside it, and a process resolves to the scope bounding it.
+        # Random rather than pid-derived so a recycled pid cannot false-match.
+        spawn_instance = uuid.uuid4().hex[:16]
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
         # No-op + loud warning where cgroup delegation is unavailable. --scope
@@ -2592,6 +2658,22 @@ class AcpRuntime:
         # run on the loop. Guarded: wrap_argv above allocated the sandbox temp
         # file, so a cancellation here must not orphan it.
         argv = await self._to_thread_guarding_sandbox(cgroup_scope_argv, argv)
+        # Name that scope after this spawn, because the ceiling above binds the
+        # whole runtime: when the kernel OOM-kills the scope, every session the
+        # runtime serves dies together, and an anonymous ``run-u<N>.scope`` in
+        # that report names no runtime to resolve those sessions from. A no-op
+        # where the wrap did not happen (no cgroup delegation), so it cannot turn
+        # a degraded host into a failed spawn, and pure argv rewriting, so it
+        # stays on the loop rather than costing a second thread hop.
+        named_argv = name_scope_unit(argv, spawn_instance)
+        # Whether the naming ACTUALLY happened is read off the argv, not re-derived
+        # from the token. name_scope_unit returns argv unchanged on every host where
+        # cgroup_scope_argv handed back the bare command (macOS, Windows, Linux
+        # without cgroup-v2 --user delegation, systemd-run outside a trusted dir),
+        # and the token is always spellable, so a token-derived name would claim a
+        # scope for exactly those hosts that have none.
+        scope_unit = (scope_unit_name(spawn_instance) or "") if named_argv is not argv else ""
+        argv = named_argv
 
         env = {**os.environ}
         if self._extra_env:
@@ -2651,12 +2733,11 @@ class AcpRuntime:
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
         env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
-        # The incarnation this spawn is. Minted here, before the process exists,
-        # because it has to travel in the child's environment: it is what a
-        # teardown reads back out of /proc/<pid>/environ to prove a process is
-        # THIS spawn's descendant once the root itself is gone. Random rather
-        # than pid-derived so a recycled pid cannot false-match.
-        spawn_instance = uuid.uuid4().hex[:16]
+        # The incarnation this spawn is (minted above the cgroup wrap, which
+        # names the scope after the same token). It has to travel in the child's
+        # environment: it is what a teardown reads back out of
+        # /proc/<pid>/environ to prove a process is THIS spawn's descendant once
+        # the root itself is gone.
         env[KIROCREW_SPAWN_INSTANCE_ENV] = spawn_instance
         # Own browser session per agent process, matching AcpClient._spawn (see
         # browser_session_env). Per PROCESS, not per agent: with session sharing
@@ -2742,6 +2823,9 @@ class AcpRuntime:
         # it could be passed in); random, not pid-derived, so it cannot
         # false-match a later spawn that the OS handed a recycled pid.
         self._process_instance = spawn_instance
+        # Recorded from the wrap's own result above, so the init log names a scope
+        # only when one exists.
+        self._scope_unit = scope_unit
         # The subprocess is LIVE from here on but nothing has recorded it yet, so
         # this window needs the same guard AcpClient._spawn has. finish_suspended_spawn
         # documents its own resume failure as FATAL, and the identity read can fail;
@@ -2891,6 +2975,10 @@ class AcpRuntime:
         # LIVE runtime losing its shield and being SIGKILLed mid-use by the very
         # sweep this call exists to hide it from.
         register_protected_pid(self._pid)
+        # Read BEFORE the appends, so the identity held here is the one this
+        # process had when the gateway took it on. It is what lets an OBSERVED
+        # death retire the session line that names THIS process and no other.
+        self._spawn_start_token = _pid_start_token(self._pid)
         try:
             _track_pid(self._pid)
             _track_session_pid(self._pid)
@@ -2954,7 +3042,21 @@ class AcpRuntime:
 
             await asyncio.to_thread(require_unchanged_derived_spec, self._derived_spec_snapshot)
             self._initialized = True
-            logger.info("AcpRuntime initialized (PID %d)", self._pid)
+            # The scope unit name is logged beside the PID because it is the only
+            # durable half of the join. An OOM report or ``systemctl`` listing
+            # names ``kirocrew-rt-<token>.scope``; the token otherwise lives only
+            # in the child's /proc/<pid>/environ and in _process_instance, both of
+            # which the kill destroys. This line survives it, so the token in the
+            # report resolves to this runtime's pid. A spawn that dies BEFORE this
+            # point has served no session, so there is nothing to resolve for it.
+            # ``unnamed`` is the honest reading on a host where no scope was
+            # created, and it is reachable: _scope_unit is empty whenever the
+            # cgroup wrap did not happen, which is every non-delegated host.
+            logger.info(
+                "AcpRuntime initialized (PID %d, scope %s)",
+                self._pid,
+                self._scope_unit or "unnamed",
+            )
             # INSIDE the guard, which is what makes a cancelled scan safe. The
             # runtime is already `_initialized` here and the caller does not hold
             # it yet, so a CancelledError raised inside the scan -- an ordinary
@@ -3209,6 +3311,11 @@ class AcpRuntime:
         platform-agnostic code that happens to no-op.
         Every call is off-loop: ``taskkill`` is a blocking spawn, and the group
         walk reads ``/proc``.
+
+        The kill is attributed once, in ``kill``, not here. ``_kill_inner`` is
+        this method's only caller, so the whole ladder -- SIGTERM, the grace, the
+        SIGKILL escalation, the vouched-group arm -- is the mechanics of that one
+        decision, and noting it per signal would write the same shot three times.
         """
         loop = asyncio.get_running_loop()
         # kill_process_tree resolves the group FROM the root's number, so it may
@@ -3330,7 +3437,22 @@ class AcpRuntime:
         field: a runtime killed under a live turn surfaces to the turn only
         as a bare "process died during prompt", and a log line that says
         "killed" without saying WHO killed leaves nothing to correlate.
+
+        The attribution line is written HERE, before any signal, rather than
+        where the process is reaped -- a line saying a process died cannot say
+        who decided it should.
+
+        A REFUSED kill returns without signalling and without discarding
+        anything. The sandbox and the bound workspace below belong to the
+        *process*, not to this handle: releasing them under a runtime another
+        lease is still using would strand a live agent on a deleted workspace,
+        which is worse than the leak the kill was meant to prevent.
         """
+        if not authorize_runtime_kill(
+            self, reason=reason or "runtime kill", caller="AcpRuntime.kill"
+        ):
+            return
+        self._process_tree_confirmed_dead = False
         try:
             await self._kill_inner(expected=expected, reason=reason)
         finally:
@@ -3404,8 +3526,10 @@ class AcpRuntime:
             # exactly this point. The drain's failure path raises instead, keeping
             # the placeholder true for a tree it could not confirm.
             self._note_reaped_after_kill(process.returncode)
+            self._process_tree_confirmed_dead = process.returncode is not None
             self._process = None
             self._process_instance = ""
+            self._scope_unit = ""
             # Tracking was retired by the shared drain under the original pin.
             return
 
@@ -3470,11 +3594,13 @@ class AcpRuntime:
                 await escalate()
             # Before the handle is dropped: the death line above was
             # written pre-signal and says returncode=<not reaped>.
+            root_confirmed_dead = self._process.returncode is not None
             self._note_reaped_after_kill(self._process.returncode)
             self._process = None
             # The id names the process that just ended; the next spawn mints its
             # own, and nothing may answer with this one in between.
             self._process_instance = ""
+            self._scope_unit = ""
             if platform_compat.pid_exists(pid):
                 # Both kill_process_tree calls above swallow OSError by design
                 # (racing a normal exit), which makes a signal-delivery failure
@@ -3505,6 +3631,7 @@ class AcpRuntime:
             # entry of one still running is what the sweep needs to reap it.
             saved_children = dict(self._child_pids)
             self._child_pids = {}
+            survivors: list[int] = []
             if saved_children:
                 survivors = await asyncio.to_thread(_prune_dead_descendants, saved_children)
                 if survivors:
@@ -3514,6 +3641,7 @@ class AcpRuntime:
                         len(survivors),
                         survivors,
                     )
+            self._process_tree_confirmed_dead = root_confirmed_dead and not survivors
 
     # ── Reader Task (single owner of stdout) ──
 
@@ -3744,8 +3872,8 @@ class AcpRuntime:
             "wait resolves",
             self._max_answer_tasks,
             request_kind,
-            msg.id,
-            f" for session {session_id}" if session_id else "",
+            _loggable_request_id(msg.id),
+            f" for session {_loggable_request_id(session_id)}" if session_id else "",
             self._answer_cap_wait_secs,
         )
         # Audit before condemning the runtime, so the record for this decision
@@ -3824,8 +3952,8 @@ class AcpRuntime:
             "(tool: %s, reason: %s): no surface on this client can answer it "
             "right now; answering with %s so the backend subagent gets a tool "
             "error instead of hanging",
-            msg.id,
-            session_id,
+            _loggable_request_id(msg.id),
+            _loggable_request_id(session_id),
             title,
             reason,
             result["outcome"]["outcome"],
@@ -3836,13 +3964,15 @@ class AcpRuntime:
             # the pipe is wedged, and every further frame from it would
             # stack another blocked task (the OOM vector). Marking the
             # runtime dead resolves EVERY pending wait by teardown, so no
-            # request is left unanswered and nothing accumulates.
+            # request is left unanswered and nothing accumulates. This is
+            # the outer guard; send_response's own drain bound fires first
+            # on a paused writer and surfaces as AcpRuntimeDead below.
             await asyncio.wait_for(self.send_response(msg.id, result), timeout=30.0)
         except asyncio.TimeoutError:
             logger.error(
                 "answer for permission request id=%s could not be written in "
                 "30s — backend not reading stdin; marking runtime dead",
-                msg.id,
+                _loggable_request_id(msg.id),
             )
             # Audit BEFORE returning: the denial DECISION was made even
             # though delivery failed — mandatory SEL coverage applies to
@@ -3851,6 +3981,14 @@ class AcpRuntime:
                 msg, session_id, f"{reason}:send_stalled_runtime_dead", title=title
             )
             self._mark_dead("permission-answer write stalled (backend not reading)")
+            return
+        except AcpRuntimeStdinStalled:
+            # send_response's own no-progress bound fired ahead of the outer
+            # guard and already marked the runtime dead; same disposition, same
+            # audit reason, so the record does not depend on which bound won.
+            self._audit_denied_off_loop(
+                msg, session_id, f"{reason}:send_stalled_runtime_dead", title=title
+            )
             return
         except AcpRuntimeDead:
             # Runtime died mid-answer; the backend's wait dies with it.
@@ -3870,7 +4008,7 @@ class AcpRuntime:
             logger.exception(
                 "failed to answer unroutable permission request id=%s — "
                 "marking runtime dead so the requester cannot hang",
-                msg.id,
+                _loggable_request_id(msg.id),
             )
             self._audit_denied_off_loop(
                 msg, session_id, f"{reason}:send_failed_runtime_dead", title=title
@@ -4004,8 +4142,8 @@ class AcpRuntime:
             logger.debug(
                 "Dropped %d unroutable frame(s) for session %s (method=%s)",
                 count,
-                session_id,
-                method,
+                _loggable_request_id(session_id),
+                _loggable_request_id(method),
             )
         counts.clear()
 
@@ -4062,7 +4200,11 @@ class AcpRuntime:
                     try:
                         dropped = await _drain_oversize_line(stdout, exc)
                     except asyncio.IncompleteReadError:
+                        # The same observed EOF as the empty-line branch below,
+                        # reached with a torn frame in hand; the exit is confirmed
+                        # and retired the same way.
                         self._mark_dead("stdout closed mid-oversize-line")
+                        await self._retire_tracking_after_exit()
                         return
                     except OversizeLineUnrecoverable as fatal:
                         logger.error("stdout unrecoverable: %s", fatal)
@@ -4081,6 +4223,13 @@ class AcpRuntime:
                 if not line:
                     rc = self._process.returncode if self._process else "?"
                     self._mark_dead(self._exit_reason(rc))
+                    # The one death path that OBSERVES the exit rather than
+                    # causing it. ``kill()`` retires the registry entries after
+                    # its own reap; nothing else did, so an externally killed
+                    # root stayed in ``kiro_session_pids.txt`` until the
+                    # periodic sweep's next tick -- up to 300s of a dead pid a
+                    # reaper could resignal.
+                    await self._retire_tracking_after_exit()
                     return
 
                 self._last_activity = time.monotonic()
@@ -4516,9 +4665,9 @@ class AcpRuntime:
         and answered once by its dispatch loop (``server_request_unknown``).
         """
         logger.debug(
-            "Ownerless server request answered -32601 — method=%s id=%r",
-            method,
-            request_id,
+            "Ownerless server request answered -32601 — method=%s id=%s",
+            _loggable_request_id(method),
+            _loggable_request_id(request_id),
         )
         try:
             await self.send_error(request_id, _JSONRPC_METHOD_NOT_FOUND, "Method not found")
@@ -4703,6 +4852,18 @@ class AcpRuntime:
         so the gateway log holds the code too. Silent when the status is still
         unknown (both waits timed out): ``<not reaped>`` is then still true.
         """
+        self._note_reaped(rc, after_kill=True)
+
+    def _note_reaped(self, rc: object, *, after_kill: bool) -> None:
+        """Amend the death summary with *rc*; log it with the death's true origin.
+
+        ``after_kill`` selects the wording, nothing else. The observed-exit path
+        (the reader hitting EOF on a root that died from OUTSIDE -- an OOM kill,
+        an operator's ``pkill``) must not log "reaped after kill": ``kill()``'s
+        own contract is that a line saying "killed" names WHO killed, and a kill
+        Kiro Crew never issued has no such name. Attribution is the whole reason
+        the two paths log differently.
+        """
         if rc is None or self._death_summary is None:
             return
         if self._death_label != self._RC_NOT_REAPED:
@@ -4710,7 +4871,13 @@ class AcpRuntime:
         self._death_label = str(rc)
         self._compose_death_summary(self._death_reason, self._death_label, self._death_tail)
         log = logger.info if self._death_expected else logger.warning
-        log("AcpRuntime reaped after kill (PID %s): returncode=%s", self._pid, rc)
+        # Two LITERAL templates rather than one with the origin interpolated:
+        # the raw template is what log filters and the tests select on, and
+        # "reaped after kill" is the string they already match.
+        if after_kill:
+            log("AcpRuntime reaped after kill (PID %s): returncode=%s", self._pid, rc)
+        else:
+            log("AcpRuntime reaped after an observed exit (PID %s): returncode=%s", self._pid, rc)
 
     def _mark_dead(self, reason: str, *, expected: bool = False) -> None:
         """Mark runtime dead, fail all pending requests, poison all session queues.
@@ -4796,6 +4963,91 @@ class AcpRuntime:
             except asyncio.QueueFull:
                 pass
 
+    async def _retire_tracking_after_exit(self) -> None:
+        """Drop this root's registry entries once its exit is CONFIRMED, not inferred.
+
+        Called from the reader loop's EOF branch, which is the only death path that
+        observes an exit instead of causing one. ``_kill_inner`` untracks after it
+        reaps; a root killed from outside (an OOM kill, a ``pkill``, an operator)
+        reached no such step, so its ``kiro_session_pids.txt`` / ``kiro_pids.txt``
+        lines survived until the periodic sweep's next tick, bounded only by
+        ``SessionCleanup.MAX_TICK_INTERVAL_SECS`` (300s). A registry line naming a
+        dead pid is the hazard the start token exists to blunt, not one to leave
+        standing for five minutes when the process that owns the line has already
+        watched it die.
+
+        A closed stdout is NOT an exit: a backend can close its pipe and keep
+        running, and untracking a live process would hide it from every reaper
+        for the host's uptime. So the exit is waited for, bounded by the same
+        window the kill path gives a SIGKILLed child to be reaped, and the pid is
+        re-probed after the wait. Any doubt -- the wait timed out, the pid still
+        answers, the probe raised -- RETAINS the entries, which is the direction
+        every reaper in ``session_pid`` already fails toward.
+
+        The write itself is bound to the process, not the number: once the root
+        is gone its number is free, and a replacement root this gateway spawns
+        can be handed it before the write lands, so a prefix-matched untrack
+        could erase the successor's only durable record. ``_untrack_root_by_identity``
+        removes the session line only when its recorded start token is the one
+        read at THIS spawn, and the bare root line only when the number is dead
+        at the moment of a probe taken under the bare file's own lock -- a live
+        holder of the number keeps its line. The root's own lines only: a
+        descendant that outlived the root is reparented and still running, and
+        its own ``kiro_pids.txt`` line is what the sweep reaps it by.
+
+        Offloaded to a thread because the untrack takes the file locks the sweep
+        contends for, and this runs on the event loop.
+        """
+        process = self._process
+        if process is None:
+            return
+        pid = process.pid
+        try:
+            if process.returncode is None:
+                await asyncio.wait_for(process.wait(), timeout=self._KILL_REAP_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.debug(
+                "AcpRuntime: stdout closed but PID %s has not exited within %.1fs; "
+                "leaving it tracked for the sweep",
+                pid,
+                self._KILL_REAP_TIMEOUT,
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "AcpRuntime: could not confirm the exit of PID %s; leaving it tracked",
+                pid,
+                exc_info=True,
+            )
+            return
+        # The wait just measured the status ``_mark_dead`` could not know (it ran
+        # on EOF, before the reap): amend the retained summary the same way the
+        # kill path does, so the ``AcpProcessDied`` a turn or a cron records
+        # carries the real code instead of ``<not reaped>``. Worded as an
+        # OBSERVED exit: nothing here issued a kill, and a log line that says
+        # "killed" without naming who killed would defeat the attribution the
+        # kill path's own docstring requires.
+        self._note_reaped(process.returncode, after_kill=False)
+        if platform_compat.pid_exists(pid):
+            return
+        try:
+            retired = await asyncio.to_thread(
+                _untrack_root_by_identity, pid, self._spawn_start_token
+            )
+        except Exception:
+            logger.debug("AcpRuntime: PID untracking after exit failed for %s", pid, exc_info=True)
+            return
+        if not retired:
+            logger.debug(
+                "AcpRuntime: registry lines for PID %s were not provably this runtime's; "
+                "leaving them for the sweep",
+                pid,
+            )
+            return
+        logger.info("AcpRuntime: retired registry tracking for PID %d after it exited", pid)
+
     # ── Protocol Interface (used by AcpSessionHandle) ──
 
     async def send_request(self, method: str, params: dict[str, Any]) -> int:
@@ -4825,8 +5077,16 @@ class AcpRuntime:
         data = json.dumps(req.to_dict()) + "\n"
 
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            # Under the write lock so a response frame waiting behind this
+            # (caller-sized, deliberately unbounded) frame measures the
+            # reader's progress exactly; see await_under_no_progress_bound.
+            async with self._stdin_write_lock():
+                self._refuse_write_if_dead()
+                self._process.stdin.write(data.encode())
+                await self._process.stdin.drain()
+        except AcpRuntimeDead:
+            self._routed_requests.pop(req_id, None)
+            raise
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._routed_requests.pop(req_id, None)
             self._mark_dead(f"pipe broken: {exc}")
@@ -4851,13 +5111,98 @@ class AcpRuntime:
         data = json.dumps(msg) + "\n"
 
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            # A notification (session/cancel) is fire-and-forget and is the one
+            # signal that can end a wedged turn: wait for the lock under the
+            # no-progress bound, append unlocked if it does not come, and never
+            # park on a drain behind a reader that stopped.
+            outcome = await write_notification_best_effort(
+                self._process.stdin,
+                self._stdin_write_lock(),
+                data.encode(),
+                bound_secs=_RESPONSE_WRITE_BOUND_SECS,
+                before_write=self._refuse_write_if_dead,
+            )
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
 
-        self._last_activity = time.monotonic()
+        # Only a drained frame is evidence the backend moved: an unlocked append
+        # or a stall must not refresh the activity clock the idle/wedged-turn
+        # probes read -- that would defer the probe at the very moment a failed
+        # write showed the backend is not reading.
+        if outcome == "drained":
+            self._last_activity = time.monotonic()
+        else:
+            logger.debug(
+                "send_notification method=%s: %s; activity clock not refreshed",
+                _loggable_request_id(method),
+                outcome,
+            )
+
+    def _refuse_write_if_dead(self) -> None:
+        """Re-check under the write lock, right before a frame goes out.
+
+        A writer that queued for the lock while a sibling's stall marked the
+        runtime dead must not write into the pipe afterwards: ``_mark_dead``
+        has already failed every pending request and poisoned every session
+        queue, and the recovery path requeues the turn -- a prompt written now
+        would run a second time. Every runtime writer calls this immediately
+        before writing: under the lock when it holds one, and on the unlocked
+        best-effort notification append as well.
+        """
+        if self._dead:
+            raise AcpRuntimeDead("runtime is dead")
+
+    def _stdin_write_lock(self) -> asyncio.Lock:
+        """The one lock every stdin write on this runtime takes (see
+        ``await_under_no_progress_bound`` in client.py for why the bound needs
+        it). Created on first use so a runtime built without ``__init__`` (test
+        doubles) has one."""
+        lock = getattr(self, "_stdin_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._stdin_lock = lock
+        return lock
+
+    async def _write_response_bounded(self, data: bytes, request_id: str | int) -> None:
+        """Write a response/error frame under the write lock and a no-progress bound.
+
+        Mirror of ``AcpClient._write_response_bounded`` for the shared runtime.
+        Every multiplexed session shares this one stdin, so a response can wait
+        behind another session's multi-MB prompt frame on a flow-control-paused
+        writer while the backend is perfectly healthy; the shared helper only
+        gives up when the write buffer has not shrunk for
+        ``_RESPONSE_WRITE_BOUND_SECS`` -- nothing consumed, reader gone -- which
+        on a shared pipe is a dead runtime, not a slow session. Marks the runtime
+        dead (resolving every pending wait by teardown) and raises
+        ``AcpRuntimeDead``, which the session provider translates to
+        ``AcpProcessDied`` so the caller takes the same session-reset +
+        bounded-requeue recovery the broken-pipe case uses. The request id
+        appears only through ``_loggable_request_id``.
+        """
+        assert self._process is not None and self._process.stdin is not None
+        if await write_response_frame_bounded(
+            self._process.stdin,
+            self._stdin_write_lock(),
+            data,
+            bound_secs=_RESPONSE_WRITE_BOUND_SECS,
+            before_write=self._refuse_write_if_dead,
+        ):
+            return
+        safe_id = _loggable_request_id(request_id)
+        window = response_write_window_secs(self._process.stdin, _RESPONSE_WRITE_BOUND_SECS)
+        logger.warning(
+            "ACP runtime stdin stalled: no write progress for %gs (floor %d bytes/window) "
+            "while delivering response to req=%s; marking runtime dead",
+            window,
+            _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
+            safe_id,
+        )
+        self._mark_dead("response write stalled (backend not reading stdin)")
+        raise AcpRuntimeStdinStalled(
+            f"stdin stalled: no write progress for {window:g}s while "
+            f"delivering response to req={safe_id}"
+        )
 
     async def send_response(self, request_id: str | int, result: dict[str, Any]) -> None:
         """Send a JSON-RPC response (for server→client requests like permission)."""
@@ -4870,8 +5215,7 @@ class AcpRuntime:
         data = json.dumps(msg) + "\n"
 
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            await self._write_response_bounded(data.encode(), request_id)
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
@@ -4887,8 +5231,7 @@ class AcpRuntime:
         data = json.dumps(msg) + "\n"
 
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            await self._write_response_bounded(data.encode(), request_id)
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
@@ -5928,23 +6271,46 @@ class AcpRuntime:
                 if projection is not None
                 else {}
             )
-            native = await asyncio.to_thread(
+            mount = await asyncio.to_thread(
                 kiro_control_plane_servers,
                 agent,
                 work_dir=work_dir,
                 existing_names={str(entry.get("name")) for entry in entries},
                 **projection_kwargs,
             )
+            name = agent or self._agent
             if (
                 projection is not None
-                and (agent or self._agent) in projection.search_agents
-                and not any(entry.get("name") == "kirocrew-core" for entry in [*entries, *native])
+                and name in projection.search_agents
+                and not any(entry.get("name") == "kirocrew-core" for entry in mount.elements)
             ):
-                raise AcpRuntimeError(
-                    "Cannot bind skill_search to this session without losing native MCP restrictions. "
-                    "Check the agent's kirocrew-core server configuration."
-                )
-            return [*entries, *native]
+                # The mount did not produce the element itself: a settings file
+                # withheld it, or a broker stub already in ``entries`` pre-empted
+                # it (the mount emits no element for a name the array carries),
+                # or nothing grants it. The mount judged the files as they are
+                # now -- the projection judged the spec at spawn; the dashboard's
+                # tool toggle writes the global file while a runtime is warm, and
+                # a stub written from an earlier overlay carries the restriction
+                # no better than the element does -- and its verdict comes with
+                # the array, from the same read. Asking the files again here
+                # would open the window in which a toggle undone in between
+                # answers "allowed" and this session falls to the generic guard
+                # below, naming the wrong file. A withheld element refuses THIS
+                # session with the sentence that names the file and the way
+                # back; the spawn and every other agent's sessions stand.
+                # Refusing is the only honest answer: the view already dropped
+                # this agent's skill resources on the element's promise, and
+                # without the element kirocrew-core mounts natively, carries no
+                # identity and answers identity_unattested to every skill_search.
+                withheld = mount.withheld.get("kirocrew-core")
+                if withheld is not None:
+                    raise AcpRuntimeError(f"Agent {name!r}: {withheld.explain('skill search')}")
+                if not any(entry.get("name") == "kirocrew-core" for entry in entries):
+                    raise AcpRuntimeError(
+                        "Cannot bind skill_search to this session without losing native MCP "
+                        "restrictions. Check the agent's kirocrew-core server configuration."
+                    )
+            return [*entries, *mount.elements]
         return entries
 
     async def create_session(
@@ -6147,7 +6513,9 @@ class AcpRuntime:
         # global/workspace entry and 2.20.0 reports as the client's own (see
         # ``hoist_managed_servers``). The kiro path returns None here and is
         # untouched.
-        kas_agents, mcp_servers = hoist_managed_servers(kas_agents, active_agent, mcp_servers)
+        kas_agents, mcp_servers = hoist_managed_servers(
+            kas_agents, active_agent, mcp_servers, session_token=stub_token
+        )
         # The host's last word on its own tool surface. A host that reads an
         # agent spec passes the list straight back; one that has nothing else
         # describing its tools narrows it to the transports it advertised at
@@ -7045,7 +7413,9 @@ class AcpRuntime:
             # Same carriage as create_session: a resumed session re-initializes
             # its servers, and the managed ones must win the same-name contest
             # on load exactly as they did on new.
-            kas_agents, mcp_servers = hoist_managed_servers(kas_agents, active_agent, mcp_servers)
+            kas_agents, mcp_servers = hoist_managed_servers(
+                kas_agents, active_agent, mcp_servers, session_token=stub_token
+            )
             # REBIND, not just re-assign the param: the hoist changes the array, and
             # wire_servers is what the stall diagnostic and the session report read.
             # Setting only load_params would leave both describing the pre-hoist roster
@@ -7298,8 +7668,22 @@ class AcpRuntime:
         self._pending_requests[req_id] = future
 
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            async with self._stdin_write_lock():
+                self._refuse_write_if_dead()
+                self._process.stdin.write(data.encode())
+                await self._process.stdin.drain()
+        except AcpRuntimeDead:
+            # Reached only through _refuse_write_if_dead: _mark_dead has already
+            # failed this future and cleared the map, so retrieve its exception
+            # (or cancel a still-pending one) rather than drop the last reference
+            # unretrieved and have asyncio log a handled error as unhandled.
+            self._pending_requests.pop(req_id, None)
+            if future.done():
+                if not future.cancelled():
+                    future.exception()
+            else:
+                future.cancel()
+            raise
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._pending_requests.pop(req_id, None)
             self._mark_dead(f"pipe broken: {exc}")

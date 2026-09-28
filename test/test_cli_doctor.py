@@ -2530,21 +2530,21 @@ class TestEffectiveModelSection:
         and printed a reset command for the wrong agent."""
         self._install_spec(None)
         agents_dir = self._agents_dir()
-        (agents_dir / "custom-agent.json").write_text(
-            json.dumps({"name": "custom-agent", "model": "claude-opus-4.8"}), encoding="utf-8"
+        (agents_dir / "custom.agent.json").write_text(
+            json.dumps({"name": "custom.agent", "model": "claude-opus-4.8"}), encoding="utf-8"
         )
-        cfg = self._bind_custom_agent(self._cfg("auto"), "custom-agent")
+        cfg = self._bind_custom_agent(self._cfg("auto"), "custom.agent")
         issues: list[str] = []
 
         cli_doctor._doctor_effective_model(cfg, "", issues)
 
         out = capsys.readouterr().out
         assert "effective:   'claude-opus-4.8'" in out
-        assert "decided by:  bound agent pin ('custom-agent')" in out
+        assert "decided by:  bound agent pin ('custom.agent')" in out
         # The repair must name the agent that actually holds the pin.
-        assert "kirocrew agent reset-model --agent 'custom-agent'" in out
+        assert "kirocrew agent reset-model --agent 'custom.agent'" in out
         # And the tier the resolver skipped for the built-in agent is shown here.
-        assert "bound agent pin ('custom-agent'):" in out
+        assert "bound agent pin ('custom.agent'):" in out
         assert "out of date" not in out, "report must agree with the resolver"
         assert issues == []
 
@@ -3010,6 +3010,38 @@ class TestWhatsAppSection:
         assert "_doctor_whatsapp(cfg, issues)" in source
 
 
+def _report_source() -> str:
+    """The source of every function that prints a row of the doctor report.
+
+    The orchestrator plus each ``kiro_crew.doctor_checks`` family, so an invariant
+    asserted over the report holds wherever a section lives.
+    """
+    import importlib
+    import inspect
+    import pkgutil
+
+    from kiro_crew import doctor_checks
+
+    families = [
+        importlib.import_module(f"{doctor_checks.__name__}.{info.name}")
+        for info in pkgutil.iter_modules(doctor_checks.__path__)
+    ]
+    return "\n".join([inspect.getsource(cli_doctor._doctor)] + [inspect.getsource(m) for m in families])
+
+
+#: The install-channel guard, spelled bare in the orchestrator and through the
+#: facade in a family module.
+_CHANNEL_GUARD = re.compile(r"if (cli_doctor\.)?pip_install_channel_available\(\):")
+
+
+def _line_above(lines: list[str], index: int) -> str:
+    """The statement line above *index*, stepping over a wrapped ``print(`` opener."""
+    above = index - 1
+    while lines[above].strip() == "print(":
+        above -= 1
+    return lines[above]
+
+
 class TestFaissHint:
     """The absent-faiss advice has to name the interpreter that would import it.
 
@@ -3026,9 +3058,7 @@ class TestFaissHint:
     """
 
     def _source(self) -> str:
-        import inspect
-
-        return inspect.getsource(cli_doctor._doctor)
+        return _report_source()
 
     def test_the_hint_is_rendered_for_this_interpreter(self) -> None:
         assert "pip_install_command_for('faiss-cpu')" in self._source()
@@ -3050,11 +3080,11 @@ class TestFaissHint:
         is worse than naming nothing, which is what the dashboard's own install
         card does in the same state."""
         source = self._source()
-
-        assert "if pip_install_channel_available():" in source
-        gate = source.index("if pip_install_channel_available():")
         call = source.index("pip_install_command_for('faiss-cpu')")
-        assert gate < call, "the render must sit inside the guard, not beside it"
+        guards = [m.start() for m in _CHANNEL_GUARD.finditer(source)]
+
+        assert guards, "the render must sit inside the guard, not beside it"
+        assert min(guards) < call, "the render must sit inside the guard, not beside it"
 
     def test_the_bundled_interpreter_yields_no_install_channel(
         self, monkeypatch: pytest.MonkeyPatch
@@ -3078,9 +3108,7 @@ class TestVoiceAwsHint:
     """
 
     def _source(self) -> str:
-        import inspect
-
-        return inspect.getsource(cli_doctor._doctor)
+        return _report_source()
 
     def test_both_voice_aws_lines_name_this_interpreter(self) -> None:
         assert self._source().count("pip_install_command('voice-aws')") == 2
@@ -3105,7 +3133,7 @@ class TestVoiceAwsHint:
 
         assert len(renders) == 2
         for index in renders:
-            assert "if pip_install_channel_available():" in lines[index - 1]
+            assert _CHANNEL_GUARD.search(_line_above(lines, index))
 
 
 class TestDoctorPrintsNoBareInstallCommand:
@@ -3120,9 +3148,7 @@ class TestDoctorPrintsNoBareInstallCommand:
     """
 
     def _source(self) -> str:
-        import inspect
-
-        return inspect.getsource(cli_doctor._doctor)
+        return _report_source()
 
     def test_no_printed_line_carries_a_bare_pip_install(self) -> None:
         """Scoped to printed lines, so the surrounding code comments that mention
@@ -3140,7 +3166,7 @@ class TestDoctorPrintsNoBareInstallCommand:
         renders = [i for i, ln in enumerate(lines) if "pip_install_command_for('-e', '.')" in ln]
 
         assert len(renders) == 1
-        assert "if pip_install_channel_available():" in lines[renders[0] - 1]
+        assert _CHANNEL_GUARD.search(_line_above(lines, renders[0]))
 
     def test_the_fts5_fix_names_this_interpreter_and_is_gated(self) -> None:
         lines = self._source().splitlines()
@@ -3149,7 +3175,7 @@ class TestDoctorPrintsNoBareInstallCommand:
         ]
 
         assert len(renders) == 1
-        assert "if pip_install_channel_available():" in lines[renders[0] - 1]
+        assert _CHANNEL_GUARD.search(_line_above(lines, renders[0]))
 
     def test_the_fts5_alternative_survives_the_gate(self) -> None:
         """The one place gating must NOT hide the whole message. Where pip cannot
@@ -4143,3 +4169,114 @@ class TestDoctorSkillViewCensus:
         line = self._line(self._run(tmp_path, monkeypatch, capsys))
         assert f"{skill_projection._PROJECTION_METADATA_DIR_NAME}/ directory" in line
         assert f"in {skill_projection._PROJECTION_LEASE_DIR_NAME}/ cannot be read" in line
+
+
+class TestRunDirCensus:
+    """The run-directory census is read-only, down to the workspace root itself.
+
+    ``workspace_root()`` creates the tree it resolves, which is right for a
+    gateway about to spawn into it and wrong for a doctor on a host where no
+    gateway ever ran: the report would leave a workspace behind as its only
+    trace. The doctor resolves without creating and says there is nothing yet.
+    Its two figures come from the sweep's own rule over this home's pid ledger;
+    no pid's liveness is probed.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, capsys, root: Path, retained=frozenset()) -> str:
+        from kiro_crew import session_pid
+
+        monkeypatch.setenv("KIROCREW_WORKSPACE", str(root))
+        monkeypatch.setattr(session_pid, "retained_gateway_pids", lambda: frozenset(retained))
+        cli_doctor._doctor_run_dirs()
+        return capsys.readouterr().out
+
+    @staticmethod
+    def _marked(root: Path, name: str, marker: str) -> Path:
+        from kiro_crew.session_work_dir import RUN_DIR_MARKER
+
+        work_dir = root / name
+        (work_dir / ".kiro" / "settings").mkdir(parents=True)
+        (work_dir / ".kiro" / "settings" / "cli.json").write_text("{}", encoding="utf-8")
+        (work_dir / RUN_DIR_MARKER).write_text(marker, encoding="ascii")
+        return work_dir
+
+    def test_a_workspace_root_that_does_not_exist_is_not_created(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        root = tmp_path / "never-ran" / "kirocrew-workspace"
+        out = self._run(monkeypatch, capsys, root)
+        assert not root.exists(), "the doctor created the workspace tree"
+        assert not root.parent.exists()
+        assert "run dirs:" in out and "no workspace root yet" in out
+
+    def test_both_figures_print_on_one_line_and_nothing_is_removed(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        from kiro_crew.session_work_dir import RUN_DIR_MARKER, data_home_id
+
+        root = tmp_path / "ws"
+        legacy = root / "subagent_deadbeef" / ".kiro" / "settings"
+        legacy.mkdir(parents=True)
+        (legacy / "cli.json").write_text("{}", encoding="utf-8")
+        self._marked(root, "subagent_00000001", "f" * 24 + "\n12345")
+        self._marked(root, "subagent_00000002", "garbled")
+        self._marked(root, "subagent_00000003", f"{data_home_id()}\n12345")
+        self._marked(root, "subagent_00000004", f"{data_home_id()}\n23456")
+        before = sorted(p.name for p in root.rglob("*"))
+        out = self._run(monkeypatch, capsys, root, retained={12345})
+        shown = os.path.realpath(root)
+        (line,) = [ln for ln in out.splitlines() if "run dirs:" in ln]
+        assert line.startswith("  run dirs:    ⚠️ ")
+        assert f"under {shown}: 1 run director(ies) carry no {RUN_DIR_MARKER} marker" in line
+        assert "3 marked director(ies) this data home cannot reclaim" in line
+        assert "no workspace root yet" not in out
+        assert sorted(p.name for p in root.rglob("*")) == before
+
+    def test_an_unmarked_backlog_names_the_remedy_and_the_cap_makes_a_floor(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        from kiro_crew import session_work_dir
+
+        root = tmp_path / "ws"
+        for n in range(1, 4):
+            (root / f"subagent_{n:08x}" / ".kiro" / "settings").mkdir(parents=True)
+        out = self._run(monkeypatch, capsys, root)
+        assert "✅ under" in out and "3 run director(ies) carry no" in out
+        assert "With the gateway stopped" not in out
+        monkeypatch.setattr(cli_doctor, "_RUN_DIR_BACKLOG_WARN", 2)
+        out = self._run(monkeypatch, capsys, root)
+        assert "⚠️ " in out and "With the gateway stopped, move directories matching" in out
+        original = session_work_dir.count_run_dirs
+        monkeypatch.setattr(
+            session_work_dir,
+            "count_run_dirs",
+            lambda path, **kw: original(path, max_entries=2, **kw),
+        )
+        out = self._run(monkeypatch, capsys, root)
+        assert "2+ run director(ies) carry no" in out and "0+ marked" in out
+
+    def test_a_root_with_nothing_the_sweep_cannot_reclaim_is_clean(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        from kiro_crew.session_work_dir import data_home_id
+
+        root = tmp_path / "ws"
+        self._marked(root, "subagent_00000001", f"{data_home_id()}\n12345")
+        out = self._run(monkeypatch, capsys, root)
+        assert "✅ no run directories left behind that the sweep cannot reclaim" in out
+
+    def test_an_unreadable_ledger_skips_the_census(self, tmp_path: Path, monkeypatch, capsys):
+        from kiro_crew import session_pid
+
+        root = tmp_path / "ws"
+        self._marked(root, "subagent_00000001", "garbled")
+        monkeypatch.setenv("KIROCREW_WORKSPACE", str(root))
+        monkeypatch.setattr(
+            session_pid,
+            "retained_gateway_pids",
+            lambda: (_ for _ in ()).throw(OSError("io")),
+        )
+        cli_doctor._doctor_run_dirs()
+        out = capsys.readouterr().out
+        assert "⚠️  the session pid ledger cannot be read; census skipped" in out

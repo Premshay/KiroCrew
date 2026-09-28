@@ -9,6 +9,7 @@ the first prompt. Bounding only the Crew prompt cannot bound that native cost.
 from __future__ import annotations
 
 import copy
+import errno
 import fnmatch
 import hashlib
 import json
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import pinned_fs, platform_compat
+from kiro_crew.acp import session_mcp
 from kiro_crew.agent_discovery import SCOPE_PROJECT, _read_agent_spec, list_agents
 from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
 from kiro_crew.atomic_write import atomic_write
@@ -92,13 +94,6 @@ _PROJECTION_PRUNE_WORK_LIMIT = 4096
 # that is unreclaimable costs a full classification and never increments it,
 # which is why the section carries its own budget below.
 _PRUNE_MAX_RECLAIMS_PER_RUN = 64
-# The budget for one call's classification work, and a BETWEEN-candidate one: it
-# bounds how many candidates are walked, not how long any single one takes, and
-# the directory enumeration that precedes the walk is outside it. Sized well under
-# _PROJECTION_LOCK_TIMEOUT_SECS and sharing that ceiling with the publication
-# writes in the same section -- two atomic writes per alias plus the settings
-# commit -- so it has to leave room for those, not merely fit under the ceiling.
-_PRUNE_MAX_SECONDS_PER_RUN = 0.4
 # The boot drain runs the per-spawn prune in a loop, so each batch holds the
 # publication lock at most as long as one spawn's prune does. The pause between
 # batches lets a waiting spawn take the lock: a blocked acquire polls with
@@ -110,6 +105,17 @@ _PRUNE_MAX_SECONDS_PER_RUN = 0.4
 _DRAIN_MAX_BATCHES = 1000
 _DRAIN_IDLE_BATCHES = 3
 _DRAIN_BATCH_PAUSE_SECS = platform_compat._LOCK_POLL_MAX_SECS * 2
+# One warning per this many seconds when an alias unlink is refused by the OS.
+# Silence here is what turned a permission problem into a wrong root cause: a
+# read-only or foreign-owned agents directory made every reclaim a no-op and
+# nothing said so. Per-file logging would flood at backlog scale, so the line
+# carries how many refusals it stands for.
+_UNLINK_WARNING_INTERVAL_SECS = 300.0
+# The refusals that DO mean the directory is not writable by this process. Any
+# other errno (ENOENT after a concurrent prune elsewhere took the file, EMFILE,
+# EIO, ...) is reported by name without that diagnosis, which would send an
+# operator to fix a mount or an owner that is fine.
+_UNWRITABLE_ERRNOS: frozenset[int] = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 # The ONE window the re-preparation contract does not cover, and the only thing
 # this age excludes. A publisher from a build that predates the lease holds no
 # lease, so between its write and kiro-cli reading `--agent` its alias looks
@@ -124,6 +130,22 @@ _PROJECTION_METADATA_DIR_NAME = ".kirocrew-skill-projection-metadata"
 # jitter and short Windows rename retries without inheriting the generic five-minute
 # lock ceiling on the native startup path.
 _PROJECTION_LOCK_TIMEOUT_SECS = 2.0
+# The share of that ceiling the prune walk must leave to the rest of its locked
+# section: the publication writes (two atomic writes per alias plus the settings
+# commit) and scheduler jitter. The lease scan's budget is taken out on its own.
+_PROJECTION_PUBLICATION_RESERVE_SECS = 1.2
+
+
+def _prune_budget_within(ceiling: float) -> float:
+    """The walk's share of ``ceiling`` once the lease scan and publication reserve are out."""
+    return ceiling - _PROJECTION_PUBLICATION_RESERVE_SECS - _PROJECTION_LEASE_SCAN_MAX_SECONDS
+
+
+# The budget for one call's classification work, and a BETWEEN-candidate one: it
+# bounds how many candidates are walked, not how long any single one takes, and
+# the directory enumeration that precedes the walk is outside it. Derived from the
+# lock ceiling, so retuning the ceiling moves the budget and keeps the reserve.
+_PRUNE_MAX_SECONDS_PER_RUN = _prune_budget_within(_PROJECTION_LOCK_TIMEOUT_SECS)
 
 # Generated specs stay in Kiro's shared agents directory, so metadata identifies
 # them for direct scanners and scopes cleanup to the owning Kiro Crew data home.
@@ -264,8 +286,17 @@ def _ensure_projection_metadata_directory(directory: Path) -> Path:
     return metadata_dir
 
 
-def _unlink_projection_lease_if_unchanged(path: Path, identity: tuple[int, int]) -> bool:
-    """Remove one unlocked lease only while its random name keeps its identity."""
+def _unlink_projection_lease_if_unchanged(
+    path: Path, identity: tuple[int, int], *, what: str = "projection record"
+) -> bool:
+    """Remove one unlocked lease only while its random name keeps its identity.
+
+    *what* names the kind of file for the refusal report: a lease record, its
+    holder sidecar, or an ownership sidecar. A refusal from the filesystem is
+    reported through the same rate-limited seam as an alias unlink -- the same
+    environment fault silences both, and one that is only half reported is the
+    wrong root cause again. An identity change stays a silent ``False``.
+    """
     current = pinned_fs.lstat_by_name(path)
     if (
         current is None
@@ -277,17 +308,24 @@ def _unlink_projection_lease_if_unchanged(path: Path, identity: tuple[int, int])
     if pinned_fs.supports_pinned_walk() and os.unlink in os.supports_dir_fd:
         try:
             parent_fd = os.open(path.parent, pinned_fs.dir_flags())
-        except OSError:
+        except OSError as exc:
+            _warn_unlink_refused(path, exc, what=what)
             return False
         try:
-            return pinned_fs.unlink_verified(parent_fd, path.name, identity)
+            return pinned_fs.unlink_verified(
+                parent_fd,
+                path.name,
+                identity,
+                on_error=lambda exc: _warn_unlink_refused(path, exc, what=what),
+            )
         finally:
             os.close(parent_fd)
     if not platform_compat.IS_WINDOWS:
         return False
     try:
         path.unlink()
-    except OSError:
+    except OSError as exc:
+        _warn_unlink_refused(path, exc, what=what)
         return False
     return True
 
@@ -343,13 +381,20 @@ def _acquire_projection_lease(directory: Path, aliases: set[str]) -> ExitStack:
         identity = (created.st_dev, created.st_ino)
         # Registered before the descriptor contexts so ExitStack releases the
         # lease lock and file handle first (required for unlink on Windows).
-        stack.callback(_unlink_projection_lease_if_unchanged, lease_path, identity)
+        stack.callback(
+            _unlink_projection_lease_if_unchanged, lease_path, identity, what="lease record"
+        )
         atomic_write(holder_path, "", restrict_to_owner=True)
         holder_created = pinned_fs.lstat_by_name(holder_path)
         if holder_created is None or not stat.S_ISREG(holder_created.st_mode):
             raise OSError("skill projection lease holder was not published as a regular file")
         holder_identity = (holder_created.st_dev, holder_created.st_ino)
-        stack.callback(_unlink_projection_lease_if_unchanged, holder_path, holder_identity)
+        stack.callback(
+            _unlink_projection_lease_if_unchanged,
+            holder_path,
+            holder_identity,
+            what="lease holder",
+        )
         holder_fd = stack.enter_context(platform_compat.open_lock_file(holder_path))
         opened = os.fstat(holder_fd)
         named = pinned_fs.lstat_by_name(holder_path)
@@ -700,6 +745,55 @@ def _settings(path: Path) -> dict[str, Any]:
     return data
 
 
+def _inheritance_preference(
+    local: dict[str, Any], global_settings: dict[str, Any]
+) -> tuple[bool, Any, bool]:
+    """Return ``(inherited, source, overlaid)`` for custom agents in one workspace.
+
+    Once Crew's overlay is in place the native key reads ``true`` whatever the
+    user chose, so the recorded preference decides: a ``global`` source follows
+    the live global setting and any other source keeps the recorded value.
+    Without the overlay, or after the user moves the native key off ``true``,
+    the native key decides -- the workspace value when present, else the global
+    one -- and only the literal ``true`` opts out.
+    """
+    inherited = local.get(_MANAGED_SETTING)
+    source = local.get(_INHERIT_SOURCE)
+    if not isinstance(inherited, bool) or local.get(_INHERIT_SETTING) is not True:
+        source = "local" if _INHERIT_SETTING in local else "global"
+        native = local.get(_INHERIT_SETTING, global_settings.get(_INHERIT_SETTING))
+        return native is not True, source, False
+    if source == "global":
+        return global_settings.get(_INHERIT_SETTING) is not True, source, True
+    return inherited, source, True
+
+
+def inherits_default_resources(work_dir: str | os.PathLike[str] | None) -> bool:
+    """Whether a custom agent started in *work_dir* inherits kiro-cli's default resources.
+
+    Those defaults are global and workspace steering plus ``AGENTS.md``. This is
+    the read-only twin of the decision :func:`prepare_native_skill_projection`
+    makes, for callers that must mirror what the native agent loads. Settings
+    that cannot be read keep inheritance, which is how those callers behaved
+    before they asked.
+    """
+    try:
+        global_settings = _settings(kiro_home() / "settings" / "cli.json")
+        local = (
+            _settings(Path(work_dir) / ".kiro" / "settings" / "cli.json")
+            if work_dir is not None
+            else {}
+        )
+    # RuntimeError: Path.resolve() reports a symlink loop that way before Python 3.13.
+    except (OSError, ValueError, RuntimeError, RecursionError, FileTooLargeError):
+        logger.warning(
+            "skill projection: Kiro settings unreadable; keeping inherited resources",
+            exc_info=True,
+        )
+        return True
+    return _inheritance_preference(local, global_settings)[0]
+
+
 def _restore_inheritance(path: Path, local: dict[str, Any]) -> None:
     """Undo only our overlay; a changed or removed native setting wins."""
     inherited = local.get(_MANAGED_SETTING)
@@ -731,6 +825,67 @@ def _managed_marker(spec: object) -> bool:
     return isinstance(spec, dict) and spec.get(_MANAGED_MARKER) == _MANAGED_MARKER_VALUE
 
 
+_UNLINK_WARNING_LOCK = threading.Lock()
+_UNLINK_WARNING_LAST = 0.0
+_UNLINK_WARNING_SUPPRESSED = 0
+
+
+def _warn_unlink_refused(path: Path, exc: OSError, *, what: str = "stale alias") -> None:
+    """Report a projection-file unlink the OS refused, at most once per interval.
+
+    The prune's every other "no" is a deliberate keep -- kept, active, leased,
+    changed under the walk -- and stays at debug. This one is not: the walk
+    classified the file as reclaimable and the filesystem would not let it go,
+    which is a permission or mount problem an operator has to fix, and at
+    backlog scale it is the same answer thousands of times per spawn. One line
+    per interval, carrying the count it stands for, is what makes it visible
+    without making it the log.
+
+    This is the ONE reporter and the ONE throttle for every such path: aliases
+    and the lease records, holder sidecars and ownership sidecars that travel
+    with them share the interval and the suppressed count, because they share
+    the fault. *what* names the kind of file so the line stays honest about
+    which one it saw, and the line names the operation and the errno it got:
+    only a permission-class errno is diagnosed as an unwritable directory --
+    a file that vanished between the walk and the unlink, or a descriptor
+    limit, is a refusal too, but not that one.
+    """
+    global _UNLINK_WARNING_LAST, _UNLINK_WARNING_SUPPRESSED
+    now = time.monotonic()
+    with _UNLINK_WARNING_LOCK:
+        if _UNLINK_WARNING_LAST and now - _UNLINK_WARNING_LAST < _UNLINK_WARNING_INTERVAL_SECS:
+            _UNLINK_WARNING_SUPPRESSED += 1
+            return
+        suppressed = _UNLINK_WARNING_SUPPRESSED
+        _UNLINK_WARNING_SUPPRESSED = 0
+        _UNLINK_WARNING_LAST = now
+    code = errno.errorcode.get(exc.errno, str(exc.errno)) if exc.errno is not None else "?"
+    reason = exc.strerror or exc.__class__.__name__
+    if exc.errno in _UNWRITABLE_ERRNOS:
+        logger.warning(
+            "skill projection: cannot remove %s %s -- unlink refused, %s (%s); %d similar "
+            "refusal(s) since the last report -- the directory %s is not writable by this "
+            "process, so no backlog there can drain",
+            what,
+            path.name,
+            code,
+            reason,
+            suppressed,
+            path.parent,
+        )
+        return
+    logger.warning(
+        "skill projection: cannot remove %s %s -- unlink refused, %s (%s); %d similar "
+        "refusal(s) since the last report, in the directory %s",
+        what,
+        path.name,
+        code,
+        reason,
+        suppressed,
+        path.parent,
+    )
+
+
 def _unlink_alias_if_unchanged(path: Path, identity: tuple[int, int]) -> bool:
     """Unlink *path* only while it still names the classified alias inode.
 
@@ -738,14 +893,23 @@ def _unlink_alias_if_unchanged(path: Path, identity: tuple[int, int]) -> bool:
     publisher. POSIX additionally pins the parent descriptor. Windows lacks
     unlink-at, so it performs one final no-link identity check before the
     by-name unlink; other platforms without a pinned walk retain the alias.
+
+    A refusal from the filesystem itself is reported (rate-limited); every
+    other ``False`` is an identity change and stays silent.
     """
     if pinned_fs.supports_pinned_walk() and os.unlink in os.supports_dir_fd:
         try:
             parent_fd = os.open(path.parent, pinned_fs.dir_flags())
-        except OSError:
+        except OSError as exc:
+            _warn_unlink_refused(path, exc)
             return False
         try:
-            return pinned_fs.unlink_verified(parent_fd, path.name, identity)
+            return pinned_fs.unlink_verified(
+                parent_fd,
+                path.name,
+                identity,
+                on_error=lambda exc: _warn_unlink_refused(path, exc),
+            )
         finally:
             os.close(parent_fd)
 
@@ -760,7 +924,8 @@ def _unlink_alias_if_unchanged(path: Path, identity: tuple[int, int]) -> bool:
             return False
         try:
             path.unlink()
-        except OSError:
+        except OSError as exc:
+            _warn_unlink_refused(path, exc)
             return False
         return True
 
@@ -1299,12 +1464,26 @@ def _is_current_publication(
 
 
 def prepare_native_skill_projection(
-    work_dir: Path, *, enabled: bool | None = None
+    work_dir: Path, *, enabled: bool | None = None, per_session_element: bool = True
 ) -> NativeSkillProjection | None:
     """Prepare native views after spec freshness admission, before spawning.
 
     Uses the existing workspace CLI settings channel. No home, identity store,
     session store or authored agent file is relocated or rewritten.
+
+    ``per_session_element`` says how ``kirocrew-core`` reaches a search agent's
+    sessions with this session's identity. ``True`` is the shared runtime: the
+    mount re-declares the server as a per-session ``mcpServers`` element
+    (:func:`session_mcp.kiro_control_plane_servers`) that REPLACES the spec's
+    declaration, so a declaration the element cannot carry -- a ``disabledTools``
+    list, a ``timeout``, a transport that is not stdio -- withholds the element,
+    the view would stand on nothing, and the spec's part of that verdict refuses
+    the view here. ``False`` is the direct client: one kiro-cli process for one
+    session, the identity on the process environment, and the declaration
+    mounted natively from the view with every restriction the view copies
+    honoured by kiro-cli itself. No element replaces anything there, so a
+    restriction on OTHER tools -- ``disabledTools: ["learn_add"]`` -- refuses
+    nothing; only ``skill_search`` itself disabled or excluded still does.
     """
     directory = kiro_agents_dir()
     crew_home_id = data_home().absolute().as_posix()
@@ -1323,6 +1502,18 @@ def prepare_native_skill_projection(
             )
         return None
     global_settings = _settings(kiro_home() / "settings" / "cli.json")
+    # Whether kirocrew-core's per-session element can be mounted is decided
+    # from the agent spec HERE and from the settings files BY THE MOUNT at each
+    # session start (:func:`session_mcp.kiro_control_plane_servers`, whose
+    # verdict the runtime refuses the session on), through one predicate shared
+    # with the mount. The split follows what each source is: the spec is this
+    # preparation's input and a restriction authored there is static for the
+    # view's life, so it refuses the view now with the reason; the settings files
+    # are written while a runtime is warm (the dashboard's tool toggle) and are
+    # shared by every agent of the process, so a restriction there refuses the
+    # search agent's SESSIONS, one at a time, naming the file -- never the spawn,
+    # which every other agent's sessions ride on. This module reads no settings
+    # file: the mount is their one reader.
     aliases: dict[str, str] = {}
     specs: dict[str, dict[str, Any]] = {}
     sources: dict[str, str] = {}
@@ -1385,6 +1576,39 @@ def prepare_native_skill_projection(
             if disabled or "skill_search" in disabled_tools:
                 errors[agent.name] = "skill_search is disabled; bounded skill discovery requires it"
                 continue
+            # The verdict the mount will reach for the spec's part, reached here
+            # first, over the declaration AS AUTHORED. The managed replacement
+            # built below carries only the keys a per-session element can
+            # express, so judging it would let a ``type`` or a key the element
+            # cannot carry vanish unjudged and the control plane mount despite the
+            # restriction; the mount's own arms read the declaration itself, and
+            # so does this. A restriction authored in the spec refuses the view:
+            # the view would drop this agent's skill resources on the promise of
+            # an element the mount can never mount for it. The settings files are
+            # deliberately NOT read here -- see the note above the loop -- so a
+            # spec that is clean gets its view whatever the files say today, and
+            # the mount asks the full question over the files at every session
+            # start. A broker stub ``session/new`` would mount ahead of the
+            # element is not a source either: a stub element carries a
+            # kiro-cli-only restriction no better than the native element does,
+            # and its overlay is written from the spec and the global file alone,
+            # so the sources decide, and only the sources.
+            #
+            # The question exists only where an element will REPLACE the
+            # declaration. The direct client mounts none: kiro-cli loads the
+            # view's entry itself -- the managed launch plus the restrictions
+            # copied onto it below -- and honours them natively, with the
+            # session's identity on the process environment. There a
+            # ``disabledTools`` naming other tools, or a ``timeout``, restricts
+            # exactly what its author meant and leaves ``skill_search`` standing
+            # (the checks above already refused the view if it did not), so
+            # withholding the view for it would refuse a supported customization
+            # and abort the spawn over a restriction that reaches the session.
+            if per_session_element:
+                withheld = session_mcp.native_mount_withholding("kirocrew-core", original_core, [])
+                if withheld is not None:
+                    errors[agent.name] = withheld.explain("skill search")
+                    continue
             entry = managed_mcp_spec_entry("kirocrew-core")
             if entry is None:
                 errors[agent.name] = "Crew's managed skill search server is unavailable"
@@ -1429,20 +1653,14 @@ def prepare_native_skill_projection(
                 # the same sidecar lock, so no effort or Tool Search update can land
                 # between this read and commit.
                 local = _settings(locked_settings)
-                inherited = local.get(_MANAGED_SETTING)
-                preference_source = local.get(_INHERIT_SOURCE)
-                if not isinstance(inherited, bool) or local.get(_INHERIT_SETTING) is not True:
+                inherited, preference_source, overlaid = _inheritance_preference(
+                    local, global_settings
+                )
+                if not overlaid:
                     local[_PREVIOUS_INHERITANCE] = {
                         "present": _INHERIT_SETTING in local,
                         "value": local.get(_INHERIT_SETTING),
                     }
-                    preference_source = "local" if _INHERIT_SETTING in local else "global"
-                    inherited = (
-                        local.get(_INHERIT_SETTING, global_settings.get(_INHERIT_SETTING))
-                        is not True
-                    )
-                elif preference_source == "global":
-                    inherited = global_settings.get(_INHERIT_SETTING) is not True
 
                 if inherited:
                     for view in specs.values():

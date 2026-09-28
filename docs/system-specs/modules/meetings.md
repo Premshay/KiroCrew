@@ -56,6 +56,7 @@ GET    /task-providers              registered task providers + the active one
 GET    /meetings                    every meeting with metadata on disk
 GET    /meetings/{id}               one meeting's metadata + live status
 DELETE /meetings/{id}               permanently remove an inactive meeting's local data
+PATCH  /meetings/{id}               {title} — rename; trimmed, non-empty, ≤ MAX_TITLE_LEN
 POST   /meetings/{id}/init          create folder/metadata/tasks/outputs (idempotent)
 POST   /meetings/{id}/start         activate: seed outputs, spawn agent sessions
 POST   /meetings/{id}/status        {status} — active | paused | reviewing | ended
@@ -218,6 +219,19 @@ extractor. A queue batches lines and flushes every `BATCH_INTERVAL_SECS` (30s),
 so an agent gets a paragraph of context rather than one interruption per
 utterance. Three consecutive dispatch failures trip a circuit breaker (backoff
 60s → 120s → stop); `POST …/reset` resumes.
+
+Each agent's first message carries the meeting context (title, description,
+attendees, attachments) from `build_meeting_context` inside a
+`<<<UNTRUSTED_CALENDAR_EVENT … >>>END_UNTRUSTED_CALENDAR_EVENT` fence with a
+line telling the model the block is data, never instructions. Each field is
+redacted, then screened with `contains_injection`: a match is replaced by
+`[withheld: failed content screening]` and recorded with
+`audit_injection_dropped`, and a withheld attachment path loses its "read the
+file at" instruction. Other fields pass through `neutralize_untrusted_text`,
+which scrubs every untrusted fence marker and the primary prompt boundary
+markers, so no field can close the fence around it. Transcript batches sent
+later by `dispatch_to_agent` are the meeting's working input and are not
+wrapped in this fence.
 
 `POST …/dispatch` first redacts and appends the finalized line to
 `transcript.jsonl`, then fans it out to the queues. The response carries the same

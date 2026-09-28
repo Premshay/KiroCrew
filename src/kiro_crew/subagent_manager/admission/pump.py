@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         asyncio,
         create_agent_folder,
         logger,
+        parent_spawn_policy,
         sel,
         time,
     )
@@ -273,8 +274,21 @@ class _PumpMixin(ManagerComponent):
         ``store.defer`` is awaited the same way (``DeferPoint``)."""
         store = self._manager._admission.taskq_store()
         admission = self._manager._admission
+        # The parent agent spec's ``availableAgents`` declaration is re-read
+        # here, off the loop, so the gate's re-check at dispatch costs the loop
+        # no directory scan (same reason the record read above is threaded).
+        policy = await asyncio.to_thread(
+            parent_spawn_policy, str(params.get("parent_session_key") or "")
+        )
+        # Neither the queued entry nor the durable row carries a policy
+        # (``queue_params`` never stores one, ``taskq_build_record`` drops the
+        # key); the filter keeps a params dict that somehow holds one from
+        # shadowing the fresh read. ``params`` itself stays whole: it is the
+        # row's identity for the stop path below.
+        spawn_params = {k: v for k, v in params.items() if k != "_parent_spawn_policy"}
         first: Any = self._manager.spawn(
-            **params,
+            **spawn_params,
+            _parent_spawn_policy=policy,
             _from_queue=True,
             _stop_before_claim=store is not None,
             _child_registration=store is None,
@@ -298,7 +312,11 @@ class _PumpMixin(ManagerComponent):
         result: Any = await admission.claim_and_start(
             first,
             lambda claimed: self._manager.spawn(
-                **params, _from_queue=True, _claimed=claimed, _child_registration=False
+                **spawn_params,
+                _parent_spawn_policy=policy,
+                _from_queue=True,
+                _claimed=claimed,
+                _child_registration=False,
             ),
             stop_params=params,
         )
@@ -508,10 +526,10 @@ class _PumpMixin(ManagerComponent):
             return
         # In-startup bound (``_startup_cap``, two session-start gate rounds): as many
         # agents as ``_startup_cap`` allows are past admission but have no
-        # runtime, stream or turn yet. Hold the pick -- the resumes above were
+        # runtime, answer or turn yet. Hold the pick -- the resumes above were
         # granted, a resume is not a start -- and arm nothing: the next edge is
         # one of them leaving startup, which ``_note_startup_progress`` (PID or
-        # first stream) and the slot-release drain (terminal, including the
+        # first answer) and the slot-release drain (terminal, including the
         # watchdog's reap of a wedged one) both pump. A timer here would only
         # poll for those same edges.
         if self._manager._startup_population() >= self._manager._startup_cap():
@@ -783,47 +801,57 @@ class _PumpMixin(ManagerComponent):
                 await self._manager._safe_announce(info)
             return
 
-        self._manager._log_spawned(info)
         # The prompt resolved; the START has not been admitted. While parked
         # this agent counted against nothing (it was starting nothing), so its
         # release is where the in-startup bound has to be applied -- and a bulk
         # trust/yolo grant releases every parked prompt in one pass. It goes
         # through the pump like a fresh spawn and is metered into startup by
-        # the same stagger and in-startup checks; a stop while it waits ends
-        # it here without a run.
-        if not await self._manager._admit_released_start(info):
-            if not info.done:
-                # Refused at release (gateway admission closed): the run holds
-                # a slot and a row but never started. Same terminal bookkeeping
-                # as a declined prompt, so the slot, the queue and the parent's
-                # completion event all settle.
-                info.done = True
-                info.error = (
-                    "spawn rejected: the gateway closed admission before this "
-                    "approved spawn could start"
-                )
-                if self._manager._release_slot(info):
-                    self._manager._running_count -= 1
-                    self._manager._drain_queue()
-                self._manager._tasks.pop(info.id, None)
-                sel().log_tool_invocation(
-                    session_key=info.parent_session_key,
-                    source="subagent",
-                    tool_name="spawn_run",
-                    outcome="rejected",
-                    metadata={"subagent_id": info.id, "reason": "admission_closed"},
-                )
-                if self._manager._on_done and self._manager._claim_finalize(info):
-                    await self._manager._safe_announce(info)
+        # the same stagger and in-startup checks. Three ways out, each its own
+        # outcome, because they are announced differently:
+        outcome = await self._manager._admit_released_start(info)
+        if outcome == "admission_closed":
+            # Refused at release: the run holds a slot and a row but never
+            # started. Same terminal bookkeeping as a declined prompt, so the
+            # slot, the queue and the parent's completion event all settle.
+            info.done = True
+            info.error = (
+                "spawn rejected: the gateway closed admission before this "
+                "approved spawn could start"
+            )
+            if self._manager._release_slot(info):
+                self._manager._running_count -= 1
+                self._manager._drain_queue()
+            self._manager._tasks.pop(info.id, None)
+            sel().log_tool_invocation(
+                session_key=info.parent_session_key,
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="rejected",
+                metadata={"subagent_id": info.id, "reason": "admission_closed"},
+            )
+            if self._manager._on_done and self._manager._claim_finalize(info):
+                await self._manager._safe_announce(info)
             return
+        if outcome != "admitted":
+            # A user stop or a reap landed while the start waited for the bound.
+            # Neither is a rejection: ``_force_reap`` owns that run's terminal
+            # record (a stop is neutral; a reap names the wait it interrupted)
+            # and its announce, so nothing is written here.
+            return
+        # The confirmed-start funnel: recorded only for a start that is
+        # actually about to run, never for one refused or ended while waiting.
+        self._manager._log_spawned(info)
         await self._manager._run(info)
 
-    async def _admit_released_start_impl(self, info: SubagentInfo) -> bool:
+    async def _admit_released_start_impl(self, info: SubagentInfo) -> str:
         """Wait for the pump to meter *info* -- released from the approval
-        prompt -- into startup. True when it may run, False when it ended
-        (stopped / reaped) while waiting or when gateway admission is closed
-        at release time -- an approved start that has not begun is new work,
-        and the updater's pause admits none (the caller writes that refusal).
+        prompt -- into startup. Answers one of three outcomes: ``"admitted"``
+        (it may run); ``"admission_closed"`` (gateway admission is closed at
+        release time -- an approved start that has not begun is new work, and
+        the updater's pause admits none; the caller writes that refusal); or
+        ``"ended"`` (a user stop or a reap landed while it waited -- the path
+        that ended it owns the terminal record and the announce, so the caller
+        writes nothing).
 
         The entry reuses the queue's RESIDENT shape (``_resume_id``): every
         scan that separates unstarted spawns from resident runs -- the
@@ -838,6 +866,11 @@ class _PumpMixin(ManagerComponent):
         parent's chip shows, and NOT in ``_startup_population`` -- it is not
         starting until the pump says so.
         """
+        # A stop or a reap that landed while the approval prompt was open wins
+        # over the admission gate: its own path owns the record, and a closed
+        # gateway must not add a rejection to a run already being ended.
+        if info.done or info.user_stopped or info.reaped or info._reap_started:
+            return "ended"
         # The same admission gate every registration in this package sits
         # behind: yield-free with the append below, so the start is either
         # queued for release before the updater's pause or refused after it.
@@ -845,7 +878,7 @@ class _PumpMixin(ManagerComponent):
             logger.info(
                 "Subagent %s: approved start refused (gateway admission is closed)", info.id
             )
-            return False
+            return "admission_closed"
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         info._start_release = fut
@@ -860,7 +893,7 @@ class _PumpMixin(ManagerComponent):
         }
         self._manager._queue.append(entry)
         self._manager._emit_queue_depth(info.parent_session_key, info.batch_id)
-        # The wait is edge-driven (PID / first stream / terminal / stagger
+        # The wait is edge-driven (PID / first answer / terminal / stagger
         # boundary all pump), with a slow self-re-arming re-pump as the
         # backstop: a pump pass that failed on an unrelated row is logged and
         # swallowed, and without this the released start would wait for the
@@ -899,7 +932,9 @@ class _PumpMixin(ManagerComponent):
                     self._manager._queue.pop(index)
                     self._manager._emit_queue_depth(info.parent_session_key, info.batch_id)
                     break
-        return granted and not (info.done or info.user_stopped or info.reaped or info._reap_started)
+        if info.done or info.user_stopped or info.reaped or info._reap_started:
+            return "ended"
+        return "admitted" if granted else "ended"
 
     def _release_admitted_start_impl(self) -> str:
         """The pump's released-start phase: meter ONE approval-released start

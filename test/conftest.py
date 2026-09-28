@@ -465,6 +465,44 @@ def cap_project_root_walk(monkeypatch, ceiling: pathlib.Path) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _approve_every_mcp_launch(request, monkeypatch):
+    """Treat every gatewayd launch as operator-approved, except where it is the subject.
+
+    gatewayd refuses a target command or declared env the operator has not
+    approved (``mcp_gateway.launch_approval``), and a hermetic home has no
+    approval store, so every resolver and forwarding test would otherwise
+    exercise the refusal instead of the behaviour it pins. The stub toggle and
+    seeding resolve the launch they approve from the agent specs, which a
+    hermetic home does not carry either, so each name resolves to one stand-in
+    launch. A module that tests the approval itself sets
+    ``ENFORCE_LAUNCH_APPROVAL = True``.
+    """
+    if getattr(request.module, "ENFORCE_LAUNCH_APPROVAL", False):
+        return
+    try:
+        from kiro_crew.mcp_gateway import launch_approval, launch_resolve
+    except ImportError:
+        return
+    monkeypatch.setattr(launch_approval, "launch_approved", lambda *_a, **_k: True)
+
+    def _stand_in_launches(names, **_kwargs):
+        env_hash = launch_approval.env_fingerprint({})
+        return {
+            n: [
+                launch_approval.ResolvedLaunch(
+                    launch_approval.launch_fingerprint(n, []),
+                    n,
+                    (),
+                    frozenset({env_hash}),
+                )
+            ]
+            for n in names
+        }
+
+    monkeypatch.setattr(launch_resolve, "resolve_launches", _stand_in_launches)
+
+
+@pytest.fixture(autouse=True)
 def _windows_restrict_to_owner_stub(request, _floor_monkeypatch):
     """On Windows, no-op the secret lockdown for hermetic tests.
 
@@ -1411,16 +1449,15 @@ class MockSlackClient(SlackClientOps):
         self._fetch_message_result: str | None = None
         self._fetch_thread_replies_result: list[dict] = []
 
-    async def post_message(self, channel, text, thread_ts=None, unfurl_links=None, unfurl_media=None):
+    async def post_message(self, channel, text, thread_ts=None):
         ts = f"{self._next_ts}.000000"
         self._next_ts += 1
         self.actions.append(
-            ("post", {"channel": channel, "text": text, "thread_ts": thread_ts, "ts": ts,
-                      "unfurl_links": unfurl_links, "unfurl_media": unfurl_media})
+            ("post", {"channel": channel, "text": text, "thread_ts": thread_ts, "ts": ts})
         )
         return ts
 
-    async def post_blocks(self, channel, blocks, text, thread_ts=None, unfurl_links=None, unfurl_media=None):
+    async def post_blocks(self, channel, blocks, text, thread_ts=None):
         ts = f"{self._next_ts}.000000"
         self._next_ts += 1
         self.actions.append(
@@ -1432,8 +1469,6 @@ class MockSlackClient(SlackClientOps):
                     "text": text,
                     "thread_ts": thread_ts,
                     "ts": ts,
-                    "unfurl_links": unfurl_links,
-                    "unfurl_media": unfurl_media,
                 },
             )
         )

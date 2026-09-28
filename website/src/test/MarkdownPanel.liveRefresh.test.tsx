@@ -43,7 +43,14 @@ beforeEach(() => {
 
 describe('MarkdownPanel live file refresh', () => {
   it('re-reads a watched file when its kept-mounted tab becomes visible', async () => {
-    const onRefresh = vi.fn().mockResolvedValue(undefined)
+    const originalFetch = globalThis.fetch
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((...args) =>
+      String(args[0]).startsWith('/api/file-read')
+        ? Promise.resolve(new Response('<svg>new</svg>'))
+        : originalFetch(...args),
+    )
+    const diskReads = () => fetchSpy.mock.calls.filter(([url]) => String(url).startsWith('/api/file-read'))
+    const onDiskContent = vi.fn()
     const props = {
       embedded: true,
       filePath: '/workspace/images/tour.svg',
@@ -52,14 +59,17 @@ describe('MarkdownPanel live file refresh', () => {
       onSave: async () => {},
       onClose: () => {},
       liveWatch: true,
-      onRefresh,
+      onDiskContent,
     }
     const { rerender } = render(<MarkdownPanel {...props} isTabActive={false} />, { wrapper })
-    expect(onRefresh).not.toHaveBeenCalled()
-
-    rerender(<MarkdownPanel {...props} isTabActive />, { wrapper })
-    await waitFor(() => expect(onRefresh).toHaveBeenCalledWith('/workspace/images/tour.svg'))
-    expect(onRefresh).toHaveBeenCalledTimes(1)
+    try {
+      expect(diskReads()).toHaveLength(0)
+      rerender(<MarkdownPanel {...props} isTabActive />, { wrapper })
+      await waitFor(() => expect(onDiskContent).toHaveBeenCalledWith('<svg>new</svg>', false, false))
+      expect(diskReads()).toHaveLength(1)
+    } finally {
+      fetchSpy.mockRestore()
+    }
   })
 
   it('does not replace an unsaved buffer on activation', async () => {

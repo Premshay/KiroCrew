@@ -248,6 +248,7 @@ async def api_session_control_create(request: web.Request) -> web.Response:
             title=str(body.get("title") or ""),
             agent=str(body.get("agent") or ""),
             folder_id=str(body.get("folder_id") or ""),
+            model=str(body.get("model") or ""),
             # The fence verdict this request's admission already settled, for the
             # same reason every other route forwards it as
             # `precomputed_ownership_fenced`: `create_session` consults it after
@@ -311,6 +312,30 @@ async def api_session_control_stop(request: web.Request) -> web.Response:
             state,
             caller_session_key=_read_session_key(request),
             target=_target(body),
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_set_model(request: web.Request) -> web.Response:
+    """POST /api/session-control/set-model — change an idle session's model."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    # No prewarm here, for the reason `api_session_control_stop` gives.
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        model = body.get("model")
+        if not isinstance(model, str):
+            raise sc.SessionControlError("model must be a string", code="bad_request")
+        result = await sc.set_model_target(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=_target(body),
+            model=model,
             caller_fenced=_carried_fence(request),
         )
     except sc.SessionControlError as exc:

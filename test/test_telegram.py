@@ -24,6 +24,7 @@ from conftest import assert_rejected_without_backtracking
 from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.dashboard.token_auth import parse_duration
+from kiro_crew.messaging import driver as messaging_driver
 from kiro_crew.messaging.commands import parse_dashboard_ttl
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
@@ -43,6 +44,7 @@ from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session import BACKGROUND_KEY, _opt_out_key
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
+from kiro_crew.telegram import renderer as telegram_renderer
 from kiro_crew.telegram.client import (
     TELEGRAM_CHUNK_LIMIT,
     TELEGRAM_MAX_TEXT,
@@ -1839,14 +1841,68 @@ class TestRenderer:
         assert "<b>after</b>" in out, "prose around it keeps its formatting"
 
     def test_strip_steering_complete_and_unclosed(self) -> None:
-        # Complete marker is removed anywhere in the text.
-        out = _strip_steering("BANANA [STEERING steer-x: rephrase] tail")
+        # Complete marker is removed anywhere in the text. The id is hex because
+        # that is the grammar `messaging.driver` accepts -- the old "steer-x"
+        # fixture was never a frame the driver would have taken.
+        out = _strip_steering("BANANA [STEERING steer-ab12: rephrase] tail")
         assert "STEERING" not in out and out.startswith("BANANA") and out.endswith("tail")
         # UNCLOSED trailing marker (still streaming, no closing "]") is also
         # removed, so the live draft never previews text that on_done strips.
         assert _strip_steering("BANANA\n\n[STEERING steer-abc: interpreted as wanting") == "BANANA"
         # No marker -> unchanged.
         assert _strip_steering("just text") == "just text"
+
+    def test_prose_that_merely_opens_with_the_sentinel_stays(self) -> None:
+        """Opening with the sentinel is not being a marker.
+
+        ``messaging.driver`` already rules that -- it requires ``steer-<id>`` --
+        and so does the dashboard's own parser. A bare ``[STEERING`` class deleted
+        ordinary prose from the delivered message, and because the class does not
+        stop at a line end it ran on to whatever ``]`` came next: here a Markdown
+        link two lines down, taking the text in between with it.
+        """
+        one_line = "Read the [STEERING] section, then [docs](x) for more."
+        assert _strip_steering(one_line) == one_line
+        across_lines = "[STEERING is the feature I mean\n\nsee the [docs](x) for it"
+        assert _strip_steering(across_lines) == across_lines
+
+    def test_a_dashed_steer_id_is_one_frame_to_both_patterns(self) -> None:
+        """``messaging.driver`` accepts ``[0-9a-f-]+`` for the id, so a dashed id
+        is a real frame -- and the two patterns here have to agree about it.
+
+        ``_rotate_at_markers`` reads the summary at the offset the MARKER pattern
+        chose, so an id class the marker accepts and the summary does not leaves
+        the steer chip with no summary at all, which is the only new information
+        that chip carries.
+        """
+        text = "[STEERING steer-a180-ae7f: checked the job id] tail"
+        marker = telegram_renderer._STEER_MARKER_RE.search(text)
+        assert marker is not None
+        summary = telegram_renderer._STEER_SUMMARY_RE.match(text, marker.start())
+        assert summary is not None and summary.group(1) == "checked the job id"
+        assert _strip_steering(text) == "tail"
+
+    def test_the_renderer_patterns_agree_with_the_driver_on_a_frame_corpus(self) -> None:
+        """``messaging.driver`` is the authority on this grammar, so the renderer
+        must not recognise a frame the driver rejects, or reject one it takes."""
+        frames = [
+            "[STEERING steer-ab12: switching to the job id]",
+            "[STEERING steer-a180-ae7f: checked]",
+            "[STEERING steer-ab12: switching to the job id\nand re-running it]",
+            "[STEERING steer-ab12]",
+        ]
+        for frame in frames:
+            assert messaging_driver._STEER_MARKER_RE.match(frame) is not None, frame
+            assert telegram_renderer._STEER_MARKER_RE.fullmatch(frame) is not None, frame
+            assert _strip_steering(f"before {frame} after") == "before  after"
+        not_frames = [
+            "[STEERING]",
+            "[STEERING is the feature I mean]",
+            "[STEERING steer-: nothing]",
+        ]
+        for frame in not_frames:
+            assert messaging_driver._STEER_MARKER_RE.match(frame) is None, frame
+            assert telegram_renderer._STEER_MARKER_RE.search(frame) is None, frame
 
     def _drive(self, events: list[OutputEvent]) -> FakeClient:
         cli = FakeClient()
@@ -3766,6 +3822,136 @@ class TestTelegramMidTurn:
         assert sess.queued == []  # NOT queued
         assert cli.reactions == [(12, _STEER_ACK_EMOJI)]  # steer-ack on the steer message
 
+    # -- the privacy confirmation follows the steer's result -------------------
+
+    @staticmethod
+    def _incognito_steer(steer_result):
+        """A busy session in steer mode, a ``/incognito`` message, and a provider
+        whose steer answers *steer_result* (a bool, or an exception to raise).
+        Returns the dispatcher, the client and the provider's steer log."""
+        from kiro_crew.messaging import privacy_mode
+
+        privacy_mode.reset()
+        d, cli, sess = _dispatcher({7})
+        sess._busy = True
+        d.cfg.messaging.queue_mode = "steer"
+        _prime_live(d.cfg)
+        provider = sess._gp
+        sent_at_steer: list[list[str]] = []
+
+        async def _steer(text: str) -> bool:
+            provider.steered.append(text)
+            sent_at_steer.append([t for t, _ in cli.sent])
+            if isinstance(steer_result, BaseException):
+                raise steer_result
+            return steer_result
+
+        provider.steer = _steer  # type: ignore[method-assign]
+
+        async def _go() -> None:
+            await d.handle_message(
+                TelegramInboundMessage(
+                    channel_type="telegram",
+                    user_id="7",
+                    conversation_id="7",
+                    text="/incognito stop now",
+                    message_id=12,
+                )
+            )
+
+        return d, cli, sess, sent_at_steer, _go
+
+    def test_a_steer_that_raises_keeps_the_mode_and_says_the_message_is_unconfirmed(
+        self,
+    ) -> None:
+        """The reservation applies the mode ahead of the steer; the steer RAISES
+        -- after its bytes may have reached the backend, so nobody knows whether
+        the message is in the turn. Fail-closed: the mode stays on, and the user
+        is told the mode is ON and that the message itself may not have run,
+        through the same producer -- never that the mode was not applied (a
+        message the backend records would then run unprotected). RED-BEFORE:
+        the raise released the mode and announced "not made incognito"."""
+        from kiro_crew.messaging import privacy_mode
+
+        d, cli, sess, sent_at_steer, go = self._incognito_steer(RuntimeError("acp gone"))
+        with pytest.raises(RuntimeError, match="acp gone"):
+            asyncio.run(go())
+        texts = [t for t, _ in cli.sent]
+        assert texts == [
+            f"{privacy_mode.NOTICE_INCOGNITO} {privacy_mode.NOTICE_UNCONFIRMED_SUFFIX}"
+        ], f"a raised steer did not keep the mode and say the message is unconfirmed: sent={texts}"
+        assert (
+            list(privacy_mode._tracker("incognito")) != []
+        ), "the mode was taken back over a message the backend may be recording"
+        assert sess.queued == [], "a message whose steer raised was queued anyway"
+
+    def test_a_raised_steer_whose_notice_also_fails_still_raises_its_own_error(
+        self,
+    ) -> None:
+        """The steer RAISES and the confirmation the commit sends fails too (the
+        Bot API is down). The commit records the mode BEFORE it sends, so the
+        notice failure changes nothing about the mode -- and it must not replace
+        the steer's own exception, which is what the caller diagnoses from.
+        RED-BEFORE: the bare ``await commit(...)`` in the ``except BaseException``
+        arm let the sender's error escape, so its ``raise`` never ran and the
+        caller saw the notice failure instead of the steer's."""
+        from kiro_crew.messaging import privacy_mode
+
+        d, cli, sess, sent_at_steer, go = self._incognito_steer(RuntimeError("acp gone"))
+        notices: list[str] = []
+
+        async def _down(chat_id: int, text: str, **kw: Any) -> int:
+            notices.append(text)
+            raise OSError("bot api down")
+
+        cli.send_message = _down  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="acp gone"):
+            asyncio.run(go())
+        assert notices == [
+            f"{privacy_mode.NOTICE_INCOGNITO} {privacy_mode.NOTICE_UNCONFIRMED_SUFFIX}"
+        ], f"the unconfirmed notice was not the one attempted: {notices}"
+        assert (
+            list(privacy_mode._tracker("incognito")) != []
+        ), "a failed notice took the mode back over a message the backend may be recording"
+        assert not [
+            k for k in privacy_mode._pending if k[0] == "incognito"
+        ], "the reservation was left pending after its commit"
+        assert sess.queued == [], "a message whose steer raised was queued anyway"
+
+    def test_a_steer_that_declines_confirms_nothing_here(self) -> None:
+        """The provider declines the steer: the message falls through to the queue
+        and runs at the drain, where the modifier is applied and announced. This
+        path says nothing about the mode -- a confirmation here, for a message
+        that has not run, would be false -- and takes the reservation back."""
+        from kiro_crew.messaging import privacy_mode
+
+        d, cli, sess, sent_at_steer, go = self._incognito_steer(False)
+        asyncio.run(go())
+        texts = [t for t, _ in cli.sent]
+        assert (
+            privacy_mode.NOTICE_INCOGNITO not in texts
+        ), f"a declined steer left a confirmation: sent={texts}"
+        assert [text for _, text, _ in sess.queued] == ["stop now"], sess.queued
+        assert list(privacy_mode._tracker("incognito")) == [], "the mode was not taken back"
+
+    def test_a_steer_that_lands_is_confirmed_once_after_it_landed(self) -> None:
+        """The confirmation follows the steer's result: one notice, sent AFTER the
+        provider reported the message in the turn -- never before it."""
+        from kiro_crew.messaging import privacy_mode
+
+        d, cli, sess, sent_at_steer, go = self._incognito_steer(True)
+        asyncio.run(go())
+        assert sess._gp.steered == ["stop now"]
+        assert sent_at_steer == [
+            []
+        ], f"the confirmation was sent before the steer reported: at steer={sent_at_steer}"
+        texts = [t for t, _ in cli.sent]
+        assert texts == [
+            privacy_mode.NOTICE_INCOGNITO
+        ], f"one confirmation, after the steer: {texts}"
+        assert list(privacy_mode._tracker("incognito")), "the steered message's mode was not kept"
+        privacy_mode.reset()
+
     def test_busy_queue_mode_enqueues(self) -> None:
         d, cli, sess = _dispatcher({7})
         sess._busy = True
@@ -4997,7 +5183,9 @@ class TestDrainSenderIdentity:
         d, _cli, sess = _dispatcher({7, 8}, dm_scope="unified")
         deferred: list[int] = []
 
-        async def _flip(session_key: str, chat_id: int, answered: list[str], n: int = 0) -> None:
+        async def _flip(
+            session_key: str, chat_id: int, answered: list[str], n: int = 0, owner: str = ""
+        ) -> None:
             deferred.append(n)
 
         d._receipt_flip_locked = _flip
@@ -5019,7 +5207,9 @@ class TestDrainSenderIdentity:
         d, _cli, sess = _dispatcher({7}, dm_scope="unified")
         deferred: list[int] = []
 
-        async def _flip(session_key: str, chat_id: int, answered: list[str], n: int = 0) -> None:
+        async def _flip(
+            session_key: str, chat_id: int, answered: list[str], n: int = 0, owner: str = ""
+        ) -> None:
             deferred.append(n)
 
         d._receipt_flip_locked = _flip
@@ -5380,6 +5570,62 @@ class TestForumCallbackGate:
 
         assert asyncio.run(_go()) is False
         assert cli.answered == []
+
+
+class TestLinkPreviewSuppression:
+    def test_send_message_disables_previews_on_initial_send_and_plain_retry(
+        self, monkeypatch
+    ) -> None:
+        client = TelegramClient(token="12345:testtoken")
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _api(method, params, timeout=30, *, record=True, err_out=None):
+            calls.append((method, dict(params)))
+            return None if len(calls) == 1 else {"message_id": 7}
+
+        monkeypatch.setattr(client, "_api", _api)
+        result = asyncio.run(client.send_message(1, "<b>hello</b>", parse_mode="HTML"))
+
+        assert result == 7
+        assert [method for method, _params in calls] == ["sendMessage", "sendMessage"]
+        for _method, params in calls:
+            assert params["link_preview_options"] == {"is_disabled": True}
+
+    def test_streaming_edit_disables_previews_on_both_attempts(self, monkeypatch) -> None:
+        """A URL appearing mid-stream must not gain a preview on the edit
+        path that the send path already denies (round-8 gpt finding)."""
+        client = TelegramClient(token="12345:testtoken")
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _api(method, params, timeout=30, *, record=True, err_out=None):
+            calls.append((method, dict(params)))
+            return None if len(calls) == 1 else {"message_id": 7}
+
+        monkeypatch.setattr(client, "_api", _api)
+        ok = asyncio.run(
+            client.edit_message(1, 7, "<b>https://evil.example</b>", parse_mode="HTML")
+        )
+
+        assert ok is True
+        assert [m for m, _p in calls] == ["editMessageText", "editMessageText"]
+        for _method, params in calls:
+            assert params["link_preview_options"] == {"is_disabled": True}
+
+    def test_draft_and_rich_paths_disable_previews(self, monkeypatch) -> None:
+        client = TelegramClient(token="12345:testtoken")
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _api(method, params, timeout=30, *, record=True, err_out=None):
+            calls.append((method, dict(params)))
+            return {"message_id": 7}
+
+        monkeypatch.setattr(client, "_api", _api)
+        asyncio.run(client.send_message_draft(1, "d1", "streaming…"))
+        asyncio.run(client.send_rich_message(1, "# heading"))
+
+        assert [m for m, _p in calls] == ["sendMessageDraft", "sendRichMessage"]
+        for _method, params in calls:
+            assert params["link_preview_options"] == {"is_disabled": True}
 
 
 class TestRichMessageAvailabilityLatch:

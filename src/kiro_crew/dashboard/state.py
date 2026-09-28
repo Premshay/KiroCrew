@@ -69,7 +69,7 @@ from kiro_crew.dashboard.slot_queue_repository import (
 )
 from kiro_crew.dashboard.slot_registry import SlotRegistry
 from kiro_crew.dashboard.system_notices import is_system_notice
-from kiro_crew.dashboard.websocket_hub import WebSocketHub
+from kiro_crew.dashboard.websocket_hub import SLOT_PATCH_WS_FLAG, WebSocketHub
 from kiro_crew.deny_guidance import remediation_for
 from kiro_crew.deny_notice import (  # noqa: F401 -- re-exported for dashboard importers
     _DENY_CAUSE_TEXT,
@@ -81,6 +81,7 @@ from kiro_crew.history import (
     mint_row_mid,
     monotonic_transcript_ts,
 )
+from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging import turn_ceiling
@@ -94,8 +95,10 @@ from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     UNBIND_REASON_USER_UNLINK,
     ChannelLink,
+    binding_token,
     channel_namespace_of,
     is_channel_session_key,
+    split_namespaced_channel_id,
 )
 from kiro_crew.messaging.renderer import display_safe
 from kiro_crew.notifications.bus import (
@@ -111,10 +114,17 @@ from kiro_crew.preview_text import strip_markdown_preview
 from kiro_crew.release_channel import channel as _release_channel_of_build
 from kiro_crew.safety_override import cached_disabled_approval_modes, safety_override
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security.credential_sources import CredentialEvidence
 from kiro_crew.sel import sel
+from kiro_crew.session_compaction import (
+    COMPACT_OUTCOME_COMPACTED,
+    COMPACT_OUTCOME_RECYCLED,
+    COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE,
+    COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS,
+)
 from kiro_crew.validation import (
-    SESSION_CHECKPOINT_GOAL_MAX,
     SESSION_CHECKPOINT_ATTENTION_KEY_MAX,
+    SESSION_CHECKPOINT_GOAL_MAX,
     SESSION_CHECKPOINT_MAIN_ITEM_MAX,
     SESSION_CHECKPOINT_MAIN_ITEMS_MAX,
     SESSION_CHECKPOINT_MILESTONE_MAX,
@@ -124,11 +134,6 @@ from kiro_crew.validation import (
     SESSION_CHECKPOINT_TRAIL_MAX,
     SESSION_RESTART_CONTINUATION_MAX,
     sanitize_string,
-)
-from kiro_crew.session_compaction import (
-    COMPACT_OUTCOME_COMPACTED,
-    COMPACT_OUTCOME_RECYCLED,
-    COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE,
 )
 
 if TYPE_CHECKING:
@@ -332,6 +337,10 @@ def _registry_for(state: Any) -> SlotRegistry:
 #: point can silently drift to a different limit.
 MAX_LIVE_SLOTS = 500
 
+#: Fields whose dashboard-user projection is identical for every slot-patch
+#: audience. Per-audience fields such as ``source_links`` require a full frame.
+_SLOT_PATCH_FIELDS = frozenset({"pinned", "title", "folder_id"})
+
 #: The most live slots ONE creator may hold, as a sub-ceiling under
 #: :data:`MAX_LIVE_SLOTS`. The global ceiling alone bounds the total but not the
 #: distribution, so a single automated creator working through a nudge loop can
@@ -356,7 +365,6 @@ MONITOR_WAKE_PREFIX = "[Monitor wake]"
 #: Return type of a mutate_folders callback.
 _T = TypeVar("_T")
 
-_CHANNEL_ID_PREFIX_RE = re.compile(r"^([a-z][a-z0-9_-]*):(.*)$", re.IGNORECASE)
 _SESSION_TIMELINE_SOURCE_MAX = 32
 _PEER_CHANNEL_INBOX_MAX = 20
 _CHANNEL_LABELS = {
@@ -719,19 +727,9 @@ def _slots_ws_frame(
         raise
 
 
-def _split_namespaced_channel_id(channel_id: str | None) -> tuple[str, str] | None:
-    """Return ``(channel_type, target)`` for a ``<type>:<target>`` id."""
-    if not channel_id:
-        return None
-    match = _CHANNEL_ID_PREFIX_RE.match(channel_id)
-    if not match:
-        return None
-    return match.group(1).lower(), match.group(2)
-
-
 def _is_genuine_slack_link(thread_ts: str | None, channel_id: str | None) -> bool:
     """True only for a complete Slack link, never another channel's legacy id."""
-    namespaced = _split_namespaced_channel_id(channel_id)
+    namespaced = split_namespaced_channel_id(channel_id)
     return bool(
         thread_ts and channel_id and (namespaced is None or namespaced[0] == SLACK_NAMESPACE)
     )
@@ -753,6 +751,94 @@ def _redacted_link_target(target: str | None) -> str:
     if len(safe) <= 6:
         return f"…{safe[-2:]}" if len(safe) > 2 else "…"
     return f"…{safe[-6:]}"
+
+
+# The unlink body reader the two unlink endpoints (``chat_mirror.mirror-unlink``,
+# ``chat_slack.slack-unlink``) share. The other two pieces of the stale-row
+# guard -- mint the row's token, compare it with the binding held and clear on
+# equality -- live below the dashboard: the token in ``messaging.link
+# .binding_token`` (the projection mints it there too, so the row and the
+# compare spell one identity), the compare-and-clear in
+# ``SessionMap.clear_mirror_link_if`` / ``clear_slack_link_if``, one guarded
+# step under the map's own lock. A route holds no compare of its own.
+
+
+async def _expected_binding(request: web.Request) -> tuple[str, str] | None:
+    """The binding an unlink body names -- ``(channel_type, binding)`` -- or None.
+
+    Shared by the mirror and Slack unlink endpoints so both spell the guard the
+    same way. Only a body naming a ``channel_type`` arms the compare; ``binding``
+    is the row's opaque token as the slots projection spells it. A body that
+    names the channel but no token still arms the compare, with a token nothing
+    matches: the caller tried to name a row and failed, and the fail-closed
+    answer is the 409, never the unconditional clear. The same posture holds one
+    step earlier: only an EMPTY body reads as no body. A body that is present but
+    not valid JSON, or not a JSON object, is refused with 400 ``invalid_body`` --
+    reading it as "no body" would hand a caller that tried to name a row and
+    garbled it the unconditional clear, the one answer the guard exists to
+    withhold from a caller with a row in hand. A body whose bytes do not decode
+    (invalid UTF-8, an unknown ``charset=``) is the same garbled body and takes
+    the same 400: decoding raises before any read or mutation, and answering it
+    with a 500 would hand the client a crash where the guard has an answer.
+    """
+    body: Any = None
+    try:
+        raw = await request.text()
+    except (UnicodeDecodeError, LookupError):
+        pass
+    else:
+        if not raw.strip():
+            return None
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            pass
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(
+            text=json.dumps(
+                {
+                    "error": "the unlink body must be a JSON object naming channel_type "
+                    "and binding, or empty",
+                    "code": "invalid_body",
+                }
+            ),
+            content_type="application/json",
+        )
+    channel_type = str(body.get("channel_type", "") or "").strip().lower()
+    if not channel_type:
+        return None
+    binding = body.get("binding")
+    return channel_type, (binding.strip() if isinstance(binding, str) else "")
+
+
+def _mirror_link_nonce(state: "DashboardState", session_key: str) -> str:
+    """The persisted nonce of *session_key*'s mirror binding, ``""`` when none.
+
+    The slots projection's reader: the row's token digests this nonce, and the
+    map's compare-and-clear (``SessionMap.clear_mirror_link_if``) reads the same
+    stored nonce, so the row and the compare digest one value. Only a string
+    counts: a session double without the accessor, or one that answers it with
+    a mock, reads as no nonce, which keeps the pre-nonce token in force there.
+    """
+    try:
+        value = state.sessions.mirror_link_nonce(session_key)
+    except Exception:
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+def _slack_link_nonce(state: "DashboardState", session_key: str) -> str:
+    """The persisted nonce of *session_key*'s Slack thread link, ``""`` when none.
+
+    The projection's reader for the Slack row, same contract as
+    ``_mirror_link_nonce``; ``SessionMap.clear_slack_link_if`` reads the stored
+    nonce itself.
+    """
+    try:
+        value = state.sessions.slack_link_nonce(session_key)
+    except Exception:
+        return ""
+    return value if isinstance(value, str) else ""
 
 
 # Native kiro-cli subagent reconnect policy. The slot state, writer, and replay
@@ -1004,13 +1090,42 @@ def is_stop_event_row(m: dict) -> bool:
     return bool(parsed and parsed.get("kind") == "stop_event")
 
 
+#: ``meta.injectKind`` values stamped on an ``inject`` row that DISPATCHED a
+#: turn (the queue drain, the cron injectors, the synthesis kick-off, an app
+#: message's delivery). Every other inject row -- a ``/note`` breadcrumb, a
+#: Stop-hook halt card, a policy refusal notice -- is appended without one and
+#: opens nothing. Mirrors ``TURN_INJECT_KINDS`` in
+#: ``website/src/store/chatSlice.ts``, which is keyed by the ``InjectKind``
+#: type so a new kind cannot be stamped without being classified there.
+#: Wider than ``_TURN_OPENING_INJECT_KINDS`` in ``chat_handlers.py`` on
+#: purpose: that set counts turns for the session-start failure streak and
+#: walks past ``recovery`` / ``user_replay`` because they resume the SAME
+#: turn; here the question is whether a dispatch happened that got no reply,
+#: and a recovery or replay dispatch that died is exactly such a turn.
+_TURN_INJECT_KINDS: frozenset[str] = frozenset(
+    {"cron", "mcp_app", "recovery", "user_replay", "synthesis"}
+)
+
+
+def _is_turn_inject(meta: object) -> bool:
+    """Whether an ``inject`` row's meta says it dispatched a turn."""
+    return isinstance(meta, dict) and meta.get("injectKind") in _TURN_INJECT_KINDS
+
+
 def is_turn_interrupted(messages: list[dict]) -> bool:
     """True when the transcript shows a turn that ended without a reply.
 
-    Two shapes qualify: the last conversational row is the USER's (nothing came
-    back at all — a gateway restart mid-turn leaves exactly this), or it is the
+    Two shapes qualify: the last turn-opening row is the USER's, a monitor
+    loop's NUDGE, or a runner-authored INJECT's (nothing came back at all — a gateway restart
+    mid-turn leaves exactly this), or the last conversational row is the
     ASSISTANT's but an error row follows it (the turn streamed partway then died,
-    which is otherwise shape-identical to a clean completion).
+    which is otherwise shape-identical to a clean completion). An inject counts
+    as an opener only when it carries a dispatching ``meta.injectKind`` (see
+    ``_TURN_INJECT_KINDS``): a queued continuation, a recovery or a synthesis
+    turn IS a turn, and without it the scan walks past an interrupted one and
+    can reach the previous turn's Stop card, which then hides the newer
+    interruption. An untagged inject -- a ``/note`` breadcrumb, a Stop-hook halt
+    card, a refusal notice -- dispatched nothing and is looked through.
 
     Two shapes are explicitly excluded. A trailing ``stop_event``: the user
     pressing Stop is a deliberate ending, not an interruption, and stopping
@@ -1052,7 +1167,8 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
         # "the gateway died before anything came back". See ``is_stop_event_row``
         # for why the discriminator has to be resolved from three carriers.
         # Only the NEWEST turn's terminator reaches here -- an older stop card
-        # is never scanned, because a later user/assistant row returns first.
+        # is never scanned, because a later user/inject/assistant row returns
+        # first.
         if is_stop_event_row(m):
             return False
         if is_system_notice(role, meta):
@@ -1071,6 +1187,12 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
             ):
                 saw_compaction_result = True
             continue
+        if role == "inject" and m.get("content") and _is_turn_inject(meta):
+            return True
+        # A monitor loop's cycle row always dispatches a turn; unanswered, it
+        # is the same shape as an unanswered user row.
+        if role == "nudge" and m.get("content"):
+            return True
         if role in ("user", "assistant") and m.get("content"):
             if role != "user":
                 return saw_trailing_error
@@ -1089,7 +1211,12 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
             return True
         if role == "error":
             saw_trailing_error = True
-    return False
+    # The walk ran off the start of the window without meeting a conversational
+    # row: a long turn can push its own opener and reply into the frozen prefix,
+    # leaving only tool rows here. A trailing error row is still the evidence
+    # the assistant branch above honors -- the turn ended in it and nothing
+    # newer proves completion -- so it decides the same way.
+    return saw_trailing_error
 
 
 def _mark_permission_resolved(
@@ -1167,6 +1294,10 @@ _AUTO_RESTART_UNCOMPACTABLE_NOTICE = (
     "♻️ Context reached {pct:.0f}% and this backend cannot compact at all, so "
     "the session was restarted. The conversation above is still here; the agent no "
     "longer remembers it."
+)
+_AUTO_COMPACT_WAITING_NOTICE = (
+    "⏸ Auto-compact failed at {pct:.0f}%. The session is waiting for its sub-agents "
+    "to finish before it restarts. Your messages are kept."
 )
 _AUTO_COMPACT_FAILED_NOTICE = (
     "⚠ Auto-compact failed at {pct:.0f}% — will retry after cooldown. "
@@ -1982,8 +2113,15 @@ def build_stale_recovery_prompt() -> str:
 
 
 # Shell output-redirection target, e.g. `> build.log` / `>> build.log`. The
-# character class excludes `&` so fd-dup forms (`2>&1`, `>&2`) self-exclude.
-_REDIRECT_TARGET_RE = re.compile(r">>?\s*([^\s;|&]+)")
+# operator must open a token: nothing but whitespace (or the start of the
+# string) may precede it, optionally through a single fd digit (`2>`, `1>>`)
+# or the both-streams `&>`. That keeps the `>` inside `->` and `=>` — Markdown
+# prose, JS fat arrows — from reading as a redirect, which matters because the
+# scanned text is the stalled tool's raw input and is a file's content when the
+# tool is a file write. The target class excludes `&` so fd-dup forms (`2>&1`,
+# `>&2`) self-exclude, and `)` so a path at the end of a parenthesis does not
+# carry the parenthesis along.
+_REDIRECT_TARGET_RE = re.compile(r"(?<![^\s])(?:\d|&)?>>?\s*([^\s;|&)]+)")
 
 
 def extract_log_redirect_target(command: str) -> str:
@@ -1992,7 +2130,9 @@ def extract_log_redirect_target(command: str) -> str:
     Used by the tool-stall recovery nudge: when a long command redirected its
     output (long commands typically redirect, e.g. ``> build.log 2>&1``), the model
     should inspect that file's tail instead of blindly re-running the command.
-    ``/dev/null`` and fd-dups (``2>&1``) are ignored.
+    ``/dev/null`` and fd-dups (``2>&1``) are ignored, and so is a ``>`` that is
+    part of another token (``->``, ``=>``): the text scanned is whatever input the
+    stalled tool received, which for a file write is the file's content.
     """
     for m in _REDIRECT_TARGET_RE.finditer(command or ""):
         target = m.group(1).strip("\"'")
@@ -2452,6 +2592,8 @@ class _ChatSlot:
         "_source_links_cache",
         "_source_links_revision",
         "_closing",
+        "credential_evidence",
+        "segment_raw_text",
         "key",
         "title",
         "agent",
@@ -2533,6 +2675,7 @@ class _ChatSlot:
         "_stop_escalated_card_id",
         "_pending_reset_history_key",
         "_pending_discard_conversation_key",
+        "_pending_model_pick",
         "_eager_spawn_task",
         "_prefetch_ttl_task",
         "_dirty_flag",
@@ -2623,6 +2766,7 @@ class _ChatSlot:
         "theme_consent",
         "theme_consent_sha",
         "memory_mode",
+        "_pending_memory_mode",
         "_ephemeral",
         "_pending_context",
         "_deferred_notes",
@@ -2659,6 +2803,8 @@ class _ChatSlot:
         "instance_id",
         "remote_slot",
         "_relay_in_flight",
+        "_turn_in_flight_generation",
+        "_turn_in_flight_prompt",
         "_active_turn_session_key",
         "_side",
         "_acp_client",
@@ -2809,6 +2955,20 @@ class _ChatSlot:
         # and rehydration appends an "interrupted" row rather than leaving the
         # transcript silently stopped. Set/cleared in ``remote_relay.relay_remote_turn``.
         self._relay_in_flight: bool = False
+        # Generation of the LOCAL turn ``chat_runner._run_chat`` durably admitted;
+        # zero when no local turn is outstanding. Persisted on the metadata line
+        # before provider dispatch and omitted after teardown, so a process that
+        # dies mid-turn leaves it on disk and every restore path converts it into
+        # the interruption row the transcript shape alone cannot prove -- partial
+        # assistant text followed by completed tool rows and no error row looks
+        # exactly like a finished answer once the process is gone.
+        self._turn_in_flight_generation: int = 0
+        # The row that opened the in-flight turn, persisted beside the
+        # generation. The row itself rides the periodic flush, so a process
+        # death inside that window loses it; the copy here lets the restore
+        # put it back before the interruption is judged. None when no turn is
+        # in flight.
+        self._turn_in_flight_prompt: dict[str, Any] | None = None
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self.messages: list[dict[str, Any]] = []
         self._buffers = SlotBufferCoordinator()
@@ -2826,6 +2986,17 @@ class _ChatSlot:
         # I/O. A DEPTH: two retractions can overlap on one slot, and each must
         # release only its own acquisition (see ``begin_close``).
         self._closing = 0
+        # This turn's tool results, reduced to sources and credential
+        # fingerprints, so a credential in the reply can name where it came
+        # from. Memory only and cleared at every turn start; see
+        # ``security.credential_sources``.
+        self.credential_evidence = CredentialEvidence()
+        # The current segment's text as the model wrote it, before any
+        # redaction. The run loop redacts each streamed delta as it arrives,
+        # which removes a value whole-in-one-delta before the segment flush can
+        # describe it; the flush redacts THIS copy instead when it agrees with
+        # the redacted one. Memory only, never persisted, dropped at each flush.
+        self.segment_raw_text: str | None = ""
         self.total_messages: int = 0  # lifetime count (survives trimming)
         self._task: asyncio.Task[Any] | None = None
         self._turn_generation: int = 0
@@ -3065,6 +3236,11 @@ class _ChatSlot:
         # called from inside the turn it wants to end, and the immediate route
         # refuses a busy slot rather than tearing down a turn mid-write.
         self._pending_discard_conversation_key: str | None = None
+        # Set by session_set_model on an idle slot; consumed at the start of the
+        # next turn (session_control.apply_pending_model_pick), which re-checks
+        # the caller's authorization and commits the model in one synchronous
+        # step. Runtime only: a pick does not survive a gateway restart.
+        self._pending_model_pick: Any = None
         # Debounced speculative session-creation task (session.eager_spawn).
         # At most one per slot: scheduling a new one cancels the previous, so
         # rapid signals (create + project set) collapse into a single spawn.
@@ -3423,6 +3599,8 @@ class _ChatSlot:
                 f"invalid memory_mode {memory_mode!r}, must be one of {VALID_MEMORY_MODES}"
             )
         self.memory_mode: str = memory_mode
+        # A save thread records a stricter folded line mode for loop-side adoption.
+        self._pending_memory_mode: str | None = None
         self._ephemeral: bool = ephemeral  # Incognito mode: no memory writes
         self._pending_context: list[dict[str, Any]] = []
         self._deferred_notes: list[dict[str, Any]] = []
@@ -5371,6 +5549,15 @@ class _ChatSlot:
         return payload
 
 
+@dataclass(frozen=True)
+class _DurableTagSnapshot:
+    """A positively read tag snapshot, or positive absence when ``present`` is false."""
+
+    present: bool
+    tags: list[dict[str, Any]]
+    unparsed: list[Any]
+
+
 class DashboardState:
     """Shared state injected into all handlers via ``app["state"]``."""
 
@@ -5393,6 +5580,13 @@ class DashboardState:
     _slots_broadcast_lock: "threading.Lock | None" = None
     _slots_broadcast_timer: "asyncio.TimerHandle | None" = None
     _slots_broadcast_last: float = 0.0
+    # Who the next coalesced slots broadcast is owed to, written under
+    # ``_slots_broadcast_lock``. A ``push_slots_update(legacy_only=True)`` owes
+    # the full list only to consumers that cannot apply a ``slot_patch`` frame;
+    # any ordinary push owes it to everyone and wins. Both False (the state of a
+    # direct ``_do_slots_broadcast`` call) means everyone.
+    _slots_push_all_owed: bool = False
+    _slots_push_legacy_owed: bool = False
     # The one loop this dashboard is served on. Every surface that hands work in
     # from a foreign thread -- the coalesced slots broadcast, an off-loop
     # websocket send, the log handler's fan-out -- resolves it through
@@ -6017,7 +6211,9 @@ class DashboardState:
             slot = self.get_slot(slot_key)
             if slot is None:
                 return
-            if not success:
+            if outcome == COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS:
+                template = _AUTO_COMPACT_WAITING_NOTICE
+            elif not success:
                 template = _AUTO_COMPACT_FAILED_NOTICE
             elif outcome == COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE:
                 template = _AUTO_RESTART_UNCOMPACTABLE_NOTICE
@@ -6884,9 +7080,15 @@ class DashboardState:
             redact_secret=redact_credentials,
         )
 
-    async def post_question_card(self, slot_key: str, questions: list[dict]) -> int:
-        """Post a non-blocking owner-only question card."""
-        return await _questions_for(self).post_card(self, slot_key, questions)
+    async def post_question_card(
+        self, slot_key: str, questions: list[dict], *, native: bool = False
+    ) -> int:
+        """Post a non-blocking owner-only question card.
+
+        ``native`` marks kiro-cli's own mid-turn ``AskUserQuestion`` card; see
+        ``QuestionCoordinator.post_card``.
+        """
+        return await _questions_for(self).post_card(self, slot_key, questions, native=native)
 
     def mark_question_pending(
         self,
@@ -6895,6 +7097,7 @@ class DashboardState:
         blocking: bool,
         card_id: str,
         questions: list[dict] | None = None,
+        native: bool = False,
     ) -> None:
         """Record one unanswered question and push the slot status."""
         _questions_for(self).mark_pending(
@@ -6903,6 +7106,7 @@ class DashboardState:
             blocking=blocking,
             card_id=card_id,
             questions=questions,
+            native=native,
         )
 
     def clear_question_pending(
@@ -7398,7 +7602,7 @@ class DashboardState:
                 _ts, _ch = self.sessions.get_slack_link(effective_session_key(slot))
                 slot._slack_linked = _is_genuine_slack_link(_ts, _ch)
                 if slot._slack_linked:
-                    namespaced = _split_namespaced_channel_id(_ch)
+                    namespaced = split_namespaced_channel_id(_ch)
                     slot._slack_channel = namespaced[1] if namespaced else (_ch or "")
                     slot._slack_thread_ts = _ts or ""
                     # Rebuild the thread -> slot index too, not just the fields:
@@ -7498,10 +7702,24 @@ class DashboardState:
         from kiro_crew.dashboard.chat_utils import (
             redact_display_content,
             serialize_wire_content,
+            with_allowed_links_restored,
         )
 
+        restored_meta: dict | None = None
         if role != "user" and content:
-            content = redact_display_content(content)
+            # The same allowed-host scope as _prepare_messages, so the live
+            # frame and the history agree on an allowed link: its placeholder
+            # becomes the address again, then the display pass runs.
+            from kiro_crew.security.exfil import scoped_exempt_hosts
+            from kiro_crew.security.redaction_allow import allowed_hosts_for
+
+            _slot = self.get_slot(slot_key)
+            with scoped_exempt_hosts(allowed_hosts_for(getattr(_slot, "workspace", None))):
+                if isinstance(content, str) and isinstance(msg.get("meta"), dict):
+                    shown = with_allowed_links_restored({"content": content, "meta": msg["meta"]})
+                    content = shown["content"]
+                    restored_meta = shown["meta"]
+                content = redact_display_content(content)
         else:
             # The wire-string invariant covers EVERY row: a structured user
             # row or a falsy container serializes to text without redaction.
@@ -7551,7 +7769,7 @@ class DashboardState:
         # test_rehydrate_does_not_broadcast_replayed_messages and
         # test_restore_recent_sessions_does_not_broadcast_either. Do not relax
         # it further without re-checking that meta is still absent.
-        direct_meta = msg.get("meta")
+        direct_meta = restored_meta if restored_meta is not None else msg.get("meta")
         if direct_meta and isinstance(direct_meta, dict):
             payload["meta"] = {**(payload.get("meta") or {}), **direct_meta}
         self._broadcast(payload)
@@ -8000,6 +8218,49 @@ class DashboardState:
     def folder_breadcrumb(self, folder_id: str, sep: str = " › ") -> str:
         """Render a cycle-safe root-to-leaf folder breadcrumb."""
         return _FOLDER_REPOSITORY.breadcrumb(self._folders, folder_id, sep)
+
+    def read_durable_tags_snapshot(self) -> _DurableTagSnapshot | None:
+        """Read committed tags through the bounded no-link file authority.
+
+        ``None`` means the durable state could not be established. A missing
+        file is distinguished by a follow-up ``lstat``: only
+        ``FileNotFoundError`` is positive absence; every existing, oversized,
+        malformed, or unreadable shape remains ambiguous. Active-row parsing
+        and legacy status backfill share this state's canonical vocabulary
+        rules so mutation reconciliation cannot drift into a second schema.
+        """
+        path = config_dir() / self._TAGS_FILE
+        try:
+            encoded = safe_read_file_bytes_nolink(str(path), within_root=str(path.parent))
+        except FileTooLargeError:
+            return None
+        if encoded is None:
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                return _DurableTagSnapshot(False, [], [])
+            except OSError:
+                return None
+            return None
+        try:
+            raw = json.loads(encoded.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, list):
+            return None
+        active, unparsed = self._partition_preserving(
+            raw,
+            lambda row: isinstance(row, dict)
+            and isinstance(row.get("id"), str)
+            and bool(row["id"]),
+            "tag entr(ies)",
+            self._TAGS_FILE,
+        )
+        tags = [dict(row) for row in active]
+        default_ids = {row["id"] for row in self._DEFAULT_TAGS}
+        for row in tags:
+            row.setdefault("status", row.get("id") in default_ids)
+        return _DurableTagSnapshot(True, tags, unparsed)
 
     def load_tags(self) -> None:
         """Load tag vocabulary and sidebar columns from disk; seed defaults if missing.
@@ -8454,7 +8715,7 @@ class DashboardState:
         # tests and during the short interval before persistence is observable.
         slack_ts = persisted_ts or slot._slack_thread_ts
         slack_channel = persisted_channel or slot._slack_channel
-        namespaced_origin = _split_namespaced_channel_id(persisted_channel)
+        namespaced_origin = split_namespaced_channel_id(persisted_channel)
         genuine_slack = _is_genuine_slack_link(slack_ts, slack_channel)
         # A Slack-BORN session's ``slack_thread_ts`` names the thread it LIVES
         # in, not a mirror target somewhere else: the Slack inbound handler
@@ -8470,13 +8731,33 @@ class DashboardState:
             and session_key.endswith(slack_ts)
         )
         links: list[dict[str, Any]] = []
+        # The per-binding nonces, read the way the bindings themselves are, so
+        # the row's token and the map's compare-and-clear digest the same
+        # material. Only a string counts: a session double that predates the
+        # accessors (or answers them with a mock) reads as no nonce.
+        mirror_nonce = _mirror_link_nonce(self, session_key)
+        slack_nonce = _slack_link_nonce(self, session_key)
 
-        def append_link(link: ChannelLink, direction: str) -> None:
+        def append_link(
+            link: ChannelLink, direction: str, nonce: str = "", *, drives_session: bool
+        ) -> None:
+            """Append one row. *drives_session*: messages sent there land in THIS session.
+
+            The inbound-routing fact is the server's to state, per row, because
+            it is not readable from the row's other fields: a Slack thread is
+            marked ``out`` (its inbound routing is Slack's own thread index, not
+            the mirror's inbound marker) yet a reply in it resumes this session;
+            a ``both`` mirror routes inbound by that marker; an ``out`` mirror
+            only receives replies; and the conversation a session was born in
+            is where its turns come from. Judged client-side from ``direction``
+            plus the channel name, a paused Slack row reads as a one-way link --
+            so the client reads this bit and special-cases nothing.
+            """
             channel_type = (link.channel_type or "").lower()
             if not channel_type:
                 return
             channel_id = link.channel_id or ""
-            nested = _split_namespaced_channel_id(channel_id)
+            nested = split_namespaced_channel_id(channel_id)
             if nested and nested[0] == channel_type:
                 channel_id = nested[1]
             normalized = ChannelLink(channel_type, channel_id, link.thread_id)
@@ -8500,7 +8781,14 @@ class DashboardState:
                     "channel": channel_type,
                     "label": _link_label(channel_type),
                     "target": _redacted_link_target(channel_id),
+                    # The row's identity for an unlink: the redacted `target`
+                    # above is display only and drops the thread, so a Slack
+                    # thread and its same-channel replacement would read alike;
+                    # the binding's own nonce keeps a same-target replacement
+                    # from reading alike too.
+                    "binding": binding_token(normalized, nonce),
                     "direction": direction,
+                    "drives_session": drives_session,
                     "live": self._channel_link_is_live(normalized),
                     "paused": paused,
                 }
@@ -8511,9 +8799,12 @@ class DashboardState:
         # mirror. This prefix sniff is intentionally defensive for unknown
         # future channel types too.
         if namespaced_origin and namespaced_origin[0] != SLACK_NAMESPACE:
+            # The conversation the session was born in: the channel dispatcher
+            # routes its messages here on every inbound turn.
             append_link(
                 ChannelLink(namespaced_origin[0], namespaced_origin[1]),
                 "origin",
+                drives_session=True,
             )
 
         if mirror is not None:
@@ -8525,6 +8816,8 @@ class DashboardState:
                     append_link(
                         ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts),
                         "out",
+                        slack_nonce,
+                        drives_session=True,
                     )
             else:
                 # A resume binding (set by an in-channel `!sessions` pick) routes
@@ -8542,13 +8835,17 @@ class DashboardState:
                     # Older/stubbed SessionManagers may not expose the accessor;
                     # degrade to the outbound reading rather than dropping the link.
                     inbound = False
-                append_link(mirror, "both" if inbound else "out")
+                append_link(
+                    mirror, "both" if inbound else "out", mirror_nonce, drives_session=inbound
+                )
         elif genuine_slack and not slack_origin_self_link:
             # Defensive fallback for SessionManager test doubles or older
             # implementations that expose get_slack_link but not get_mirror_link.
             append_link(
                 ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts),
                 "out",
+                slack_nonce,
+                drives_session=True,
             )
 
         if genuine_slack and slack_origin_self_link:
@@ -8559,10 +8856,15 @@ class DashboardState:
             # it back. It stays `origin` so the sidebar keeps showing where the
             # conversation came from — provenance is history and survives a
             # disconnect; only the delivery indicator reflects the mute.
-            append_link(ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts), "origin")
+            append_link(
+                ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts),
+                "origin",
+                slack_nonce,
+                drives_session=True,
+            )
 
         if genuine_slack and not slack_origin_self_link:
-            slack_namespace = _split_namespaced_channel_id(slack_channel)
+            slack_namespace = split_namespaced_channel_id(slack_channel)
             visible_slack_channel = slack_namespace[1] if slack_namespace else (slack_channel or "")
             # A Slack ROW accompanies `slack_linked=True` unconditionally. The
             # dashboard's channel control is built from `links` alone — it no
@@ -8575,7 +8877,12 @@ class DashboardState:
             if not any(
                 row["channel"] == SLACK_NAMESPACE and row["direction"] != "origin" for row in links
             ):
-                append_link(ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts), "out")
+                append_link(
+                    ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts),
+                    "out",
+                    slack_nonce,
+                    drives_session=True,
+                )
             return links, True, visible_slack_channel, slack_ts or ""
         return links, False, "", ""
 
@@ -8888,7 +9195,7 @@ class DashboardState:
                 exc_info=True,
             )
 
-    def push_slots_update(self) -> None:
+    def push_slots_update(self, *, legacy_only: bool = False) -> None:
         """Push slots, keeping provider status confined to owner websockets.
 
         Coalesces on a leading plus trailing edge: the first call after an idle
@@ -8898,7 +9205,22 @@ class DashboardState:
         so an uncoalesced burst redraws the whole sidebar once per mutation for
         what the user sees as one change. The trailing flush re-serializes at
         delivery time, so a coalesced frame is never a stale frame.
+
+        ``legacy_only`` owes the full list only to consumers that cannot apply a
+        ``slot_patch`` frame (SSE readers, app tokens, a tab whose bundle
+        predates the frame). :meth:`push_slot_patch` and
+        :meth:`push_slot_removed` use it: the patch already reached every
+        socket that declared the capability, so those sockets skip this
+        broadcast. An ordinary call absorbed into the same window widens the
+        broadcast back to everyone.
         """
+        lock = self._slots_broadcast_lock
+        if lock is not None:
+            with lock:
+                if legacy_only:
+                    self._slots_push_legacy_owed = True
+                else:
+                    self._slots_push_all_owed = True
         if self._slots_push_suspend:
             # Inside suspend_slots_push(); remember that a push is owed and let the
             # outermost block emit a single coalesced broadcast on exit.
@@ -8907,7 +9229,6 @@ class DashboardState:
 
         now = time.monotonic()
         broadcast_now = False
-        lock = self._slots_broadcast_lock
         if lock is None:
             # Partially-constructed state (built via __new__): no coalescing.
             self._do_slots_broadcast()
@@ -9012,6 +9333,35 @@ class DashboardState:
                 self._slots_broadcast_last = time.monotonic()
         self._do_slots_broadcast()
 
+    def _take_slots_audience(self) -> bool:
+        """Consume the owed-audience flags; True when only legacy consumers are owed."""
+        lock = self._slots_broadcast_lock
+        if lock is None:
+            return False
+        with lock:
+            legacy_only = self._slots_push_legacy_owed and not self._slots_push_all_owed
+            self._slots_push_legacy_owed = False
+            self._slots_push_all_owed = False
+        return legacy_only
+
+    def _has_legacy_slots_audience(self) -> bool:
+        """True when some consumer can only learn slot changes from a full list.
+
+        That is every SSE reader, and every open socket that did not declare
+        the ``slot_patch`` capability at connect: an app token, a companion
+        window, or a tab still running a bundle from before the frame existed.
+        App sockets count even when their scope would filter the list to
+        nothing, because asking the scope gate here would audit a denial per
+        socket per metadata edit; the cost is one serialization that the
+        pre-patch protocol paid on every edit anyway.
+        """
+        if getattr(self, "_sse_queues", None):
+            return True
+        return any(
+            not ws.closed and not ws.get(SLOT_PATCH_WS_FLAG, False)
+            for ws in list(getattr(self, "_ws_clients", None) or ())
+        )
+
     def _do_slots_broadcast(self) -> None:
         """Serialize and broadcast the slot list. Bypasses coalescing."""
         from kiro_crew.dashboard.handlers.source_providers import (
@@ -9020,6 +9370,13 @@ class DashboardState:
         from kiro_crew.platform.governance_profiles import (
             governance_answer_generation,
         )
+
+        legacy_only = self._take_slots_audience()
+        if legacy_only and not self._has_legacy_slots_audience():
+            # Every consumer already applied the patch this broadcast was owed
+            # for, so serializing the whole list would reach nobody.
+            self._emit_member_slot_transitions()
+            return
 
         yolo_active = self.is_yolo_active()  # expire first if needed
         # PUBLIC-repo chip status rides the general frame so any authenticated
@@ -9040,6 +9397,10 @@ class DashboardState:
         # One serialization pass for all three audiences -- see
         # ``serialize_slot_views`` for why three passes stalled the event loop.
         owner_ws_clients = getattr(self, "_owner_ws_clients", None)
+        if legacy_only and owner_ws_clients:
+            owner_ws_clients = {
+                ws for ws in owner_ws_clients if not ws.get(SLOT_PATCH_WS_FLAG, False)
+            }
         slots_data, slots_data_ws, owner_slots = self.serialize_slot_views(
             owner=bool(owner_ws_clients)
         )
@@ -9113,6 +9474,9 @@ class DashboardState:
                 # tree alone is not a change signal.
                 "foldersGeneration": self.folders_generation(),
                 "governanceGeneration": answer_generation,
+                # Read by ``_broadcast`` to skip sockets that already applied
+                # the ``slot_patch`` this broadcast was owed for.
+                "_legacy_only": legacy_only,
             }
         )
         # The owner frame is the owner's ONLY slots frame — `_send_ws_all` skips
@@ -9132,9 +9496,20 @@ class DashboardState:
                     folders=_safe_folder_tree(getattr(self, "_folders", None)),
                     folders_gen=self.folders_generation(),
                     governance_gen=answer_generation,
-                )
+                ),
+                **({"skip_slot_patch_clients": True} if legacy_only else {}),
             )
 
+        self._emit_member_slot_transitions()
+
+    def _emit_member_slot_transitions(self) -> None:
+        """Log slot/opened and slot/closed for member-driven slots.
+
+        Runs after every slots broadcast and after :meth:`push_slot_removed`,
+        which is how a close reaches the log when no consumer needed the full
+        list. It diffs against the last-seen set, so a second call for the same
+        registry state emits nothing.
+        """
         # Best-effort per-member event log: emit slot/opened and slot/closed
         # for slots DRIVEN by a member (created_by is a member NAME), diffed
         # against the last-seen set on this state object. Additive; never
@@ -9333,6 +9708,87 @@ class DashboardState:
         if full:
             self.push_slots_update()
 
+    def push_slot_patch(self, key: str, fields: Iterable[str]) -> None:
+        """Publish a metadata edit to one slot without re-sending the slot list.
+
+        Sockets that declared the ``slot_patch`` capability receive
+        ``{"type": "slot_patch", "data": {"slots": [{"key", <field>: ...}]}}``,
+        a row carrying only the named fields, and merge it into their copy of
+        the row. Every other consumer gets the full list through
+        ``push_slots_update(legacy_only=True)``, so an old tab kept open across
+        a gateway restart sees the same thing it always did.
+
+        The values come from the dashboard-user projection of the slot, so a
+        patched field reads exactly as it would in the full frame (the title is
+        redacted the same way). Only fields in :data:`_SLOT_PATCH_FIELDS` are
+        accepted because ``source_links`` and other per-audience fields require
+        a full frame. A slot that is gone or still under construction falls back
+        to an ordinary full push.
+        """
+        field_names = tuple(fields)
+        unsupported = sorted(set(field_names) - _SLOT_PATCH_FIELDS)
+        if unsupported:
+            raise ValueError(f"unsupported slot patch fields: {', '.join(unsupported)}")
+        slot = self._slots.get(key)
+        under_construction = getattr(self, "_slots_under_construction", None) or ()
+        if slot is None or key in under_construction:
+            self.push_slots_update()
+            return
+        if self._has_legacy_slots_audience():
+            self.push_slots_update(legacy_only=True)
+        if not self._has_slot_patch_clients():
+            return
+        row = self.serialize_slot(slot, dashboard_user=True)
+        patch: dict[str, Any] = {"key": key}
+        for field in field_names:
+            if field in row:
+                patch[field] = row[field]
+        self._send_slot_patch({"slots": [patch]})
+
+    def push_slot_removed(self, key: str) -> None:
+        """Publish that slot *key* left the registry without re-sending the list.
+
+        Patch-capable sockets receive ``{"slots": [...], "removed": [key]}``.
+        The ``slots`` rows re-state the ``parent`` of every row whose creator is
+        not live, because a removed conductor turns its workers' ``parent.key``
+        to ``None`` in the full frame; carrying those rows keeps the sidebar's
+        nesting identical to what a full list would have produced. Everyone else
+        gets the full list, as with :meth:`push_slot_patch`.
+
+        A key that is registered again (a same-name replacement landed while the
+        close was tearing down) is not removed: the full push describes it.
+        """
+        if key in self._slots:
+            self.push_slots_update()
+            return
+        if self._has_legacy_slots_audience():
+            self.push_slots_update(legacy_only=True)
+        if self._has_slot_patch_clients():
+            under_construction = getattr(self, "_slots_under_construction", None) or ()
+            rows: list[dict[str, Any]] = [
+                {"key": k} for k in list(self._slots) if k not in under_construction
+            ]
+            _attach_slot_parents(rows, getattr(self, "spend_slot_by_session", None))
+            orphans = [
+                {"key": row["key"], "parent": row["parent"]}
+                for row in rows
+                if isinstance(row.get("parent"), dict)
+                and row["parent"].get("key") is None
+                and not row.get("lineage_pending")
+            ]
+            self._send_slot_patch({"slots": orphans, "removed": [key]})
+        self._emit_member_slot_transitions()
+
+    def _has_slot_patch_clients(self) -> bool:
+        return any(
+            not ws.closed and ws.get(SLOT_PATCH_WS_FLAG, False)
+            for ws in list(getattr(self, "_ws_clients", None) or ())
+        )
+
+    def _send_slot_patch(self, data: dict[str, Any]) -> None:
+        """Serialize one ``slot_patch`` frame and hand it to patch-capable sockets."""
+        _websocket_for(self).send_ws_slot_patch(json.dumps({"type": "slot_patch", "data": data}))
+
     def push_session_summary(self, key: str) -> None:
         """Broadcast that a session's intent summary was regenerated.
 
@@ -9427,6 +9883,8 @@ class DashboardState:
                     "slots": slots_list,
                     "yolo": note.get("_yolo", False),
                     "channelTrusted": note.get("channelTrusted", False),
+                    # Consumed by ``_send_ws_all``; never serialized to a client.
+                    "_legacy_only": bool(note.get("_legacy_only", False)),
                 }
                 # Built by `_slots_ws_frame`, NOT inline: the owner frame in
                 # `_do_slots_broadcast` has to carry an identical key set, and it
@@ -9513,8 +9971,11 @@ class DashboardState:
     def _send_ws_all(self, msg_type: str, data: object, msg: str) -> None:
         _websocket_for(self)._send_ws_all(msg_type, data, msg)
 
-    def _send_ws_owners(self, msg: str) -> None:
-        _websocket_for(self)._send_ws_owners(msg)
+    def _send_ws_owners(self, msg: str, *, skip_slot_patch_clients: bool = False) -> None:
+        if skip_slot_patch_clients:
+            _websocket_for(self)._send_ws_owners(msg, skip_slot_patch_clients=True)
+        else:
+            _websocket_for(self)._send_ws_owners(msg)
 
     def broadcast_ws(self, msg_type: str, data: object) -> None:
         # Mirror first, broadcast second. A relay reader consumes the SSE stream,

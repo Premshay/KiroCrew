@@ -26,7 +26,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from kiro_crew import acp_tool_gate, model_registry
+from kiro_crew import acp_tool_gate, model_registry, permission_floor
 from kiro_crew.acp import kas_wire
 from kiro_crew.acp._dispatch import (
     DRAIN_YIELD_AFTER_S,
@@ -64,6 +64,7 @@ from kiro_crew.acp.client import (
     _is_safe_oauth_url,
     _is_tool_interrupted_marker,
     _jsonrpc_error_code,
+    _loggable_request_id,
     _push_model_via_effort_split,
     _raise_acp_error,
     acp_config_option,
@@ -1110,6 +1111,10 @@ class AcpSessionHandle:
         # approve_tool / reject_tool echo the exact ids the agent advertised
         # (kiro "allow_once"/"allow_always"; claude-agent-acp "allow"/"reject").
         self._permission_options: dict[str | int, dict[str, str]] = {}
+        # Request id -> the permission event built for it, so approve_tool can
+        # put the request through the security floor (``permission_floor``)
+        # whichever consumer answers it.
+        self._permission_gate_events: dict[str | int, AcpEvent] = {}
         # req_ids of in-flight _wait_for_response calls (send_command /
         # set_config_option / compact). The prompt dispatch loop shares this
         # session's queue, so when it dequeues one of these responses it uses
@@ -1423,6 +1428,7 @@ class AcpSessionHandle:
         self._tool_call_tool_name.clear()
         self._native_child_tool_call_ids.clear()
         self._permission_options.clear()
+        self._permission_gate_events.clear()
         # Per-turn reset (parity with kiro-cli's authoritative full subagent_list
         # each turn): otherwise a completed sub-agent from a prior turn stays in
         # the roster and is re-emitted in the next turn's EVENT_SUBAGENT_LIST,
@@ -1533,6 +1539,15 @@ class AcpSessionHandle:
                 for _owed in _stale_owed:
                     self._queue.put_nowait(_owed)
                 _stale_owed.clear()
+                # Audit FIRST (off-loop, so it never delays the answer): the
+                # reject below is a bounded wire write that can fail, and a
+                # permission decision must leave its SEL record either way.
+                self._audit_handle_reject(
+                    stale.id,
+                    str(_stale_title),
+                    "stranded_request_pre_turn_drain",
+                    sub_session_id=(_stale_sid if _stale_sid != self._session_id else ""),
+                )
                 try:
                     await self.reject_tool(stale.id)
                 except asyncio.CancelledError:
@@ -1561,7 +1576,7 @@ class AcpSessionHandle:
                     "rejected permission request id=%s stranded in the "
                     "pre-turn drain (abandoned turn or between-turns child "
                     "frame) — answering so the backend cannot hang",
-                    stale.id,
+                    _loggable_request_id(stale.id),
                 )
                 # Crew-card notice ONLY for a child-origin strand: the card
                 # keys on sub_session_id, so the parent's own session id (an
@@ -1570,12 +1585,6 @@ class AcpSessionHandle:
                 # covered by the WARNING + SEL record.
                 if _stale_sid and _stale_sid != self._session_id:
                     self._pending_reject_notices.append((_stale_sid, str(_stale_title)))
-                self._audit_handle_reject(
-                    stale.id,
-                    str(_stale_title),
-                    "stranded_request_pre_turn_drain",
-                    sub_session_id=(_stale_sid if _stale_sid != self._session_id else ""),
-                )
             else:
                 # Everything that is not a permission request is DISCARDED, which
                 # is correct (it belongs to a turn nobody is reading any more) but
@@ -1863,7 +1872,7 @@ class AcpSessionHandle:
 
     # ── Tool Approval ──
 
-    async def approve_tool(self, request_id: str | int, option_id: str | None = None) -> None:
+    async def approve_tool(self, request_id: str | int, option_id: str | None = None) -> bool:
         """Approve a pending permission request.
 
         ``option_id`` overrides the auto-resolved id when provided. Otherwise the
@@ -1873,7 +1882,30 @@ class AcpSessionHandle:
         literals when nothing was recorded. This keeps kiro-cli
         ("allow_once"/"allow_always") and claude-agent-acp ("allow"/"allow_always")
         working without the caller knowing the backend.
+
+        Every approval first passes the security floor
+        (:mod:`kiro_crew.permission_floor`): a request the deny floor or the
+        sensitive-path checks refuse is REJECTED here, whichever consumer asked
+        to approve it and whether or not that consumer consulted the gate.
         """
+        gate_event = self._permission_gate_events.pop(request_id, None)
+        # No recorded event means no request this transport built, so there is
+        # nothing the floor could judge: refuse rather than approve unjudged.
+        if gate_event is None:
+            reason: str | None = permission_floor.REASON_NO_EVENT
+        else:
+            reason = await asyncio.to_thread(permission_floor.refusal_for, gate_event)
+        if reason is not None:
+            logger.warning(
+                "approve_tool: security floor rejected req=%s: %s",
+                _loggable_request_id(request_id),
+                permission_floor.loggable_reason(reason),
+            )
+            await asyncio.to_thread(
+                permission_floor.audit_refusal, gate_event, reason, request_id=request_id
+            )
+            await self.reject_tool(request_id)
+            return False
         resolved_id = option_id
         recorded = self._permission_options.pop(request_id, None)
         # Answered — the turn is no longer waiting on a human. Also closes the
@@ -1893,6 +1925,7 @@ class AcpSessionHandle:
             request_id,
             {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": resolved_id}},
         )
+        return True
 
     async def reject_tool(self, request_id: str | int) -> None:
         """Reject a pending permission request.
@@ -1906,6 +1939,7 @@ class AcpSessionHandle:
         later tool call in it without prompting.
         """
         recorded = self._permission_options.pop(request_id, None)
+        self._permission_gate_events.pop(request_id, None)
         # Answered (see approve_tool) — a rejection ends the human wait too.
         self._end_human_wait()
         reject_id = recorded.get("reject") if recorded else None
@@ -1922,7 +1956,7 @@ class AcpSessionHandle:
                 "reject_tool: no deny option advertised for req=%s; answering "
                 "'cancelled', which the backend may treat as cancelling the "
                 "remainder of the turn's tool calls",
-                request_id,
+                _loggable_request_id(request_id),
             )
             await self._runtime.send_response(
                 request_id,
@@ -1950,8 +1984,8 @@ class AcpSessionHandle:
         would answer it without a human, and a human offered the choice is being
         asked to re-decide something the spec already settled.
 
-        The reject is sent before the audit, and the audit runs off the loop, so an
-        audit failure cannot undo or delay the refusal.
+        The audit is recorded first and runs off the loop, so it can neither delay
+        the refusal nor be lost when the (bounded) reject write fails.
         """
         if not self.spec_denied_tools:
             return False
@@ -1967,13 +2001,13 @@ class AcpSessionHandle:
             server,
             self._session_id,
         )
-        await self.reject_tool(event.request_id)
         self._audit_handle_reject(
             event.request_id,
             f"mcp__{server}__{tool}",
             "spec_disabled_tool",
             sub_session_id=event.sub_session_id or "",
         )
+        await self.reject_tool(event.request_id)
         return True
 
     def _tripwire_spec_disabled_tool(self, result: AcpEvent, msg: JsonRpcMessage) -> None:
@@ -2059,13 +2093,13 @@ class AcpSessionHandle:
             "checked against that, while a consumer may auto-approve it [session=%s]",
             self._session_id,
         )
-        await self.reject_tool(event.request_id)
         self._audit_handle_reject(
             event.request_id,
             "mcp__unidentified",
             "spec_disabled_tool_unidentified_call",
             sub_session_id=event.sub_session_id or "",
         )
+        await self.reject_tool(event.request_id)
         return True
 
     def _audit_handle_reject(
@@ -2088,13 +2122,16 @@ class AcpSessionHandle:
         that never reach a consumer, so no consumer-side audit fires — every
         permission decision must still leave a SEL record (repo convention;
         the runtime's unregistered-session auto-reject does the same).
-        Off-loop (``asyncio.to_thread``) and AFTER the reject was sent: sel()
-        may do blocking filesystem work on first use, and an audit failure
-        must not undo or delay the already-made decision. Title is
-        backend/LLM-authored: bounded then redacted before it is stored.
+        Off-loop (``asyncio.to_thread``) and BEFORE the reject goes on the
+        wire: sel() may do blocking filesystem work on first use, so the audit
+        never delays the answer, and the reject is a bounded write that can
+        fail -- the decision must leave its SEL record whether or not the wire
+        accepted it (the same audit-first ordering chat_runner's deny paths
+        keep). Title is backend/LLM-authored: bounded then redacted before it
+        is stored.
         """
         safe_title = redact_text(str(title)[:4096])[:120] if title else "<unknown>"
-        rid = request_id if isinstance(request_id, (str, int)) else ""
+        rid = request_id if isinstance(request_id, (str, int, float)) else ""
         # Hang-resilience series: handle-owned denials (fail-close fidelity
         # gate, pre-turn drain). CHILD-origin only — the pre-turn drain also
         # answers abandoned PARENT-turn requests (sub_session_id empty), and
@@ -2256,7 +2293,7 @@ class AcpSessionHandle:
                         MODEL_CONFIG_ID,
                     )
                     return ""
-                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID):
+                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID, self._runtime.acp_backend):
                     raise
                 last_exc = exc
                 continue
@@ -3912,7 +3949,10 @@ class AcpSessionHandle:
                         self._queue.put_nowait(msg)
                         await asyncio.sleep(0)
                     else:
-                        logger.debug("Dropping stray response frame id=%s (no waiter)", msg.id)
+                        logger.debug(
+                            "Dropping stray response frame id=%s (no waiter)",
+                            _loggable_request_id(msg.id),
+                        )
                     continue
 
                 # The backend's hooks requests, answered here rather
@@ -3936,6 +3976,10 @@ class AcpSessionHandle:
 
                 if action == "permission":
                     _perm_event = self._build_permission_event(msg)
+                    if _perm_event is None:
+                        if msg.id is not None:
+                            await self._runtime.send_error(msg.id, -32600, "invalid request id")
+                        continue
                     # Before the fidelity gate: a tool the spec switched off is
                     # refused whether or not this consumer opted into the child
                     # contract, and naming that reason in the audit is more use
@@ -3955,16 +3999,16 @@ class AcpSessionHandle:
                         logger.warning(
                             "rejecting low-fidelity child permission request "
                             "id=%s for fidelity-unaware consumer (child=%s)",
-                            _perm_event.request_id,
-                            _perm_event.sub_session_id,
+                            _loggable_request_id(_perm_event.request_id),
+                            _loggable_request_id(_perm_event.sub_session_id),
                         )
-                        await self.reject_tool(_perm_event.request_id)
                         self._audit_handle_reject(
                             _perm_event.request_id,
                             _perm_event.title or "",
                             "child_low_fidelity_unaware_consumer",
                             sub_session_id=_perm_event.sub_session_id or "",
                         )
+                        await self.reject_tool(_perm_event.request_id)
                         yield AcpEvent(
                             kind=EVENT_SUBAGENT_ACTIVITY,
                             sub_session_id=_perm_event.sub_session_id,
@@ -4029,12 +4073,19 @@ class AcpSessionHandle:
                     _upd = _upd if isinstance(_upd, dict) else {}
                     _disc = str(_upd.get("sessionUpdate") or "")
                     _text = redact_text(str(_upd.get("content") or _upd.get("message") or ""))
+                    # An echo that named no session and was fanned out to
+                    # co-tenants is not this session's own (``runtime_global``).
+                    _ownerless = msg.fanout_no_owner
                     if _disc in ("steering_queued", "AgentExecutionUserMessageQueued"):
-                        yield AcpEvent(kind=EVENT_STEER_QUEUED, text=_text)
+                        yield AcpEvent(
+                            kind=EVENT_STEER_QUEUED, text=_text, runtime_global=_ownerless
+                        )
                     elif _disc in ("steering_consumed", "AgentExecutionSteeringInjected"):
-                        yield AcpEvent(kind=EVENT_STEER_CONSUMED, text=_text)
+                        yield AcpEvent(
+                            kind=EVENT_STEER_CONSUMED, text=_text, runtime_global=_ownerless
+                        )
                     elif _disc == "steering_cleared":
-                        yield AcpEvent(kind=EVENT_STEER_CLEARED)
+                        yield AcpEvent(kind=EVENT_STEER_CLEARED, runtime_global=_ownerless)
                 elif action == "metadata":
                     self._track_metadata(msg)
                 elif action == "compaction":
@@ -4058,7 +4109,9 @@ class AcpSessionHandle:
                     # the subagent roster already draws (runtime_global=).  A lone
                     # session's frame is left unmarked and genuinely is its own,
                     # so a single-session run is unaffected.  The event still
-                    # surfaces either way — only the mutations are gated.
+                    # surfaces either way, carrying that provenance
+                    # (``runtime_global``) so a consumer measuring this session's
+                    # own activity can tell; only the mutations are gated.
                     owns_frame = not msg.fanout_no_owner
                     if status_type == "completed" and owns_frame:
                         # The pre-compaction counts (and their authoritative
@@ -4081,15 +4134,27 @@ class AcpSessionHandle:
                             self._compaction_failed_at = time.monotonic()
                             self.last_compaction_transient = compaction_failure_is_transient(params)
                         summary = compaction_failure_detail(params)
-                    yield AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)
+                    yield AcpEvent(
+                        kind=EVENT_COMPACTION_STATUS,
+                        text=status_type,
+                        title=summary,
+                        runtime_global=not owns_frame,
+                    )
                 elif action == "clear":
-                    yield AcpEvent(kind=EVENT_CLEAR_STATUS)
+                    # Same provenance as the compaction notice: one that named
+                    # no session and was fanned out to co-tenants is not this
+                    # session's own.
+                    yield AcpEvent(kind=EVENT_CLEAR_STATUS, runtime_global=msg.fanout_no_owner)
                 elif action == "agent_switched":
                     saw_agent_switch = True
                     params = msg.params or {}
                     name = params.get("agentName", "")
                     self.active_agent = name if isinstance(name, str) else ""
-                    yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=params.get("agentName", ""))
+                    yield AcpEvent(
+                        kind=EVENT_AGENT_SWITCHED,
+                        text=params.get("agentName", ""),
+                        runtime_global=msg.fanout_no_owner,
+                    )
                 elif action == "subagent_list":
                     params = msg.params or {}
                     subs = params.get("subagents")
@@ -4960,7 +5025,7 @@ class AcpSessionHandle:
         except Exception:
             logger.warning("KAS executeHook refusal undeliverable for %s", self._session_id)
 
-    def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
+    def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent | None:
         """Build an AcpEvent for a permission request via the shared parser.
 
         Delegates to _dispatch.build_permission_event so this transport reads the
@@ -4985,8 +5050,12 @@ class AcpSessionHandle:
             cache_scope=str(_perm_params.get("sessionId") or self._session_id),
             kas_consent_meta=self._runtime.acp_backend == ACP_BACKEND_KAS,
         )
+        if event is None:
+            return None
         if recorded is not None and event.request_id != "":
             self._permission_options[event.request_id] = recorded
+        if event.request_id != "":
+            self._permission_gate_events[event.request_id] = event
         # A frame the runtime routed here for a backend-internal subagent
         # carries the CHILD's sessionId, not this handle's. Mark the origin so
         # the policy consumer can tell reduced-fidelity requests apart. Child

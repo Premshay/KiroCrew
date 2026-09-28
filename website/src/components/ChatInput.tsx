@@ -227,6 +227,7 @@ import { fmtDateFields, fmtPercent } from '../i18n/format'
 import SessionRefStrip from './SessionRefStrip'
 import type { SessionRef } from '../utils/sessionRefs'
 import { activeElementIsEditable, isEditableTarget } from '../utils/editableTarget'
+import { LiquidGlass } from './ui/liquid-glass'
 const INPUT_MIN_H = 44
 const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
@@ -4933,29 +4934,29 @@ function ChatInput({
             {/* File drag-and-drop target. Drag-drop is inherently pointer-only; the
            keyboard-accessible path is the "Attach files" button that opens the
            hidden file input above. Hence the scoped disable for the drop zone. */}
-            {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
-            <div
-              data-testid="input-wrapper"
-              ref={wrapperRef}
-              className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${memoryMode === 'incognito' || memoryMode === 'temporary' ? 'border-2' : 'border'} ${memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
-              onDragOver={onDragOver}
-              onDragLeave={onDragLeave}
-              onDrop={onDrop}
-            >
-              <SessionRefStrip
-                refs={pendingSessions}
-                onRemove={onRemoveSessionRef}
-                rootRef={sessionStripRef}
-              />
-              <FilePreviewStrip
-                files={pendingFiles}
-                dirs={pendingDirs}
-                resizedInfo={resizedInfo}
-                onRemove={onRemoveFile}
-                onRemoveDir={onRemoveDir}
-                rootRef={fileStripRef}
-              />
+      {/* Liquid Glass pane under the composer: --glass-tint over the blurred
+           transcript; the wrapper's own hairline border takes --glass-edge so the
+           pane keeps an outline on a white page, where a lit white rim vanishes. Always
+           mounted so an approval box arriving above never remounts the editor;
+           while one is attached the wrapper goes back to a solid surface and
+           square top, and the glass simply sits hidden behind it. */}
+      <LiquidGlass
+        cornerRadius={16}
+        frost={24}
+        lightIntensity={24}
+      >
+      {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
+      <div
+        data-testid="input-wrapper"
+        ref={wrapperRef}
+        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${hasApproval ? 'bg-bg-elevated' : 'bg-transparent'} ${memoryMode === 'temporary' ? 'border-aim' : memoryMode === 'incognito' ? 'border-warn' : hasApproval ? 'border-border focus-within:border-accent/50' : 'border-[color:var(--glass-edge)] focus-within:border-accent/50'}`}
 
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+      >
+        <SessionRefStrip refs={pendingSessions} onRemove={onRemoveSessionRef} rootRef={sessionStripRef} />
+        <FilePreviewStrip files={pendingFiles} dirs={pendingDirs} resizedInfo={resizedInfo} onRemove={onRemoveFile} onRemoveDir={onRemoveDir} rootRef={fileStripRef} />
               {handsFreePhase && (
                 <div
                   data-testid="handsfree-status"
@@ -6082,10 +6083,9 @@ function ChatInput({
                 </div>
               </div>
 
-              {/* Mobile bottom sheet */}
-            </div>
-          </motion.div>
-        )}
+        {/* Mobile bottom sheet */}
+
+      </div></LiquidGlass></motion.div>)}
       </AnimatePresence>
 
       {/* The way back. It stands exactly where the composer was and is the only

@@ -65,6 +65,7 @@ from kiro_crew.mcp_core import (
     strict_identity_diagnosis,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
+from kiro_crew.mcp_tool_titles import with_titles
 from kiro_crew.pinned_fs import fd_real_path
 from kiro_crew.platform import current_context, redact_log_via_context
 from kiro_crew.platform import redact_via_context as redact
@@ -1134,7 +1135,7 @@ def _resolve_cron_folder(ref: str, *, session_key: str | None) -> tuple[str, str
 
 def _list_tools() -> list[dict[str, Any]]:
     """Return MCP tool definitions."""
-    return [
+    tools: list[dict[str, Any]] = [
         {
             "name": "cron_list",
             "description": (
@@ -1515,6 +1516,7 @@ def _list_tools() -> list[dict[str, Any]]:
             },
         },
     ]
+    return with_titles("kirocrew-cron", tools)
 
 
 # ── cron_list rendering ──
@@ -2052,7 +2054,8 @@ def _deny_channel_agent_cron(tool_name: str) -> str | None:
 
     Channel agents (session keys ``channel:<channel_id>:<agent_id>``) are
     confined to channel-post communication -- ``CHANNEL_AGENT_BLOCKED_TOOLS``
-    holds back ``send_*`` and every ``session_*`` verb for exactly that reason.
+    holds back ``send_*``, every ``session_*`` verb, and every verb that starts
+    work outside the caller's own turn, for exactly that reason.
     Scheduling a cron job is the same shape made durable: ``cron_add`` takes an
     ``agent`` and ``approval_mode`` that flow straight to ``add_job``, so a
     channel agent could schedule ``agent="kirocrew", approval_mode="auto"`` and

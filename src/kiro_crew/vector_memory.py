@@ -1569,9 +1569,8 @@ class VectorMemoryStore:
           id map, written with no lockdown of their own.
 
         Not exhaustive for the data home as a whole -- ``memory.py``'s FTS index
-        (``memory_index.db``) and its sidecars carry the same secrets and are not
-        this class's to open. Tracked separately rather than reached across a module
-        boundary from here.
+        (``memory_index.db``) and its sidecars carry the same secrets; ``memory.py``
+        restricts those itself in ``MemoryStore._restrict_index_files``.
         """
         return (
             Path(f"{self._db_path}-wal"),
@@ -2551,6 +2550,26 @@ class VectorMemoryStore:
                 logger.warning("Facet stamp rollback failed for %r", item_id)
             logger.warning("Facet stamp failed for %r (row kept, carve axes absent)", item_id)
 
+    def embed_semantic(self, key: str, value: object) -> list[float] | None:
+        """Embed a semantic value before entering a caller-owned publication lock."""
+        if self.embed_fn is None or key.startswith("lesson."):
+            return None
+        value_json = json.dumps(value, ensure_ascii=False)
+        return self._try_embed(f"{key} {value_json}", PRIORITY_BULK)
+
+    def embed_semantic_retirement(self, key: str, value_json: str) -> list[float] | None:
+        """Resolve V1 supersession similarity before a caller-owned publication lock."""
+        if self.algorithm_version == "v2" or self.embed_fn is None:
+            return None
+        try:
+            old_value = json.loads(value_json)
+        except (json.JSONDecodeError, TypeError):
+            old_value = str(value_json)
+        if not isinstance(old_value, str) or len(old_value) < 3 or _is_degenerate_value(old_value):
+            return None
+        key_suffix = key.rsplit(".", 1)[-1].replace("_", " ")
+        return self._try_embed(f"{key_suffix}: {old_value}")
+
     @timed("vector", "write")
     def set_semantic(
         self,
@@ -2564,6 +2583,12 @@ class VectorMemoryStore:
         expected_revision: int | None = None,
         correction: record_meta.CorrectionEvidence | None = None,
         defer_embedding: bool = False,
+        embedding: list[float] | None = None,
+        embedding_resolved: bool = False,
+        embedding_generation: int | None = None,
+        retirement_embedding: list[float] | None = None,
+        retirement_embedding_resolved: bool = False,
+        retirement_value_json: str | None = None,
     ) -> tuple[SemanticRejectCode, str] | None:
         """Write a semantic memory entry with full validation pipeline.
 
@@ -2579,6 +2604,13 @@ class VectorMemoryStore:
         has measured this embedder to be slow and must stop paying that latency
         once per item. The row is keyword-searchable at once, and the state it
         persists is the state a FAILED embed already persists.
+
+        ``embedding_resolved`` and ``retirement_embedding_resolved`` say the caller
+        already attempted the value and V1 supersession embeddings, including a
+        ``None`` result. The matching generation and exact prior value keep those
+        vectors from crossing a model swap or a concurrent semantic update. This
+        lets transcript-derived callers perform inference before taking their
+        publication lock.
         """
         # Persist the raw UTF-8 dump (as memory_edit._json does for user
         # edits) so the size gate in validate_semantic measures exactly the
@@ -2613,6 +2645,12 @@ class VectorMemoryStore:
             expected_revision=expected_revision,
             correction=correction,
             defer_embedding=defer_embedding,
+            embedding=embedding,
+            embedding_resolved=embedding_resolved,
+            embedding_generation=embedding_generation,
+            retirement_embedding=retirement_embedding,
+            retirement_embedding_resolved=retirement_embedding_resolved,
+            retirement_value_json=retirement_value_json,
         )
         if conflict is not None:
             logger.info("Semantic write rejected for %r: %s", key, conflict)
@@ -2898,6 +2936,12 @@ class VectorMemoryStore:
         correction: record_meta.CorrectionEvidence | None = None,
         _consolidation: bool = False,
         defer_embedding: bool = False,
+        embedding: list[float] | None = None,
+        embedding_resolved: bool = False,
+        embedding_generation: int | None = None,
+        retirement_embedding: list[float] | None = None,
+        retirement_embedding_resolved: bool = False,
+        retirement_value_json: str | None = None,
     ) -> str | None:
         """Retain V1 conflict scoring; propose inferred changes in private V2.
 
@@ -3152,7 +3196,12 @@ class VectorMemoryStore:
         already_embedded = bool(
             existing and existing["value_json"] == value_json and existing["embedding"] is not None
         )
-        if (
+        if embedding_resolved:
+            embed_generation = (
+                embedding_generation if embedding_generation is not None else self._space_generation
+            )
+            vec = embedding
+        elif (
             self.embed_fn is not None
             and not defer_embedding
             and not key.startswith("lesson.")
@@ -3160,16 +3209,19 @@ class VectorMemoryStore:
         ):
             embed_generation = self._space_generation
             vec = self._try_embed(f"{key} {value_json}", PRIORITY_BULK)
-            if vec:
-                blob = struct.pack(f"{len(vec)}f", *vec)
-                with self._vector_commit(vec, best_effort=True) as current:
-                    if current and self._space_generation == embed_generation:
-                        self.db.execute(
-                            f"UPDATE {self._sem_rel} SET embedding = ? "
-                            f"WHERE key = ? AND value_json = ? AND is_deleted = 0"
-                            f"{self._sem_guard}",
-                            (blob, key, value_json),
-                        )
+        else:
+            embed_generation = self._space_generation
+            vec = None
+        if vec and not already_embedded:
+            blob = struct.pack(f"{len(vec)}f", *vec)
+            with self._vector_commit(vec, best_effort=True) as current:
+                if current and self._space_generation == embed_generation:
+                    self.db.execute(
+                        f"UPDATE {self._sem_rel} SET embedding = ? "
+                        f"WHERE key = ? AND value_json = ? AND is_deleted = 0"
+                        f"{self._sem_guard}",
+                        (blob, key, value_json),
+                    )
 
         # 9. Retire conflicting episodic entries that reference the old value
         # (called outside the lock — _retire_stale_episodic does a blocking embed
@@ -3209,7 +3261,24 @@ class VectorMemoryStore:
                 and not _is_degenerate_value(old_text)
             ):
                 try:
-                    self._retire_stale_episodic(key, old_text, defer_embedding=defer_embedding)
+                    resolved_retirement = bool(
+                        retirement_embedding_resolved
+                        and retirement_value_json == old_val
+                        and (
+                            embedding_generation is None
+                            or self._space_generation == embedding_generation
+                        )
+                    )
+                    self._retire_stale_episodic(
+                        key,
+                        old_text,
+                        defer_embedding=defer_embedding,
+                        query_embedding=(retirement_embedding if resolved_retirement else None),
+                        # The same verdict for both: a pre-resolved vector that the
+                        # key's rewrite or a model swap made stale is NOT "resolved
+                        # to None" -- the retirement must embed the actual old value.
+                        embedding_resolved=resolved_retirement,
+                    )
                 except Exception:
                     logger.warning(
                         "Stale-episodic retirement failed for key %r (semantic write kept)",
@@ -3239,7 +3308,13 @@ class VectorMemoryStore:
         return True
 
     def delete_semantic(
-        self, key: str, source: str, *, expect_value_json: str | None = None
+        self,
+        key: str,
+        source: str,
+        *,
+        expect_value_json: str | None = None,
+        superseded_by: str | None = None,
+        supersede_reason: str | None = None,
     ) -> bool:
         """Tombstone a semantic memory entry with its full prior revision.
 
@@ -3253,8 +3328,52 @@ class VectorMemoryStore:
 
         A caller that omits it deletes whatever is stored under *key*, which is what
         an explicit forget wants.
+
+        Pass *superseded_by* (the winning row's key) and optionally
+        *supersede_reason* (why it won, e.g. ``"62% keyword overlap"``) when this
+        deletion is a dedup SUPERSEDE rather than an explicit forget. Two audit
+        surfaces then carry the attribution durably, so a supersession can be told
+        apart from a forget and traced to its winner AFTER the fact -- even when the
+        ``learn_add`` reply that named it was lost to a timed-out write:
+
+        * the record's status is stamped ``superseded`` in ``memory_record_meta``
+          (not the default ``"forgotten"`` a plain forget records), and that value is
+          preserved in each revision snapshot -- so the tombstone reads apart from a
+          forget both in current state and in history. (The ``memory_revisions.status``
+          COLUMN is the revision's own workflow state, always ``"accepted"`` here; the
+          ``superseded`` record status lives in ``memory_record_meta`` and in the
+          revision's ``after`` snapshot, which is what ``get_record_metadata`` reads.)
+        * the audit event records ``superseded_by`` / ``supersede_reason`` as its
+          ``new_value`` instead of a bare ``None``.
+
+        IDENTITIES only -- ``superseded_by`` is the winner's ``lesson.<digest>`` row
+        id, never its text. A lesson can hold whatever the user tells the agent, and
+        both sinks persist to disk; the row TEXT belongs in the redacted result
+        ``superseded`` field, not here.
         """
         now = _now_iso()
+        is_supersede = superseded_by is not None
+        # Structural guards for the "identities only, never lesson text" invariant:
+        # both fields are code-derived (superseded_by is a lesson.<digest> row id from
+        # _lesson_key; the reason is a tag like an overlap ratio, a cosine, "contains"),
+        # so both are single-line and short. Enforce that at the sink rather than trust
+        # every future caller -- a value built from rule text would otherwise carry
+        # lesson content into a disk-persisted audit row.
+        for _label, _val, _cap in (
+            ("supersede_reason", supersede_reason, 120),
+            ("superseded_by", superseded_by, 200),
+        ):
+            if _val is not None and ("\n" in _val or len(_val) > _cap):
+                raise ValueError(f"{_label} must be a short single-line identifier, not text")
+        # A supersede records who won and why; a forget stays a bare None, unchanged.
+        new_value = (
+            json.dumps(
+                {"superseded_by": superseded_by, "reason": supersede_reason or ""},
+                separators=(",", ":"),
+            )
+            if is_supersede
+            else None
+        )
         with self._db_lock, self.db:
             row = self.db.execute(
                 "SELECT * FROM semantic_memory WHERE key=? AND is_deleted=0", (key,)
@@ -3279,9 +3398,29 @@ class VectorMemoryStore:
                 key,
                 dict(row),
                 source,
-                operation="forget",
+                # A supersede stamps the retained revision "superseded" so it reads
+                # apart from an explicit forget; only "status" rides here because
+                # normalize_metadata rejects any field outside its fixed set, and
+                # the winner/reason are recorded on the audit event below.
+                metadata={"status": "superseded"} if is_supersede else None,
+                operation="supersede" if is_supersede else "forget",
             )
-        self._log_event("delete", "semantic", key, row["value_json"], None, source)
+            if is_supersede:
+                # The attribution event is part of the supersede transaction, so the
+                # tombstone, revision, and winner/reason commit or roll back together.
+                # Same columns the event-log helper writes.
+                self.db.execute(
+                    "INSERT INTO memory_events (event_type, memory_type, memory_key, "
+                    "old_value, new_value, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("delete", "semantic", key, row["value_json"], new_value, source, now),
+                )
+        if not is_supersede:
+            # A forget writes its audit event best-effort AFTER committing the
+            # tombstone, through the shared helper -- an unavailable event table
+            # must not fail a forget. Only the supersede branch inlines the INSERT
+            # inside the transaction, where losing the winner/reason is the data
+            # loss this change exists to prevent.
+            self._log_event("delete", "semantic", key, row["value_json"], new_value, source)
         return True
 
     def _retire_one_episodic(self, mem_id: str, text: str, superseded_by: str) -> None:
@@ -3323,7 +3462,13 @@ class VectorMemoryStore:
         )
 
     def _retire_stale_episodic(
-        self, key: str, old_value: str, *, defer_embedding: bool = False
+        self,
+        key: str,
+        old_value: str,
+        *,
+        defer_embedding: bool = False,
+        query_embedding: list[float] | None = None,
+        embedding_resolved: bool = False,
     ) -> None:
         """V1 keeps its original heuristic; member V2 requires literal evidence.
 
@@ -3332,7 +3477,13 @@ class VectorMemoryStore:
         reaches only V1, the arm that embeds; V2 proves supersession from text.
         """
         if self.algorithm_version != "v2":
-            self._retire_stale_episodic_v1(key, old_value, defer_embedding=defer_embedding)
+            self._retire_stale_episodic_v1(
+                key,
+                old_value,
+                defer_embedding=defer_embedding,
+                query_embedding=query_embedding,
+                embedding_resolved=embedding_resolved,
+            )
             return
         # No embedding/similarity can prove a contradiction. Require the old
         # value in an assertion about this key, then keep an undoable audit row.
@@ -3354,7 +3505,13 @@ class VectorMemoryStore:
                 self._invalidate_episodic_scoring()
 
     def _retire_stale_episodic_v1(
-        self, key: str, old_value: str, *, defer_embedding: bool = False
+        self,
+        key: str,
+        old_value: str,
+        *,
+        defer_embedding: bool = False,
+        query_embedding: list[float] | None = None,
+        embedding_resolved: bool = False,
     ) -> None:
         """Soft-delete episodic entries that reference a superseded semantic value.
 
@@ -3383,7 +3540,12 @@ class VectorMemoryStore:
         # ``defer_embedding`` takes the same arm an unavailable embedder takes:
         # the text fallback below. Retiring fewer rephrased episodes is what this
         # path already does whenever the embed answers None.
-        emb = None if defer_embedding else self._try_embed(query)
+        if embedding_resolved:
+            emb = query_embedding
+        elif defer_embedding:
+            emb = None
+        else:
+            emb = self._try_embed(query)
         with self._db_lock:
             if emb is not None:
                 # mmr=False: internal write-path caller that applies its own cosine
@@ -3947,6 +4109,10 @@ class VectorMemoryStore:
 
     # ── Episodic CRUD ──
 
+    def embed_episodic(self, text: str) -> list[float] | None:
+        """Embed episodic *text* before entering a caller-owned write lock."""
+        return self._try_embed(text) if self.embed_fn else None
+
     def write_episodic(
         self,
         text: str,
@@ -3958,6 +4124,8 @@ class VectorMemoryStore:
         *,
         preserve_existing: bool = False,
         defer_embedding: bool = False,
+        embedding_resolved: bool = False,
+        embedding_generation: int | None = None,
         facets: "memory_schema.MemoryFacets | None" = None,
         metadata: dict | None = None,
     ) -> bool:
@@ -3976,7 +4144,11 @@ class VectorMemoryStore:
 
         ``defer_embedding`` stores the row with a NULL embedding instead of
         embedding inline, leaving it for :meth:`backfill_missing_embeddings`.
-        Inference cost grows steeply with text length (~0.4s per 2000-char chunk
+        ``embedding_resolved`` says the caller already attempted inference and
+        supplied its result, including ``None``; this method then performs no
+        inference of its own. Such a caller also supplies ``embedding_generation``
+        from :attr:`space_generation` before inference, so a model swap in the gap
+        leaves the vector NULL. Inference cost grows steeply with text length (~0.4s per 2000-char chunk
         on CPU), so a bulk writer such as the onboarding importer would hold its
         caller for minutes. The row is FTS5 keyword-searchable immediately, and
         becomes semantically searchable once the sweep fills it in. Only for
@@ -4046,8 +4218,17 @@ class VectorMemoryStore:
         # vector that reconcile has already swept past and that backfill never
         # revisits, because backfill only refills NULLs. So carry the generation to
         # the write and re-check it while holding the lock.
-        embed_generation = self._space_generation
-        if embedding is None and not defer_embedding and self.embed_fn is not None:
+        embed_generation = (
+            embedding_generation
+            if embedding_resolved and embedding_generation is not None
+            else self._space_generation
+        )
+        if (
+            embedding is None
+            and not defer_embedding
+            and not embedding_resolved
+            and self.embed_fn is not None
+        ):
             embedding = self._try_embed(text)
 
         embedding_blob: bytes | None = None
@@ -5336,6 +5517,8 @@ class VectorMemoryStore:
         repo_scope: str | None = None,
         *,
         applies: str | None = None,
+        rule_emb_resolved: bool = False,
+        defer_backfills: bool = False,
         facets: "memory_schema.MemoryFacets | None" = None,
     ) -> LessonWriteResult:
         """Write a lesson as a semantic entry with key lesson.<hash>.
@@ -5395,7 +5578,10 @@ class VectorMemoryStore:
         that MUST also read :attr:`space_generation` BEFORE it embeds and pass it
         as ``rule_emb_generation``, so a model swap landing between that embed and
         this write is detected and the vector is left NULL for the backfill
-        instead of being committed into the wrong space.
+        instead of being committed into the wrong space. ``rule_emb_resolved``
+        additionally distinguishes an attempted embed that returned ``None`` from
+        no attempt, and ``defer_backfills`` suppresses lazy legacy-row inference;
+        together they let a caller keep inference outside a short publication lock.
 
         Runtime model-identity assertions and recognized concrete-ID model-selection
         imperatives in either persisted field are refused here, before embedding or
@@ -5483,7 +5669,7 @@ class VectorMemoryStore:
             lesson_embed_generation = rule_emb_generation
         else:
             lesson_embed_generation = self._space_generation
-        if rule_emb is None:
+        if rule_emb is None and not rule_emb_resolved:
             rule_emb = self._try_embed(rule) if self.embed_fn else None
         backfills_done = 0
         # (blob, key, space generation, exact value embedded). The generation is
@@ -5801,7 +5987,11 @@ class VectorMemoryStore:
                     and len(existing_emb_blob) >= 4
                 ):
                     row_blob = existing_emb_blob
-                elif self.embed_fn and backfills_done < _MAX_BACKFILLS_PER_CALL:
+                elif (
+                    self.embed_fn
+                    and not defer_backfills
+                    and backfills_done < _MAX_BACKFILLS_PER_CALL
+                ):
                     # Same lazy-backfill contract as the main scan (count even
                     # on failure; generation sampled BEFORE the embed). The
                     # blob is memoized onto the row dict so the main scan
@@ -5991,6 +6181,7 @@ class VectorMemoryStore:
                     row_blob = existing_emb_blob
                 elif (
                     self.embed_fn
+                    and not defer_backfills
                     and backfills_done < _MAX_BACKFILLS_PER_CALL
                     and not existing.get("_authority_prepass_embed_failed")
                 ):
@@ -6098,17 +6289,31 @@ class VectorMemoryStore:
         # row sharing that key fails it, and no separate same-key check is needed.
         #
         # A supersede is LOGGED here because this is where one happens; the scan only
-        # nominates rows. IDENTITIES only, never row text -- a lesson holds whatever
-        # the user once told the agent, and this sink persists to disk.
+        # nominates rows. IDENTITIES only, never row text -- a lesson can hold
+        # whatever the user tells the agent, and this sink persists to disk.
+        #
+        # The attribution is passed INTO delete_semantic (winning key + reason), so
+        # the tombstone's record status and audit event record it durably in the
+        # database rather than only in the ``learn_add`` reply, which a
+        # timed-out-but-committed write can lose. The DB event/status write is that
+        # durable trace; the line below logs at WARNING so the same deletion is
+        # visible to a human tailing gateway.log (a default install records WARNING+
+        # to disk), not only to a query against the audit table.
         for d_key, d_report, d_body, d_reason in deferred_supersedes:
-            if not self.delete_semantic(d_key, source, expect_value_json=d_body):
+            if not self.delete_semantic(
+                d_key,
+                source,
+                expect_value_json=d_body,
+                superseded_by=key,
+                supersede_reason=d_reason,
+            ):
                 logger.info(
                     "Lesson supersede skipped: %s changed or went while %s was written",
                     d_key,
                     key,
                 )
                 continue
-            logger.info(
+            logger.warning(
                 "Lesson supersede: %s replaces %s [%s] (%s), %d so far",
                 key,
                 d_key,
@@ -6500,7 +6705,13 @@ class VectorMemoryStore:
             self._check_recall_query(recall_query)
             lesson_rows = self._eligible_rows(self.get_lessons(), "directive")
         for row in lesson_rows:
-            decoded = json.loads(row["value_json"])
+            try:
+                decoded = json.loads(row["value_json"])
+            except (TypeError, ValueError, RecursionError):
+                # One unreadable row must not fail every context build; the key
+                # names the row to repair, the value is left out of the log.
+                logger.warning("Skipping lesson %r: stored value_json does not decode", row["key"])
+                continue
             text = _renderable_lesson_text(decoded, row["key"])
             if not text:
                 continue

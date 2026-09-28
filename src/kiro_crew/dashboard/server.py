@@ -572,6 +572,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/session-control/create",
         "/api/session-control/fork",
         "/api/session-control/stop",
+        "/api/session-control/set-model",
         "/api/session-control/close",
         "/api/session-control/send",
         "/api/session-control/adopt",
@@ -1960,6 +1961,10 @@ def _register_mcp_routes(app: web.Application) -> None:
         "/api/session-control/stop", _deferred("session_control", "api_session_control_stop")
     )
     app.router.add_post(
+        "/api/session-control/set-model",
+        _deferred("session_control", "api_session_control_set_model"),
+    )
+    app.router.add_post(
         "/api/session-control/close", _deferred("session_control", "api_session_control_close")
     )
     app.router.add_post(
@@ -2765,6 +2770,42 @@ def _apply_startup_yolo(state: DashboardState, cfg: Any) -> None:
         "Safety override enabled at startup (dangerouslySkipPermissions=true, %s)",
         "no expiry" if result.ttl == 0 else f"expires in {result.ttl}s per policy",
     )
+
+
+async def _retake_hops_then_revive(registry: InstancesRegistry, manager: SshTunnelManager) -> None:
+    """Re-take the lent hop ports, then revive. Both off the boot path, in this order.
+
+    A hop lease is PERSISTED and the listening socket that enforces it is not, so a
+    restart arrives holding leases that keep ports out of this gateway's own allocator
+    and own them in no other sense -- the window the lease alone cannot close, reopened
+    by the restart. Re-taking them is therefore startup work, not a nicety.
+
+    But it is not BOOT-PATH work. `_instances_startup` is an `on_startup` hook, so it
+    runs inside `runner.setup()` before the HTTP port is bound, and the re-take costs a
+    registry read plus one bind per live lease -- data-scaled work on the path the
+    desktop app's gateway-wait window measures. So it moves in here, behind the same
+    tracked task that already backgrounds the revive below for that exact reason, and
+    the read itself goes to a thread because it is a file read on the event loop.
+
+    Ordering is load-bearing and is why this is one task rather than two: the revive
+    reconnects instances that will ALLOCATE ports, and a lease whose hold is not yet
+    taken is a port the allocator already avoids but nothing owns. Re-taking first
+    means no reconnect can race a lease that is still unenforced.
+    """
+    try:
+        unheld = await asyncio.to_thread(manager.sync_hop_holds)
+    except Exception:
+        logger.exception("Could not re-take lent hop ports after restart")
+    else:
+        if unheld:
+            logger.error(
+                "Could not re-take %d lent hop port(s) after restart: %s. A chained "
+                "credential naming each is still valid, so another process may hold "
+                "it; the guard retries each until it is taken or its lease lapses.",
+                len(unheld),
+                sorted(unheld),
+            )
+    await _revive_intended_instances(registry, manager)
 
 
 async def _revive_intended_instances(
@@ -3986,7 +4027,7 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
         # the port bind immediately; tunnels reconnect (or surface their error
         # on the instance tab, which persists on failure) without gating
         # startup.
-        revive_task = asyncio.create_task(_revive_intended_instances(registry, manager))
+        revive_task = asyncio.create_task(_retake_hops_then_revive(registry, manager))
         state._background_tasks.add(revive_task)
         revive_task.add_done_callback(state._background_tasks.discard)
 
@@ -4009,7 +4050,7 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
             # Imported here, not at module scope: this file is on the gateway boot
             # path, and the emitter is flag-gated behind KIROCREW_CREW_LOG.
             # AUTOSDE's no-new-work-on-gateway-boot-path rule asks for the IMPORT to
-            # be gated, not just the handler, so a launch with the flag unset pays
+            # be gated, not just the handler, so a launch with the flag off pays
             # nothing for a subsystem it will never call.
             from kiro_crew.crew_log import emit as crew_log_emit
 
@@ -5605,12 +5646,6 @@ async def start_dashboard(
         # failed warm never blocks readiness.
         await warm_sel_singleton()
 
-        # Bind the crew-log push to this loop and register it with the session
-        # emitter. Installed here rather than lazily on a first request: the frame
-        # exists so a watching client learns of a growth it did not ask for, and a
-        # publisher armed by the first read would miss every growth before it.
-        handlers.install_crew_log_publisher(state)
-
         # Explicit middleware ordering — self-documenting and immune to future insertions
         app.middlewares[:] = [
             # Outermost: privacy-safe per-route latency. Times the FULL
@@ -5847,6 +5882,12 @@ async def start_dashboard(
     # the constructor (which runs pre-bind, on the loop) and runs here on a
     # worker thread once requests are already being served.
     _kick_knowledge_orphan_reclaim(state)
+    # Bind the crew-log push to this loop and register it with the session emitter,
+    # once the listener is serving: installing it imports and builds the publisher,
+    # which the crew log's default-on flag would otherwise put in front of the bind.
+    # It is installed here rather than on a first request because the frame exists
+    # so a watching client learns of a growth it did not ask for.
+    handlers.install_crew_log_publisher(state)
 
     # Event-loop heartbeat: proves the asyncio loop is live (the off-loop /proc
     # sampler can't — it runs in a subprocess). Sleeps 10s, then logs actual
@@ -5899,8 +5940,10 @@ async def start_dashboard(
         while True:
             t0 = time.monotonic()
             await asyncio.sleep(interval)
-            _loop_watchdog.beat()
             lag = time.monotonic() - t0 - interval
+            # Claimed before beat(): check() holds its own capture flag until a beat.
+            capture_lag = _loop_watchdog.claim_lag_enrichment(lag)
+            _loop_watchdog.beat()
             # Resource-pressure notifications ride the heartbeat cadence
             # rather than owning a task: the notifier self-gates to its own
             # sample interval, never raises, and off-loads its synchronous
@@ -5921,6 +5964,16 @@ async def start_dashboard(
                 # stays silent unless it actually wedges (the tripwire), and we
                 # don't emit ~8.6k INFO lines/day when DEBUG is enabled.
                 logger.debug("event-loop heartbeat ok (lag %.2fs)", lag)
+            if capture_lag:
+                # Bounded like the probes above so a busy executor cannot starve
+                # beat(); shielded so the capture still clears its in-flight flag.
+                try:
+                    capture = asyncio.get_running_loop().run_in_executor(
+                        None, _loop_watchdog.log_lag_enrichment, lag
+                    )
+                    await asyncio.wait_for(asyncio.shield(capture), 2.0)
+                except Exception:
+                    logger.debug("heartbeat lag capture not awaited", exc_info=True)
 
     def _heartbeat_done(task: "asyncio.Task") -> None:  # type: ignore[type-arg]
         if task.cancelled():

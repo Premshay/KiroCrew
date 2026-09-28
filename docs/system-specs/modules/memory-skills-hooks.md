@@ -375,12 +375,33 @@ material by replacing a manual member document.
 
 Both versions freeze a deep copy of the extraction transcript and revalidate
 its generation, original message prefix and new user turns after the model
-returns, before any memory write. Edited/deleted source messages or a new user
-turn refuse that pass and leave it pending without charging a different span's
-retry budget. Appended assistant acknowledgments can remain pending while the
-unchanged original span is committed. This source check and each record's
-revision check protect against stale background extraction; they are separate
-checks, not a cross-file transcript/database transaction.
+returns, before any memory write. Every transcript-derived durable publication
+then enters `ConversationLog.publication_hold` for that one write: the member V2
+atomic consolidation transaction, and each V1 history, semantic, preference,
+project, lesson and episodic write. The hold runs on the existing worker and spans
+neither extraction nor embedding inference nor an event-loop await. Edited/deleted
+source messages or a new user turn refuse that pass and leave it pending without
+charging a different span's retry budget. Appended assistant acknowledgments can
+remain pending while the unchanged original span is committed. The
+persistence switch is checked at the start of the run and before its first
+publication. If it turns off before any output commits, the run is refused and
+no transcript span is marked consolidated. Once one output commits, the run
+finishes its remaining outputs and marks the span normally so a retry cannot
+repeat a partial consolidation. The same latch governs a later hold the seam
+refuses: before the first commit a restricted line (`TranscriptWithheld`) or a
+lock the hold cannot take (`TranscriptBusy`) refuses the run with nothing
+marked; after it, the run stops publishing at that output -- a restricted line
+must not be learned from and a busy lock cannot be vouched for -- logs at
+warning which stage was refused and why, and still marks the span consolidated.
+The outputs after the first are best-effort memory, while leaving the span
+pending re-runs it on the next idle sweep and `append_history`, which carries no
+receipt, appends the same history entry twice; a transcript restricted mid-run
+is refused by the derivation seam on every later run, so marking it loses
+nothing. The run-level latch counts only a publication
+whose writer reports success, or a no-result writer that completes without raising.
+This source check and each record's revision
+check protect against stale background extraction; they are separate checks,
+not a cross-file transcript/database transaction.
 
 The prefs path does NOT advance the persisted `last_consolidated` marker — only the history path does. This ensures history consolidation always covers all messages, even if prefs consolidation fired earlier.
 
@@ -388,7 +409,52 @@ Idle detection: `_last_activity[key]` updated on every `maybe_consolidate()` cal
 
 **Both paths write to the session's captured store.** `_consolidate` captures the
 canonical execution context before its first await and refuses incognito or
-temporary sessions before reading their transcripts. V2 uses that context's exact
+temporary sessions before reading their transcripts. A channel thread's
+`!temporary` / `!incognito` mode lives in two durable records for two readers:
+the session map's flag (`SessionMap.set_flag`, keyed by the live `slack:<ts>`
+key) is what the channel's inbound gate hydrates from per message, and the
+transcript header's `memory_mode` is what every memory reader refuses on -- this
+pass's pre-snapshot check, the derivation seam (`TranscriptWithheld`) and the
+publication hold around each durable write, above. `privacy_mode._commit_mode`
+writes both, the row first and then the header, tighten-only against the
+header's mode read NORMALIZED (`history.transcript_privacy_mode`: the shared
+predicate's `lower()` and set, returning the mode, so a header spelled
+`Temporary` is the stricter mode it is rather than an unknown string an
+incognito stamp would overwrite; upserted, so a thread flagged before its first
+turn gets a metadata-only header that `ConversationLog.append` then keeps), so a
+transcript read never depends on the session map. A privacy flag keeps its map
+entry alive through `SessionMap.prune` and the per-read repair, both of which
+run under the map lock on the event loop and read no transcript, and through
+every other path: no step removes a privacy-flagged row, whatever the header
+says, because the gate hydrates from the map alone and a removed row leaves it
+reading the thread as persistent after the next restart. The header of a row
+flagged before the stamp existed is ensured by `SessionMap.stamp_privacy_headers`,
+which the session pool's `start_pool` runs right after `prune` (awaited in place
+by a blocking start; inside the already-scheduled task by a non-blocking one, so
+a live-config apply or a background-session restart never waits on it): every
+flagged row is named under the map lock (a snapshot of candidates, no file
+touched), then each row is re-read and stamped under that session's
+durable-write lock (`privacy_mode._serialized`, the lock the modifier's commit
+and a reservation's release hold across their own row-and-header sequences): a
+row the re-read finds unflagged is skipped, and a row still flagged has its
+existing transcript's header probed on a worker thread and the mode copied in
+where it is missing or weaker (tighten-only, never creating a transcript).
+Serialized because the snapshot goes stale under live traffic: a reservation
+released after the snapshot restores the header and clears the row, and a stamp
+from the snapshot alone re-wrote the released mode into that header over a row
+that was gone -- which nothing loosens again (the sweep only tightens, from
+rows; a later release of the same mode reads the stale stamp as its own
+`header_before`), so the thread's consolidation stayed refused for good. A flag
+tightened during the probe is re-stamped by the next pass, and a header that
+already records the mode costs no write (`needs_tightening`). The rows are
+capped at `SessionMap.PRIVACY_ROW_CAP` (the trackers' `PRIVACY_LRU_MAX`), held
+by refusing a NEW flag fail-closed -- the modifier tells the user the message
+was not processed and does not run it -- never by evicting a retained row.
+Retiring those rows needs the inbound gate to read the header, a separate
+change. This pre-snapshot refusal is the memory-mode choke point every entry
+point inherits (idle sweep, `maybe_consolidate`, expiry sweep, dashboard
+trigger, CLI); the dashboard trigger adds its own target-side 403 in front of it
+(see the route table below). V2 uses that context's exact
 member store and commits learned records, history and the retry receipt in one
 SQLite transaction. V1 retains `context.store_of_session(log, key)` and its
 Markdown and lesson fallback behavior. See [Memory across surfaces and channels](#memory-across-surfaces-and-channels).
@@ -850,7 +916,7 @@ SQLite table `semantic_memory` — structured key-value store with:
 - **Key format**: `^[a-z][a-z0-9_.]*[a-z0-9]$`, max 100 chars; value JSON max 4,096 bytes. The lower bound is a decoded one: a value that is null, empty, or only whitespace is refused as `VALUE_EMPTY`, so no row can hold a value that reads as absent.
 - **Confidence gating**: writes whose source is not `user_explicit` require confidence ≥ `_DEFAULT_CONFIDENCE_THRESHOLD` (0.8); `user_explicit` bypasses the threshold
 - **V1 conflict resolution**: `user_explicit` replaces an existing value; an automated source cannot replace an active user-explicit fact, unless the stored value is itself degenerate (null, empty, or only whitespace) — that row holds nothing for precedence to protect, and only an automated writer would ever repair it, so such a write is allowed and logged. Otherwise higher confidence wins, or the newer value wins when the confidence difference is less than 0.1. Tombstones can be recreated. V1 consolidation retains direct stale-key deletion and its semantic prompt, while extracted lessons keep their automatic consolidation source. An LLM confidence claim is not user evidence. Reaffirmation still refreshes confidence/source and reaches the original embedding and retirement paths. Owner edits retain shared revision checks. A rejected write logs a best-effort `conflict_skip` event; an unavailable event log does not prevent a V1 data write.
-- **Injection detection**: the `_INJECTION_PATTERNS` regex set (14 patterns, `vector_memory_constants.py`) is scanned on every value write
+- **Injection detection**: the `_INJECTION_PATTERNS` regex set (`vector_memory_constants.py`) is scanned on every value write
 - **Write-time embedding**: `_write_semantic()` embeds `"<key> <value_json>"` after the upsert (outside `_db_lock`, at `PRIORITY_BULK` — nothing blocks on it and the tail is reached from consolidation/import loops; same space-generation contract as `write_lesson`) and persists the struct-packed, un-normalized vector into the row's `embedding` column. The upsert's conflict clause keeps the stored vector when the value is unchanged (a re-affirmation — the tail then skips the redundant embed) and clears it when the value changed, so a row never ranks by a vector for text it no longer holds. `lesson.*` keys are excluded (`write_lesson` owns their vector — raw rule text). `set_semantic_if_absent()` (bulk import) defers embedding to the backfill sweep, like `write_episodic(defer_embedding=True)`. Rows missed while the model was absent — plus rows cleared by `reconcile_embedding_space()` — are repaired by `_backfill_semantic_kv_embeddings()` inside `backfill_missing_embeddings()`.
 - **Audit trail**: `memory_events` table logs every create/update/delete with old+new values, bounded at `_MAX_EVENTS = 10_000`. The dashboard events API recursively redacts credentials and unsafe URLs on response for Global V1, named V1 and private V2. Stored events and their identities remain unchanged.
 
@@ -1289,7 +1355,24 @@ unbounded archival memory.
 
 Admitted project essentials are the active project's root `AGENTS.md` and
 `SOUL.md`, default/`always` documents under `.kiro/steering`, and Markdown file
-resources explicitly declared by the template. Native `manual`, `auto` and
+resources explicitly declared by the template. The global `~/.kiro/steering`
+always documents, the root `AGENTS.md` and undeclared `.kiro/steering`
+documents are kiro-cli default resources: when kiro-cli serves the session and
+`chat.disableInheritingDefaultResources` opts the workspace out, the snapshot
+omits them and keeps the prompt, the declared resources and `SOUL.md`, which is
+Crew's own file rather than a kiro-cli default. The verdict is computed once
+per normal turn, where the harness is known, and handed to the snapshot and the
+folder-steering dedup; no consumer reads the setting itself, and on any other
+harness the member keeps inheriting because a kiro-cli setting changes nothing
+there. A profile validation pass does not read the setting and instead measures
+the inheriting envelope, which is the largest envelope any harness can build.
+The preference comes from the skill projection's decision (see
+[ACP client](acp-client.md)), so Crew's overlay on that key never reads as an
+opt-out; settings that cannot be read keep inheritance. A non-member kiro-cli
+chat follows the same decision: in an opted-out workspace a folder that
+declares the project's or the global `.kiro/steering` root carries those
+always documents itself, at session start and after a compaction, instead of
+skipping them as already delivered. Native `manual`, `auto` and
 `fileMatch` steering retain their trigger semantics. A custom template's
 declared prompt may be inline or a file source. Missing optional root files
 are allowed; an unreadable declared source or malformed/shadowed template
@@ -2305,7 +2388,7 @@ before reading transcript bodies, opening learned memory or billing a model.
 | POST | `/api/memory/migrate` | Migrate markdown → structured memory (gated) |
 | POST | `/api/memory/import` | Import from JSON export (gated) |
 | POST | `/api/memory/promote` | Promote repeated episodic patterns to semantic facts, tombstoning the rows folded in (gated) |
-| POST | `/api/memory/consolidate` | Trigger consolidation for one session (restricted-mode check only) |
+| POST | `/api/memory/consolidate` | Trigger consolidation for one session. Gated on the caller like every write, and additionally on the TARGET: the body's `key` is resolved through `resolve_session_memory_mode` (live slot first, then the persisted execution record and transcript header) and a temporary or incognito target is 403 `restricted_target_session` (the body carries the target's `mode` as a field, which the Memory tab's tally names) before the running claim or any other work. A channel transcript reaches the route as its filename stem (`slack_<ts>`), so the stem is first unfolded to the thread's live key through the session map (`channel_key_for_stem`) and the thread's flag is read there. When that live resolution does not refuse, the route reads the transcript header under `key` exactly as `_consolidate` does (`get_metadata`, the mode normalized), so a stem the map cannot unfold, or an entry the map no longer holds, is refused from its header here instead of answering 200 for a pass the consolidator refuses. A key no record calls restricted proceeds |
 | GET | `/api/memory/context-preview?q=` | Preview injected semantic + episodic context |
 | GET | `/api/memory/observability?q=` | `stats` + `rejections` + `context_preview`, plus `reads` — the read-volume counters (see above). `reads` is resolved LAST, so it INCLUDES the reads this request itself performed; that is what lets a caller issue the same `q` twice and compare the two objects |
 | GET | `/api/memory/recall?q=` | V2 task recall with evidence. Explicit `store` requires the dashboard owner; the authenticated MCP path uses the owning session's canonical execution context and requires memory reads to be allowed. Invalid or unavailable member memory returns an explicit error |
@@ -2690,7 +2773,7 @@ concurrent native write from being duplicated.
 
 User-taught corrections ("always do X", "never do Y"). Single write path through `vector_memory.write_lesson()`:
 
-1. **Vector memory** (primary): stored as `lesson.<md5hash>` semantic entries with `confidence=1.0, source=user_explicit`. The value is a mapping `{"rule", "category", "negative"}`, plus `"repo_scope"` when the lesson is restricted to one repository — the NOT-clause is a separate field; legacy in-band `"rule — NOT: negative"` rows stay readable without migration. Injected via `get_lessons_context()` — separate from `[Semantic Memory]` block. A scoped lesson is gated by `project_scope.project_scope_satisfied` against the session's active project BEFORE the shown/omitted counts are computed, using the same rule as a skill's `repo_scope`.
+1. **Vector memory** (primary): stored as `lesson.<md5hash>` semantic entries with `confidence=1.0, source=user_explicit`. The value is a mapping `{"rule", "category", "negative"}`, plus `"repo_scope"` when the lesson is restricted to one repository — the NOT-clause is a separate field; legacy in-band `"rule — NOT: negative"` rows stay readable without migration. Injected via `get_lessons_context()` — separate from `[Semantic Memory]` block. A scoped lesson is gated by `project_scope.project_scope_satisfied` against the session's active project BEFORE the shown/omitted counts are computed, using the same rule as a skill's `repo_scope`. A row whose stored `value_json` does not decode is skipped with one warning naming its key (never its value), so one bad row cannot fail every context build.
 2. **V1 JSONL fallback** (`~/.kiro/crew/lessons.jsonl`): only used when vector memory is not initialized. Read-only migration source once vector memory is active.
 
 **V1 priority**: vector lessons override JSONL. V2 never constructs a JSONL lesson store or falls back to one; an empty SQLite lesson table is a valid empty result. The fallback is keyed on whether the
@@ -2965,6 +3048,12 @@ opens keep the final-name and size checks while the
 ancestor and unlink identity checks degrade to by-name checks. Setup and gateway
 startup both invoke it; startup runs it on every boot so a package upgrade needs
 no separate setup command.
+
+Agent skill-path discovery also scans nested AIM package snapshots under the
+per-package snapshot tree. A valid object version manifest with `currentEventId`
+selects that snapshot. Malformed JSON or a non-object manifest has no selected
+event and follows the existing fallback of scanning nested snapshots; it does not
+abort agent configuration.
 
 **Project skills (`<project>/.kiro/skills`) — a different source from the one above.**
 `$KIROCREW_PROJECT_DIR/skills/` is a *sync* source: its contents are copied into
@@ -3275,7 +3364,18 @@ The explicit unbudgeted catalog renderer remains available to non-startup caller
 Native Kiro 2.21.2 progressively loads bodies but places every mapped skill's
 metadata into startup context. Native CLI launch views omit those skill resources
 and suppress implicit native skill inheritance; Crew supplies the bounded directory.
-The authored agent spec remains the mapping authority. See
+The authored agent spec remains the mapping authority. On a shared runtime a view
+stands on the `kirocrew-core` per-session element that gives `skill_search` this
+session's identity, so the projection asks the same predicate the mount asks over
+the spec entry as authored at preparation, refusing a view whose spec withholds
+the element; the global and project MCP settings are read once per session start
+by the mount alone, which hands its verdict on with the array, and the runtime
+refuses that one session on it -- stub or no stub in its array -- naming the file
+and the restriction while the spawn and the other agents' sessions stand. The
+direct client mounts the declaration natively with the identity on its process
+environment, so its view keeps a spec restriction on other tools
+([native skill startup views](acp-client.md#native-skill-startup-views)).
+See
 [context management](../../architecture/context-management.md#4-default-agent-vs-other-agents)
 for native view and inherited steering behavior.
 
@@ -4339,7 +4439,7 @@ session ends → HistoryConsolidator (3h idle path)
             → SEL audit event emitted
 ```
 
-No new timer, no new background task — piggybacks on the existing idle-fired `HistoryConsolidator._consolidate()` path. The auxiliary LLM already runs on the background kiro-cli session every 3 hours of idle per session; the auto-skill keys are appended to the same JSON the LLM already returns.
+No new timer, no new background task — piggybacks on the existing idle-fired `HistoryConsolidator._consolidate()` path. The auxiliary LLM already runs on the background kiro-cli session every 3 hours of idle per session; the auto-skill keys are appended to the same JSON the LLM already returns. Before every final stage, create, or refine write, the consolidator enters `ConversationLog.publication_hold`, which revalidates the chained transcript privacy lines and retains their locks for only that final filesystem write. A restricted or unreadable line discards the candidate. The hold never spans skill extraction, metadata dedupe, or merge model calls, so privacy validation and publication are atomic without blocking transcript writers for model latency.
 
 ### Eligibility gate (`_count_tool_call_messages`, `_session_touched_sensitive`)
 
@@ -4358,6 +4458,37 @@ Prompt keys are only appended when ALL hold:
 Auto-generated skills live under `~/.kiro/crew/skills/auto/<slug>/SKILL.md`. Slug validated against `^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`. The `auto/` prefix:
 - Makes provenance visible without parsing frontmatter (`list_auto_skills()`)
 - Prevents accidental overwrite of hand-authored skills via the refine path (`update_auto_skill()` explicitly refuses names outside `auto/`)
+
+### One slug space, one allocator
+
+The live tree `auto/<slug>` and the pending queue `auto/.pending/<slug>` are two halves of ONE name space, because a queued NEW candidate's promotion destination IS `auto/<slug>`. A claim that consults only its own half can take a name the other half depends on, and the losing side goes silently: `approve_pending_skill` refuses a candidate whose live name is occupied (`live_exists`) for as long as that directory stands, TTL pruning then deletes it unreviewed, and consolidation advances its message offset whatever one candidate's outcome, so nothing is retried from the same sessions.
+
+**The invariant: the three AUTO-SKILL allocators test availability with `_auto_slug_available` while holding `_auto_slug_claim_lock`.** They are `create_auto_skill` (live publish), `stage_skill_candidate` (queue a candidate), and `restore_auto_skill` (move an archived skill back live). A new allocator in this pipeline MUST route through the same pair rather than checking a directory itself.
+
+Two writers reach `auto/` WITHOUT that coordination, and both are known gaps rather than covered cases:
+
+- The `crystallize` builtin skill stages `auto/.pending/<slug>` with raw file tools instead of calling `stage_skill_candidate`, so it can write a pending directory after a live claim already stands. Approval then refuses that candidate for `live_exists` and TTL pruning deletes it unarchived. Closing this means giving crystallize a host path that calls `stage_skill_candidate`, not adding another direct-write guard.
+- `create_skill` accepts any name, including an `auto/`-prefixed one, from the dashboard prompt and discover handlers (`READONLY_SKILL_KEY_PREFIXES` does not exclude `auto/`), so a hand-created `auto/<slug>` can strand a queued candidate through the same `live_exists` refusal. Closing this means refusing or routing `auto/`-prefixed names at those call sites.
+
+`_auto_slug_available(slug, claim=...)` answers for the claim actually being made, because the halves are not symmetric:
+
+| `claim` | Free when |
+|---|---|
+| `live` | `auto/<slug>` absent AND no pending NEW candidate under that slug |
+| `pending-new` | `auto/.pending/<slug>` absent AND `auto/<slug>` unoccupied (a queued candidate whose live name is taken is unapprovable) |
+| `pending-update` | `auto/.pending/<slug>` absent; the live tree does not constrain it |
+
+An UPDATE candidate is queued under `<target-slug>-update` and `approve_pending_update` promotes it over the live `target` in its metadata, never consulting `auto/<candidate-slug>`, so it reserves nothing in the live tree. The `live` test reads the queued candidate's `kind` to tell the two apart and FAILS CLOSED: metadata that is missing, unreadable, or silent about `kind` keeps the slug reserved. Staging therefore holds the lock until `.meta.json` is committed, since `kind` is the field a concurrent publish reads.
+
+`_auto_slug_claim_lock` is an advisory exclusive lock on `skills/.auto-slug-claim.lock` — a dot-prefixed plain file at the skills root, skipped by discovery, placed outside `auto/` so taking it does not create the auto namespace as a side effect of a refused claim. It yields whether the lock was ACQUIRED, and an unacquired lock is a REFUSAL: opening the file can fail on a read-only home, and the acquire can lose within its seconds-long ceiling. Each namespace's claim is additionally an atomic `mkdir(exist_ok=False)`, so a claim lost to a concurrent writer refuses instead of overwriting, but `mkdir` alone cannot make the cross-namespace pair safe because the two paths create different directories.
+
+**Both claim paths return `None` rather than raising or half-succeeding.** `stage_skill_candidate` returns `None` when nothing is queued: an invalid slug, an oversized procedure, an unacquired lock, or no free name across `<slug>` and siblings `<slug>-2..-50`. A `None` means the candidate is NOT on disk and the caller MUST take its rejection branch, because a name returned from a path that wrote nothing is recorded as a staged candidate that does not exist, and the offset advance makes that loss permanent and invisible. `create_auto_skill` and `restore_auto_skill` likewise answer `None` on refusal, which their callers audit as a rejection.
+
+**One of those refusals is transient, and only that one is retried.** An invalid slug, an oversized procedure and an exhausted sibling walk are properties of the CANDIDATE: refused once, refused forever. An unacquired claim lock is a property of the MOMENT. A caller reading a bare `None` cannot tell them apart, so a claim path also fills in a `ClaimRefusal` when one is supplied, setting `retryable` for the lock case alone.
+
+Skill detection is what acts on it. It records a `(rotation_generation, message_count)` marker per session BEFORE staging runs and skips a pass whose pair is unchanged, so a stall would otherwise cost the candidate until a further message changed the count or a gateway restart cleared the marker — a session that goes quiet right after the stall loses it. On a `retryable` refusal the pass RETRACTS its own marker, so the next consolidation re-judges the same unchanged session and reaches the claim with the lock free.
+
+**The shared consolidation offset is deliberately left advanced.** History, semantic and lesson extraction all consume it, so rewinding it to re-attempt one skill candidate would re-summarize an already-consolidated tail into duplicate entries — which is why skill detection reads the last `_SKILL_DETECTION_WINDOW` messages of the whole session and was decoupled from that offset in the first place. The marker is the only state the retry rewinds.
 
 ### Provenance (`AutoSkillProvenance`)
 

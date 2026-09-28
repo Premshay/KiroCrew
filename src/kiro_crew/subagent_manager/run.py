@@ -19,9 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from ..subagent import (
-        _AGENT_NAME_RE,
         _CANCEL_RESUME_PREFIX,
-        _MAX_ERROR_DETAIL_LEN,
         _ON_DONE_TIMEOUT,
         _RECOVERY_SLOT_WAIT_SECS,
         _RESET_TIMEOUT,
@@ -37,6 +35,7 @@ if TYPE_CHECKING:
         FALLBACK_CANDIDATE_ATTEMPTS,
         FALLBACK_STORY_ATTR,
         HOOK_EVENT_POST_TOOL_USE,
+        MAX_ERROR_DETAIL_LEN,
         STOP_CLASS_CANCELLED,
         STOP_RECOVERY_MAX_RETRIES,
         TOOL_AUTO_APPROVE,
@@ -72,19 +71,27 @@ if TYPE_CHECKING:
         configured_fallback_chain,
         evict_completed_agents,
         extract_options,
+        failure_name,
         fire_tool_hooks,
         hook_gate_kwargs,
         identity_grant_covers_child,
+        is_registered_agent_name,
         is_runtime_death,
+        join_failures,
+        kill_set,
         logger,
         name_grant,
+        process_survived_async,
         provider_fallback_active,
+        read_tombstone,
         run_in_embed_pool,
         sel,
+        teardown_capture,
         time,
         transient_retry_delay,
         update_state,
         window_for_provider_client,
+        with_kill_failure,
         write_result_chunk,
     )
 
@@ -389,29 +396,131 @@ class RunEventCoordinator(ManagerComponent):
         except Exception:
             logger.warning("Subagent %s: release failed", info.id, exc_info=True)
         if not info._session_sharing:
+            # Taken BEFORE the reset and RETAINED under the run's id: the reset
+            # pops the session from the map before the awaits that can hang,
+            # and this teardown is the reset that commonly hangs while the
+            # reaper (a deadline, a user Stop) arrives to act on it -- the
+            # reaper finds the map empty and reads this entry instead. On a map
+            # miss here the roles are reversed and the entry is the reaper's.
+            # Every process the key names is a candidate, each on its own handle.
+            pairs = self._manager._sessions_under(session_key)
+            handles = self._manager._retain_process_handles(info.id, session_key, pairs)
+            seen = [session for session, _handle in pairs]
+            # Under a scope whose hook takes the handle of the exact session the
+            # reset pops (a successor a cold start registered after the snapshot);
+            # a popped session with no pid the snapshot never saw is a kill
+            # failure, one it saw names no process (see ``_force_reap``).
+            reset_kwargs, popped = teardown_capture(self._manager._sessions, session_key)
+            kill_failed: str | None = None
+            fallback_ran = False
             try:
-                await asyncio.wait_for(
-                    self._manager._sessions.reset(session_key), timeout=_RESET_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Subagent %s: reset timed out, force-killing", info.id)
-                await self._manager._sigkill_session(session_key)
                 try:
-                    sel().log_tool_invocation(
-                        session_key=session_key,
-                        source="subagent",
-                        tool_name="run_finally_force_kill",
-                        outcome="sigkill",
-                        metadata={"subagent_id": info.id},
+                    await asyncio.wait_for(
+                        self._manager._sessions.reset(session_key, **reset_kwargs),
+                        timeout=_RESET_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Subagent %s: reset timed out, force-killing", info.id)
+                    fallback_ran = True
+                    targets, missing = kill_set(handles, popped, seen=seen)
+                    kill_failed = join_failures(
+                        await self._manager._sigkill_sessions(session_key, targets), missing
                     )
                 except Exception:
-                    logger.exception("Subagent %s: SEL audit failed", info.id)
-            except Exception:
-                logger.exception("Subagent %s: reset failed", info.id)
+                    logger.exception("Subagent %s: reset failed, force-killing", info.id)
+                    fallback_ran = True
+                    targets, missing = kill_set(handles, popped, seen=seen)
+                    kill_failed = join_failures(
+                        await self._manager._sigkill_sessions(session_key, targets), missing
+                    )
+                else:
+                    # A completed reset (True, or False for a key the reaper had
+                    # already popped) is not proof the process is gone; each
+                    # handle is asked, and a process still standing gets the
+                    # fallback (see ``_force_reap``).
+                    targets, missing = kill_set(handles, popped, seen=seen)
+                    survivors = [
+                        handle for handle in targets if await process_survived_async(handle)
+                    ]
+                    if survivors:
+                        logger.warning(
+                            "Subagent %s: process survived the reset, force-killing", info.id
+                        )
+                        fallback_ran = True
+                        kill_failed = await self._manager._sigkill_sessions(session_key, survivors)
+                    if missing:
+                        fallback_ran = True
+                        kill_failed = join_failures(kill_failed, missing)
+                if kill_failed is not None:
+                    # The record names the survivor BEFORE the report publishes:
+                    # the terminal report spawned ahead of this teardown waits
+                    # on ``teardown_done`` (set by the caller's ``finally`` once
+                    # this returns) before it builds its payload, so the
+                    # completion the parent receives, the ``subagent_done``
+                    # event and the tombstone all carry the same failure -- and
+                    # a completed run whose process the kill left standing is
+                    # NOT marked delivered (``_report_terminal`` gates that on
+                    # an empty error), so its folder stays in orphan
+                    # reconciliation, which is what kills the survivor at the
+                    # next start. Published first, the parent received a clean
+                    # completion whose ``delivered`` tombstone hid the process
+                    # from reconciliation for good (the cron reaper's
+                    # ``last_error`` takes the same suffix, the one spelling).
+                    info.error = with_kill_failure(info.error or "", kill_failed)
+                    tombstone = read_tombstone(info.id)
+                    if tombstone is not None and tombstone.get("cause") != "delivered":
+                        # The run's own arm wrote it already (an error, a
+                        # timeout, a cancel): re-written under the same cause so
+                        # the record on disk names the failure too.
+                        self._manager._write_tombstone(info, str(tombstone.get("cause") or "error"))
+                if fallback_ran:
+                    try:
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="subagent",
+                            tool_name="run_finally_force_kill",
+                            # Never ``sigkill`` for a process the kill left
+                            # alive; the failure it reported is the record's
+                            # error text and this row's.
+                            outcome="sigkill" if kill_failed is None else "failed",
+                            error=kill_failed or "",
+                            metadata={"subagent_id": info.id},
+                        )
+                    except Exception:
+                        logger.exception("Subagent %s: SEL audit failed", info.id)
+            except asyncio.CancelledError as exc:
+                # The kill never decided: the cancellation landed inside the
+                # reset, the survivor probe or the signal (a gateway shutdown
+                # cancelling the run task). The report this teardown gates is
+                # released by the caller's ``finally`` either way, so the record
+                # names the undecided kill BEFORE that release -- the cron
+                # reaper's rule for its own cancelled kill awaits -- and the
+                # completion the parent receives, the ``subagent_done`` event and
+                # the delivered-or-not decision all see it: a clean record here
+                # published a success and wrote the ``delivered`` tombstone that
+                # hid a process nothing had stopped from orphan reconciliation.
+                # Not when a reap cancelled this task: the reap consumed the
+                # retained handle before cancelling and its own arm writes the
+                # kill's outcome, so a second record here would name the kill
+                # twice.
+                if not info._reap_started:
+                    info.error = with_kill_failure(
+                        info.error or "",
+                        f"{failure_name(exc)}: the teardown was cancelled before its kill decided",
+                    )
+                raise
+            finally:
+                # Decided (or cancelled out from under -- by the reaper, which
+                # consumed the entry before cancelling this task).
+                self._manager._process_handles.pop(info.id, None)
 
     async def _run_impl(self, info: SubagentInfo) -> None:
         """Execute a subagent task in its own session."""
         session_key = info.conversation_key or f"subagent:{info.id}"
+        # Set by the reap-echo arm below: the run ended because a reap in
+        # flight tore its runtime down, and that reap publishes the terminal
+        # report once its kill has decided (see the ``finally``).
+        reap_owns_report = False
         try:
             await asyncio.wait_for(
                 self._manager._run_inner(info, session_key), timeout=self._manager._default_timeout
@@ -513,6 +622,16 @@ class RunEventCoordinator(ManagerComponent):
                 # is what wins the first-arrival record over the reaper's own
                 # synthesis (guard 1 in ``_force_reap``), so the whole record --
                 # error, stat, tombstone -- is written HERE, as it was before.
+                # The REPORT is not: this arm runs while the reap still awaits
+                # its reset or the fallback kill that follows it, so a report
+                # published from this task's ``finally`` would tell the parent
+                # the run was reaped before the kill has decided, and a failure
+                # the fallback then reports would reach only the in-memory
+                # error text. The reap claims the report after its kill has
+                # decided (``supersede_recovery=True``), with the failure
+                # appended and the tombstone re-written -- so it is left to
+                # the reap.
+                reap_owns_report = True
                 origin = info._stop_origin or "the reaper"
                 if not info.done:
                     # Neutrality follows the FIRST stopper. A Stop that lands
@@ -545,11 +664,11 @@ class RunEventCoordinator(ManagerComponent):
             else:
                 # Story appended INSIDE the cap: info.error reaches a WS frame
                 # and the Subagents panel, so the rendered total stays bounded
-                # by _MAX_ERROR_DETAIL_LEN exactly as before — and the budget
+                # by MAX_ERROR_DETAIL_LEN exactly as before — and the budget
                 # trims the ERROR text, never the story, so a verbose chain
                 # cannot push the walk out of the terminal error.
                 info.error = append_fallback_story(
-                    _describe_exception(exc), exc, budget=_MAX_ERROR_DETAIL_LEN
+                    _describe_exception(exc), exc, budget=MAX_ERROR_DETAIL_LEN
                 )
                 info.done = True
                 Stats().inc_subagent_failed()
@@ -574,7 +693,15 @@ class RunEventCoordinator(ManagerComponent):
             # from _agents AND _tasks, and it still must not tombstone a child that
             # is being killed.
             self._manager._teardown_gates[info.id] = teardown_done
-            if self._manager._claim_finalize(info):
+            if reap_owns_report:
+                # The reap-echo arm ran: the reap that tore the runtime down
+                # publishes the report once its kill has decided (its claim
+                # supersedes). The run still owns its cost sample, which the
+                # claim branch below would otherwise have recorded; the reap's
+                # own record guard is skipped for a record this arm wrote.
+                info.elapsed = time.time() - info.started
+                self._manager._record_cost(info)
+            elif self._manager._claim_finalize(info):
                 info.elapsed = time.time() - info.started
                 self._manager._record_cost(info)
                 report_task = self._manager._spawn_terminal_report(
@@ -970,8 +1097,10 @@ class RunEventCoordinator(ManagerComponent):
         # an arbitrary spawn-approval wait). Must be the first statement.
         info._exec_started = time.time()
         info._first_stream_started = None
+        info._startup_cotenant_frames = 0
         # The durable row stays ``starting`` until this run's OWN turn produces
-        # its first stream event (``_mark_running`` in the stream loop below):
+        # its first stream event addressed to its session
+        # (``ensure_running_marked`` in the stream loop below):
         # session creation, the session-start gate and a late adoption are all
         # start time, and a row that reads ``running`` while no turn exists yet
         # would let a stall be judged against a session that is still being
@@ -1368,7 +1497,7 @@ class RunEventCoordinator(ManagerComponent):
             )
         # Intentionally check info.agent (not resolved `agent`) so only
         # explicitly requested agents skip _SYSTEM_PREFIX (defense-in-depth).
-        named_agent = bool(info.agent and _AGENT_NAME_RE.fullmatch(info.agent))
+        named_agent = bool(info.agent and is_registered_agent_name(info.agent))
         raw_task = info._raw_task or info.task
         message = raw_task if named_agent else (_SYSTEM_PREFIX + raw_task)
         if info._cancel_retry_used and (info.streaming_text or info.tool_count > 0):
@@ -1651,9 +1780,24 @@ class RunEventCoordinator(ManagerComponent):
                     _withheld: LLMEvent | None = None
                     _infra: Any = None
                     async for _ev in client.stream(msg):
-                        # The run's own turn has produced its first frame: the
-                        # durable row is ``running`` from here.
-                        self.ensure_running_marked(info)
+                        if not _ev.runtime_global:
+                            # A frame addressed to THIS session: the run's own
+                            # turn exists, so the durable row is ``running`` and
+                            # the run is out of startup from here. Taken on the
+                            # raw frame, ahead of the withholding below, because
+                            # a completion withheld for recovery is an answer
+                            # too. A ``runtime_global`` frame is a co-tenant's
+                            # traffic that the shared runtime fanned out, so it
+                            # proves nothing about this start (see the
+                            # activity-clock note in the loop that consumes this
+                            # stream).
+                            self.ensure_running_marked(info)
+                            self._manager._leave_startup(info)
+                        elif info._first_stream_started is None:
+                            # Kept for the startup reap's record, so a start
+                            # that saw only co-tenant traffic reads apart from
+                            # one whose stream stayed silent.
+                            info._startup_cotenant_frames += 1
                         if _ev.kind == EVENT_STRUCTURED_STATUS:
                             # W4: the execution layer (or the liveness oracle)
                             # says a tool is waiting for real input. The lane
@@ -1827,13 +1971,6 @@ class RunEventCoordinator(ManagerComponent):
         # leaves TurnUsage.duration_ms at 0, so the row needs this.
         # Includes transient-retry backoff, which is real wall time the caller
         # waited for this turn.
-        info._first_stream_started = time.time()
-        # The last way out of startup that is not a PID (a provider may create
-        # its child lazily from ``stream()``, so a run can reach here with
-        # ``_pid`` still None): wake a spawn the in-startup bound is holding.
-        # Only the FIRST turn's stream is a transition; this line runs per turn.
-        if info.turns == 0:
-            self._manager._note_startup_progress(info)
         _turn_t0 = time.monotonic()
         async for event in _stream_with_transient_retry():
             # Refresh the activity clock for every event kind that BELONGS to
@@ -2690,6 +2827,13 @@ class RunEventCoordinator(ManagerComponent):
         # (the prompt itself was refused), and the session IS live -- the turn
         # was issued -- so the row must be ``running`` before the wait is
         # written or the wait is refused and the row parked instead.
+        #
+        # The same fact takes the run out of startup: the provider answered
+        # this session's prompt, so what follows is a wait for the dependency,
+        # bounded by the scope's own deadline and ending in its own error --
+        # never a start that is not starting for the startup watchdog to reap,
+        # and never a place in the in-startup bound while parked.
+        self._manager._leave_startup(info)
         verdict = await self._dependency_verdict(coordinator, info, signal)
         if verdict.outcome != "wait":
             info._resume_event = None
@@ -2836,7 +2980,8 @@ class RunEventCoordinator(ManagerComponent):
     def ensure_running_marked(self, info: "SubagentInfo") -> None:
         """Write the durable row ``running`` once the run's own turn exists.
 
-        Normally done by the first stream event; the stop-recovery path calls it
+        Normally done by the first stream event addressed to this session (a
+        ``runtime_global`` frame is a co-tenant's); the stop-recovery path calls it
         too, because a wait can only be recorded on a ``running`` row and the
         turn that failed was a real turn on a live session. The write is POSTED,
         which is what orders it ahead of the wait write ``yield_slot`` posts
@@ -2999,7 +3144,7 @@ class RunEventCoordinator(ManagerComponent):
         Names the class and the raw stop reason (so a parent can act on it),
         the recovery attempts spent, and whether a partial was preserved.
         """
-        evidence = _redact(str(getattr(event, "text", "") or ""))[:_MAX_ERROR_DETAIL_LEN]
+        evidence = _redact(str(getattr(event, "text", "") or ""))[:MAX_ERROR_DETAIL_LEN]
         partial = " — partial result preserved" if info.partial else ""
         if stop.name == STOP_CLASS_CANCELLED:
             return f"cancelled (stop_reason={stop.stop_reason}): turn cancelled by the runtime{partial}"

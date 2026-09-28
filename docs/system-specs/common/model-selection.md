@@ -301,6 +301,17 @@ its own once the cache refreshes with a list that carries it.
   id being tested, and callers gate on that. Comparing ids across two harnesses'
   namespaces calls every legitimate model unusable (harness-parity invariant `H12`).
 
+Member create and update validation pass the DM slot's backend to the shared
+model-pin check. When the configured default harness (`agent.acp_backend`) and
+the member DM harness (`agent.member_acp_backend`) share a model-registry
+namespace, the default scopes the entitlement evidence; when they diverge the
+member backend does, because the DM thread runs on it. Entitlement evidence then
+comes only from live providers sharing that scoped backend's namespace: `kiro`
+(including the empty default backend) and `kas` share `acp`. Providers with
+unknown identity or another namespace supply no evidence, so a pin the scoped
+backend has no live catalog for is treated as unknown (allowed), never rejected
+by an unrelated harness's advertised ids.
+
 ## The one allowed concrete fallback
 
 The `claude_code` seam's `cc_model` (`_BACKGROUND_CC_MODEL` in `agent.py`) is the one

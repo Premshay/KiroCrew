@@ -25,6 +25,7 @@ from kiro_crew import model_registry, resource_status
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent import _prompt_path, is_managed_prompt
 from kiro_crew.agent_discovery import agent_skill_globs
+from kiro_crew.agent_sdk.drivers import acp as acp_driver
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, is_claude_code
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
 from kiro_crew.board_tag_grammar import is_grantable_tag_id
@@ -54,6 +55,7 @@ from kiro_crew.member_essential_context import (
     _MAX_DOCUMENTS,
     ESSENTIAL_MAX_CHARS,
     MemberEssentialContextError,
+    member_inherits_default_resources,
     render_essentials,
 )
 from kiro_crew.members import (
@@ -524,32 +526,61 @@ _THREAD_FENCE_NEUTRALIZED = "[fence-marker-removed]"
 
 
 def _fence_marker_regex(marker: str) -> re.Pattern[str]:
-    """Compile a case-insensitive, whitespace-tolerant matcher for a fence marker.
+    """Compile a case-insensitive, separator-tolerant matcher for a fence marker.
 
-    A literal, case-sensitive ``str.replace`` only neutralizes the exact marker
-    text. An attacker who controls the fenced thread-parent content could
-    smuggle a lowercase, title-case, or internally-spaced variant (e.g.
-    ``<<< untrusted thread parent``) that a literal replace would miss, letting
-    the forged marker "break out" of the UNTRUSTED DATA block. To close that
-    gap we match each significant character of the marker separated by optional
-    whitespace, treat underscores as interchangeable with whitespace, and
-    compile with ``re.IGNORECASE``.
+    Each significant character of the marker may be separated by optional
+    whitespace, and matching is case-insensitive. An underscore position is
+    one separator run of any whitespace, underscore or hyphen, including an
+    empty run: markers are matched on the normalized view, which removes
+    default-ignorable characters and folds Unicode dashes to ``-``, so a
+    separator may have been removed or folded before matching.
+
+    The underscore run REPLACES the optional-whitespace joins on either side of
+    it rather than sitting between them, so no two nullable classes are ever
+    adjacent and matching stays linear in the input length.
     """
-    chars: list[str] = [r"[\s_]" if ch == "_" else re.escape(ch) for ch in marker]
-    return re.compile(r"\s*".join(chars), re.IGNORECASE)
+    separator = r"[\s_-]*"
+    pieces: list[str] = []
+    for ch in marker:
+        if ch == "_":
+            if pieces and pieces[-1] == r"\s*":
+                pieces.pop()
+            if not pieces or pieces[-1] != separator:
+                pieces.append(separator)
+            continue
+        if pieces and pieces[-1] != separator:
+            pieces.append(r"\s*")
+        pieces.append(re.escape(ch))
+    return re.compile("".join(pieces), re.IGNORECASE)
 
 
 _THREAD_FENCE_OPEN_RE = _fence_marker_regex(_THREAD_FENCE_OPEN)
 _THREAD_FENCE_CLOSE_RE = _fence_marker_regex(_THREAD_FENCE_CLOSE)
 
+# Delimiters that wrap untrusted calendar/meeting metadata in a meetings agent's
+# first message. Content inside the block is neutralized of every untrusted
+# fence, so no fenced surface can close another surface's block either.
+UNTRUSTED_CALENDAR_FENCE_OPEN = "<<<UNTRUSTED_CALENDAR_EVENT"
+UNTRUSTED_CALENDAR_FENCE_CLOSE = ">>>END_UNTRUSTED_CALENDAR_EVENT"
+_CALENDAR_FENCE_OPEN_RE = _fence_marker_regex(UNTRUSTED_CALENDAR_FENCE_OPEN)
+_CALENDAR_FENCE_CLOSE_RE = _fence_marker_regex(UNTRUSTED_CALENDAR_FENCE_CLOSE)
+
+_UNTRUSTED_FENCE_RES: tuple[re.Pattern[str], ...] = (
+    _THREAD_FENCE_CLOSE_RE,
+    _THREAD_FENCE_OPEN_RE,
+    _CALENDAR_FENCE_CLOSE_RE,
+    _CALENDAR_FENCE_OPEN_RE,
+)
+
 
 def _neutralize_fence_markers(text: str) -> str:
-    """Replace Unicode-normalized variants of either thread fence in *text*.
+    """Replace Unicode-normalized variants of every untrusted fence in *text*.
 
-    The shared marker matcher supplies NFKC, default-ignorable removal, and
+    Covers the thread-parent and calendar-event fences, open and close. The
+    shared marker matcher supplies NFKC, default-ignorable removal, and
     original-coordinate spans; the replacement remains fence-specific.
     """
-    spans = _marker_spans(text, (_THREAD_FENCE_CLOSE_RE, _THREAD_FENCE_OPEN_RE))
+    spans = _marker_spans(text, _UNTRUSTED_FENCE_RES)
     return _apply_marker_spans(text, spans, _THREAD_FENCE_NEUTRALIZED)
 
 
@@ -966,6 +997,17 @@ def _post_compaction_checkpoint_context(checkpoint: Mapping[str, object] | None)
     if next_action := _text("next_action"):
         lines.append(f"Next action: {next_action}")
     return "\n".join(lines)
+
+
+def neutralize_untrusted_text(text: str) -> str:
+    """Neutralize untrusted fence markers and primary boundary markers in *text*.
+
+    Public entry point for surfaces outside this module that frame untrusted
+    content inside an untrusted-data fence: the result carries no fence marker
+    (thread-parent or calendar-event) and no forgeable prompt boundary marker.
+    Span-local, like both underlying scrubs.
+    """
+    return _neutralize_structural_markers(_neutralize_fence_markers(text))
 
 
 def _fit_folder_steering_into_envelope(
@@ -2256,20 +2298,32 @@ def _load_steering_resources() -> str:
         return ""
 
 
-def _project_steering_delivered(provider_type: str, native_steering: bool) -> bool:
+def _project_steering_delivered(
+    provider_type: str, native_steering: bool, project: str | None
+) -> bool:
     """Whether the project/global ``.kiro/steering`` trees already reach the model.
 
     Three paths exist and this names all of them, so the folder-steering dedup
     skips those trees ONLY where one of them is in effect: kiro-cli (the ACP
     default label) loads an agent's ``resources`` natively when spawned with
-    ``--agent``; the Claude Code seam receives the explicit ``[Steering
-    resources]`` load in ``build_message`` (gated on ``is_cc``); KAS reports
-    ``native_steering`` on its session provider. Every other harness -- Codex,
-    OpenCode, Pi, Goose, DeepSeek -- has NO path for those trees today, so a
-    folder that declares one of them must deliver its documents itself rather
-    than skip them as "already delivered" with nothing arriving in their place.
+    ``--agent``, but only while *project* inherits kiro-cli's default resources
+    (a workspace that sets ``chat.disableInheritingDefaultResources`` gets
+    those trees from nobody, so the folder must carry them); the Claude Code
+    seam receives the explicit ``[Steering resources]`` load in
+    ``build_message`` (gated on ``is_cc``); KAS reports ``native_steering`` on
+    its session provider. Every other harness -- Codex, OpenCode, Pi, Goose,
+    DeepSeek -- has NO path for those trees today, so a folder that declares one
+    of them must deliver its documents itself rather than skip them as "already
+    delivered" with nothing arriving in their place. The opt-out is read only
+    on the kiro-cli disjunct: a kiro-cli setting changes nothing on another
+    harness. The driver is asked directly, with no admission check on
+    *project*: this path also serves non-member sessions and must not raise.
     """
-    return provider_type == PROVIDER_ACP or is_claude_code(provider_type) or bool(native_steering)
+    return (
+        (provider_type == PROVIDER_ACP and acp_driver.inherits_default_resources(project))
+        or is_claude_code(provider_type)
+        or bool(native_steering)
+    )
 
 
 def _render_folder_steering_section(
@@ -2404,11 +2458,13 @@ _MEMBER_HOW_YOU_WORK_COMMON = """[HOW YOU WORK]
    the result back with the answer; for irreversible actions, come back with a
    concrete proposal and wait for approval. Never hand the problem back
    untouched.
-2. Front desk vs workshop. This DM thread is your front desk — keep it light,
-   because it lives for years. Do NOT run substantial work inline here: open a
-   separate work session for it (spawn_run and the session tools), keep the
-   heavy context there, and report back in this thread with the outcome and
-   evidence ("re: <the thing>"). Several work items can run in parallel.
+2. Front desk vs workshop. This DM thread is your front desk and lives for
+   years, so keep it light.
+   Do focused work (a lookup, a fix, a review) right here. Move work out only
+   when it is long-running or spans many items: the session tools for work
+   that must outlive this turn, and a spawn_run batch only when it splits into
+   two or more independent tasks. Report back in this thread with the outcome
+   and evidence ("re: <the thing>").
 3. When stuck, climb this ladder in order, and genuinely try each rung:
    (a) try a genuinely DIFFERENT approach — another tool, entry point, or
        strategy, not the same command again;
@@ -2422,9 +2478,8 @@ _MEMBER_HOW_YOU_WORK_COMMON = """[HOW YOU WORK]
        items — escalation is non-blocking.
 4. Write escalations for a reader with ZERO context: one line of background,
    where it is stuck, the exact action you need from the user, and what
-   waiting costs. Keep it short. Before sending, have a context-free subagent
-   read the draft and confirm a stranger could act on it; rewrite until it
-   passes.
+   waiting costs. Keep it short. Before sending, reread the draft as a
+   stranger with no context would, and rewrite until they could act on it.
 5. A quiet cycle is a successful cycle. Report real signals — results, walls,
    threshold crossings — never "nothing new"."""
 
@@ -2467,8 +2522,8 @@ def _template_selected_on_member_store(execution_context: Any) -> bool:
     or a ``spawn_run(agent=...)`` delegate of a member — is that member's
     delegate sent to do the work: it keeps the member's identity, its
     ``[PERMANENT RULES]`` and its memory, but not the desk protocol, whose
-    "open a separate work session" item would only make the delegate hand the
-    work on again.
+    "front desk vs workshop" item (move work out only when it is long-running
+    or spans many items) would only make the delegate hand the work on again.
 
     A member with no persisted ``member_id`` is never in this position. Its
     record names it by ``selection_kind == "member"`` and ``selection_name``
@@ -2476,8 +2531,8 @@ def _template_selected_on_member_store(execution_context: Any) -> bool:
     without losing the member -- and losing the member drops its rules along
     with its persona. The ``session_create`` arm therefore keeps such a member's
     selection and changes only the template, so that child keeps its whole
-    desk; the spawn gate's ``spawn_run(agent=...)`` child of such a member is a
-    plain template run on the parent's store and has no member section at all.
+    desk; a ``spawn_run(agent=...)`` child of such a member is a plain template
+    run on the parent's store and has no member section at all.
     """
     return (
         execution_context is not None
@@ -3666,6 +3721,7 @@ class ContextBuilder:
         # Every VARIABLE payload is scrubbed before the genuine headers are
         # minted around it — see _MEMBER_MARKER_RES for why this runs at
         # content time rather than in the structural-marker scan.
+        member = _scrub_member_payload(member)
         description = _scrub_member_payload(description)
         triggers = _scrub_member_payload(triggers)
         rules = _scrub_member_payload(rules)
@@ -3766,6 +3822,7 @@ class ContextBuilder:
         trigger_text: str = "",
         steering_dirs: tuple[str, ...] = (),
         template_selected: bool = False,
+        provider_type: str = PROVIDER_ACP,
     ) -> str:
         """Refresh complete member essentials without opening learned memory.
 
@@ -3773,6 +3830,11 @@ class ContextBuilder:
         for the execution being built and is handed to the member-section builder
         unchanged: the envelope keeps the member's identity, rules, documents and
         anchors, and withholds only the desk protocol and briefing.
+
+        ``provider_type`` names the harness serving the session. Only kiro-cli
+        (:data:`PROVIDER_ACP`) honours ``chat.disableInheritingDefaultResources``,
+        so its verdict is read once here, where the harness is known, and handed
+        to every consumer; no consumer reads the setting itself.
         """
         from kiro_crew.member_essential_context import (
             MemberEssentialContextError,
@@ -3802,17 +3864,29 @@ class ContextBuilder:
         if profile_overrides is None:
             context_groups = _config_scoped_groups(context_groups)
         reads = not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY)
+        include_project = not blocks_reads and _group_included(
+            context_groups, CONTEXT_GROUP_PROJECT
+        )
         identity = self._build_member_section(
             owner, strict=True, include_briefing=reads, template_selected=template_selected
         )
+        # A validation pass measures the largest envelope any harness can build,
+        # so it keeps inheritance and never reads kiro-cli's opt-out. On a normal
+        # turn, the setting changes what a member loads only on a session
+        # kiro-cli serves: every other harness keeps inheriting. Read once, where
+        # the project group applies, and pass the verdict to the snapshot and the
+        # folder-steering dedup below so the two cannot disagree.
+        inherits_default_resources = True
+        if profile_overrides is None and include_project and provider_type == PROVIDER_ACP:
+            inherits_default_resources = member_inherits_default_resources(project)
         documents = documents_for_member(
             template,
             project,
             conditional_index=conditional_index,
             context_settings=True,
             trigger_text=trigger_text,
-            include_project=not blocks_reads
-            and _group_included(context_groups, CONTEXT_GROUP_PROJECT),
+            include_project=include_project,
+            inherits_default_resources=inherits_default_resources,
         )
         if execution_template and execution_template != template:
             sources = dict(documents)
@@ -3822,8 +3896,8 @@ class ContextBuilder:
                 conditional_index=conditional_index,
                 context_settings=True,
                 trigger_text=trigger_text,
-                include_project=not blocks_reads
-                and _group_included(context_groups, CONTEXT_GROUP_PROJECT),
+                include_project=include_project,
+                inherits_default_resources=inherits_default_resources,
             ):
                 if source in sources and sources[source] != body:
                     raise MemberEssentialContextError(
@@ -3846,14 +3920,29 @@ class ContextBuilder:
         # until the folder shrinks. The character budget depends on the memory
         # documents appended below, so the candidates are collected here (their
         # position recorded) and fitted just before the envelope renders.
+        #
+        # The project and global ``.kiro/steering`` trees are skipped as already
+        # delivered only while the snapshot above actually delivered them: a
+        # kiro-cli workspace that opts out of the default resources gets them
+        # from neither the snapshot nor the harness, so a folder that declares
+        # one of those roots must carry its documents itself. The template's
+        # declared resources can still carry some of those files, so under the
+        # opt-out a folder document whose canonical path the template already
+        # delivered is not collected again. Same verdict as the snapshot, read
+        # once above.
         folder_docs: SteeringCollection = SteeringCollection()
         folder_insert_at = len(documents)
-        if (
-            steering_dirs
-            and not blocks_reads
-            and _group_included(context_groups, CONTEXT_GROUP_PROJECT)
-        ):
-            folder_docs = collect_folder_steering(steering_dirs, project=project)
+        if steering_dirs and include_project:
+            folder_docs = collect_folder_steering(
+                steering_dirs,
+                project=project,
+                skip_delivered_roots=inherits_default_resources,
+                delivered_sources=(
+                    tuple(source for source, _ in documents)
+                    if not inherits_default_resources
+                    else ()
+                ),
+            )
         if reads:
             from kiro_crew.memory_stores import memory_store_dir_for
 
@@ -4021,6 +4110,7 @@ class ContextBuilder:
                 member_template=execution_context.template_id if execution_context else "",
                 steering_dirs=steering_dirs,
                 template_selected=_template_selected_on_member_store(execution_context),
+                provider_type=provider_type,
             )
 
         # Minimal V1 stays date/time + agent identity. Private V2 also carries
@@ -5005,6 +5095,7 @@ class ContextBuilder:
                 and not context_provider.native_steering,
                 steering_dirs=steering_dirs,
                 template_selected=_template_selected_on_member_store(execution_context),
+                provider_type=provider_type,
             )
         if _essentials and not is_new_session:
             parts.append(_essentials)
@@ -5193,6 +5284,7 @@ class ContextBuilder:
                     skip_delivered_roots=_project_steering_delivered(
                         provider_type,
                         context_provider is not None and context_provider.native_steering,
+                        project,
                     ),
                 )
                 if _folder_ctx:
@@ -5346,6 +5438,7 @@ class ContextBuilder:
                     skip_delivered_roots=_project_steering_delivered(
                         provider_type,
                         context_provider is not None and context_provider.native_steering,
+                        project,
                     ),
                 )
                 if _folder_ctx:

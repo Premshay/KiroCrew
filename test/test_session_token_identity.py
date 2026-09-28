@@ -490,7 +490,7 @@ def test_kiro_identity_projection_preserves_native_restrictions(tmp_path, monkey
             "kirocrew",
             work_dir=tmp_path,
             existing_names={"kirocrew-core"} if restriction == "stub" else (),
-        )
+        ).elements
         == []
     )
 
@@ -538,7 +538,7 @@ def test_kiro_identity_projection_repairs_a_stale_reserved_name_command(
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
     monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name, **_kw: dict(managed))
 
-    elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path)
+    elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path).elements
 
     assert [e["name"] for e in elements] == ["kirocrew-core"]
     launched = (elements[0]["command"], elements[0]["args"])
@@ -571,7 +571,7 @@ def test_kiro_identity_projection_survives_a_scalar_args_on_a_reserved_name(
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
     monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name, **_kw: dict(managed))
 
-    elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path)
+    elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path).elements
 
     assert [(e["name"], e["command"], e["args"]) for e in elements] == [
         ("kirocrew-core", "test-crew", ["mcp"])
@@ -606,7 +606,7 @@ def test_kiro_identity_projection_covers_a_granted_opt_in_server(tmp_path, monke
         "managed_mcp_spec_entry",
         lambda name, **_kw: dict(spec["mcpServers"][name]) if name in spec["mcpServers"] else None,
     )
-    elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path)
+    elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path).elements
     names = [e["name"] for e in elements]
     assert names == ["kirocrew-core", server], names
     granted = next(e for e in elements if e["name"] == server)
@@ -634,7 +634,7 @@ def test_kiro_identity_projection_leaves_an_ungranted_opt_in_server_out(tmp_path
         "managed_mcp_spec_entry",
         lambda name, **_kw: dict(spec["mcpServers"][name]) if name in spec["mcpServers"] else None,
     )
-    elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path)
+    elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path).elements
     assert [e["name"] for e in elements] == ["kirocrew-core"]
 
 
@@ -686,7 +686,7 @@ class TestGrantedOptInResolution:
         monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
         monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", _record)
 
-        elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path)
+        elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path).elements
 
         assert [element["name"] for element in elements] == [name]
         assert seen == [(name, {"include_opt_in": True})]
@@ -754,7 +754,7 @@ def test_kiro_identity_projection_fails_closed_on_settings_errors(
             lambda *a, **k: pytest.fail("A refused credential target must never be opened"),
         )
 
-    assert session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path) == []
+    assert session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path).elements == []
 
 
 def test_the_control_plane_element_env_matches_the_spec_writing_consumer(tmp_path, monkeypatch):
@@ -798,7 +798,7 @@ def test_the_control_plane_element_env_matches_the_spec_writing_consumer(tmp_pat
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
     monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name, **_kw: dict(managed))
 
-    elements = session_mcp.kiro_control_plane_servers("an-agent", work_dir=None)
+    elements = session_mcp.kiro_control_plane_servers("an-agent", work_dir=None).elements
 
     # PRECONDITION -- the entry really is projected, so every env assertion below is
     # about a value that reaches a session, not about an element that was dropped.

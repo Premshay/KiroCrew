@@ -10,7 +10,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any, AsyncContextManager, TypeGuard
 
 from kiro_crew import model_scope
 from kiro_crew.acp.client import (
@@ -92,6 +92,7 @@ from kiro_crew.providers.base import (
 )
 from kiro_crew.providers.cleanup import _is_safe_path
 from kiro_crew.recovery.ladder import InfraError
+from kiro_crew.session_work_dir import mark_run_dir, reclaim_session_work_dir
 from kiro_crew.workspace_cli_settings import (
     CLI_SETTINGS_LOCK_ACTION_TIMEOUT_SECS,
     CLI_SETTINGS_LOCK_TIMEOUT_SECS,
@@ -111,8 +112,23 @@ def _write_cli_overlay(
     """Write a workspace cli.json overlay so kiro-cli applies effort at spawn.
 
     Path: ``<work_dir>/.kiro/settings/cli.json``. Workspace settings override
-    the global ``~/.kiro/settings/cli.json`` so this only affects the slot's
-    own session. Merge-safe and idempotent — safe to call before every spawn.
+    the global ``~/.kiro/settings/cli.json``, so nothing here touches the user's
+    global kiro settings. The overlay's scope is that WORK DIRECTORY, not a
+    session: every session served by one runtime shares the work dir, so the
+    file is shared by all of them, and kiro-cli reads it only at spawn. A write
+    therefore reaches no session that is already running -- it lands on the next
+    respawn, and then for every session that respawn serves. Merge-safe and
+    idempotent — safe to call before every spawn.
+
+    Its unit of state is therefore ``(work_dir, model)`` and never
+    ``(session, model)``: two sessions on one runtime running the same model have
+    one entry between them, and the last write is the one a respawn reads.
+    Nothing reaches this writer except :class:`AcpProvider`, which is the object
+    that spawns the runtime and so always owns it, which is why a live effort
+    change is pushed to the running session separately
+    (:meth:`AcpProvider.change_effort`) rather than through this file. A session
+    that joins a runtime it did not spawn has no path here at all today; if one
+    is added, it needs to say that its write cannot reach the running process.
 
     The effort sub-key is family-specific (``effort_settings_key``): Claude
     models use ``output_config``, GPT models use ``reasoning`` — kiro-cli
@@ -171,10 +187,12 @@ def _write_tool_search_overlay(
 ) -> None:
     """Write kiro Tool Search settings into the workspace cli.json overlay.
 
-    Path: ``<work_dir>/.kiro/settings/cli.json`` — the SAME per-session overlay
-    used for effort. Workspace settings override the global
-    ``~/.kiro/settings/cli.json`` so this only affects this slot's own kiro-cli
-    session and never mutates the user's global kiro settings.
+    Path: ``<work_dir>/.kiro/settings/cli.json`` — the SAME overlay used for
+    effort, with the same scope: the work directory, which every session on a
+    runtime shares, read by kiro-cli only at spawn (see
+    :func:`_write_cli_overlay`). Workspace settings override the global
+    ``~/.kiro/settings/cli.json``, so this never mutates the user's global kiro
+    settings.
 
     This file is the kiro-cli (Rust engine) channel only. KAS never opens it: its
     Tool Search setting rides the ACP ``initialize`` request instead (see
@@ -392,6 +410,7 @@ class AcpProvider(LLMProvider):
         shared_scratch: Path | None = None,
         on_gate_acquired: Callable[[float], None] | None = None,
         on_gate_queued: Callable[[], None] | None = None,
+        disposable_work_dir: bool = False,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -440,6 +459,16 @@ class AcpProvider(LLMProvider):
         # Its companion for gate ENTRY: the manager freezes the start clock for
         # the span spent waiting for a permit. Same None-is-inert rule.
         self._on_gate_queued: Callable[[], None] | None = on_gate_queued
+        # Whether ``work_dir`` was DERIVED for a one-run session (a subagent, a
+        # stateless cron run) and is this provider's to reclaim at shutdown. An
+        # explicit caller cwd is never marked, whatever key the session has; and
+        # marking only authorizes removing Crew's own residue, never a file the
+        # run wrote (session_work_dir.reclaim_session_work_dir).
+        self._disposable_work_dir: bool = bool(disposable_work_dir)
+        # Installed by the session registry when this provider is registered.
+        # The context manager retains the registry lock from the final ownership
+        # decision through the filesystem reclaim, closing the successor race.
+        self._work_dir_claim_probe: Callable[[], AsyncContextManager[bool]] | None = None
         self._client = AcpClient(**kwargs)
         self.model_switch_method = model_switch_method
         self._session_provider_label = session_provider_label
@@ -1917,6 +1946,47 @@ class AcpProvider(LLMProvider):
         )
         return True
 
+    async def reapply_live_effort(self, level: str) -> bool:
+        """Re-apply *level* (empty: the resolved default) to the model just switched to.
+
+        An in-place switch never respawns, so without this the new model runs at its
+        own default. False asks the caller for a reset; errors propagate.
+        """
+        if not self.supports_effort():
+            # No effort selector on this model: the level stays persisted for a
+            # capable one, the same "persisted no-op" the effort endpoint applies.
+            return True
+        if level:
+            return bool(await self.change_effort(level))
+        # No override: re-resolve so a workspace default reaches the new model. A
+        # False here only means there was no default to push, so nothing is stale.
+        await self.clear_effort()
+        return True
+
+    async def set_model(self, model: str) -> None:
+        """Switch the live session's model, then re-apply the slot's effort to it.
+
+        The effort goes last so it wins over a ``<model>[<effort>]`` pick's own
+        level. The target's own override applies as ``reapply_live_effort`` does;
+        without one, the level of the model left is pushed live but never stored.
+        """
+        overrides = self._effort_per_model
+        carried = overrides.get(self._client._model, "")
+        await self._client.set_model(model)
+        try:
+            own = overrides.get(self._client._model) or overrides.get(model, "")
+            if own or not carried:
+                await self.reapply_live_effort(own)
+            elif self.supports_effort():
+                # Live only: persisting it would overwrite the target's stored state.
+                if self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION:
+                    await self._set_effort_config_option(carried)
+                elif self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
+                    await self._client.send_command("/effort", args={"level": carried})
+        except Exception:
+            # The model DID switch; failing here would make a fallback walk skip it.
+            logger.warning("Effort re-apply after set_model(%s) failed", model, exc_info=True)
+
     async def clear_effort(self) -> bool | None:
         """Clear the slot's effort override for the current model.
 
@@ -2002,6 +2072,13 @@ class AcpProvider(LLMProvider):
         if self.memory_mode != "persistent":
             self._client._resume_session_id = ""
         self.essential_delivery.invalidate()
+        if self._disposable_work_dir:
+            # The ONE place the directory's provenance is written: before any
+            # writer puts a file in it, on every (re)start, idempotent. The
+            # sweep reclaims only a directory that carries this mark and names a
+            # dead predecessor of this data home (session_work_dir); the shutdown
+            # reclaim below keys on the flag and on the mark naming this process.
+            await asyncio.to_thread(mark_run_dir, Path(self._client._work_dir))
         # Re-apply the overlay on every (re)start to cover resume / model swap.
         # (no-op for claude backend — that path applies effort live below.)
         self._apply_effort_overlay()
@@ -2071,6 +2148,74 @@ class AcpProvider(LLMProvider):
         finally:
             if self.memory_mode != "persistent" and session_id:
                 await self.cleanup_session(session_id)
+            if self._disposable_work_dir:
+                await self._reclaim_work_dir()
+
+    def set_work_dir_claim_probe(
+        self,
+        probe: Callable[[], AsyncContextManager[bool]],
+    ) -> None:
+        """Install the registry claim that guards the final reclaim decision."""
+        self._work_dir_claim_probe = probe
+
+    def disown_work_dir(self) -> None:
+        """Drop this provider's claim on its derived work directory.
+
+        The factory flag says the directory was derived from a one-run KEY; it
+        cannot say whether this instance is the one the registry kept for that
+        key. When two providers for the same key race and one is discarded, or a
+        recycled session's successor is already registered, the discarded
+        provider and the live one share the directory, so the registry tells the
+        discarded one to leave it -- the live sibling reclaims it at its own
+        shutdown. A marker nonce could not carry this: whichever instance wrote
+        the marker can be the one torn down while the other lives.
+        """
+        self._disposable_work_dir = False
+
+    async def _reclaim_work_dir(self) -> None:
+        """Remove this run's derived work dir only after its tree and claim end.
+
+        Shutdown can retain PID tracking when a root or descendant survives, so
+        its return alone is not proof that no process still uses this directory
+        as its cwd. The registry claim is the other half: it holds the registry
+        lock from the final no-successor decision through the off-loop reclaim,
+        so a new holder cannot register in between. If cancellation arrives
+        during that reclaim, shutdown waits for its worker before releasing the
+        claim, then propagates the cancellation. An absent, denied, or broken
+        claim fails closed and leaves the directory for the sweep. The reclaim
+        itself accepts a missing marker (the flag is its provenance) and, when a
+        marker is present, requires it to name this data home and this process
+        exactly; nothing about another process is probed.
+        """
+        if getattr(self._client, "process_tree_confirmed_dead", None) is not True:
+            logger.debug("retaining run work dir until its process tree is confirmed dead")
+            return
+        claim_probe = self._work_dir_claim_probe
+        if claim_probe is None:
+            logger.debug("retaining run work dir because no registry claim probe is installed")
+            return
+        work_dir = Path(self._client._work_dir)
+        try:
+            async with claim_probe() as claimed:
+                if not claimed:
+                    logger.debug("retaining claimed run work dir %s", work_dir)
+                    return
+                reclaim = asyncio.ensure_future(
+                    asyncio.to_thread(reclaim_session_work_dir, work_dir)
+                )
+                try:
+                    removed = await asyncio.shield(reclaim)
+                except asyncio.CancelledError:
+                    try:
+                        await reclaim
+                    except BaseException:
+                        pass
+                    raise
+        except Exception:
+            logger.debug("work dir reclaim failed for %s", work_dir, exc_info=True)
+            return
+        if removed:
+            logger.debug("reclaimed run work dir %s", work_dir)
 
     @staticmethod
     def _to_llm_event(e: Any) -> LLMEvent:
@@ -2093,6 +2238,9 @@ class AcpProvider(LLMProvider):
             tool_output=e.tool_output,
             tool_output_digest=e.tool_output_digest,
             tool_output_bytes=e.tool_output_bytes,
+            # The fingerprints the credential card traces a source by. Dropping
+            # them leaves every credential in the reply with no source.
+            tool_output_credentials=e.tool_output_credentials,
             tool_final=e.tool_final,
             # Dropping this clears the task panel and records an empty plan/updated.
             todo=e.todo,
@@ -2137,6 +2285,9 @@ class AcpProvider(LLMProvider):
             sub_session_id=e.sub_session_id,
             provider_child=e.provider_child,
             is_shell=e.is_shell,
+            # The harness's own tool id for a permission request. Dropping it
+            # leaves every KAS call unnamed, so no tool-scoped spec hook fires.
+            harness_tool_id=e.harness_tool_id,
             # Canonical, non-model-authored tool identity (_meta.kiro). The
             # session-directive forgery gate in chat_runner keys on THESE, so
             # dropping them here silently discards every session-bound tool's
@@ -2213,8 +2364,8 @@ class AcpProvider(LLMProvider):
             async for e in events:
                 yield self._to_llm_event(e)
 
-    async def approve_tool(self, request_id: str | int, *, always: bool = False) -> None:
-        await self._client.approve_tool(request_id, always=always)
+    async def approve_tool(self, request_id: str | int, *, always: bool = False) -> bool:
+        return await self._client.approve_tool(request_id, always=always)
 
     async def reject_tool(self, request_id: str | int) -> None:
         await self._client.reject_tool(request_id)
@@ -2415,6 +2566,13 @@ class AcpProvider(LLMProvider):
         await self._client.new_conversation()
 
     def is_alive(self) -> bool:
+        """Whether the shared client is responsive.
+
+        PROCESS-level, like every liveness answer on this provider: the client is
+        one kiro-cli process that may host several ACP sessions, so co-tenants
+        cannot be told apart here. Read it as "the process serving me is up", not
+        as "my session is usable".
+        """
         return self._client.is_responsive()
 
     def is_process_alive(self) -> bool:
@@ -2486,6 +2644,11 @@ class AcpProvider(LLMProvider):
         return err if isinstance(err, InfraError) else None
 
     def touch_activity(self) -> None:
+        """Refresh the CLIENT's activity clock.
+
+        PROCESS-level: the stamp lives on the shared client, so this marks every
+        session on that process active, not just this one.
+        """
         self._client.touch_activity()
 
     def runtime_info(self) -> tuple[int | None, str | None]:

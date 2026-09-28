@@ -1,35 +1,35 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bot, Check, ChevronDown } from "lucide-react";
-import { Popover, PopoverTrigger, PopoverContent } from "./ui/popover";
-import { useListboxKeyboard } from "../hooks/useListboxKeyboard";
-import { useDocumentImeLatch } from "../hooks/useImeGuard";
-import { useProvider } from "../providers";
-import { isTouchDevice } from "../utils/isTouchDevice";
-import { Input, Btn } from "./ui";
-import { SourceBadge } from "./SourceBadge";
-import ErrorNotice from "./ErrorNotice";
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Bot, Check, ChevronDown } from 'lucide-react'
+import { Popover, PopoverTrigger, PopoverContent } from './ui/popover'
+import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
+import { useDocumentImeLatch } from '../hooks/useImeGuard'
+import { useProvider } from '../providers'
+import { isTouchDevice } from '../utils/isTouchDevice'
+import { Input, Btn, PanelSectionHeader } from './ui'
+import { SourceBadge } from './SourceBadge'
+import ErrorNotice from './ErrorNotice'
 
-import { i18nT } from "../i18n/t";
+import { i18nT } from '../i18n/t'
 export interface KiroCrewAgent {
-  name: string;
-  kiro_agent: string;
-  workspace: string;
-  memory_store: string;
+  name: string
+  kiro_agent: string
+  workspace: string
+  memory_store: string
   /** This agent's own default model. '' means inherit (kiro template pin, then
    *  the global fallback). Optional: older payloads predate the field. */
-  model?: string;
+  model?: string
   /** This agent's own default reasoning effort. '' means inherit the global
    *  default. Optional: older payloads predate the field. */
-  reasoning_effort?: string;
+  reasoning_effort?: string
   /** Optional companion-owned capabilities for this crew's runtime. */
   runtime_policy?: {
-    runtime?: string;
-    model?: "selectable" | "managed" | "unsupported";
-    models?: string[];
-    effort?: "selectable" | "managed" | "unsupported";
-    model_label?: string;
-    effort_label?: string;
-  } | null;
+    runtime?: string
+    model?: 'selectable' | 'managed' | 'unsupported'
+    models?: string[]
+    effort?: 'selectable' | 'managed' | 'unsupported'
+    model_label?: string
+    effort_label?: string
+  } | null
   /** Optional label shown in place of `name`. Presentation only: `name` stays
    *  the immutable identity every route, dispatch and binding is keyed on.
    *  Empty or absent means the name itself is displayed. Optional: older
@@ -38,11 +38,11 @@ export interface KiroCrewAgent {
   description: string
   /** Free-text routing intent read by the orchestrator's select_crew. Optional:
    *  older payloads predate the field, and it falls back to `description`. */
-  triggers?: string;
-  source: string;
+  triggers?: string
+  source: string
   /** Default session color (#rrggbb hex) applied to new sessions using this
    *  agent. Empty or absent means no agent color. */
-  session_color?: string;
+  session_color?: string
   /** Per-crew avatar override, verbatim from the backend. `{}`/absent means
    *  the face is derived from the crew name; interpreted by ghostTraitsFrom. */
   avatar?: unknown
@@ -65,10 +65,10 @@ export function crewDisplayName(a: Pick<KiroCrewAgent, 'name' | 'display_name'>)
 }
 
 interface Props {
-  agents: KiroCrewAgent[];
-  defaultAgent: string;
-  value: string;
-  onChange: (name: string) => void;
+  agents: KiroCrewAgent[]
+  defaultAgent: string
+  value: string
+  onChange: (name: string) => void
   /**
    * Pass true when this selector renders INSIDE a Radix modal dialog (the
    * Schedule job form). The popup then mounts its own react-remove-scroll
@@ -83,7 +83,7 @@ interface Props {
    * the popup, so the dialog body itself does not wheel-scroll until the
    * popup closes.
    */
-  modal?: boolean;
+  modal?: boolean
   /**
    * Present when the roster could not be LOADED, as opposed to an install that
    * genuinely has one agent. Without it those two states render identically —
@@ -103,7 +103,15 @@ interface Props {
    * bails out of the re-render, and without it the button would be
    * pixel-identical after every press during an outage.
    */
-  rosterFailure?: { reloading: boolean; onReload: () => void };
+  rosterFailure?: { reloading: boolean; onReload: () => void }
+  /**
+   * Group the list by `selection_kind` — crewmates first, then installed agent
+   * templates — when the roster carries one (the folded execution catalog does).
+   * Opt-in: the schedule form asks for it, because a cron may name either kind
+   * and a flat list of both reads as one roster. Surfaces that did not opt in
+   * keep the flat rendering they had, whatever their rows carry.
+   */
+  groupByKind?: boolean
 }
 
 /**
@@ -129,28 +137,43 @@ export default function AgentSelector({
   onChange,
   modal = false,
   rosterFailure,
+  groupByKind = false,
 }: Props) {
-  const provider = useProvider();
-  const [open, setOpen] = useState(false);
-  const [filter, setFilter] = useState("");
-  const btnRef = useRef<HTMLButtonElement>(null);
-  const dropdownRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const provider = useProvider()
+  const [open, setOpen] = useState(false)
+  const [filter, setFilter] = useState('')
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const dropdownRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
 
   const active = value || defaultAgent || (agents[0]?.name ?? 'default')
   // What the trigger shows for the active agent: its display label when the
   // roster row is at hand, the raw identity otherwise (a roster still loading,
   // or a value naming an agent the roster does not list).
-  const activeAgent = agents.find(a => a.name === active)
+  const activeAgent = agents.find((a) => a.name === active)
   const activeLabel = activeAgent ? crewDisplayName(activeAgent) : active
 
   const filtered = useMemo(
-    () => filter
-      ? agents.filter(a =>
-          (a.name + ' ' + (a.display_name ?? '')).toLowerCase().includes(filter.toLowerCase()))
-      : agents,
+    () =>
+      filter
+        ? agents.filter((a) =>
+            (a.name + ' ' + (a.display_name ?? '')).toLowerCase().includes(filter.toLowerCase()),
+          )
+        : agents,
     [agents, filter],
-  );
+  )
+
+  // Grouped by namespace when asked to AND the roster carries one (the folded
+  // execution catalog: crewmates AND installed templates). A name-only roster
+  // (a channel's member list, a project's bindings) renders flat whatever the
+  // caller asked. The chrome — header and templates hint — is drawn only when
+  // the roster holds BOTH kinds: with one kind a header would name a
+  // distinction the list does not draw. Decided on the unfiltered roster so a
+  // filter that narrows to one group keeps its header instead of making it
+  // flicker. The `role="group"` label stays for assistive technology, which
+  // does not read the chrome.
+  const grouped = groupByKind && agents.some((a) => a.selection_kind)
+  const showGroupChrome = new Set(agents.map((a) => a.selection_kind ?? 'member')).size > 1
 
   // A load failure is only worth reporting while it costs the user the list.
   // Gated on the roster being EMPTY so a failed refresh over a roster we still
@@ -158,7 +181,7 @@ export default function AgentSelector({
   // rendering rather than being overwritten by a stale error. Narrowed to the
   // failure object rather than a boolean so the render below cannot reach for a
   // retry that is not there.
-  const rosterFailed = agents.length === 0 ? rosterFailure : undefined;
+  const rosterFailed = agents.length === 0 ? rosterFailure : undefined
 
   // Focus return: in modal mode the popover's FocusScope is still trapping
   // when this runs, so focusing eagerly would fight the scope's own teardown
@@ -166,17 +189,17 @@ export default function AgentSelector({
   // non-modal mode there is no trap and the eager focus keeps the selector's
   // synchronous focus contract.
   const closeToTrigger = useCallback(() => {
-    setOpen(false);
-    if (!modal) btnRef.current?.focus();
-  }, [modal]);
+    setOpen(false)
+    if (!modal) btnRef.current?.focus()
+  }, [modal])
 
   const handleSelect = useCallback(
     (a: KiroCrewAgent) => {
-      onChange(a.name);
-      closeToTrigger();
+      onChange(a.name)
+      closeToTrigger()
     },
     [onChange, closeToTrigger],
-  );
+  )
 
   // Reset the filter on the CLOSE TRANSITION, not in onOpenChange: Radix only
   // calls onOpenChange for closes it initiates itself (outside click), while
@@ -184,8 +207,8 @@ export default function AgentSelector({
   // an onOpenChange-only reset leaks the typed filter into the next open,
   // showing a narrowed (or empty "No matches") list the user did not filter.
   useEffect(() => {
-    if (!open) setFilter("");
-  }, [open]);
+    if (!open) setFilter('')
+  }, [open])
 
   // Tracked IME latch for the two NATIVE Escape consumers below. The native
   // flags alone cannot identify a composition-cancel Escape on WebKit — the
@@ -196,7 +219,7 @@ export default function AgentSelector({
   // compositionend, with stranded-latch recovery) and owns the decline:
   // stopPropagation always, preventDefault only in the post-composition
   // window where the browser would otherwise act.
-  const imeLatch = useDocumentImeLatch(open);
+  const imeLatch = useDocumentImeLatch(open)
 
   // Escape must dismiss ONLY this popup, never the host surface. Radix layers
   // hand the document-level Escape listener from the host dialog to this
@@ -221,22 +244,20 @@ export default function AgentSelector({
   // handlers that must see every Escape regardless of who consumed it (voice
   // read-back stop) still do.
   useEffect(() => {
-    if (!open) return;
+    if (!open) return
     const onEsc = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      const t = e.target;
+      if (e.key !== 'Escape') return
+      const t = e.target
       const inPopup =
-        t instanceof Node &&
-        (dropdownRef.current?.contains(t) || btnRef.current?.contains(t));
-      if (!inPopup) return;
-      if (!imeLatch.claimKey(e)) return;
-      e.preventDefault();
-      closeToTrigger();
-    };
-    window.addEventListener("keydown", onEsc, { capture: true });
-    return () =>
-      window.removeEventListener("keydown", onEsc, { capture: true });
-  }, [open, closeToTrigger, imeLatch]);
+        t instanceof Node && (dropdownRef.current?.contains(t) || btnRef.current?.contains(t))
+      if (!inPopup) return
+      if (!imeLatch.claimKey(e)) return
+      e.preventDefault()
+      closeToTrigger()
+    }
+    window.addEventListener('keydown', onEsc, { capture: true })
+    return () => window.removeEventListener('keydown', onEsc, { capture: true })
+  }, [open, closeToTrigger, imeLatch])
 
   const { onListKeyDown } = useListboxKeyboard({
     open,
@@ -249,20 +270,108 @@ export default function AgentSelector({
     hasFilterInput: true,
     filteredCount: filtered.length,
     onEnterSingleMatch: () => {
-      const a = filtered[0];
-      if (a) handleSelect(a);
+      const a = filtered[0]
+      if (a) handleSelect(a)
     },
     closeToTrigger,
-  });
+  })
+
+  // One option row, shared by the flat and grouped renderings. The roster
+  // `useAgents` hands this picker is folded to one row per name (a member wins
+  // over a same-named template), so the name is the key and the default badge
+  // marks the row named as the default — a template-only default carries it
+  // truthfully.
+  const renderRow = (a: KiroCrewAgent) => {
+    const isCurrent = active === a.name
+    const isDefault = a.name === defaultAgent
+    return (
+      <Btn
+        key={a.name}
+        role="option"
+        aria-selected={isCurrent}
+        tabIndex={-1}
+        className={`w-full text-left px-3 py-2 flex items-center gap-2 min-w-0 border-0 rounded-none cursor-pointer
+          ${isCurrent ? 'bg-accent-subtle hover:bg-accent-subtle' : 'hover:bg-bg-hover'}
+        `}
+        onClick={() => handleSelect(a)}
+      >
+        <div className="flex flex-col min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span
+              className={`text-[13px] font-mono font-semibold truncate ${isCurrent ? 'text-accent' : 'text-text'}`}
+            >
+              {crewDisplayName(a)}
+            </span>
+            {/* The ID stays visible when a label covers it: `agent=` in
+                spawn params, crons and the CLI all address the ID, so a
+                picker that hid it would strand anyone wiring those up. */}
+            {crewDisplayName(a) !== a.name && (
+              <span
+                className="text-[11px] font-mono text-muted truncate max-w-[9rem]"
+                title={i18nT('components.agentSelector.agent_id_tooltip', { name: a.name })}
+              >
+                {a.name}
+              </span>
+            )}
+            {isDefault && (
+              <span className="px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent-subtle text-accent border border-accent/30 shrink-0">
+                {i18nT('components.agentSelector.default')}
+              </span>
+            )}
+            {a.source && (
+              <SourceBadge source={a.source} className="shrink-0">
+                {a.source}
+              </SourceBadge>
+            )}
+          </div>
+          <span className="text-[11px] text-muted truncate">
+            {a.description || provider.resolveAgentTemplate(a)}
+          </span>
+        </div>
+        {isCurrent && (
+          <span className="text-accent text-[11px] ml-auto shrink-0">
+            <Check className="lucide-inline" />
+          </span>
+        )}
+      </Btn>
+    )
+  }
+
+  const groupedRows = (['member', 'template'] as const).map((kind) => {
+    const rows = filtered.filter((a) => (a.selection_kind ?? 'member') === kind)
+    if (!rows.length) return null
+    const label =
+      kind === 'member'
+        ? i18nT('components.agentDropdownList.group_members')
+        : i18nT('components.agentDropdownList.group_templates')
+    return (
+      <div key={kind} role="group" aria-label={label} className="flex flex-col">
+        {showGroupChrome && (
+          <PanelSectionHeader label={label} count={rows.length} className="px-3 pt-2 pb-1" />
+        )}
+        {showGroupChrome && kind === 'template' && (
+          // What a template pick IS, said where the pick happens: the job runs
+          // the shared template on the default crew's workspace and memory.
+          <p className="px-3 pb-1 text-[11px] leading-snug text-muted">
+            {i18nT('components.agentDropdownList.group_templates_hint')}
+          </p>
+        )}
+        <div className="divide-y divide-border">{rows.map(renderRow)}</div>
+      </div>
+    )
+  })
 
   return (
     <Popover open={open} onOpenChange={setOpen} modal={modal}>
       <PopoverTrigger
         ref={btnRef}
         className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-mono font-medium border border-border bg-bg-elevated text-text hover:border-border-strong transition-all cursor-pointer"
-        aria-label={i18nT("components.agentSelector.switch_agent")}
+        aria-label={i18nT('components.agentSelector.switch_agent')}
       >
-        <span className="text-accent"><Bot size={14} /></span> {activeLabel}
+        <span className="text-accent">
+          <Bot size={14} />
+        </span>{' '}
+        {activeLabel}
         <ChevronDown size={12} className="text-muted ml-1 shrink-0" aria-hidden />
       </PopoverTrigger>
       <PopoverContent
@@ -277,7 +386,7 @@ export default function AgentSelector({
         // aria-haspopup matches); it needs a name or AT announces an
         // unnamed dialog. Named after the list — NOT the trigger's label,
         // which must stay unique to the trigger.
-        aria-label={i18nT("components.agentSelector.agent_list")}
+        aria-label={i18nT('components.agentSelector.agent_list')}
         onKeyDown={onListKeyDown}
         // On touch, keep the on-screen keyboard down (it costs half the
         // viewport before the user has asked to filter) but move focus to
@@ -285,9 +394,9 @@ export default function AgentSelector({
         // screen-reader user outside the popup — and, in modal mode, on an
         // element hideOthers() has just aria-hidden.
         onOpenAutoFocus={(e) => {
-          if (!isTouchDevice()) return;
-          e.preventDefault();
-          dropdownRef.current?.focus();
+          if (!isTouchDevice()) return
+          e.preventDefault()
+          dropdownRef.current?.focus()
         }}
         // Modal only: the focus trap is still live when closeToTrigger runs,
         // so the deterministic focus return must happen at FocusScope
@@ -299,8 +408,8 @@ export default function AgentSelector({
         onCloseAutoFocus={
           modal
             ? (e) => {
-                e.preventDefault();
-                btnRef.current?.focus();
+                e.preventDefault()
+                btnRef.current?.focus()
               }
             : undefined
         }
@@ -312,9 +421,9 @@ export default function AgentSelector({
         // popup-origin key that handler already consumed the event before
         // any layer saw it.
         onEscapeKeyDown={(e) => {
-          if (!imeLatch.claimKey(e)) return;
-          e.preventDefault();
-          closeToTrigger();
+          if (!imeLatch.claimKey(e)) return
+          e.preventDefault()
+          closeToTrigger()
         }}
         // An 8px viewport gutter (the hand-rolled positioner guaranteed the
         // left one) and a width cap so the popup never overhangs at 320px.
@@ -330,8 +439,8 @@ export default function AgentSelector({
             <Input
               ref={inputRef}
               type="text"
-              aria-label={i18nT("components.agentSelector.filter_agents")}
-              placeholder={i18nT("components.agentSelector.type_to_filter")}
+              aria-label={i18nT('components.agentSelector.filter_agents')}
+              placeholder={i18nT('components.agentSelector.type_to_filter')}
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               className="w-full px-2 py-1 text-[13px]"
@@ -340,54 +449,13 @@ export default function AgentSelector({
         )}
         <div
           role="listbox"
-          aria-label={i18nT("components.agentSelector.agent_list")}
+          aria-label={i18nT('components.agentSelector.agent_list')}
           className="flex-1 min-h-0 overflow-y-auto divide-y divide-border"
         >
-          {filtered.map((a) => {
-            const isCurrent = active === a.name;
-            const isDefault = a.name === defaultAgent;
-            return (
-              <Btn
-                key={a.name}
-                role="option"
-                aria-selected={isCurrent}
-                tabIndex={-1}
-                className={`w-full text-left px-3 py-2 flex items-center gap-2 min-w-0 border-0 rounded-none cursor-pointer
-                  ${isCurrent ? "bg-accent-subtle hover:bg-accent-subtle" : "hover:bg-bg-hover"}
-                `}
-                onClick={() => handleSelect(a)}
-              >
-                <div className="flex flex-col min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5">
-                    <span className={`text-[13px] font-mono font-semibold truncate ${isCurrent ? 'text-accent' : 'text-text'}`}>{crewDisplayName(a)}</span>
-                    {/* The ID stays visible when a label covers it: `agent=` in
-                        spawn params, crons and the CLI all address the ID, so a
-                        picker that hid it would strand anyone wiring those up. */}
-                    {crewDisplayName(a) !== a.name && (
-                      <span className="text-[11px] font-mono text-muted truncate max-w-[9rem]" title={i18nT('components.agentSelector.agent_id_tooltip', { name: a.name })}>{a.name}</span>
-                    )}
-                    {isDefault && <span className="px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent-subtle text-accent border border-accent/30 shrink-0">{i18nT('components.agentSelector.default')}</span>}
-                    {a.source && (
-                      <SourceBadge source={a.source} className="shrink-0">
-                        {a.source}
-                      </SourceBadge>
-                    )}
-                  </div>
-                  <span className="text-[11px] text-muted truncate">
-                    {a.description || provider.resolveAgentTemplate(a)}
-                  </span>
-                </div>
-                {isCurrent && (
-                  <span className="text-accent text-[11px] ml-auto shrink-0">
-                    <Check className="lucide-inline" />
-                  </span>
-                )}
-              </Btn>
-            );
-          })}
+          {grouped ? groupedRows : filtered.map(renderRow)}
           {filtered.length === 0 && !rosterFailed && (
             <div className="px-3 py-2 text-[13px] text-muted italic">
-              {i18nT("components.agentSelector.no_matches")}
+              {i18nT('components.agentSelector.no_matches')}
             </div>
           )}
         </div>
@@ -401,7 +469,7 @@ export default function AgentSelector({
               variant="inline"
               askAgent
               testId="agent-selector-roster-error"
-              message={i18nT("components.agentSelector.roster_load_failed")}
+              message={i18nT('components.agentSelector.roster_load_failed')}
             />
             <Btn
               onClick={rosterFailed.onReload}
@@ -410,12 +478,12 @@ export default function AgentSelector({
               className="text-[12px] px-2 py-1 shrink-0"
             >
               {rosterFailed.reloading
-                ? i18nT("components.agentSelector.retrying")
-                : i18nT("components.agentSelector.retry")}
+                ? i18nT('components.agentSelector.retrying')
+                : i18nT('components.agentSelector.retry')}
             </Btn>
           </div>
         )}
       </PopoverContent>
     </Popover>
-  );
+  )
 }

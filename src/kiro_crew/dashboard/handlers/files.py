@@ -2767,12 +2767,14 @@ class _TextRead(NamedTuple):
     ``invalid`` (validation refused), ``dir`` / ``missing`` (nothing to read),
     ``file`` (``content`` is the capped text) or ``read_failed``. ``path`` is the
     validated path, or ``""`` for ``invalid`` -- the raw input is the caller's to
-    log, as before.
+    log, as before. ``lossy`` says the UTF-8 decode had to substitute
+    replacement characters, so ``content`` is not the file as written.
     """
 
     kind: str
     path: str
     content: str
+    lossy: bool = False
 
 
 #: How much of a file the binary sniff reads before deciding, in BYTES. 8 KiB is
@@ -2880,7 +2882,14 @@ def _read_request_path(raw: str, read_cap: int) -> _TextRead:
             data = checked.file.read(read_cap * 4)
         if b"\x00" in data[:_FILE_READ_SNIFF_BYTES]:
             return _TextRead("binary", checked.path, "")
-        return _TextRead("file", checked.path, data.decode("utf-8", errors="replace")[:read_cap])
+        try:
+            return _TextRead("file", checked.path, data.decode("utf-8")[:read_cap])
+        except UnicodeDecodeError:
+            # A text file the UTF-8 decode cannot render faithfully -- Latin-1,
+            # one stray byte, a codepoint split at the snapshot bound. The
+            # replacement characters make this body NOT the file as written,
+            # and the viewer must know before it offers the body as a copy.
+            return _TextRead("file", checked.path, data.decode("utf-8", errors="replace")[:read_cap], True)
     except OSError:
         with contextlib.suppress(Exception):
             checked.file.close()
@@ -3145,6 +3154,7 @@ async def api_file_read(request: web.Request) -> web.Response:
         # other opener in this module is ``api_file_diff``, which feeds the SAME
         # panel the ``original`` this buffer is compared against; the outbox
         # flagged-file check and the upload gates keep the unconditional ``redact``.
+        as_written = content
         if await _owner_view_bypasses_credential_pass(request):
             content = redact_owner_view_via_context(content)
         else:
@@ -3152,7 +3162,20 @@ async def api_file_read(request: web.Request) -> web.Response:
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_read", outcome="success", resources=path
         )
-        headers = {"X-Truncated": "true"} if truncated else {}
+        # All three headers say the same thing to the viewer: this body is not
+        # the file as written. The panel keeps the last copy of a file deleted
+        # outside the dashboard and offers to download it; a capped, redacted
+        # or lossily decoded body must not be offered under the file's own
+        # name as if it were whole. The verdict rides in headers because
+        # nothing in the body can carry it: a file may quote the redaction tag
+        # verbatim, or contain the replacement character itself.
+        headers = {}
+        if truncated:
+            headers["X-Truncated"] = "true"
+        if content != as_written:
+            headers["X-Redacted"] = "true"
+        if outcome.lossy:
+            headers["X-Lossy-Decode"] = "true"
         # Pick a sensible content_type per file extension so browsers and
         # debuggers (DevTools "Response" preview, curl) interpret the body
         # correctly. JSON files in particular benefit from application/json
@@ -5259,6 +5282,12 @@ def _grep_sensitive_globs(root: str) -> list[str]:
     """
     args: list[str] = []
     root_real = os.path.realpath(root)
+    # Should ``sandbox_credential_targets`` raise ``PathResolutionStalled`` (a
+    # ``RuntimeError``: the roots could not be canonicalised), it is deliberately
+    # NOT caught here. An empty exclusion list would let ripgrep read the stores
+    # before the per-hit filter sees them; letting it propagate reaches
+    # ``_grep_rg``'s ``RuntimeError`` catch, which returns ``None`` and routes the
+    # search to the fail-closed python engine instead.
     for target in sandbox_credential_targets():
         if not target:
             continue
@@ -6090,6 +6119,17 @@ async def api_file_diff(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+def _browse_entry_is_dir(entry) -> bool:
+    # DirEntry.is_dir(follow_symlinks=True) stats the target, so one
+    # unreadable child (a TCC-protected dir, a permission-denied entry)
+    # raises instead of answering. Treat that as a non-dir so one bad
+    # sibling never aborts the sort or the listing loop.
+    try:
+        return bool(entry.is_dir(follow_symlinks=True))
+    except OSError:
+        return False
+
+
 def _browse_dirs_sync(base: str, skip: set[str]) -> list[dict]:
     """Walk *base* one level deep and return its visible subdirectories.
 
@@ -6102,12 +6142,15 @@ def _browse_dirs_sync(base: str, skip: set[str]) -> list[dict]:
     dirs: list[dict] = []
     try:
         for entry in sorted(os.scandir(base), key=lambda e: e.name.lower()):
-            if entry.is_dir(follow_symlinks=True) and entry.name not in skip and not entry.name.startswith("."):
-                # Resolve symlinks before the sensitivity check — a symlink in
-                # a benign dir pointing at ~/.aws would otherwise pass through.
-                if is_sensitive_path(os.path.realpath(entry.path)):
-                    continue
-                dirs.append({"name": entry.name, "path": entry.path})
+            if not _browse_entry_is_dir(entry):
+                continue
+            if entry.name in skip or entry.name.startswith("."):
+                continue
+            # Resolve symlinks before the sensitivity check — a symlink in
+            # a benign dir pointing at ~/.aws would otherwise pass through.
+            if is_sensitive_path(os.path.realpath(entry.path)):
+                continue
+            dirs.append({"name": entry.name, "path": entry.path})
     except PermissionError:
         pass
     return dirs
@@ -6122,9 +6165,19 @@ def _browse_files_sync(base: str, skip: set[str]) -> tuple[list[dict], list[dict
     dirs: list[dict] = []
     files: list[dict] = []
     try:
-        # Sort: dirs before files, then alphabetical
-        for entry in sorted(os.scandir(base), key=lambda e: (not e.is_dir(follow_symlinks=True), e.name.lower())):
+        # Sort: dirs before files, then alphabetical. The key must not raise
+        # on an unreadable child: DirEntry.is_dir stats the target, so one
+        # bad sibling would abort sorted() and empty the whole listing.
+        for entry in sorted(os.scandir(base), key=lambda e: (not _browse_entry_is_dir(e), e.name.lower())):
             if entry.name.startswith("."):
+                continue
+            # An entry that cannot even be classified is skipped, not fatal:
+            # without this, one unreadable child aborts the loop and drops
+            # every entry after it.
+            try:
+                is_dir = entry.is_dir(follow_symlinks=True)
+                is_file = False if is_dir else entry.is_file(follow_symlinks=True)
+            except OSError:
                 continue
             # Resolve symlinks before the sensitivity check — a symlink in a
             # benign dir pointing at ~/.aws would otherwise pass through.
@@ -6137,10 +6190,10 @@ def _browse_files_sync(base: str, skip: set[str]) -> tuple[list[dict], list[dict
                 mtime = int(entry.stat(follow_symlinks=True).st_mtime)
             except OSError:
                 mtime = 0
-            if entry.is_dir(follow_symlinks=True):
+            if is_dir:
                 if entry.name not in skip:
                     dirs.append({"name": entry.name, "path": entry.path, "mtime": mtime})
-            elif entry.is_file(follow_symlinks=True):
+            elif is_file:
                 files.append({"name": entry.name, "path": entry.path, "mtime": mtime})
     except PermissionError:
         pass
@@ -8217,6 +8270,7 @@ async def api_project_tree(request: web.Request) -> web.Response:
                 "truncatedDirectories": [],
                 "hiddenOnlyDirectories": [],
                 "unreadableDirectories": [],
+                "linkedDirectories": [],
             }
         )
 
@@ -8269,9 +8323,12 @@ async def api_project_tree(request: web.Request) -> web.Response:
                     # file beneath it it is absent, never childless -- while an
                     # indexed path beneath it still comes from the index
                     # (`--cached` reads no directory) and makes it an ordinary
-                    # populated row.
+                    # populated row. A symlink to a directory is listed by git
+                    # as a FILE (the link itself is the tracked object), so it
+                    # is a file row here, never a childless directory.
                     "hiddenOnlyDirectories": [],
                     "unreadableDirectories": [],
+                    "linkedDirectories": [],
                 }
 
         # Fallback: walk twice so the first pass can compute fair per-directory
@@ -8280,8 +8337,9 @@ async def api_project_tree(request: web.Request) -> web.Response:
         directories: list[str] = []
         # Directories the walk leaves CHILDLESS although they are not empty on
         # disk: every entry is a directory this filter drops (a dot-directory
-        # or a tooling cache) or a symlink to a directory the walk does not
-        # follow, and there is no file. The dashboard renders a childless folder
+        # or a tooling cache) and there is no file -- a symlink to a directory
+        # is NOT such an entry (it is a visible row of its own, see
+        # ``linked_directories``). The dashboard renders a childless folder
         # with a state row beneath it, and the row must not call such a folder
         # empty -- `_bg/` holding only `.kiro/` is the reported case. Reported
         # separately from `directories` so the tree can tell the two apart; a
@@ -8289,6 +8347,11 @@ async def api_project_tree(request: web.Request) -> web.Response:
         # even when it also holds hidden entries. The root itself, when its top
         # level holds only such entries, is named as ``.`` (it is no row).
         hidden_only_directories: list[str] = []
+        # Symlinks to directories, listed as rows of their own (see the walk
+        # below): the walk never follows a link, so nothing beneath one is
+        # listed, and the dashboard says so beneath its row rather than calling
+        # the link -- or the folder holding only links -- empty.
+        linked_directories: list[str] = []
         # Directories the walk KEPT but could not read. ``os.walk`` reports a
         # failed ``scandir`` on a subdirectory through ``onerror`` and then
         # skips it WITHOUT yielding it (its default ``onerror=None`` swallows
@@ -8335,28 +8398,45 @@ async def api_project_tree(request: web.Request) -> web.Response:
         file_counts: dict[str, int] = {}
         for dirpath, dirnames, filenames in os.walk(base, onerror=_record_unreadable):
             had_subdirectories = bool(dirnames)
-            dirnames[:] = sorted(
-                d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
-            )
             rel_dir = os.path.relpath(dirpath, base)
             directory = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
             if directory:
                 directories.append(directory)
-            # A symlink to a directory stays in ``dirnames`` but the walk
-            # never descends it (``followlinks`` is off), so it becomes
-            # neither a row nor a parent: one more entry the listing hides.
-            # The root is judged by the same rule, OUTSIDE the ``if directory``
-            # above: a project directory whose top level holds only skipped or
-            # hidden entries yields no file and no kept subdirectory, so the
-            # payload would be the empty-workspace shape and the dashboard
-            # would call the workspace empty -- the claim this listing refuses
-            # to make one level down. The root is no directory row of its own,
-            # so it is named as ``.``, exactly as an unreadable root is.
-            if (
-                had_subdirectories
-                and not filenames
-                and all(os.path.islink(os.path.join(dirpath, d)) for d in dirnames)
-            ):
+            # A symlink to a directory is a visible, navigable entry -- ``ls``
+            # shows it -- but the walk never descends it (``followlinks`` is
+            # off, against link cycles) and never yields it, so it would be
+            # neither a row nor a parent and its folder would read as childless.
+            # It is listed as a directory row of its own and named in
+            # ``linkedDirectories``: the row shows, nothing beneath it is
+            # listed (the target is not walked), and the dashboard says so
+            # beneath it instead of calling the link empty. The name filter
+            # below applies to every entry alike, link or not: what a folder
+            # shows must be predictable from the NAME alone, and a ``.cache``
+            # or ``node_modules`` that is a link to another disk is as much a
+            # hidden item as its real twin (Design lane on ``9f52681b54``) --
+            # so links are told apart among the names the filter KEPT, and a
+            # filtered link counts as a hidden entry like any filtered
+            # directory. Hidden-only therefore means every entry the folder
+            # holds is one the listing filters out by nature (dot-directories,
+            # the skip set), real or linked: it applies when the filter emptied
+            # ``dirnames`` and no file remains. A kept link is a row, and a
+            # folder holding only kept links is not hidden-only. The root is
+            # judged by the same rule, OUTSIDE the ``if directory`` above: a
+            # project directory whose top level holds only skipped or hidden
+            # entries yields no file and no kept subdirectory, so the payload
+            # would be the empty-workspace shape and the dashboard would call
+            # the workspace empty -- the claim this listing refuses to make one
+            # level down. The root is no directory row of its own, so it is
+            # named as ``.``, exactly as an unreadable root is.
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
+            )
+            links = [name for name in dirnames if os.path.islink(os.path.join(dirpath, name))]
+            for name in links:
+                link = f"{directory}/{name}" if directory else name
+                directories.append(link)
+                linked_directories.append(link)
+            if had_subdirectories and not filenames and not dirnames:
                 hidden_only_directories.append(directory or ".")
             file_counts[directory] = len(filenames)
 
@@ -8383,6 +8463,7 @@ async def api_project_tree(request: web.Request) -> web.Response:
             "truncatedDirectories": truncated_directories,
             "hiddenOnlyDirectories": hidden_only_directories,
             "unreadableDirectories": unreadable_directories,
+            "linkedDirectories": linked_directories,
         }
 
     result = await asyncio.to_thread(_run)
@@ -8411,6 +8492,7 @@ async def api_project_tree(request: web.Request) -> web.Response:
         "truncatedDirectories",
         "hiddenOnlyDirectories",
         "unreadableDirectories",
+        "linkedDirectories",
     ):
         result[key] = list(
             dict.fromkeys(redact_path_segments(p, redact) for p in result[key])

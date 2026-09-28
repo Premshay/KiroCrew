@@ -1,11 +1,24 @@
-import { Fragment, useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
+import {
+  Fragment,
+  Suspense,
+  lazy,
+  useState,
+  useRef,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+} from 'react'
 import { createPortal } from 'react-dom'
 import { useLocation, useNavigate, useNavigationType, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
 import { useIsMobile } from '../hooks/useIsMobile'
+import { useShellSlot } from '../hooks/useShellSlot'
+import { useMobileNavRail } from '../components/MobileNavRailContext'
 import { useVisualViewport } from '../hooks/useVisualViewport'
 import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
+import { useFolderSortMode } from '../hooks/useFolderSortMode'
 import { useRailWidth } from '../hooks/useRailWidth'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
 import { settingsPath } from '../components/settingsPath'
@@ -74,16 +87,15 @@ import {
   replaceMessages,
   requestStop,
   pendingQuestionFor,
-  captureStatelessCard,
   clearFollowupCard,
   dismissFollowupItem,
   clearFolderSuggestion,
   ageFolderSuggestion,
-  retireStatelessQuestion,
   capturePendingAskId,
   confirmOptimisticSend,
   resolveOptimisticSteer,
   requestSlotReveal,
+  refreshSlot,
   mcpAppKey,
   selectAutomationForSlot,
   sseAutomation,
@@ -96,6 +108,7 @@ import { addNotification, removeNotificationByTs } from '../store/notificationsS
 import {
   onTerminalReady,
   sendToTerminalSession,
+  sendRawToTerminalSession,
   getTerminalShell,
   getTerminalFenceShells,
 } from '../utils/terminalRegistry'
@@ -112,7 +125,12 @@ import {
 import { isPopoutOpen as isTerminalPopoutOpen } from '../utils/terminalPopout'
 import { disposeTerminalSession, useDeleteTerminalSession } from '../components/CliPanel'
 import { interceptSlashCommand, isInterceptedSlashCommand } from './chat/ChatInput'
-import { triggerRefresh, updateSlot, slotIsRemoteBound } from '../store/dashboardSlice'
+import {
+  triggerRefresh,
+  updateSlot,
+  slotIsRemoteBound,
+  sseSlotTitle,
+} from '../store/dashboardSlice'
 import { performSlotSwitch } from '../lib/slotSwitch'
 import { appendFollowUpOption, removeFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
 import { drainPendingChunks } from '../lib/pendingChunkDrain'
@@ -126,7 +144,12 @@ import {
   normalizeAutomationRecord,
   type AutomationRecord,
 } from '../monitoring/automation'
-import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS } from '../utils/fileReadQuery'
+import {
+  fetchFileRead,
+  fileReadQueryKey,
+  FILE_READ_STALE_MS,
+  isPartialRead,
+} from '../utils/fileReadQuery'
 import { safeSetItem, safeSetSessionItem } from '../utils/safeStorage'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { EmptyState, Btn, Input } from '../components/ui'
@@ -378,13 +401,13 @@ import ChatInput from '../components/ChatInput'
 import SessionControlHost from '../components/SessionControlHost'
 import { useSessionControls, useSessionControlStatuses } from '../hooks/useSessionControls'
 import type { ChatFolder } from '../types'
-import ErrorNotice from '../components/ErrorNotice'
+import ErrorNotice, { ErrorNoticeMenuItem } from '../components/ErrorNotice'
 import VoicePlaybackNotice from '../components/VoicePlaybackNotice'
 import ChatDropOverlay from '../components/ChatDropOverlay'
 import SessionGridView from '../components/SessionGridView'
 import SessionTabStrip from '../components/SessionTabStrip'
 import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutStore'
-import { effortSupportedForCrew } from '../lib/effort'
+import { effortPopoverLeft, effortSupportedForCrew } from '../lib/effort'
 import { mcpAppTabTitle } from '../lib/mcpAppSrcdoc'
 import { countCompletedTurns } from '../lib/completedTurns'
 import { displayModel, modelLabel, pinIsWithheld } from '../lib/model'
@@ -424,6 +447,7 @@ import { turnHadPolicyBlock } from '../app-sdk/turnPolicyBlock'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { JiraHostsCtx } from '../lib/jiraHosts'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
+import ErrorBoundary from '../components/ErrorBoundary'
 import SessionTitleControl from './chat/SessionTitleControl'
 import { useChatNavigation } from '../hooks/useChatNavigation'
 import { useChatPins } from '../hooks/useChatPins'
@@ -488,6 +512,15 @@ import {
 import { deriveFollowUpOptions, parseOptions } from '../app-sdk/protocol'
 import { isNoteRow } from '../lib/noteContract'
 import OverlayDrawer from '../components/OverlayDrawer'
+// Lazy for the same reason App.tsx lazy-loads the pill: the update chunk is
+// off the app-core budget, and the phone menu needs it only while an update exists.
+const MobileUpdateMenuItem = lazy(() => import('../components/UpdatePill'))
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from '../components/ui/dropdown-menu'
 import { loadChatConfig, CONTENT_WIDTH, type ChatConfig } from './chat/ChatSettings'
 import { scaleContentWidth } from './chat/contentWidth'
 import SessionFlyout, { TOGGLE_RECT } from './chat/SessionFlyout'
@@ -499,7 +532,18 @@ import {
   expandKnowledgeBlock,
 } from './chat/useKnowledgeFetch'
 import { KnowledgePicker } from './chat/KnowledgePicker'
-import { MessageSquare, Clock, AppWindow, Undo2, Columns2, ExternalLink, X } from 'lucide-react'
+import {
+  MessageSquare,
+  Clock,
+  AppWindow,
+  Undo2,
+  Columns2,
+  ExternalLink,
+  X,
+  MoreHorizontal,
+  EyeOff,
+  VenetianMask,
+} from 'lucide-react'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { PanelLeftSolid, PanelLeftLight, PanelRightSolid } from '../components/icons/panels'
 
@@ -515,6 +559,7 @@ import type { ChatMessage } from '../types'
 import { shouldMountSidePanel, isSidePanelHidden, sidePanelDockMotion } from './chat/sidePanelMount'
 import type { ParsedSubagentCompletion } from './chat/subagentCompletion'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
+import { useKirocrewConfigReader } from '../hooks/useKirocrewConfigReader'
 import TurnBlock from './chat/TurnBlock'
 import Clickable from '../components/Clickable'
 import WorkflowProgressBar from './chat/WorkflowProgressBar'
@@ -527,6 +572,21 @@ import { errMessage } from '../utils/thunkError'
 import { i18nT } from '../i18n/t'
 import { fmtDateFields } from '../i18n/format'
 import { fmtMessageTime, fmtMessageTimeFull } from './chat/messageTime'
+
+/**
+ * Horizontal room the chat pane reclaims (negative margin) while the desktop
+ * sessions sidebar is collapsed: the gap the open panel kept between itself and
+ * the pane. Every pane-space offset that clears the stationary toggle adds it.
+ */
+const COLLAPSED_PANE_RECLAIM_PX = 8
+/**
+ * Leading clearance for the open-session strip while the desktop sessions
+ * sidebar is collapsed. The pane's reclaimed margin moves the toggle's
+ * container-space right edge (x + size) that much farther into the strip; the
+ * final 4px keeps the first tab visibly separate from the control.
+ */
+const COLLAPSED_SESSION_TABS_INSET =
+  TOGGLE_RECT.x + TOGGLE_RECT.size + COLLAPSED_PANE_RECLAIM_PX + 4
 /**
  * Human-readable reason from a rejected thunk. `unwrap()` rejects with RTK's
  * SERIALIZED error — a plain object, never an `Error` instance — so an
@@ -693,6 +753,33 @@ export default function ChatPage({
   // effect reads it (mobile replaces rather than pushes a session switch), and
   // that effect is defined well above where the layout hooks start.
   const isMobile = useIsMobile()
+  /**
+   * Phone: the App shell's top bar is the ONE bar, and this page's title row
+   * lives in it. The shell renders `#mobile-topbar-slot` (centre cell) and
+   * `#mobile-topbar-trail-slot` (after the bell) only on the chat route below
+   * the breakpoint; this page fills them through `createPortal` — the same
+   * hand-off `#activity-bar-slot` uses on desktop. Both resolve to `null`
+   * anywhere the shell does not render them (the popout window, an embedded
+   * host, a desktop width), and the page then keeps its own inline title row
+   * — so a missing slot degrades to today's layout rather than to no title.
+   *
+   * `mobileNavRail` is the shell's main navigation as an icon rail, rendered
+   * beside the sessions pane inside this page's ONE drawer (see the
+   * OverlayDrawer below). `null` off the phone chat route.
+   */
+  const singleBar = isMobile && !embedded && !popout
+  const topbarSlot = useShellSlot('mobile-topbar-slot', singleBar)
+  const topbarTrailSlot = useShellSlot('mobile-topbar-trail-slot', singleBar)
+  const mobileNavRail = useMobileNavRail()
+  /**
+   * Whether the title row is in the shell's bar rather than inline. Derived
+   * from the slot ELEMENT, not from `isMobile`: the two can disagree for a
+   * render on a breakpoint crossing, and the row must be in exactly one place
+   * — the inline copy stands down only once the portal target exists, and the
+   * transcript's header spacer, the fixed sessions button and the split view's
+   * inline toggle all key off this same flag so none of them doubles up.
+   */
+  const titleInTopbar = topbarSlot !== null
   // The mobile sessions drawer and its scrim are `fixed` overlays that autofocus
   // a search input, so a software keyboard is open whenever they are. iOS Safari
   // shrinks only the VISUAL viewport for the keyboard (`interactive-widget`
@@ -1316,10 +1403,12 @@ export default function ChatPage({
   const modelPickerModels = useMemo(() => {
     const pickerSlot = slots.find((slot) => slot.key === activeSlot)
     return withJevRoute(
-      filterInteractiveModels(effectiveModels, hiddenModelIds, [
-        pickerSlot?.model || '',
-        pickerSlot?.served_model || '',
-      ], codexPairModels),
+      filterInteractiveModels(
+        effectiveModels,
+        hiddenModelIds,
+        [pickerSlot?.model || '', pickerSlot?.served_model || ''],
+        codexPairModels,
+      ),
       jevRouteOn,
       jevRouteLabel,
     )
@@ -3142,19 +3231,17 @@ export default function ChatPage({
       // clear, and (below) the send target.
       const uiSlot = activeSlotRef.current
 
-      // Capture the stateless card pending at ENTRY — before the first await
-      // below. This send consumes the answer channel of the card the user saw
-      // when they hit send; captured after an await, the card-submit flow can
-      // clear the card (or a newer one can land) in the gap, and the capture
-      // would compare against the wrong baseline (fork GPT review, 995718f).
+      // Capture a pending BLOCKING card at ENTRY — before the first await below.
+      // This send consumes the answer channel of the card the user saw when they
+      // hit send; captured after an await, the card-submit flow can resolve the
+      // card (or a newer one can land) in the gap, and the capture would compare
+      // against the wrong baseline. Its staleness is
+      // resolved over the network, not in the store. A STATELESS card needs no
+      // capture: the server retires it when this send's user row lands and
+      // announces it with `question_card_resolved`.
       const entrySendSlot = targetSlot ?? uiSlot
       // An app's supplied text is not the human's answer to a pending card.
       // Null captures keep all composer-owned completion effects inert.
-      const cardAtSend = isolated
-        ? null
-        : captureStatelessCard(store.getState().chat.pendingQuestions, entrySendSlot)
-      // Same entry-time capture for a BLOCKING card, whose staleness is resolved
-      // over the network instead of in the store.
       const askAtSend = isolated
         ? null
         : capturePendingAskId(store.getState().chat.pendingQuestions, entrySendSlot)
@@ -3807,29 +3894,18 @@ export default function ChatPage({
           }),
         )
       }
-      if (body.ok && !body.queued && cardAtSend && slot === entrySendSlot) {
-        // Immediate dispatch confirmed (`ok`): the message consumed the slot's
-        // next-turn channel, so the card captured at entry is now stale. An
-        // independent check, not part of the else-if chain above — the card must
-        // retire regardless of which transcript-echo rule applied. A QUEUED
-        // acceptance deliberately does NOT retire here — the queued message is
-        // still cancellable, and cancelling must keep the card. Its ordinary
-        // turn-consuming server frame owns later retirement. The slot guard
-        // covers forceNew rerouting the send into a freshly created session —
-        // that send answers nothing in the entry slot, whose card must stay.
-        // Deliberately NOT done on the optimistic append (a failed send must
-        // keep the card) nor on the abort-timeout path below (delivery
-        // unconfirmed — a wrongly kept card is dismissible, a wrongly deleted
-        // one is not recoverable).
-        dispatch(retireStatelessQuestion({ slot, expected: cardAtSend }))
-      }
+      // No stateless-card retirement here: the server retires the card when the
+      // user row lands (immediate dispatch) or when the queued entry pops, and
+      // announces it with `question_card_resolved` to every window, this one
+      // included. A failed send appends no row, so the card stays; a queued send
+      // stays cancellable with the card intact until its pop.
       if (body.ok && !body.queued && folderCardAtSend && slot === entrySendSlot) {
-        // Same delivery bar and slot-identity guard as the stateless-card
-        // retirement above, for the folder-suggestion card's turn-aging: the
-        // card was on screen when the user hit send (captured at entry, active
-        // slot only) and the server confirmed the send was delivered. Failed
-        // sends never reach here; queued sends are still cancellable; forceNew
-        // reroutes answer nothing in the entry slot. ts pins the card
+        // Delivery bar and slot-identity guard for the folder-suggestion card's
+        // turn-aging: the card was on screen when the user hit send (captured at
+        // entry, active slot only) and the server confirmed the send was
+        // delivered. Failed sends never reach here; queued sends are still
+        // cancellable; forceNew reroutes (the send lands in a freshly created
+        // session) answer nothing in the entry slot. ts pins the card
         // generation, so a replacement that landed mid-flight is not aged.
         dispatch(ageFolderSuggestion({ slot, ts: folderCardAtSend.ts }))
       }
@@ -3982,7 +4058,10 @@ export default function ChatPage({
       // `auto` would have resolved to anyway. Routing is armed by a pick made once the
       // slot exists, where the flag is set with it.
       if (!activeSlot) {
-        if (modelName === JEV_ROUTE_MODEL) { setPendingModel(''); return }
+        if (modelName === JEV_ROUTE_MODEL) {
+          setPendingModel('')
+          return
+        }
         setPendingModel(modelName)
         return
       }
@@ -4152,6 +4231,12 @@ export default function ChatPage({
   // future payload change) can resolve to a non-array, and `= []` only covers
   // undefined — which crashed the whole chat page on `.find`.
   const chatFolders: ChatFolder[] = Array.isArray(chatFoldersRaw) ? chatFoldersRaw : []
+  // The sidebar's folder sort mode, for the folder-suggestion card's option list:
+  // the card draws the same tree the sidebar draws and must list it in the same
+  // order. Read here (shared kirocrewConfig query) so the card stays pure. The
+  // read's failure travels too, for the one case the sidebar's banner cannot
+  // cover: this screen with no sidebar on it (see `sidebarOnScreen` below).
+  const { mode: folderSortMode, error: folderSortError } = useFolderSortMode()
   const activeFolderName = chatFolders.find((f) => f.id === currentSlot?.folder_id)?.name || ''
   // The session IDENTITY, not the display slot. `activeSlot` is the slot id
   // (`chat-2`); the key the rest of the system stores session-scoped state under
@@ -4736,6 +4821,65 @@ export default function ChatPage({
     // Both are stable for the provider's / component's lifetime (a context
     // client and a []-dep useCallback), so the listener still installs once.
   }, [queryClient, showActionError])
+  // A redaction card's "Open in Terminal": open a dock terminal and TYPE the
+  // command without submitting it, so the reader reviews it before it runs.
+  // The typing tier refuses a newline, which is what keeps this from running.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {}
+      const command: unknown = detail.command
+      const reqId: unknown = detail.reqId
+      const emit = (ok: boolean) =>
+        window.dispatchEvent(
+          new CustomEvent('mc:prefill-terminal-result', { detail: { reqId, ok } }),
+        )
+      if (typeof command !== 'string' || !command || /[\r\n]/.test(command)) {
+        emit(false)
+        return
+      }
+      const sessionId = addDockTerminal(currentProjectRef.current ?? undefined)
+      if (!sessionId) {
+        emit(false)
+        return
+      }
+      let settled = false
+      const unsub = onTerminalReady(sessionId, () => {
+        settled = true
+        emit(sendRawToTerminalSession(sessionId, command))
+      })
+      setTimeout(() => {
+        if (!settled) {
+          unsub()
+          emit(false)
+        }
+      }, RUN_IN_TERMINAL_READY_DEADLINE_MS)
+    }
+    window.addEventListener('mc:prefill-terminal', handler)
+    return () => window.removeEventListener('mc:prefill-terminal', handler)
+  }, [])
+  // A redaction card's "Pre-fill request": the text lands in the composer for
+  // the reader to review; nothing is sent. It appends to unsent text rather
+  // than replacing it, because the pending-input path persists what it sets.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const text: unknown = (e as CustomEvent).detail?.text
+      if (typeof text === 'string' && text)
+        dispatch(setPendingInput(mergeIntoDraft(inputRef.current, text)))
+    }
+    window.addEventListener('mc:prefill-composer', handler)
+    return () => window.removeEventListener('mc:prefill-composer', handler)
+  }, [dispatch])
+  // A redaction card's "Allow for this host": the reply was saved with the
+  // link removed, and the server shows allowed hosts' links again when it
+  // serves the slot, so reload it to show the link in place of the chip.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const slot: unknown = (e as CustomEvent).detail?.slot
+      if (typeof slot === 'string' && slot) void dispatch(refreshSlot(slot))
+    }
+    window.addEventListener('mc:redaction-hosts-changed', handler)
+    return () => window.removeEventListener('mc:redaction-hosts-changed', handler)
+  }, [dispatch])
   // Cold-tab hydration: after a reload (or when restoring a slot's strip from
   // the persisted panel-tabs store), file tabs come back as lightweight
   // references with their heavy content stripped (content === undefined). Read
@@ -4783,6 +4927,7 @@ export default function ChatPage({
           content: text,
           savedContent: text,
           binary: r.data.ok && r.data.binary,
+          partial: r.data.ok && isPartialRead(r.data),
         })
       } else if ((r.data || r.isError) && !reportedColdReadsRef.current.has(t.id)) {
         // The tab stays cold (its buffer untouched, so the next chip/tree click
@@ -4985,9 +5130,10 @@ export default function ChatPage({
   // default — the backend applies `slot.reasoning_effort or agent.reasoning_effort`
   // — so the composer must show the inherited value rather than a bare
   // "Default", which read as "the model decides" and hid the real setting.
+  const readKirocrewConfig = useKirocrewConfigReader()
   const { data: _defaultEffort } = useQuery({
     queryKey: ['default-effort', provider.id],
-    queryFn: () => provider.resolveDefaultEffort(),
+    queryFn: () => provider.resolveDefaultEffort(readKirocrewConfig),
     enabled: provider.capabilities.reasoningEffort,
   })
   const defaultEffort = _defaultEffort || ''
@@ -5100,6 +5246,11 @@ export default function ChatPage({
   // it, so exiting focus mode restores what the user had. null = focus mode is
   // not the reason the list is hidden (the user owns the state).
   const sidebarAutoHidden = useRef<boolean | null>(null)
+  // One LLM title generation at a time from the phone bar's menu item: the
+  // menu closes on select, so nothing else stops a second tap from starting a
+  // concurrent call whose last response would win (SessionTitleControl's
+  // button has the same guard in its `generating` state).
+  const menuAutoTitleInFlight = useRef(false)
   const [sidePanelDock] = useSidePanelDock()
   // Recomputed on every dock flip: the wrapper keeps one React key across the
   // flip, so both axes have to stay named or the flipped-away one gets driven
@@ -5350,6 +5501,14 @@ export default function ChatPage({
   const openKiroSignIn = useCallback(() => {
     navigate(KIRO_SIGN_IN_PATH)
   }, [navigate])
+  // A `materialization_changed` row's fix: the member's Capabilities pane in
+  // the crew editor, where the changed agent file is reviewed and saved.
+  const openMemberCapabilities = useCallback(
+    (member: string) => {
+      navigate(`/capabilities?tab=crews&crew=${encodeURIComponent(member)}&pane=capabilities`)
+    },
+    [navigate],
+  )
   // The non-inference exit for a feature request the plan could not afford
   // (#13342) is decided per row in the shared row set, from the row alone: the
   // user row the header's "Request a Feature" action sent carries the flow's
@@ -7079,6 +7238,15 @@ export default function ChatPage({
   visibleIndexMapRef.current = visibleIndexMap
   const lastTextIdxRef = useRef(lastTextIdx)
   lastTextIdxRef.current = lastTextIdx
+  // The first reply in this session with a removed credential: the one-time
+  // redaction coach renders after it and nowhere else.
+  const redactionCoachTs = useMemo(() => {
+    for (const m of messages) {
+      const r = (m.meta as Record<string, unknown> | undefined)?.redactions
+      if (m.role === 'assistant' && Array.isArray(r) && r.length > 0) return m.ts ?? null
+    }
+    return null
+  }, [messages])
   const slotStateRef2 = useRef(slotState)
   slotStateRef2.current = slotState
 
@@ -7284,6 +7452,9 @@ export default function ChatPage({
                       fileChangesOmittedFiles={
                         (m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files
                       }
+                      blockedLinks={(m.meta as Record<string, unknown> | undefined)?.blocked_links}
+                      redactions={(m.meta as Record<string, unknown> | undefined)?.redactions}
+                      showRedactionCoach={!!m.ts && m.ts === redactionCoachTs}
                       turnStats={
                         chatConfig.showTurnStats
                           ? ((m.meta as Record<string, unknown> | undefined)?.turn_stats as
@@ -7422,6 +7593,7 @@ export default function ChatPage({
       onPickModel: openModelPickerFromError,
       onOpenDefaultModel: embedded || popout ? undefined : openDefaultModelSetting,
       onOpenSignIn: embedded || popout ? undefined : openKiroSignIn,
+      onOpenCapabilities: embedded || popout ? undefined : openMemberCapabilities,
       onSessionOpen: selectSessionTab,
       sessions: connected ? sessionTitles : undefined,
       activeSession: activeSlot || undefined,
@@ -7509,10 +7681,12 @@ export default function ChatPage({
     openModelPickerFromError,
     openDefaultModelSetting,
     openKiroSignIn,
+    openMemberCapabilities,
     handleFolderOpen,
     handleSpeak,
     handleApplyPlan,
     mcpAppPanel,
+    redactionCoachTs,
   ])
 
   const renderMessage = useCallback(
@@ -7909,45 +8083,10 @@ export default function ChatPage({
   // top-to-bottom. The header row ends at the slot's left edge,
   // so the top-bar right cluster (capsule, terminal, bell, gear) shifts left
   // when the panel opens. Null on mobile / embed frames -> inline fallback.
-  //
-  // Seed the portal slot SYNCHRONOUSLY so the very first render after a
-  // ChatPage remount (e.g. switching back to /chat) already targets the
-  // full-height actbar grid column. An effect-only seed leaves activitySlot
-  // null for render 1, which falls back to the inline panel (rendered below
-  // the header) and then flashes: below-header -> disappear -> portal opens.
-  // The App shell (and its #activity-bar-slot) lives outside the router, so on
-  // route-nav back it's already in the DOM. The effect below stays as the
-  // fallback for cold load / mobile->desktop crossings where it isn't yet.
-  const [activitySlot, setActivitySlot] = useState<HTMLElement | null>(() =>
-    isMobile || embedMode ? null : document.getElementById('activity-bar-slot'),
-  )
-  useEffect(() => {
-    if (isMobile || embedMode) {
-      setActivitySlot(null)
-      return
-    }
-    const el = document.getElementById('activity-bar-slot')
-    if (el) {
-      setActivitySlot(el)
-      return
-    }
-    // Slot not in the DOM yet. On a mobile -> desktop crossing, this
-    // component's media-query subscription can flush (and run this effect)
-    // before the App shell re-renders the slot div -- a one-shot lookup here
-    // would miss it forever and strand the panel on the inline fallback
-    // (rendering below the header instead of in the full-height column).
-    // Watch the DOM until the slot appears, then latch it and stop.
-    setActivitySlot(null)
-    const mo = new MutationObserver(() => {
-      const found = document.getElementById('activity-bar-slot')
-      if (found) {
-        setActivitySlot(found)
-        mo.disconnect()
-      }
-    })
-    mo.observe(document.body, { childList: true, subtree: true })
-    return () => mo.disconnect()
-  }, [isMobile, embedMode])
+  // `useShellSlot` seeds synchronously (no first-render flash into the inline
+  // fallback) and watches the DOM across a mobile -> desktop crossing; the
+  // phone top-bar slots below resolve through the same hook.
+  const activitySlot = useShellSlot('activity-bar-slot', !isMobile && !embedMode)
   /** The inline panel's mount predicate, shared by the overlay phase effect
    *  and the render below so the two cannot disagree. */
   const sidePanelWantsMount =
@@ -8230,6 +8369,20 @@ export default function ChatPage({
   const sidebarOpen = isMobile
     ? mobileSessions
     : sidebarPinned || (filteredSlots.length === 0 && !previewExpanded)
+  // Whether the sidebar -- and with it the banner that says a failed
+  // folder-order read -- is on this screen right now. The same facts that mount
+  // it below: embed-chat never mounts one, embed-sessions always does, and the
+  // dashboard mounts it in the drawer while the drawer is (mobile) or the panel
+  // is open (desktop). The header menu and the folder-suggestion card say the
+  // failure themselves only when this is false: one screen, one notice.
+  const sidebarOnScreen =
+    embedMode === 'chat'
+      ? false
+      : embedMode === 'sessions'
+        ? true
+        : isMobile
+          ? drawerMounted
+          : sidebarOpen
 
   // ── Collapsed-sidebar hover flyout ──────────────────────────────────────
   // Hovering the toggle while collapsed opens a recents list over the chat, so
@@ -8371,6 +8524,22 @@ export default function ChatPage({
       {mobileSessions ? <PanelLeftLight size={16} /> : <PanelLeftSolid size={16} />}
     </button>
   )
+  /**
+   * The same toggle for the shell's bar. `p-2` puts its 32px box at the bar's
+   * 8px inset, so the glyph's ink lands on the 16px page gutter the nav logo
+   * held before it (page-layout.md, "The title belongs to the content column").
+   */
+  const topbarSessionsToggle = (
+    <button
+      className="p-2 rounded-md text-text hover:text-text-strong hover:bg-bg-hover cursor-pointer bg-transparent border-none shrink-0"
+      onClick={() => (mobileSessions ? closeSidebar() : openSidebar())}
+      aria-label={i18nT('pages.chatPage.toggle_sessions')}
+      aria-expanded={mobileSessions}
+      data-testid="mobile-topbar-sessions-toggle"
+    >
+      {mobileSessions ? <PanelLeftLight size={18} /> : <PanelLeftSolid size={18} />}
+    </button>
+  )
 
   // Unchanged from the inline WelcomeView handler; shared with the composer memory chip.
   const switchMemoryMode = async (newMode: MemoryMode) => {
@@ -8471,7 +8640,11 @@ export default function ChatPage({
                   // with nothing dimmed under it. Insetting rather than restating the
                   // edges is what lets every safe-area class keep owning its own edge,
                   // here and on the panel below.
-                  style={{ opacity: drawerScrim, marginTop: vv.offsetTop, marginBottom: keyboardInset }}
+                  style={{
+                    opacity: drawerScrim,
+                    marginTop: vv.offsetTop,
+                    marginBottom: keyboardInset,
+                  }}
                   // Ignored while a drag owns the panel: the release that ends a
                   // close gesture lands here as a click, and treating it as a
                   // tap-to-dismiss would run a second close over the settle.
@@ -8548,7 +8721,7 @@ export default function ChatPage({
               )}
             </AnimatePresence>
             {embedMode === 'chat' ? null : embedMode === 'sessions' ? (
-              <div className="flex-1 min-w-0 h-full overflow-hidden [&_.sidebar-inner]:!w-full [&_.sidebar-inner]:!border-0 [&_.sidebar-inner]:!rounded-none [&_.sidebar-inner]:!shrink [&_.sidebar-inner]:!bg-bg [&_.sidebar-resize-handle]:!hidden">
+              <div className="flex-1 min-w-0 h-full overflow-hidden [&_.sidebar-inner]:!w-full [&_.sidebar-inner]:!border-0 [&_.sidebar-inner]:!rounded-none [&_.sidebar-inner]:!shrink [&_.sidebar-inner]:!bg-bg [--folder-row-sticky-bg:var(--bg)] [&_.sidebar-resize-handle]:!hidden">
                 <ChatSidebar
                   slots={filteredSlots}
                   activeSlot={null}
@@ -8588,39 +8761,305 @@ export default function ChatPage({
                 slideStyle={
                   isMobile ? { marginTop: vv.offsetTop, marginBottom: keyboardInset } : undefined
                 }
+                // Top edge: below the shell's bar while this page still draws its own
+                // title row under that bar, so the two bars stay visible above the
+                // panel; with the row IN the shell's bar (`titleInTopbar`) the panel
+                // covers the whole safe-area height like the App nav drawer it
+                // replaces on this route -- the rail's brand mark then sits where
+                // that drawer's did. Close: scrim tap, swipe, Back -- all unchanged.
                 morph={!isMobile}
                 morphTarget={TOGGLE_RECT}
                 expandFrom={expandFrom}
                 contentH={Math.max(0, containerH - 8)}
                 className={
                   isMobile
-                    ? 'mobile-sessions-overlay fixed top-safe-offset-[42px] bottom-safe left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0'
+                    ? `mobile-sessions-overlay fixed ${titleInTopbar ? 'top-safe' : 'top-safe-offset-[42px]'} bottom-safe left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0`
                     : ''
                 }
               >
-                <ChatSidebar
-                  slots={filteredSlots}
-                  activeSlot={activeSlot}
-                  unreadSlots={surfaceUnreadSlots}
-                  history={history}
-                  historyHasMore={historyHasMore}
-                  defaultAgent={defaultAgent}
-                  installedAgents={installedAgents}
-                  mode={mode}
-                  onWidthChange={setSidebarWidth}
-                  onDragChange={setSidebarDragging}
-                  collapsible={!isMobile}
-                  staticRows={isMobile}
-                  onSelectSlot={clearSplitOnSelect}
-                  onOpenSlotInNewTab={ownsSessionTabs ? openSlotInNewTab : undefined}
-                  onOpenSource={revealSourceLink}
-                  // Only offer the pane as a drop target when a composer exists to show
-                  // the chip — see canStageSessionRef for why this is a named predicate.
-                  chatDropTarget={canStageSessionRef ? chatPaneEl : null}
-                  onDropSessionRef={stageSessionRef}
-                />
+                {/* Phone chat page: ONE drawer holds the shell's navigation rail (72px,
+            from MobileNavRailContext) beside the sessions pane, Discord-style, so
+            the bar above needs no second drawer trigger. The pane keeps its
+            `staticRows` content and takes the drawer's remaining width; the
+            drawer's own width, slide, scrim and keyboard inset are unchanged.
+            Row taps that stay on this page close the drawer (`closeSidebar`);
+            rows that leave it `replace` the duplicate history entry
+            `pushDrawerEntry` minted, so Back lands on the chat. */}
+                {(() => {
+                  const sessionsPane = (
+                    <ChatSidebar
+                      slots={filteredSlots}
+                      activeSlot={activeSlot}
+                      unreadSlots={surfaceUnreadSlots}
+                      history={history}
+                      historyHasMore={historyHasMore}
+                      defaultAgent={defaultAgent}
+                      installedAgents={installedAgents}
+                      mode={mode}
+                      onWidthChange={setSidebarWidth}
+                      onDragChange={setSidebarDragging}
+                      collapsible={!isMobile}
+                      staticRows={isMobile}
+                      onSelectSlot={clearSplitOnSelect}
+                      onOpenSlotInNewTab={ownsSessionTabs ? openSlotInNewTab : undefined}
+                      onOpenSource={revealSourceLink}
+                      // Only offer the pane as a drop target when a composer exists to show
+                      // the chip — see canStageSessionRef for why this is a named predicate.
+                      chatDropTarget={canStageSessionRef ? chatPaneEl : null}
+                      onDropSessionRef={stageSessionRef}
+                    />
+                  )
+                  return isMobile && mobileNavRail ? (
+                    <div className="flex h-full min-h-0 w-full" data-testid="mobile-split-drawer">
+                      {mobileNavRail({ onActivate: closeSidebar })}
+                      {/* The pane sits on the drawer's elevated surface so it reads apart
+                from the rail's `bg-bg-accent` (the sidebar's own shell paints
+                `bg-bg`, one step too close to the rail on the light themes). */}
+                      {/* The drawer's `[&>*]` resets (no card border/radius/margin on the
+                sidebar root) reach only its direct child, which is now this
+                wrapper -- so the wrapper carries the same resets one level down. */}
+                      <div className="flex-1 min-w-0 h-full min-h-0 flex flex-col overflow-hidden bg-bg-elevated [&_.sidebar-inner]:!bg-bg-elevated [&_.sidebar-inner]:!w-full [&_.sidebar-inner]:!min-w-0 [&_.sidebar-inner]:!shrink [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0">
+                        {sessionsPane}
+                      </div>
+                    </div>
+                  ) : (
+                    sessionsPane
+                  )
+                })()}
               </OverlayDrawer>
             )}
+            {/* Phone: this page's share of the shell's single top bar. Leading cell:
+          [sessions toggle][session title][session menu]. The title is first and
+          the menu chevron trails it, as on the approved mock — one control the
+          eye reads as "the session, and its menu". Rendered whenever the slot
+          exists, so the sessions toggle is in the bar even with no session open
+          (the fixed corner button below stands down); the title half needs a
+          session and is not drawn in split view, whose grid names each pane. */}
+            {topbarSlot &&
+              createPortal(
+                <>
+                  {embedMode !== 'chat' && topbarSessionsToggle}
+                  {activeSlot && !(splitMode && splitFeatureEnabled) && (
+                    <div
+                      className="group/header flex min-w-0 flex-1 items-center gap-0.5"
+                      data-testid="mobile-topbar-title"
+                    >
+                      {/* ONE control for title + menu: the session menu's trigger carries
+                  the title text with the chevron flush after its last character
+                  (the approved mock), so the bar's centre holds two controls --
+                  the sessions toggle and this -- and the title has one tap
+                  target, not a rename tap beside a menu tap. Rename lives in the
+                  menu (`onRename`) and swaps this trigger for the shared title
+                  editor while it is open; the memory-mode glyphs ride the label
+                  so an incognito/temporary session is still marked. */}
+                      {editingTitle ? (
+                        <SessionTitleControl
+                          slotKey={activeSlot}
+                          title={title}
+                          editing
+                          onEditingChange={(open) => setEditingTitleSlot(open ? activeSlot : null)}
+                          onError={showActionError}
+                          onAttempt={() => setActionError(null)}
+                        />
+                      ) : (
+                        <ChatHeaderMenu
+                          activeSlot={activeSlot}
+                          agent={currentSlot?.agent}
+                          onReveal={() => {
+                            // Same as the inline row's reveal: the phone drives its own
+                            // drawer, and the store carries the request (#912).
+                            sidebarAutoHidden.current = null
+                            openSidebar()
+                            dispatch(requestSlotReveal(activeSlot))
+                          }}
+                          onRename={() => setEditingTitleSlot(activeSlot)}
+                          // The phone bar does not render the title row's hover-revealed
+                          // Auto-title button (an opacity-0 control has no touch home), so
+                          // the LLM rename is a menu item here. Same endpoint and same
+                          // store write as SessionTitleControl's button; the Undo window
+                          // that button offers is a hover-hold affordance and is not
+                          // offered from a menu -- Rename in the same menu is the way back.
+                          onAutoTitle={() => {
+                            if (menuAutoTitleInFlight.current) return
+                            menuAutoTitleInFlight.current = true
+                            setActionError(null)
+                            const slot = activeSlot
+                            api
+                              .generateTitle(slot)
+                              .then((r) => {
+                                /* title is redacted server-side via redact_exfiltration_urls + redact_credentials */
+                                if (r.title) dispatch(sseSlotTitle({ key: slot, title: r.title }))
+                              })
+                              .catch((e) =>
+                                showActionError(
+                                  errMessage(e) || i18nT('pages.chatPage.unknown_error'),
+                                  i18nT('pages.chatPage.could_not_generate_title'),
+                                ),
+                              )
+                              .finally(() => {
+                                menuAutoTitleInFlight.current = false
+                              })
+                          }}
+                          mode={effectiveMode}
+                          sidebarOnScreen={sidebarOnScreen}
+                          // Pop out / focus the popped-out window live in the bar's
+                          // trailing ⋯ menu (below), the phone's window menu; the same
+                          // row in two adjacent menus read as two different actions.
+                          omitPopout
+                          triggerLabel={
+                            <>
+                              {currentSlot?.memory_mode === 'incognito' && (
+                                <EyeOff
+                                  size={13}
+                                  className="lucide-inline shrink-0 text-warn"
+                                  aria-label={i18nT(
+                                    'pages.chatPage.incognito_memory_writes_disabled',
+                                  )}
+                                />
+                              )}
+                              {currentSlot?.memory_mode === 'temporary' && (
+                                <VenetianMask
+                                  size={13}
+                                  className="lucide-inline shrink-0 text-aim"
+                                  aria-label={i18nT(
+                                    'pages.chatPage.temporary_no_memory_reads_or_writes',
+                                  )}
+                                />
+                              )}
+                              {title}
+                            </>
+                          }
+                        />
+                      )}
+                      {/* The autopilot explainer rides the bar too: it is the only
+                  place the mode is explained, and the inline row that carried
+                  it is not rendered here. A tooltip disclosure, not an action. */}
+                      {/* No Autopilot InfoTip here: it is a third button in a two-button
+                  cell. The session menu already names the mode (its
+                  Autopilot/Normal switch row) and the composer shows it. No
+                  InboundLinkChip either, for the same reason: a two-way link
+                  would make it a third trigger. Its actions are the session
+                  menu's "Linked surfaces" section (LinkedSurfacesSection). */}
+                    </div>
+                  )}
+                </>,
+                topbarSlot,
+              )}
+            {/* Trailing cell: the page's overflow menu, after the shell's bell — the
+          second of the two controls a row may hold. It carries what the inline
+          title row shows as icons: pop-out (or focus the popped-out window),
+          the activity panel, and split view. Nothing here is a hard swap: the
+          menu opens with DropdownMenu's own animation. */}
+            {topbarTrailSlot &&
+              activeSlot &&
+              !embedMode &&
+              createPortal(
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className="w-8 h-8 rounded-md flex items-center justify-center text-text hover:text-text-strong hover:bg-bg-hover bg-transparent border-none cursor-pointer shrink-0"
+                      aria-label={i18nT('pages.chatPage.more_actions')}
+                      title={i18nT('pages.chatPage.more_actions')}
+                      data-testid="mobile-topbar-more"
+                    >
+                      <MoreHorizontal size={18} />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="min-w-[220px]">
+                    {/* A pending update leads the menu (accent row, same lifecycle label
+                as the desktop pill: available → downloading N% → ready). The
+                phone bar has no cell with room for the pill without making a
+                three-control group, so this is its phone home. Renders nothing
+                when no update exists. */}
+                    {/* Local boundary: this is a lazy chunk, and a chunk that fails to
+                load after the preload heal declined would otherwise reject up
+                to the ROUTE boundary and replace the whole chat page with an
+                error card. The fallback is the shared error surface, not
+                nothing: this menu is the update's only phone home, so a chunk
+                that never loads must SAY so here (`errors-use-error-notice`),
+                and the sibling item carries the agent hand-off through the
+                menu's roving focus. Settings › About still checks for updates. */}
+                    <ErrorBoundary
+                      scope="mobile-update-menu"
+                      fallback={
+                        <>
+                          <ErrorNotice
+                            id="mobile-update-menu-error"
+                            variant="inline"
+                            className="px-2 py-1.5"
+                            message={i18nT('pages.chatPage.update_entry_load_failed')}
+                          />
+                          <ErrorNoticeMenuItem
+                            Item={DropdownMenuItem}
+                            message={i18nT('pages.chatPage.update_entry_load_failed')}
+                            describedBy="mobile-update-menu-error"
+                          />
+                        </>
+                      }
+                    >
+                      <Suspense fallback={null}>
+                        <MobileUpdateMenuItem variant="menu-item" />
+                      </Suspense>
+                    </ErrorBoundary>
+                    {activePoppedOut ? (
+                      <DropdownMenuItem
+                        className="[@media(hover:none)]:min-h-10"
+                        onSelect={() => focusActivePopout(activeSlot)}
+                      >
+                        <span className="flex items-center gap-2">
+                          <ExternalLink size={14} className="shrink-0 text-muted" />
+                          <span>{i18nT('pages.chatPage.focus_popped_out_window')}</span>
+                        </span>
+                      </DropdownMenuItem>
+                    ) : (
+                      <DropdownMenuItem
+                        className="[@media(hover:none)]:min-h-10"
+                        onSelect={() => openActivePopout(activeSlot, currentSlot?.title)}
+                      >
+                        <span className="flex items-center gap-2">
+                          <ExternalLink size={14} className="shrink-0 text-muted" />
+                          <span>{i18nT('pages.chatPage.pop_out_to_window')}</span>
+                        </span>
+                      </DropdownMenuItem>
+                    )}
+                    {!activityOpen && (
+                      <DropdownMenuItem
+                        className="[@media(hover:none)]:min-h-10"
+                        onSelect={toggleAct}
+                      >
+                        <span className="flex items-center gap-2">
+                          <PanelRightSolid size={14} className="shrink-0 text-muted" />
+                          <span>{i18nT('pages.chatPage.open_activity_panel')}</span>
+                        </span>
+                      </DropdownMenuItem>
+                    )}
+                    {splitFeatureEnabled &&
+                      (splitAnchorForActive && !activeIsSplitAnchor ? (
+                        <DropdownMenuItem
+                          className="[@media(hover:none)]:min-h-10"
+                          onSelect={() => enterSplit(splitAnchorForActive)}
+                        >
+                          <span className="flex items-center gap-2">
+                            <Columns2 size={14} className="shrink-0 text-muted" />
+                            <span>{i18nT('pages.chatPage.return_to_split_view')}</span>
+                          </span>
+                        </DropdownMenuItem>
+                      ) : (
+                        <DropdownMenuItem
+                          className="[@media(hover:none)]:min-h-10"
+                          onSelect={() => enterSplit(activeSlot)}
+                        >
+                          <span className="flex items-center gap-2">
+                            <Columns2 size={14} className="shrink-0 text-muted" />
+                            <span>{i18nT('pages.chatPage.enter_split_view')}</span>
+                          </span>
+                        </DropdownMenuItem>
+                      ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>,
+                topbarTrailSlot,
+              )}
 
             {/* Per-slot tag picker — a single connected popover, opened from any session
           menu (sidebar row or header) via the ChatPage-scoped TagPopover context. */}
@@ -8634,7 +9073,9 @@ export default function ChatPage({
                 style={
                   {
                     transition: 'flex 0.2s',
-                    ...(!sidebarOpen && !isMobile ? { marginLeft: '-0.5rem' } : {}),
+                    ...(!sidebarOpen && !isMobile
+                      ? { marginLeft: -COLLAPSED_PANE_RECLAIM_PX }
+                      : {}),
                     '--mc-content-width': scaleContentWidth(
                       CONTENT_WIDTH[chatConfig.contentWidth],
                       chatConfig.contentWidth,
@@ -8822,6 +9263,7 @@ export default function ChatPage({
                   !embedded &&
                   !sidebarOpen &&
                   !inlineSidePanelShowing &&
+                  !titleInTopbar &&
                   !(activeSlot && (messages.length > 0 || slotRunning)) && (
                     <div className="fixed top-safe-offset-[42px] left-safe ml-2 z-10">
                       <button
@@ -8854,7 +9296,26 @@ export default function ChatPage({
                 {activeSlot && ownsSessionTabs && !(splitMode && splitFeatureEnabled) && (
                   // no-drag: on the desktop shell the top strip of the window is the
                   // titlebar drag region, and a tab you cannot click is worse than no tab.
-                  <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+                  //
+                  // While the desktop sidebar is collapsed the shell insets the strip
+                  // past the stationary toggle, gliding on the same 240ms curve as the
+                  // panel morph and the title row so the tabs do not jump at the start
+                  // of the slide. The shell owns the strip's bottom divider (the strip
+                  // draws none of its own): an inset border on the strip's root would
+                  // stop short of the gutter and leave a notch under the toggle, so
+                  // the shell draws one continuous hairline across the full width.
+                  // `empty:hidden` keeps the shell out of the layout when the strip
+                  // renders nothing (fewer than two tabs), so the divider it owns
+                  // appears only when the strip does.
+                  <div
+                    className="empty:hidden border-b border-border transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)]"
+                    style={
+                      {
+                        WebkitAppRegion: 'no-drag',
+                        paddingLeft: !sidebarOpen && !isMobile ? COLLAPSED_SESSION_TABS_INSET : 0,
+                      } as React.CSSProperties
+                    }
+                  >
                     <SessionTabStrip
                       tabs={sessionTabs.tabs}
                       activeKey={activeSlot}
@@ -8877,7 +9338,7 @@ export default function ChatPage({
                     // toggle inline.
                     leading={
                       isMobile
-                        ? embedMode !== 'chat'
+                        ? embedMode !== 'chat' && !titleInTopbar
                           ? { control: mobileSessionsToggle }
                           : undefined
                         : embedMode !== 'chat' &&
@@ -8960,179 +9421,187 @@ export default function ChatPage({
                   values on the same 320ms curve as the panel — an instant
                   class flip here reads as the title jumping sideways at the
                   start of the slide. */}
-                        <div
-                          className={`relative pr-1.5 pt-[9px] pb-2 flex items-center gap-2 bg-bg pointer-events-none transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${!isMobile && embedMode !== 'chat' && filteredSlots.length > 0 && !sidebarOpen ? 'pl-[60px]' : isMobile ? (embedMode === 'chat' ? 'pl-4' : 'pl-3') : 'pl-5'}`}
-                        >
-                          {/* Divider between toggle and title — ALWAYS mounted and
+                        {/* Phone: the shell's single bar hosts this row (the portal above),
+                  so the inline copy stands down. The fold sentinel, the pinned
+                  prompt and the header fade stay: they belong to the transcript
+                  column, not to the bar. */}
+                        {!titleInTopbar && (
+                          <div
+                            className={`relative pr-1.5 pt-[9px] pb-2 flex items-center gap-2 bg-bg pointer-events-none transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${!isMobile && embedMode !== 'chat' && filteredSlots.length > 0 && !sidebarOpen ? 'pl-[60px]' : isMobile ? (embedMode === 'chat' ? 'pl-4' : 'pl-3') : 'pl-5'}`}
+                          >
+                            {/* Divider between toggle and title — ALWAYS mounted and
                     absolute (zero width, no flex-gap participation) so it can
                     never change the row's layout; it rides the row (title
                     side) and only fades. left-[52px] = the collapsed pane's
                     view of container x 44 (button 8+28 + 8px gap). */}
-                          {!isMobile && embedMode !== 'chat' && filteredSlots.length > 0 && (
-                            <span
-                              aria-hidden="true"
-                              className={`absolute left-[52px] top-[13px] w-px h-5 bg-border transition-opacity ${sidebarOpen ? 'opacity-0 duration-100' : 'opacity-100 duration-150 delay-[90ms]'}`}
-                            />
-                          )}
-                          {embedMode !== 'chat' && isMobile && mobileSessionsToggle}
-                          <div className="group/header flex min-w-0 items-stretch gap-0.5 pointer-events-auto">
-                            <div className="flex items-center rounded-l-md rounded-r-[2px] px-1.5 py-0.5 group-hover/header:bg-bg-hover transition-colors">
-                              <ChatHeaderMenu
-                                activeSlot={activeSlot}
-                                agent={currentSlot?.agent}
-                                onReveal={
-                                  activeSlot && embedMode !== 'chat'
-                                    ? () => {
-                                        // The request rides the store, not a window event: with the
-                                        // drawer collapsed ChatSidebar is unmounted, so an event
-                                        // dispatched here (before the mount that setSidebarPinned
-                                        // schedules commits) had no listener and was dropped —
-                                        // the store entry survives until the sidebar consumes it
-                                        // (#912). Mobile drives its own drawer state. Embed-chat
-                                        // never mounts a sidebar, so the item is not offered there:
-                                        // a stored request would outlive the view and fire on
-                                        // whichever sidebar mounts next.
-                                        sidebarAutoHidden.current = null
-                                        if (isMobile) openSidebar()
-                                        else if (!sidebarPinned) setSidebarPinned(true)
-                                        dispatch(requestSlotReveal(activeSlot))
-                                      }
-                                    : undefined
-                                }
-                                onRename={
-                                  activeSlot ? () => setEditingTitleSlot(activeSlot) : undefined
-                                }
-                                mode={effectiveMode}
-                              />
-                            </div>
-                            {/* Shared with every split-view pane header (#9727). The editor
-                    flag stays here, pinned to the slot it opened on. */}
-                            {activeSlot && (
-                              <SessionTitleControl
-                                slotKey={activeSlot}
-                                title={title}
-                                editing={editingTitle}
-                                onEditingChange={(open) =>
-                                  setEditingTitleSlot(open ? activeSlot : null)
-                                }
-                                onError={showActionError}
-                                onAttempt={() => setActionError(null)}
+                            {!isMobile && embedMode !== 'chat' && filteredSlots.length > 0 && (
+                              <span
+                                aria-hidden="true"
+                                className={`absolute left-[52px] top-[13px] w-px h-5 bg-border transition-opacity ${sidebarOpen ? 'opacity-0 duration-100' : 'opacity-100 duration-150 delay-[90ms]'}`}
                               />
                             )}
-                          </div>
-                          {effectiveMode === 'orchestrator' && (
-                            <span className="pointer-events-auto">
-                              <InfoTip
-                                text={i18nT(
-                                  'pages.chatPage.autopilot_plans_before_executing_each_stage_need',
-                                )}
-                              />
-                            </span>
-                          )}
-                          <InboundLinkChip slotKey={activeSlot} />
-                          {/* Trailing controls grouped under a single ml-auto so multiple
+                            {embedMode !== 'chat' && isMobile && mobileSessionsToggle}
+                            <div className="group/header flex min-w-0 items-stretch gap-0.5 pointer-events-auto">
+                              <div className="flex items-center rounded-l-md rounded-r-[2px] px-1.5 py-0.5 group-hover/header:bg-bg-hover transition-colors">
+                                <ChatHeaderMenu
+                                  activeSlot={activeSlot}
+                                  agent={currentSlot?.agent}
+                                  onReveal={
+                                    activeSlot && embedMode !== 'chat'
+                                      ? () => {
+                                          // The request rides the store, not a window event: with the
+                                          // drawer collapsed ChatSidebar is unmounted, so an event
+                                          // dispatched here (before the mount that setSidebarPinned
+                                          // schedules commits) had no listener and was dropped —
+                                          // the store entry survives until the sidebar consumes it
+                                          // (#912). Mobile drives its own drawer state. Embed-chat
+                                          // never mounts a sidebar, so the item is not offered there:
+                                          // a stored request would outlive the view and fire on
+                                          // whichever sidebar mounts next.
+                                          sidebarAutoHidden.current = null
+                                          if (isMobile) openSidebar()
+                                          else if (!sidebarPinned) setSidebarPinned(true)
+                                          dispatch(requestSlotReveal(activeSlot))
+                                        }
+                                      : undefined
+                                  }
+                                  onRename={
+                                    activeSlot ? () => setEditingTitleSlot(activeSlot) : undefined
+                                  }
+                                  mode={effectiveMode}
+                                  sidebarOnScreen={sidebarOnScreen}
+                                />
+                              </div>
+                              {/* Shared with every split-view pane header (#9727). The editor
+                    flag stays here, pinned to the slot it opened on. */}
+                              {activeSlot && (
+                                <SessionTitleControl
+                                  slotKey={activeSlot}
+                                  title={title}
+                                  editing={editingTitle}
+                                  onEditingChange={(open) =>
+                                    setEditingTitleSlot(open ? activeSlot : null)
+                                  }
+                                  onError={showActionError}
+                                  onAttempt={() => setActionError(null)}
+                                />
+                              )}
+                            </div>
+                            {effectiveMode === 'orchestrator' && (
+                              <span className="pointer-events-auto">
+                                <InfoTip
+                                  text={i18nT(
+                                    'pages.chatPage.autopilot_plans_before_executing_each_stage_need',
+                                  )}
+                                />
+                              </span>
+                            )}
+                            <InboundLinkChip slotKey={activeSlot} />
+                            {/* Trailing controls grouped under a single ml-auto so multiple
                   right-aligned items don't each absorb free space (two ml-auto
                   siblings split the gap, parking the split icon mid-header). */}
-                          {/* focus-caption-reserve: this group owns the window's top-trailing
+                            {/* focus-caption-reserve: this group owns the window's top-trailing
                   corner — where Windows and frameless Linux paint their caption
                   controls — whenever the side panel is not holding that edge, i.e.
                   while it is closed (the state that renders the reopen toggle
                   below) or docked at the bottom. Right-docked and showing, the
                   panel is at that edge instead and carries the reserve itself, so
                   reserving here too would indent these controls for nothing. */}
-                          <div
-                            className={`ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none${!sidePanelWantsMount || sidePanelDock === 'bottom' ? ' focus-caption-reserve' : ''}`}
-                          >
-                            {/* Pop-out control, promoted to the title bar (menu items remain for
+                            <div
+                              className={`ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none${!sidePanelWantsMount || sidePanelDock === 'bottom' ? ' focus-caption-reserve' : ''}`}
+                            >
+                              {/* Pop-out control, promoted to the title bar (menu items remain for
                   sidebar parity). Mirrors the split-view pattern to its left: a
                   dimmed icon to act, an accent chip when the state is active.
                   Inside the popout window itself the same spot carries Return. */}
-                            {popout ? (
-                              <Clickable
-                                className="flex items-center gap-1 text-muted hover:text-text transition-colors cursor-pointer pointer-events-auto text-[11px] font-medium px-1.5 py-0.5 rounded hover:bg-bg-hover"
-                                onClick={returnSelfToMain}
-                                title={i18nT(
-                                  'pages.chatPage.return_this_session_to_the_main_window',
-                                )}
-                                aria-label={i18nT('pages.chatPage.return_to_main_window')}
-                              >
-                                <Undo2 size={13} /> {i18nT('pages.chatPage.return')}
-                              </Clickable>
-                            ) : (
-                              !embedMode &&
-                              activeSlot &&
-                              (activePoppedOut ? (
+                              {popout ? (
                                 <Clickable
-                                  className="flex items-center gap-1 text-accent bg-accent/10 hover:bg-accent/20 transition-colors cursor-pointer pointer-events-auto text-[11px] font-medium px-1.5 py-0.5 rounded"
-                                  onClick={() => focusActivePopout(activeSlot)}
+                                  className="flex items-center gap-1 text-muted hover:text-text transition-colors cursor-pointer pointer-events-auto text-[11px] font-medium px-1.5 py-0.5 rounded hover:bg-bg-hover"
+                                  onClick={returnSelfToMain}
                                   title={i18nT(
-                                    'pages.chatPage.this_session_is_open_in_its_own_window_focus_it',
+                                    'pages.chatPage.return_this_session_to_the_main_window',
                                   )}
-                                  aria-label={i18nT('pages.chatPage.focus_popped_out_window')}
+                                  aria-label={i18nT('pages.chatPage.return_to_main_window')}
                                 >
-                                  <ExternalLink size={13} /> {i18nT('pages.chatPage.popped_out')}
+                                  <Undo2 size={13} /> {i18nT('pages.chatPage.return')}
                                 </Clickable>
                               ) : (
-                                <Clickable
-                                  className="flex items-center justify-center w-7 h-7 rounded-md hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 text-muted hover:text-text pointer-events-auto"
-                                  onClick={() => openActivePopout(activeSlot, currentSlot?.title)}
-                                  title={i18nT('pages.chatPage.pop_out_to_window')}
-                                  aria-label={i18nT(
-                                    'pages.chatPage.pop_out_session_to_its_own_window',
-                                  )}
-                                >
-                                  <ExternalLink size={15} />
-                                </Clickable>
-                              ))
-                            )}
-                            {/* Activity panel open toggle — relocated here from the top bar
+                                !embedMode &&
+                                activeSlot &&
+                                (activePoppedOut ? (
+                                  <Clickable
+                                    className="flex items-center gap-1 text-accent bg-accent/10 hover:bg-accent/20 transition-colors cursor-pointer pointer-events-auto text-[11px] font-medium px-1.5 py-0.5 rounded"
+                                    onClick={() => focusActivePopout(activeSlot)}
+                                    title={i18nT(
+                                      'pages.chatPage.this_session_is_open_in_its_own_window_focus_it',
+                                    )}
+                                    aria-label={i18nT('pages.chatPage.focus_popped_out_window')}
+                                  >
+                                    <ExternalLink size={13} /> {i18nT('pages.chatPage.popped_out')}
+                                  </Clickable>
+                                ) : (
+                                  <Clickable
+                                    className="flex items-center justify-center w-7 h-7 rounded-md hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 text-muted hover:text-text pointer-events-auto"
+                                    onClick={() => openActivePopout(activeSlot, currentSlot?.title)}
+                                    title={i18nT('pages.chatPage.pop_out_to_window')}
+                                    aria-label={i18nT(
+                                      'pages.chatPage.pop_out_session_to_its_own_window',
+                                    )}
+                                  >
+                                    <ExternalLink size={15} />
+                                  </Clickable>
+                                ))
+                              )}
+                              {/* Activity panel open toggle — relocated here from the top bar
                   (item 2.4) so opening the panel no longer narrows the now
                   full-width header. Shown only while the panel is closed; the
                   panel's own header carries the close button. Never disabled:
                   below the mobile breakpoint the panel opens full width, at or
                   above it opens beside the chat. There is no width at which
                   the button does nothing. */}
-                            {!embedMode && !popout && !activityOpen && (
-                              <Clickable
-                                className="pi-morph flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 pointer-events-auto text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
-                                onClick={toggleAct}
-                                title={i18nT('pages.chatPage.open_activity_panel')}
-                                aria-label={i18nT('pages.chatPage.open_activity_panel')}
-                              >
-                                <PanelRightSolid size={15} />
-                              </Clickable>
-                            )}
-                            {!embedMode &&
-                              splitFeatureEnabled &&
-                              (splitAnchorForActive && !activeIsSplitAnchor ? (
+                              {!embedMode && !popout && !activityOpen && (
                                 <Clickable
-                                  className="flex items-center gap-1 text-accent bg-accent/10 hover:bg-accent/20 transition-colors cursor-pointer pointer-events-auto text-[11px] font-medium px-1.5 py-0.5 rounded"
-                                  onClick={() => enterSplit(splitAnchorForActive)}
-                                  title={i18nT(
-                                    'pages.chatPage.this_session_is_open_in_a_split_return_to_it',
-                                  )}
-                                  aria-label={i18nT('pages.chatPage.return_to_split_view')}
+                                  className="pi-morph flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 pointer-events-auto text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
+                                  onClick={toggleAct}
+                                  title={i18nT('pages.chatPage.open_activity_panel')}
+                                  aria-label={i18nT('pages.chatPage.open_activity_panel')}
                                 >
-                                  <Columns2 size={13} /> {i18nT('pages.chatPage.in_split')}
+                                  <PanelRightSolid size={15} />
                                 </Clickable>
-                              ) : (
-                                <Clickable
-                                  className="opacity-40 hover:opacity-100 transition-opacity cursor-pointer pointer-events-auto"
-                                  onClick={() => enterSplit(activeSlot)}
-                                  title={i18nT('pages.chatPage.split_view_d')}
-                                  aria-label={i18nT('pages.chatPage.enter_split_view')}
-                                >
-                                  <Columns2 size={14} />
-                                </Clickable>
-                              ))}
-                          </div>
-                          {/* Header fade — softens content passing up into the opaque title
+                              )}
+                              {!embedMode &&
+                                splitFeatureEnabled &&
+                                (splitAnchorForActive && !activeIsSplitAnchor ? (
+                                  <Clickable
+                                    className="flex items-center gap-1 text-accent bg-accent/10 hover:bg-accent/20 transition-colors cursor-pointer pointer-events-auto text-[11px] font-medium px-1.5 py-0.5 rounded"
+                                    onClick={() => enterSplit(splitAnchorForActive)}
+                                    title={i18nT(
+                                      'pages.chatPage.this_session_is_open_in_a_split_return_to_it',
+                                    )}
+                                    aria-label={i18nT('pages.chatPage.return_to_split_view')}
+                                  >
+                                    <Columns2 size={13} /> {i18nT('pages.chatPage.in_split')}
+                                  </Clickable>
+                                ) : (
+                                  <Clickable
+                                    className="opacity-40 hover:opacity-100 transition-opacity cursor-pointer pointer-events-auto"
+                                    onClick={() => enterSplit(activeSlot)}
+                                    title={i18nT('pages.chatPage.split_view_d')}
+                                    aria-label={i18nT('pages.chatPage.enter_split_view')}
+                                  >
+                                    <Columns2 size={14} />
+                                  </Clickable>
+                                ))}
+                            </div>
+                            {/* Header fade — softens content passing up into the opaque title
                   row, so it hangs off that row's bottom edge (anchor="below":
                   as an in-flow sibling its 24px consumed layout and pushed the
                   pinned card that far off the header; out of flow it overlays
                   the transcript and the pinned card paints above it). */}
-                          <EdgeFade side="top" anchor="below" />
-                        </div>
+                            <EdgeFade side="top" anchor="below" />
+                          </div>
+                        )}
+                        {titleInTopbar && <EdgeFade side="top" anchor="below" />}
                         {/* Fold sentinel — zero-height, always mounted. Its top edge is the
                   line the pinned prompt sticks to (see updatePinnedPrompt). */}
                         <div ref={pinFoldRef} aria-hidden className="h-0" />
@@ -9184,6 +9653,10 @@ export default function ChatPage({
                             side={chatConfig.minimapSide}
                           />
                           <TranscriptScrollShell
+                            // The 64px spacer clears the inline title row; with the row in
+                            // the shell's bar (phone) the transcript starts at the top of the
+                            // column and the spacer would be a blank band under the bar.
+                            headerSpacer={!titleInTopbar}
                             scrollerRef={scrollerRef}
                             onScroll={onScrollPin}
                             virt={virt}
@@ -9322,7 +9795,9 @@ export default function ChatPage({
                               if (item.kind === 'turn') {
                                 return (
                                   <div
-                                    key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx}
+                                    key={vi.key}
+                                    ref={virt.measureRef(vi.index)}
+                                    data-display-index={displayIdx}
                                   >
                                     <TurnBlock
                                       turn={item}
@@ -9355,7 +9830,9 @@ export default function ChatPage({
                               )
                               return (
                                 <div
-                                  key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx}
+                                  key={vi.key}
+                                  ref={virt.measureRef(vi.index)}
+                                  data-display-index={displayIdx}
                                   className={`px-4 mx-auto w-full py-1`}
                                   data-pinned-standin={
                                     pinnedStandin
@@ -9728,18 +10205,14 @@ export default function ChatPage({
                                   // next-turn send, exactly as the non-blocking `ask_question`
                                   // card always does.
                                   //
-                                  // Steer ONLY the native card, which carries neither an
-                                  // `ask_id` (the blocking backend card) nor a server
-                                  // `card_id` (the non-blocking `ask_question` MCP card,
-                                  // stored as `serverCardId`). The client always mints a
-                                  // local `cardId` per delivery, so that field cannot tell
-                                  // the two apart -- `serverCardId` is the one the server
-                                  // sets only for the non-blocking card. The non-blocking
-                                  // card can be answered while sub-agents keep the slot
-                                  // busy, and it must still start a next turn.
+                                  // Steer ONLY the native card, which the server marks
+                                  // `native` on the `question_card` frame and the /pending
+                                  // row. The non-blocking `ask_question` MCP card carries
+                                  // the same server `card_id` but no such mark: it can be
+                                  // answered while sub-agents keep the slot busy, and it
+                                  // must still start a next turn.
                                   const slot = activeSlot || undefined
-                                  const isNativeCard =
-                                    !pendingQuestion?.ask_id && !pendingQuestion?.serverCardId
+                                  const isNativeCard = pendingQuestion?.native === true
                                   if (
                                     slot &&
                                     isNativeCard &&
@@ -9876,6 +10349,32 @@ export default function ChatPage({
                                   <AnimatePresence>
                                     {folderSuggestion && activeSlot ? (
                                       <div className="pt-1.5" key="folder-suggestion">
+                                        {/* The card's option list follows the sidebar's folder
+                            order. A failed read of that order is said once per
+                            screen -- by the sidebar's banner while the sidebar is
+                            on this screen, and here, above the card, only when it
+                            is not (embed chat, the drawer closed, the panel
+                            collapsed): otherwise the list is drawn in the stored
+                            order with nothing on screen to say why.
+                            No hand-off: the card's dropdown holds a pick that is
+                            not saved until Accept, and the hand-off navigates
+                            away and unmounts it -- so the line under the notice
+                            is the one phrase every surface uses for this failure
+                            plus where the hand-off lives. */}
+                                        {folderSortError !== null && !sidebarOnScreen && (
+                                          <ErrorNotice
+                                            title={i18nT(
+                                              'pages.chatSidebar.folder_order_unavailable',
+                                            )}
+                                            message={folderSortError}
+                                            messagePlacement="below"
+                                            footer={i18nT(
+                                              'pages.chatSidebar.folder_order_unavailable_detail_picker_ask',
+                                            )}
+                                            className="mb-1.5"
+                                            testId="folder-suggestion-order-unavailable"
+                                          />
+                                        )}
                                         {/* Keyed by the suggestion's ts: a replacement card
                             remounts the component, so its dropdown re-prefills
                             and a selection made against the previous suggestion
@@ -9890,6 +10389,7 @@ export default function ChatPage({
                                           suggestedFolderName={folderSuggestion.folderName}
                                           suggestedFolderBreadcrumb={folderSuggestion.breadcrumb}
                                           folders={chatFolders}
+                                          folderSortMode={folderSortMode}
                                           onAccept={folderSuggestionAccept}
                                           onDecline={folderSuggestionDecline}
                                         />
@@ -10500,9 +11000,9 @@ export default function ChatPage({
                               ref={reasoningEffortDropdownRef}
                               className="fixed z-[9999] animate-slide-up"
                               style={(() => {
-                                const left = Math.max(
-                                  8,
-                                  Math.min(reasoningEffortBtnRect.left, window.innerWidth - 220),
+                                const left = effortPopoverLeft(
+                                  reasoningEffortBtnRect.left,
+                                  window.innerWidth,
                                 )
                                 return {
                                   bottom: window.innerHeight - reasoningEffortBtnRect.top + 4,

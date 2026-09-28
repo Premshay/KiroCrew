@@ -51,6 +51,8 @@ def test_rewrite_agents_signature_is_pinned_to_fingerprint_inputs() -> None:
         "stub_servers",
         "shared_readonly_servers",
         "pooling_enabled",
+        # Fingerprinted through ``LaunchApprovals.digest``.
+        "approvals",
     }
 
 

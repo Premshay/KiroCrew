@@ -53,6 +53,12 @@ _ALT_SLASH_KEY = "Kx3Q51tPusV/D0URlGfMmNbVc7Z8yJhLpQrStUwZ"
 _NO_SLASH_KEY = "Kx3Q51tPusVkD0URlGfMmNbVc7Z8yJhLpQrStUwZ"
 
 
+def _jose_header(min_len: int) -> str:
+    """A base64url JOSE header segment at least *min_len* characters long."""
+    raw = json.dumps({"alg": "HS256", "pad": "A" * min_len}).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
 class TestRedactCredentials:
     """Tests for redact_credentials()."""
 
@@ -335,11 +341,11 @@ class TestRedactCredentials:
         to be missed. This ratchet makes that omission fail here instead of
         silently degrading a user-facing warning.
         """
-        from kiro_crew import security
+        from kiro_crew.security import redaction
 
         declared = {
             name: value
-            for name, value in vars(security).items()
+            for name, value in vars(redaction).items()
             if name.startswith("_REDACTED_") and name.endswith("_TAG")
             if isinstance(value, str)
         }
@@ -348,7 +354,7 @@ class TestRedactCredentials:
         unregistered = {
             name: value
             for name, value in declared.items()
-            if value not in security.CREDENTIAL_REDACTION_TAGS
+            if value not in redaction.CREDENTIAL_REDACTION_TAGS
         }
         assert not unregistered, (
             "redaction tag(s) not in CREDENTIAL_REDACTION_TAGS: "
@@ -624,6 +630,60 @@ class TestRedactCredentials:
         result, warnings = redact_credentials(text)
         assert result == text
         assert warnings == []
+
+    def test_hostname_containing_eyj_not_redacted(self) -> None:
+        """A dotted name with `eyJ` inside has JWT shape but no JSON-object header."""
+        from kiro_crew.security import _contains_fixed_credential, _decode_b64_safe
+
+        for text in ("ssh honeyJar.example.com", "https://api.honeyJar.co.uk/v1/x"):
+            assert redact_credentials(text) == (text, []), text
+            assert not _contains_fixed_credential(text), text
+            assert _decode_b64_safe(base64.b64encode(text.encode()).decode()) == "", text
+
+    def test_jose_validated_jwt_redacted_on_every_batch_path(self) -> None:
+        from kiro_crew.security import (
+            _contains_fixed_credential,
+            _decode_b64_chunk,
+            _decode_b64_safe,
+        )
+
+        for token in (self._JWT, self._JWE, self._JWE_DIR):
+            text = f"host honeyJar.example.com token {token}"
+            result, warnings = redact_credentials(text)
+            assert result == "host honeyJar.example.com token [REDACTED: credential]"
+            assert len(warnings) == 1
+            assert _contains_fixed_credential(token)
+            encoded = base64.b64encode(token.encode()).decode()
+            assert _decode_b64_chunk(encoded) == token
+            assert _decode_b64_safe(encoded) == token
+
+    def test_credential_inside_rejected_jwt_shape_still_redacted(self) -> None:
+        """A rejected JWT-shaped span is rescanned, so nothing inside it leaks."""
+        result, _ = redact_credentials("eyJx.AKIAIOSFODNN7EXAMPLE.y")
+        assert "AKIAIOSFODNN7EXAMPLE" not in result
+        result, _ = redact_credentials(f"eyJfoo.{self._JWT}")
+        assert result == "eyJfoo.[REDACTED: credential]"
+        # a link token matched by the same start: the other branches are retried there
+        link = "eyJ" + "e" * 100 + "." + "S" * 43
+        assert redact_credentials(f"{link}.json")[0] == "[REDACTED: credential].json"
+
+    def test_non_jose_json_header_still_redacted(self) -> None:
+        """itsdangerous / Flask-session tokens carry a JSON header with no `alg`/`enc`."""
+        typ_only = base64.urlsafe_b64encode(b'{"typ":"JWT"}').decode().rstrip("=")
+        payload = base64.urlsafe_b64encode(b'{"user_id":7}').decode().rstrip("=")
+        for token in (f"{typ_only}.payload.sig", f"{payload}.ZsT9kA.sig-x_Y"):
+            assert redact_credentials(f"cookie {token} end")[0] == (
+                "cookie [REDACTED: credential] end"
+            ), token
+
+    def test_dense_eyj_header_fails_closed(self) -> None:
+        """A header holding a second `eyJ` is redacted whole instead of rescanned per `eyJ`."""
+        from kiro_crew.security import _partial_jwt_tail
+
+        dense = "eyJ" * 30000 + ".x.y"
+        assert redact_credentials(dense)[0] == "[REDACTED: credential]"
+        assert redact_credentials(f"monkeyJ{self._JWT}")[0] == "monk[REDACTED: credential]"
+        assert _partial_jwt_tail(dense).start() == 0
 
     # ── Two-segment dashboard link token ──
     # `dashboard.token_auth.generate_token` emits `base64url(payload).base64url(
@@ -4396,6 +4456,7 @@ class TestOperatorOAuthEndpointExtension:
         self, ext_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from kiro_crew import security
+        from kiro_crew.security import exfil
 
         logged: list = []
 
@@ -4403,7 +4464,7 @@ class TestOperatorOAuthEndpointExtension:
             def log(self, event: object) -> None:
                 logged.append(event)
 
-        monkeypatch.setattr(security, "SecurityEventLog", lambda: _RecorderLog())
+        monkeypatch.setattr(exfil, "SecurityEventLog", lambda: _RecorderLog())
         security._emit_oauth_extension_used_event(self.HOST, self.PATH)
         security._emit_oauth_extension_used_event(self.HOST, self.PATH)
         assert len(logged) == 1
@@ -4420,13 +4481,13 @@ class TestOperatorOAuthEndpointExtension:
     def test_audit_failure_does_not_break_the_approval(
         self, ext_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from kiro_crew import security
+        from kiro_crew.security import exfil
 
         class _BrokenLog:
             def log(self, event: object) -> None:
                 raise RuntimeError("SEL unavailable")
 
-        monkeypatch.setattr(security, "SecurityEventLog", lambda: _BrokenLog())
+        monkeypatch.setattr(exfil, "SecurityEventLog", lambda: _BrokenLog())
         self._write_extension(ext_home, [{"host": self.HOST, "path": self.PATH}])
         assert oauth_url_contains_credential(self.CONSENT_URL) is False
 
@@ -6275,18 +6336,20 @@ class TestAdaptiveHomeTargetsExpiry:
             gate._KEYSTONE_ARTIFACT_PARENTS,
         )
         adapter_roots = dict(roots.adapter_roots)
-        real = gate._realpath_or_none
+        real = gate._realpaths_or_none
         override_anchored_seen = 0
 
         for tier in tiers:
             self._clear()
             asked: list[str] = []
 
-            def recording(path: str, _sink=asked) -> str | None:
-                _sink.append(path)
-                return real(path)
+            # The build resolves its anchors as ONE batched child request, so the
+            # recorder sits on the batch seam; the population it asks for is the same.
+            def recording(paths: list[str], _sink=asked) -> list[str | None]:
+                _sink.extend(paths)
+                return real(paths)
 
-            monkeypatch.setattr(gate, "_realpath_or_none", recording)
+            monkeypatch.setattr(gate, "_realpaths_or_none", recording)
             gate._home_dir_targets_uncached(tier, roots)
 
             expected = {roots.home}
@@ -7744,7 +7807,7 @@ class TestStreamRedactor:
         """
         from kiro_crew.security import _STREAM_HOLDBACK_MAX, StreamRedactor
 
-        payload = "eyJ" + "A" * (_STREAM_HOLDBACK_MAX + 800)
+        payload = _jose_header(_STREAM_HOLDBACK_MAX + 800)
         jwt = f"{payload}.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6"
         assert len(jwt) > _STREAM_HOLDBACK_MAX
         r = StreamRedactor()
@@ -7763,7 +7826,7 @@ class TestStreamRedactor:
         """
         from kiro_crew.security import _STREAM_HOLDBACK_MAX, StreamRedactor
 
-        seg = "eyJ" + "A" * (_STREAM_HOLDBACK_MAX + 400)
+        seg = _jose_header(_STREAM_HOLDBACK_MAX + 400)
         jwe = f"{seg}.QW5rZXk.aXY.Y2lwaGVydGV4dA.dGFn"  # 5 compact JWE segments
         assert len(jwe) > _STREAM_HOLDBACK_MAX
         r = StreamRedactor()
@@ -7771,6 +7834,31 @@ class TestStreamRedactor:
         assert jwe not in emitted
         assert "eyJ" not in emitted  # no raw head leaked ahead of the flush
         assert "[REDACTED: credential]" in emitted
+
+    def test_jose_validated_jwt_split_across_chunks(self) -> None:
+        from kiro_crew.security import StreamRedactor
+
+        jws = TestRedactCredentials._JWT
+        jwe = TestRedactCredentials._JWE_DIR
+        text = f"host honeyJar.example.com then {jws} and {jwe} done"
+        for size in (1, 5, 13):
+            r = StreamRedactor()
+            chunks = [text[i : i + size] for i in range(0, len(text), size)]
+            emitted = "".join(r.feed(c) for c in chunks) + r.flush()
+            assert emitted == (
+                "host honeyJar.example.com then [REDACTED: credential]"
+                " and [REDACTED: credential] done"
+            ), size
+
+    def test_holdback_anchor_needs_a_json_header(self) -> None:
+        from kiro_crew.security import _partial_jwt_tail
+
+        assert _partial_jwt_tail("see honeyJar.example.com") is None
+        assert _partial_jwt_tail("eyJ0.honeyJar.example") is None
+        jws = TestRedactCredentials._JWT
+        assert _partial_jwt_tail(f"x {jws[:40]}") is not None
+        assert _partial_jwt_tail("x eyJhbGciOi") is not None  # header still arriving
+        assert _partial_jwt_tail(f"eyJfoo.{jws[:40]}").start() == 7
 
     def test_terminal_long_opaque_bearer_not_bisected(self) -> None:
         """A >512-char opaque (non-JWT) Bearer token stays fully redacted.
@@ -7923,7 +8011,7 @@ class TestStreamRedactor:
         """
         from kiro_crew.security import _STREAM_HOLDBACK_JWT_MAX, StreamRedactor
 
-        jwt = "eyJ" + "A" * (_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
+        jwt = _jose_header(_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
         r = StreamRedactor()
         emitted = r.feed("prefix ") + r.feed(jwt)
         emitted += r.flush()
@@ -7980,7 +8068,7 @@ class TestStreamRedactor:
         )
 
         redactor = StreamRedactor()
-        jwt = "eyJ" + "A" * (_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
+        jwt = _jose_header(_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
         assert redactor.feed(jwt) == REDACTED_CREDENTIAL_TAG
         assert redactor._discarding
         assert redactor.feed("!Important") + redactor.flush() == "!Important"
@@ -8019,7 +8107,7 @@ class TestStreamRedactor:
         )
 
         redactor = StreamRedactor()
-        jwt = "eyJ" + "A" * (_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
+        jwt = _jose_header(_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
         assert redactor.feed(jwt) == REDACTED_CREDENTIAL_TAG
         assert redactor._discarding
         assert redactor.feed("More.JWT_- done") + redactor.flush() == " done"

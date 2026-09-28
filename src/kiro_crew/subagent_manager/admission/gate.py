@@ -12,11 +12,13 @@ if TYPE_CHECKING:
 
     from ...execution_context import ExecutionContext
     from ...subagent import (
+        AGENT_NOT_AVAILABLE_CODE,
         QUEUED_REASON_ADAPTIVE_CAP_ZERO,
         QUEUED_REASON_CONCURRENCY_LIMIT,
         QUEUED_REASON_LOW_MEMORY,
         QUEUED_REASON_POSTURE_CRITICAL,
         KiroCrewConfig,
+        ParentSpawnPolicy,
         SubagentInfo,
         _cost_bucket,
         _effective_next_start_gb,
@@ -24,12 +26,14 @@ if TYPE_CHECKING:
         _startup_memory_reserve_gb,
         _validate_agent,
         _validate_app_agent_ownership,
+        _vet_parent_available_agents,
         _vet_spawn_governance,
         asyncio,
         cached_admission_check,
         check_memory_available,
         learned_cost_for,
         logger,
+        parent_spawn_policy,
         platform_compat,
         redact_credentials,
         redact_exfiltration_urls,
@@ -201,6 +205,7 @@ class _GateMixin(ManagerComponent):
         delegation: dict[str, str] | None = None,
         _execution_context: dict | None = None,
         _stage_boundary_owner: str = "",
+        _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
     ) -> "SubagentInfo | PreparedSpawn | ClaimPoint | None":
         """Spawn a subagent for *task*.
 
@@ -502,8 +507,62 @@ class _GateMixin(ManagerComponent):
                 )
             )
 
+        # --- Parent agent spec: ``toolsSettings.subagent.availableAgents`` ---
+        # kiro-cli's own allowlist of what THIS agent may spawn, honoured here
+        # because Kiro Crew's sub-agents bypass kiro-cli's built-in ``subagent``
+        # tool. Checked against the EFFECTIVE child template (explicit,
+        # inherited, or a member's), so ``crew=`` cannot route around it, and
+        # only when the parent's spec declares the key -- omitted is "allow
+        # all", the unchanged case. An intersection with the governance gate
+        # above: both must admit.
+        # ``_parent_spawn_policy`` is the event-loop callers' OFF-loop read
+        # (``spawn_async``, ``/api/spawn`` and the durable pump resolve it
+        # through ``to_thread``). The inline fallback serves the synchronous
+        # ``spawn()`` callers and the in-memory queue's synchronous drain, which
+        # re-enters WITHOUT a stored copy so the declaration is read fresh at
+        # dispatch (``queue_params`` below says why).
+        if _gate and _parent_spawn_policy is None:
+            _parent_spawn_policy = parent_spawn_policy(parent_session_key)
+        allowlist_err = (
+            _vet_parent_available_agents(_parent_spawn_policy, execution.template_id, app=app)
+            if _gate and _parent_spawn_policy is not None
+            else None
+        )
+        if allowlist_err:
+            if _persistent_diagnostics:
+                logger.warning("Subagent spawn refused by parent agent spec: %s", allowlist_err)
+            else:
+                logger.warning("Subagent %s refused by parent agent spec", agent_id)
+            sel().log_tool_invocation(
+                session_key=parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="denied",
+                error=allowlist_err if _persistent_diagnostics else "spawn denied by agent spec",
+                metadata=(
+                    {"agent": execution.template_id, **_task_audit}
+                    if _persistent_diagnostics
+                    else _task_audit
+                ),
+            )
+            return _refuse_row(
+                SubagentInfo(
+                    id=agent_id,
+                    task=_redacted_task,
+                    memory_mode=_memory_mode,
+                    agent=agent,
+                    parent_session_key=parent_session_key,
+                    done=True,
+                    error=f"spawn refused: {allowlist_err}",
+                    error_code=AGENT_NOT_AVAILABLE_CODE,
+                    batch_id=batch_id,
+                    batch_total=max(0, int(batch_total)),
+                )
+            )
+
         # --- Persist BEFORE any resource check: write-before-ack. Policy refusals
-        # above (empty task, memory identity, cwd, governance) never reach the
+        # above (empty task, memory identity, cwd, governance, the parent spec's
+        # allowlist) never reach the
         # store, so a refused spawn leaves no row; from here on the row exists
         # and every later exit either starts it, defers it, or marks it failed.
         # A drained spawn (_from_queue) already has its row. ---
@@ -536,6 +595,15 @@ class _GateMixin(ManagerComponent):
             # of the crew it was handed to.
             "memory_store": memory_store,
             "_execution_context": execution.to_record(),
+            # Deliberately NOT queued: ``_parent_spawn_policy``. The queued
+            # entry waits on capacity, so the wait is unbounded in time, and
+            # the declaration it was admitted under may have been tightened
+            # while it waited. Every drain re-reads it: the durable pump
+            # off-loop before its re-check, the in-memory synchronous drain
+            # through the gate's inline fallback above -- a memo-pinned
+            # directory read (``_PARENT_ALLOWLIST_MEMO``), so a ``scandir``
+            # in the ordinary case, and a full parse only when the memo
+            # declines to pin.
             "crew": crew,
             "_stage_boundary_owner": _stage_boundary_owner,
             "_memory_mode": _memory_mode,
@@ -1301,7 +1369,7 @@ class _GateMixin(ManagerComponent):
         else:
             # Registered and handed to a run (or to the approval prompt, which
             # is part of starting): admitted -> starting. ``running`` is written
-            # by the run itself at its first stream event.
+            # by the run itself at its first stream event addressed to its session.
             self._manager._admission.taskq_mark(info, "starting")
             # Nested: a parent blocked in spawn_sub_agents yields its lane slot
             # for this child (taskq.waits, W3); an event-loop caller awaits the

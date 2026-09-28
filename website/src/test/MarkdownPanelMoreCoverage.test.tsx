@@ -39,12 +39,16 @@ import type { PierreEditorHandle } from '../pierre'
 const highlightRegistry = new Map<string, Range[]>()
 class StubHighlight {
   readonly ranges: Range[]
-  constructor(...ranges: Range[]) { this.ranges = ranges }
+  constructor(...ranges: Range[]) {
+    this.ranges = ranges
+  }
 }
 vi.stubGlobal('Highlight', StubHighlight)
 vi.stubGlobal('CSS', {
   highlights: {
-    set: (name: string, hl: StubHighlight) => { highlightRegistry.set(name, hl.ranges) },
+    set: (name: string, hl: StubHighlight) => {
+      highlightRegistry.set(name, hl.ranges)
+    },
     delete: (name: string) => highlightRegistry.delete(name),
   },
   escape: (s: string) => s,
@@ -55,12 +59,17 @@ vi.stubGlobal('CSS', {
 // `data-diff-base` is the whole point of the editable-diff stub: `undefined`
 // renders the plain editor, a string renders the live-diff editing surface, and
 // the panel is what decides which.
-vi.mock('../pierre', async importOriginal => ({
+vi.mock('../pierre', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  PierreEditor: forwardRef<PierreEditorHandle, {
-    file: { contents: string }; diffBase?: string | null; diffSplit?: boolean
-    onChange: (v: string) => void
-  }>(function PierreEditorStub({ file, diffBase, diffSplit, onChange }, ref) {
+  PierreEditor: forwardRef<
+    PierreEditorHandle,
+    {
+      file: { contents: string }
+      diffBase?: string | null
+      diffSplit?: boolean
+      onChange: (v: string) => void
+    }
+  >(function PierreEditorStub({ file, diffBase, diffSplit, onChange }, ref) {
     useImperativeHandle(ref, () => ({ jumpToLine: () => {}, focus: () => {} }), [])
     return (
       <div
@@ -80,10 +89,18 @@ vi.mock('../pierre', async importOriginal => ({
   PierreCode: ({ file }: { file: { contents: string } }) => (
     <div data-testid="pierre-code" data-value={file.contents} />
   ),
-  PierreFilePair: ({ oldFile, newFile }: {
-    oldFile: { contents: string } | null; newFile: { contents: string } | null
+  PierreFilePair: ({
+    oldFile,
+    newFile,
+  }: {
+    oldFile: { contents: string } | null
+    newFile: { contents: string } | null
   }) => (
-    <div data-testid="pierre-diff" data-old={oldFile?.contents ?? ''} data-new={newFile?.contents ?? ''} />
+    <div
+      data-testid="pierre-diff"
+      data-old={oldFile?.contents ?? ''}
+      data-new={newFile?.contents ?? ''}
+    />
   ),
 }))
 
@@ -116,26 +133,36 @@ interface FetchOpts {
 let fetchOpts: FetchOpts = {}
 
 function installFetch() {
-  vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: { method?: string }) => {
-    const url = String(input)
-    if (url.startsWith('/api/knowledge/config')) {
-      return { ok: true, json: async () => ({ enabled: !!fetchOpts.knowledgeEnabled, supported_formats: ['.md', '.txt'] }) }
-    }
-    if (url.startsWith('/api/knowledge/sources')) {
-      if (init?.method === 'POST') return { ok: true, status: 201, json: async () => ({ id: 7 }) }
-      return { ok: true, json: async () => [] }
-    }
-    if (url.startsWith('/api/file-download')) return { ok: true, blob: async () => new Blob(['bytes']) }
-    if (url.startsWith('/api/file-read') && fetchOpts.fileReadFails) {
-      return { ok: false, status: 500, headers: { get: () => null } }
-    }
-    return {
-      ok: true,
-      status: 200,
-      headers: { get: () => null },
-      text: async () => fetchOpts.fileReadText ?? 'content from disk',
-    }
-  }))
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: unknown, init?: { method?: string }) => {
+      const url = String(input)
+      if (url.startsWith('/api/knowledge/config')) {
+        return {
+          ok: true,
+          json: async () => ({
+            enabled: !!fetchOpts.knowledgeEnabled,
+            supported_formats: ['.md', '.txt'],
+          }),
+        }
+      }
+      if (url.startsWith('/api/knowledge/sources')) {
+        if (init?.method === 'POST') return { ok: true, status: 201, json: async () => ({ id: 7 }) }
+        return { ok: true, json: async () => [] }
+      }
+      if (url.startsWith('/api/file-download'))
+        return { ok: true, blob: async () => new Blob(['bytes']) }
+      if (url.startsWith('/api/file-read') && fetchOpts.fileReadFails) {
+        return { ok: false, status: 500, headers: { get: () => null } }
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => fetchOpts.fileReadText ?? 'content from disk',
+      }
+    }),
+  )
 }
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -148,7 +175,10 @@ function LocationProbe() {
 
 const wrapper = ({ children }: { children: React.ReactNode }) => (
   <MemoryRouter>
-    <QueryClientProvider client={qc}>{children}<LocationProbe /></QueryClientProvider>
+    <QueryClientProvider client={qc}>
+      {children}
+      <LocationProbe />
+    </QueryClientProvider>
   </MemoryRouter>
 )
 
@@ -165,7 +195,9 @@ beforeEach(() => {
   installFetch()
   // happy-dom has no scrollIntoView; the comment-row flash calls it directly.
   Object.defineProperty(Element.prototype, 'scrollIntoView', {
-    configurable: true, writable: true, value: vi.fn(),
+    configurable: true,
+    writable: true,
+    value: vi.fn(),
   })
   vi.mocked(api.artifacts).mockResolvedValue({ artifacts: [] } as never)
   vi.mocked(api.artifact).mockResolvedValue({ live_dirty: false, pinned: false } as never)
@@ -211,10 +243,14 @@ describe('OverflowMenu — keyboard dismissal', () => {
 
 describe('OverflowMenu — artifact entries', () => {
   it('opens the artifact from the menu once the file is already one', async () => {
-    vi.mocked(api.artifacts).mockResolvedValue({ artifacts: [{ slug: 'notes-md', name: 'notes.md' }] } as never)
+    vi.mocked(api.artifacts).mockResolvedValue({
+      artifacts: [{ slug: 'notes-md', name: 'notes.md' }],
+    } as never)
     openOverflow()
     fireEvent.click(await screen.findByText('In Artifacts'))
-    await waitFor(() => expect(screen.getByTestId('pathname')).toHaveTextContent('/artifacts/notes-md'))
+    await waitFor(() =>
+      expect(screen.getByTestId('pathname')).toHaveTextContent('/artifacts/notes-md'),
+    )
   })
 
   it('promotes the file from the menu, re-reading it from disk', async () => {
@@ -223,13 +259,17 @@ describe('OverflowMenu — artifact entries', () => {
     fireEvent.click(await screen.findByText('Add to artifacts'))
     await waitFor(() => expect(api.createArtifact).toHaveBeenCalled())
     expect(vi.mocked(api.createArtifact).mock.calls[0][0]).toMatchObject({
-      content: '# the on-disk truth\n', kind: 'markdown', source_path: '/tmp/notes.md',
+      content: '# the on-disk truth\n',
+      kind: 'markdown',
+      source_path: '/tmp/notes.md',
     })
     expect(await screen.findByText('Added!')).toBeInTheDocument()
   })
 
   it('keeps the artifact usable when its detail fetch fails', async () => {
-    vi.mocked(api.artifacts).mockResolvedValue({ artifacts: [{ slug: 'notes-md', name: 'notes.md' }] } as never)
+    vi.mocked(api.artifacts).mockResolvedValue({
+      artifacts: [{ slug: 'notes-md', name: 'notes.md' }],
+    } as never)
     vi.mocked(api.artifact).mockRejectedValue(new Error('detail unavailable'))
     openOverflow()
     // The query falls back to the list row rather than reporting no artifact.
@@ -243,12 +283,19 @@ describe('OverflowMenu — knowledge entry', () => {
     fetchOpts.knowledgeEnabled = true
     openOverflow()
     fireEvent.click(await screen.findByText('Add to Knowledge'))
-    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
-      '/api/knowledge/sources', expect.objectContaining({ method: 'POST' }),
-    ))
-    const post = vi.mocked(fetch).mock.calls.find(([, init]) => (init as { method?: string } | undefined)?.method === 'POST')!
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(
+        '/api/knowledge/sources',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    )
+    const post = vi
+      .mocked(fetch)
+      .mock.calls.find(([, init]) => (init as { method?: string } | undefined)?.method === 'POST')!
     expect(JSON.parse((post[1] as { body: string }).body)).toEqual({
-      name: 'notes.md', source_type: 'local_file', uri: '/tmp/notes.md',
+      name: 'notes.md',
+      source_type: 'local_file',
+      uri: '/tmp/notes.md',
     })
   })
 
@@ -301,14 +348,18 @@ function openPanelMenu() {
 
 describe('MarkdownPanel — snapshot failure', () => {
   it('surfaces the server message instead of reporting a silent snapshot', async () => {
-    vi.mocked(api.artifacts).mockResolvedValue({ artifacts: [{ slug: 'notes-md', name: 'notes.md' }] } as never)
+    vi.mocked(api.artifacts).mockResolvedValue({
+      artifacts: [{ slug: 'notes-md', name: 'notes.md' }],
+    } as never)
     vi.mocked(api.updateArtifact).mockRejectedValue(new Error('artifact is read-only'))
     mountPanel()
     await screen.findByLabelText('Open as artifact')
     openPanelMenu()
     fireEvent.click(await screen.findByText('Snapshot version'))
     // The failure lands in the panel's shared ErrorNotice, not a blocking alert.
-    expect(await screen.findByTestId('markdown-panel-action-error')).toHaveTextContent('artifact is read-only')
+    expect(await screen.findByTestId('markdown-panel-action-error')).toHaveTextContent(
+      'artifact is read-only',
+    )
     expect(window.alert).not.toHaveBeenCalled()
   })
 })
@@ -344,10 +395,9 @@ describe('MarkdownPanel — discard with no owner refresh', () => {
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: 'Discard changes' }))
     await waitFor(() => expect(onContentChange).toHaveBeenCalledWith('the version on disk'))
-    expect(fetch).toHaveBeenCalledWith(
-      '/api/file-read?path=%2Ftmp%2Fnotes.md',
-      { signal: expect.any(AbortSignal) },
-    )
+    expect(fetch).toHaveBeenCalledWith('/api/file-read?path=%2Ftmp%2Fnotes.md', {
+      signal: expect.any(AbortSignal),
+    })
   })
 })
 
@@ -404,7 +454,9 @@ describe('MarkdownPanel — comment highlight pointer handling', () => {
   it('flashes the comment row when its highlighted anchor is clicked', async () => {
     const { painted, scrollRoot } = await mountWithPaintedComment()
     caretInside(painted)
-    await act(async () => { fireEvent.click(scrollRoot, { clientX: 20, clientY: 20 }) })
+    await act(async () => {
+      fireEvent.click(scrollRoot, { clientX: 20, clientY: 20 })
+    })
     const row = document.querySelector('[data-comment-id="c1"]') as HTMLElement
     // The background is set through a CSS custom property, which happy-dom
     // does not retain on the inline style; the transition it is paired with is
@@ -414,7 +466,9 @@ describe('MarkdownPanel — comment highlight pointer handling', () => {
 
     // A second click cancels the in-flight flash before starting the next one,
     // so two rows are never lit at once.
-    await act(async () => { fireEvent.click(scrollRoot, { clientX: 20, clientY: 20 }) })
+    await act(async () => {
+      fireEvent.click(scrollRoot, { clientX: 20, clientY: 20 })
+    })
     expect(vi.mocked(Element.prototype.scrollIntoView).mock.calls.length).toBeGreaterThan(1)
   })
 
@@ -424,11 +478,20 @@ describe('MarkdownPanel — comment highlight pointer handling', () => {
     const stray = document.createTextNode('elsewhere')
     Object.defineProperty(document, 'caretRangeFromPoint', {
       configurable: true,
-      value: () => { const r = document.createRange(); r.setStart(stray, 0); r.collapse(true); return r },
+      value: () => {
+        const r = document.createRange()
+        r.setStart(stray, 0)
+        r.collapse(true)
+        return r
+      },
     })
-    await act(async () => { fireEvent.mouseMove(scrollRoot, { clientX: 5, clientY: 5 }) })
+    await act(async () => {
+      fireEvent.mouseMove(scrollRoot, { clientX: 5, clientY: 5 })
+    })
     expect(document.querySelector('.mc-comment-tooltip')).toBeNull()
-    await act(async () => { fireEvent.click(scrollRoot, { clientX: 5, clientY: 5 }) })
+    await act(async () => {
+      fireEvent.click(scrollRoot, { clientX: 5, clientY: 5 })
+    })
     const row = document.querySelector('[data-comment-id="c1"]') as HTMLElement
     expect(row.style.transition).toBe('')
   })
@@ -439,24 +502,33 @@ describe('MarkdownPanel — comment highlight pointer handling', () => {
     // observer is what keeps the ranges attached to the new nodes.
     await act(async () => {
       scrollRoot.appendChild(document.createElement('span'))
-      await new Promise(resolve => setTimeout(resolve, 120))
+      await new Promise((resolve) => setTimeout(resolve, 120))
     })
     expect(highlightRegistry.get('mc-comment')?.length).toBe(1)
   })
 
   it('adopts the drafts of a file switched in under the same panel', async () => {
-    localStorage.setItem('mc-comment-drafts', JSON.stringify({
-      '/tmp/first.md': [{ id: 'a1', anchor: 'alpha', text: 'note on the first file' }],
-      '/tmp/second.md': [{ id: 'b1', anchor: 'alpha', text: 'note on the second file' }],
-    }))
+    localStorage.setItem(
+      'mc-comment-drafts',
+      JSON.stringify({
+        '/tmp/first.md': [{ id: 'a1', anchor: 'alpha', text: 'note on the first file' }],
+        '/tmp/second.md': [{ id: 'b1', anchor: 'alpha', text: 'note on the second file' }],
+      }),
+    )
     const onSubmitComments = vi.fn()
     const { rerender } = render(
-      <MarkdownPanel embedded {...panelProps({ filePath: '/tmp/first.md', content: BODY, onSubmitComments })} />,
+      <MarkdownPanel
+        embedded
+        {...panelProps({ filePath: '/tmp/first.md', content: BODY, onSubmitComments })}
+      />,
       { wrapper },
     )
     expect(await screen.findByText('note on the first file')).toBeInTheDocument()
     rerender(
-      <MarkdownPanel embedded {...panelProps({ filePath: '/tmp/second.md', content: BODY, onSubmitComments })} />,
+      <MarkdownPanel
+        embedded
+        {...panelProps({ filePath: '/tmp/second.md', content: BODY, onSubmitComments })}
+      />,
     )
     expect(await screen.findByText('note on the second file')).toBeInTheDocument()
     expect(screen.queryByText('note on the first file')).toBeNull()
@@ -479,14 +551,22 @@ describe('MarkdownPanel — comment highlight pointer handling', () => {
  */
 describe('MarkdownPanel — diff surface wiring', () => {
   it('renders the diff read-only in preview, with no editor to type into', async () => {
-    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: 'from HEAD\n', status: 'clean' } as never)
+    vi.mocked(api.fileDiff).mockResolvedValue({
+      diff: 'x',
+      original: 'from HEAD\n',
+      status: 'clean',
+    } as never)
     mountPanel({ initialDiffMode: true, content: 'in the buffer\n' })
     expect(await screen.findByTestId('pierre-diff')).toBeInTheDocument()
     expect(screen.queryByTestId('pierre-editor')).toBeNull()
   })
 
   it('swaps the read-only diff for an editor diffed against HEAD in source mode', async () => {
-    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: 'from HEAD\n', status: 'clean' } as never)
+    vi.mocked(api.fileDiff).mockResolvedValue({
+      diff: 'x',
+      original: 'from HEAD\n',
+      status: 'clean',
+    } as never)
     mountPanel({ initialDiffMode: true, content: 'in the buffer\n' })
     await screen.findByTestId('pierre-diff')
     fireEvent.click(screen.getByText('Edit'))
@@ -500,7 +580,11 @@ describe('MarkdownPanel — diff surface wiring', () => {
   })
 
   it('forwards an edit made on the editable diff surface to the owner', async () => {
-    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: 'from HEAD\n', status: 'clean' } as never)
+    vi.mocked(api.fileDiff).mockResolvedValue({
+      diff: 'x',
+      original: 'from HEAD\n',
+      status: 'clean',
+    } as never)
     const onContentChange = vi.fn()
     mountPanel({ initialDiffMode: true, content: 'in the buffer\n', onContentChange })
     fireEvent.click(screen.getByText('Edit'))
@@ -516,7 +600,11 @@ describe('MarkdownPanel — diff surface wiring', () => {
   })
 
   it('shares the app-wide split/unified preference with the editable diff', async () => {
-    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: 'from HEAD\n', status: 'clean' } as never)
+    vi.mocked(api.fileDiff).mockResolvedValue({
+      diff: 'x',
+      original: 'from HEAD\n',
+      status: 'clean',
+    } as never)
     localStorage.setItem('mc-diff-split', '0')
     mountPanel({ initialDiffMode: true, content: 'in the buffer\n' })
     fireEvent.click(screen.getByText('Edit'))
@@ -535,9 +623,9 @@ describe('MarkdownPanel — fullscreen for a code file', () => {
   it('offers the knowledge toggle in the overlay header too', async () => {
     fetchOpts.knowledgeEnabled = true
     const dialog = await goFullscreen({})
-    await waitFor(() => expect(
-      within(dialog).getByLabelText('Add to Knowledge Library'),
-    ).toBeInTheDocument())
+    await waitFor(() =>
+      expect(within(dialog).getByLabelText('Add to Knowledge Library')).toBeInTheDocument(),
+    )
   })
 
   it('carries the editor toolbar for a code file, which the side panel does not', async () => {
@@ -578,7 +666,11 @@ describe('MarkdownPanel — fullscreen for a code file', () => {
 })
 
 describe('MarkdownPanel — live file watch', () => {
-  interface StubStream { onmessage?: (ev: { data: string }) => void; onerror?: () => void; onopen?: () => void }
+  interface StubStream {
+    onmessage?: (ev: { data: string }) => void
+    onerror?: () => void
+    onopen?: () => void
+  }
   const streams: StubStream[] = []
 
   function installEventSource() {
@@ -586,7 +678,9 @@ describe('MarkdownPanel — live file watch', () => {
       onmessage?: (ev: { data: string }) => void
       onerror?: () => void
       onopen?: () => void
-      constructor(readonly url: string) { streams.push(this) }
+      constructor(readonly url: string) {
+        streams.push(this)
+      }
       close() {}
     }
     vi.stubGlobal('EventSource', StubEventSource)
@@ -605,7 +699,9 @@ describe('MarkdownPanel — live file watch', () => {
     const props = { ...panelProps({ onContentChange }), liveWatch: true }
     render(<MarkdownPanel embedded {...props} />, { wrapper })
     await waitFor(() => expect(streams.length).toBe(1))
-    act(() => { streams[0].onmessage?.({ data: JSON.stringify({ content: 'rewritten on disk' }) }) })
+    act(() => {
+      streams[0].onmessage?.({ data: JSON.stringify({ content: 'rewritten on disk' }) })
+    })
     await waitFor(() => expect(onContentChange).toHaveBeenCalledWith('content from disk'))
     expect(onContentChange).not.toHaveBeenCalledWith('rewritten on disk')
   })
@@ -625,7 +721,9 @@ describe('MarkdownPanel — live file watch', () => {
     await waitFor(() => expect(onContentChange).toHaveBeenCalledWith('content from disk'))
     onContentChange.mockClear()
     fetchOpts.fileReadFails = true
-    act(() => { streams[0].onmessage?.({ data: JSON.stringify({ content: 'event body only' }) }) })
+    act(() => {
+      streams[0].onmessage?.({ data: JSON.stringify({ content: 'event body only' }) })
+    })
     await screen.findByTestId('markdown-panel-action-error')
     expect(onContentChange).not.toHaveBeenCalledWith('event body only')
     expect(onContentChange).not.toHaveBeenCalled()
@@ -646,23 +744,36 @@ describe('MarkdownPanel — live file watch', () => {
     await waitFor(() => expect(streams.length).toBe(1))
 
     let releaseWatch: (() => void) | undefined
-    const watchBody = new Promise<void>(resolve => { releaseWatch = resolve })
+    const watchBody = new Promise<void>((resolve) => {
+      releaseWatch = resolve
+    })
     vi.mocked(globalThis.fetch)
       .mockResolvedValueOnce({
-        ok: true, status: 200, headers: { get: () => null },
-        text: async () => { await watchBody; return 'slow watch revision' },
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => {
+          await watchBody
+          return 'slow watch revision'
+        },
       } as unknown as Response)
       .mockResolvedValueOnce({
-        ok: true, status: 200, headers: { get: () => null },
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
         text: async () => 'refresh revision',
       } as unknown as Response)
 
-    act(() => { streams[0].onmessage?.({ data: JSON.stringify({ content: 'x' }) }) })
+    act(() => {
+      streams[0].onmessage?.({ data: JSON.stringify({ content: 'x' }) })
+    })
     fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
     fireEvent.click(screen.getByRole('menuitem', { name: /refresh/i }))
     await waitFor(() => expect(onContentChange).toHaveBeenCalledWith('refresh revision'))
-    act(() => { releaseWatch?.() })
-    await new Promise(resolve => setTimeout(resolve, 30))
+    act(() => {
+      releaseWatch?.()
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
     expect(onContentChange).not.toHaveBeenCalledWith('slow watch revision')
   })
 
@@ -679,31 +790,49 @@ describe('MarkdownPanel — live file watch', () => {
     await waitFor(() => expect(streams.length).toBe(1))
 
     let releaseFirst: (() => void) | undefined
-    const firstBody = new Promise<void>(resolve => { releaseFirst = resolve })
+    const firstBody = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
     vi.mocked(globalThis.fetch)
       .mockResolvedValueOnce({
-        ok: true, status: 200, headers: { get: () => null },
-        text: async () => { await firstBody; return 'older revision' },
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => {
+          await firstBody
+          return 'older revision'
+        },
       } as unknown as Response)
       .mockResolvedValueOnce({
-        ok: true, status: 200, headers: { get: () => null },
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
         text: async () => 'newer revision',
       } as unknown as Response)
 
-    act(() => { streams[0].onmessage?.({ data: JSON.stringify({ content: 'a' }) }) })
-    act(() => { streams[0].onmessage?.({ data: JSON.stringify({ content: 'b' }) }) })
+    act(() => {
+      streams[0].onmessage?.({ data: JSON.stringify({ content: 'a' }) })
+    })
+    act(() => {
+      streams[0].onmessage?.({ data: JSON.stringify({ content: 'b' }) })
+    })
     await waitFor(() => expect(onContentChange).toHaveBeenCalledWith('newer revision'))
-    act(() => { releaseFirst?.() })
-    await new Promise(resolve => setTimeout(resolve, 30))
+    act(() => {
+      releaseFirst?.()
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
     expect(onContentChange).not.toHaveBeenCalledWith('older revision')
   })
 
   it('does not watch a dirty buffer, which a disk push would clobber', async () => {
     streams.length = 0
     installEventSource()
-    const props = { ...panelProps({ content: 'edited body', savedBaseline: 'disk body' }), liveWatch: true }
+    const props = {
+      ...panelProps({ content: 'edited body', savedBaseline: 'disk body' }),
+      liveWatch: true,
+    }
     render(<MarkdownPanel embedded {...props} />, { wrapper })
-    await new Promise(resolve => setTimeout(resolve, 20))
+    await new Promise((resolve) => setTimeout(resolve, 20))
     expect(streams.length).toBe(0)
   })
 })
@@ -713,7 +842,11 @@ describe('MarkdownPanel — comment anchoring edge cases', () => {
     // Diff mode with nothing to show renders the zero-diff notice in place of
     // the markdown preview, so a selection there has no source position to
     // resolve: the anchor is the text the toolbar captured, with no line.
-    vi.mocked(api.fileDiff).mockResolvedValue({ diff: '', original: 'same\n', status: 'clean' } as never)
+    vi.mocked(api.fileDiff).mockResolvedValue({
+      diff: '',
+      original: 'same\n',
+      status: 'clean',
+    } as never)
     mountPanel({ initialDiffMode: true, content: 'same\n', onSubmitComments: vi.fn() })
     const notice = await screen.findByText('No changes in this file')
     const textNode = notice.firstChild as Text
@@ -732,12 +865,18 @@ describe('MarkdownPanel — comment anchoring edge cases', () => {
     fireEvent.click(screen.getByLabelText('Add comment'))
     await screen.findByText('from the fallback')
     const stored = JSON.parse(localStorage.getItem('mc-comment-drafts') || '{}')
-    expect(stored['/tmp/notes.md'][0]).toMatchObject({ anchor: 'No changes in this file', text: 'from the fallback' })
+    expect(stored['/tmp/notes.md'][0]).toMatchObject({
+      anchor: 'No changes in this file',
+      text: 'from the fallback',
+    })
     expect(stored['/tmp/notes.md'][0].line).toBeUndefined()
   })
 
   it('marks every text node a cross-block selection touches', async () => {
-    mountPanel({ content: '# Title\n\nalpha beta gamma\n\ndelta epsilon\n', onSubmitComments: vi.fn() })
+    mountPanel({
+      content: '# Title\n\nalpha beta gamma\n\ndelta epsilon\n',
+      onSubmitComments: vi.fn(),
+    })
     const first = await screen.findByText(/alpha beta gamma/)
     const second = await screen.findByText(/delta epsilon/)
     const range = document.createRange()

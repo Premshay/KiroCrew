@@ -4164,6 +4164,12 @@ class TestKiroReadinessQueueHandoff:
         state.sessions.record_failure = AsyncMock()
         state.conversation_log = MagicMock()
         state.conversation_log.read_messages.return_value = []
+        # The turn-start read-back folds the on-disk line into the live carrier;
+        # a mocked log must answer that read like an absent file (readable, no line).
+        state.conversation_log.get_metadata_status.return_value = ({}, True)
+        # The turn now reaches the transcript save; a MagicMock ``_path`` would
+        # otherwise materialise a ``MagicMock/`` tree in the current directory.
+        state.conversation_log._path.return_value = tmp_path / "transcript.jsonl"
         if wait_end == "deadline":
             monkeypatch.setattr("kiro_crew.memory_startup.MEMORY_ADMISSION_WAIT_SECONDS", 0.0)
         state.memory_startup_task = asyncio.create_task(prepare_memory())
@@ -5106,7 +5112,7 @@ class TestSessionRename:
             assert data["title"] == "My Chat"
             assert slot.title == "My Chat"
             assert slot._titled is True
-            state.push_slot_title.assert_called_once_with("s1", "My Chat")
+            state.push_slot_title.assert_called_once_with("s1", "My Chat", full=False)
 
     @pytest.mark.asyncio
     async def test_rename_not_found(self, tmp_path, monkeypatch):
@@ -5155,7 +5161,7 @@ class TestSessionRename:
             assert resp.status == 200
             assert len(data["title"]) == 200
             assert state._slots["s1"].title == "x" * 200
-            state.push_slot_title.assert_called_once_with("s1", "x" * 200)
+            state.push_slot_title.assert_called_once_with("s1", "x" * 200, full=False)
 
     @pytest.mark.asyncio
     async def test_resumed_session_preserves_title(self, tmp_path, monkeypatch):
@@ -10280,6 +10286,7 @@ class TestRuntimeWiring:
         must live in the finally, on every exit path."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
 
+        from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
         from kiro_crew.context import ContextBuilder
         from kiro_crew.memory import MemoryStore
         from kiro_crew.skills import SkillsLoader
@@ -10295,7 +10302,11 @@ class TestRuntimeWiring:
         )
 
         state = _make_state(tmp_path, context_builder=ctx_builder)
-        slot = state.get_or_create_slot("member-rearm-test", mode="member")
+        cfg = KiroCrewConfig()
+        cfg.agents["rearm-test"] = KiroCrewAgentConfig(kiro_agent="kirocrew")
+        cfg.default_agent = "rearm-test"
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", lambda: cfg)
+        slot = state.get_or_create_slot("member-rearm-test", agent="rearm-test", mode="member")
 
         mock_client = MagicMock()
         _arm_inner_client_handlers(mock_client.client)
@@ -13474,6 +13485,27 @@ class TestApiChatAgentPassing:
                 )
             assert resp.status == 400
             mock_emit.assert_called_once_with("s1", "../evil", outcome="denied_invalid")
+
+    @pytest.mark.asyncio
+    async def test_credential_shaped_invalid_agent_is_redacted_in_sel(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from unittest.mock import MagicMock, patch
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("member-dr-eggbot", agent="dr. eggbot", mode="member")
+        unsafe = "crew password=shortvalue"
+        audit = MagicMock()
+        with patch("kiro_crew.dashboard.chat_utils.sel", return_value=audit):
+            async with TestClient(TestServer(_make_app(state))) as client:
+                response = await client.post(
+                    "/api/chat?ws=1",
+                    json={"message": "hello", "slot": slot.key, "agent": unsafe},
+                )
+
+        assert response.status == 400
+        event = audit.log.call_args.args[0]
+        assert event.agent == "crew password=[REDACTED]"
+        assert unsafe not in event.agent
 
     @pytest.mark.asyncio
     async def test_non_string_agent_logs_actual_value(self, tmp_path, monkeypatch):
@@ -18140,9 +18172,10 @@ class TestForkSlot:
     async def test_fork_of_temporary_parent_stays_temporary_with_its_history(self, tmp_path):
         """Temporary blocks memory READS, not the session's own thread history.
 
-        Cold provider replay uses the child's live message window. A temporary
-        fork carries its copied turns into the fresh provider without writing
-        those bodies into a durable conversation log.
+        Cold provider replay uses the child's live message window, and the
+        copied turns also reach the child's own conversation log -- a temporary
+        fork is a chat the user reopens from History like any other -- under a
+        metadata line that names the temporary mode, so nothing learns from it.
         """
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("src", memory_mode="temporary")
@@ -18175,8 +18208,12 @@ class TestForkSlot:
         )
         assert "parent question" in replay
         assert "parent answer" in replay
-        assert state.conversation_log.recent(history_key) == []
-        assert not state.conversation_log._path(history_key).exists()
+        recent = state.conversation_log.recent(history_key)
+        assert [m["content"] for m in recent if m.get("role") in ("user", "assistant")] == [
+            "parent question",
+            "parent answer",
+        ]
+        assert state.conversation_log.get_metadata(history_key).get("memory_mode") == "temporary"
 
     @pytest.mark.asyncio
     async def test_fork_history_visible_to_new_kiro_via_context_builder(self, tmp_path):
@@ -20917,8 +20954,20 @@ class TestEmptyResponseRetry:
         notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
         assert not any("returned nothing this turn" in m.get("content", "") for m in notice_msgs)
         # Re-queue path must NOT persist/consolidate the spurious empty turn or
-        # record success (item 3 of the CR).
-        mock_save.assert_not_called()
+        # record success (item 3 of the CR). The only saves are the in-flight
+        # marker's: this slot has no transcript yet, so admission falls back to
+        # the forced save that creates it, and the finally clears the marker
+        # with a second one before the queued retry receives its own generation.
+        assert mock_save.await_count == 2
+        for marker_save in mock_save.await_args_list:
+            assert marker_save.args == (state, slot)
+            # Both marker saves are pinned to this slot incarnation so a
+            # cancelled runner outliving a same-key replacement writes nothing.
+            assert marker_save.kwargs == {
+                "force": True,
+                "expected_history_key": "dashboard:empty-resp-slot",
+                "expected_slot_name": "empty-resp-slot",
+            }
         mock_consolidate.assert_not_called()
         state.sessions.record_success.assert_not_called()
         # _flush_file_changes is intentionally NOT skipped: the try-body call (inside
@@ -25748,6 +25797,9 @@ class TestCloseBroadcastDurability:
                 frames.append(set(state._slots))
 
         state.push_slots_update = MagicMock(side_effect=_push)
+        # A successful close announces the removal through push_slot_removed,
+        # which is the same slot-list broadcast for this test's purpose.
+        state.push_slot_removed = MagicMock(side_effect=lambda _key: _push())
 
         real_sync = chat_handlers._sync_dashboard_slots
 
@@ -25866,6 +25918,9 @@ class TestCloseBroadcastDurability:
         seen = asyncio.Event()
         state.push_slots_update = MagicMock(
             side_effect=lambda: (calls.append("broadcast"), seen.set())
+        )
+        state.push_slot_removed = MagicMock(
+            side_effect=lambda _key: (calls.append("broadcast"), seen.set())
         )
 
         async def _hang(*args, **kwargs):
@@ -26389,3 +26444,113 @@ class TestUnflushedTailOrderingAndSnapshot:
             "stopped",
             "partial an",
         ], f"the owed chunk must keep its trailing window position; got {bodies}"
+
+
+class TestHistoryResumeInterruptedTurnMarker:
+    """The History resume endpoint shares the startup restore's marker handling."""
+
+    @staticmethod
+    def _saved_state(tmp_path, monkeypatch, name: str, rows: list[tuple], generation: int):
+        from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot(name)
+        for row in rows:
+            slot.append(*row[:3], meta=row[3] if len(row) > 3 else None)
+        slot._turn_in_flight_generation = generation
+        assert _save_slot_to_history(state, slot, force=True)
+        del state._slots[slot.key]
+        return state
+
+    @pytest.mark.asyncio
+    async def test_resume_reconciles_partial_assistant_and_tool_tail(self, tmp_path, monkeypatch):
+        state = self._saved_state(
+            tmp_path,
+            monkeypatch,
+            "resume-interrupted",
+            [
+                ("user", "inspect it", "msg msg-u"),
+                ("assistant", "partial result", "msg msg-a"),
+                ("tool", "read complete", "tool", {"done": True}),
+            ],
+            generation=18,
+        )
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            response = await client.post(
+                "/api/chat/slots/resume-interrupted/resume",
+                json={"key": "dashboard:resume-interrupted"},
+            )
+            payload = await response.json()
+
+        assert response.status == 200
+        restored = state.get_slot("resume-interrupted")
+        assert restored is not None
+        assert restored.to_dict()["interrupted"] is True
+        assert restored.messages[-1]["meta"]["kind"] == "gateway_restart_interruption"
+        # The paging cursor counts the recovered row, so the next older page
+        # starts where this response's rows end.
+        assert payload["total"] == 4
+        assert payload["messages"][-1]["role"] == "error"
+        assert payload["next_before"] == 0
+        assert payload["has_more"] is False
+
+    @pytest.mark.asyncio
+    async def test_resume_preserves_a_deliberate_stop(self, tmp_path, monkeypatch):
+        state = self._saved_state(
+            tmp_path,
+            monkeypatch,
+            "resume-stopped",
+            [
+                ("user", "inspect it", "msg msg-u"),
+                ("system", "Stopped", json.dumps({"kind": "stop_event"})),
+            ],
+            generation=19,
+        )
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            response = await client.post(
+                "/api/chat/slots/resume-stopped/resume",
+                json={"key": "dashboard:resume-stopped"},
+            )
+            payload = await response.json()
+
+        assert response.status == 200
+        restored = state.get_slot("resume-stopped")
+        assert restored is not None
+        assert restored.to_dict()["interrupted"] is False
+        assert all(
+            (m.get("meta") or {}).get("kind") != "gateway_restart_interruption"
+            for m in restored.messages
+        )
+        assert payload["total"] == 2
+
+    @pytest.mark.asyncio
+    async def test_resume_ignores_a_malformed_boolean_marker(self, tmp_path, monkeypatch):
+        state = self._saved_state(
+            tmp_path,
+            monkeypatch,
+            "resume-malformed",
+            [("user", "hi", "msg msg-u"), ("assistant", "complete", "msg msg-a")],
+            generation=0,
+        )
+        assert state.conversation_log is not None
+        state.conversation_log.update_metadata(
+            "dashboard:resume-malformed", {"turn_in_flight_generation": True}
+        )
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            response = await client.post(
+                "/api/chat/slots/resume-malformed/resume",
+                json={"key": "dashboard:resume-malformed"},
+            )
+
+        assert response.status == 200
+        restored = state.get_slot("resume-malformed")
+        assert restored is not None
+        assert restored.to_dict()["interrupted"] is False
+        assert all(
+            (m.get("meta") or {}).get("kind") != "gateway_restart_interruption"
+            for m in restored.messages
+        )

@@ -31,6 +31,13 @@ from kiro_crew.constants import (
     KIROCREW_SPAWNED_VALUE,
 )
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
+from kiro_crew.runtime_ownership import (
+    PidRefcount,
+    authorize_runtime_kill,
+    commit_runtime_teardown,
+    release_runtime_teardown,
+    tenancy_epoch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -996,6 +1003,36 @@ def _session_pid_entry_index(my_gw_pid: int) -> dict[int, tuple[str, str | None]
     return index
 
 
+def retained_gateway_pids() -> frozenset[int]:
+    """The gateway pids that still have an entry in ``kiro_session_pids.txt``.
+
+    Read-only, under the file's own lock, and the file is not changed. This is
+    the evidence ``session_work_dir`` uses for a predecessor gateway of THIS data
+    home: :func:`cleanup_orphaned_sessions` has already reaped every child it
+    could confirm dead or kill and removed those entries, so a gateway pid that
+    still has one may have something alive and its run directories are kept. A
+    ledger that cannot be read raises ``OSError`` rather than answering "nothing
+    retained": the callers decide a deletion on this answer and fail closed.
+    """
+    path = _session_pid_file_path()
+    with _session_pid_file_lock():
+        if not path.exists():
+            return frozenset()
+        lines = path.read_text(encoding="utf-8").splitlines()
+    retained: set[int] = set()
+    for line in lines:
+        parts = line.strip().split(":")
+        if len(parts) not in (2, 3):
+            continue
+        try:
+            gw_pid = int(parts[0])
+        except ValueError:
+            continue
+        if gw_pid > 0:
+            retained.add(gw_pid)
+    return frozenset(retained)
+
+
 def _kill_confirmed_and_writeback(
     my_gw_pid: int, confirmed: list[int], killed_or_dead: set[str]
 ) -> int:
@@ -1936,6 +1973,7 @@ def _sync_kill_provider(provider: object) -> None:
     leaves carry ``LLMProvider = Any`` runtime stubs and why this module reaches
     acp.client through function-local imports.  ``test_agent_lifecycle_cycle.py``
     pins the absence; keep this leaf ignorant of the agent layer.
+
     """
     # ACP provider: long-lived process via client._pid
     client = getattr(provider, "_client", None)
@@ -1962,6 +2000,45 @@ def _sync_kill_provider(provider: object) -> None:
     if not isinstance(pid, int) or pid <= 1:
         logger.debug("_sync_kill_provider: refusing to signal invalid pid %r", pid)
         return
+    # Asked ONCE, here, before any signal. Everything below is one careful
+    # escalation -- a group resolved while the leader was alive, a SIGTERM grace,
+    # a recorded descendant sweep -- and asking per signal would both write the
+    # same shot three times and leave a window where the answer changed
+    # mid-escalation.
+    #
+    # This is the ONE gate every hard kill of a provider passes: all three
+    # ``_dispatch_hard_kill`` implementations (the facade's static seam, the
+    # allocator's, and the warm pool's) resolve their killer through
+    # ``get_sync_kill_provider()``, and the dashboard's reset-all fallback calls
+    # this function directly.
+    #
+    # A caller legitimately ending this runtime releases its lease first. The
+    # owning provider does so as the first statement of its shutdown's owning
+    # branch -- a plain statement, not a ``finally``, so a shutdown cancelled
+    # BEFORE it has no release and this gate would refuse the cleanup that
+    # follows. The two paths where that is reachable release explicitly:
+    # ``session_allocation``'s handler that spans registration, and the
+    # dashboard's reset-all timeout arm.
+    #
+    # At ``cap=1`` a refusal therefore does NOT mean a second tenant exists --
+    # one runtime has one owning session. It means a lease outlived the session
+    # that took it, so read a ``REFUSED`` line as a release site that did not
+    # run, not as a near miss the gate handled.
+    if not authorize_runtime_kill(
+        pid,
+        reason="leaked provider teardown",
+        caller="session_pid._sync_kill_provider",
+    ):
+        return
+    # The verdict above is a statement about the past, and this function is where
+    # that matters most: it runs on an EXECUTOR thread while a session-sharing
+    # subagent takes its turn's tenancy on the event loop, and between here and the
+    # first signal sit a start-id read, a group resolution and an unbounded
+    # descendant walk. A claim landing in that window is invisible to the verdict,
+    # so the epoch is captured here and re-checked immediately before every signal
+    # below -- the only place the check is worth anything, since narrowing the gap
+    # is the entire point.
+    tenancy_token = tenancy_epoch(pid)
     # Deny-by-default on the ROOT's own identity -- but only where the pid can go
     # stale. ``_client._pid`` is a RECORDED number that outlives a failed start, so
     # it can name a process the OS has since handed to someone else; and for a group
@@ -2012,6 +2089,12 @@ def _sync_kill_provider(provider: object) -> None:
             return
         # Every Windows shape uses exact-tree cleanup and the same capacity
         # admission. Refusal preserves the whole tree; no root-only fallback.
+        #
+        # Committed HERE, before the one hard kill this platform sends: taskkill /F
+        # has no grace to re-check inside, so the barrier is the only thing standing
+        # between the verdict and a claim taken while the tree comes down.
+        if not _commit_teardown(pid, tenancy_token):
+            return
         try:
             if pid_from_client:
                 # PINNED: the query handle that verified this identity is held
@@ -2048,6 +2131,10 @@ def _sync_kill_provider(provider: object) -> None:
                 exc,
             )
             return
+        finally:
+            # Every exit above returns, so the barrier is dropped here or not at
+            # all: a pid left committed is one no tenant can ever claim again.
+            release_runtime_teardown(pid)
         logger.warning("_sync_kill_provider: killed PID %d for leaked provider", pid)
         return
     # Resolved once, while the root is alive. The root's zombie is then held
@@ -2083,73 +2170,93 @@ def _sync_kill_provider(provider: object) -> None:
         # recorded shape cannot reach that state -- an unverified root turns the walk
         # off (`include_live_walk=root_verified`), leaving only the spawn snapshot.
         pgid = _group_from_witnessed_descendant(pid, recorded_start, records)
-    for sig in (platform_compat.SIGTERM, platform_compat.SIGKILL):
-        # killpg is authorized by GROUP OWNERSHIP, not by the root still being alive.
-        # `_pgroup_still_ours` proves an identity-verified member of our tree owns this
-        # pgid -- the root if it is still there, otherwise a spawn-recorded descendant --
-        # and that is exactly the property killpg needs. Demanding the root's identity
-        # on top of it suppresses the escalation in the one case it matters: asyncio's
-        # watcher collects the leader zombie during the grace, so the SIGKILL round is
-        # skipped, and a descendant that forked into the group AFTER the snapshot is
-        # reached by neither the group signal nor the recorded sweep. It survives the
-        # teardown, which is the leak this whole change exists to stop.
-        #
-        # The pid-scoped fallback below is different: it names the root itself, so it
-        # keeps the root identity check.
-        group_ok = pgid is not None and _pgroup_still_ours(
-            pgid, pid, recorded_start, records, gated=pid_from_client
+    # Committed ONCE here, immediately before the first signal, and held for the
+    # whole escalation. A per-round re-read cannot serve: by the second round the
+    # SIGTERM has already been delivered and its grace -- seconds, by this
+    # function's own comment ample time for a shared turn to start -- has passed,
+    # so abandoning the SIGKILL leaves the turn that claimed in the grace dying
+    # from a signal no table can recall. Closing the pid to new tenants is the only
+    # answer that holds for the duration of a kill that cannot be taken back.
+    if not _commit_teardown(pid, tenancy_token):
+        return
+    try:
+        for sig in (platform_compat.SIGTERM, platform_compat.SIGKILL):
+            # killpg is authorized by GROUP OWNERSHIP, not by the root still being
+            # alive. `_pgroup_still_ours` proves an identity-verified member of our
+            # tree owns this pgid -- the root if it is still there, otherwise a
+            # spawn-recorded descendant -- and that is exactly the property killpg
+            # needs. Demanding the root's identity on top of it suppresses the
+            # escalation in the one case it matters: asyncio's watcher collects the
+            # leader zombie during the grace, so the SIGKILL round is skipped, and a
+            # descendant that forked into the group AFTER the snapshot is reached by
+            # neither the group signal nor the recorded sweep. It survives the
+            # teardown, which is the leak this whole change exists to stop.
+            #
+            # The pid-scoped fallback below is different: it names the root itself,
+            # so it keeps the root identity check.
+            group_ok = pgid is not None and _pgroup_still_ours(
+                pgid, pid, recorded_start, records, gated=pid_from_client
+            )
+            root_ok = root_verified and _root_identity_holds(
+                pid, recorded_start, gated=pid_from_client
+            )
+            if group_ok or root_ok:
+                try:
+                    if group_ok:
+                        os.killpg(pgid, sig)  # type: ignore[arg-type]
+                    elif pgid is None:
+                        platform_compat.kill_pid(pid, sig)
+                    else:
+                        logger.warning(
+                            "_sync_kill_provider: pgid %d holds no verified member "
+                            "of pid %d's tree; signalling recorded descendants only",
+                            pgid,
+                            pid,
+                        )
+                except ProcessLookupError:
+                    # The root (or its whole group) is gone. Descendants that escaped
+                    # it can still be alive, so sweep before deciding this teardown
+                    # is done.
+                    pass
+                except OSError:
+                    pass
+            _signal_provider_descendants(records, sig)
+            if sig == platform_compat.SIGTERM:
+                deadline = time.monotonic() + _PROVIDER_TERM_GRACE_SECONDS
+                while True:
+                    # Deliberately NOT reaping here. A zombie owns its pid, and for a
+                    # group leader that pid IS the pgid, so reaping the root mid-grace
+                    # frees the number while the SIGKILL escalation below still aims
+                    # at it -- a pid recycled into a new group leader would take that
+                    # SIGKILL. The root's exit is read from its zombie state instead,
+                    # and it is reaped only once no further group signal can be sent.
+                    if _provider_tree_gone(pid, pgid, records):
+                        _reap_provider_root(pid, recorded_start, gated=pid_from_client)
+                        logger.warning(
+                            "_sync_kill_provider: killed PID %d for leaked provider "
+                            "(SIGTERM, scope=%s, descendants=%d)",
+                            pid,
+                            "pgid" if pgid is not None else "pid",
+                            len(records),
+                        )
+                        return
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(_PROVIDER_TERM_POLL_SECONDS)
+        _reap_provider_root(pid, recorded_start, gated=pid_from_client)
+        logger.warning(
+            "_sync_kill_provider: killed PID %d for leaked provider "
+            "(SIGKILL, scope=%s, descendants=%d)",
+            pid,
+            "pgid" if pgid is not None else "pid",
+            len(records),
         )
-        root_ok = root_verified and _root_identity_holds(pid, recorded_start, gated=pid_from_client)
-        if group_ok or root_ok:
-            try:
-                if group_ok:
-                    os.killpg(pgid, sig)  # type: ignore[arg-type]
-                elif pgid is None:
-                    platform_compat.kill_pid(pid, sig)
-                else:
-                    logger.warning(
-                        "_sync_kill_provider: pgid %d holds no verified member "
-                        "of pid %d's tree; signalling recorded descendants only",
-                        pgid,
-                        pid,
-                    )
-            except ProcessLookupError:
-                # The root (or its whole group) is gone. Descendants that escaped it
-                # can still be alive, so sweep before deciding this teardown is done.
-                pass
-            except OSError:
-                pass
-        _signal_provider_descendants(records, sig)
-        if sig == platform_compat.SIGTERM:
-            deadline = time.monotonic() + _PROVIDER_TERM_GRACE_SECONDS
-            while True:
-                # Deliberately NOT reaping here. A zombie owns its pid, and for a
-                # group leader that pid IS the pgid, so reaping the root mid-grace
-                # frees the number while the SIGKILL escalation below still aims
-                # at it -- a pid recycled into a new group leader would take that
-                # SIGKILL. The root's exit is read from its zombie state instead,
-                # and it is reaped only once no further group signal can be sent.
-                if _provider_tree_gone(pid, pgid, records):
-                    _reap_provider_root(pid, recorded_start, gated=pid_from_client)
-                    logger.warning(
-                        "_sync_kill_provider: killed PID %d for leaked provider "
-                        "(SIGTERM, scope=%s, descendants=%d)",
-                        pid,
-                        "pgid" if pgid is not None else "pid",
-                        len(records),
-                    )
-                    return
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(_PROVIDER_TERM_POLL_SECONDS)
-    _reap_provider_root(pid, recorded_start, gated=pid_from_client)
-    logger.warning(
-        "_sync_kill_provider: killed PID %d for leaked provider "
-        "(SIGKILL, scope=%s, descendants=%d)",
-        pid,
-        "pgid" if pgid is not None else "pid",
-        len(records),
-    )
+    finally:
+        # The grace's early return is inside this block, so the barrier is dropped
+        # here for every path out of the escalation. Left standing it would refuse
+        # this pid's tenancies for the life of the gateway -- the leak that made a
+        # reservation released at each early exit the wrong shape.
+        release_runtime_teardown(pid)
 
 
 def _tracked_child_has_runtime_identity(child_pid: int) -> bool:
@@ -2883,12 +2990,135 @@ def _untrack_session_pid(pid: int) -> bool:
         return _rewrite_pid_file(path, "\n".join(lines) + "\n" if lines else "")
 
 
+def _untrack_pid_if_dead(pid: int) -> bool:
+    """Remove *pid*'s bare ``kiro_pids.txt`` line only if the number is DEAD now.
+
+    The liveness probe runs INSIDE ``_pid_file_lock``, which is the lock
+    :func:`_track_pid` appends under, so at the moment of the probe the number's
+    holder is one of exactly two things. Either a successor already holds the
+    number and has appended its bare line -- it cannot be mid-append, because it
+    would need the lock this call holds -- in which case ``pid_exists`` is True
+    and the line is RETAINED; or the number's holder has not called
+    :func:`_track_pid` yet (or there is none), in which case a live holder still
+    answers the probe and the line is RETAINED, and a dead number does not and
+    the line is REMOVED. A retained bare line naming a LIVE successor is exactly
+    the line that successor's own ``_track_pid`` writes, so retaining is never
+    wrong, and the sweep prunes any bare line whose pid is dead within its tick.
+    ``pid_exists`` treats EPERM as alive: deny-by-default, the direction every
+    reaper in this module fails toward.
+
+    Returns whether the bare-line step is SETTLED: the line was removed, or it
+    was correctly retained for a live holder. A refused rewrite returns False.
+    """
+    with _pid_file_lock():
+        path = _pid_file_path()
+        if not path.exists():
+            return True
+        if platform_compat.pid_exists(pid):
+            return True
+        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = [ln for ln in lines if ln.strip() != str(pid)]
+        return _rewrite_pid_file(path, "\n".join(lines) + "\n" if lines else "")
+
+
+def _untrack_root_by_identity(pid: int, start_token: str | None) -> bool:
+    """Retire a root's registry lines only while they still name THAT process.
+
+    For the caller that learned of a death by OBSERVING it (the runtime reader
+    hitting EOF) rather than by causing it. A root that exited from outside has no
+    process left to re-check, so the number alone cannot say whose lines these
+    are: between the caller's liveness probe and this write the kernel can hand
+    the same number to a replacement root this gateway just tracked, and a
+    prefix-matched untrack would then erase the successor's only durable record.
+    The recorded start token is the identity the number lacks, so under
+    ``_session_pid_file_lock`` ONLY the line equal to
+    ``<gateway_pid>:<pid>:<start_token>`` is removed -- a line carrying a
+    different token is a successor's and is left alone, and a line with no token
+    cannot be proven ours and is left to the sweep. With no token to compare
+    (``None``) nothing is touched at all, which is the same deny-by-default every
+    reaper in this module fails toward.
+
+    The bare ``<pid>`` root line in ``kiro_pids.txt`` carries no identity, and a
+    successor handed the dead root's number may have no session line of its own
+    (:func:`_track_session_pid` dedups on the ``gw:pid`` prefix, so it returns
+    without writing while OUR line still stands). The session file therefore
+    cannot say whether the number has a new holder; the kernel can. The bare line
+    goes through :func:`_untrack_pid_if_dead`, which probes ``pid_exists`` inside
+    ``_pid_file_lock`` -- the lock ``_track_pid`` appends under -- and removes
+    the line only when the number is dead at that moment; a live holder keeps
+    it. The two per-file locks are taken in turn, never nested, and no lock
+    spans the pair: a successor's tracking may land between the two steps, and
+    then it finds its own bare line retained and its session line written by
+    itself, so neither ordering loses a live root.
+
+    Returns whether the retirement COMMITTED -- every write this call owed, not
+    merely the session one: the session rewrite landed AND the bare-line step
+    settled (removed, or retained for a live holder). The caller logs a full
+    retirement on a true answer (``acp/runtime.py``), so reporting the session
+    rewrite alone would claim a clean retirement while a stale bare root line
+    survives a refused ``kiro_pids.txt`` write; a refusal is not a commit. The
+    sweep does prune such a line within its tick, but a return value that
+    outruns the writes it reports is what the log then repeats.
+    """
+    if not start_token:
+        return False
+    ours = f"{os.getpid()}:{pid}:{start_token}"
+    with _session_pid_file_lock():
+        session_path = _session_pid_file_path()
+        if not session_path.exists():
+            return False
+        lines = session_path.read_text(encoding="utf-8").splitlines()
+        kept = [ln for ln in lines if ln.strip() != ours]
+        if len(kept) == len(lines):
+            return False
+        if not _rewrite_pid_file(session_path, "\n".join(kept) + "\n" if kept else ""):
+            return False
+    return _untrack_pid_if_dead(pid)
+
+
 # ── Sweep-protected PIDs ──────────────────────────────────────────────────
 # Live agent-process PIDs tracked in the PID file but NOT registered as
 # SessionMap sessions (e.g. app-managed worker pools / shared ACP runtimes).
 # The periodic orphan sweep consults _protected_pids() to avoid killing them.
-_PROTECTED_PIDS: set[int] = set()
+#
+# COUNTED, not listed. Several independent holders shield one pid -- an
+# app-managed worker pool, the knowledge LLM pool, a shared ACP runtime -- and
+# each pairs its own register with its own unregister. As a plain set the first
+# holder to leave tore the shield off a process the others were still using, and
+# the sweep then reaped a live runtime. A pid stays shielded until the LAST
+# holder drops it.
+_PROTECTED_PIDS: PidRefcount = PidRefcount()
 _PROTECTED_LOCK = threading.Lock()
+
+
+def _commit_teardown(pid: int, token: int) -> bool:
+    """Close *pid* to new tenants and answer whether the signal may be delivered.
+
+    The gate's verdict is computed before a start-id read, a group resolution and
+    an unbounded descendant walk, on a thread that does not own the tenancy table.
+    This is where that verdict is made current AND the window is shut: re-reading
+    before each signal, which this replaces, could only abandon the LATER SIGKILL,
+    because the SIGTERM was already out and its grace is by design long enough for a
+    shared turn to begin. A claim arriving in that grace would have been granted a
+    defence against a signal already delivered.
+
+    True obliges the caller to call :func:`release_runtime_teardown` on every exit
+    path; a barrier left standing refuses that pid's tenancies for the life of the
+    gateway.
+
+    Logged at WARNING when it declines, because an abandoned kill leaves a process
+    alive that a drain decided to end: the next drain revisits it, and until then
+    this line is the only record of why the teardown did not happen.
+    """
+    if commit_runtime_teardown(pid, token):
+        return True
+    logger.warning(
+        "_sync_kill_provider: ABANDONING the authorized kill of pid %d -- a tenant "
+        "claimed this process after the gate allowed it, so the signal would land "
+        "on a live turn; the next drain revisits it",
+        pid,
+    )
+    return False
 
 
 def register_protected_pid(pid: int) -> None:
@@ -2896,14 +3126,20 @@ def register_protected_pid(pid: int) -> None:
 
     For app-managed worker pools whose processes are tracked in the PID file but
     not registered as SessionMap sessions. Pair every call with
-    ``unregister_protected_pid`` on worker shutdown/replacement."""
+    ``unregister_protected_pid`` on worker shutdown/replacement -- the shield is
+    reference counted, so a second holder of the same pid takes its own
+    reference and an unpaired call leaks one."""
     if isinstance(pid, int) and pid > 0:
         with _PROTECTED_LOCK:
             _PROTECTED_PIDS.add(pid)
 
 
 def unregister_protected_pid(pid: int) -> None:
-    """Drop a PID from the sweep-protected set (worker shut down / replaced)."""
+    """Drop ONE reference on a sweep-protected PID (worker shut down / replaced).
+
+    The pid stops being shielded only when the last holder drops it, so a pool
+    that replaces one of several workers on a shared process does not expose the
+    process to the sweep."""
     with _PROTECTED_LOCK:
         _PROTECTED_PIDS.discard(pid)
 

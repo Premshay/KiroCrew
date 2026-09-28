@@ -440,7 +440,9 @@ without a new consent check; a stale cache is returned with its stale state when
 Cost Explorer consent is absent or a refresh fails. This keeps the Bill view
 available without misrepresenting a cached value as fresh.
 
-`backup.run_snapshot_backup` uploads a generated snapshot archive, and
+The backup engine's one import path is `backend.backup`, a facade over private owners
+in `backend.backup_parts`; "Backup composition and source ownership" below maps which
+owner holds each rule. `backup.run_snapshot_backup` uploads a generated snapshot archive, and
 `backup.run_sessions_backup` archives session material only when descriptor-based
 traversal pinning is available. `backup._authorize_upload` requires the app to
 remain enabled, the S3 grant to still name the target account, and shutdown not
@@ -906,7 +908,7 @@ earlier archive may hold conversations this one does not, since none of those st
 pinned from one run to the next. `delete_object_versions` erases versions outright, so
 the retired object has no recovery while the gap recovers on the next successful run. The
 suppression stops the DELETION and not the audit: a declined sweep still files its
-retention event, with the reason, because this is the one path in the module that erases
+retention event, with the reason, because this is the one path in the engine that erases
 object versions permanently and that function's contract is that every terminal outcome
 files one. That event is also what makes the accepted cost observable -- while such a
 state persists the archives accumulate past the keep count, and one event per run naming
@@ -1108,8 +1110,9 @@ contending WRITER, not through the upload: `_state_lock` took `_run_lock` before
 parking on the sidecar file lock, so a writer meeting an in-flight upload -- a
 mid-upload revocation, or any second account's `_record_run` finishing -- held
 `_run_lock` for the upload's whole duration and `last_runs` queued behind the
-writer. So the module has ONE acquisition order, stated in a comment above
-`_state_lock` and pointed at from `_run_lock`'s own definition:
+writer. So the engine has ONE acquisition order, stated in the lock-order note above
+`_state_lock` in `backup_parts/state.py` and pointed at from `_run_lock`'s own
+definition beside it:
 
     _RETENTION_GATE -> state sidecar FILE lock -> _run_lock -> leaf locks
 
@@ -1120,6 +1123,35 @@ the file lock first, and `_record_run` and `_record_skip` no longer wrap it in
 callers' outer hold was the only thing serialising it, and `(process, sequence)`
 is the identity the compare-and-set inside `mutate` reads, so a shared sequence
 would let a stale baseline pass a check it must fail.
+
+The in-lock failure handoff runs INSIDE that lock rather than after it. When a
+run's state update fails at ANY step taken after the sidecar lock is acquired --
+the read, the pending merge, `mutate`, or `write_state` -- `_record_run_locked`
+holds the completed upload's record in process memory (see below) via
+`_remember_unpersisted`. The upload happens BEFORE `_record_run` is called, so that
+completed-upload record exists whichever step raises, a read failure included:
+publishing over an unread document strands the run just as a failed write does.
+`_locked_state_update` releases the sidecar lock the instant any of those steps
+raises, so if that handoff ran from the outer except -- after the block released --
+a second run-record writer could take the sidecar lock in the gap, `_merge_pending`
+in nothing (the first run is not held yet), and persist only its own record; the
+first upload would then live in memory alone and be forgotten on restart, reopening
+the unattended re-upload. `_locked_state_update` takes an `on_in_lock_failure`
+callback and invokes it while the sidecar lock is still held, then re-raises, so the
+record is held before any other writer can read the state it is missing from -- no
+second lock, no serialization of the happy path (two same-kind runs still contend on
+the file lock and resolve by `(process, sequence)` supersession, and the status read
+stays non-blocking). The callback takes only `_unpersisted_lock`, a leaf below the
+two locks the block holds, so the acquisition order stands. It fires on any such
+failure and never on success. A failure to ACQUIRE the sidecar lock itself cannot
+run an in-lock callback. The outer handler still holds that record in process
+memory, preventing another upload while this process lives, but it cannot promise
+immediate disk convergence: a peer may already hold the sidecar lock and commit
+state that does not include this run, and no callback can execute under a lock this
+caller never acquired. A restart may therefore re-upload that archive, which is
+the fallback for an unavailable state lock. Only the UNCONDITIONAL run
+write passes the callback: the conditional (`expected`) path re-uploads a full copy
+on failure and remembers nothing.
 The sidecar lock is taken with a ceiling derived from that hold rather than
 `file_lock`'s 300s default, which is sized for a sub-second read plus a rename.
 A shorter ceiling would refuse a contender that is only waiting, and that refusal
@@ -1149,8 +1181,13 @@ different risk decisions and enabling one must not enable the other.
 A run's `at` is the observed UTC wall time, not a unique identifier or a
 monotonic clock. `process` (a random process token plus PID) and `sequence`
 distinguish and order this process's completed run records even when wall time
-ties or moves backwards. Recording and state updates share an in-process lock;
-the existing sidecar lock still serializes disk writes across processes.
+ties or moves backwards. The in-lock failure handoff -- when a completed upload's
+state update fails at any step after the sidecar lock is acquired (read, merge,
+`mutate`, or `write_state`), `_record_run_locked` holds the run in process memory
+via `_remember_unpersisted` -- runs INSIDE the sidecar lock (`_locked_state_update`'s
+`on_in_lock_failure` callback), so a second same-process record writer cannot read
+state in the window after a failed update releases the lock and before the run is
+held; the sidecar lock still serializes disk writes across processes.
 A newly recorded run unconditionally replaces its kind's prior state under the
 sidecar lock, including prior-process or legacy records with equal or later wall
 times. Only best-effort overlay/recovery comparisons use local sequence or the
@@ -1479,6 +1516,73 @@ that posture is right for the archive at all is a question about the archive,
 tracked on its own; the scheduler inherits whatever that path decides, because it
 is the same function. What scheduling adds is one consent bit that is strictly
 narrower than the owner-triggered route's gate, never wider.
+
+### Backup composition and source ownership
+
+`backend.backup` is the backup engine's only import path and its only patch surface.
+`routes.py`, `hooks.py` and the engine's tests reach it as `backup.X`, private helpers
+included; only the composition-contract test imports a part directly. The rules it
+composes live in the private package `backend.backup_parts`, one owner per
+responsibility, lowest layer first:
+
+| Owner | Holds |
+|---|---|
+| `backup_parts/egress_text.py` | `_redact_egress` and `sanitize_label`, the one redaction sequence for published labels, rendered foreign labels, recorded failure text and exported conversation rows |
+| `backup_parts/state.py` | `backup.json`, its reads and the read-for-update split, `_state_lock`, `_upload_lock`, `_locked_state_update`, the lock-order note, and the recovery overlay (`_unpersisted_runs`, `_merge_pending`, `_release_persisted_versions`); also the two facts a run record carries into the document (`_set_conversations_retained`, `a_retained_archive_carries_conversations`, `_clear_nightly_failure`) |
+| `backup_parts/identity.py` | `install_identity`, `set_install_label`, the key namespace (`KIND_SUBPATHS`, `KEY_SEP`, `_stamp`), `classify_key` and `UnprovenArchive` |
+| `backup_parts/fingerprints.py` | `_body_fingerprint`, `_tree_fingerprint`, `_manifest_digest` and `_is_provable_version_id` |
+| `backup_parts/traversal.py` | the descriptor-pinned descent `_add_pinned`, `_CAN_PIN_TRAVERSAL`, and `kind_unavailable_reason` |
+| `backup_parts/ledger.py` | `_record_run`, `_record_skip`, the run identity (`_run_process`, `_run_sequence`), and the projections `uploaded_objects`, `uploaded_versions`, `retention_owned_keys`, `last_runs`, `remembered_archives` |
+| `backup_parts/layer_b.py` | the Layer B grant and its scope marker, `set_sessions_layer_b`, and both Layer B audits |
+| `backup_parts/nightly.py` | the `nightly` and `nightly_sessions` grants, `_NIGHTLY_CONSENT_READERS`, the failure record and its witness, the backoff, and both due checks with `scheduled_sessions_blocked_code` |
+| `backup_parts/uploads.py` | `_authorize_upload`, `_refuse_upload`, `_authorize_recovery_read`, the teardown stop, and `_unchanged_baseline` |
+| `backup_parts/catalog.py` | `list_remote_backups`, `other_install_ids`, `_install_folders` and `read_remote_label` |
+| `backup_parts/retention.py` | the keep count and its writer, `_delete_under_the_retention_gate`, `_prune_remote_archives`, its audits and measurements |
+
+`backend/backup.py` keeps what those owners are composed into: both archive builders and
+every outbound archive and label PUT (`run_snapshot_backup`, `run_sessions_backup`,
+`_publish_label`), the terminal conversation export, the screened walk `_add_tree`, the
+staged restore with `_recover_recorded_version`, and the Job SDK runner
+`make_job_runner`. Two gates pin several of these to that file by path, so moving one
+is a change to the gate as well as to this spec: the link-screen baseline declares
+`_add_tree`, `_conversation_scratch_parent`, `_kiro_cli_conversation_db` and
+`restore_download` as sites of `backup.py`, and the redaction-sink registry names
+`backup.py` as the backup push boundary. The three owners whose text reaches the
+redaction call-site scan are registered as internal partitions behind that one boundary
+in `security_posture.NON_EGRESS_REDACTION_MODULES`, which adds no posture row:
+`egress_text` defines the sequence, `nightly` applies it to the failure text the status
+route serves (the scan matches its read of the outbound-redaction switch), and
+`retention` redacts its gate-side log lines and SEL audit text.
+
+A part imports only parts below it and never the facade, so the graph is acyclic and
+the facade is the one hop between a caller and an owner. `test_aws_control_backup_composition_contract.py`
+pins that order against the package on disk.
+
+A read through the facade answers with the object the owner holds. A name the facade's
+own functions use is bound in it by an ordinary import, as each part binds what it
+imports from a lower part. Every other name is not bound in the facade at all: the
+module-level `__getattr__` reads it from its first holder on each access, through
+`sys.modules`, and the parts that import it hold that same object. That lazily resolved
+half follows the one-storage rule `test_mirrored_owner_storage.py` enforces on any
+module of this shape -- owners are held as dotted names, never module objects -- and
+the names are declared to the type checker under `TYPE_CHECKING`, so a misspelled or
+mis-called `backup.X` stays a type error.
+
+A write through the facade -- `monkeypatch.setattr(backup, ...)`, `mock.patch.object`,
+shadowing a builtin -- reaches every module that holds the name, because a part
+resolves a name through its own globals and a patch that landed on the facade alone
+would leave the code under test running the unpatched object. So the engine keeps one
+namespace for writes, and a test patches the facade, never a part: a write into one part
+reaches no other holder. `mock.patch` undoes a name the facade does not bind by deleting
+it and writing the original back -- under `create=True` it only deletes -- and the delete
+reaches every holder, so such a patch never passes `create=True` and a thread started
+inside it is joined before the patch ends. The contract test pins
+that every module holding a name holds the same object, that a write, a delete and
+their undo reach all of them, that every name in its frozen inventory resolves, that a
+star import carries exactly the inventory's public names, and that `_run_sequence`, the
+one name an owner rebinds through `global`, is read live from `ledger`. Every part logs
+through the facade's logger name, and each lock object has one identity, so log routing
+and the lock order above hold across the parts.
 
 ## Dashboard surface
 

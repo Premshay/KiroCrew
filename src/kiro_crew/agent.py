@@ -59,6 +59,7 @@ from kiro_crew.agent_files import (
 from kiro_crew.agent_files import CONDUCTOR_AGENT_FILENAME as _CONDUCTOR_AGENT_FILENAME
 from kiro_crew.agent_files import CONSOLIDATE_AGENT_FILENAME as _CONSOLIDATE_AGENT_FILENAME
 from kiro_crew.agent_files import FAST_RECON_AGENT_FILENAME as _FAST_RECON_AGENT_FILENAME
+from kiro_crew.agent_files import GUEST_AGENT_FILENAME as _GUEST_AGENT_FILENAME
 from kiro_crew.agent_files import HEARTBEAT_AGENT_FILENAME as _HEARTBEAT_AGENT_FILENAME
 from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_FILENAME
 from kiro_crew.agent_files import (
@@ -151,7 +152,7 @@ from kiro_crew.sel import (  # circular import: sel imports config which imports
     SecurityEvent,
     sel,
 )
-from kiro_crew.validation import _AGENT_NAME_RE
+from kiro_crew.validation import is_registered_agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -1863,9 +1864,9 @@ def _all_skill_paths() -> list[str]:
                     current_event = ""
                     if manifest.is_file():
                         try:
-                            current_event = json.loads(manifest.read_text(encoding="utf-8")).get(
-                                "currentEventId", ""
-                            )
+                            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+                            if isinstance(manifest_data, dict):
+                                current_event = manifest_data.get("currentEventId", "")
                         except (json.JSONDecodeError, OSError):
                             pass
                     for sub in pkg.iterdir():
@@ -4507,14 +4508,9 @@ def agent_spec_path(name: str, *, agents_dir: Path | None = None) -> Path | None
     resolution, and every writer that receives one refuses rather than
     serializing JSON over a markdown file.
 
-    *name* is validated against the shared agent-name grammar BEFORE it reaches
-    the path join, so a caller passing a traversal (``../../something``) gets
-    ``None`` rather than a path outside the agents directory. The check lives
-    here, at the resolver, so every caller inherits it instead of each one
-    remembering: this function returns a path that :func:`reset_agent_model`
-    then WRITES, and the CLI takes the name from a user-supplied ``--agent``.
-    A symlinked or otherwise unsafe candidate is refused for the same reason --
-    see :func:`_spec_path_is_safe`.
+    A malformed or path-shaped *name* returns ``None``, so a traversal such as
+    ``../../something`` cannot escape the agents directory. Symlinked and other
+    unsafe candidates are also refused; see :func:`_spec_path_is_safe`.
 
     A DECLARED ``name`` wins over a matching filename, which is the order the
     other two resolvers already use (``_resolve_named_agent_model`` and the
@@ -4529,7 +4525,7 @@ def agent_spec_path(name: str, *, agents_dir: Path | None = None) -> Path | None
     iterates the directory unordered, so which of them is live is undefined, and
     a writer cannot pick without risking clearing the pin nothing is reading.
     """
-    if not _AGENT_NAME_RE.match(name or ""):
+    if not is_registered_agent_name(name):
         return None
     agents_dir = agents_dir if agents_dir is not None else kiro_agents_dir_path()
     if not agents_dir.is_dir():
@@ -7773,6 +7769,47 @@ def _install_aim_capabilities() -> None:
     still written.
     """
     _install_lite_agent_fallback()
+    _install_guest_agent()
+
+
+#: What a non-operator channel sender's agent is told. Conversational, because a
+#: human is on the other end; explicit about having no tools, because the spec
+#: mounts none and the model should not promise to act.
+GUEST_AGENT_PROMPT = (
+    "You are answering a guest: a person the operator allowed to message this "
+    "account, not the operator. Reply to what they ask, briefly and helpfully, "
+    "from the conversation alone. You have no tools: you cannot run commands, read "
+    "or write files, browse, or act on anything, so never claim to have done so. "
+    "If a request needs any of that, say the account owner has to do it."
+)
+
+
+def _install_guest_agent() -> None:
+    """Write the tool-less ``kirocrew-guest`` config a non-operator sender talks to.
+
+    Separate from ``kirocrew-lite`` on purpose: the lite agent is the background
+    helper (titles, extraction) and may one day need a tool; this one is a trust
+    boundary and never may. Same model as the operator's chat so an admitted
+    sender gets an ordinary answer, never a background worker's minimal default.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    try:
+        model = KiroCrewConfig.load().agent.model or "auto"
+    except Exception:
+        model = "auto"
+    guest_path = kiro_agents_dir_path() / _GUEST_AGENT_FILENAME
+    guest_config = {
+        "name": "kirocrew-guest",
+        "model": model,
+        "tools": [],
+        "mcpServers": {},
+        # Pinned: kiro-cli defaults this to True and would spawn every server in
+        # the user-level mcp.json for a session that must mount nothing.
+        "includeMcpJson": False,
+        "prompt": GUEST_AGENT_PROMPT,
+    }
+    _atomic_json_write(guest_path, guest_config)
 
 
 def _install_lite_agent_fallback() -> None:
@@ -8021,7 +8058,8 @@ it.
 
 Arm a loop on your own session with `monitor_start`, carrying the cycle
 instructions AND the exit condition, then end the turn. A reply saying
-*requested* is success — do not retry it. If arming is refused outright, say no
+*requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If arming is refused outright, say no
 loop is running and drive that one round with `wait`. Call `autonudge_stop` when
 you stop. (The loop is on a timer today. When `monitor_start` accepts a
 `watch: "work-ledger"` field, gate on that instead and the quiet cycles stop
@@ -8204,6 +8242,10 @@ handle immediately.
 #:   goes to ``/api/chat/slots/<target>/tags`` where the target is the session
 #:   named in the ARGUMENTS — the same shape as ``chat_folder_move_session``.
 #:   Ingested content could re-label any persistent same-workspace session.
+#: * ``chat_session_pin`` — WITHHELD. Writes another session's ``pinned`` flag:
+#:   the PATCH goes to ``/api/chat/slots/<target>/pin`` where the target is the
+#:   session named in the ARGUMENTS, the same shape as ``chat_tag_assign``, and
+#:   no conductor step needs it.
 #: * ``session_send`` — WITHHELD. Runs text as another session's user-role turn
 #:   under that target's own grants. The server-side gates bound WHICH target is
 #:   reachable; nothing bounds WHAT is sent.
@@ -9203,7 +9245,8 @@ in that case.
 
 **Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
 instructions AND the exit condition, then end the turn; call `autonudge_stop`
-when you stop. A reply saying *requested* is success — do not retry it. If
+when you stop. A reply saying *requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If
 arming is refused outright, say no loop is running and drive that one round
 with `wait`. A quiet cycle is one line, then end the turn.
 
@@ -10157,7 +10200,8 @@ gate is the correct state; assuming its answer is not.
 
 **Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
 instructions AND the exit condition, then end the turn; call `autonudge_stop`
-when you stop. A reply saying *requested* is success — do not retry it. If
+when you stop. A reply saying *requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If
 arming is refused outright, say no loop is running and drive that one round
 with `wait`. A quiet cycle is one line, then end the turn.
 

@@ -21,6 +21,9 @@ AGENT_FILENAME = "kirocrew.json"
 
 # Background/auxiliary managed agent specs KiroCrew writes under ~/.kiro/agents/.
 LITE_AGENT_FILENAME = "kirocrew-lite.json"
+# The tool-less agent a non-operator channel sender talks to. Its own file so the
+# background helper (lite) may grow a tool one day without handing it to a guest.
+GUEST_AGENT_FILENAME = "kirocrew-guest.json"
 CONDUCTOR_AGENT_FILENAME = "kirocrew-conductor.json"
 PIPELINE_CONDUCTOR_AGENT_FILENAME = "kirocrew-pipeline-conductor.json"
 # The goal conductor's work-ledger variant, and a SEPARATE spec rather than a flag
@@ -53,6 +56,7 @@ CONSOLIDATE_AGENT_FILENAME = "kirocrew-consolidate.json"
 OWNED_KIRO_AGENT_FILES = (
     AGENT_FILENAME,
     LITE_AGENT_FILENAME,
+    GUEST_AGENT_FILENAME,
     CONDUCTOR_AGENT_FILENAME,
     PIPELINE_CONDUCTOR_AGENT_FILENAME,
     LEDGER_CONDUCTOR_AGENT_FILENAME,

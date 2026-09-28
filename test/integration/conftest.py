@@ -122,6 +122,17 @@ cross-home flake three tests later.
    * ``crew_log.emit`` caches and its shutdown-drain flag -- the real exit
      path drains the session log and marks the writer as draining for
      shutdown, which would keep the next boot's writer from starting.
+   * ``sandbox._SHIM_ARGV_CACHE`` -- the spawn shim's resolved argv, derived
+     from the boot's config and home.
+   * ``browser_cli.launch._warned_lifecycle_losses`` -- the warn-once set for
+     browser-socket lifecycle losses; carried across boots it would silence
+     the second boot's first diagnostic.
+   * ``sandbox`` cgroup-counter baselines (``_SLICE_THROTTLE_PROBE_SEEN``,
+     ``_SLICE_THROTTLE_EDGE_AT``, ``_SLICE_MEMHIGH_EVENTS_SEEN``,
+     ``_SLICE_OOM_SEEN``) -- each is "seeded from the first read in this
+     process", and a fresh process has none; a baseline carried across boots
+     would let the second boot read the first one's counter climb as a live
+     throttle episode.
 
 2. **Snapshot and restore** around the boot by ``booted_gateway``, on every
    exit: the SIGINT/SIGTERM handlers ``run()`` installs; the event loop's
@@ -188,6 +199,7 @@ import faulthandler
 import json
 import os
 import re
+import secrets
 import signal
 import time
 from contextlib import asynccontextmanager
@@ -204,8 +216,10 @@ from kiro_crew import (
     embeddings,
     memory_startup,
     safety_override,
+    sandbox,
     shutdown_event,
 )
+from kiro_crew.browser_cli import launch as browser_launch
 from kiro_crew.config import live as config_live
 from kiro_crew.config.loader import CREDENTIAL_KEYS
 from kiro_crew.crew_log import emit as crew_log_emit
@@ -427,7 +441,15 @@ def _path_matches(canonical: str, concrete: str) -> bool:
     return re.fullmatch(pattern, concrete) is not None
 
 
-def _record_registered_routes(app: Any) -> None:
+def registered_routes(app: Any) -> frozenset[tuple[str, str]]:
+    """Every ``(METHOD, canonical path)`` the live router serves.
+
+    The same reading the coverage metric is measured against, so a test that
+    sweeps "every route of a kind" and the ratchet that counts it agree on what
+    a route is: static prefix mounts carry no path and are not routes; HEAD and
+    OPTIONS are aiohttp's own and not contracts of this layer.
+    """
+    routes: set[tuple[str, str]] = set()
     for resource in app.router.resources():
         canonical = _canonical_path(resource)
         if not canonical:
@@ -435,7 +457,12 @@ def _record_registered_routes(app: Any) -> None:
         for route in resource:
             if route.method in ("HEAD", "OPTIONS"):
                 continue
-            _REGISTERED_ROUTES.add((route.method, canonical))
+            routes.add((route.method, canonical))
+    return frozenset(routes)
+
+
+def _record_registered_routes(app: Any) -> None:
+    _REGISTERED_ROUTES.update(registered_routes(app))
 
 
 @dataclass
@@ -453,6 +480,7 @@ class IntegrationGateway:
     _client: ClientSession
     _boot_secs: float
     _tasks_before: frozenset["asyncio.Task[Any]"]
+    _cookie: str = ""
 
     @property
     def base_url(self) -> str:
@@ -468,6 +496,10 @@ class IntegrationGateway:
         """The real ``web.Application`` the orchestrator built."""
         runner = self.orchestrator._dashboard_runner
         return runner.app if runner is not None else None
+
+    def registered_routes(self) -> frozenset[tuple[str, str]]:
+        """``(METHOD, canonical path)`` for every route this boot serves."""
+        return registered_routes(self.app)
 
     def _note_hit(self, method: str, path: str) -> None:
         # "Hit" means REQUESTED, whatever the status came back: the metric
@@ -498,13 +530,19 @@ class IntegrationGateway:
     ) -> Any:
         """One HTTP request against the live gateway. Returns the response.
 
-        ``auth=True`` (default) sends the boot token as ``?token=``; pass
-        ``auth=False`` to prove the 401/403 side of a contract.
+        ``auth=True`` (default) sends the dashboard session cookie ``_boot``
+        minted from the boot token; pass ``auth=False`` to prove the 401/403
+        side of a contract. The cookie, not ``?token=``: the link token is a
+        one-use nonce that the ``mixed_internal`` routes (``/api/chat/slots``
+        among them) refuse once any ordinary route has minted the cookie, and
+        aiohttp's jar does not keep cookies set by an IP host, so the harness
+        carries it as a header the way the E2E ``_Client`` carries its jar.
         """
         url = f"{self.base_url}{path}"
         params = dict(kwargs.pop("params", {}) or {})
+        headers = dict(headers or {})
         if auth:
-            params["token"] = self.token
+            headers["Cookie"] = self._cookie
         self._note_hit(method.upper(), path.split("?", 1)[0])
         return await self._client.request(
             method,
@@ -530,6 +568,26 @@ class IntegrationGateway:
 
     async def delete(self, path: str, **kw: Any) -> Any:
         return await self.request("DELETE", path, **kw)
+
+    def mcp_headers(self, session_key: str) -> dict[str, str]:
+        """The headers a managed MCP server sends on the session's behalf.
+
+        The launcher's half of the session-token handshake, done in-process:
+        mint a token, publish its signed ``token -> session_key`` record the way
+        ``session/new`` does, and hand back the three headers the internal
+        routes authenticate on (``X-Internal-Secret`` proves the loopback
+        process, ``X-Session-Token`` attests the ``X-Session-Key``). Use with
+        ``auth=False``: these routes are for processes, not the dashboard user.
+        """
+        from kiro_crew.session_token_sig import publish_session_token
+
+        token = secrets.token_hex(16)
+        publish_session_token(token, session_key)
+        return {
+            "X-Internal-Secret": self.app["local_secret"],
+            "X-Session-Key": session_key,
+            "X-Session-Token": token,
+        }
 
     async def get_json(self, path: str, *, expect: int = 200, **kw: Any) -> Any:
         resp = await self.get(path, **kw)
@@ -571,6 +629,7 @@ class IntegrationGateway:
         self.token = fresh.token
         self._run_task = fresh._run_task
         self._client = fresh._client
+        self._cookie = fresh._cookie
         self._tasks_before = fresh._tasks_before
         return self
 
@@ -646,6 +705,12 @@ def _reset_home_bound_globals() -> None:
     embeddings.reset_shared_embedder()
     embeddings.reset_download_manager()
     crew_log_emit.reset_caches()
+    sandbox._SLICE_THROTTLE_PROBE_SEEN = None
+    sandbox._SLICE_THROTTLE_EDGE_AT = None
+    sandbox._SLICE_MEMHIGH_EVENTS_SEEN = None
+    sandbox._SLICE_OOM_SEEN = None
+    sandbox._SHIM_ARGV_CACHE.clear()
+    browser_launch._warned_lifecycle_losses.clear()
     live_nudge = autonudge._INSTANCE
     if live_nudge is not None:
         with contextlib.suppress(Exception):
@@ -666,6 +731,10 @@ def home_bound_globals_are_clear() -> bool:
         and safety_override._singleton is None
         and embeddings._shared_embedder is None
         and embeddings._download_manager is None
+        and sandbox._SLICE_THROTTLE_PROBE_SEEN is None
+        and sandbox._SLICE_THROTTLE_EDGE_AT is None
+        and not sandbox._SHIM_ARGV_CACHE
+        and not browser_launch._warned_lifecycle_losses
     )
 
 
@@ -863,6 +932,24 @@ async def _boot(home: Path, *, boot_secs: float) -> IntegrationGateway:
     )
     if handle.app is not None:
         _record_registered_routes(handle.app)
+    try:
+        async with client.get(
+            f"{handle.base_url}/api/status",
+            params={"token": handle.token},
+            timeout=ClientTimeout(total=10),
+        ) as resp:
+            set_cookie = resp.headers.get("Set-Cookie", "")
+            if resp.status != 200 or not set_cookie.startswith("mc_token_"):
+                raise RuntimeError(
+                    f"boot token did not mint a session cookie: {resp.status} {set_cookie[:60]!r}"
+                )
+            handle._cookie = set_cookie.split(";", 1)[0]
+            # Every boot exercises this route; count it like any other request.
+            handle._note_hit("GET", "/api/status")
+    except BaseException:
+        await client.close()
+        await _teardown_boot(orchestrator, run_task, tasks_before)
+        raise
     return handle
 
 
@@ -913,7 +1000,9 @@ async def booted_gateway(
 
 
 @pytest.fixture
-def integration_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def integration_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unpinned_agent_spec_home: Any
+) -> Path:
     """A fresh, isolated ``KIROCREW_HOME`` with the fake model wired in.
 
     Mirrors ``kiro_crew.testing.harness.spawn_feature_gateway``'s environment
@@ -926,8 +1015,31 @@ def integration_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # Isolate the agent-spec home too: boot rewrites managed MCP specs under
     # ``kiro_agents_dir()``, which must never be the operator's ``~/.kiro/agents``.
     monkeypatch.setenv("KIRO_HOME", str(home / "kiro"))
+    # ``unpinned_agent_spec_home`` (rootdir conftest) is requested above: the
+    # rootdir pins the WRITE side of the agent-spec seam (the ``KIRO_AGENTS_DIR``
+    # hooks) to its own per-test directory while the READ side
+    # (``config.paths.kiro_agents_dir``) follows ``KIRO_HOME``, so under the pin
+    # the boot writes ``kirocrew.json`` where no request will read it. That
+    # fixture releases the pin; with ``KIRO_HOME`` set above, both sides resolve
+    # to ``<home>/kiro/agents`` -- the private target the shared-home write guard
+    # exempts -- so its "read-only use" caveat (writes would reach the operator's
+    # live agents) does not apply here.
     monkeypatch.setenv("KIROCREW_KIRO_BIN", str(fake_acp_backend.__file__))
     monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    # Unsandboxed consent, for THIS disposable home only, written as the operator
+    # would write it. The agent binary is the fake above -- a stdlib echo stub --
+    # so OS isolation guards nothing this layer asserts, and the CI container
+    # refuses ``unshare(CLONE_NEWUSER)`` at the runtime policy level, which no
+    # sysctl can lift. Without it every spawn (a chat turn, ``--list-models``,
+    # the sandboxed ``aws configure list-profiles``) fails with a sandbox
+    # refusal instead of running the stub. The E2E suite grants the same
+    # consent for the same reason; a sandboxed spawn doing real work stays
+    # proven by the ``e2e-private-namespace`` and ``e2e-boot-matrix`` lanes.
+    # A test that pins more config merges into this file rather than replacing
+    # it, or the consent goes with it.
+    (home / "config.local.json").write_text(
+        json.dumps({"agent": {"sandbox_allow_unsandboxed_exec": True}}), encoding="utf-8"
+    )
     # Strict on-loop persistence, set HERE rather than in the CI job's env: the
     # rootdir conftest deletes this name before every test body, so a job-level
     # value never reaches the boot. Set per test it makes an on-loop store write
@@ -937,6 +1049,23 @@ def integration_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # No channel credential may reach the boot (module docstring, "The boot
     # reaches no real channel"): the orchestrator would open the transport.
     for key in CREDENTIAL_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    # Nor the operator's AWS identity: the cloud routes shell the real ``aws``
+    # CLI, which reads ``~/.aws`` (env-var credentials are not supported there),
+    # so a sweep that reaches ``/api/cloud/preflight`` on a developer machine
+    # with a default profile would exercise their account. Both files the CLI
+    # reads are pointed at paths that do not exist under this home, and the
+    # profile selectors are dropped, so every ``aws`` call fails to resolve
+    # credentials before it reaches the network.
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(home / "no-aws" / "config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(home / "no-aws" / "credentials"))
+    for key in (
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    ):
         monkeypatch.delenv(key, raising=False)
     return home
 

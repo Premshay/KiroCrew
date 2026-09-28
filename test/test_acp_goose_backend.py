@@ -145,6 +145,8 @@ def _stub(backend: str = GOOSE) -> AcpClient:
     client._acp_backend = backend
     client._available_mode_ids = []
     client._modes_advertised = False
+    client._session_key = ""
+    client._agent = ""
     return client
 
 
@@ -1490,7 +1492,10 @@ def test_a_classified_goose_call_is_still_approved_without_a_deny_set() -> None:
 
 
 def test_a_harness_outside_the_set_builds_nothing_without_a_deny_set() -> None:
-    """Every other backend keeps the prior site byte for byte: no event, plain approve."""
+    """Every other backend keeps the prior answer: a plain approve, no option ids.
+
+    The event is built for the approval floor alone; nothing it advertised is
+    recorded, so the answer this site sends is the one it always sent."""
     import asyncio
 
     from kiro_crew.acp.types import JsonRpcMessage
@@ -1502,15 +1507,24 @@ def test_a_harness_outside_the_set_builds_nothing_without_a_deny_set() -> None:
     async def _approve(request_id: str) -> None:
         approved.append(request_id)
 
-    def _never_build(_msg):  # pragma: no cover - must not run
-        raise AssertionError("no event is built on a session that judges nothing")
+    built: list = []
+    client._permission_options = {}
+
+    def _build(msg):
+        from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+
+        built.append(msg.id)
+        client._permission_options[msg.id] = {"once": "allow"}
+        return AcpEvent(kind=EVENT_PERMISSION_REQUEST, request_id=msg.id)
 
     client.approve_tool = _approve  # type: ignore[method-assign]
-    client._build_permission_event = _never_build  # type: ignore[method-assign]
+    client._build_permission_event = _build  # type: ignore[method-assign]
 
     msg = JsonRpcMessage(id="perm-c", method="session/request_permission", params={})
     asyncio.run(client._handle_permission(msg))
     assert approved == ["perm-c"]
+    assert built == ["perm-c"], "the approval floor needs the event"
+    assert "perm-c" not in client._permission_options
 
 
 def test_the_drift_refusals_run_on_both_answering_sites() -> None:
@@ -1524,3 +1538,152 @@ def test_the_drift_refusals_run_on_both_answering_sites() -> None:
     stream = inspect.getsource(AcpClient.send_message_stream)
     assert "if self._judges_permission_requests:" in stream
     assert "self._extract_tool_event(msg)" in stream
+
+
+# ── An unconfigured harness: the declared message, and no retry ──
+
+#: The ``session/new`` error goose 1.50.1 and 1.52.0 return when no provider is
+#: configured, copied off the live wire (``goose acp``, empty config home).
+_GOOSE_NO_PROVIDER_ERROR = {
+    "code": -32603,
+    "message": "Internal error",
+    "data": "Failed to resolve provider: Configuration value not found: GOOSE_PROVIDER",
+}
+
+
+def _startup_client(backend: str, spawns: list[int]) -> AcpClient:
+    """A client whose every ``session/new`` answers the live no-provider error.
+
+    Shaped the way ``_send_request`` raises it, so the startup ladder sees the same
+    ``AcpError`` text a real goose child produces.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kiro_crew.acp.client import AcpError
+
+    client = AcpClient(acp_backend=backend)
+    client._process = None
+    client._session_id = None
+    client._kill_process = AsyncMock()
+    client._cleanup_failed_live_spawn = AsyncMock()
+    client._snapshot_process_tree = AsyncMock()
+
+    def _reset():
+        # The real reset drops the process handle, which is what makes the next
+        # pass spawn again; without it a retry would silently be a no-op.
+        client._process = None
+        client._session_id = None
+
+    client._reset_state = _reset
+
+    async def _spawn():
+        spawns.append(1)
+        client._process = MagicMock()
+        client._process.returncode = None
+
+    async def _session_new():
+        raise AcpError(f"JSON-RPC error: {_GOOSE_NO_PROVIDER_ERROR}")
+
+    client._spawn = _spawn
+    client._initialize_session = _session_new
+    return client
+
+
+def test_an_unconfigured_goose_names_the_fix_and_is_not_retried() -> None:
+    import asyncio
+
+    from kiro_crew.acp.client import AcpAuthRequired, AcpError
+    from kiro_crew.agent_sdk import host_auth
+
+    spawns: list[int] = []
+    client = _startup_client(GOOSE, spawns)
+    with pytest.raises(AcpError) as info:
+        asyncio.run(client.ensure_ready())
+    assert str(info.value) == host_auth.signed_out_message(GOOSE)
+    # One spawn: a fresh process reads the same missing provider.
+    assert spawns == [1]
+    assert info.value.transient is False
+    # Not the Kiro sign-in type: the dashboard would mark a valid kiro-cli login
+    # as signed out over a goose setup gap.
+    assert not isinstance(info.value, AcpAuthRequired)
+    assert info.value.auth_required is False
+
+
+def test_the_goose_phrase_does_not_classify_another_harness() -> None:
+    """Scoped per harness: kiro-cli meeting the same words keeps its retry."""
+    import asyncio
+
+    from kiro_crew.acp.client import AcpAuthRequired, AcpError
+
+    spawns: list[int] = []
+    client = _startup_client(acp_backends.ACP_BACKEND_KIRO, spawns)
+    with pytest.raises(AcpError) as info:
+        asyncio.run(client.ensure_ready())
+    assert not isinstance(info.value, AcpAuthRequired)
+    assert spawns == [1, 1]
+
+
+def test_a_cancel_answers_the_open_permission_request_as_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACP: after ``session/cancel`` the client answers every open permission request.
+
+    goose holds a cancelled turn open until its permission request is answered, so a
+    Stop from a surface that did not reject the open approval first waited out the
+    whole ack budget and hard-killed the process. The frame is the live capture's own.
+    """
+    import asyncio
+    import threading
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kiro_crew.acp.types import JsonRpcMessage
+
+    frame = next(
+        json.loads(line)
+        for line in (CORPUS / "turn-live.jsonl").read_text(encoding="utf-8").splitlines()
+        if '"session/request_permission"' in line
+    )
+    audited: list[dict] = []
+    recorder = MagicMock()
+    recorder.log_tool_invocation = lambda **kw: audited.append(kw)
+    resolved_on: list[object] = []
+
+    def _sel() -> MagicMock:
+        # An unwarmed sel() initialises on the calling thread, so it must be
+        # resolved inside the off-loop hop, never on the event loop.
+        resolved_on.append(threading.current_thread())
+        return recorder
+
+    monkeypatch.setattr(acp_client.sel_module, "sel", _sel)
+    client = AcpClient(work_dir=tmp_path, acp_backend=GOOSE)
+    proc = MagicMock()
+    proc.returncode = None
+    proc.stdin.drain = AsyncMock()
+    client._process = proc
+    client._session_id = frame["params"]["sessionId"]
+    client._build_permission_event(
+        JsonRpcMessage(id=frame["id"], method=frame["method"], params=frame["params"])
+    )
+
+    asyncio.run(client.cancel_session())
+
+    # The cancelled approval is a denial Crew made, so it is audited like one.
+    assert [(a["outcome"], a["request_id"]) for a in audited] == [
+        ("rejected_on_cancel", frame["id"])
+    ]
+    assert resolved_on and threading.main_thread() not in resolved_on
+
+    written = [
+        json.loads(line)
+        for call in proc.stdin.write.call_args_list
+        for line in call.args[0].decode().splitlines()
+    ]
+    assert [w.get("method") for w in written] == ["session/cancel", None]
+    assert written[1] == {
+        "jsonrpc": "2.0",
+        "id": frame["id"],
+        "result": {"outcome": {"outcome": "cancelled"}},
+    }
+    # Answered once: a second cancel has nothing left to answer.
+    asyncio.run(client.cancel_session())
+    assert len(proc.stdin.write.call_args_list) == len(written) + 1

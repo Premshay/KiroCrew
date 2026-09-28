@@ -137,12 +137,14 @@ from kiro_crew.dashboard.handlers.agent_templates import (
     read_only_reason_for_path,
     validate_definition_patch,
 )
-from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
+from kiro_crew.external_text import redact_external_text as _redact_external
+from kiro_crew.kiro_prerequisite import spawn_supervised_oneshot
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.members import MemberNameError, validate_member_name
 from kiro_crew.memory_stores import (
     DEFAULT_MEMORY_STORE,
     MemberAlreadyExists,
@@ -154,16 +156,15 @@ from kiro_crew.memory_stores import (
     retire_unpublished_allocation,
 )
 from kiro_crew.platform.governance import sanitize_agent_config_governance
-from kiro_crew.platform_compat import is_link_or_junction
+from kiro_crew.platform_compat import is_link_or_junction, kill_and_reap
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     cgroup_scope_argv,
     configured_sandbox_mode,
-    create_subprocess_limited,
     scrub_agent_subprocess_env,
     wrap_argv,
 )
-from kiro_crew.validation import _AGENT_NAME_RE
+from kiro_crew.validation import TEMPLATE_NAME_RE
 
 _MODEL_LIST_STDERR_TAIL_CHARS = 1000
 _MODEL_DISCOVERY_CACHE_TTL_SECS = 30.0
@@ -2415,11 +2416,15 @@ async def api_models(request: web.Request) -> web.Response:
             # the protected .env read off the gateway loop.
             await asyncio.to_thread(inject_kiro_cli_api_key, env)
             env = scrub_agent_subprocess_env(env)
-            proc = await create_subprocess_limited(
-                *argv,
+            # Supervised so the call ends whatever it leaves behind. A kiro-cli
+            # launcher wrapper can start a ~140-thread credential helper for each
+            # call and leave it running; this endpoint re-polls every 8s while
+            # degraded, so on a gateway on that path every poll leaked one until
+            # the agent cgroup ran out of pids.
+            proc = await spawn_supervised_oneshot(
+                argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                start_new_session=True,
                 env=env,
             )
             try:
@@ -2427,11 +2432,9 @@ async def api_models(request: web.Request) -> web.Response:
                     proc.communicate(), timeout=_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS
                 )
             except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.communicate()
+                # The whole group, while the supervisor still leads it: killing
+                # only the leader would leave the command and its helpers running.
+                await kill_and_reap(proc)
                 # A cold CLI spawn exceeded the timeout. This is the common
                 # cause of the "picker is empty until I refresh" symptom: a
                 # slow first `--list-models` spawn returning [] (HTTP 200) would
@@ -2703,11 +2706,6 @@ async def api_slash_commands(request: web.Request) -> web.Response:
         ]
     )
 
-
-# A published template's filename is its permanent identity (no rename), so the
-# name is validated up front. Same charset the fork sanitizer produces, plus a
-# length cap that keeps the filename portable.
-_TEMPLATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 
 # Windows reserves these basenames (before the first dot, any extension) at the
 # filesystem level: creating CON.json raises, and some transports mangle them.
@@ -3282,7 +3280,7 @@ async def api_agent_publish(request: web.Request) -> web.Response:
     new_name = body.get("name")
     if not isinstance(crew, str) or not crew.strip():
         return web.json_response({"error": "crew is required", "code": "crew_required"}, status=400)
-    if not isinstance(new_name, str) or not _TEMPLATE_NAME_RE.match(new_name.strip()):
+    if not isinstance(new_name, str) or not TEMPLATE_NAME_RE.fullmatch(new_name.strip()):
         return web.json_response(
             {
                 "error": "name must be 1-63 letters, digits, dots, dashes or underscores",
@@ -5048,13 +5046,41 @@ def _cached_agent_advertised_ids(request: web.Request, name: str) -> list[str] |
     return advertised_model_ids(cached[1].get("models", []))
 
 
+def _pin_entitlement_backend(cfg: Any) -> str:
+    """The harness whose live catalog may judge a crew's model pin.
+
+    Every agent created or updated here is a Crew Member whose DM slot
+    (``member-<slug>``) routes through ``agent.member_acp_backend`` — not
+    through the configured default harness ``agent.acp_backend``. When the two
+    share a model-registry namespace, the default backend scopes the
+    entitlement evidence correctly (kiro, including the empty default backend,
+    and kas share ``acp``). When they do not, the default's catalog cannot
+    establish whether the pin the DM thread will actually run is usable — a
+    live kiro session's catalog would deterministically reject a
+    claude-advertised id — so the evidence must come from the harness the DM
+    thread will ACTUALLY run on, which is ``member_backend``. Returning it (not
+    ``None``) keeps the scope on the member's own namespace: a provider from an
+    unrelated harness can neither admit nor reject the pin, and when no member
+    -namespace provider is live the catalog is simply unknown (fail-open) rather
+    than judged by the wrong backend's advertised ids.
+    """
+    default_backend = getattr(cfg.agent, "acp_backend", "")
+    member_backend = getattr(cfg.agent, "member_acp_backend", "")
+    if (
+        capabilities_for(member_backend).model_id_namespace
+        != capabilities_for(default_backend).model_id_namespace
+    ):
+        return member_backend
+    return default_backend
+
+
 def _model_pin_rejected(
     model: str,
     request: web.Request,
     provider: str,
     *,
     advertised_ids: list[str] | None = None,
-    use_active_advertised_ids: bool = True,
+    backend: str | None = None,
 ) -> str | None:
     """Reason a crew's model pin is unusable, or ``None`` to allow it.
 
@@ -5111,11 +5137,8 @@ def _model_pin_rejected(
     from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
     from kiro_crew.dashboard.handlers.core import _validate_role_model
 
-    if advertised_ids is None and not use_active_advertised_ids:
-        return _model_rejected_reason(model, provider=provider)
-
     if advertised_ids is None:
-        return _validate_role_model(model, request, provider=provider)
+        return _validate_role_model(model, request, provider=provider, backend=backend)
 
     reason = _model_rejected_reason(model, provider=provider)
     if reason:
@@ -5140,26 +5163,15 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "body must be an object", "code": "body_not_object"}, status=400
         )
-    name = body.get("name", "").strip()
+    name = body.get("name", "")
+    if not isinstance(name, str):
+        return web.json_response(
+            {"error": "Agent name must be text", "code": "invalid_member_name"}, status=400
+        )
     if not name:
         return web.json_response({"error": "Agent name is required"}, status=400)
-    # Refused at the SOURCE, not masked at one read site. Once such a name is
-    # stored it reaches logs, error messages, telemetry and every other surface
-    # that prints a crew name -- none of which this module controls -- so closing
-    # it here closes it once, where masking a read closes one of N. Keyed on
-    # ``_roster_mask`` via ``_name_would_be_masked``, so this rule and the
-    # roster's cannot drift apart.
-    #
-    # BOUNDARY, stated because it is real and narrower than "the hazard is
-    # closed": this covers only names created THROUGH this route, from now on. A
-    # crew already present in `config.json`, one written there by hand, and one
-    # added by ``_do_agents_sync`` from a discovered spec are NOT retroactively
-    # renamed. That is the reason the owner keeps reading a stored name verbatim:
-    # renaming is the remediation, and a name must be legible to be renamed.
-    #
-    # The name is deliberately NOT echoed back. Reflecting a credential-shaped
-    # string into a response body -- and from there into the request log -- is the
-    # disclosure this rule exists to prevent.
+    # Keep the credential-specific response before the shared validator so the
+    # rejected value is never echoed through the generic error path.
     if _name_would_be_masked(name):
         return web.json_response(
             {
@@ -5171,21 +5183,18 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
-    # The crew name must satisfy the same grammar ``GET /api/members`` applies
-    # when it lists the roster (``members.py`` skips any row failing
-    # ``_AGENT_NAME_RE``). Persisting a name that fails it -- a space, a non-ASCII
-    # letter, a leading dash -- would create a crew no roster surface can show or
-    # open; refused here, once, for every client of this route. Same BOUNDARY
-    # as the credential rule above: names already stored are not renamed.
-    if not _AGENT_NAME_RE.match(name):
+    # The crew name is a display name: it must satisfy the same rule
+    # ``GET /api/members`` applies when it lists the roster
+    # (``members.validate_member_name``). Persisting a name that fails it -- a
+    # tab, a line break, edge whitespace, a hidden character -- would create a
+    # crew no roster surface can show or open; refused here, once, for every
+    # client of this route. Same BOUNDARY as the credential rule above: names
+    # already stored are not renamed.
+    try:
+        validate_member_name(name)
+    except MemberNameError as exc:
         return web.json_response(
-            {
-                "error": (
-                    "Agent name must use letters, digits, '-' or '_' only, "
-                    "start and end with a letter or digit, and be at most 64 characters."
-                ),
-                "code": "invalid_agent_name",
-            },
+            {"error": f"Invalid Crew Member name: {exc}", "code": "invalid_member_name"},
             status=400,
         )
     # The template pointer must be EXPLICIT. Defaulting it to "kirocrew" would
@@ -5205,11 +5214,10 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
-    # Grammar-checked before the name is persisted or used to look anything up.
-    # This is the one shared agent-name grammar every other boundary uses, so a
-    # value that cannot name an agent (path separators, traversal, wildcards,
-    # over-length) is refused here rather than stored as a dangling pointer.
-    if not _AGENT_NAME_RE.match(kiro_agent):
+    # Validate the template identifier before storing or resolving it. This grammar
+    # permits published dotted names but still rejects paths, spaces, and punctuation
+    # at either edge.
+    if not TEMPLATE_NAME_RE.fullmatch(kiro_agent):
         return web.json_response(
             {"error": "invalid kiro_agent name", "code": "invalid_kiro_agent_name"},
             status=400,
@@ -5317,7 +5325,9 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": f"Agent '{name}' already exists", "code": "agent_exists"}, status=409
             )
-        model_reason = _model_pin_rejected(model, request, cfg.agent.provider)
+        model_reason = _model_pin_rejected(
+            model, request, cfg.agent.provider, backend=_pin_entitlement_backend(cfg)
+        )
         if model_reason:
             return web.json_response({"error": model_reason, "code": "invalid_model"}, status=400)
         # Checked INSIDE the config lock, immediately before the binding is
@@ -5478,11 +5488,6 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
     # the caller's expected prior binding when it supplies one.
     if "kiro_agent" in body and set(body) <= {"kiro_agent", "expected_kiro_agent"}:
         new_target = body["kiro_agent"]
-        if not isinstance(new_target, str) or not new_target:
-            return web.json_response(
-                {"error": "kiro_agent must be a non-empty string", "code": "invalid_kiro_agent"},
-                status=400,
-            )
         expected_raw = body.get("expected_kiro_agent")
         if expected_raw is not None and not isinstance(expected_raw, str):
             return web.json_response(
@@ -5497,9 +5502,21 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": f"Agent '{name}' not found", "code": "agent_not_found"}, status=404
             )
+        stored_target = current.agents[name].kiro_agent
+        if new_target != stored_target and (
+            not isinstance(new_target, str) or not TEMPLATE_NAME_RE.fullmatch(new_target)
+        ):
+            return web.json_response(
+                {"error": "invalid kiro_agent name", "code": "invalid_kiro_agent_name"},
+                status=400,
+            )
         # The new target itself stays acceptable so a repeated switch to the
         # same template is idempotent rather than a spurious conflict.
-        expected = None if expected_raw is None else (expected_raw, new_target)
+        expected: tuple[str, ...] | None = (
+            None if expected_raw is None else (expected_raw, new_target)
+        )
+        if expected is None and new_target == stored_target:
+            expected = (stored_target,)
         # Under the handler-level config lock, like fork/publish/reset: the
         # cross-process advisory lock inside ``_rebind_crew_locked`` guards the
         # file write, but it cannot stop the generic path below from saving a
@@ -5550,6 +5567,7 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "name": name})
     if "model" in body:
         pending_model = normalize_agent_model(body["model"])
+        target_advertised_ids = _cached_agent_advertised_ids(request, name)
     # Rejected before the config is even loaded: the check is pure, and every
     # validation must land before the first field assignment below so a bad value
     # cannot leave the in-memory record half-updated.
@@ -5559,7 +5577,6 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": effort_reason, "code": "invalid_reasoning_effort"}, status=400
             )
-        target_advertised_ids = _cached_agent_advertised_ids(request, name)
     # Same placement rule as reasoning_effort: validated up here, before the
     # lock and before any field or avatar-file mutation. A body that pairs a
     # bad `starred` with an avatar promotion would otherwise move the staged
@@ -5595,7 +5612,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 request,
                 cfg.agent.provider,
                 advertised_ids=target_advertised_ids,
-                use_active_advertised_ids=False,
+                # MERGE-REVIEW: prefer this agent's discovery; without it,
+                # only the target backend namespace may judge its model pin.
+                backend=_pin_entitlement_backend(cfg),
             )
             if model_reason:
                 return web.json_response(
@@ -5603,6 +5622,12 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 )
         agent = cfg.agents[name]
         if "kiro_agent" in body and body["kiro_agent"] != agent.kiro_agent:
+            new_target = body["kiro_agent"]
+            if not isinstance(new_target, str) or not TEMPLATE_NAME_RE.fullmatch(new_target):
+                return web.json_response(
+                    {"error": "invalid kiro_agent name", "code": "invalid_kiro_agent_name"},
+                    status=400,
+                )
             try:
                 await asyncio.to_thread(require_unmanaged_template, agent.kiro_agent)
             except CapabilityError as exc:

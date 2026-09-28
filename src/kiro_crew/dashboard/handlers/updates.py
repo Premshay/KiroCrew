@@ -171,10 +171,6 @@ _last_update_check: float = 0.0
 _check_task: asyncio.Task[None] | None = None
 _check_task_generation: int | None = None
 
-#: Release channels the installer publishes. Anything else in the channel file (a
-#: hand-edit, junk, a lane this build predates) falls back to ``stable``.
-_RELEASE_CHANNELS = ("stable", "insider", "nightly")
-
 #: ``schema`` every CLI artifact manifest carries. A payload without it is not a
 #: manifest and must not be read as one.
 _CLI_MANIFEST_SCHEMA = "kirocrew-cli-artifact-manifest-v1"
@@ -1287,6 +1283,9 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
 
 async def api_update_auto(request: web.Request) -> web.Response:
     """POST /api/update/auto — toggle auto-update on/off."""
+    owner_denied = await require_owner_dashboard_request(request, "update.auto")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -2054,7 +2053,10 @@ def apply_log_level(level_name: str, *, source: str) -> bool:
 
     The one place the runtime level changes, shared by the dashboard endpoint
     and the ``agent.log_level`` config applier so a ``kirocrew config set`` or
-    an ``$EDITOR`` edit takes effect exactly like the Logs page toggle.
+    an ``$EDITOR`` edit takes effect exactly like the Logs page toggle. The
+    logger is the single level gate for every sink, ``gateway.log`` included:
+    the file handler and the queue handler ``cli._setup_cli_logging`` installs
+    carry no level of their own, so this one change reaches the file too.
     """
     name = str(level_name or "").upper()
     if name not in _LOG_LEVELS:
@@ -2161,10 +2163,15 @@ async def _safe_ws_send(ws: web.WebSocketResponse, msg: str, state: DashboardSta
     would fall back to a synchronous manifest read.
     """
     try:
-        if not ws.get("_is_dashboard_user", False):
-            if not state._ws_client_allowed(ws, "log", {}):
-                state._ws_log_subscribers.discard(ws)
-                return
+        # Every socket kind goes through the predicate: for a dashboard user it
+        # answers True at once and records the grant under the reserved
+        # dashboard-user auditee, so the live stream leaves the same record as
+        # the ring replay that ``subscribe_logs`` admitted it to. Skipping the
+        # call for that socket kind was the one place the log stream's grant to
+        # the owner went unrecorded.
+        if not state._ws_client_allowed(ws, "log", {}):
+            state._ws_log_subscribers.discard(ws)
+            return
         await ws.send_str(msg)
     except Exception:
         state._ws_log_subscribers.discard(ws)
@@ -2411,6 +2418,9 @@ async def api_update_channel(request: web.Request) -> web.Response:
     own right — the profile parser fails closed on unknown keys, so a new key has
     to be rolled out before it can be set.
     """
+    owner_denied = await require_owner_dashboard_request(request, "update.channel")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -2533,6 +2543,9 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
     git checkout. Restart has no such precondition — it is valid on every
     layout, including a desktop bundle's embedded gateway.
     """
+    owner_denied = await require_owner_dashboard_request(request, "update.restart")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if state._gateway_restart_in_progress:
         return web.json_response({"ok": True, "already_in_progress": True})

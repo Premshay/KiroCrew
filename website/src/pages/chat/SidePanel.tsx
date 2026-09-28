@@ -5,7 +5,35 @@ import { useDevMode } from '../../hooks/useDevMode'
 import { usePointerDrag } from '../../hooks/usePointerDrag'
 import { useLongPressReorder } from '../../hooks/useLongPressReorder'
 import { Reorder } from 'framer-motion'
-import { FileText, Bot, Workflow, ScrollText, MessageCircleQuestionMark, TerminalSquare, GitCompare, GitPullRequest, GitBranch, History, Plus, MoreHorizontal, X, Hash, Pen, Columns2, Component, Globe, CircleDot, Folder, Folders, Link as LinkIcon, PanelRight, PanelBottom, Layers, ListTree, Pin } from 'lucide-react'
+import {
+  FileText,
+  Bot,
+  Workflow,
+  ScrollText,
+  MessageCircleQuestionMark,
+  TerminalSquare,
+  GitCompare,
+  GitPullRequest,
+  GitBranch,
+  History,
+  Plus,
+  MoreHorizontal,
+  X,
+  Hash,
+  Pen,
+  Columns2,
+  Component,
+  Globe,
+  CircleDot,
+  Folder,
+  Folders,
+  Link as LinkIcon,
+  PanelRight,
+  PanelBottom,
+  Layers,
+  ListTree,
+  Pin,
+} from 'lucide-react'
 import { PanelRightLight } from '../../components/icons/panels'
 import ActivityViewer from './ActivityViewer'
 import DiffPanel from '../../components/DiffPanel'
@@ -25,8 +53,14 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { useTerminalEnabled, useTerminalTitle } from '../../utils/terminalRegistry'
 import type { usePanelTabs, ViewKind, PanelTab, TabKind } from '../../hooks/usePanelTabs'
-import { PINNED_VIEWS, useAllAppTabs } from '../../hooks/usePanelTabs'
-import { usePanelTabDescriptors, useInstalledApps, panelTabDescriptor, isPanelTabKind, type PanelTabDescriptor } from '../../hooks/panelTabRegistry'
+import { PINNED_VIEWS, useAllAppTabs, usePanelTerminalsPending } from '../../hooks/usePanelTabs'
+import {
+  usePanelTabDescriptors,
+  useInstalledApps,
+  panelTabDescriptor,
+  isPanelTabKind,
+  type PanelTabDescriptor,
+} from '../../hooks/panelTabRegistry'
 import AppHost from '../../components/AppHost'
 import { appIcon } from '../../apps/appIcons'
 import { scrollMemoryKeyFor } from '../../hooks/useScrollMemory'
@@ -43,7 +77,12 @@ import {
 import { safeSetItem } from '../../utils/safeStorage'
 import { ContentSkeleton } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
-import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS } from '../../utils/fileReadQuery'
+import {
+  fetchFileRead,
+  fileReadQueryKey,
+  FILE_READ_STALE_MS,
+  isPartialRead,
+} from '../../utils/fileReadQuery'
 import { errMessage } from '../../utils/thunkError'
 import { useAppSelector } from '../../store'
 import { selectSlotSubagents, selectSlotToolLog } from '../../store/chatSlice'
@@ -59,8 +98,19 @@ import { i18nT } from '../../i18n/t'
 // — their icon comes from the manifest descriptor via `iconForKind` instead.
 type BuiltinTabKind = Exclude<TabKind, `app:${string}`>
 const KIND_ICON: Record<BuiltinTabKind, ReactNode> = {
-  changes: <GitPullRequest size={16} />, issues: <CircleDot size={16} />, files: <Folders size={16} />, links: <LinkIcon size={16} />, artifacts: <Component size={16} />, subagents: <Bot size={16} />, workflows: <Workflow size={16} />,
-  logs: <ScrollText size={16} />, crewlog: <History size={16} />, context: <Layers size={16} />, side: <MessageCircleQuestionMark size={16} />, terminal: <TerminalSquare size={16} />, browser: <Globe size={16} />,
+  changes: <GitPullRequest size={16} />,
+  issues: <CircleDot size={16} />,
+  files: <Folders size={16} />,
+  links: <LinkIcon size={16} />,
+  artifacts: <Component size={16} />,
+  subagents: <Bot size={16} />,
+  workflows: <Workflow size={16} />,
+  logs: <ScrollText size={16} />,
+  crewlog: <History size={16} />,
+  context: <Layers size={16} />,
+  side: <MessageCircleQuestionMark size={16} />,
+  terminal: <TerminalSquare size={16} />,
+  browser: <Globe size={16} />,
   summary: <ListTree size={16} />,
   pins: <Pin size={16} />,
   file: <FileText size={16} />,
@@ -156,48 +206,64 @@ export const NEW_MENU_DESC_KEY: Record<ViewKind | 'terminal', string> = {
  *  Every key of `NEW_MENU_LABEL_KEY` must appear exactly once across the
  *  groups — `sidePanelAddMenu.test.tsx` pins that partition, so adding a view
  *  without placing it in a group fails rather than silently dropping it. */
-const NEW_MENU_GROUPS: { id: string; items: { kind: ViewKind | 'terminal'; icon: ReactNode }[] }[] = [
-  // Session output — what this chat referenced or produced. (Changes / Files /
-  // Artifacts are auto-pinned and filtered out below; they are listed here so
-  // this table stays the complete catalog of views.)
-  {
-    id: 'session-output',
-    items: [
-      { kind: 'summary', icon: <ListTree size={15} /> },
-      { kind: 'pins', icon: <Pin size={15} /> },
-      { kind: 'changes', icon: <GitPullRequest size={15} /> },
-      { kind: 'issues', icon: <CircleDot size={15} /> },
-      { kind: 'files', icon: <Folders size={15} /> },
-      { kind: 'links', icon: <LinkIcon size={15} /> },
-      { kind: 'artifacts', icon: <Component size={15} /> },
-      { kind: 'subagents', icon: <Bot size={15} /> },
-      { kind: 'workflows', icon: <Workflow size={15} /> },
-      { kind: 'git', icon: <GitBranch size={15} /> },
-    ],
-  },
-  // Interactive workspaces — the surfaces the user types into. Terminal is a
-  // per-chat shell: its tab lives in this chat's panel state, so it comes and
-  // goes with the session, unlike the app-wide dock terminal in the nav rail.
-  {
-    id: 'workspaces',
-    items: [
-      { kind: 'side', icon: <MessageCircleQuestionMark size={15} /> },
-      { kind: 'browser', icon: <Globe size={15} /> },
-      { kind: 'terminal', icon: <TerminalSquare size={15} /> },
-    ],
-  },
-  // Diagnostics.
-  {
-    id: 'diagnostics',
-    items: [
-      { kind: 'logs', icon: <ScrollText size={15} /> },
-      { kind: 'context', icon: <Layers size={15} /> },
-      { kind: 'crewlog', icon: <History size={15} /> },
-    ],
-  },
-]
+const NEW_MENU_GROUPS: { id: string; items: { kind: ViewKind | 'terminal'; icon: ReactNode }[] }[] =
+  [
+    // Session output — what this chat referenced or produced. (Changes / Files /
+    // Artifacts are auto-pinned and filtered out below; they are listed here so
+    // this table stays the complete catalog of views.)
+    {
+      id: 'session-output',
+      items: [
+        { kind: 'summary', icon: <ListTree size={15} /> },
+        { kind: 'pins', icon: <Pin size={15} /> },
+        { kind: 'changes', icon: <GitPullRequest size={15} /> },
+        { kind: 'issues', icon: <CircleDot size={15} /> },
+        { kind: 'files', icon: <Folders size={15} /> },
+        { kind: 'links', icon: <LinkIcon size={15} /> },
+        { kind: 'artifacts', icon: <Component size={15} /> },
+        { kind: 'subagents', icon: <Bot size={15} /> },
+        { kind: 'workflows', icon: <Workflow size={15} /> },
+        { kind: 'git', icon: <GitBranch size={15} /> },
+      ],
+    },
+    // Interactive workspaces — the surfaces the user types into. Terminal is a
+    // per-chat shell: its tab lives in this chat's panel state, so it comes and
+    // goes with the session, unlike the app-wide dock terminal in the nav rail.
+    {
+      id: 'workspaces',
+      items: [
+        { kind: 'side', icon: <MessageCircleQuestionMark size={15} /> },
+        { kind: 'browser', icon: <Globe size={15} /> },
+        { kind: 'terminal', icon: <TerminalSquare size={15} /> },
+      ],
+    },
+    // Diagnostics.
+    {
+      id: 'diagnostics',
+      items: [
+        { kind: 'logs', icon: <ScrollText size={15} /> },
+        { kind: 'context', icon: <Layers size={15} /> },
+        { kind: 'crewlog', icon: <History size={15} /> },
+      ],
+    },
+  ]
 
-const VIEW_KINDS = new Set<TabKind>(['changes', 'issues', 'links', 'files', 'artifacts', 'subagents', 'workflows', 'logs', 'crewlog', 'context', 'side', 'git', 'summary', 'pins'])
+const VIEW_KINDS = new Set<TabKind>([
+  'changes',
+  'issues',
+  'links',
+  'files',
+  'artifacts',
+  'subagents',
+  'workflows',
+  'logs',
+  'crewlog',
+  'context',
+  'side',
+  'git',
+  'summary',
+  'pins',
+])
 
 /** Views behind the Developer Mode consent gate (Settings > Developer) — the
  *  same gate the standalone Developer page uses. All three are raw
@@ -476,14 +542,41 @@ export function sidePanelEffectiveWidth({
 }
 
 export default function SidePanel({
-  tabsCtl, slot, onFileOpen, onArtifactOpen, onAddToContext,
-  projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource,
-  issues, selectedIssueUrl, onSelectIssue, onReconcileIssue,
-  onAddSourceToChat, onSubmitComments, connected = true, onFileSave, onClose, panelHidden,
-  pins, pinsLoading, onJumpToPin, onUnpin,
-  slotTitle, chatMode,
-  expanded, fillWidth, canDockBottom = true,
-  leadingTabs, extraReserveW = 0, hiddenViews, onActiveTabChange,
+  tabsCtl,
+  slot,
+  onFileOpen,
+  onArtifactOpen,
+  onAddToContext,
+  projectDir,
+  navLinks,
+  navResolving,
+  sources,
+  selectedSourceUrl,
+  onSelectSource,
+  onReconcileSource,
+  issues,
+  selectedIssueUrl,
+  onSelectIssue,
+  onReconcileIssue,
+  onAddSourceToChat,
+  onSubmitComments,
+  connected = true,
+  onFileSave,
+  onClose,
+  panelHidden,
+  pins,
+  pinsLoading,
+  onJumpToPin,
+  onUnpin,
+  slotTitle,
+  chatMode,
+  expanded,
+  fillWidth,
+  canDockBottom = true,
+  leadingTabs,
+  extraReserveW = 0,
+  hiddenViews,
+  onActiveTabChange,
 }: SidePanelProps) {
   const {
     tabs,
@@ -584,14 +677,19 @@ export default function SidePanel({
     },
     [hiddenViews],
   )
+  // Restored terminal chips wait for the liveness ruling too, as the dock's do.
+  const terminalsPending = usePanelTerminalsPending()
   const visibleTabs = useMemo(
-    () => (hiddenViews ? tabs.filter((t) => !isWithheld(t.kind)) : tabs),
-    [tabs, hiddenViews, isWithheld],
+    () =>
+      hiddenViews || terminalsPending
+        ? tabs.filter((t) => !isWithheld(t.kind) && !(terminalsPending && t.kind === 'terminal'))
+        : tabs,
+    [tabs, hiddenViews, isWithheld, terminalsPending],
   )
   const activeId = useMemo(() => {
     if (storedActiveId === null) return null
-    if (leadingTabs?.some(t => t.id === storedActiveId)) return storedActiveId
-    if (visibleTabs.some(t => t.id === storedActiveId)) return storedActiveId
+    if (leadingTabs?.some((t) => t.id === storedActiveId)) return storedActiveId
+    if (visibleTabs.some((t) => t.id === storedActiveId)) return storedActiveId
     return leadingTabs?.[0]?.id ?? visibleTabs[0]?.id ?? null
   }, [storedActiveId, visibleTabs, leadingTabs])
   // The fallback is REPORTED to the host, never written back into the store.
@@ -619,11 +717,16 @@ export default function SidePanel({
   // Files header's per-project quick action (issue #1142) so the two entry
   // points cannot drift on WHERE the shell starts — that cwd is the whole point
   // of the affordance.
-  const openProjectTerminal = useCallback(() => { openTerminal({ cwd: projectDir }) }, [openTerminal, projectDir])
-  const openMenuItem = useCallback((kind: ViewKind | 'terminal') => {
-    if (kind === 'terminal') openProjectTerminal()
-    else openView(kind)
-  }, [openProjectTerminal, openView])
+  const openProjectTerminal = useCallback(() => {
+    openTerminal({ cwd: projectDir })
+  }, [openTerminal, projectDir])
+  const openMenuItem = useCallback(
+    (kind: ViewKind | 'terminal') => {
+      if (kind === 'terminal') openProjectTerminal()
+      else openView(kind)
+    },
+    [openProjectTerminal, openView],
+  )
   // Closing a terminal tab kills its PTY (server) and disposes local state. The
   // server delete goes through a React Query mutation (use-react-query
   // guideline); the synchronous WS + xterm teardown stays in disposeTerminalSession.
@@ -822,7 +925,7 @@ export default function SidePanel({
               pinned chips beside these have never had their own. */}
           {!!leadingTabs?.length && (
             <div className="flex items-end gap-2 shrink-0" data-testid="side-panel-leading-tabs">
-              {leadingTabs.map(lt => (
+              {leadingTabs.map((lt) => (
                 <TabChip
                   key={lt.id}
                   tab={{ title: lt.title }}
@@ -1013,11 +1116,18 @@ export default function SidePanel({
             category views: each is a query-driven view, not an editor whose
             buffer a switch would lose. Scrolls itself — the host renders plain
             content, and this keeps the strip pinned above a long body. */}
-        {leadingTabs?.filter(lt => lt.id === activeId).map(lt => (
-          <div key={lt.id} className="absolute inset-0 overflow-y-auto" data-testid="side-panel-leading-body" data-leading-id={lt.id}>
-            {lt.render()}
-          </div>
-        ))}
+        {leadingTabs
+          ?.filter((lt) => lt.id === activeId)
+          .map((lt) => (
+            <div
+              key={lt.id}
+              className="absolute inset-0 overflow-y-auto"
+              data-testid="side-panel-leading-body"
+              data-leading-id={lt.id}
+            >
+              {lt.render()}
+            </div>
+          ))}
         {visibleTabs.length === 0 && !leadingTabs?.length && (
           /* Empty state: launcher — the available views themselves, roomy and
              clickable, instead of a hint pointing at the + menu. */
@@ -1120,7 +1230,9 @@ export default function SidePanel({
                   // that removes Terminal from the + menu must remove its
                   // per-project shortcut, or the button promises a shell this
                   // panel will not open.
-                  onOpenTerminal={terminalEnabled && !isWithheld('terminal') ? openProjectTerminal : undefined}
+                  onOpenTerminal={
+                    terminalEnabled && !isWithheld('terminal') ? openProjectTerminal : undefined
+                  }
                 />
               </div>
             )
@@ -1130,9 +1242,27 @@ export default function SidePanel({
             return (
               <div key={t.id} className="absolute inset-0">
                 <ActivityViewer
-                  view={t.kind as 'changes' | 'issues' | 'links' | 'artifacts' | 'subagents' | 'workflows' | 'logs' | 'crewlog' | 'context' | 'side' | 'git' | 'summary' | 'pins'}
-                  open onToggle={closePanel} slot={slot}
-                  subagents={subagents} toolLog={toolLog}
+                  view={
+                    t.kind as
+                      | 'changes'
+                      | 'issues'
+                      | 'links'
+                      | 'artifacts'
+                      | 'subagents'
+                      | 'workflows'
+                      | 'logs'
+                      | 'crewlog'
+                      | 'context'
+                      | 'side'
+                      | 'git'
+                      | 'summary'
+                      | 'pins'
+                  }
+                  open
+                  onToggle={closePanel}
+                  slot={slot}
+                  subagents={subagents}
+                  toolLog={toolLog}
                   sources={sources}
                   selectedSourceUrl={selectedSourceUrl}
                   onSelectSource={onSelectSource}
@@ -1179,7 +1309,14 @@ export default function SidePanel({
                 slot={slot}
                 onClose={() => handleCloseTab(t.id)}
                 onContentChange={(c) => patchTab(t.id, { content: c })}
-                onDiskContent={(c, binary) => patchTab(t.id, { content: c, savedContent: c, ...(binary === undefined ? {} : { binary }) })}
+                onDiskContent={(c, binary, partial) =>
+                  patchTab(t.id, {
+                    content: c,
+                    savedContent: c,
+                    ...(binary === undefined ? {} : { binary }),
+                    ...(partial === undefined ? {} : { partial }),
+                  })
+                }
                 onDiffModeChange={(diffMode) => patchTab(t.id, { diffMode })}
                 onRevealConsumed={() => patchTab(t.id, { revealLine: undefined })}
                 onPathChange={(p) =>
@@ -1369,7 +1506,7 @@ function FileTabBody({
   /** Disk-originated content (file watch / Refresh): the panel routes it here
    *  so the tab's saved baseline moves with the buffer it just replaced, and the
    *  binary verdict of that read moves with both. */
-  onDiskContent: (c: string, binary?: boolean) => void
+  onDiskContent: (c: string, binary?: boolean, partial?: boolean) => void
   onDiffModeChange: (diffMode: boolean) => void
   onFileSave: (fp: string, c: string) => Promise<void>
   onFileOpen?: (
@@ -1398,6 +1535,7 @@ function FileTabBody({
       filePath={tab.path || ''}
       content={tab.content || ''}
       binary={tab.binary}
+      partial={tab.partial}
       scrollMemoryKey={scrollMemoryKey}
       onContentChange={onContentChange}
       onDiskContent={onDiskContent}
@@ -1469,13 +1607,21 @@ function FileTabBody({
  * this placeholder and that page ask for costs one GET and yields one answer
  * rather than two racing reads of the same file.
  */
-function HydratingFileTab({ path, onDiskContent }: { path: string; onDiskContent: (c: string, binary?: boolean) => void }) {
+function HydratingFileTab({
+  path,
+  onDiskContent,
+}: {
+  path: string
+  onDiskContent: (c: string, binary?: boolean, partial?: boolean) => void
+}) {
   const [error, setError] = useState<string | null>(null)
   const qc = useQueryClient()
   // Held in a ref so a new callback identity from the parent's render does not
   // re-trigger the read; only the path does.
   const applyRef = useRef(onDiskContent)
-  useEffect(() => { applyRef.current = onDiskContent })
+  useEffect(() => {
+    applyRef.current = onDiskContent
+  })
   useEffect(() => {
     const ac = new AbortController()
     setError(null)
@@ -1491,22 +1637,34 @@ function HydratingFileTab({ path, onDiskContent }: { path: string; onDiskContent
           staleTime: FILE_READ_STALE_MS,
         })
         if (ac.signal.aborted) return
-        if (r.ok) { applyRef.current(r.text, r.binary); return }
+        if (r.ok) {
+          applyRef.current(r.text, r.binary, isPartialRead(r))
+          return
+        }
         if (r.status === 404) {
-          applyRef.current(i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or'), false)
+          applyRef.current(
+            i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or'),
+            false,
+          )
           return
         }
         // The same sentence the chip click reports for a failed read: a human
         // line naming the file, with the status as the detail -- a bare "HTTP
         // 500" is a code machines produce, not something a reader can act on.
-        setError(i18nT('pages.chatPage.could_not_read_file_reason', {
-          path, reason: i18nT('pages.chatPage.http_status', { status: r.status }),
-        }))
+        setError(
+          i18nT('pages.chatPage.could_not_read_file_reason', {
+            path,
+            reason: i18nT('pages.chatPage.http_status', { status: r.status }),
+          }),
+        )
       } catch (e) {
         if (!ac.signal.aborted) {
-          setError(i18nT('pages.chatPage.could_not_read_file_reason', {
-            path, reason: errMessage(e) || i18nT('pages.chatPage.unknown_error'),
-          }))
+          setError(
+            i18nT('pages.chatPage.could_not_read_file_reason', {
+              path,
+              reason: errMessage(e) || i18nT('pages.chatPage.unknown_error'),
+            }),
+          )
         }
       }
     })()
@@ -1524,18 +1682,45 @@ function HydratingFileTab({ path, onDiskContent }: { path: string; onDiskContent
       </div>
     )
   }
-  return <div data-testid="file-tab-hydrating" className="h-full p-4"><ContentSkeleton rows={8} /></div>
+  return (
+    <div data-testid="file-tab-hydrating" className="h-full p-4">
+      <ContentSkeleton rows={8} />
+    </div>
+  )
 }
 
-function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDiskContent, onDiffModeChange, onRevealConsumed, onPathChange, onFileSave, onFileOpen, onAddToContext, onSubmitComments, connected = true, onTerminalSendToChat, diffLineNumbers, setDiffLineNumbers, diffSideBySide, setDiffSideBySide }: {
-  tab: PanelTab; active: boolean; slot: string
+function TabBody({
+  tab,
+  active,
+  slot,
+  projectDir,
+  onClose,
+  onContentChange,
+  onDiskContent,
+  onDiffModeChange,
+  onRevealConsumed,
+  onPathChange,
+  onFileSave,
+  onFileOpen,
+  onAddToContext,
+  onSubmitComments,
+  connected = true,
+  onTerminalSendToChat,
+  diffLineNumbers,
+  setDiffLineNumbers,
+  diffSideBySide,
+  setDiffSideBySide,
+}: {
+  tab: PanelTab
+  active: boolean
+  slot: string
   /** The chat's project directory — the file-browser rail's tree root. */
   projectDir?: string
   onClose: () => void
   onContentChange: (c: string) => void
   /** Disk-originated content (file watch / Refresh): restamps the tab's saved
    *  baseline alongside the buffer, so a re-open still treats the tab clean. */
-  onDiskContent: (c: string, binary?: boolean) => void
+  onDiskContent: (c: string, binary?: boolean, partial?: boolean) => void
   onDiffModeChange: (diffMode: boolean) => void
   /** Drop the tab's one-shot line-reveal target once the panel has acted on it. */
   onRevealConsumed: () => void
@@ -1560,8 +1745,10 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
   // An app-contributed tab (contributes.panelTabs) never reaches here: like the MCP
   // `app` kind, its body renders from the cross-slot `allAppTabs` list so a chat
   // switch cannot remount its `AppHost`. The tab loop above returns null for both.
+  const terminalsPending = usePanelTerminalsPending()
+  // A restored shell may be gone: connecting before the ruling would spawn a new one.
   if (tab.kind === 'terminal')
-    return (
+    return terminalsPending ? null : (
       <CliPanel
         sessionId={tab.sessionId ?? ''}
         cwd={tab.cwd}
@@ -1776,11 +1963,25 @@ function DraggableTabItem({
   )
 }
 
-function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = false, host = false, icon, testId }: {
+function TabChip({
+  tab,
+  active,
+  onSelect,
+  onClose,
+  closable = true,
+  pinned = false,
+  host = false,
+  icon,
+  testId,
+}: {
   /** A stored tab, or — for the host's leading tab — just a title: that chip has
    *  no `kind` (it is not a `PanelTab`) and brings its own `icon`. */
   tab: Pick<PanelTab, 'title'> & Partial<Pick<PanelTab, 'kind' | 'sessionId' | 'path'>>
-  active: boolean; onSelect: () => void; onClose: () => void; closable?: boolean; pinned?: boolean
+  active: boolean
+  onSelect: () => void
+  onClose: () => void
+  closable?: boolean
+  pinned?: boolean
   /** A host-owned leading chip: always labelled like a document tab, but named
    *  (aria-label) like a pinned view, since it is the strip's own navigation. */
   host?: boolean

@@ -1570,6 +1570,22 @@ purely to keep the kiro spec schema-clean; nothing in the fork resolves it.
 all times — after install, refresh, and any dashboard edit — or kiro-cli drops
 the agent and silently falls back to default.
 
+## Monitoring runtime policy
+
+`monitoring.max_runtime_secs` is the finite wall-clock ceiling shared by monitor
+MCP tools and API mutations; it is checked when a budget is written, never
+against a persisted record on load. It defaults to 604800
+seconds; an operator may set up to 2592000 (30 days). Invalid config
+values fall back to the shipped ceiling, and `coerce_runtime_ceiling` logs a
+warning naming the rejected value and the fallback whenever a configured value
+is replaced (an unset key is the ordinary default and is silent). Validation
+errors quote the ceiling with a duration gloss, `(7 days)` for the default.
+`monitoring.limits` reads the live
+snapshot (or the loader in standalone MCP processes). Raising or lowering the
+ceiling does not change existing budgets, creation times, deadlines, active
+state or the generic four-hour arming default. A PR-specific daily/30-day preference belongs in that
+installation's maintenance instructions and explicit new requests.
+
 ## Live config: one watcher, one applier registry
 
 `config/live.py` is the single mechanism by which a write to `config.json`
@@ -1742,7 +1758,18 @@ dispatcher; `WorkflowService` binds `agent.workflow_run_timeout_secs` to its
 ones whose holder is `DashboardState`, or that must rebuild agent artifacts,
 live in `server.py::_register_config_watch` — `agent.provider`,
 `agent.model`, `agent.role_models.background`, and `agent.log_level`
-(→ `handlers/updates.py::apply_log_level_from_config`).
+(→ `handlers/updates.py::apply_log_level_from_config`). The log-level applier
+shares `apply_log_level` with the Logs page's `POST /api/logs/level`, and that
+one function moves the `kiro_crew` logger only — which is the ONLY level gate
+on the way to `gateway.log`: the file handler and the queue handler
+`cli._setup_cli_logging` installs carry no level of their own (kiro_crew
+records are gated at the kiro_crew logger, third-party records on the detached
+gateway's root-attached handler at the root logger's WARNING), so the runtime
+change reaches the file with nothing else to update. The handlers used to hold
+a boot-time copy of the level that nothing updated, so a gateway booted at
+WARNING dropped its raised INFO records before the file until a restart while
+the live Logs stream showed them (#14231); a level re-added to either handler
+is that bug again, and `test_cli_logging.py` pins the contract.
 Both model appliers rebuild the installed agent specifications before the
 watcher finishes dispatching the change. After a successful `agent.model`
 rebuild, its applier emits a refresh frame, so dashboard PATCH responses and
@@ -2053,6 +2080,7 @@ class DashboardConfig:
     theme_mode: str = ""           # "dark" | "light" | "system"; empty = unset (frontend falls back to localStorage or "system")
     theme_color: str = ""          # color-theme slug (e.g. "kiro", "emerald", "monokai"); empty = unset
     language: str = ""             # dashboard UI language, BCP-47 (e.g. "en", "zh-CN"); empty = auto-detect from the browser. See "Dashboard UI language" below.
+    folder_sort: str = "custom"    # sidebar folder order: "custom" (stored positions) | "name" (natural, 01. < 02. < 10.) | "created" (newest first). A view preference; never rewrites a folder's stored order. See "Sidebar folder order" below.
     onboarded: bool = False         # whether the "Choose your look" onboarding modal was completed
     import_onboarded: bool = False  # whether foreign-agent import was completed or skipped
     crewmates_onboarded: bool = False  # whether the first-run Meet CrewMates flow was finished or dismissed
@@ -2431,6 +2459,97 @@ appears.
 them at boot via `GET /api/theme/boot`; empty `theme_mode`/`theme_color` mean
 unset (the frontend falls back to `localStorage` or the built-in default).
 
+### Sidebar folder order
+
+`DashboardConfig.folder_sort` is the chat sidebar's folder sort mode — `custom`
+(the stored per-container `order` positions set by dragging or by the
+`chat_folder_move` tool; the default, so an upgrade changes nothing), `name` (an
+ASCII-case-insensitive natural order, so `01.` < `02.` < `10.` and `alpha` < `Beta`;
+only `A`-`Z` fold, every other letter compares as written, because that is the one
+fold both readers perform identically without a Unicode table) or `created` (newest first
+on the `created_at` epoch stamp every folder creator writes). It is workspace-
+persistent rather than browser-local because two readers must agree on it: the
+sidebar (and the folder pickers) through the shared `GET /api/config/kirocrew`
+query, and the `kirocrew-dashboard` MCP server's `chat_folder_tree`, which reads the
+same `config.json` through the loader (the HTTP route is cookie-only) and lists
+folders in the order the sidebar draws them so an agent can pick a `before`/`after`
+anchor from it (see `docs/architecture/mcp.md`). Written only through the
+`PATCH /api/config/kirocrew` allowlist (`dashboard.folder_sort`, enum
+`FOLDER_SORT_MODES`); the loader reads anything outside that set as `custom`.
+Choosing a mode is a VIEW change — no folder's stored `order` is rewritten — so
+switching back to `custom` restores the manual arrangement exactly; the sidebar
+re-sorts when the save lands (the success write into the shared `kirocrewConfig`
+cache), not on the pick, so every reader of that cache switches together. A sidebar
+drag among siblings is a write to the stored positions computed against the drawn
+order, so it is offered only when the mode is known to be `custom`: outside that
+(and while the settings query is still loading or has failed, when the tree draws
+the stored order as a fallback) the folder rows stop being reorder targets — their
+sortable's droppable side is off, so no slot opens — while dragging a folder into
+another still works; before the FIRST read lands no folder drag is offered at all
+(both sortable sides off, no grab cursor), since nothing on screen could yet say
+why a lift died at the drop. The status line that answers a withdrawn drop carries
+a **Switch to Custom** action on the same write path as the menu row. What the UI
+keys on is what it KNOWS, never the transient query status (`useFolderSortRead`):
+the mode is known when a config body is on hand — fresh, cached, or kept across a
+failed background refetch, which react-query retries on its own and which is
+therefore silent; a read that failed with no body to fall back on is said on an
+`ErrorNotice`, held through the retry's pending phase (`errorUpdatedAt`, so an
+observer mounted mid-retry reports it too) so the banner does not unmount and
+remount around each automatic retry, and cleared when a body arrives.
+One screen says it once: the sidebar's banner over its tree (the plain title leads,
+the server's own words sit under it as a smaller line -- they stay the notice's
+`message` because that string is the error-journal key the hand-off reads -- then
+a plain subline and the hand-off stacked under the text), and, on the screens with
+no sidebar, the job form beside its folder picker and the Command Bar above its
+folder list. The subline is ONE phrase wherever this failure is said -- *All
+folders are shown, in your Custom order; retries automatically* -- because a person
+may see it on up to four surfaces at once and two phrasings read as two failures,
+and it says that membership is intact, since a picker under a failure notice was
+not trusted to still list every folder; where the
+notice carries no hand-off of its own (the job form and the Command Bar: unsaved
+input beside them) it adds *Open the chat sidebar to ask the agent about it.* The
+session menu
+and the folder-suggestion card say nothing of their own while the sidebar is on the
+screen; when it is not (a phone with the drawer closed, a desktop with the panel
+collapsed, embed chat) they say it themselves — the menu in the rule's in-menu form
+(passive notice, the picker's subline, a sibling **Ask the agent** item described by
+the notice, a separator closing the block), the card as the same notice above it
+without a hand-off, with the picker-plus-pointer subline.
+
+The **Folder order** rows (*Custom* / *By name* / *By date created (newest first)* -- the
+direction spelled, as the session rows spell theirs, and worded so
+that no label mirrors the chat session sort rows in the same menu, whose heading
+names its object, **Sort sessions by**, because two orderings in one menu read as
+sorting twice; and *Custom*, not *Custom order*, under a heading that already says
+"order") are offered in every sidebar lane. The flat lane draws no folder tree and the conductor lane nests
+by lineage, but the mode is not idle there: every row menu's **Move to folder**
+picker, the history search's folder groups, the Command Bar, the job form and the
+MCP tree all list in it, and the menu rows are the only control that writes it -- a
+mode a person cannot change from the lane they are in would be a trap. Only the drag
+note under the rows (*Folders can be dragged into place in Custom order only*, a
+fact about the modes -- not the sidebar hint's "Switch to Custom" sentence, which
+sits beside a button that does the switching and would read as an inert action
+here) is confined to the lanes that draw a folder row to drag (the tree, and the
+board unless flat view empties its columns of folders). In `created` mode a second
+fact line joins it whenever a folder in the list has no `created_at` -- a folder
+from before the stamp existed -- because the comparator puts such rows after every
+stamped one, in the stored order: on a pre-upgrade tree that is the order the person
+already had, and the pick looks broken unless the menu says why (*Folders made
+before dates were recorded have no date; they come last, in your Custom order*);
+`chat_folder_tree` states the same fact in its header for the agent reading the
+tree, so neither reader takes that stored-order tail for a date order. The hint itself stays until
+the person's next interaction away from it -- a pointer or key landing anywhere but
+on the line -- a switch back to Custom, or the next drag; never a clock, which took
+the action away from under a hand reaching for it. The mode's saves go out ONE at a
+time, in pick order (react-query mutation `scope`): two picks inside one round-trip
+would be two concurrent `PATCH`es to the same path, and the server persists
+whichever arrives last -- a delayed first request would land after the second and
+store the earlier pick, and the settle-time refetch would then draw that order as
+if chosen. Queued behind an in-flight save, the newer pick's request starts when
+the previous one settles, so the last pick is both the last request the server sees
+and the persisted one; a refusal behind a newer pick is not reported (the newer
+save's own outcome is).
+
 ### Interactive model picker visibility
 
 `DashboardConfig.model_picker_hidden_models` is a workspace-persistent list of
@@ -2599,26 +2718,36 @@ auto-language workspaces have always sent.
 
 Two consequences fall out of naming in a non-latin script:
 
-- **The prose guard needs a second ceiling.** `_looks_like_prose` rejects a reply
-  that is a sentence rather than a name, and its word ceiling counts
-  `str.split()` tokens — which is 1 for any length of Chinese, Japanese or Thai.
-  `_TITLE_MAX_UNSPACED_CHARS` bounds those scripts by character instead, counting
+- **The prose guard needs a second ceiling.** `label_guard.looks_like_prose`
+  (shared by every label path -- the session title, the Slack/Telegram
+  conversation name, the nav link chips and the session summary -- and reached
+  from `chat_title` through its `_looks_like_prose` alias) rejects a reply that
+  is a sentence rather than a name, and its word ceiling counts `str.split()`
+  tokens — which is 1 for any length of Chinese, Japanese or Thai.
+  `TITLE_MAX_UNSPACED_CHARS` bounds those scripts by character instead, counting
   only unspaced-script characters so latin identifiers in a mixed title stay
   free, and the full-width terminators `。！？` are matched without the ASCII
   rule's trailing-whitespace requirement (those scripts do not space after
-  punctuation). A short refusal with no terminator remains a documented false
-  negative for those unspaced scripts. Korean is spaced, so the word ceiling
-  bounds its long sentences, but a SHORT Korean refusal clears every other
-  check -- and Korean puts the refusal verb last, so English-style prefix
-  openers cannot catch it. `_looks_like_prose` therefore also matches Korean
-  sentence shape: the sentence-final polite conjugations
-  (`_TITLE_KO_SENTENCE_ENDINGS`, the formal "-nida" family and the
-  informal-polite "-yo" family) plus the apology opener
-  (`_TITLE_KO_PROSE_OPENERS`), which a title as a noun phrase never carries. A
-  plain-form (banmal) Korean refusal remains a documented false negative, and
-  a sentence-form Korean title loses to the fallback name -- the deliberate
-  direction of the trade, since a fallback name is still the user's own words
-  while a stored refusal is the bug.
+  punctuation). Both ceilings are parameters, because the prompts differ: the
+  title defaults (12 words / 24 characters) sit above its 3-6 word contract,
+  and the 18-word session summary passes its own. A short refusal with no
+  terminator remains a documented false negative for those unspaced scripts.
+  Korean is spaced, so the word ceiling bounds its long sentences, but a SHORT
+  Korean refusal clears every other check -- and Korean puts the refusal verb
+  last, so English-style prefix openers cannot catch it. `looks_like_prose`
+  therefore also matches Korean sentence shape: the sentence-final polite
+  conjugations (`KO_SENTENCE_ENDINGS`, the formal "-nida" family and the
+  informal-polite "-yo" family) plus the apology opener (`KO_PROSE_OPENERS`),
+  which a title as a noun phrase never carries. A plain-form (banmal) Korean
+  refusal remains a documented false negative, and a sentence-form Korean
+  title loses to the fallback name -- the deliberate direction of the trade,
+  since a fallback name is still the user's own words while a stored refusal
+  is the bug. The sentence-shape signals (terminators, Korean conjugation) and
+  the narration openers (`PROSE_OPENERS`) are parameters too, for the one path
+  whose label IS a descriptive sentence: the session summary runs the guard
+  with `sentence_shape=False` and without the conversation-referring openers,
+  since "the conversation covers ..." is its legitimate shape and a false
+  positive there is re-spent on a model turn at every later list.
 - **The reveal animation needs characters.** The sidebar types a new title in one
   word at a time; a single-token title skipped the animation entirely, so
   `_title_reveal_prefixes` steps unspaced scripts two characters at a time
@@ -2631,9 +2760,10 @@ It also keeps the reply's first line only -- the rule
 `SKIP` verdict followed by a reason collapses back to the bare control word.
 `_validate_title_reply` treats BOTH taught control words (`SKIP`, `KEEP`) as
 no-title sentinels on every path, matched case-insensitively, alone or with a
-punctuation-separated reason on one line (`_is_verdict_reply`) -- while a real
-title that merely opens with the word ("SKIP and KEEP handling", "KEEP-ALIVE
-header bug") survives.
+punctuation-separated reason on one line (`label_guard.is_verdict_reply`, the
+same check the messaging namer and the session summary run against their own
+taught word) -- while a real title that merely opens with the word ("SKIP and
+KEEP handling", "KEEP-ALIVE header bug") survives.
 
 ### Response verbosity reaches every agent
 

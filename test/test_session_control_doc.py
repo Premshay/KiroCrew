@@ -62,7 +62,9 @@ def test_the_page_names_every_advertised_tool(doc_text: str, advertised_tools: l
     tool_half = doc_text.split("## What you cannot reach", 1)[0]
     claimed = {
         match.group(1)
-        for match in re.finditer(r"`((?:session|chat_folder|chat_tag)_[a-z_]+)`", tool_half)
+        for match in re.finditer(
+            r"`((?:session|chat_folder|chat_tag|chat_session)_[a-z_]+)`", tool_half
+        )
     }
     assert claimed, "found no backticked tool names at all — the scan anchor moved"
     assert claimed <= advertised, (
@@ -139,14 +141,14 @@ def test_the_page_matches_the_session_control_group_and_the_channel_block(
     from kiro_crew.channel import CHANNEL_AGENT_BLOCKED_TOOLS
     from kiro_crew.mcp_dashboard import SESSION_CONTROL_TOOLS
 
-    assert len(SESSION_CONTROL_TOOLS) == 8
+    assert len(SESSION_CONTROL_TOOLS) == 9
     for tool in SESSION_CONTROL_TOOLS:
         assert f"`{tool}`" in doc_text
         assert tool in CHANNEL_AGENT_BLOCKED_TOOLS, (
             f"{tool} left the channel containment list; the page tells a channel agent "
-            "it is blocked from all eight"
+            "it is blocked from all nine"
         )
-    assert "all eight\nsession tools" in doc_text or "all eight session tools" in doc_text
+    assert "all nine\nsession tools" in doc_text or "all nine session tools" in doc_text
 
 
 def test_every_tabulated_refusal_code_is_one_the_source_raises(doc_text: str) -> None:

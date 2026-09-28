@@ -387,6 +387,17 @@ def _dispatchers() -> list[Path]:
     return found
 
 
+#: The two names a drain reaches the flip through: the registry transition itself, and a
+#: channel's own thin wrapper around it. Both are checked, because a wrapper that forwards
+#: an owner says nothing about whether its own caller supplied one.
+_FLIP_CALLEES = frozenset({"flip_answering_locked", "_receipt_flip_locked"})
+
+#: Where the owner token sits positionally in both of them, after (session key, address,
+#: answered, deferred). Read as a position rather than as a substring anywhere in the call,
+#: so an argument that merely contains the word cannot stand in for it.
+_FLIP_OWNER_ARG = 4
+
+
 class TestRatchet:
     def test_no_channel_keeps_its_own_receipt_registry_or_lock(self) -> None:
         """A third copy of this subsystem must fail here, not in production."""
@@ -485,10 +496,16 @@ class TestAnAddressKeyNamesOneConversation:
         ``lines``; a write anywhere else would retain a whole burst verbatim, or an
         uncapped list of records, for the life of the process -- the defect this pin
         exists to stop coming back.
+
+        Emptying the list is the other direction and cannot retain anything, so it has
+        its own seam: ``abandon``, which gives a debt up and returns the count that keeps
+        the loss from being silent. Pinned here as well, so a third site cannot discard
+        records by claiming to be that one.
         """
         src = Path(Q.__file__).with_suffix(".py").read_text(encoding="utf-8")
         tree = ast.parse(src)
         offenders = []
+        emptied = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
                 for target in node.targets:
@@ -497,11 +514,13 @@ class TestAnAddressKeyNamesOneConversation:
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "append"
                 and isinstance(node.func.value, ast.Attribute)
                 and node.func.value.attr == "owed_bodies"
             ):
-                offenders.append(node.lineno)
+                if node.func.attr == "append":
+                    offenders.append(node.lineno)
+                elif node.func.attr == "clear":
+                    emptied.append(node.lineno)
         # The one inside terminalize is the seam itself.
         assert len(offenders) == 1, (
             "owed_bodies is written outside terminalize, so that site retains records "
@@ -512,6 +531,13 @@ class TestAnAddressKeyNamesOneConversation:
         ]
         assert seam, "terminalize is gone; the bound has no home"
         assert seam[0].lineno < offenders[0] < seam[0].end_lineno
+        give_up = [
+            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "abandon"
+        ]
+        assert give_up, "abandon is gone; giving a debt up has no counted seam"
+        assert all(
+            give_up[0].lineno < line < give_up[0].end_lineno for line in emptied
+        ), f"owed_bodies is emptied outside abandon, so those records drop uncounted: {emptied}"
 
     def test_every_receipt_surface_stand_in_names_its_address(self) -> None:
         """A fake without an address withholds every write, and says nothing about why.
@@ -687,6 +713,10 @@ class TestSeveralOwedRecordsSurviveInOrder:
 
         The OLDEST is released on overflow: the newest record is the one that corrects
         what the reader can currently see.
+
+        Driven by drains alone. A grow against a terminal entry is a refused publication
+        too, so interleaving them would spend the lifetime allowance before the list could
+        overflow -- which is why that allowance is sized off this cap.
         """
 
         async def go() -> ReceiptQueue:
@@ -696,7 +726,6 @@ class TestSeveralOwedRecordsSurviveInOrder:
                 await queue.create_or_grow_locked("s", chat, "m0", "alice")
                 for n in range(RECEIPT_MAX_OWED + 2):
                     await queue.flip_answering_locked("s", chat, [f"m{n}"])
-                    await queue.create_or_grow_locked("s", chat, f"m{n + 1}", "alice")
             return queue
 
         receipt = asyncio.run(go())._receipts["s"]
@@ -713,6 +742,9 @@ class TestSeveralOwedRecordsSurviveInOrder:
         A mid-turn message meeting a terminal entry gets no bubble, and its line is not
         kept: no path reads a terminal entry's lines, so keeping them would change
         nothing a reader sees while holding a verbatim burst for the whole outage.
+
+        Held inside the lifetime allowance, so what is pinned here is the line retention
+        alone; giving the debt up past that allowance has its own tests.
         """
 
         async def go() -> ReceiptQueue:
@@ -721,7 +753,7 @@ class TestSeveralOwedRecordsSurviveInOrder:
             async with queue.lock:
                 await queue.create_or_grow_locked("s", chat, "first", "alice")
                 await queue.flip_answering_locked("s", chat, ["first"])
-                for n in range(6):
+                for n in range(Q.RECEIPT_MAX_PUBLISH_ATTEMPTS - 2):
                     await queue.create_or_grow_locked("s", chat, f"during outage {n}", "alice")
             return queue
 
@@ -899,3 +931,653 @@ class TestReleasedRecordsAreCounted:
         chat = asyncio.run(go())
         assert all(self.OMITTED not in body for _, body in chat.edits)
         assert all(self.OMITTED not in body for body in chat.sent)
+
+
+class TestRetentionIsBoundedInLifetimeAndPopulation:
+    """A debt is kept while it is plausibly publishable, and while the registry has room.
+
+    ``RECEIPT_MAX_OWED`` bounds how much one debt holds. These bound the other two ways it
+    can grow without end: how LONG one is held, and how MANY are held. The entry is the
+    registry's only entry for its session key, and a key can span several conversations,
+    so a debt that is never given up is a key that is never released -- and every healthy
+    conversation sharing it goes without receipts too.
+    """
+
+    GIVEN_UP = "queue receipt debt given up"
+
+    @staticmethod
+    def given_up(caplog: Any) -> list[int]:
+        """The record count from each give-up warning, in order.
+
+        A released record leaves no other trace, so the warning IS the accounting. Read as
+        the log's own arguments rather than its rendered text, which is what the operator's
+        handler receives.
+        """
+        return [
+            r.args[2]
+            for r in caplog.records
+            if isinstance(r.args, tuple) and len(r.args) == 3 and "given up" in str(r.msg)
+        ]
+
+    @staticmethod
+    async def _owing(chat: _Surface, key: str = "s") -> ReceiptQueue:
+        """A terminal entry on *key*, owing one record that reached nobody."""
+        queue = ReceiptQueue()
+        async with queue.lock:
+            await queue.create_or_grow_locked(key, chat, "first", "alice")
+            await queue.flip_answering_locked(key, chat, ["first"])
+        assert queue._receipts[key].owes_record, "the record was refused, so it is owed"
+        return queue
+
+    def test_the_allowance_outlives_the_records_the_size_cap_needs(self) -> None:
+        """The two bounds race, and the sizing is what keeps the size cap reachable.
+
+        A debt takes on one record per refused publication, so an allowance shorter than
+        the retentions ``RECEIPT_MAX_OWED`` needs would give the debt up before that cap
+        could ever bite -- leaving ``omitted_records`` describing a state nothing reaches.
+        """
+        assert Q.RECEIPT_MAX_PUBLISH_ATTEMPTS > RECEIPT_MAX_OWED + 2
+
+    def test_a_conversation_that_refuses_every_write_gives_the_debt_up(self, caplog) -> None:
+        """The permanent-failure case: neither the edit nor the post ever lands.
+
+        Every arriving message is turned away with no bubble while the debt is held, so the
+        allowance bounds the acknowledgements one debt may cost. Past it the debt is given
+        up and the key released.
+        """
+
+        async def go() -> tuple[ReceiptQueue, bool]:
+            # One surface throughout, and its sends are spent, so nothing this
+            # conversation is offered can land and no fresh bubble hides the release.
+            chat = _Surface(edit_refuses=True, send_fails_after=1)
+            queue = await self._owing(chat)
+            async with queue.lock:
+                # The refusal that created the debt counts as one, so this is one short.
+                for _ in range(Q.RECEIPT_MAX_PUBLISH_ATTEMPTS - 2):
+                    await queue.create_or_grow_locked("s", chat, "again", "alice")
+                held = "s" in queue._receipts
+                await queue.create_or_grow_locked("s", chat, "again", "alice")
+            return queue, held
+
+        with caplog.at_level("WARNING", logger="kiro_crew.messaging.queue_receipt"):
+            queue, held = asyncio.run(go())
+        assert held, "inside the allowance the record is still owed, not discarded"
+        assert "s" not in queue._receipts, "past it the debt is given up and the key freed"
+        assert self.given_up(caplog) == [1], "the record given up is counted, not dropped"
+
+    def test_the_ordinary_grow_and_drain_pattern_reaches_the_bound(self, caplog) -> None:
+        """The interleaving the bound exists for, and the one it must not be blind to.
+
+        Real traffic alternates a mid-turn message with the drain that answers it, and both
+        are refused publications against a dead conversation. A retention that restarted
+        the allowance would leave the count oscillating below the cap forever, so the key
+        would never be released however long the outage lasted.
+        """
+
+        async def go() -> ReceiptQueue:
+            chat = _Surface(edit_refuses=True, send_fails_after=1)
+            queue = await self._owing(chat)
+            async with queue.lock:
+                for n in range(Q.RECEIPT_MAX_PUBLISH_ATTEMPTS):
+                    await queue.create_or_grow_locked("s", chat, f"mid {n}", "alice")
+                    await queue.flip_answering_locked("s", chat, [f"mid {n}"])
+            return queue
+
+        with caplog.at_level("WARNING", logger="kiro_crew.messaging.queue_receipt"):
+            queue = asyncio.run(go())
+        assert not queue.has_receipt("s"), "no live bubble on a conversation taking nothing"
+        assert "s" not in queue._receipts, "the key is released despite the interleaving"
+        assert self.given_up(caplog), "and what it cost is counted"
+
+    def test_a_healthy_sibling_on_a_shared_key_gets_its_receipt_back(self) -> None:
+        """The harm the lifetime bound exists to end.
+
+        One session key can span several conversations -- a group space routes as one key
+        for every member. While an unreachable conversation holds the key, a healthy
+        sibling's mid-turn message takes the terminal branch and gets no bubble. Once the
+        debt is given up, the very next message opens a fresh bubble on the sibling's own
+        surface.
+        """
+
+        async def go() -> tuple[ReceiptQueue, _Surface]:
+            gone = _Surface(edit_refuses=True, send_fails_after=1, address="gone")
+            queue = await self._owing(gone)
+            alive = _Surface(address="alive")
+            async with queue.lock:
+                for _ in range(Q.RECEIPT_MAX_PUBLISH_ATTEMPTS - 1):
+                    await queue.create_or_grow_locked("s", alive, "hello", "bob")
+            return queue, alive
+
+        queue, alive = asyncio.run(go())
+        assert alive.sent == [receipt_text(["hello"])], "the sibling gets one fresh bubble"
+        assert queue.has_receipt("s"), "and a live entry, so its next message grows that one"
+        assert queue._receipts["s"].address == alive.address_key, "opened on the sibling"
+
+    def test_a_spent_debt_still_gives_a_sibling_drain_its_record(self, caplog) -> None:
+        """A drain answering a HEALTHY chat is not given up with the dead one's debt.
+
+        The release exists to hand the key back to the siblings, so discarding the very
+        record that arrives on a working surface would be the harm it was meant to end. The
+        debt's refusals are evidence about the dead conversation and none about this one,
+        and the answered messages have already left the queue, so the record is posted
+        there rather than counted lost.
+        """
+
+        async def go() -> tuple[ReceiptQueue, _Surface]:
+            gone = _Surface(edit_refuses=True, send_fails_after=1, address="gone")
+            queue = await self._owing(gone)
+            alive = _Surface(address="alive")
+            async with queue.lock:
+                # One short of the allowance, so the drain below is the attempt that
+                # spends it.
+                for _ in range(Q.RECEIPT_MAX_PUBLISH_ATTEMPTS - 2):
+                    await queue.create_or_grow_locked("s", gone, "again", "alice")
+                await queue.flip_answering_locked("s", alive, ["hello"])
+            return queue, alive
+
+        with caplog.at_level("WARNING", logger="kiro_crew.messaging.queue_receipt"):
+            queue, alive = asyncio.run(go())
+        assert alive.sent == [receipt_text(["hello"], answering=True)], "posted on its own"
+        assert "s" not in queue._receipts, "and the dead conversation's key is released"
+        assert self.given_up(caplog) == [1], "only the debt's own record is given up"
+
+    def test_a_sibling_record_its_own_chat_refuses_is_counted(self, caplog) -> None:
+        """The loss is accounted for when the sibling's surface will not take it either.
+
+        Then this record does reach nobody, and a bound that released it silently would be
+        indistinguishable from one that never held anything.
+        """
+
+        async def go() -> ReceiptQueue:
+            gone = _Surface(edit_refuses=True, send_fails_after=1, address="gone")
+            queue = await self._owing(gone)
+            # Sends past zero fail, so the sibling has a working address and no channel.
+            mute = _Surface(address="alive", send_fails_after=0)
+            async with queue.lock:
+                for _ in range(Q.RECEIPT_MAX_PUBLISH_ATTEMPTS - 2):
+                    await queue.create_or_grow_locked("s", gone, "again", "alice")
+                await queue.flip_answering_locked("s", mute, ["hello"])
+            return queue
+
+        with caplog.at_level("WARNING", logger="kiro_crew.messaging.queue_receipt"):
+            queue = asyncio.run(go())
+        assert "s" not in queue._receipts, "the key is still released"
+        assert self.given_up(caplog) == [1, 1], "the debt, then the record that followed it"
+
+    def test_a_debt_that_publishes_part_of_itself_is_not_given_up(self, caplog) -> None:
+        """Landing a body restarts the allowance, so a slow channel keeps its records.
+
+        The allowance is spent by attempts that move NOTHING. A channel that lands the
+        oldest record and refuses the next is working, and giving the rest up there would
+        discard records on their way to a reader.
+        """
+
+        async def go() -> tuple[ReceiptQueue, int]:
+            chat = _Surface(edit_refuses=True, send_fails_after=1)
+            queue = await self._owing(chat)
+            async with queue.lock:
+                # A second record joins the debt, then arriving messages are turned away
+                # until one attempt short of the allowance.
+                await queue.flip_answering_locked("s", chat, ["second"])
+                while queue._receipts["s"].publish_failures < Q.RECEIPT_MAX_PUBLISH_ATTEMPTS - 1:
+                    await queue.create_or_grow_locked("s", chat, "again", "alice")
+                spent = queue._receipts["s"].publish_failures
+                # Edits land again: the oldest record publishes, the newer one still
+                # cannot be posted beneath it.
+                chat.edit_refuses = False
+                await queue.create_or_grow_locked("s", chat, "again", "alice")
+            return queue, spent
+
+        with caplog.at_level("WARNING", logger="kiro_crew.messaging.queue_receipt"):
+            queue, spent = asyncio.run(go())
+        assert spent == Q.RECEIPT_MAX_PUBLISH_ATTEMPTS - 1, "it really was one short"
+        receipt = queue._receipts["s"]
+        assert receipt.owed_bodies == [receipt_text(["second"], answering=True)]
+        assert receipt.publish_failures == 0, "one record landed, so the allowance restarts"
+        assert self.given_up(caplog) == [], "nothing is given up while the debt is draining"
+
+    def test_a_given_up_debt_does_not_re_arm_its_own_key(self, caplog) -> None:
+        """A drain meeting a spent debt must not put the key straight back into retention.
+
+        Its own record has nowhere to go -- the attempt just refused an edit AND a post on
+        that surface -- so retaining it would re-arm the very key the bound released, with
+        a fresh allowance, and starve the siblings again. It goes with the debt instead,
+        counted rather than dropped.
+        """
+
+        async def go() -> ReceiptQueue:
+            chat = _Surface(edit_refuses=True, send_fails_after=1)
+            queue = await self._owing(chat)
+            async with queue.lock:
+                for n in range(Q.RECEIPT_MAX_PUBLISH_ATTEMPTS):
+                    await queue.flip_answering_locked("s", chat, [f"drain {n}"])
+            return queue
+
+        with caplog.at_level("WARNING", logger="kiro_crew.messaging.queue_receipt"):
+            queue = asyncio.run(go())
+        assert "s" not in queue._receipts, "the key stays released, not re-armed"
+        counts = self.given_up(caplog)
+        assert len(counts) == 1, "given up once, not a second write-off on the same entry"
+        assert counts[0] > RECEIPT_MAX_OWED, (
+            "the count covers more than the bodies still held: the omitted records the "
+            "entry carried, and this drain's own record that died with the debt"
+        )
+
+    def test_a_key_that_stops_arriving_is_released_by_the_population_bound(self, caplog) -> None:
+        """The orphan case: a debt no transition will ever visit again.
+
+        A session key carries a generation that rotates on reset, so traffic moves to a new
+        key and the debt on the old one is never retried -- per-debt attempts cannot expire
+        what is never attempted. The population bound is what reaches it.
+        """
+
+        async def go() -> ReceiptQueue:
+            queue = await self._owing(
+                _Surface(edit_refuses=True, send_fails_after=1, address="before"), "s"
+            )
+            async with queue.lock:
+                for n in range(Q.RECEIPT_MAX_DEBTS):
+                    key = f"s:gen{n + 1}"
+                    chat = _Surface(edit_refuses=True, send_fails_after=1, address=key)
+                    await queue.create_or_grow_locked(key, chat, "m", "alice")
+                    await queue.flip_answering_locked(key, chat, ["m"])
+            return queue
+
+        with caplog.at_level("WARNING", logger="kiro_crew.messaging.queue_receipt"):
+            queue = asyncio.run(go())
+        assert "s" not in queue._receipts, "the orphaned pre-rotation debt is the one released"
+        assert len(queue._receipts) == Q.RECEIPT_MAX_DEBTS, "the registry is held at the bound"
+        assert self.given_up(caplog) == [1], "the released record is counted, not silent"
+
+    def test_the_population_bound_spares_a_debt_that_is_still_being_retried(self) -> None:
+        """Eviction position follows what was ATTEMPTED, not only what was retained.
+
+        A debt refused on every burst is the opposite of silent, and it still has a channel
+        to hope for. Reading position from retentions alone would leave it at the front and
+        evict it while an untouched orphan sat behind it -- losing the record that had the
+        better chance.
+        """
+
+        async def go() -> ReceiptQueue:
+            retried = _Surface(edit_refuses=True, send_fails_after=1, address="retried")
+            queue = await self._owing(retried, "retried")
+            async with queue.lock:
+                # An orphan retained AFTER it, so retention order alone would spare the
+                # orphan and evict the one still being addressed.
+                orphan = _Surface(edit_refuses=True, send_fails_after=1, address="orphan")
+                await queue.create_or_grow_locked("orphan", orphan, "m", "alice")
+                await queue.flip_answering_locked("orphan", orphan, ["m"])
+                # The retried debt is attempted again, which is what moves it behind.
+                await queue.create_or_grow_locked("retried", retried, "again", "alice")
+                for n in range(Q.RECEIPT_MAX_DEBTS - 1):
+                    key = f"filler{n}"
+                    chat = _Surface(edit_refuses=True, send_fails_after=1, address=key)
+                    await queue.create_or_grow_locked(key, chat, "m", "alice")
+                    await queue.flip_answering_locked(key, chat, ["m"])
+            return queue
+
+        queue = asyncio.run(go())
+        assert "orphan" not in queue._receipts, "the untouched debt is the victim"
+        assert "retried" in queue._receipts, "the one still being retried keeps its record"
+
+    def test_the_population_bound_counts_the_records_already_counted_as_omitted(
+        self, caplog
+    ) -> None:
+        """A released debt carries its own count of losses, and that is given up too.
+
+        Counting only the bodies still held would lose a count that was itself the record
+        of a loss -- the same silence one level up.
+        """
+
+        async def go() -> ReceiptQueue:
+            chat = _Surface(edit_refuses=True, send_fails_after=1, address="before")
+            queue = ReceiptQueue()
+            async with queue.lock:
+                await queue.create_or_grow_locked("s", chat, "first", "alice")
+                # Six records owed: four retained, two counted as omitted.
+                for n in range(RECEIPT_MAX_OWED + 2):
+                    await queue.flip_answering_locked("s", chat, [f"drain {n}"])
+                overflowed = queue._receipts["s"]
+                assert len(overflowed.owed_bodies) == RECEIPT_MAX_OWED
+                assert overflowed.omitted_records == 2
+                for n in range(Q.RECEIPT_MAX_DEBTS):
+                    key = f"s:gen{n + 1}"
+                    other = _Surface(edit_refuses=True, send_fails_after=1, address=key)
+                    await queue.create_or_grow_locked(key, other, "m", "alice")
+                    await queue.flip_answering_locked(key, other, ["m"])
+            return queue
+
+        with caplog.at_level("WARNING", logger="kiro_crew.messaging.queue_receipt"):
+            queue = asyncio.run(go())
+        assert "s" not in queue._receipts
+        assert RECEIPT_MAX_OWED + 2 in self.given_up(caplog), "held bodies AND the omitted"
+
+    def test_the_population_bound_never_releases_a_live_entry(self, caplog) -> None:
+        """A live entry's messages are still QUEUED, so its bubble is not the registry's.
+
+        Dropping one strands that bubble on "⏳ Queued" and opens a second beside it. Only
+        terminal entries are candidates, however full the registry is.
+        """
+
+        async def go() -> ReceiptQueue:
+            queue = ReceiptQueue()
+            live = _Surface(address="live")
+            async with queue.lock:
+                await queue.create_or_grow_locked("live", live, "still queued", "alice")
+                for n in range(Q.RECEIPT_MAX_DEBTS + 3):
+                    key = f"debt{n}"
+                    chat = _Surface(edit_refuses=True, send_fails_after=1, address=key)
+                    await queue.create_or_grow_locked(key, chat, "m", "alice")
+                    await queue.flip_answering_locked(key, chat, ["m"])
+            return queue
+
+        with caplog.at_level("WARNING", logger="kiro_crew.messaging.queue_receipt"):
+            queue = asyncio.run(go())
+        assert queue.has_receipt("live"), "the live entry survives a registry full of debts"
+        assert queue._receipts["live"].texts == ["still queued"]
+        assert len(self.given_up(caplog)) == 3, "only the terminal entries past the bound go"
+
+    def test_giving_a_debt_up_says_nothing_to_the_reader(self) -> None:
+        """The count is for the operator's log, not for a chat nobody can write to.
+
+        Every write to that conversation has just been refused, so there is no reader to
+        tell. What the bound leaves behind is the bubble's own stale text, which no write
+        could have corrected either.
+        """
+
+        async def go() -> list[str]:
+            chat = _Surface(edit_refuses=True, send_fails_after=1)
+            queue = await self._owing(chat)
+            # Read from here on rather than clearing the log: the fake refuses sends past
+            # a count of what it has already sent, so emptying it would let them land.
+            mark_sent, mark_edits = len(chat.sent), len(chat.edits)
+            async with queue.lock:
+                for _ in range(Q.RECEIPT_MAX_PUBLISH_ATTEMPTS):
+                    await queue.create_or_grow_locked("s", chat, "again", "alice")
+            return chat.sent[mark_sent:] + [b for _, b in chat.edits[mark_edits:]]
+
+        offered = asyncio.run(go())
+        assert all("omitted" not in body for body in offered)
+        assert all("given up" not in body for body in offered)
+
+
+class TestAPartialDrainKeepsWhatIsStillQueuedHere:
+    """One bubble, two members, one drain: the flip may not retire what it did not answer.
+
+    A group space routes as one session key AND one address, so every member's mid-turn
+    message lands on the SAME bubble and ``addressed_by`` is true for all of them. The
+    drain still answers ONE principal per turn -- entries collapse only when the sender
+    matches -- so at a shared address a PARTIAL drain is the ordinary case. Retiring the
+    bubble there takes away the only handle the other member's message has: their own
+    later drain finds no entry to flip, so nothing records them at all, and their
+    acknowledgement is erased while the message is still queued.
+
+    The remedy is the guard the partial stop already ships one method below, asked of the
+    bubble's own address. What remains is three different things and only one of them may
+    hold the key, which is why each is its own test here.
+    """
+
+    #: Two members of one space: different principals, ONE address.
+    ALICE = "webex\x00a@example.com\x00SPACE\x00"
+    BOB = "webex\x00b@example.com\x00SPACE\x00"
+
+    @staticmethod
+    async def _shared_bubble(surface: _Surface, lines: list[tuple[str, str]]) -> ReceiptQueue:
+        """One bubble grown over *lines*, the way a two-member burst grows it."""
+        queue = ReceiptQueue()
+        async with queue.lock:
+            for owner, text in lines:
+                await queue.create_or_grow_locked("s", surface, text, owner)
+        return queue
+
+    def test_the_bubble_is_re_rendered_as_queued_not_as_answering(self) -> None:
+        """ "Now answering" would say Bob's message went, and it is still on the queue."""
+
+        async def go() -> _Surface:
+            s = _Surface()
+            queue = await self._shared_bubble(s, [(self.ALICE, "alice asked"), (self.BOB, "bob")])
+            async with queue.lock:
+                await queue.flip_answering_locked("s", s, ["alice asked"], 0, self.ALICE)
+            return s
+
+        s = asyncio.run(go())
+        assert s.edits[-1] == (7, receipt_text(["bob"]))
+        assert all("Now answering" not in body for _, body in s.edits)
+
+    def test_the_entry_survives_so_the_second_members_drain_can_flip_it(self) -> None:
+        """The half that matters: the entry is that message's only handle."""
+
+        async def go() -> ReceiptQueue:
+            s = _Surface()
+            queue = await self._shared_bubble(s, [(self.ALICE, "alice asked"), (self.BOB, "bob")])
+            async with queue.lock:
+                await queue.flip_answering_locked("s", s, ["alice asked"], 0, self.ALICE)
+            return queue
+
+        queue = asyncio.run(go())
+        assert queue.has_receipt("s"), "Bob is still queued, so the bubble keeps its handle"
+        assert queue._receipts["s"].texts == ["bob"], "only the answered line was taken"
+
+    def test_the_second_members_own_drain_then_records_them_exactly_once(self) -> None:
+        """End of the sequence: one record for Bob, and no duplicate of Alice's text."""
+
+        async def go() -> tuple[ReceiptQueue, _Surface]:
+            s = _Surface()
+            queue = await self._shared_bubble(s, [(self.ALICE, "alice asked"), (self.BOB, "bob")])
+            async with queue.lock:
+                await queue.flip_answering_locked("s", s, ["alice asked"], 0, self.ALICE)
+                await queue.flip_answering_locked("s", s, ["bob"], 0, self.BOB)
+            return queue, s
+
+        queue, s = asyncio.run(go())
+        answering = [body for _, body in s.edits if "Now answering" in body]
+        assert answering == [receipt_text(["bob"], answering=True)]
+        assert not queue.has_receipt("s"), "nothing is left queued here, so the key is released"
+        assert all("alice asked" not in body for body in answering)
+
+    def test_a_refused_re_render_owes_no_record(self) -> None:
+        """These messages have NOT left the queue, so this transition is a grow, not a flip.
+
+        Owing a record here would publish "still queued" as a durable record and make the
+        entry terminal, which stops it being grown -- so the next mid-turn message would
+        open a second bubble beside a bubble that is still correct.
+        """
+
+        async def go() -> ReceiptQueue:
+            s = _Surface(edit_refuses=True)
+            queue = await self._shared_bubble(s, [(self.ALICE, "alice asked"), (self.BOB, "bob")])
+            async with queue.lock:
+                await queue.flip_answering_locked("s", s, ["alice asked"], 0, self.ALICE)
+            return queue
+
+        queue = asyncio.run(go())
+        receipt = queue._receipts["s"]
+        assert not receipt.owes_record and receipt.owed_bodies == []
+        assert queue.has_receipt("s"), "a refused re-render leaves the entry LIVE, not terminal"
+
+    def test_a_line_at_another_address_does_not_hold_the_bubble(self) -> None:
+        """The other side of the rule, or it is a mute button rather than a guard.
+
+        A unified DM scope puts two chats on one key, and the other chat's line was never
+        rendered on this bubble -- so it is owed nothing by it and the bubble retires
+        normally. That line keeps its own record through its own chat's bubble.
+        """
+
+        async def go() -> tuple[ReceiptQueue, _Surface]:
+            here, elsewhere = _Surface(address="here"), _Surface(address="elsewhere")
+            queue = ReceiptQueue()
+            async with queue.lock:
+                await queue.create_or_grow_locked("s", here, "alice asked", self.ALICE)
+                await queue.create_or_grow_locked("s", elsewhere, "bob elsewhere", self.BOB)
+                await queue.flip_answering_locked("s", here, ["alice asked"], 0, self.ALICE)
+            return queue, here
+
+        queue, here = asyncio.run(go())
+        assert here.edits[-1] == (7, receipt_text(["alice asked"], answering=True))
+        assert not queue.has_receipt("s"), "another chat's line is not this bubble's to keep"
+
+    def test_the_answered_principals_own_cap_remainder_still_flips(self) -> None:
+        """``+N deferred`` is the contract for one's OWN remainder, and it is left alone.
+
+        Those messages are answered by this same principal's very next drain and the flip
+        body says so, so they are not a reason to hold the bubble. Only another
+        principal's line is -- theirs is answered by a drain that needs this entry.
+        """
+
+        async def go() -> tuple[ReceiptQueue, _Surface]:
+            s = _Surface()
+            queue = await self._shared_bubble(s, [(self.ALICE, "first"), (self.ALICE, "second")])
+            async with queue.lock:
+                await queue.flip_answering_locked("s", s, ["first"], 1, self.ALICE)
+            return queue, s
+
+        queue, s = asyncio.run(go())
+        assert "Now answering" in s.edits[-1][1] and "+1 deferred" in s.edits[-1][1]
+        assert not queue.has_receipt("s")
+
+    def test_an_unnamed_caller_finalises_the_whole_bubble_as_before(self) -> None:
+        """No principal named, so nothing can be told apart from it. Unchanged behaviour."""
+
+        async def go() -> ReceiptQueue:
+            s = _Surface()
+            queue = await self._shared_bubble(s, [(self.ALICE, "alice asked"), (self.BOB, "bob")])
+            async with queue.lock:
+                await queue.flip_answering_locked("s", s, ["alice asked"])
+            return queue
+
+        queue = asyncio.run(go())
+        assert not queue.has_receipt("s")
+
+    def test_only_the_answered_lines_are_taken_not_the_principals_whole_list(self) -> None:
+        """The record-level half, on the object that holds it.
+
+        A drain collapses in arrival order up to its cap and re-enqueues the rest, so
+        what is still queued is that principal's LATEST lines -- dropping their lines
+        outright would take a message that is still queued off the list the next
+        re-render is built from.
+        """
+        from kiro_crew.messaging.queue_receipt import QueueReceipt, ReceiptLine
+
+        here = receipt_address_key("fake", "chat")
+        receipt = QueueReceipt(
+            msg_id=7,
+            opened_on=_Surface(),
+            lines=[
+                ReceiptLine(owner=self.ALICE, text="a1", address=here),
+                ReceiptLine(owner=self.BOB, text="b1", address=here),
+                ReceiptLine(owner=self.ALICE, text="a2", address=here),
+            ],
+        )
+        # One of Alice's two went back on the queue, so "a1" was answered and "a2" was not.
+        receipt.drop_answered(self.ALICE, 1)
+        assert receipt.texts == ["b1", "a2"]
+        assert receipt.others_at_address(self.ALICE) == ["b1"]
+
+    def test_a_full_drain_keeping_nothing_drops_every_line_that_principal_has(self) -> None:
+        """``still_queued`` of zero is the ordinary drain, and it must keep none.
+
+        Guards the slice: ``-0`` is ``0``, so expressing "keep the last zero" as a plain
+        negative slice answers EMPTY and would drop nothing at all on exactly the case
+        that has to drop everything.
+        """
+        from kiro_crew.messaging.queue_receipt import QueueReceipt, ReceiptLine
+
+        here = receipt_address_key("fake", "chat")
+        receipt = QueueReceipt(
+            msg_id=7,
+            opened_on=_Surface(),
+            lines=[
+                ReceiptLine(owner=self.ALICE, text="a1", address=here),
+                ReceiptLine(owner=self.BOB, text="b1", address=here),
+                ReceiptLine(owner=self.ALICE, text="a2", address=here),
+            ],
+        )
+        receipt.drop_answered(self.ALICE, 0)
+        assert receipt.texts == ["b1"]
+
+    def test_an_unrecorded_earlier_message_does_not_cost_a_queued_one_its_line(self) -> None:
+        """The count-mismatch case, which is why the drop counts from the END.
+
+        A queued message does not always open a line: Alice's FIRST had its
+        ``send_receipt`` refused, so the bubble Bob opened lists only Bob's line and
+        Alice's SECOND. A drain that answers Alice's first therefore answers one message
+        while Alice holds one line -- and that line belongs to a message still on the
+        queue. Dropping "as many as were answered" consumes it, and since that line is
+        the only handle her still-queued message has, it would lose both its
+        acknowledgement here and its own final record.
+        """
+        from kiro_crew.messaging.queue_receipt import QueueReceipt, ReceiptLine
+
+        here = receipt_address_key("fake", "chat")
+        receipt = QueueReceipt(
+            msg_id=7,
+            opened_on=_Surface(),
+            lines=[
+                ReceiptLine(owner=self.BOB, text="b1", address=here),
+                ReceiptLine(owner=self.ALICE, text="a2", address=here),
+            ],
+        )
+        # The drain answered Alice's "a1" -- which never opened a line -- and put "a2"
+        # back, so exactly one of hers is still queued.
+        receipt.drop_answered(self.ALICE, 1)
+        assert receipt.texts == ["b1", "a2"]
+        assert receipt.others_at_address(self.ALICE) == ["b1"]
+
+    def test_a_principal_holding_fewer_lines_than_are_queued_loses_none(self) -> None:
+        """Fewer lines than still-queued messages resolves toward keeping, never dropping.
+
+        Every line they hold is still queued, so none may go. The alternative direction
+        is unrecoverable: a line left listed is re-rendered by the next transition, a
+        line removed is gone.
+        """
+        from kiro_crew.messaging.queue_receipt import QueueReceipt, ReceiptLine
+
+        here = receipt_address_key("fake", "chat")
+        receipt = QueueReceipt(
+            msg_id=7,
+            opened_on=_Surface(),
+            lines=[ReceiptLine(owner=self.ALICE, text="a3", address=here)],
+        )
+        receipt.drop_answered(self.ALICE, 2)
+        assert receipt.texts == ["a3"]
+
+    def test_every_drain_names_the_principal_it_answered(self) -> None:
+        """A source check, because the point is that NO drain is missing the argument.
+
+        A channel wired up later cannot inherit the whole-bubble retire by leaving it
+        out, and no behavioural test can be written in advance for a drain that does not
+        exist yet. Each dispatcher either passes an owner token at the flip or hands one
+        to its own ``_receipt_flip_locked`` wrapper.
+
+        Judged PER CALL, and in the owner's own ARGUMENT POSITION. Asking whether the
+        file mentions an owner somewhere lets a wrapper that forwards one to the registry
+        answer for the whole channel, while the drain call one layer above it -- the call
+        that decides what the wrapper has to forward -- goes unread. And a substring test
+        over every argument passes on any expression that merely contains the word.
+        """
+        seen = 0
+        offenders: list[str] = []
+        for path in _dispatchers():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name not in _FLIP_CALLEES:
+                    continue
+                seen += 1
+                keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+                owner = keywords.get("owner")
+                if owner is None and len(node.args) > _FLIP_OWNER_ARG:
+                    owner = node.args[_FLIP_OWNER_ARG]
+                spelled = "" if owner is None else ast.unparse(owner)
+                if spelled in {"", '""', "''"}:
+                    offenders.append(f"{path.parent.name}:{node.lineno} {name}")
+        # A control on the scan itself: an empty offender list must mean the calls were
+        # read and named their principal, not that the pattern matched nothing at all.
+        assert seen >= len(_FLIP_CALLEES) * 2, f"the flip-call scan found only {seen} call(s)"
+        assert not offenders, (
+            "these flip calls do not name whose messages they answered, so the bubble is "
+            f"retired over another principal's still-queued lines: {offenders}"
+        )

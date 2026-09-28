@@ -1,4 +1,5 @@
 [
+  "components.redaction.coach_title",
   "pages.overview.vectorMemoryCard.repair_deferred",
   "pages.overview.vectorMemoryCard.repair_invalidation",
   "pages.overview.vectorMemoryCard.repair_vectors",
@@ -93,6 +94,7 @@
   "apps.pptxMaker.pptxMakerPage.slide_count",
   "apps.specBuilder.components.specDetail.pending_comment",
   "apps.workflows.workflowRunTree.agent",
+  "components.agentSkillsEditor.mapping_unresolved_count",
   "components.agentTemplateDetail.changes_count",
   "components.appstore.categoryRail.app",
   "components.artifactFolderDeleteDialog.artifact",
@@ -122,6 +124,7 @@
   "components.skillBrowserModal.file",
   "components.webPreviewPanel.annotate_clear_confirm",
   "components.webPreviewPanel.annotations_count",
+  "components.workspaceTree.unreadable_dismissed",
   "crewCapabilities.memberChanged",
   "pages.aidlc.taskDetailPanel.task_2",
   "pages.appsPage.agent",
@@ -184,6 +187,10 @@
   "pages.membersPage.activity_projects_more",
   "pages.membersPage.activity_routed_count",
   "pages.membersPage.member_count",
+  "pages.membersPage.team_crewmate_count",
+  "pages.membersPage.team_need_you_count",
+  "pages.membersPage.team_state_waiting",
+  "pages.membersPage.team_waiting_count",
   "pages.overview.mcpTab.applied_change",
   "pages.overview.mcpTab.disabled_count",
   "pages.overview.mcpTab.pending_change",
@@ -227,5 +234,13 @@
   "pages.contextBreakdown.scope_turns",
   "pages.contextBreakdown.earlier_hidden",
   "pages.contextBreakdown.scope_all_turns",
-  "components.fileChangeChips.omitted_files_notice"
+  "components.fileChangeChips.omitted_files_notice",
+  "pages.chatSidebar.opened_sessions_count",
+  "pages.overview.memoryTab.skipped_incognito_session",
+  "pages.overview.memoryTab.skipped_temporary_session",
+  "pages.overview.memoryTab.skipped_sessions",
+  "pages.overview.memoryTab.consolidated_sessions_skipped",
+  "pages.overview.memoryTab.consolidate_failed_session",
+  "pages.overview.memoryTab.skipped_temporary_count",
+  "pages.overview.memoryTab.skipped_incognito_count"
 ]

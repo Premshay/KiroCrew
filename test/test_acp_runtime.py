@@ -69,11 +69,32 @@ from kiro_crew.acp.types import (
     METHOD_SET_MODE,
     JsonRpcMessage,
 )
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED
 
 # ── Harness ──
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    A runtime start materialises the agent spec (``ensure_agent_materialized`` ->
+    ``rebuild_agent_config``) and a worker install writes one
+    (``_install_worker_agent`` -> ``_write_worker_spec``); both end in
+    ``_write_derived_permissions``, which reads ``installed_kiro_cli_version``
+    function-locally from ``kiro_crew.kiro_cli``: one real ``kiro-cli --version``
+    spawn per binary identity, process-cached, so whichever test in the worker
+    writes a spec first pays it against the HOST's install with the checkout as
+    the child's cwd. Pinned to the floor release, as ``test_agent.py`` and the
+    generated-writer suites pin it.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
 
 
 @pytest.fixture
@@ -225,11 +246,31 @@ def kas_readiness_wire(monkeypatch, tmp_path):
                 assert name in wire_names
                 element = next(e for e in request["params"]["mcpServers"] if e["name"] == name)
                 assert element["type"] == "stdio"
-                assert element["command"] == projected["mcpServers"][name]["command"]
-                assert element["env"] == [
+                # The resume path owns its array, so its session token rides on
+                # the hoisted element; create_session is handed an explicit array
+                # here, which mints none.
+                tokens = [pair for pair in element["env"] if pair["name"] == STUB_SESSION_TOKEN_ENV]
+                assert len(tokens) == (1 if resume else 0) and all(p["value"] for p in tokens)
+                declared_env = [
                     {"name": k, "value": str(v)}
                     for k, v in (projected["mcpServers"][name].get("env") or {}).items()
                 ]
+                if not tokens:
+                    assert element["command"] == projected["mcpServers"][name]["command"]
+                    assert element["env"] == declared_env
+                    continue
+                # A tokened element launches the managed invocation, never the
+                # spec's (KAS spawns it; gatewayd's own-binary check never runs).
+                from kiro_crew.agent import _managed_mcp_env, managed_mcp_spec_entry
+
+                managed = managed_mcp_spec_entry(name, include_opt_in=True)
+                assert element["command"] == managed["command"]
+                assert element["args"] == [str(a) for a in managed.get("args", [])]
+                assert [p for p in element["env"] if p not in tokens] == [
+                    p
+                    for p in declared_env
+                    if p["name"] in ("KIROCREW_PORT", "KIROCREW_SESSION_KEY")
+                ] + [{"name": k, "value": v} for k, v in _managed_mcp_env().items()]
         if pre_ready:
             status("connected")
             tags("kirocrew-core", "kirocrew-dashboard")
@@ -2073,6 +2114,118 @@ async def test_mark_dead_is_idempotent():
     assert q["sA"].empty()
 
 
+# ── An exit the reader OBSERVES retires the registry entries too ─────────────
+#
+# ``_kill_inner`` untracks the root after its own reap. A root killed from outside
+# reached no kill, so its ``kiro_session_pids.txt`` / ``kiro_pids.txt`` lines
+# survived until the periodic sweep's next tick, up to 300s. Measured on the
+# nightly leak gate: SIGKILL of a background runtime left its line for 293s. The
+# reader loop's EOF branch now retires the two entries once the exit is CONFIRMED,
+# and only then -- a closed stdout on a process that is still running, or one
+# whose exit cannot be confirmed within the reap window, keeps its lines.
+
+
+def _track_untracks(monkeypatch, rt_mod, *, pid_exists: bool):
+    """Record every identity-bound retirement; the real one is pinned in
+    test_pid_lifecycle.py against the files themselves."""
+    calls: list[tuple[int, str | None]] = []
+    monkeypatch.setattr(
+        rt_mod, "_untrack_root_by_identity", lambda p, tok: calls.append((p, tok)) or True
+    )
+    monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda p: pid_exists)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_observed_exit_retires_registry_entries_once_reaped(monkeypatch):
+    """EOF on a root that the child watcher then reaps: both entries are dropped."""
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, reader, proc = _make_runtime()
+    rt._spawn_start_token = "tok-4242"
+    calls = _track_untracks(monkeypatch, rt_mod, pid_exists=False)
+
+    async def _reap():  # the reap lands after EOF, as in the field
+        proc.returncode = -9
+        return -9
+
+    proc.wait = _reap
+    task = await _start_reader(rt)
+    try:
+        reader.feed_eof()
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        await _stop_reader(task)
+    assert rt._dead is True
+    # Bound to the identity read at spawn, never to the bare number.
+    assert calls == [(4242, "tok-4242")]
+    # The status the wait measured reaches the retained summary: a turn or a
+    # cron that records this death sees the real code, not ``<not reaped>``.
+    assert rt._death_label == "-9"
+    assert rt._death_summary is not None and "returncode=-9" in rt._death_summary
+
+
+@pytest.mark.asyncio
+async def test_observed_exit_keeps_tracking_while_the_root_still_runs(monkeypatch):
+    """A closed stdout is not an exit. A root that never exits within the reap
+    window, or one whose pid still answers after the wait, stays tracked -- an
+    untracked live process is invisible to every reaper for the host's uptime."""
+    import kiro_crew.acp.runtime as rt_mod
+
+    # Wait times out: the process closed its pipe and kept running.
+    rt, reader, proc = _make_runtime()
+    calls = _track_untracks(monkeypatch, rt_mod, pid_exists=False)
+    rt._KILL_REAP_TIMEOUT = 0.05
+
+    async def _never_exits():
+        await asyncio.sleep(10)
+
+    proc.wait = _never_exits
+    task = await _start_reader(rt)
+    try:
+        reader.feed_eof()
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        await _stop_reader(task)
+    assert calls == []
+
+    # Reaped by the watcher's account, yet the pid still answers: retain.
+    rt, reader, proc = _make_runtime()
+    calls = _track_untracks(monkeypatch, rt_mod, pid_exists=True)
+    proc.returncode = 1
+    task = await _start_reader(rt)
+    try:
+        reader.feed_eof()
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        await _stop_reader(task)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_eof_inside_an_oversize_line_retires_the_same_way(monkeypatch):
+    """The other observed-EOF return: stdout closes mid-oversize-line. Same
+    confirmed exit, same retirement -- a sibling left to the sweep would carry
+    the very 300s window the empty-line branch closes."""
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, reader, proc = _make_runtime()
+    rt._spawn_start_token = "tok-4242"
+    calls = _track_untracks(monkeypatch, rt_mod, pid_exists=False)
+    proc.returncode = 137
+    task = await _start_reader(rt)
+    try:
+        # Over the reader's line limit with no newline, then EOF: readuntil raises
+        # LimitOverrunError, the drain hits IncompleteReadError.
+        reader.feed_data(b"x" * (reader._limit + 1))
+        reader.feed_eof()
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        await _stop_reader(task)
+    assert rt._dead is True
+    assert calls == [(4242, "tok-4242")]
+
+
 # ── Death-log severity: deliberate teardown vs genuine death ──
 #
 # A warm-pool TTL recycle tears runtimes down via kill() on a schedule; logging
@@ -3295,11 +3448,19 @@ async def test_handle_wait_turn_done_timeout():
     assert result is False
 
 
+def _recorded_request(request_id):
+    """The event the handle builds for a permission request it routes."""
+    from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+
+    return AcpEvent(kind=EVENT_PERMISSION_REQUEST, request_id=request_id, title="notes.txt")
+
+
 @pytest.mark.asyncio
 async def test_handle_approve_tool():
     rt, _, proc = _make_runtime()
     q = _register(rt, "sA")
     handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle._permission_gate_events["req-7"] = _recorded_request("req-7")
     await handle.approve_tool("req-7", option_id="allow_always")
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())
     assert sent["id"] == "req-7"
@@ -3733,6 +3894,7 @@ async def test_approve_tool_echoes_recorded_option():
     handle = AcpSessionHandle("sA", q["sA"], rt)
     # Simulate build_permission_event having recorded claude-agent-acp ids.
     handle._permission_options[42] = {"once": "allow", "always": "allow_always"}
+    handle._permission_gate_events[42] = _recorded_request(42)
     await handle.approve_tool(42)  # no explicit id → resolves the "once" variant
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())
     assert sent["result"]["outcome"]["optionId"] == "allow"
@@ -6264,7 +6426,7 @@ class TestAcpRuntimeLoadSession:
 
             return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
 
-        def _hoist(agents, agent, servers):
+        def _hoist(agents, agent, servers, **_kw):
             # The shape the real hoist produces: a managed server appears on the
             # array that was not in the roster the caller passed in.
             return agents, list(servers) + [{"name": "hoisted", "command": "/bin/h"}]
@@ -6292,6 +6454,77 @@ class TestAcpRuntimeLoadSession:
             "the report reads a different array than the resume sent; rebind "
             "wire_servers at the hoist rather than only load_params['mcpServers']"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+    async def test_kas_hoisted_control_plane_carries_the_session_token(self, monkeypatch, resume):
+        """On KAS the managed servers reach the wire through the hoist, token included.
+
+        The runtime stamps the per-session token onto its array BEFORE
+        ``hoist_managed_servers`` runs, and on KAS that array is empty: every
+        managed server arrives through the hoist. A hoisted ``kirocrew-core``
+        without the token reads its tool policy unattested and refuses every call
+        as ``identity_unattested`` -- memory, logs, spawn_run -- on every session.
+        """
+        rt, _, _ = _make_runtime()
+        rt._can_load_session = True
+        sent: list[tuple[str, dict]] = []
+
+        async def _fake_send(method, params, timeout=None):
+            sent.append((method, params))
+            if method == METHOD_SESSION_LOAD:
+                return {"modes": {"currentModeId": "kirocrew"}, "models": []}
+            if method == METHOD_SESSION_NEW:
+                return {"sessionId": "sid-kas-new"}
+            return {}
+
+        async def _fake_agents(agent, *, member_dispatch=False, crew_panel=False, session_key=""):
+            from kiro_crew.acp.harness import SessionExtras
+
+            return SessionExtras(
+                custom_agents=[
+                    {
+                        "id": agent,
+                        "prompt": "p",
+                        "tools": ["@kirocrew-core", "@external"],
+                        "mcpServers": {
+                            "kirocrew-core": {
+                                "command": "kc",
+                                "args": ["mcp-core"],
+                                "env": {"KIROCREW_SESSION_KEY": session_key},
+                            },
+                            "external": {"command": "ext"},
+                        },
+                    }
+                ]
+            )
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
+        # Readiness is its own concern (see the kas_readiness_wire tests); this one
+        # is about what the request carried, so the wait returns at once.
+        monkeypatch.setattr(AcpSessionHandle, "wait_mcp_ready", AsyncMock(return_value=None))
+        rt._acp_backend = ACP_BACKEND_KAS
+
+        if resume:
+            handle = await rt.load_session(
+                "", "sid-kas-load", cwd="/work", agent="kirocrew", session_key="dashboard:chat-1"
+            )
+            method = METHOD_SESSION_LOAD
+        else:
+            handle = await rt.create_session(
+                cwd="/work", agent="kirocrew", session_key="dashboard:chat-1"
+            )
+            method = METHOD_SESSION_NEW
+        params = next(p for m, p in sent if m == method)
+        core = [e for e in params["mcpServers"] if e.get("name") == "kirocrew-core"]
+        assert len(core) == 1, "kirocrew-core must travel in the session-level array"
+        (token,) = _identity_tokens(core)
+        assert token, "the hoisted kirocrew-core was launched without the session token"
+        assert token == handle.stub_session_token, "the element must carry THIS session's token"
+        # A third-party server stays in the agent block, and never gets the token.
+        (agent_block,) = params["_meta"]["kiro"]["customAgents"]
+        assert STUB_SESSION_TOKEN_ENV not in json.dumps(agent_block)
 
     @pytest.mark.asyncio
     async def test_load_session_keeps_the_transcript_path_alongside_the_agents(self, monkeypatch):
@@ -8594,7 +8827,8 @@ async def test_unknown_session_drops_aggregate_into_one_counted_record(caplog):
         records = _drop_records(caplog)
         assert len(records) == 1, records
         assert (
-            "Dropped 6 unroutable frame(s) for session ghost (method=session/update)" in records[0]
+            "Dropped 6 unroutable frame(s) for session 'ghost' (method='session/update')"
+            in records[0]
         )
         # The point of the change: SIX dropped frames produce ONE log record,
         # not six. Counts every record naming the session, whatever its wording.
@@ -8623,8 +8857,8 @@ async def test_two_unknown_sessions_are_counted_separately(caplog):
         records = _drop_records(caplog)
         assert len(records) == 2, records
         joined = "\n".join(records)
-        assert "Dropped 3 unroutable frame(s) for session sid-aaa" in joined
-        assert "Dropped 2 unroutable frame(s) for session sid-bbb" in joined
+        assert "Dropped 3 unroutable frame(s) for session 'sid-aaa'" in joined
+        assert "Dropped 2 unroutable frame(s) for session 'sid-bbb'" in joined
     finally:
         await _stop_reader(task)
 
@@ -8665,7 +8899,7 @@ async def test_no_session_broadcast_drops_are_counted(caplog):
         records = _drop_records(caplog)
         assert len(records) == 1, records
         assert "Dropped 4 unroutable frame(s)" in records[0]
-        assert "(method=mcp/status)" in records[0]
+        assert "(method='mcp/status')" in records[0]
     finally:
         await _stop_reader(task)
 
@@ -8688,9 +8922,9 @@ def test_drop_counter_state_does_not_leak_between_intervals(caplog):
 
     records = _drop_records(caplog)
     assert len(records) == 2, records
-    assert "Dropped 2 unroutable frame(s) for session sid-x" in records[0]
+    assert "Dropped 2 unroutable frame(s) for session 'sid-x'" in records[0]
     # Not 3 — the first window's count did not carry over.
-    assert "Dropped 1 unroutable frame(s) for session sid-x" in records[1]
+    assert "Dropped 1 unroutable frame(s) for session 'sid-x'" in records[1]
 
 
 def test_drop_counter_map_is_bounded(caplog):
@@ -8724,6 +8958,52 @@ def test_drop_counter_truncates_backend_controlled_key_text():
     assert count == 1
     assert len(session_id) == limit
     assert len(method) == limit
+
+
+def test_drop_key_is_redacted_before_the_retention_cap(caplog):
+    """A credential straddling the 80-char cut leaves no fragment in key or log.
+
+    Redact-before-bound on the retained key: a slice taken FIRST would sever the
+    token at the cap into a head no credential pattern matches, and the flush
+    would then log that head verbatim.
+    """
+    import logging
+
+    import kiro_crew.acp.runtime as runtime_mod
+
+    rt, _reader, _ = _make_runtime()
+    limit = runtime_mod._DROP_SUMMARY_KEY_MAX_CHARS
+    token = "AKIA" + "STRADDLE0123456A"
+    hostile = "s" * (limit - 9) + token + " tail"
+    assert limit - 9 < limit < limit - 9 + len(token), "premise: the cap cuts the token"
+
+    rt._note_dropped_frame(hostile, hostile)
+    (session_id, method), count = next(iter(rt._dropped_frames.items()))
+    assert count == 1
+    for part in (session_id, method):
+        assert "AKIA" not in part and len(part) <= limit
+
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp.runtime"):
+        rt._flush_dropped_frames()
+    records = _drop_records(caplog)
+    assert records, "the flush must still report the drop"
+    assert all("AKIA" not in r for r in records)
+
+
+def test_drop_key_over_the_redact_input_cap_keeps_only_its_length():
+    """A multi-KB key half never reaches the redactor and retains no content."""
+    import kiro_crew.acp._dispatch as acp_dispatch
+    import kiro_crew.acp.runtime as runtime_mod
+
+    rt, _reader, _ = _make_runtime()
+    huge = "ghp_" + "A" * (acp_dispatch._REQUEST_ID_REDACT_INPUT_CAP + 40)
+
+    rt._note_dropped_frame(huge, "session/update")
+
+    (session_id, method), count = next(iter(rt._dropped_frames.items()))
+    assert count == 1 and method == "session/update"
+    assert session_id.startswith("<id too long: ") and "ghp_" not in session_id
+    assert len(session_id) <= runtime_mod._DROP_SUMMARY_KEY_MAX_CHARS
 
 
 def test_drop_counter_handles_missing_method():
@@ -8800,7 +9080,7 @@ def test_drop_counter_placeholder_appears_in_flushed_summary(caplog):
 
     records = _drop_records(caplog)
     assert len(records) == 1, records
-    assert "Dropped 1 unroutable frame(s) for session ? (method=?)" in records[0]
+    assert "Dropped 1 unroutable frame(s) for session '?' (method='?')" in records[0]
 
 
 class TestToolPurposeExtraction:
@@ -9469,6 +9749,13 @@ async def _drain_audits(rt) -> None:
     """Await in-flight audit tasks so none outlives the test's event loop."""
     if rt._audit_tasks:
         await asyncio.gather(*list(rt._audit_tasks), return_exceptions=True)
+
+
+async def _drain_answers(rt) -> None:
+    """Await the retained off-loop permission answers (each writes stdin under
+    the transport's write lock, so a burst completes over several turns)."""
+    if rt._answer_tasks:
+        await asyncio.gather(*list(rt._answer_tasks), return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -12419,6 +12706,9 @@ async def test_buffered_burst_with_responsive_backend_does_not_trip_cap():
     task = await _start_reader(rt)
     try:
         await _drain(reader)
+        # The answers are retained tasks that take the stdin write lock in
+        # turn; wait on that observable condition rather than a turn count.
+        await _drain_answers(rt)
         await _drain_audits(rt)
         # Responsive backend (writes complete immediately): every request
         # answered, cap never tripped.

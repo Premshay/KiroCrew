@@ -578,6 +578,13 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # day-file written later is visible), and every legitimate writer is the
     # gateway, outside the sandbox. Nothing writes a decision row from inside one.
     "decisions",
+    # The hosts a reader allowed long-query links for, per workspace. Every entry
+    # relaxes the exfiltration check for that host, so a writable list lets a
+    # prompt-injected agent allow the host it wants to send conversation data to.
+    # A top-level DIRECTORY for the ``decisions`` reasons: the gateway is the only
+    # writer, an empty directory reads as "no host allowed", and a directory bind
+    # shows the gateway's later writes live.
+    "redaction-allow",
     # Recorded consent to deliver a scanner-flagged file. Same class as
     # ``aws_service_consent.json``: a writable grant lets an auto-approved agent
     # consent, on the owner's behalf, to shipping the owner's secrets. This seal is
@@ -709,6 +716,17 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # mutators via the dashboard/CLI) runs unsandboxed. Absent-file coverage
     # mirrors the sidecar's own entry via the pre-create list.
     "agent_model_state.json.lock",
+    # The operator's approved MCP launch fingerprints (``mcp_gateway.launch_approval``).
+    # An input to a decision that runs a program OUTSIDE the sandbox: gatewayd
+    # spawns a stubbed server's backend as the user, and this record is what says
+    # which command a stubbed name may run. A sandboxed writer could approve its own
+    # command. Read-only, not hidden: it holds hashes and server names, no secret.
+    # Every writer (the dashboard stub toggle, the gateway's rewrite pass) runs in
+    # the gateway process, outside the sandbox.
+    "mcp-launch-approvals",
+    # Gateway resolve-once artifacts choose the entry point substituted for an
+    # approved npm launcher. The installer runs in the unsandboxed gateway.
+    "mcp/resolved",
 )
 
 #: Crew-home leaves that MUST stay read-write for a sandboxed process. Every entry is
@@ -915,6 +933,9 @@ _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
     # outside the sandbox, and nothing writes a decision row from inside one. Also off
     # the read-gate floor, so the mask never covered it either way.
     "decisions",
+    # Allowed hosts for the exfiltration check. Host names, not credentials; the
+    # risk is a write, answered by the read-only seal.
+    "redaction-allow",
     # The operator's cloud configuration and the launch record beside it. Neither holds
     # a credential (``CloudConfig`` documents the file as the operator's own, with none),
     # and in-sandbox code READS both: the provisioner selector resolves the Fargate block
@@ -937,6 +958,12 @@ _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
     # markup reaching the operator's dashboard), and the read-only seal above is what
     # answers it.
     "panel-templates",
+    # Launch fingerprints and server names: no credential, and the decision it
+    # feeds is made by gatewayd outside any sandbox, never by a child reading it.
+    "mcp-launch-approvals",
+    # Launch trees and records contain no credential. Their integrity is enforced
+    # by the read-only mount; foreign harnesses may read the resolved package tree.
+    "mcp/resolved",
 )
 
 
@@ -1416,10 +1443,17 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     # which is the state of every install that has never sampled a decision, and
     # leaves exactly the name an agent would create in order to forge a verdict.
     "decisions",
+    # The redaction allow-list, on the same argument: no file means no host
+    # allowed, which is what an empty directory means too, and the bind is live.
+    "redaction-allow",
     # Pi's gate launcher and sealed extension. Materialised here rather than only by
     # the adapter so the directory is a read-only mountpoint before ANY sandbox starts,
     # including the first pi spawn on a fresh install.
     "pi-gate",
+    # Empty directories are absent-equivalent to the approval and resolution readers.
+    # Pre-creation gives Linux concrete bind targets on a fresh install.
+    "mcp-launch-approvals",
+    "mcp/resolved",
 )
 #: Read-only directory leaves whose NAME must remain the mounted name. A resolving
 #: symlink is unsafe here: the mount follows its target and leaves the lexical name
@@ -1432,7 +1466,10 @@ _CREW_NOFOLLOW_READONLY_DIR_LEAVES: tuple[str, ...] = (
     "subagents",
     "member-memory-bindings",
     "decisions",
+    "redaction-allow",
     "pi-gate",
+    "mcp-launch-approvals",
+    "mcp/resolved",
 )
 assert set(_CREW_NOFOLLOW_READONLY_DIR_LEAVES) <= set(_CREW_PRECREATE_READONLY_DIR_LEAVES)
 #: Read-only FILE leaves whose NAME must remain the sealed name, for the same reason
@@ -1485,9 +1522,21 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
         "the agent could append a feedback row the owner's summary counts as a "
         "verdict nobody gave",
     ),
+    "redaction-allow": (
+        "sealed redaction allow-list",
+        "the agent could allow the host it wants to send conversation data to",
+    ),
     "pi-gate": (
         "sealed pi gate runtime",
         "the agent could plant the launcher a later pi session execs out of",
+    ),
+    "mcp-launch-approvals": (
+        "sealed MCP launch approvals",
+        "the agent could approve a command the gateway launches outside the sandbox",
+    ),
+    "mcp/resolved": (
+        "sealed resolved MCP launches",
+        "the agent could replace the executable the gateway substitutes for an approved launch",
     ),
 }
 assert set(_DELEGATED_OVERLAP_LEAF_REASONS) == set(_CREW_NOFOLLOW_READONLY_FILE_LEAVES) | set(
@@ -2284,6 +2333,44 @@ def _publish_empty_ceiling(
                 os.unlink(tmp)
 
 
+def _materialize_sealable_parent_dirs(target: str, leaf: str) -> None:
+    """Create a nested ceiling's parents without following aliases.
+
+    ``leaf`` is the full relative entry from the strict no-follow list. Each
+    intermediate component gets the same owner-only mode and post-race
+    validation as the final directory. The data-home root itself is never
+    created here.
+    """
+    relative = os.path.normpath(leaf)
+    suffix = os.sep + relative
+    normalized = os.path.normpath(target)
+    if not normalized.endswith(suffix):
+        raise SandboxCeilingUnsealable(
+            f"cannot derive the data home for nested governance ceiling {target}"
+        )
+    data_home = normalized[: -len(suffix)]
+    parent_relative = os.path.dirname(relative)
+    if not parent_relative or parent_relative == "." or not os.path.isdir(data_home):
+        return
+
+    current = data_home
+    for component in parent_relative.split(os.sep):
+        current = os.path.join(current, component)
+        _refuse_if_dangling_symlink(current)
+        _refuse_if_symlink_leaf(current)
+        if os.path.exists(current):
+            _require_real_dir_nofollow(current)
+            continue
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            _require_real_dir_nofollow(current)
+        except OSError as exc:
+            raise SandboxCeilingUnsealable(
+                f"cannot create the governance ceiling parent {current}: {exc}"
+            ) from exc
+
+
 def _materialize_sealable_ceilings() -> list[str]:
     """Create every absent sealable ceiling; return the paths actually created.
 
@@ -2326,7 +2413,18 @@ def _materialize_sealable_ceilings() -> list[str]:
     dir_targets, file_targets = _sealable_absent_ceilings()
 
     for target in dir_targets:
-        strict_nofollow = os.path.basename(target) in _CREW_NOFOLLOW_READONLY_DIR_LEAVES
+        normalized = os.path.normpath(target)
+        strict_leaf = next(
+            (
+                leaf
+                for leaf in _CREW_NOFOLLOW_READONLY_DIR_LEAVES
+                if normalized.endswith(os.sep + os.path.normpath(leaf))
+            ),
+            None,
+        )
+        strict_nofollow = strict_leaf is not None
+        if strict_leaf is not None:
+            _materialize_sealable_parent_dirs(target, strict_leaf)
         _refuse_if_dangling_symlink(target)
         # BEFORE the warn-and-continue below: for a protected leaf an alias is a
         # refusal, and reaching `_warn_if_alias_backed` would log that the path was
@@ -7480,23 +7578,6 @@ def main():
                 _mount_or_die(p.encode(), _stage_dir.encode(), _MS_BIND,
                               "staging private window %s" % p)
                 _private_stage[p] = _stage_dir
-        # Bind-mount empty dirs over credential paths (per-dir tmpdir to
-        # prevent content leaking across mounts via shared backing dir).
-        for d in SENSITIVE_DIRS:
-            target = d.encode()
-            if os.path.isdir(target):
-                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
-                _windows = [p for p in _private_stage
-                            if p.startswith(d.rstrip("/") + "/")]
-                for p in _windows:
-                    os.makedirs(os.path.join(per_dir_empty.decode(),
-                                             os.path.relpath(p, d)))
-                _mount_or_die(per_dir_empty, target, _MS_BIND,
-                              "hiding credential directory %s" % d)
-                for p in _windows:
-                    _mount_or_die(_private_stage[p].encode(), p.encode(), _MS_BIND,
-                                  "opening private window %s" % p)
-
         # Exposed-but-read-only dirs (the governance cache): bind the real dir over
         # itself, then remount that bind MS_RDONLY. Both steps are load-bearing --
         # MS_RDONLY is ignored on the initial MS_BIND, so without the remount this
@@ -7506,6 +7587,22 @@ def main():
         # and rejects a remount that would drop them, so the seal re-asserts them
         # via _locked_mount_flags -- re-asserting bits already in force can only
         # keep restrictions, never widen access.
+        #
+        # MUST run BEFORE the SENSITIVE_DIRS hide loop. A non-recursive
+        # MS_BIND does not replicate submounts, so a self-bind of a parent
+        # established AFTER a hide of one of its leaves masks that hide: lookups
+        # through the new parent mount reach the REAL leaf. That is exactly the
+        # ``run`` / ``run/voice-runtime`` pair -- the runtime parent is sealed
+        # here and its decoder leaf is hidden below -- and with the loops the
+        # other way round the hide degraded to read-only-visible (container
+        # measured: the marker inside the leaf was readable, writes EROFS). Seal
+        # first, hide second: a hide placed ON a sealed parent is a mount on top
+        # of it and stays reachable through it, the same kernel property the
+        # WRITABLE_DIRS carve-outs below rely on. The reverse nesting (a sealed
+        # leaf inside a hidden tree) is order-insensitive in outcome: the hide
+        # masks the seal, so the leaf is hidden either way. Staging of private
+        # windows stays ahead of this loop on purpose, so a window's stage bind
+        # is never taken from an already-sealed source.
         for d in READONLY_DIRS:
             target = d.encode()
             # ``exists``, not ``isdir``: a governance ceiling is a plain file
@@ -7520,6 +7617,27 @@ def main():
                               _MS_REMOUNT | _MS_BIND | _MS_RDONLY
                               | _locked_mount_flags(target),
                               "sealing read-only path %s" % d)
+
+        # Bind-mount empty dirs over credential paths (per-dir tmpdir to
+        # prevent content leaking across mounts via shared backing dir). Runs
+        # AFTER the READONLY_DIRS seals: a hidden leaf nested under a
+        # sealed parent (``run/voice-runtime`` under ``run``) must be hidden on
+        # top of the parent's self-bind, never underneath it, or the
+        # non-recursive parent bind masks the hide.
+        for d in SENSITIVE_DIRS:
+            target = d.encode()
+            if os.path.isdir(target):
+                per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
+                _windows = [p for p in _private_stage
+                            if p.startswith(d.rstrip("/") + "/")]
+                for p in _windows:
+                    os.makedirs(os.path.join(per_dir_empty.decode(),
+                                             os.path.relpath(p, d)))
+                _mount_or_die(per_dir_empty, target, _MS_BIND,
+                              "hiding credential directory %s" % d)
+                for p in _windows:
+                    _mount_or_die(_private_stage[p].encode(), p.encode(), _MS_BIND,
+                                  "opening private window %s" % p)
 
         # Writable carve-outs (#8653) — validated by the builder against every
         # seal this script applies; each approved entry lives INSIDE the sealed
@@ -7794,10 +7912,32 @@ def main():
         # pids, so session identity, claim-push, and systemd stay intact.
         # Only ``kill`` needs arg inspection: tkill/tgkill/pidfd_send_signal
         # are inherently targeted (no broadcast semantics). pid==0 and
-        # negative process-group targets stay ALLOWED on purpose — the spawn
-        # already setsid()s, so every reachable process group is inside the
-        # sandbox session, and denying killpg breaks legitimate tooling
-        # (timeout(1), shell job control, cleanup traps).
+        # negative process-group targets stay ALLOWED on purpose, because
+        # denying killpg breaks legitimate tooling (timeout(1), shell job
+        # control, cleanup traps).
+        #
+        # What this filter denies is exactly one thing: the ``kill(-1, sig)``
+        # host-wide broadcast. A NAMED negative target — ``kill(-<pgid>, sig)``
+        # for a process group outside the spawn — is not denied at the syscall
+        # layer, and the subtree shares the host pid namespace (no CLONE_NEWPID
+        # here, by the same deliberate choice as above), so such a signal is
+        # same-uid permitted and lands outside the spawn's own tree. setsid()
+        # places the spawn in its own group; it does not restrict which groups
+        # the spawn may signal.
+        #
+        # Session isolation is therefore not a property of this filter at all.
+        # It is also not expressible here: one agent RUNTIME can serve several
+        # sessions at once (a parent plus the subagents whose sessions are
+        # created on its runtime), so the narrower rule "deny group targets
+        # while more than one session is being served" would need a session
+        # count, and this is a static BPF program installed before the first
+        # session is claimed — it cannot read that count, which changes after
+        # the filter is sealed. The containable form of the problem lives one
+        # layer out, where a signal is matched against the runtime's own session
+        # set, so the ownership model is the thing that has to answer it.
+        # TODO(ownership): once a runtime's session set is a first-class object,
+        # state in docs/decisions/ whether an in-sandbox group signal is
+        # acceptable for a multi-session runtime, and link that decision here.
         if _libc.prctl:
             _PR_SET_SECCOMP = 22
             _SECCOMP_MODE_FILTER = 2
@@ -8800,7 +8940,14 @@ def delegated_workspace_exposes_sealed_target(
         # Named per target: the consequences differ, and an operator reading this needs to
         # know which seal they are looking at. Looked up in the same mapping the target list
         # is built from, so a covered leaf cannot render another leaf's consequence.
-        named = _DELEGATED_OVERLAP_LEAF_REASONS.get(os.path.basename(target))
+        named = next(
+            (
+                reason
+                for leaf, reason in _DELEGATED_OVERLAP_LEAF_REASONS.items()
+                if _norm(target).endswith(os.sep + os.path.normcase(os.path.normpath(leaf)))
+            ),
+            None,
+        )
         if named is not None:
             what, consequence = named
         else:
@@ -13326,6 +13473,50 @@ def apply_windows_resource_ceiling(pid: int) -> bool:
     )
 
 
+# Prefix of the scope unit name a caller gets from ``scope_unit_name``. Carries
+# the owning gateway's product name so a human reading ``systemctl --user
+# list-units`` can tell an agent scope from anything else in the slice, and is
+# the token the reverse lookup matches on.
+_SCOPE_UNIT_PREFIX = "kirocrew-rt-"
+# systemd unit names accept alphanumerics and ``:-_.\`` plus escapes; anything
+# else has to be escaped to be a legal name. Rather than escape, a token
+# carrying something else is REFUSED (see ``scope_unit_name``), because every
+# caller mints its own token and a token needing escapes is a caller bug.
+_SCOPE_UNIT_TOKEN_SAFE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+
+
+def scope_unit_name(token: str) -> str | None:
+    """The scope unit name for a spawn identified by *token*, or None.
+
+    ``cgroup_scope_argv`` otherwise lets systemd auto-name the scope
+    ``run-u<N>.scope``, whose only content is "the Nth transient unit this user
+    manager made". One scope holds one spawn, and one spawn is one agent
+    RUNTIME, which may serve several sessions -- so an anonymous scope name is
+    the reason a reader holding a scope (the slice OOM report at
+    :func:`check_agents_slice_pressure`, ``systemd-cgls``, an operator reading
+    ``systemctl --user list-units``) can name the victim's directory but not the
+    runtime it held, nor the sessions leasing that runtime. Naming the scope
+    after the runtime's own spawn token closes that: the SAME token travels in
+    the child's environment as ``KIROCREW_SPAWN_INSTANCE``, so a scope name and
+    a live process both resolve to one incarnation. For the case that matters
+    most -- a scope the kernel already killed, where both the environment and the
+    in-memory ``_process_instance`` are gone -- ``AcpRuntime`` logs this unit name
+    beside its pid at initialization, and sessions are logged against that same
+    pid as they are created, so the join survives the process.
+
+    Returns ``None`` when *token* cannot form a legal unit name, and the caller
+    then wraps the spawn exactly as before -- anonymously, but bounded. That
+    direction is deliberate: the scope's JOB is the DoS ceiling, and a naming
+    defect must never be able to cost a spawn its ceiling or fail the spawn
+    outright. ``token`` is expected to be an opaque random identifier, so it is
+    validated rather than escaped; a value needing escapes is a caller bug and
+    is refused rather than mangled into a name a reverse lookup would miss.
+    """
+    if not _SCOPE_UNIT_TOKEN_SAFE.match(token or ""):
+        return None
+    return f"{_SCOPE_UNIT_PREFIX}{token}.scope"
+
+
 def cgroup_scope_argv(argv: list[str]) -> list[str]:
     """Wrap *argv* in a transient systemd --user --scope with cgroup v2 limits.
 
@@ -13354,6 +13545,23 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
 
     Layers OUTSIDE the OS-level sandbox: callers pass the already-``wrap_argv``-ed
     argv here so the child is filesystem-isolated AND cgroup-bounded.
+
+    The ceiling is per SPAWN, and therefore per agent RUNTIME rather than per
+    SESSION: one process can serve several sessions (a parent and the subagents
+    whose sessions are created on its runtime), and cgroup v2 kills a breaching
+    scope as ONE unit, so every session on that runtime goes together. The
+    per-scope values come from :func:`_cgroup_limits_from_config`, which is where
+    a ceiling that scales with the number of sessions a runtime serves would
+    attach -- it is the single place both the value and its config source are
+    resolved, so a scaling factor applied there reaches every caller without any
+    spawn site being taught about sessions.
+
+    The scope itself is left ANONYMOUS here -- systemd auto-names it
+    ``run-u<N>.scope``. A caller that can name the runtime it is spawning passes
+    the result through :func:`name_scope_unit`, which is a separate step so that
+    this function's argv stays byte-identical for the many callers wrapping a
+    one-off tool or app subprocess that no reader needs to resolve back to a
+    runtime.
 
     On a host without cgroup v2 delegation (older Linux, no systemd user
     session, macOS), returns *argv* unchanged and logs a one-time loud SECURITY
@@ -13471,6 +13679,33 @@ def pytest_cgroup_scope_argv(
         "--",
         *argv,
     ]
+
+
+def name_scope_unit(argv: list[str], token: str) -> list[str]:
+    """Name the scope in a :func:`cgroup_scope_argv` result after *token*.
+
+    Returns *argv* UNCHANGED unless it really is a systemd-run scope wrapper AND
+    *token* forms a legal unit name (:func:`scope_unit_name`). Both degradations
+    are one decision: the scope's job is the DoS ceiling, the name is a
+    diagnostic, and a diagnostic must never cost a spawn its ceiling nor fail the
+    spawn outright. A host without cgroup delegation (where ``cgroup_scope_argv``
+    hands back the bare command) and a token that cannot be spelled as a unit
+    therefore both leave the spawn exactly as it would otherwise have been.
+
+    A separate step rather than a keyword on ``cgroup_scope_argv`` because that
+    function has dozens of callers and is widely replaced by one-argument stubs in
+    tests: a keyword there would make every one of those stubs refuse the call,
+    for callers that have no runtime to name anyway. The recognition check here
+    makes a stubbed wrap a silent no-op instead.
+
+    ``--unit`` goes BEFORE the ``--`` separator. After it, systemd-run reads it as
+    an argument to the wrapped command instead of a property of the scope.
+    """
+    unit = scope_unit_name(token)
+    if unit is None or "--scope" not in argv or "--" not in argv:
+        return argv
+    at = argv.index("--")
+    return [*argv[:at], "--unit", unit, *argv[at:]]
 
 
 # ── aggregate ceiling on the parent slice ──

@@ -4,6 +4,7 @@ import { resizeImageForModel, type ResizeInfo } from '../utils/resizeImage'
 import type { ProjectionsBlock } from '../state/memberProjectionTypes'
 import type {
   AppContributor,
+  AgentTagPolicy,
   ChatSlot,
   CronJob,
   IssueSource,
@@ -2306,6 +2307,11 @@ export interface InstanceTunnelStatus {
   error?: string
   connected_at?: number
   token_ttl_remaining?: number
+  /** Seconds the CURRENT token was issued for -- what `token_ttl_remaining`
+   *  counts down from. Read it, never the row's `ttl`, when measuring how far a
+   *  token has run: a chained crew's token is minted by the crew holding the
+   *  hop, so the row's figure is a different number. See `lib/tokenTtl`. */
+  token_ttl_total?: number
   /** Fargate only: the loopback URL of the crew's turn API through the open
    *  forward. Present only while connected; never accompanied by a token. */
   turn_url?: string
@@ -2353,6 +2359,14 @@ export interface InstanceView {
   ssm_run_as: string
   /** Provisioner that created this crew, when it came from a launcher. */
   provisioner_id?: string
+  /** Set when this crew is reached by riding another crew's hop: that crew's id,
+   *  and the loopback port ON THAT CREW where its own forward listens. All empty
+   *  for a top-level crew, which is every crew added before chaining existed.
+   *  `via_remote_id` is this crew's id in the PARENT's registry -- the id the
+   *  parent looks it up by when it mints this crew's token. */
+  via_instance_id?: string
+  via_remote_port?: number
+  via_remote_id?: string
   was_connected: boolean
   status: InstanceTunnelStatus
 }
@@ -2372,6 +2386,14 @@ export interface AddInstanceBody {
   aws_profile?: string
   aws_region?: string
   ssm_run_as?: string
+  /** Chain this crew behind one already configured here: that crew's id, plus the
+   *  loopback port on it where its own forward to this crew listens, plus this
+   *  crew's own id IN THAT CREW's registry, which is what the parent looks it up
+   *  by when it mints the token. The gateway decides whether the chain is allowed
+   *  (depth cap, parent transport) and refuses with a `chain_*` code. */
+  via_instance_id?: string
+  via_remote_port?: number
+  via_remote_id?: string
   id?: string
 }
 
@@ -2558,6 +2580,12 @@ export interface KiroPrerequisiteStatus {
    */
   login_command: string
   sso_login_command: string
+  /**
+   * True when the resolved CLI is the copy built into the desktop app. The gate
+   * then explains why `login_command` is an absolute path into the app's own
+   * resources rather than the bare name the user's shell would resolve.
+   */
+  bundled_cli: boolean
   setup_allowed: boolean
   /**
    * True when the CLI binary is present and executable but could not be
@@ -2991,6 +3019,15 @@ export interface MemberActivityEntry {
   project?: string
 }
 
+/** One team of crewmates (GET /api/teams). `members` are exact crew NAMES in
+ *  the user's order; a crewmate is on at most one team, which the store
+ *  enforces on every write. */
+export interface CrewTeam {
+  id: string
+  name: string
+  members: string[]
+}
+
 /** Free-form fields a crew publishes into its webview. The crew owns the shape,
  *  so every value is unknown until the renderer narrows it. */
 export type CrewPanelData = Record<string, unknown>
@@ -3351,6 +3388,10 @@ export const api = {
       projections?: Record<string, unknown>
       resolved?: unknown
       writes_drained?: unknown
+      recording?: unknown
+      flag_value?: unknown
+      flag_recognised?: unknown
+      env_file?: unknown
     }
     return {
       folds: read.projections ?? {},
@@ -3363,6 +3404,17 @@ export const api = {
       // taken, so the value may be behind the record. Absent reads as drained: an
       // older gateway does not send the field and did not race either.
       writesDrained: read.writes_drained !== false,
+      // False only when the gateway says recording is switched off. Absent reads as
+      // on: an older gateway does not send the field.
+      recording: read.recording !== false,
+      // The KIROCREW_CREW_LOG value that switched it off, so the panel can quote it.
+      // Empty when the gateway does not send one.
+      flagValue: typeof read.flag_value === 'string' ? read.flag_value : '',
+      // False when that value is not one of the switch-off spellings.
+      flagRecognised: read.flag_recognised !== false,
+      // The `.env` the gateway reads; the default home's when the gateway sends none.
+      envFile:
+        typeof read.env_file === 'string' && read.env_file ? read.env_file : '~/.kiro/crew/.env',
     }
   },
   telemetryStartup: () => fetch('/api/telemetry/startup').then(j),
@@ -3571,6 +3623,21 @@ export const api = {
     del('/api/security/denied-commands/user/' + encodeURIComponent(id)).then(
       j,
     ) as Promise<DeniedCommandsData>,
+  // Redaction cards: the per-workspace allowed-host list (Settings → Security →
+  // Redaction). Every route is owner-only.
+  redactionAllowedHosts: () =>
+    get('/api/redaction/allowed-hosts').then(j) as Promise<{
+      workspaces: Record<string, string[]>
+    }>,
+  redactionAllowHost: (slot: string, host: string) =>
+    post('/api/redaction/allowed-hosts', { slot, host }).then(j) as Promise<{
+      ok: boolean
+      workspace: string
+    }>,
+  redactionRevokeHost: (workspace: string, host: string) =>
+    del(
+      `/api/redaction/allowed-hosts?workspace=${encodeURIComponent(workspace)}&host=${encodeURIComponent(host)}`,
+    ).then(j) as Promise<{ ok: boolean; removed: boolean }>,
   // Third-party app trust (Settings → Security). Like denied-commands, every
   // endpoint returns the full refreshed snapshot so callers can seed the query
   // cache from the mutation response instead of re-fetching.
@@ -3744,6 +3811,7 @@ export const api = {
     profile: string
     region: string
     size_key: string
+    subnet_id?: string
     login_target?: KiroLoginTarget
   }) => post('/api/cloud/launch', body).then(j) as Promise<LaunchJob>,
   cloudLaunchStatus: (id: string) =>
@@ -4060,6 +4128,12 @@ export const api = {
         owns_runtime: boolean
         prompts: number
         channel: string
+        /**
+         * Live sessions sharing this row's runtime; 1 when exclusive. Optional
+         * because an older gateway does not send it — absent reads as exclusive,
+         * which is the pre-sharing shape rather than a guess in either direction.
+         */
+        sharers?: number
         rss_mb: number | null
         procs: number | null
         mcp: number | null
@@ -4274,6 +4348,19 @@ export const api = {
        *  notes. */
       truncated: boolean
     }>,
+  // Crewmate teams: a name plus an ordered member list, stored by the gateway
+  // in the data home's crew-teams directory. Dashboard-only like the members routes; the three
+  // writes are owner actions. `remove` rather than `delete`: a reserved word
+  // reads badly as a method name at every call site.
+  teams: {
+    list: () => fetch('/api/teams').then(j) as Promise<{ teams: CrewTeam[] }>,
+    create: (body: { name: string; members: string[] }) =>
+      post('/api/teams', body).then(j) as Promise<{ team: CrewTeam }>,
+    update: (id: string, body: { name?: string; add?: string[]; remove?: string[] }) =>
+      put('/api/teams/' + encodeURIComponent(id), body).then(j) as Promise<{ team: CrewTeam }>,
+    remove: (id: string) =>
+      del('/api/teams/' + encodeURIComponent(id)).then(j) as Promise<{ ok: boolean }>,
+  },
   updateKirocrewAgent: (name: string, body: object) =>
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) => del('/api/agents/' + encodeURIComponent(name)).then(j),
@@ -4488,6 +4575,7 @@ export const api = {
       truncatedDirectories?: string[]
       hiddenOnlyDirectories?: string[]
       unreadableDirectories?: string[]
+      linkedDirectories?: string[]
     }>,
   workspaces: () => fetch('/api/workspaces').then(j),
   createWorkspace: (body: object) => post('/api/workspaces', body).then(j),
@@ -4965,6 +5053,18 @@ export const api = {
       running: boolean
       ping_ok: boolean
       supported: boolean
+      launch_refused?: Record<
+        string,
+        {
+          reason: 'added_outside_dashboard' | 'changed_needs_reapproval'
+          commands?: string[][]
+          envs?: string[][]
+          approved_commands?: string[][]
+          approved_envs?: string[][]
+          complete?: boolean
+          expected_launch?: string
+        }
+      >
     }>,
   mcpGatewayEnable: (enabled: boolean) =>
     post('/api/mcp-gateway/enable', { enabled }).then(j) as Promise<{
@@ -4982,7 +5082,7 @@ export const api = {
         server: string
         agent: string
         pid: number | null
-        sessions: number
+        stubs?: number
         idle_s: number
         rss_kb: number
       }[]
@@ -4992,11 +5092,35 @@ export const api = {
     }>,
   mcpGatewayServers: () =>
     fetch('/api/mcp-gateway/servers').then(j) as Promise<{ servers: McpManagedServer[] }>,
-  mcpGatewaySetStub: (name: string, stub: boolean) =>
-    post('/api/mcp-gateway/servers/stub', { name, stub }).then(j) as Promise<{
+  // What the gateway would run for this server, so the operator approves a
+  // command rather than a name. `expected_launch` is the identity the approval
+  // is written against and is present only when every command could be shown.
+  mcpGatewayLaunchPreview: (name: string) =>
+    fetch(`/api/mcp-gateway/servers/launch?name=${encodeURIComponent(name)}`).then(j) as Promise<{
+      name: string
+      commands: string[][]
+      envs: string[][]
+      complete: boolean
+      expected_launch?: string
+    }>,
+  mcpGatewaySetStub: (
+    name: string,
+    stub: boolean,
+    expectedLaunch?: string,
+    resolveEligibility = false,
+  ) =>
+    post('/api/mcp-gateway/servers/stub', {
+      name,
+      stub,
+      ...(expectedLaunch ? { expected_launch: expectedLaunch } : {}),
+      ...(resolveEligibility ? { resolve_eligibility: true } : {}),
+    }).then(j) as Promise<{
       ok: boolean
       name: string
       stub: boolean
+      stubbed?: string[]
+      skipped?: Array<{ name: string; reason: string }>
+      sharing_on?: boolean
       enabled?: boolean
       applied?: boolean
       restart_required?: boolean
@@ -5013,22 +5137,20 @@ export const api = {
   // unmeasured server, so the answer arrives through the progress read, not here.
   mcpMeasureStart: () => post('/api/mcp/measure', {}).then(j) as Promise<McpMeasureProgress>,
   mcpMeasureProgress: () => fetch('/api/mcp/measure').then(j) as Promise<McpMeasureProgress>,
-  // Batch form of the above -- one config write for the whole set, so "toggle
-  // all" can't land the allowlist half-flipped. Like the single form it records
-  // rather than applies, and answers `restart_required`.
+  // Batch form of the above, for turning stubs OFF -- one config write for the
+  // whole set, so "unstub all" can't land the allowlist half-flipped. Like the
+  // single form it records rather than applies, and answers `restart_required`.
   //
-  // `resolveEligibility` hands the decision to the server: it re-reads the sharing
-  // switch and each server's verdict inside the same lock hold that writes them, so
-  // the policy and the write cannot disagree. The response then reports `stubbed`
-  // and `skipped` rather than echoing the request, because the two differ by design.
-  mcpGatewaySetStubMany: (names: string[], stub: boolean, resolveEligibility?: boolean) =>
-    post(
-      '/api/mcp-gateway/servers/stub',
-      resolveEligibility ? { names, stub, resolve_eligibility: true } : { names, stub },
-    ).then(j) as Promise<{
+  // `stub: false` only, and the endpoint refuses a batch stub=true: turning a stub
+  // ON approves the exact command that server would run, and one body cannot carry
+  // one launch identity per name. Enabling is therefore a request per server.
+  // The response reports `stubbed` and `skipped` rather than echoing the request,
+  // because the server decides which names it acts on.
+  mcpGatewaySetStubMany: (names: string[], stub: false) =>
+    post('/api/mcp-gateway/servers/stub', { names, stub }).then(j) as Promise<{
       ok: boolean
       names: string[]
-      stub: boolean
+      stub: false
       stubbed?: string[]
       skipped?: Array<{ name: string; reason: string }>
       sharing_on?: boolean
@@ -5216,8 +5338,16 @@ export const api = {
   /** Structured monitor records include terminal outcomes for inspection. */
   monitorsList: (): Promise<{ enabled: boolean; monitors: unknown[] }> =>
     fetch('/api/monitors').then(j),
-  monitorForSlot: (slot: string): Promise<{ enabled: boolean; monitor: unknown | null }> =>
-    fetch('/api/monitors/slot/' + encodeURIComponent(slot)).then(j),
+  /** `max_runtime_ceiling_secs` is the LIVE operator ceiling
+   *  (`monitoring.max_runtime_secs`), which a default install sets far below the
+   *  contract's absolute maximum; the popover bounds its runtime input by it. */
+  monitorForSlot: (
+    slot: string,
+  ): Promise<{
+    enabled: boolean
+    monitor: unknown | null
+    max_runtime_ceiling_secs?: number
+  }> => fetch('/api/monitors/slot/' + encodeURIComponent(slot)).then(j),
   monitorCreate: (body: Required<MonitorWrite>): Promise<MonitorResponse> =>
     post('/api/monitors', body).then(j) as Promise<MonitorResponse>,
   monitorUpdate: (id: string, body: MonitorWrite): Promise<MonitorResponse> =>
@@ -5468,8 +5598,13 @@ export const api = {
     }).then(j),
   remindMirror: (slot: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-link').then(j),
-  unlinkMirror: (slot: string) =>
-    post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-unlink').then(j),
+  // Severs the binding a link row names — the session's mirror OR its Slack
+  // thread: `expected` is the row's `{channel_type, binding}` and the server
+  // routes a `slack` binding to the Slack teardown itself, so the menu carries
+  // no channel-to-endpoint assumption. Without `expected`, an unconditional
+  // clear of the mirror for callers that hold no row.
+  unlinkMirror: (slot: string, expected?: { channel_type: string; binding: string }) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-unlink', expected).then(j),
   slackChannels: () => fetch('/api/slack/channels').then(j),
   // Folders
   chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
@@ -5544,9 +5679,17 @@ export const api = {
   chatTags: () => fetch('/api/chat/tags', { headers: { ..._sk } }).then(j),
   createChatTag: (name: string, color?: string, status?: boolean) =>
     post('/api/chat/tags', { name, color: color || '', status: !!status }).then(j),
+  adoptChatTag: (id: string, status: boolean) =>
+    post('/api/chat/tags/' + encodeURIComponent(id) + '/adopt', { status }).then(j),
   updateChatTag: (
     id: string,
-    body: { name?: string; color?: string; order?: number; status?: boolean },
+    body: {
+      name?: string
+      color?: string
+      order?: number
+      status?: boolean
+      agent?: AgentTagPolicy
+    },
   ) => patch('/api/chat/tags/' + encodeURIComponent(id), body).then(j),
   deleteChatTag: (id: string) => del('/api/chat/tags/' + encodeURIComponent(id)).then(j),
   setSlotTags: (slot: string, tags: string[], baseTagsRevision?: string) =>
@@ -5760,11 +5903,14 @@ export const api = {
     post('/api/approvals/' + encodeURIComponent(id) + '/' + action, {}).then(j),
   /** Question cards still awaiting an answer, for rehydration after a reload or
    *  websocket reconnect (`question_card` is a one-shot broadcast). A blocking
-   *  ask carries `ask_id`; a stateless card carries `card_id` instead. */
+   *  ask carries `ask_id`; a stateless card carries `card_id` instead, and
+   *  `native` when it is kiro-cli's mid-turn `AskUserQuestion` card (whose
+   *  answer steers into the live turn). */
   pendingQuestions: (): Promise<
     {
       ask_id?: string
       card_id?: string
+      native?: boolean
       slot: string
       questions: {
         question: string

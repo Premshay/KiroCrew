@@ -451,12 +451,13 @@ def make_non_dumpable(*, clear=_clear_dumpable) -> None:
 def verify_sandbox(
     settings: Settings, *, env: Mapping[str, str], probe=_user_namespaces_available
 ) -> None:
-    """Refuse to start unless the model subprocess can run sandboxed.
+    """Refuse to start unless the model subprocess can run sandboxed, or the
+    deployment declares the internal-only trust boundary.
 
     kiro-cli runs the model subprocess inside a sandbox. On Linux that needs an
     unprivileged user namespace; without one, ``wrap_argv`` fails CLOSED. This
-    container is sandboxed-only, so a host that cannot provide one is refused here,
-    loudly, rather than left to fail every turn.
+    container is sandboxed-only by default, so a host that cannot provide one is
+    refused here, loudly, rather than left to fail every turn.
 
     **Why taking the credential out of the worker's environment does not earn an
     unsandboxed posture.** The worker auto-approves every tool it calls on untrusted
@@ -466,20 +467,34 @@ def verify_sandbox(
     is the vault: the backend answers the engine's token request from it, so the
     backend's uid must be able to decrypt it, and the worker is a child of the backend
     under that same uid. Measured -- a uid-1000 process reads and decrypts that vault
-    directly. An auto-approved unsandboxed worker therefore still has a route, which is
-    why ``sandbox_allow_unsandboxed_exec`` stays false and why this refusal has no
-    credential-shaped escape hatch.
+    directly. So no clean environment can be traded for this refusal, and the
+    assertion below is a tripwire on that invariant rather than a posture.
 
-    Closing the remaining route is not something this file can do: it needs a user
-    namespace, or a worker under a different uid from the BACKEND (the gateway's own
-    spawn path), or a credential not worth stealing.
+    **What CAN lift it is a trust boundary, not a credential claim.** With
+    ``settings.internal_only`` the deployment states that this task runs the operator's
+    OWN crews and that the operator bears the risk of what those crews read. The
+    exposure is then ACCEPTED, and it is worth being exact about its size: it is NOT
+    only a prompt an outsider types. An internal crew consumes untrusted CONTENT as a
+    matter of course -- tool output, fetched web pages, connector and API payloads,
+    repository and ticket text -- any of which can carry an injection, and all of which
+    reach the worker whoever sent the prompt. So with this set, a worker injected
+    through any of those routes can read the vault. What the claim buys is not "no
+    injection can happen" but "the credential at risk and the account it belongs to are
+    the operator's own". That is why the switch names the boundary and not the
+    consequence -- an operator cannot set "allow unsandboxed" without saying whose crews
+    these are and therefore who bears it. Closing the route properly still needs a user
+    namespace, a worker under a different uid from the BACKEND (the gateway's own spawn
+    path), or a credential not worth stealing; a Firecracker-based runtime is the answer
+    for multi-tenant or external callers.
 
-    **Only ``SANDBOX_AVAILABLE`` proceeds.** Undetermined refuses, and so does any
+    **Only ``SANDBOX_AVAILABLE`` proceeds unconditionally, and only ``SANDBOX_DENIED``
+    is lift-able.** Undetermined refuses whatever the boundary says, and so does any
     verdict this function does not recognise. Reading a probe that cannot reach an
     answer as permission to continue is the same defect as reading the environment
     through a denylist: it holds for the hosts someone already thought of and fails
-    open on the next one. The refusal repeats the verdict verbatim so an operator
-    learns what could not be determined rather than only that something could not be.
+    open on the next one. A boundary can accept a KNOWN exposure and cannot accept an
+    unknown one. The refusal repeats the verdict verbatim so an operator learns what
+    could not be determined rather than only that something could not be.
     """
     # The environment route, asserted rather than decided -- and checked before the
     # probe, because it is broken whatever the host can provide. `build_backend_env`
@@ -504,23 +519,57 @@ def verify_sandbox(
     if verdict == SANDBOX_AVAILABLE:
         return
     if verdict == SANDBOX_DENIED:
+        # The internal-only branch. A DENIED verdict is a definite, informative answer
+        # about the host -- "no unprivileged user namespace here" -- and the internal-only
+        # boundary is the deployment stating that this consequence is accepted, so there
+        # IS something for it to accept. That is why the branch sits under DENIED and not
+        # under the undetermined verdict below, which carries no answer at all: a boundary
+        # can accept a known exposure and cannot accept an unknown one.
+        #
+        # Deliberately no second condition about the environment: the credential assertion
+        # above already refused on every verdict, so reaching here means the environment
+        # route is closed whatever this branch decides.
+        if settings.internal_only:
+            log.warning(
+                "no user-namespace sandbox on this host; starting UNSANDBOXED because "
+                "SMC_INTERNAL_ONLY is set. The model subprocess runs without a sandbox "
+                "and can reach the crew's vault under the backend's uid, so any "
+                "untrusted content it reads -- tool output, a fetched page, a connector "
+                "payload -- can inject a worker that reads the model credential. "
+                "Accepted because the deployment declares these are the operator's own "
+                "crews and the operator bears that risk."
+            )
+            return
         raise common.ConfigError(
             "No user-namespace sandbox is available on this host, so kiro-cli cannot "
-            "spawn the model subprocess sandboxed. This container runs sandboxed-only. "
-            "Taking the model credential out of the worker's environment is not enough "
-            "to offer an unsandboxed posture instead: the backend answers the engine's "
-            "token request from the crew's vault, so the backend's uid must be able to "
-            "decrypt it, and the worker runs as a child of the backend under that same "
-            "uid. Run where unprivileged user namespaces are permitted."
+            "spawn the model subprocess sandboxed. This container runs sandboxed-only "
+            "unless the deployment declares the internal-only trust boundary by setting "
+            "SMC_INTERNAL_ONLY=1. Accepting that boundary means: these are the "
+            "operator's OWN crews and the operator bears the risk of what they read. Be "
+            "clear about that risk before setting it -- it is NOT only about who sends "
+            "the prompt. The worker auto-approves every tool it calls; the backend "
+            "answers the engine's token request from the crew's vault so the backend's "
+            "uid must be able to decrypt it, and the worker runs as a child of the "
+            "backend under that same uid. So untrusted CONTENT the crew reads in the "
+            "ordinary course of its work -- tool output, a fetched web page, a connector "
+            "or API payload, text someone else wrote -- can inject that worker into "
+            "reading the model credential, whoever sent the prompt. Taking the "
+            "credential out of the worker's environment does not change that and is not "
+            "a substitute for the declaration. Do NOT set it where the credential at "
+            "risk is not the operator's own to lose: a user namespace is the real "
+            "containment, and a Firecracker-based runtime is the answer for multi-tenant "
+            "callers. Otherwise, run where unprivileged user namespaces are permitted."
         )
     raise common.ConfigError(
         f"Whether this host permits an unprivileged user-namespace sandbox could not be "
         f"determined: {verdict}. This container runs sandboxed-only, so an undetermined "
         "answer refuses exactly as a denial does: continuing would run a model "
         "subprocess that auto-approves every tool, with no evidence that a sandbox is "
-        "in place. Run this image on Linux where unprivileged user namespaces are "
-        "permitted, and fix what stopped the probe rather than reading its silence as "
-        "consent."
+        "in place. SMC_INTERNAL_ONLY does not cover this case and is not the fix for it: "
+        "that setting accepts a KNOWN absence of isolation, and this verdict says the "
+        "probe reached no answer at all, so there is nothing for a boundary to accept. "
+        "Run this image on Linux where unprivileged user namespaces are permitted, and "
+        "fix what stopped the probe rather than reading its silence as consent."
     )
 
 

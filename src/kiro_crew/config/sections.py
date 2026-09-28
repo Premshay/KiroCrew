@@ -55,6 +55,7 @@ from kiro_crew.instances.constants import (
 )
 from kiro_crew.instances.constants import WARM_SET_CAP_AUTO as _WARM_SET_CAP_AUTO
 from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX
+from kiro_crew.monitoring.limits import DEFAULT_RUNTIME_CEILING_SECS, MAX_RUNTIME_CEILING_SECS
 from kiro_crew.stt.limits import DEFAULT_IDLE_EVICT_SECS as _STT_DEFAULT_IDLE_EVICT_SECS
 from kiro_crew.stt.limits import DEFAULT_PARTIAL_INTERVAL_MS as _STT_DEFAULT_PARTIAL_INTERVAL_MS
 from kiro_crew.stt.limits import DEFAULT_SILENCE_MS as _STT_DEFAULT_SILENCE_MS
@@ -3389,6 +3390,28 @@ class DashboardConfig:
             "Concatenate follow-up messages while the agent is busy instead of queueing them separately.",
         ),
     )
+    title_refresh_every_turns: int = field(
+        default=0,
+        metadata=_meta(
+            "Refresh Auto Title Every N Turns",
+            "Re-examine a session's auto-generated title every N user turns "
+            "(at turns N, 2N, 3N, ...) from its last ten messages, and rename the "
+            "session when the topic has moved. 0 keeps the built-in schedule: "
+            "turns 8 and 24 only. Either way, a title that began as a bare link "
+            "or ticket key also gets one refresh after the first turn. A value "
+            "from 1 to 3 is raised to 4, and the ceiling is 1000. Each refresh is "
+            "one background LLM call. Turns are counted over the messages held "
+            "for the session. A session reloaded by a gateway restart or "
+            "reopened from History holds its latest 500 plus the new ones, and "
+            "the cadence continues from the restored count; if the reload keeps "
+            "fewer user turns than the latest built-in turn the session had "
+            "already reached (the first turn, 8 or 24), the cadence resumes "
+            "after that turn instead. Once 10,000 are held, the oldest drop off "
+            "as new ones arrive, so refreshes slow down or stop until the next "
+            "reload. A title you renamed by hand is never refreshed. Takes "
+            "effect on the next turn; no restart.",
+        ),
+    )
     mcp_probe_timeout_secs: int = field(
         default=15,
         metadata=_meta(
@@ -3772,6 +3795,26 @@ class DashboardConfig:
             "Recent Session Tint Count",
             "Number of most-recently-active sessions to highlight in the sidebar with a "
             "graded accent stripe (0-10; 0 = off).",
+        ),
+    )
+    # Literal enum rather than FOLDER_SORT_MODES: that constant is defined below
+    # this class (with the other write/load bounds) and a class body is evaluated
+    # top to bottom. test_config_patch.py::TestFolderSortRoundTrip::
+    # test_the_allowlist_enum_is_the_loader_list_spelled_once pins the two
+    # spellings equal.
+    folder_sort: str = field(
+        default="custom",
+        metadata=_meta(
+            "Sidebar Folder Order",
+            "How the chat sidebar orders session folders: 'custom' keeps the stored "
+            "positions (set by dragging a folder or by chat_folder_move), 'name' is an "
+            "ASCII-case-insensitive natural order (01. < 02. < 10.; A-Z fold to a-z, "
+            "other letters compare as written), 'created' is newest "
+            "first. A view preference only -- choosing a mode never rewrites the "
+            "stored positions, so switching back to 'custom' restores them exactly. "
+            "Read by the sidebar and by chat_folder_tree, which lists folders in the "
+            "order the sidebar draws them.",
+            enum=["custom", "name", "created"],
         ),
     )
     update_nudge: dict = field(
@@ -4476,10 +4519,12 @@ class SessionSummaryConfig:
         metadata=_meta(
             "Assistant Excerpt Size",
             "Characters kept from each end of an assistant message when building "
-            "the summarization input (>=80). User messages are always included in "
-            "full -- they carry intent and are small -- while assistant output is "
+            "the summarization input (>=80). User messages are included in full "
+            "unless the whole input exceeds the fixed 40,000-character summary input "
+            "limit -- they carry intent and are small -- while assistant output is "
             "excerpted because it holds the progress detail but dominates the "
-            "transcript.",
+            "transcript. Past that limit, middle turns are dropped and any turn is "
+            "cut to about 5,000 characters per end, so larger values stop helping.",
         ),
     )
 
@@ -4770,8 +4815,20 @@ COMPLETION_KEEP_CHARS_MIN = 0
 COMPLETION_KEEP_CHARS_MAX = 512_000
 MCP_PROBE_TIMEOUT_MIN = 5
 MCP_PROBE_TIMEOUT_MAX = 120
+# ``dashboard.title_refresh_every_turns``: 0 is "built-in schedule"; any other
+# value is at least MIN, so a typo of 1 cannot spend an LLM call on every turn.
+TITLE_REFRESH_EVERY_TURNS_MIN = 4
+TITLE_REFRESH_EVERY_TURNS_MAX = 1000
 RECENT_TINT_COUNT_MIN = 0
 RECENT_TINT_COUNT_MAX = 10
+# The sidebar's folder sort modes, spelled once for the same reason as the bounds
+# above: the loader normalizes to this set, the PATCH allowlist accepts exactly
+# it, and the ``kirocrew-dashboard`` MCP server reads the stored value back
+# through it. ``custom`` is the stored ``order`` positions (today's behaviour and
+# the default), ``name`` an ASCII-case-insensitive natural order, ``created`` newest
+# first. The frontend's ``readFolderSortMode`` mirrors this list.
+FOLDER_SORT_MODES: tuple[str, ...] = ("custom", "name", "created")
+FOLDER_SORT_DEFAULT = "custom"
 SESSION_TIMEOUT_MIN = 0
 SESSION_TIMEOUT_MAX = 86400
 POOL_TTL_SECS_MIN = 0
@@ -5926,16 +5983,21 @@ class McpConfig:
         ),
     )
     honour_auto_approve: bool = field(
-        default=False,
+        default=True,
         metadata=_meta(
             "Honour MCP autoApprove",
-            "Keep an ``autoApprove`` list no server spec declares -- one hand-added "
-            "to ``mcp.json`` -- in the agent config Kiro Crew writes. Off by default, "
-            "and off DROPS those verbs: such a tool is approved locally with no "
-            "permission request, so no approval card is ever shown for it. A ceiling "
-            "strips the key whatever this says; a verb a spec declares is kept either "
-            "way. Applies at restart, when the spec is rebuilt, so turning it off "
-            "does not retract a grant already in the file.",
+            "Keep an ``autoApprove`` list you wrote yourself -- one hand-added to "
+            "``mcp.json`` or to an agent file -- in the agent config Kiro Crew "
+            "writes. On by default: an ``autoApprove`` is a deliberate choice about "
+            "your own tools and is respected, so those verbs run without an approval "
+            "card. Know what it costs before writing one: the agent runtime approves "
+            "such a call locally and emits no permission request, so Kiro Crew's "
+            "own tool gate never runs for it. Turn this OFF to drop every verb no "
+            "server spec declares, which puts those tools back through the gate. A "
+            "governance ceiling strips the key whatever this says, and a verb a spec "
+            "declares is kept either way. Applies at restart, when the spec is "
+            "rebuilt, so a change does not retract or restore a grant already in the "
+            "file.",
             restart=True,
         ),
     )
@@ -6537,22 +6599,23 @@ class DecisionsConfig:
 
 @dataclass
 class MonitoringConfig:
-    """Which side justifies itself when a session picks a monitoring path.
+    """Monitor arming preference and finite wall-clock policy.
 
-    Two paths can watch the same pull request today and NEITHER is gated. The
-    probe-gated structured monitor (``monitor_watch``) and the per-interval
-    prompt loop (``monitor_start``) are both armable on a stock install, and
-    ``GET /api/monitors`` answers ``enabled`` from whether the service object
-    exists rather than from any key, so there has never been a switch that
-    turns the structured engine on or off.
-
-    What is genuinely unsettable is which of the two an arming takes, and the
-    reason is that no code chooses: the choice is made by the model reading the
-    two tool descriptions. So this section is read exactly where those
-    descriptions are built -- ``mcp_tools/control.py::schemas()`` -- and
-    nowhere else. That is the honest extent of it, and the help text below says
-    so rather than implying an enforcement this key does not have.
+    The preference changes tool guidance, not eligibility. The runtime ceiling
+    is enforced across tools, API mutations and persistence; raising it never
+    extends an existing loop's stored budget or creation time.
     """
+
+    max_runtime_secs: int = field(
+        default=DEFAULT_RUNTIME_CEILING_SECS,
+        metadata=_meta(
+            "Maximum monitoring runtime (seconds)",
+            "Finite wall-clock ceiling for new and updated monitors. Accepts up to "
+            "2592000 seconds (30 days). Raising this limit never extends an existing deadline.",
+            min=1,
+            max=MAX_RUNTIME_CEILING_SECS,
+        ),
+    )
 
     prefer_structured_arming: bool = field(
         default=False,
@@ -7800,9 +7863,12 @@ class WhatsAppConfig:
         default_factory=list,
         metadata=_meta(
             "Allowed WhatsApp IDs",
-            "Phone numbers (digits only, country code, no '+') additionally "
-            "permitted to DM the agent when dm_policy='allowlist'. Empty adds "
-            "nobody beyond the linked account.",
+            "Phone numbers (digits only, country code, no '+') permitted to "
+            "address the agent besides the linked account: in direct chats when "
+            "dm_policy='allowlist', and in every configured group regardless of "
+            "dm_policy (a group member not listed here is dropped silently, even "
+            "when they @-mention the agent or the group is in 'rules' mode). Empty "
+            "adds nobody beyond the linked account.",
             tags=["whatsapp"],
         ),
     )
@@ -7816,7 +7882,9 @@ class WhatsAppConfig:
             "unprompted when the entry's rules say the agent can genuinely "
             "help) | 'off', 'rules': free-text guidance for when to speak, "
             "'cooldown_s': minimum seconds between unprompted replies "
-            "(default 120)}. Groups not listed are ignored entirely.",
+            "(default 120)}. Groups not listed are ignored entirely. Listing a "
+            "group lets the agent speak there; it does not admit its members: "
+            "only you and the numbers in allowed_wa_ids can make the agent reply.",
             tags=["whatsapp"],
         ),
     )

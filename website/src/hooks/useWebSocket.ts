@@ -61,6 +61,7 @@ import {
   sseMcpReportUpdate,
   setChannelTrusted,
   sseSlotTitle,
+  sseSlotPatch,
   triggerRefresh,
   fetchSlots,
   markSlotUnread,
@@ -71,6 +72,7 @@ import {
   touchSlotActivity,
   patchSlotSourceLinks,
   type SubagentDetail,
+  type SlotPatchFrame,
 } from '../store/dashboardSlice'
 import {
   addNotification,
@@ -87,6 +89,7 @@ import {
   TURN_DONE_KIND,
   APPROVAL_KIND,
   shouldChimeOnTurnDone,
+  shouldChimeOnPermissionRow,
 } from './notificationEvent'
 import { shouldNotifyOnChatComplete } from './chatCompleteNotify'
 import { postNativeNotification } from '../lib/nativeNotify'
@@ -234,6 +237,15 @@ const isSlotOnScreen = (slot: string): boolean =>
 const isSlotRenderedVisibly = (slot: string): boolean =>
   isChatSurfaceVisible() || slot === getViewedThreadSlot()
 const WORKFLOW_HEAL_MS = 15000
+/** A socket that has delivered nothing for this long while the page is visible
+ *  is treated as dead, even when its `readyState` still reads OPEN. The gateway
+ *  pushes a `dashboard` status frame on every socket every 5s
+ *  (`_WS_STATUS_INTERVAL` in `dashboard/ws.py`), so this is four missed ticks. */
+export const WS_SILENCE_MS = 20_000
+/** How often the silence check runs: the status frame's own cadence. */
+export const WS_SILENCE_CHECK_MS = 5_000
+/** Ceiling for the silence window after repeated silent reconnects. */
+export const WS_SILENCE_MAX_MS = 300_000
 const LEGACY_AUTOMATION_SEED_QUERY_KEY = ['automation-seed', 'legacy'] as const
 const STRUCTURED_AUTOMATION_SEED_QUERY_KEY = ['automation-seed', 'structured'] as const
 
@@ -537,6 +549,16 @@ export function useWebSocket() {
   const logCbRef = useRef<LogCallback>(null)
   const subagentSubRef = useRef(false)
   const reconnectRef = useRef(1000)
+  // Silence watchdog state (see WS_SILENCE_MS), kept in visible time: when the
+  // current socket last delivered a frame, when its silence clock started (at
+  // open), when the page was hidden (0 while visible), until when a socket
+  // thawed by a return is spared, and how many silent sockets in a row the
+  // watchdog has replaced.
+  const lastFrameAtRef = useRef(0)
+  const silenceClockStartedAtRef = useRef(0)
+  const hiddenAtRef = useRef(0)
+  const graceUntilRef = useRef(0)
+  const silentReconnectsRef = useRef(0)
   const wasConnectedRef = useRef(false)
   const reconnectingRef = useRef(false) // suppress markSlotUnread during reconnect catch-up
   const lastVersionRef = useRef<string | null>(null)
@@ -692,6 +714,21 @@ export function useWebSocket() {
     },
     [dispatch, updateVoiceBusy],
   )
+
+  const releaseVoiceOnSocketLoss = useCallback(() => {
+    if (
+      !voiceRequestsRef.current.size &&
+      !voicePlayingRef.current &&
+      !store.getState().chat.voicePlaying
+    )
+      return
+    reportVoiceFailure({
+      slot: store.getState().chat.activeSlot,
+      code: 'voice_playback_failed',
+    })
+    // Audio frames have no reconnect replay, so release the incomplete stream.
+    stopVoice()
+  }, [stopVoice])
 
   const getPcmPlayer = useCallback(() => {
     pcmPlayerRef.current ??= new VoicePcmPlayer(
@@ -1230,6 +1267,7 @@ export function useWebSocket() {
             slot: q.slot as string,
             ask_id: q.ask_id,
             card_id: q.card_id,
+            native: q.native,
             questions: q.questions as Parameters<typeof setQuestionCard>[0]['questions'],
           }),
         )
@@ -1560,11 +1598,18 @@ export function useWebSocket() {
     if (closingRef.current) return // component unmounted, don't reconnect
     // closingRef invariant: reset by useEffect before calling connect()
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${proto}//${location.host}/api/ws`)
+    // `caps=slot_patch`: this bundle applies one-row `slot_patch` frames, so
+    // the gateway sends those instead of the full slot list after a pin,
+    // rename, folder move or close. A gateway that predates the frame ignores
+    // the parameter and keeps sending full lists, which this handler still
+    // applies.
+    const ws = new WebSocket(`${proto}//${location.host}/api/ws?caps=slot_patch`)
     wsRef.current = ws
 
     ws.onopen = () => {
       reconnectRef.current = 1000
+      silenceClockStartedAtRef.current = Date.now()
+      lastFrameAtRef.current = silenceClockStartedAtRef.current
       // Forget the last-seen allowlist generation: it is process-local to the
       // gateway, so after a restart an equal number can mean a different
       // allowlist. Clearing it makes the next generation frame refetch.
@@ -1744,9 +1789,11 @@ export function useWebSocket() {
         // socket died — for good, until a remount. The observed hydrate queries
         // are the registry of on-screen panes (api/slotMessagesQuery.ts): warm
         // each once through the same sanctioned path, which reconciles the rows
-        // to the server's canonical transcript, idles the run indicator only
-        // when the server says the turn ended, and raises the chunk replay
-        // floor when it is still live. The active slot is skipped here and
+        // to the server's canonical transcript, settles the run indicator to
+        // the server's answer (idle when the turn ended, streaming when one
+        // started during the outage) unless a live frame ordered after the
+        // warm already wrote it, and raises the chunk replay floor when the
+        // turn is still live. The active slot is skipped here and
         // again inside the thunk.
         for (const slot of observedPaneSlots(queryClient)) {
           if (slot === active || warmed.has(slot)) continue
@@ -1818,6 +1865,7 @@ export function useWebSocket() {
     }
 
     ws.onmessage = (e) => {
+      if (wsRef.current === ws) lastFrameAtRef.current = Date.now()
       try {
         const msg = JSON.parse(e.data)
         const { type, data } = msg
@@ -1853,6 +1901,8 @@ export function useWebSocket() {
             )
               break
             lastSlotsRawRef.current = raw
+            // Query keys this frame has made stale; flushed once at the end.
+            const staleKeys = new Set<'chat-folders' | 'dashboardConfig'>()
             dispatch(sseSlots(data as ChatSlot[]))
             lastSlotsArrayRef.current = store.getState().dashboard.slots
             if (msg.yolo !== undefined) {
@@ -1903,7 +1953,7 @@ export function useWebSocket() {
                 )
                 // Backfill history_count (omitted from the WS payload) — the seed
                 // marked the query fresh, so nudge the real GET to run.
-                queryClient.invalidateQueries({ queryKey: ['chat-folders'] })
+                staleKeys.add('chat-folders')
               }
             }
             // Refetch the folder tree when the STORE changed, for every source of
@@ -1929,7 +1979,7 @@ export function useWebSocket() {
               const prevFoldersGen = lastFoldersGenRef.current
               lastFoldersGenRef.current = msg.foldersGeneration
               if (prevFoldersGen === null || prevFoldersGen !== msg.foldersGeneration) {
-                queryClient.invalidateQueries({ queryKey: ['chat-folders'] })
+                staleKeys.add('chat-folders')
               }
             }
             // Refresh the cached GitLab-hosts allowlist when it may have changed.
@@ -1942,9 +1992,7 @@ export function useWebSocket() {
               const prevGen = lastGitlabHostsGenRef.current
               lastGitlabHostsGenRef.current = msg.gitlabHostsGeneration
               if (prevGen === null || prevGen !== msg.gitlabHostsGeneration) {
-                queryClient.invalidateQueries({
-                  queryKey: ['dashboardConfig'],
-                })
+                staleKeys.add('dashboardConfig')
               }
             }
             // Same contract for the governance ceiling: a centrally pushed policy
@@ -1956,11 +2004,16 @@ export function useWebSocket() {
               const prevGovGen = lastGovernanceGenRef.current
               lastGovernanceGenRef.current = msg.governanceGeneration
               if (prevGovGen === null || prevGovGen !== msg.governanceGeneration) {
-                queryClient.invalidateQueries({
-                  queryKey: ['dashboardConfig'],
-                })
+                staleKeys.add('dashboardConfig')
               }
             }
+            // One invalidation per key per frame. Several arms above can each
+            // ask for the same key on one frame (the first frame of a connection
+            // trips both generation arms, and the folder seed plus its generation),
+            // and every invalidate cancels the refetch the previous one started
+            // and issues another, so separate calls put two identical GETs on the
+            // wire where one answers them all.
+            for (const key of staleKeys) queryClient.invalidateQueries({ queryKey: [key] })
             break
           }
           case 'credential_redaction_changed': {
@@ -2022,6 +2075,23 @@ export function useWebSocket() {
           case 'slot_title':
             dispatch(sseSlotTitle(data as { key: string; title: string }))
             break
+          case 'slot_patch': {
+            const frame = data as SlotPatchFrame
+            const dashboard = store.getState().dashboard
+            const removed = new Set(frame.removed ?? [])
+            const hasUnknownRow = (frame.slots ?? []).some(
+              (row) =>
+                typeof row?.key === 'string' &&
+                !removed.has(row.key) &&
+                !Object.prototype.hasOwnProperty.call(dashboard.closingSlots ?? {}, row.key) &&
+                !dashboard.slots.some((slot) => slot.key === row.key),
+            )
+            // A stale list can remove a newly created row; its later patch cannot
+            // restore that row, so the authoritative list repairs the omission.
+            if (hasUnknownRow) dispatch(fetchSlots())
+            dispatch(sseSlotPatch(frame))
+            break
+          }
           case 'session_summary': {
             // A turn finished and the backend regenerated this session's intent
             // summary. Invalidate so the panel picks it up immediately.
@@ -2367,6 +2437,23 @@ export function useWebSocket() {
           case 'chat_message':
             flushChunks()
             dispatch(sseChatMessage(data))
+            // Approval-blocked chime for an INTERACTIVE chat. The chat runner
+            // parks its turn on this `permission` row and emits no `approval`
+            // frame for it (that frame is the coordinator registry's, and chimes
+            // on its own), so this row is where the sound is synthesized — the
+            // `chat_done` / `question_card` layering: client-side, sound only,
+            // no feed row, no toast. The row is delivered once, so one frame is
+            // one sound; a row carrying `resolved` — the batch-rejection
+            // re-append, or a turn with no budget left to wait, decided before
+            // the append — and a reconnect replay stay silent. A Slack post
+            // that fails after the row went out retires it via
+            // `approval_resolved`; that arrival chime is the accepted residual.
+            if (
+              data.role === 'permission' &&
+              shouldChimeOnPermissionRow({ meta: data.meta, reconnecting: reconnectingRef.current })
+            ) {
+              dispatchMcNotification(APPROVAL_KIND)
+            }
             // Re-rank the sidebar the instant a session sees a message, instead of waiting
             // for the next full slots push. `last_ts` moves for agent output too (it feeds
             // "last message" reads); the ORDERING key moves only for an inbound prompt —
@@ -2737,14 +2824,10 @@ export function useWebSocket() {
             break
           case 'question_card': {
             const previous = store.getState().chat.pendingQuestions?.[data.slot]
-            // `fresh` marks a live delivery and preserves the card's existing
-            // identity/rehydration contract. Audio deduplicates by server id.
-            dispatch(
-              setQuestionCard({
-                ...(data as Parameters<typeof setQuestionCard>[0]),
-                fresh: true,
-              }),
-            )
+            // Every card carries its server identity (`ask_id` or `card_id`);
+            // the reducer coalesces a re-delivery of the same id. Audio
+            // deduplicates by that id too.
+            dispatch(setQuestionCard(data as Parameters<typeof setQuestionCard>[0]))
             const current = store.getState().chat.pendingQuestions?.[data.slot]
             const id = data.ask_id || data.card_id
             if (
@@ -3707,19 +3790,7 @@ export function useWebSocket() {
       wsRef.current = null
 
       if (closingRef.current) return
-      if (
-        voiceRequestsRef.current.size ||
-        voicePlayingRef.current ||
-        store.getState().chat.voicePlaying
-      ) {
-        reportVoiceFailure({
-          slot: store.getState().chat.activeSlot,
-          code: 'voice_playback_failed',
-        })
-        // Audio frames have no reconnect replay. Retrying the connection cannot
-        // recover the missing samples, so release the pending stream explicitly.
-        stopVoice()
-      }
+      releaseVoiceOnSocketLoss()
       const delay = reconnectRef.current
       reconnectRef.current = Math.min(delay * 2, 10000)
       reconnectTimerRef.current = setTimeout(connect, delay)
@@ -3742,6 +3813,7 @@ export function useWebSocket() {
     stopVoice,
     updateVoiceBusy,
     updateAutoSpeak,
+    releaseVoiceOnSocketLoss,
     getPcmPlayer,
     syncPendingApprovals,
     syncPendingQuestions,
@@ -3766,6 +3838,7 @@ export function useWebSocket() {
     reconnectRef.current = 1000 // reset backoff window
     const ws = wsRef.current
     if (ws && ws.readyState !== WebSocket.CLOSED) {
+      releaseVoiceOnSocketLoss()
       // Detach handlers BEFORE close() so the onclose handler doesn't fire
       // asynchronously and schedule a redundant reconnect on top of our 0ms
       // timer below — that race would briefly create two parallel WebSocket
@@ -3784,7 +3857,75 @@ export function useWebSocket() {
     }
     wsRef.current = null
     reconnectTimerRef.current = setTimeout(connect, 0)
-  }, [connect])
+  }, [connect, releaseVoiceOnSocketLoss])
+
+  /** Replace a socket that is OPEN but has stopped delivering.
+   *
+   *  A browser can keep a WebSocket whose transport is gone -- a phone that
+   *  changed networks, or a tab resumed after the OS froze it -- without ever
+   *  firing `onclose`. Nothing else notices: the reconnect catch-up only runs on
+   *  close, and the health probe only polls while `connected` is false. Every
+   *  one-shot frame is then lost until a manual reload; an agent-armed
+   *  `autonudge_state` is the visible case, since no local mutation writes that
+   *  record. The gateway's 5s `dashboard` frame is the liveness signal: while the
+   *  page is visible, a socket silent for WS_SILENCE_MS is torn down through
+   *  `forceReconnect`, whose catch-up re-reads every frame family.
+   *
+   *  Silence is measured in visible time only. Hidden pages are skipped (timers
+   *  are throttled there, and a suspended tab processed nothing); on the return
+   *  every stamp moves past the hidden interval, so silence adds up across tab
+   *  switches while a frame that arrived in the background counts as arriving
+   *  at the return. A thawed socket then gets two checks to deliver its next
+   *  status frame before it can be replaced -- unless its visible silence had
+   *  already passed the window when the page came back, in which case the
+   *  first check replaces it, so a dead socket cannot outlive a run of glances
+   *  each shorter than that grace. Each consecutive silent replacement doubles
+   *  the window up to WS_SILENCE_MAX_MS, so a gateway that stopped sending
+   *  status on a live socket costs one reconnect per window rather than one
+   *  every 20s; a socket observed live for a whole window of visible time since
+   *  it opened resets the count. */
+  useEffect(() => {
+    const silenceWindowMs = () =>
+      Math.min(WS_SILENCE_MS * 2 ** silentReconnectsRef.current, WS_SILENCE_MAX_MS)
+    const check = () => {
+      if (document.hidden) return
+      const ws = wsRef.current
+      if (!ws || ws.readyState !== WebSocket.OPEN) return
+      const now = Date.now()
+      const silenceMs = silenceWindowMs()
+      if (now - lastFrameAtRef.current <= silenceMs) {
+        if (now - silenceClockStartedAtRef.current > silenceMs) silentReconnectsRef.current = 0
+        return
+      }
+      if (now < graceUntilRef.current) return
+      silentReconnectsRef.current += 1
+      forceReconnect()
+    }
+    const onVisibility = () => {
+      const now = Date.now()
+      if (document.hidden) {
+        hiddenAtRef.current = now
+        return
+      }
+      // Move each stamp past only the hidden time after it, and never past
+      // now: a stamp from before the hide keeps its visible age, and a frame
+      // that arrived while hidden counts as arriving at the return.
+      const skipHidden = (stamp: number) => stamp + now - Math.max(hiddenAtRef.current, stamp)
+      lastFrameAtRef.current = skipHidden(lastFrameAtRef.current)
+      silenceClockStartedAtRef.current = skipHidden(silenceClockStartedAtRef.current)
+      hiddenAtRef.current = 0
+      // Two checks of grace for a thawed socket, none for one whose visible
+      // silence had already passed the window before it was hidden.
+      graceUntilRef.current =
+        now - lastFrameAtRef.current > silenceWindowMs() ? 0 : now + WS_SILENCE_CHECK_MS * 2
+    }
+    const timer = setInterval(check, WS_SILENCE_CHECK_MS)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [forceReconnect])
 
   /* The watchdog's escalation target. `forceReconnect` depends on `connect` and
    * so on the whole socket setup, while the watchdog's interval must keep one

@@ -123,6 +123,7 @@ from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trust
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
+from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 from kiro_crew.platform import current_context
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
@@ -152,7 +153,6 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionClosingError, SessionManager
-from kiro_crew.session_map import SessionMap
 from kiro_crew.slack.blocks import build_working_blocks, deprecation_warning_block
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.format import (
@@ -808,17 +808,6 @@ def _is_slack_restricted(session_key: str) -> bool:
     return privacy_mode.is_restricted(session_key)
 
 
-def _conv_state_map(sessions: object) -> "SessionMap | None":
-    """Return the SessionManager's canonical SessionMap, or None.
-
-    Thin wrapper over :func:`kiro_crew.messaging.privacy_mode.conv_state_map`,
-    which documents why requiring the real class (rather than any attribute) is
-    load-bearing for a test double.
-    """
-    sm = privacy_mode.conv_state_map(sessions)
-    return sm if isinstance(sm, SessionMap) else None
-
-
 def _hydrate_conv_flags(sessions: object, session_key: str) -> None:
     """Restore persisted temporary/incognito flags into the in-memory caches.
 
@@ -827,21 +816,6 @@ def _hydrate_conv_flags(sessions: object, session_key: str) -> None:
     from the durable ``SessionMap`` entry).
     """
     privacy_mode.hydrate(sessions, session_key)
-
-
-def _strip_incognito_token(text: str) -> tuple[str, bool]:
-    """Remove standalone ``!incognito`` token from *text*."""
-    return privacy_mode.strip_token(text, privacy_mode.MODE_INCOGNITO)
-
-
-def _strip_temporary_token(text: str) -> tuple[str, bool]:
-    """Remove standalone ``!temporary`` token from *text*.
-
-    Returns ``(cleaned_text, found)`` where *found* is True if the token
-    was present.  The cleaned text has the token removed and excess
-    whitespace collapsed.
-    """
-    return privacy_mode.strip_token(text, privacy_mode.MODE_TEMPORARY)
 
 
 async def _apply_privacy_mode(
@@ -857,8 +831,9 @@ async def _apply_privacy_mode(
     """Mark a session as *mode* and notify the user (idempotent).
 
     Everything platform-shaped is a callback into this module, which is what lets
-    the shared applier own the ordering (mark before any await, then the durable
-    flag, then the audit, then the notice).
+    the shared applier own the ordering (``privacy_mode._commit_mode``, whose
+    docstring is the one statement of it: the durable records first, awaited,
+    then the publication -- or a refusal that publishes nothing).
     """
 
     async def _notify(message: str) -> None:
@@ -889,50 +864,6 @@ async def _apply_privacy_mode(
     )
 
 
-async def _apply_temporary_modifier(
-    session_key: str,
-    user_id: str,
-    channel: str,
-    slack: SlackClientOps,
-    sessions: SessionManager,
-    reply_ts: str,
-    link_thread: bool = True,
-) -> None:
-    """Mark a session as temporary and notify the user (idempotent)."""
-    await _apply_privacy_mode(
-        privacy_mode.MODE_TEMPORARY,
-        session_key,
-        user_id,
-        channel,
-        slack,
-        sessions,
-        reply_ts,
-        link_thread,
-    )
-
-
-async def _apply_incognito_modifier(
-    session_key: str,
-    user_id: str,
-    channel: str,
-    slack: SlackClientOps,
-    sessions: SessionManager,
-    reply_ts: str,
-    link_thread: bool = True,
-) -> None:
-    """Mark a session as incognito and notify the user (idempotent)."""
-    await _apply_privacy_mode(
-        privacy_mode.MODE_INCOGNITO,
-        session_key,
-        user_id,
-        channel,
-        slack,
-        sessions,
-        reply_ts,
-        link_thread,
-    )
-
-
 async def maybe_apply_privacy_modifiers(
     text: str,
     cmd_text: str,
@@ -955,8 +886,13 @@ async def maybe_apply_privacy_modifiers(
     - *cmd_text* — the mention-stripped command text with the token removed
       (the native path reuses it for its subsequent ``!compact``/``!bang``
       checks; the transport path ignores it).
-    - *only_modifier* — True when the message was nothing but the modifier(s);
-      the caller MUST then return without starting an LLM turn.
+    - *only_modifier* — True when there is nothing left to run: the message was
+      nothing but the modifier(s), OR the modifier was REFUSED (the gateway's
+      private-conversation limit, or an over-long key -- ``apply_mode`` has
+      already audited the denial and told the user the message was not
+      processed). The caller MUST then return without starting an LLM turn:
+      running the message with the mode silently dropped would be the leak the
+      modifier exists to prevent.
 
     Slack's TWO texts are why this drives ``privacy_mode``'s primitives rather
     than its single-text ``strip_and_apply``: only *cmd_text* decides whether the
@@ -971,9 +907,13 @@ async def maybe_apply_privacy_modifiers(
         cmd_stripped, had_mode = privacy_mode.strip_token(cmd_text, mode)
         if not had_mode:
             continue
-        await _apply_privacy_mode(
-            mode, session_key, user_id, channel, slack, sessions, reply_ts, link_thread
-        )
+        try:
+            await _apply_privacy_mode(
+                mode, session_key, user_id, channel, slack, sessions, reply_ts, link_thread
+            )
+        except privacy_mode.PrivacyModeRefused:
+            # Audited and announced by apply_mode; nothing is left to run.
+            return text, cmd_stripped, True
         cmd_text = cmd_stripped
         text = pattern.sub("", text)
         text = " ".join(text.split()) or text  # collapse whitespace
@@ -4437,7 +4377,17 @@ async def handle_message(
                         # block.
                         _ng_refusal = await name_grant.refusal_for_event(event)
                         if _ng_refusal is None:
-                            await client.approve_tool(event.request_id)
+                            approval_sent = await client.approve_tool(event.request_id)
+                            if approval_sent is False:
+                                sel().log_tool_invocation(
+                                    session_key=session_key,
+                                    source="slack",
+                                    tool_name=event.title,
+                                    tool_kind=event.tool_kind,
+                                    outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                                    request_id=event.request_id,
+                                )
+                                continue
                             Stats().inc_tool_auto_approved()
                             sel().log_tool_invocation(
                                 session_key=session_key,
@@ -4483,7 +4433,17 @@ async def handle_message(
 
                 # auto_approve_subagent_spawn → auto-approve spawn_run tool calls
                 if _should_auto_approve_spawn(context_builder, event):
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
+                    if approval_sent is False:
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="slack",
+                            tool_name=event.title,
+                            tool_kind=event.tool_kind,
+                            outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                            request_id=event.request_id,
+                        )
+                        continue
                     Stats().inc_tool_auto_approved()
                     sel().log_tool_invocation(
                         session_key=session_key,
@@ -4497,7 +4457,17 @@ async def handle_message(
                     continue
 
                 if approval_mode == APPROVAL_AUTO:
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
+                    if approval_sent is False:
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="slack",
+                            tool_name=event.title,
+                            tool_kind=event.tool_kind,
+                            outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                            request_id=event.request_id,
+                        )
+                        continue
                     Stats().inc_tool_auto_approved()
                     sel().log_tool_invocation(
                         session_key=session_key,
@@ -4513,7 +4483,17 @@ async def handle_message(
                 # Trust mode (per-session) or YOLO mode (owner-only global) → auto-approve
                 _yolo_now = is_yolo_mode()
                 if _yolo_now or session_key in _trusted_sessions:
-                    await client.approve_tool(event.request_id)
+                    approval_sent = await client.approve_tool(event.request_id)
+                    if approval_sent is False:
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="slack",
+                            tool_name=event.title,
+                            tool_kind=event.tool_kind,
+                            outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                            request_id=event.request_id,
+                        )
+                        continue
                     Stats().inc_tool_auto_approved()
                     logger.info(
                         "Auto-approved %s (%s)",
@@ -6384,6 +6364,7 @@ async def handle_interaction(
     # replaces. approve_tool pops the recorded options before sending, so the
     # guard's fallback reject can land as a cancelled outcome (ends the turn's
     # remaining tool calls) — still strictly better than a wedged subprocess.
+    floor_refused = False
     try:
         if action_id in (_ACTION_APPROVE, _ACTION_TRUST):
             # Set trust state BEFORE approving (so subsequent tools auto-approve)
@@ -6408,15 +6389,25 @@ async def handle_interaction(
                     logger.warning(
                         "No session_key on pending approval %s; approving without trust", key
                     )
+            approval_sent = True
             if pending.provider:
-                await pending.provider.approve_tool(pending.request_id)
+                approval_sent = await pending.provider.approve_tool(pending.request_id)
             if not pending.future.done():
-                pending.future.set_result(_OUTCOME_APPROVED)
-            Stats().inc_tool_approval()
+                pending.future.set_result(
+                    _OUTCOME_APPROVED if approval_sent is not False else _OUTCOME_REJECTED
+                )
+            if approval_sent is not False:
+                Stats().inc_tool_approval()
+            else:
+                # The transport's gate refused the call: the card must not
+                # be relabelled as approved.
+                floor_refused = True
             sel().log_api_access(
                 caller=user_id,
                 operation="slack.interactive.approval",
-                outcome="allowed",
+                outcome=(
+                    "allowed" if approval_sent is not False else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                ),
                 source="slack",
                 resources=action_id,
             )
@@ -6445,7 +6436,7 @@ async def handle_interaction(
             pending.future.set_result(_OUTCOME_REJECTED)
         raise
 
-    return action_id
+    return _ACTION_REJECT if floor_refused else action_id
 
 
 def _build_approval_blocks(event: LLMEvent, is_dm: bool = True, source: str = "") -> list[dict]:

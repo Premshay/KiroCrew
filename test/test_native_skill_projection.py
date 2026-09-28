@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import gc
 import hashlib
 import itertools
 import json
 import os
 import shutil
+import stat
 import threading
 import time
 import uuid
@@ -97,6 +99,9 @@ def native_tree(tmp_path, monkeypatch):
         "list_agents",
         lambda **kw: [SimpleNamespace(name="custom", filename="custom.json", scope="global")],
     )
+    # The projection reads the settings files the control-plane mount reads;
+    # point the global one into the temp tree so no test reads this host's own.
+    monkeypatch.setattr("kiro_crew.agent._KIRO_MCP_JSON", home / "settings" / "mcp.json")
     return home, agents, project
 
 
@@ -725,7 +730,7 @@ def _legacy_alias(agents, digest="0" * 24, name=None, resources=None, age_secs=3
     return path
 
 
-def test_prune_spares_a_legacy_alias_that_may_be_mid_publish(native_tree):
+def test_prune_spares_a_legacy_alias_that_may_be_mid_publish(native_tree, monkeypatch):
     """The one window the re-preparation contract does not cover.
 
     A publisher from a build predating the lease holds no lease, so between its
@@ -738,6 +743,8 @@ def test_prune_spares_a_legacy_alias_that_may_be_mid_publish(native_tree):
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
     fresh = _legacy_alias(agents, "f" * 24, age_secs=0)
     stale = _legacy_alias(agents, "e" * 24)
+    # Both candidates must be classified, so the walk must not end on the clock.
+    _hold_the_prune_clock(monkeypatch)
 
     assert projection.prepare_native_skill_projection(project) is not None
 
@@ -765,7 +772,7 @@ def test_prune_reclaims_the_backlog_left_by_builds_that_wrote_no_ownership(nativ
     assert _alias_file(agents, prepared).exists(), "this run's own alias was reclaimed"
 
 
-def test_prune_leaves_an_unattributable_alias_even_with_the_right_name(native_tree):
+def test_prune_leaves_an_unattributable_alias_even_with_the_right_name(native_tree, monkeypatch):
     """Shape is not provenance, and an unlink is not undoable.
 
     An operator's own agent could in principle carry this name, so one positive
@@ -778,6 +785,8 @@ def test_prune_leaves_an_unattributable_alias_even_with_the_right_name(native_tr
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
     unattributable = _legacy_alias(agents, "9" * 24, owned=False)
     attributable = _legacy_alias(agents, "8" * 24)
+    # Both candidates must be classified, so the walk must not end on the clock.
+    _hold_the_prune_clock(monkeypatch)
 
     assert projection.prepare_native_skill_projection(project) is not None
 
@@ -831,6 +840,8 @@ def test_prune_caps_reclaims_per_run_so_the_backlog_drains_over_spawns(native_tr
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
     monkeypatch.setattr(projection, "_PROJECTION_PRUNE_WORK_LIMIT", 4, raising=False)
     monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 3)
+    # The survivor counts below assume each walk ends on the cap, not the clock.
+    _hold_the_prune_clock(monkeypatch)
     backlog = [_legacy_alias(agents, f"{n:024x}") for n in range(8)]
 
     assert projection.prepare_native_skill_projection(project) is not None
@@ -1849,6 +1860,8 @@ def test_prune_work_cap_counts_retained_candidates_before_reclaims(native_tree, 
 
     monkeypatch.setattr(projection, "_PROJECTION_PRUNE_WORK_LIMIT", 3, raising=False)
     monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 64)
+    # Every stale candidate must be reached, so the walk must not end on the clock.
+    _hold_the_prune_clock(monkeypatch)
 
     scans = 0
 
@@ -2170,6 +2183,8 @@ def test_boot_drain_retries_a_batch_that_missed_the_lock(native_tree, monkeypatc
     monkeypatch.setattr(projection, "_projection_alias_lock", flaky)
     monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 2)
     monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+    # The exact batch sequence below assumes each walk ends on the cap, not the clock.
+    _hold_the_prune_clock(monkeypatch)
 
     assert projection.drain_stale_aliases() == 5
     assert not any(alias.exists() or meta.exists() for alias, meta in backlog)
@@ -2353,6 +2368,7 @@ def test_prune_scans_the_lease_directory_once_for_many_candidates(native_tree, m
     """
     _home, agents, _project = native_tree
     candidates = [_legacy_alias(agents, f"{index:024x}") for index in range(4)]
+    walked = [_legacy_alias(agents, f"{index:024x}") for index in range(100, 104)]
     external = projection._acquire_projection_lease(agents, {p.stem for p in candidates})
     lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
     normalized_lease_dir = os.path.normcase(os.path.normpath(os.fspath(lease_dir)))
@@ -2382,6 +2398,46 @@ def test_prune_scans_the_lease_directory_once_for_many_candidates(native_tree, m
 
     assert scandir_calls == 1, "the lease directory must be scanned once, not once per candidate"
     assert all(p.exists() for p in candidates)
+    assert not any(p.exists() for p in walked), "unleased candidates are walked and reclaimed"
+
+
+def test_a_lease_released_during_the_walk_keeps_its_aliases_for_that_call(native_tree, monkeypatch):
+    """A release races the snapshot lock-free, so a stale snapshot may only keep.
+
+    The lease is closed after the one scan and before the walk; the aliases it
+    named survive this call, and an unleased stale alias beside them is still
+    reclaimed, so the walk did run.
+    """
+    _home, agents, _project = native_tree
+    leased = [_legacy_alias(agents, f"{index:024x}") for index in range(3)]
+    free = _legacy_alias(agents, "f" * 24)
+    lease = projection._acquire_projection_lease(agents, {p.stem for p in leased})
+    real_candidates = projection._projection_prune_candidates
+
+    def release_then_enumerate(directory, skip):
+        lease.close()
+        return real_candidates(directory, skip)
+
+    monkeypatch.setattr(projection, "_projection_prune_candidates", release_then_enumerate)
+    reclaimed = projection._prune_stale_managed_aliases(
+        agents, projection.data_home().absolute().as_posix(), keep=set()
+    )
+
+    assert all(p.exists() for p in leased), "a lease released mid-walk must still keep its aliases"
+    assert not free.exists() and reclaimed == 1
+
+
+@pytest.mark.parametrize("ceiling", [projection._PROJECTION_LOCK_TIMEOUT_SECS, 1.7, 4.0])
+def test_prune_budget_follows_the_lock_ceiling_and_keeps_the_publication_reserve(ceiling):
+    """The walk budget is the ceiling minus the lease scan and a named reserve."""
+    budget = projection._prune_budget_within(ceiling)
+    reserve = projection._PROJECTION_PUBLICATION_RESERVE_SECS
+    scan = projection._PROJECTION_LEASE_SCAN_MAX_SECONDS
+    assert reserve > 0
+    assert budget + scan + reserve <= ceiling + 1e-9
+    assert budget == pytest.approx(ceiling - scan - reserve)
+    shipped = projection._prune_budget_within(projection._PROJECTION_LOCK_TIMEOUT_SECS)
+    assert projection._PRUNE_MAX_SECONDS_PER_RUN == shipped > 0
 
 
 def test_prune_skips_all_candidate_deletion_when_lease_scan_is_uncertain(native_tree, monkeypatch):
@@ -2560,6 +2616,8 @@ def test_prune_does_not_let_the_run_keep_alias_starve_backlog_reclamation(native
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
     monkeypatch.setattr(projection, "_PROJECTION_PRUNE_WORK_LIMIT", 4, raising=False)
     monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 3)
+    # The exact reclaim count below assumes the walk ends on the cap, not the clock.
+    _hold_the_prune_clock(monkeypatch)
     backlog = [_legacy_alias(agents, f"{index:024x}") for index in range(8)]
 
     # The run's own alias is named by its view digest, so it is identified at
@@ -3054,3 +3112,297 @@ def test_census_truncates_wherever_the_reclaim_lease_scan_caps(native_tree, monk
     finally:
         for lease in leases:
             lease.close()
+
+
+# ── A refused unlink is reported, not swallowed ──
+
+
+_dir_fd_seam_only = pytest.mark.skipif(
+    os.name != "posix",
+    reason="these drive the dir_fd unlink seam; Windows unlinks by name and reports the "
+    "parent open instead, so the injected errno never reaches the reporter there",
+)
+
+
+def _seed_backlog(agents, count):
+    """*count* reclaimable legacy aliases, backdated past the minimum age."""
+    return [_legacy_alias(agents, f"{n:024x}") for n in range(count)]
+
+
+@_dir_fd_seam_only
+def test_a_refused_unlink_is_reported_once_per_interval_with_its_count(
+    native_tree, monkeypatch, caplog
+):
+    """Silence here is what sent an outside report after the wrong root cause.
+
+    A permission or read-only refusal answering ``False`` like a deliberate keep,
+    with nothing logged, makes an agents directory this process cannot write look
+    exactly like one with nothing to reclaim. One warning per interval,
+    carrying how many refusals it stands for -- never one line per file.
+    """
+    _home, agents, _project = native_tree
+    backlog = _seed_backlog(agents, 5)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_LAST", 0.0)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_SUPPRESSED", 0)
+    monkeypatch.setattr(projection.platform_compat, "IS_WINDOWS", False)
+
+    def refuse(*args, on_error=None, **kwargs):
+        # What pinned_fs.unlink_verified does when the OS refuses the unlink
+        # itself: report through the seam, answer False.
+        assert on_error is not None, "the prune did not ask to hear about a refusal"
+        on_error(PermissionError(13, "Permission denied"))
+        return False
+
+    monkeypatch.setattr(projection.pinned_fs, "unlink_verified", refuse)
+    monkeypatch.setattr(projection.pinned_fs, "supports_pinned_walk", lambda: True)
+    monkeypatch.setattr(projection.os, "supports_dir_fd", {projection.os.unlink})
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+        warnings = [r for r in caplog.records if "cannot remove stale alias" in r.getMessage()]
+        assert len(warnings) == 1, "a refused unlink was either silent or logged per file"
+        assert "unlink refused, EACCES (Permission denied)" in warnings[0].getMessage()
+        assert "is not writable by this process" in warnings[0].getMessage()
+        assert "0 similar refusal(s)" in warnings[0].getMessage()
+        assert all(p.exists() for p in backlog)
+
+        # Past the interval the next refusal reports again, carrying the ones it
+        # swallowed in between.
+        monkeypatch.setattr(
+            projection,
+            "_UNLINK_WARNING_LAST",
+            time.monotonic() - projection._UNLINK_WARNING_INTERVAL_SECS - 1,
+        )
+        projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+        warnings = [r for r in caplog.records if "cannot remove stale alias" in r.getMessage()]
+        assert len(warnings) == 2
+        assert "4 similar refusal(s)" in warnings[1].getMessage()
+
+
+@pytest.mark.parametrize(
+    ("exc", "code"),
+    [
+        (FileNotFoundError(errno.ENOENT, "No such file or directory"), "ENOENT"),
+        (OSError(errno.EMFILE, "Too many open files"), "EMFILE"),
+        (OSError(errno.EIO, "Input/output error"), "EIO"),
+    ],
+)
+@_dir_fd_seam_only
+def test_a_refusal_that_is_not_a_permission_problem_is_worded_neutrally(
+    native_tree, monkeypatch, caplog, exc, code
+):
+    """Only EACCES/EPERM/EROFS mean the directory is unwritable.
+
+    A prune in another process can take the file between the walk's stat and this
+    unlink (ENOENT), or the process can be out of descriptors (EMFILE); calling
+    either "the directory is not writable" sends an operator to fix a mount or an
+    owner that is fine. The line still says what failed and with which errno,
+    through the same throttle and count.
+    """
+    _home, agents, _project = native_tree
+    backlog = _seed_backlog(agents, 2)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_LAST", 0.0)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_SUPPRESSED", 0)
+    monkeypatch.setattr(projection.platform_compat, "IS_WINDOWS", False)
+
+    def refuse(*args, on_error=None, **kwargs):
+        assert on_error is not None
+        on_error(exc)
+        return False
+
+    monkeypatch.setattr(projection.pinned_fs, "unlink_verified", refuse)
+    monkeypatch.setattr(projection.pinned_fs, "supports_pinned_walk", lambda: True)
+    monkeypatch.setattr(projection.os, "supports_dir_fd", {projection.os.unlink})
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+    warnings = [r for r in caplog.records if "cannot remove stale alias" in r.getMessage()]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert f"unlink refused, {code} ({exc.strerror})" in message
+    assert str(agents) in message and "0 similar refusal(s)" in message
+    assert "not writable" not in message
+    assert projection._UNLINK_WARNING_SUPPRESSED == 1, "the second refusal was not counted"
+    assert all(p.exists() for p in backlog)
+
+
+@_dir_fd_seam_only
+@pytest.mark.parametrize("code", [errno.EPERM, errno.EROFS])
+def test_every_permission_class_errno_is_diagnosed_as_unwritable(
+    native_tree, monkeypatch, caplog, code
+):
+    _home, agents, _project = native_tree
+    _seed_backlog(agents, 1)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_LAST", 0.0)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_SUPPRESSED", 0)
+    monkeypatch.setattr(projection.platform_compat, "IS_WINDOWS", False)
+
+    def refuse(*args, on_error=None, **kwargs):
+        on_error(OSError(code, os.strerror(code)))
+        return False
+
+    monkeypatch.setattr(projection.pinned_fs, "unlink_verified", refuse)
+    monkeypatch.setattr(projection.pinned_fs, "supports_pinned_walk", lambda: True)
+    monkeypatch.setattr(projection.os, "supports_dir_fd", {projection.os.unlink})
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+    (warning,) = [r for r in caplog.records if "cannot remove stale alias" in r.getMessage()]
+    assert errno.errorcode[code] in warning.getMessage()
+    assert "is not writable by this process" in warning.getMessage()
+
+
+@_dir_fd_seam_only
+def test_a_refused_lease_unlink_reports_through_the_same_throttle(native_tree, monkeypatch, caplog):
+    """The lease and sidecar unlinks share the alias reporter, not a second one.
+
+    The same read-only or foreign-owned directory that refuses an alias unlink
+    refuses its lease record, holder and ownership sidecar, and a rule applied
+    to one of two paths is the same silence on the other. One reporter, one
+    interval, one suppressed count: a refused lease unlink is the first line,
+    the refused alias unlinks in the same interval are the count on the next.
+    """
+    _home, agents, _project = native_tree
+    backlog = _seed_backlog(agents, 3)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_LAST", 0.0)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_SUPPRESSED", 0)
+    monkeypatch.setattr(projection.platform_compat, "IS_WINDOWS", False)
+
+    def refuse(*args, on_error=None, **kwargs):
+        assert on_error is not None, "the lease unlink did not ask to hear about a refusal"
+        on_error(PermissionError(13, "Permission denied"))
+        return False
+
+    monkeypatch.setattr(projection.pinned_fs, "unlink_verified", refuse)
+    monkeypatch.setattr(projection.pinned_fs, "supports_pinned_walk", lambda: True)
+    monkeypatch.setattr(projection.os, "supports_dir_fd", {projection.os.unlink})
+    # Off the prune's walk, so the count below is exactly the alias refusals.
+    lease_dir = agents.parent / "elsewhere" / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir(parents=True)
+    record = lease_dir / f"1-{'ab' * 16}{projection._PROJECTION_LEASE_RECORD_SUFFIX}"
+    record.write_text('{"aliases":[]}')
+    info = os.stat(record)
+    identity = (info.st_dev, info.st_ino)
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        assert (
+            projection._unlink_projection_lease_if_unchanged(
+                record, identity, what="stale lease record"
+            )
+            is False
+        )
+        warnings = [r for r in caplog.records if "cannot remove" in r.getMessage()]
+        assert len(warnings) == 1, "a refused lease unlink was silent"
+        message = warnings[0].getMessage()
+        assert "stale lease record" in message and record.name in message
+        assert "unlink refused, EACCES (Permission denied)" in message
+        assert "is not writable by this process" in message and str(lease_dir) in message
+        assert "0 similar refusal(s)" in message
+        assert record.exists()
+
+        # Within the interval the alias refusals are swallowed into the SAME count.
+        projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+        assert len([r for r in caplog.records if "cannot remove" in r.getMessage()]) == 1
+        assert all(p.exists() for p in backlog)
+        monkeypatch.setattr(
+            projection,
+            "_UNLINK_WARNING_LAST",
+            time.monotonic() - projection._UNLINK_WARNING_INTERVAL_SECS - 1,
+        )
+        assert (
+            projection._unlink_projection_lease_if_unchanged(
+                record, identity, what="stale lease record"
+            )
+            is False
+        )
+        warnings = [r for r in caplog.records if "cannot remove" in r.getMessage()]
+        assert len(warnings) == 2
+        assert "3 similar refusal(s)" in warnings[1].getMessage()
+
+    # An identity change is a deliberate keep and stays silent: no report, no count.
+    caplog.clear()
+    changed = (identity[0], identity[1] + 1)
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        assert projection._unlink_projection_lease_if_unchanged(record, changed) is False
+    assert not [r for r in caplog.records if "cannot remove" in r.getMessage()]
+    assert projection._UNLINK_WARNING_SUPPRESSED == 0
+
+
+@pytest.mark.skipif(
+    not projection.pinned_fs.supports_pinned_walk() or os.name != "posix",
+    reason="a directory without write permission is a POSIX way to refuse an unlink",
+)
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory permission bits"
+)
+def test_a_read_only_agents_directory_produces_the_refusal_warning(
+    native_tree, monkeypatch, caplog
+):
+    """End to end through the real unlink: the reported field case, with no seam.
+
+    The prune classifies the alias as reclaimable, the kernel refuses the unlink,
+    and the warning names the directory -- which is what an operator needs to
+    stop looking for a code bug and fix a mount or an owner.
+    """
+    _home, agents, _project = native_tree
+    backlog = _seed_backlog(agents, 3)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_LAST", 0.0)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_SUPPRESSED", 0)
+    original_mode = stat.S_IMODE(os.stat(agents).st_mode)
+    os.chmod(agents, original_mode & ~stat.S_IWUSR)
+    try:
+        with caplog.at_level("WARNING", logger=projection.logger.name):
+            projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+    finally:
+        os.chmod(agents, original_mode)
+    warnings = [r for r in caplog.records if "cannot remove stale alias" in r.getMessage()]
+    assert len(warnings) == 1
+    assert str(agents) in warnings[0].getMessage()
+    # The kernel's real answer is EACCES, the one case the line may diagnose as
+    # an unwritable directory.
+    assert "EACCES" in warnings[0].getMessage()
+    assert "is not writable by this process" in warnings[0].getMessage()
+    assert all(p.exists() for p in backlog)
+
+
+@pytest.mark.parametrize(
+    ("workspace", "global_value"),
+    [
+        ({}, None),
+        ({"chat.disableInheritingDefaultResources": True}, None),
+        ({}, True),
+        ({"chat.disableInheritingDefaultResources": False}, True),
+        ({"chat.disableInheritingDefaultResources": "true"}, None),
+    ],
+)
+def test_reader_agrees_with_the_projection_across_its_overlay(native_tree, workspace, global_value):
+    """Readers that mirror native loading must decode Crew's overlay as the projection wrote it.
+
+    After the projection runs, the workspace's native key reads ``true`` whatever
+    the user chose, so a reader of the raw key would see an opt-out everywhere.
+    """
+    home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    if workspace:
+        settings = project / ".kiro" / "settings" / "cli.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps(workspace), encoding="utf-8")
+    if global_value is not None:
+        settings = home / "settings" / "cli.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            json.dumps({"chat.disableInheritingDefaultResources": global_value}), encoding="utf-8"
+        )
+    before = projection.inherits_default_resources(project)
+    prepared = projection.prepare_native_skill_projection(project)
+    projected = any("steering" in item for item in prepared.specs["custom"]["resources"])
+    assert before is projected
+    assert projection.inherits_default_resources(project) is projected
+
+
+def test_reader_follows_a_live_global_preference_under_the_overlay(native_tree):
+    home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    settings = home / "settings" / "cli.json"
+    settings.parent.mkdir()
+    settings.write_text('{"chat.disableInheritingDefaultResources":true}', encoding="utf-8")
+    projection.prepare_native_skill_projection(project)
+    assert projection.inherits_default_resources(project) is False
+    settings.write_text('{"chat.disableInheritingDefaultResources":false}', encoding="utf-8")
+    assert projection.inherits_default_resources(project) is True

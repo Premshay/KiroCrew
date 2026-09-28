@@ -160,6 +160,28 @@ def _make_snapshot(src: Path, out: Path, extra_args: list[str] | None = None) ->
     return tarballs[0]
 
 
+#: The snapshot family: the facade and every module that owns part of what it does. A
+#: source scan guarding a snapshot rule reads all of them -- the code a rule is about can
+#: live in any one of them, and a scan of the facade alone would pass by not looking.
+SNAPSHOT_FAMILY = (
+    "snapshot.py",
+    "snapshot_components.py",
+    "snapshot_archive.py",
+    "snapshot_restore.py",
+    "snapshot_merge.py",
+)
+
+
+def snapshot_family_paths() -> list[Path]:
+    root = Path(snapshot_mod.__file__).parent
+    return [root / name for name in SNAPSHOT_FAMILY]
+
+
+def snapshot_family_source() -> str:
+    """Every family module's source, concatenated in :data:`SNAPSHOT_FAMILY` order."""
+    return "\n".join(path.read_text(encoding="utf-8") for path in snapshot_family_paths())
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """Set up source dir, output dir, and snapshot tarball."""

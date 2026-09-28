@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -485,8 +485,13 @@ class TestPeerCapabilityCarrier:
         from kiro_crew.instances import ssh_tunnel_manager as stm
 
         mgr = stm.SshTunnelManager.__new__(stm.SshTunnelManager)
+        # This carrier re-reads the forward it resolved before it spends the
+        # credential, which asks the manager for the live tunnel and its generation.
+        # A manager assembled without `__init__` has to name both.
+        mgr._tunnels = {}
+        mgr._tunnel_epoch = {}
         mgr._peer_target = MagicMock(return_value=("http://127.0.0.1:1" + path, "cookie"))
-        mgr._peer_cookie_header = MagicMock(return_value={"Cookie": "c=1"})
+        mgr._peer_cookie_header = AsyncMock(return_value={"Cookie": "c=1"})
 
         captured: list[float] = []
 
@@ -573,8 +578,14 @@ def _manager_answering(monkeypatch, replies: dict[str, tuple[int, object]]):
     from kiro_crew.instances import ssh_tunnel_manager as stm
 
     mgr = stm.SshTunnelManager.__new__(stm.SshTunnelManager)
+    # This carrier re-reads the forward it resolved before it spends the credential,
+    # which asks the manager for the live tunnel and its generation. A manager
+    # assembled without `__init__` has to name both; empty is the right answer here,
+    # because `_peer_target` is mocked and the two readings compared are consistent.
+    mgr._tunnels = {}
+    mgr._tunnel_epoch = {}
     mgr._peer_target = MagicMock(side_effect=lambda _iid, path: ("http://peer" + path, "cookie"))
-    mgr._peer_cookie_header = MagicMock(return_value={"Cookie": "c=1"})
+    mgr._peer_cookie_header = AsyncMock(return_value={"Cookie": "c=1"})
 
     class _FakeSession:
         def __init__(self, *, timeout):

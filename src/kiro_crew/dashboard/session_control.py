@@ -41,9 +41,12 @@ import logging
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew import model_registry
+from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     _workspace_name_for_dir,
@@ -63,6 +66,7 @@ from kiro_crew.dashboard.chat_fork import (
 )
 from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES as _PERSISTENCE_TRANSIENT_ROLES
 from kiro_crew.dashboard.chat_utils import (
+    _normalize_model,
     drained_to_thread,
     effective_session_key,
     slot_history_key,
@@ -85,12 +89,18 @@ from kiro_crew.execution_context import (
     resolve_member_execution,
 )
 from kiro_crew.history import metadata_now_iso, transcript_stem
+from kiro_crew.members import select_provider_backend
 from kiro_crew.memory_stores import named_store_or_empty
 from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, ChannelLink, parse_session_key
 from kiro_crew.messaging.transport import DM_TARGET_PREFIX, sole_direct_target
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
-from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN, MAX_LONG_STRING
+from kiro_crew.validation import (
+    _MODEL_NAME_RE,
+    MAX_ACP_SESSION_ID_LEN,
+    MAX_LONG_STRING,
+    MAX_SHORT_STRING,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from kiro_crew.dashboard.state import DashboardState, _ChatSlot
@@ -1623,6 +1633,7 @@ async def create_session(
     title: str = "",
     agent: str = "",
     folder_id: str = "",
+    model: str = "",
     caller_fenced: bool | None = None,
 ) -> dict[str, Any]:
     """Open a new session in the caller's workspace, persisted at birth.
@@ -1661,6 +1672,13 @@ async def create_session(
     every caller class the move path's app-ownership rule exists to stop is
     already refused above it -- an app-scoped caller cannot create a session at
     all (`app_scoped_caller`).
+
+    ``model`` pins the model the child starts on, as the person's own pick in the
+    model dropdown would: same rejection guard, same pick-generation bump, and
+    recorded in the persist-at-birth metadata so an idle child keeps it across a
+    restart. Empty leaves the slot on the agent's or the global default, exactly
+    as before. It is not a privilege the caller lacks -- ``spawn_run`` already
+    takes a per-run ``model`` -- and it moves no memory boundary.
 
     ``caller_fenced`` is the ownership-fence verdict the HTTP gate already settled
     on the caller's VERIFIED scope, carried in for the same reason
@@ -1830,6 +1848,38 @@ async def create_session(
             f"{agent_name!r} does not resolve to a configured agent",
             code="agent_unresolved",
         )
+
+    # The model the child starts on. Checked by the SAME guard the dashboard's
+    # model picker runs (`_model_rejected_reason`), against the provider from the
+    # config snapshot already loaded off the loop, so an id the picker would refuse
+    # is refused here too -- before anything is allocated, where refusing loses
+    # nothing. Length and charset are bounded HERE, not left to the MCP schema:
+    # SESSION_CREATE_SCHEMA runs only in mcp_dashboard, and the HTTP route
+    # forwards the body's model string as-is, so without this bound an
+    # internal-secret caller could persist, broadcast and audit-log an
+    # arbitrarily long or arbitrarily shaped value.
+    model_name = _normalize_model(model.strip())
+    if model_name:
+        if len(model_name) > MAX_SHORT_STRING or not _MODEL_NAME_RE.fullmatch(model_name):
+            raise SessionControlError(
+                "model id is too long or contains characters outside the model-id charset",
+                code="model_rejected",
+            )
+
+        # Never persist or broadcast a value the security scrubber classifies.
+        if redact(model_name) != model_name:
+            raise SessionControlError(
+                "model id looks like a credential and was refused",
+                code="model_rejected",
+            )
+
+        # circular import: chat_handlers imports session_control lazily, and this
+        # module is imported by the dashboard package before chat_handlers loads.
+        from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
+
+        model_reason = _model_rejected_reason(model_name, provider=cfg.agent.provider or "")
+        if model_reason:
+            raise SessionControlError(model_reason, code="model_rejected")
 
     # Capture the child route once. Inherited member/store identity survives
     # renamed aliases or changed config; an explicit member selection is resolved
@@ -2253,6 +2303,14 @@ async def create_session(
             # (`is_new` in chat_runner), so the [FOLDER] line reaches the model
             # without it.
             slot.folder_id = folder_id
+        if model_name:
+            # Pinned the way a person's pick in the model dropdown pins it: the
+            # slot has no provider session yet, so there is nothing to switch --
+            # the first turn starts on this model. The pick-generation bump marks
+            # it as an explicit choice, so the fallback restore probe treats it
+            # exactly as it treats a human pick rather than as a backfilled value.
+            slot.model = model_name
+            slot._model_pick_gen += 1
         if title.strip():
             slot.title = sanitize_outbound(title.strip())[:200]
             slot._titled = True
@@ -2325,6 +2383,11 @@ async def create_session(
                     # the filing would not survive a restart: for an idle newborn
                     # THIS dict is the only record of the placement on disk.
                     **({"folder_id": slot.folder_id} if slot.folder_id else {}),
+                    # The pinned model, only when one was asked for -- the normal
+                    # save path writes `model` too, but for an idle newborn this
+                    # dict is the only record, and without it a restart would
+                    # bring the session back on the default model.
+                    **({"model": slot.model} if model_name else {}),
                     # Creator attribution, only when this entry point set it. The
                     # member ownership boundary in `authorize_target` reads it, so
                     # losing it on restart would strand every worker a member
@@ -2407,6 +2470,7 @@ async def create_session(
         detail={
             "agent": slot.agent or "",
             "folder_id": slot.folder_id or "",
+            "model": model_name,
             # What the child was BORN with, so an auto-approved tool call in it is
             # traceable to the creator's grant rather than appearing unexplained.
             # Always present: "false" is the record that the grant did not transfer.
@@ -2418,6 +2482,7 @@ async def create_session(
         "ok": True,
         "target": slot.key,
         "title": slot.title or slot.key,
+        **({"model": model_name} if model_name else {}),
     }
 
 
@@ -3751,6 +3816,368 @@ async def stop_target(
     return {"ok": True, "target": slot.key, **result}
 
 
+async def set_model_target(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    target: str,
+    model: str,
+    caller_fenced: bool | None = None,
+) -> dict[str, Any]:
+    """Record *model* as *target*'s pending pick, applied when its next turn starts.
+
+    Nothing about the target changes now. The pick is committed by
+    :func:`apply_pending_model_pick` at the start of the target's next turn,
+    which re-runs this same gate and writes ``slot.model`` in one synchronous
+    step. Committing here instead would need the live model switch, whose
+    provider awaits sit after the last gate: a channel link or mirror landing
+    in that window would let the change reach a session the caller may no
+    longer touch.
+
+    Only an IDLE session takes a pick. A target with a turn or attached
+    sub-agents in flight is refused with ``target_busy``; a caller that wants
+    to force it stops the target first (``session_stop``) and retries. A later
+    pick replaces an earlier one that has not been applied yet.
+
+    Two picks the picker allows are refused here. "Auto (Jev)" arms per-turn
+    routing, which the model route keeps owner-only. A crew-bound (remote)
+    target runs its turns on the peer, where this pick would never be applied.
+
+    ``caller_fenced`` has the meaning :func:`stop_target` documents.
+    """
+    # Deferred for the same import cycle `stop_target` documents.
+    from kiro_crew.dashboard.chat_handlers import (
+        _is_jev_route_pick,
+        _model_rejected_reason,
+        _normalize_model,
+        _subagents_attached_response,
+        _switch_target_busy,
+    )
+    from kiro_crew.dashboard.chat_runner import _JEV_ROUTE_AUTO_MODELS
+
+    # Validated before any gate: a malformed pick needs no target lookup, and
+    # refusing it first keeps a bad argument from reading as an access decision.
+    # Stripped once, so every check and the stored pick see the same spelling.
+    model = model.strip()
+    # "auto" is refused with the Jev sentinel: with the Jev preview on, a slot
+    # on "auto" hands each turn's model choice to Jev routing, which only the
+    # owner may arm. The picker's display label and any case of the sentinel
+    # are refused the same way, so no spelling of the Jev entry is stored.
+    # An empty name is the absence of a pick, not a model.
+    folded = model.lower()
+    if (
+        _is_jev_route_pick(model)
+        or folded in _JEV_ROUTE_AUTO_MODELS
+        or folded in _JEV_ROUTE_SPELLINGS
+    ):
+        raise SessionControlError(
+            "Auto and Auto (Jev) can only be picked by the owner from the model picker",
+            code="model_owner_only",
+            status=403,
+        )
+    if not model:
+        raise SessionControlError("model is required", code="model_rejected", status=400)
+    if redact(model) != model:
+        # The pick is stored on the slot and broadcast to every dashboard, so a
+        # credential-shaped argument is refused rather than persisted.
+        raise SessionControlError(
+            "model looks like it contains a credential; model not changed",
+            code="model_rejected",
+            status=400,
+        )
+    model_name = _normalize_model(model)
+    try:
+        agent_cfg = (await asyncio.to_thread(KiroCrewConfig.load)).agent
+        provider = agent_cfg.provider
+        member_backend, default_backend = agent_cfg.member_acp_backend, agent_cfg.acp_backend
+    except Exception:  # pragma: no cover - config load is resilient
+        provider, member_backend, default_backend = "", "", ""
+
+    # Same prewarm ordering and fence-verdict handling as `close_target`: the
+    # verdict is stored with the pick so the turn-start re-check reads no config.
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:  # noqa: BLE001 - a prewarm failure must not fail the switch
+        logger.warning("session-control SEL prewarm failed", exc_info=True)
+    await prewarm_enabled_check()
+    caller_key = caller_slot_key(state, caller_session_key)
+    if caller_fenced is None:
+        caller_fenced = bool(caller_key) and _caller_is_ownership_fenced(state, caller_key)
+
+    slot = authorize_target(
+        state,
+        caller_session_key=caller_session_key,
+        target=target,
+        operation="set_model",
+        precomputed_ownership_fenced=caller_fenced,
+    )
+    slot_key = slot.key
+    # The model check and the alias correction both key on the TARGET's backend,
+    # resolved through the same member-aware gate the provider factory uses: a
+    # member DM routes to agent.member_acp_backend, which can differ from the
+    # configured default, and a Claude backend takes canonical keys as wire ids.
+    backend = select_provider_backend(effective_session_key(slot), member_backend, default_backend)
+    target_provider = (
+        provider if is_claude_code(provider) else capabilities_for(backend).provider_seam
+    )
+    rejected = _model_rejected_reason(model_name, provider=target_provider)
+    if rejected:
+        raise SessionControlError(rejected, code="model_rejected", status=400)
+    if (
+        not is_claude_code(target_provider)
+        and capabilities_for(backend).model_id_namespace == MODEL_NAMESPACE_ACP
+    ):
+        # On a kiro-cli backend an alias such as "sonnet" is not a wire id: stored
+        # as-is it would be withheld at session start and the target would stay
+        # on the default. Other backends keep their own id namespace untouched.
+        model_name = model_registry.acp_id_correction(model_name) or model_name
+
+    with _audit_denials(
+        caller_session_key=caller_session_key, operation="set_model", slot_key=slot_key
+    ):
+        if slot.is_remote or slot.executor == "remote":
+            raise SessionControlError(
+                "that session runs on a remote crew; changing its model from another "
+                "session is not supported yet",
+                code="remote_target_unsupported",
+                status=409,
+            )
+        session_key = effective_session_key(slot)
+        if _switch_target_busy(state, slot, session_key, state.sessions.get_provider(session_key)):
+            raise _target_busy_error()
+        children = await _subagents_attached_response(state, slot, session_key, "set_model")
+        if children is not None:
+            raise _target_busy_error()
+        # The await above can let a turn start, or the target be replaced,
+        # linked or mirrored; re-run the idle check and the gate synchronously
+        # right before storing the pick.
+        session_key = effective_session_key(slot)
+        if _switch_target_busy(state, slot, session_key, state.sessions.get_provider(session_key)):
+            raise _target_busy_error()
+        # A model-picker switch in flight holds _model_pick_lock across its
+        # provisional pick-generation bump and a possible rollback. Capturing
+        # the generation inside that window would store a value the rollback
+        # then invalidates, and the next turn would silently drop the pick.
+        # Nothing awaits between here and the store below, so this check
+        # holds until the pick is recorded.
+        if slot._model_pick_lock.locked():
+            raise _target_busy_error()
+        live = authorize_target(
+            state,
+            caller_session_key=caller_session_key,
+            target=slot_key,
+            operation="set_model",
+            skip_enabled_check=True,
+            precomputed_ownership_fenced=caller_fenced,
+        )
+        if live is not slot:
+            raise SessionControlError(
+                "the target session was replaced; model not changed",
+                code="target_replaced",
+                status=409,
+            )
+        caller_tab_id = _caller_tab_id(state, caller_session_key)
+        if not caller_tab_id:
+            raise SessionControlError(
+                "this session has no tab identity to hold a pending pick; model not changed",
+                code="caller_unidentified",
+                status=403,
+            )
+        slot._pending_model_pick = PendingModelPick(
+            model=model_name,
+            caller_session_key=caller_session_key,
+            caller_tab_id=caller_tab_id,
+            caller_fenced=caller_fenced,
+            pick_gen=slot._model_pick_gen,
+        )
+
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="set_model",
+        slot_key=slot_key,
+        outcome="allowed",
+        detail={"model": model_name or "auto", "stage": "pending"},
+    )
+    return {"ok": True, "target": slot_key, "model": model_name, "pending": True}
+
+
+@dataclass(frozen=True)
+class PendingModelPick:
+    """A ``session_set_model`` pick waiting for the target's next turn.
+
+    Carries the caller's key AND tab identity, its ownership-fence verdict at
+    call time, and the target's pick generation then, so a model the user picks
+    in the meantime wins over this one. The tab identity is what ties the pick
+    to the calling session: a slot key can be handed to a new occupant after
+    the caller closes, and that occupant must not inherit the pick.
+    """
+
+    model: str
+    caller_session_key: str
+    caller_tab_id: str
+    caller_fenced: bool
+    pick_gen: int
+
+
+def _caller_tab_id(state: "DashboardState", caller_session_key: str) -> str:
+    """The calling slot's ``_tab_id``, or ``""`` when it has none or is gone."""
+    caller_key = caller_slot_key(state, caller_session_key)
+    caller = state._slots.get(caller_key) if caller_key else None
+    return str(getattr(caller, "_tab_id", "") or "") if caller is not None else ""
+
+
+def _another_alias_is_mid_turn(state: "DashboardState", slot: "_ChatSlot") -> bool:
+    """Whether a slot OTHER than *slot* runs a turn on *slot*'s session.
+
+    The alias half of ``_switch_target_busy``: *slot*'s own turn is the one
+    starting, so its ``running`` flag is not a signal here. A registered
+    provider with an active turn, or another running slot whose turn key
+    names the same session, means the session is not *slot*'s to reset now.
+    """
+    # circular import: chat_handlers imports this module at module level.
+    from kiro_crew.dashboard.chat_handlers import _cancel_target
+    from kiro_crew.messaging.link import canonical_key
+
+    session_key = effective_session_key(slot)
+    provider = state.sessions.get_provider(session_key)
+    has_active_turn = getattr(provider, "has_active_turn", None)
+    if callable(has_active_turn) and has_active_turn():
+        return True
+    target = canonical_key(session_key)
+    return any(
+        other is not slot and other.running and canonical_key(_cancel_target(other)) == target
+        for other in list(state._slots.values())
+    )
+
+
+def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool:
+    """Commit *slot*'s pending ``session_set_model`` pick, if it is still allowed.
+
+    Called at the start of the slot's turn, before a session is acquired, after
+    :func:`prewarm_enabled_check` so the fence re-read below is a cache hit.
+    SYNCHRONOUS on purpose: the gate and the write to ``slot.model`` run with no
+    suspension between them, so nothing can link or mirror the target after it
+    was authorized and before the model changed. A pick the gate now refuses is
+    dropped and audited, and the turn runs on the model it already had. So is a
+    pick the user has overtaken with a newer picker choice.
+
+    The ownership fence only tightens: a caller fenced at call time stays
+    fenced, and one that was not is re-checked now, since it may have become a
+    fenced crew member while the pick waited.
+
+    Returns True when ``slot.model`` changed, meaning a live session still runs
+    the old model and must be reset before this turn uses it.
+    """
+    pick = slot._pending_model_pick
+    if pick is None:
+        return False
+    if slot._model_pick_lock.locked():
+        # A model-picker switch is mid-transaction: its pick generation is
+        # provisional and may still roll back. Leave the pick pending and run
+        # this turn on the current model; the next turn start decides against
+        # the settled generation (a committed picker choice then supersedes the
+        # pick, a rolled-back one lets it apply). Nothing is decided yet, so
+        # nothing is audited here.
+        logger.info("session-control set_model: pick on %s deferred, picker in flight", slot.key)
+        return False
+    if _another_alias_is_mid_turn(state, slot):
+        # Another slot drives the same session and has a turn in flight (or is
+        # cold-starting it). A commit now would reset nothing the turn can see:
+        # get_or_create attaches to that session on its old model. Leave the
+        # pick pending; a later turn start applies it once the session is idle.
+        logger.info("session-control set_model: pick on %s deferred, alias mid-turn", slot.key)
+        return False
+    slot._pending_model_pick = None
+    if slot._model_pick_gen != pick.pick_gen:
+        _audit(
+            caller_session_key=pick.caller_session_key,
+            operation="set_model",
+            slot_key=slot.key,
+            outcome="denied",
+            detail={"code": "superseded_by_newer_pick", "stage": "turn_start"},
+        )
+        return False
+    if _caller_tab_id(state, pick.caller_session_key) != pick.caller_tab_id:
+        _audit(
+            caller_session_key=pick.caller_session_key,
+            operation="set_model",
+            slot_key=slot.key,
+            outcome="denied",
+            detail={"code": "caller_replaced", "stage": "turn_start"},
+        )
+        return False
+    caller_key = caller_slot_key(state, pick.caller_session_key)
+    fenced = pick.caller_fenced or (
+        bool(caller_key) and _caller_is_ownership_fenced(state, caller_key)
+    )
+    # The enabled check runs here too: an operator who disables session control
+    # after a pick was queued must stop it from applying. `_run_chat` calls
+    # `prewarm_enabled_check` immediately before this, with nothing suspending
+    # in between, so the check reads the warmed config and does no file IO.
+    try:
+        live = authorize_target(
+            state,
+            caller_session_key=pick.caller_session_key,
+            target=slot.key,
+            operation="set_model",
+            precomputed_ownership_fenced=fenced,
+        )
+    except SessionControlError as exc:
+        _audit(
+            caller_session_key=pick.caller_session_key,
+            operation="set_model",
+            slot_key=slot.key,
+            outcome="denied",
+            detail={"code": exc.code, "stage": "turn_start"},
+        )
+        return False
+    if live is not slot:
+        _audit(
+            caller_session_key=pick.caller_session_key,
+            operation="set_model",
+            slot_key=slot.key,
+            outcome="denied",
+            detail={"code": "target_replaced", "stage": "turn_start"},
+        )
+        return False
+    # A fallback serving the session means the wire model differs from the pin,
+    # so an equal pin still needs the session reset, as the picker treats it.
+    changed = (
+        (slot.model or "") != pick.model
+        or bool(slot._active_fallback_model)
+        or bool(slot._refusal_fallback_primary)
+    )
+    slot.model = pick.model
+    # A concrete pick answers the routing question, as it does from the picker.
+    slot.jev_route = False
+    # Recorded as an explicit pick so the model-fallback restore never undoes it.
+    slot._model_pick_gen += 1
+    _audit(
+        caller_session_key=pick.caller_session_key,
+        operation="set_model",
+        slot_key=slot.key,
+        outcome="allowed",
+        detail={"model": pick.model or "auto", "stage": "turn_start"},
+    )
+    return changed
+
+
+#: Lowercased spellings of the picker's Jev entry that ``session_set_model``
+#: refuses alongside the exact sentinel: its display label and any case of the
+#: sentinel id. Owner-only, like the sentinel itself.
+_JEV_ROUTE_SPELLINGS = frozenset({"auto (jev)", "auto:jev"})
+
+
+def _target_busy_error() -> SessionControlError:
+    """The refusal ``set_model_target`` gives a target with work in flight."""
+    return SessionControlError(
+        "session busy, model not changed: it has a turn or sub-agents in flight. "
+        "Stop it with session_stop and retry once it is idle.",
+        code="target_busy",
+        status=409,
+    )
+
+
 async def close_target(
     state: "DashboardState",
     *,
@@ -4422,6 +4849,17 @@ def read_messages(
         # "nothing happening".
         **({"streaming": True} if durable_end < len(raw_window) else {}),
         "queue_depth": len(slot._queue),
+        # The model the target's turns use, and a session_set_model pick still
+        # waiting for its next turn, so a caller can see whether its pick took.
+        # Redacted: the owner's picker stores whatever string it is given.
+        # The served model when the backend has reported one (it reflects an
+        # inherited default or an active fallback), otherwise the pin.
+        "model": redact(slot.served_model or slot.model or ""),
+        **(
+            {"pending_model": redact(slot._pending_model_pick.model)}
+            if slot._pending_model_pick is not None
+            else {}
+        ),
         "total": total,
         # The cursor to poll with next. This is NOT `total`: when more than
         # `limit` rows are new, the window stops short of the end, and a caller

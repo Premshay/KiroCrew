@@ -23,12 +23,14 @@ import base64
 import bisect
 import hashlib
 import hmac
+import json
 import math
 import posixpath
 import re
 import secrets
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from typing import NamedTuple
 
 from kiro_crew.credential_patterns import AWS_KEY_ID, JWT_MULTI_SEGMENT
 from kiro_crew.security.redaction_switch import credential_pass_bypassed
@@ -282,6 +284,52 @@ def get_credential_patterns() -> list[re.Pattern[str]]:
     combined compiled regex, so the list has one element.
     """
     return [_CREDENTIAL_PATTERNS]
+
+
+# The JWS/JWE branch is shape-only (it matches `honeyJar.example.com`), so its hits need a
+# JSON-object header. Only it and the one-dot link token start with `eyJ`: two dots mark them.
+_CREDENTIAL_PATTERNS_SANS_JWT = re.compile(
+    _CREDENTIAL_PATTERNS.pattern.replace(f"|{JWT_MULTI_SEGMENT}", "", 1)
+)
+
+
+def _is_json_object_segment(segment: str) -> bool:
+    """Whether *segment* base64url-decodes to a JSON object: JOSE, itsdangerous, Flask session."""
+    try:
+        header = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(header, dict)
+
+
+def _credential_matches(text: str) -> Iterator[re.Match[str]]:
+    """``_CREDENTIAL_PATTERNS.finditer(text)``, minus JWT-branch hits whose header is not JSON.
+
+    A rejected hit retries the other branches at its start, then resumes one character on,
+    so a credential nested inside the rejected span is still found. A header holding a
+    second ``eyJ`` stays a credential: rejecting it would rescan that header once per ``eyJ``.
+    """
+    pos = 0
+    while (m := _CREDENTIAL_PATTERNS.search(text, pos)) is not None:
+        header = m.group().split(".", 1)[0]
+        if (
+            m.group().startswith("eyJ")
+            and m.group().count(".") >= 2
+            and header.find("eyJ", 1) == -1
+            and not _is_json_object_segment(header)
+        ):
+            alt = _CREDENTIAL_PATTERNS_SANS_JWT.match(text, m.start())
+            if alt is None:
+                pos = m.start() + 1
+                continue
+            m = alt
+        yield m
+        pos = max(m.end(), m.start() + 1)
+
+
+def _contains_credential_pattern(text: str) -> bool:
+    """Validated ``_CREDENTIAL_PATTERNS.search``: see :func:`_credential_matches`."""
+    return next(_credential_matches(text), None) is not None
 
 
 # ── Cheap pre-filter for `_CREDENTIAL_PATTERNS` (performance only) ──
@@ -855,7 +903,7 @@ def _decode_b64_chunk(chunk: str) -> str:
     # characters -- so this straddles the crossover instead of sitting above it.
     if len(decoded) >= _PREFILTER_MIN_LEN and not _might_contain_credential(decoded):
         return ""
-    return decoded if _CREDENTIAL_PATTERNS.search(decoded) else ""
+    return decoded if _contains_credential_pattern(decoded) else ""
 
 
 def _decode_b64_safe(text: str) -> str:
@@ -871,7 +919,7 @@ def _decode_b64_safe(text: str) -> str:
     for m in _B64_CHUNK_RE.finditer(text):
         try:
             decoded = base64.b64decode(m.group(), validate=True).decode("utf-8", errors="ignore")
-            if _CREDENTIAL_PATTERNS.search(decoded):
+            if _contains_credential_pattern(decoded):
                 return decoded
         except Exception:
             continue
@@ -885,7 +933,7 @@ def _contains_fixed_credential(text: str) -> bool:
     front-channel state and PKCE values are high-entropy by design, while the
     canonical signatures and decoded credentials remain unambiguous.
     """
-    return bool(_CREDENTIAL_PATTERNS.search(text) or _decode_b64_safe(text))
+    return bool(_contains_credential_pattern(text) or _decode_b64_safe(text))
 
 
 def _text_contains_bare_secret(text: str) -> bool:
@@ -1385,6 +1433,111 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
     """Redact raw credential patterns from text, including base64-encoded.
 
     Returns (cleaned_text, list_of_warnings).
+    """
+    spans, warnings, _rules = _credential_redaction_plan(text)
+    if not spans:
+        return text, warnings
+    return _splice(text, spans), warnings
+
+
+#: Label forms of the key-value AWS branches: the key name, its separator and
+#: an optional opening quote. The redactor replaces the WHOLE match, label
+#: included, so a record keeps the label to let the reader see which field
+#: the removed value belonged to. A label is a fixed key name, never secret.
+_AWS_LABEL_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"(?:SecretAccessKey|aws_secret_access_key)[\"']?\s*[:=]\s*[\"']?"),
+        "aws_secret_access_key",
+    ),
+    (re.compile(r"(?:SessionToken|aws_session_token)[\"']?\s*[:=]\s*[\"']?"), "aws_session_token"),
+    (re.compile(r"(?:AccessKeyId|aws_access_key_id)[\"']?\s*[:=]\s*[\"']?"), "aws_access_key_id"),
+)
+
+#: Unlabelled pass-1 branches, in the alternation's order, each with the rule
+#: id a record names. The first whose pattern fully matches the redacted span
+#: wins; a span none of them matches is ``credential_pattern``.
+_PASS1_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(AWS_KEY_ID), "aws_access_key_id"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*"), "private_key"),
+    (re.compile(r"xox[bpas]-[\s\S]*"), "slack_token"),
+    (re.compile(r"[0-9]{6,}:[A-Za-z0-9_-]{30,}"), "telegram_bot_token"),
+    (
+        re.compile(r"[MNO][A-Za-z0-9_-]{22,30}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{25,}"),
+        "discord_bot_token",
+    ),
+    (re.compile(r"(?:gh[opsur]_|github_pat_)[\s\S]*"), "github_token"),
+    (re.compile(r"glpat-[\s\S]*"), "gitlab_token"),
+    (re.compile(r"(?:sk|rk)_(?:live|test)_[\s\S]*"), "stripe_key"),
+    (re.compile(r"SG\.[\s\S]*"), "sendgrid_key"),
+    (re.compile(r"sk-proj-[\s\S]*"), "openai_key"),
+    (re.compile(r"sk-ant-[\s\S]*"), "anthropic_key"),
+    (re.compile(r"npm_[\s\S]*"), "npm_token"),
+    (re.compile(r"pypi-[\s\S]*"), "pypi_token"),
+    (re.compile(r"do[opr]_v1_[\s\S]*"), "digitalocean_token"),
+    (re.compile(r"GOCSPX-[\s\S]*"), "google_oauth_secret"),
+    (re.compile(r"[a-z+]+://[^\s:/@]*:[^\s/]+@"), "url_userinfo"),
+    (re.compile(r"eyJ[\s\S]*"), "jwt"),
+)
+
+
+def _pass1_rule(matched: str) -> tuple[str, str]:
+    """``(rule_id, label)`` for one pass-1 match; ``label`` is ``""`` when none."""
+    for pattern, rule in _AWS_LABEL_RULES:
+        head = pattern.match(matched)
+        if head is not None:
+            return rule, head.group()
+    for pattern, rule in _PASS1_RULES:
+        if pattern.fullmatch(matched):
+            return rule, ""
+    return "credential_pattern", ""
+
+
+class CredentialMatch(NamedTuple):
+    """One credential placeholder the redactor wrote, described for a record.
+
+    ``ordinal`` is the placeholder's index among EVERY credential tag in the
+    cleaned text (tags already present in the input count too), which is how a
+    renderer pairs the record with the tag it describes. ``value`` is the
+    removed plaintext: it exists so the caller can look for where the value
+    came from while the turn is still in memory, and it must never be stored,
+    logged or sent anywhere.
+    """
+
+    ordinal: int
+    rule: str
+    label: str
+    value: str
+
+
+def redact_credentials_with_records(text: str) -> tuple[str, list[str], list[CredentialMatch]]:
+    """:func:`redact_credentials`, plus one :class:`CredentialMatch` per tag written.
+
+    The cleaned text and warnings are byte-identical to ``redact_credentials``;
+    both share one plan, so the records cannot describe a redaction the text
+    does not contain.
+    """
+    spans, warnings, rules = _credential_redaction_plan(text)
+    if not spans:
+        return text, warnings, []
+    matches: list[CredentialMatch] = []
+    ordinal = 0
+    cursor = 0
+    for start, end, tag in spans:
+        ordinal += sum(text.count(t, cursor, start) for t in CREDENTIAL_REDACTION_TAGS)
+        rule, label = rules.get(start, ("credential_pattern", ""))
+        matches.append(CredentialMatch(ordinal, rule, label, text[start:end][len(label) :]))
+        ordinal += 1
+        cursor = end
+    return _splice(text, spans), warnings, matches
+
+
+def _credential_redaction_plan(
+    text: str,
+) -> tuple[list[_RedactionSpan], list[str], dict[int, tuple[str, str]]]:
+    """Every span :func:`redact_credentials` rewrites, with its warnings and rules.
+
+    Returns ``(spans, warnings, rules)``: ``spans`` sorted and disjoint against
+    the input, ``rules`` mapping each span's start to its ``(rule_id, label)``.
 
     Unconditional on every surface EXCEPT inside an explicit
     ``redaction_switch.owner_view()`` scope: there, and only there, the owner's
@@ -1409,9 +1562,10 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
     character is redacted twice and no character a pass flagged is left behind.
     """
     if credential_pass_bypassed():
-        return text, []
+        return [], [], {}
 
     warnings: list[str] = []
+    rules: dict[int, tuple[str, str]] = {}
 
     # 1. Plaintext credential patterns.
     #
@@ -1425,7 +1579,7 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
     # disjoint; it is what the later passes subtract from.
     taken: list[_RedactionSpan] = []
     if _might_contain_credential(text):
-        for m in _CREDENTIAL_PATTERNS.finditer(text):
+        for m in _credential_matches(text):
             # Emit ONLY non-sensitive metadata (length). Do NOT slice any part of
             # the match into the warning: `_CREDENTIAL_PATTERNS` matches the raw
             # secret value itself (e.g. `ghp_…`, `sk-ant-…`), so even a short prefix
@@ -1436,6 +1590,7 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
             # likewise log length only.
             warnings.append(f"Redacted credential pattern ({len(m.group())} chars)")
             taken.append((m.start(), m.end(), _REDACTED_CREDENTIAL_TAG))
+            rules[m.start()] = _pass1_rule(m.group())
 
     # Passes 2 and 3 both scan the ORIGINAL `text` for runs of the base64
     # alphabet, and they select the SAME spans: `[A-Za-z0-9+/]{40,}` is greedy and
@@ -1464,6 +1619,7 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
         warnings.append(f"Redacted base64-encoded credential ({len(chunk)} chars)")
         for start, end in _uncovered(m.start(), m.end(), taken):
             pass2.append((start, end, _REDACTED_ENCODED_CREDENTIAL_TAG))
+            rules[start] = ("encoded_credential", "")
     # Pass-2 chunks are disjoint from each other and were cut around `taken`,
     # so the union is disjoint and a sort restores the order.
     taken = sorted(taken + pass2)
@@ -1495,6 +1651,7 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
             continue
         for start, end in gaps:
             pass3.append((start, end, _REDACTED_CREDENTIAL_TAG))
+            rules[start] = ("bare_aws_secret", "")
         warnings.append(f"Redacted bare secret key ({len(run)} chars)")
     taken = sorted(taken + pass3)
 
@@ -1546,11 +1703,10 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
             continue
         for start, end in gaps:
             pass4.append((start, end, _REDACTED_CREDENTIAL_TAG))
+            rules[start] = ("token_parameter", "")
         warnings.append(f"Redacted token parameter value ({value_end - value_start} chars)")
 
-    if not taken and not pass4:
-        return text, warnings
-    return _splice(text, sorted(taken + pass4)), warnings
+    return sorted(taken + pass4), warnings, rules
 
 
 # Absolute filesystem paths, POSIX and Windows. Deliberately narrow: anchored to
