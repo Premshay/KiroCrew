@@ -2663,6 +2663,7 @@ class _ChatSlot:
         "_checkpoint_activity_generation",
         "_checkpoint_covered_generation",
         "_checkpoint_reminder_generation",
+        "_checkpoints_this_turn",
         "_mcp_report",
         "_mcp_report_session_id",
         "_on_message",
@@ -3179,6 +3180,7 @@ class _ChatSlot:
         self._checkpoint_activity_generation: int = 0
         self._checkpoint_covered_generation: int = 0
         self._checkpoint_reminder_generation: int = 0
+        self._checkpoints_this_turn: int = 0
         # What THIS slot's agent session reported about its MCP servers, as
         # published by the ACP layer at session init and updated by later
         # registration frames. None = this slot has no live session that
@@ -4320,6 +4322,18 @@ class _ChatSlot:
     def mark_checkpoint_activity(self) -> None:
         """Record a meaningful state change without inventing its narrative."""
         self._checkpoint_activity_generation += 1
+        self._checkpoints_this_turn = 0
+
+    def note_checkpoint_call(self) -> int:
+        """Count checkpoint calls since the last activity mark; returns the count including this one.
+
+        One checkpoint per turn is the intended cadence: the card shows only the latest, and the
+        trail keeps every milestone either way. Measured on 2026-09-28 across 507 sessions, 36 %
+        of 11,037 calls were second-or-later checkpoints within a single turn (nexus notebook
+        §31c). The count lets the tool result say so instead of the model guessing.
+        """
+        self._checkpoints_this_turn += 1
+        return self._checkpoints_this_turn
 
     def checkpoint_freshness_payload(self) -> dict[str, int | bool]:
         """Expose generation state so consumers can flag a stale checkpoint."""

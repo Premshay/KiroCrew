@@ -13511,9 +13511,11 @@ async def _run_chat(
                 slot._dirty = True
                 _checkpoint_reminder = (
                     "[KiroCrew checkpoint reminder]\n"
-                    "Meaningful session state changed since the last checkpoint. Before ending "
-                    "this turn, publish a concise session_checkpoint that states the current "
-                    "work and explicit next_action; do not infer either from a peer receipt.\n"
+                    "Meaningful session state changed since the last checkpoint. At the END of "
+                    "this turn publish ONE concise session_checkpoint that states the current "
+                    "work and explicit next_action, folding every milestone of the turn into "
+                    "that single call; do not checkpoint mid-turn, and do not infer either "
+                    "from a peer receipt.\n"
                     "[End KiroCrew checkpoint reminder]\n\n"
                 )
                 message = _checkpoint_reminder + message

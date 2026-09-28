@@ -4459,7 +4459,10 @@ async def api_session_checkpoint(request: web.Request) -> web.Response:
     if state.restart_barrier.active:
         _publish_restart_barrier(state)
     state.push_slots_update()
-    return web.json_response({"ok": True, "session_checkpoint": slot.session_checkpoint_payload()})
+    calls = slot.note_checkpoint_call() if hasattr(slot, "note_checkpoint_call") else 1
+    return web.json_response(
+        {"ok": True, "session_checkpoint": slot.session_checkpoint_payload(), "calls_this_turn": calls}
+    )
 
 
 async def api_session_restart_continuation(request: web.Request) -> web.Response:

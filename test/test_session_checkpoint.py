@@ -59,6 +59,7 @@ class TestCheckpointDirectiveDispatch:
         schema = descriptor["inputSchema"]
         assert schema["required"] == ["summary", "milestone"]
         assert "Whenever work remains" in descriptor["description"]
+        assert "AT MOST ONCE PER TURN" in descriptor["description"]
         assert schema["properties"]["goal"]["maxLength"] == 240
         assert schema["properties"]["next_action"]["maxLength"] == 160
         assert "Include it whenever work remains" in schema["properties"]["next_action"][
@@ -89,6 +90,26 @@ class TestCheckpointDirectiveDispatch:
             )
             == ""
         )
+
+    def test_second_checkpoint_in_a_turn_is_recorded_but_told_once_is_enough(self, monkeypatch) -> None:
+        checkpoint = _checkpoint()
+        post = MagicMock(
+            return_value={"ok": True, "session_checkpoint": checkpoint, "calls_this_turn": 2}
+        )
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
+        monkeypatch.setattr(mcp_core, "_post", post)
+
+        result = mcp_core._call_tool_inner("session_checkpoint", checkpoint)
+        assert result.startswith("Checkpoint recorded (call 2 this turn).")
+        assert "Do not checkpoint again before the next user turn" in result
+
+    def test_checkpoint_calls_are_counted_per_turn_and_reset_on_activity(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot.mark_checkpoint_activity()
+        assert slot.note_checkpoint_call() == 1
+        assert slot.note_checkpoint_call() == 2
+        slot.mark_checkpoint_activity()  # next user turn
+        assert slot.note_checkpoint_call() == 1
 
     def test_refuses_a_checkpoint_without_a_verified_session_identity(self, monkeypatch) -> None:
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")

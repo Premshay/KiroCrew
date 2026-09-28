@@ -1047,11 +1047,12 @@ def schemas() -> list[dict[str, Any]]:
             "name": "session_checkpoint",
             "description": (
                 "Record a concise checkpoint for the calling session's Multiplex card. "
-                "Use only at meaningful milestones: starting a task or goal, changing "
-                "a plan, delegating or receiving child work, making a decision, becoming "
-                "blocked, or finishing. Do NOT call every turn and do NOT summarize the "
-                "full transcript. The summary and current main_items replace the prior "
-                "view; milestone is appended to a seven-item server-capped trail. "
+                "Call it AT MOST ONCE PER TURN, at the end of the turn, when the turn "
+                "started a task or goal, changed a plan, delegated or received child work, "
+                "made a decision, hit a blocker, or finished something; fold every milestone "
+                "of the turn into that one call. Never checkpoint mid-turn and never "
+                "summarize the full transcript. The summary and current main_items replace "
+                "the prior view; milestone is appended to a seven-item server-capped trail. "
                 "Optional goal and progress describe the current objective. Whenever work "
                 "remains, include one concrete next_action; omit it only when there is "
                 "genuinely no known next step. Set attention.status to unassigned only when "
@@ -2273,6 +2274,13 @@ def session_checkpoint(name: str, args: dict[str, Any]) -> str:
                 "do not retry automatically."
             )
         return f"Error: checkpoint was not recorded: {result.get('error', 'unknown error')}"
+    calls = result.get("calls_this_turn")
+    if isinstance(calls, int) and calls > 1:
+        return (
+            f"Checkpoint recorded (call {calls} this turn). One checkpoint per turn is enough: "
+            "the card shows only the latest and the trail already kept the earlier milestone. "
+            "Do not checkpoint again before the next user turn."
+        )
     return "Checkpoint recorded for this session's Multiplex view."
 
 
