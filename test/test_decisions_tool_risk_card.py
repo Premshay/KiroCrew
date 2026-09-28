@@ -30,6 +30,7 @@ import pytest
 from chat_test_helpers import _make_ready_kiro_prerequisite
 
 from kiro_crew.acp.types import (
+    EVENT_TOOL_CALL_UPDATE,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -202,6 +203,35 @@ class TestTheRecordRidesTheToolCard:
         assert rows, f"expected a tool row, got {slot.messages}"
         assert _record_of(rows[0]) == RECORD
         assert len(calls) == 1, "one oracle call per tool call"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_initial_input_defers_the_question_to_the_update(self, tmp_path):
+        """claude-agent-acp streams ``tool_call`` with no rawInput and a stub title,
+        then a ``tool_call_update`` with the command. The question is asked once,
+        on the update, with the real arguments; the record lands on the same row."""
+        state, client = _runner(tmp_path)
+        slot = _slot()
+        stub = _tool_call(title="Terminal", arguments="")
+        update = LLMEvent(
+            kind=EVENT_TOOL_CALL_UPDATE,
+            title="rm -rf /data",
+            tool_name="bash",
+            tool_call_id="tc-1",
+            tool_kind="execute",
+            tool_input='{"command": "rm -rf /data"}',
+            is_shell=True,
+        )
+        _scripts(client, [stub, update])
+
+        with _quiet_sel(), _answering(RECORD) as calls:
+            await chat_runner._run_chat(state, slot, "clean up /data")
+        await _settle(slot)
+
+        assert len(calls) == 1, "asked once, on the update, not on the empty stub"
+        assert calls[0]["arguments"] == '{"command": "rm -rf /data"}'
+        rows = _tool_rows(slot)
+        assert rows and _record_of(rows[0]) == RECORD
+        assert rows[0]["meta"]["input"] == '{"command": "rm -rf /data"}'
 
     @pytest.mark.asyncio
     async def test_the_tool_rows_own_meta_survives_beside_it(self, tmp_path):

@@ -11746,6 +11746,10 @@ async def _run_chat(
     # `command` input names a command that ran, so only it may become a credential
     # card's Open in Terminal pre-fill; any other tool's `command` field is data.
     _shell_tool_calls: set[str] = set()
+    # tool_call_ids whose initial ``tool_call`` carried no input, so the tool.risk
+    # annotation was deferred to the ``tool_call_update`` that brings the rawInput
+    # (claude-agent-acp streams the stub first; see the update handler).
+    _risk_deferred_tcids: set[str] = set()
     # Every unambiguous coding tool call retains the turn's shared bounded key
     # (`_tcid_identity_key`, a fixed 16-char digest) until its permission
     # decision, so a statusless call that a later denial rejects is never
@@ -14550,14 +14554,21 @@ async def _run_chat(
                 # Returns None for every session this seam is off or unsampled
                 # for, which is every session by default.
                 _tool_row_meta = _tool_meta(event)
-                _risk_meta = await _tool_risk_meta(
-                    state,
-                    slot,
-                    event,
-                    session_key=session_key,
-                    message=message,
-                    calls_this_turn=_turn_tool_calls,
-                )
+                _risk_meta = None
+                if event.tool_input:
+                    _risk_meta = await _tool_risk_meta(
+                        state,
+                        slot,
+                        event,
+                        session_key=session_key,
+                        message=message,
+                        calls_this_turn=_turn_tool_calls,
+                    )
+                elif event.tool_call_id and len(_risk_deferred_tcids) < _MAX_TCID_SOURCES:
+                    # Empty rawInput on the initial event (claude-agent-acp): a risk
+                    # question about "" is a wasted call and a guaranteed ``safe``.
+                    # Ask once the ``tool_call_update`` supplies the arguments.
+                    _risk_deferred_tcids.add(event.tool_call_id)
                 if _risk_meta:
                     _tool_row_meta = {**(_tool_row_meta or {}), **_risk_meta}
                 slot.append(
@@ -14792,9 +14803,24 @@ async def _run_chat(
                     # with the same tool_call_id, and we don't want to
                     # overwrite that post-approval marker. Preserve whatever
                     # leading icon (🔧/✅/🚫) the existing message has.
-                    _meta_patch: dict[str, str] = {}
+                    _meta_patch: dict[str, Any] = {}
                     if _input_upd:
                         _meta_patch["input"] = _input_upd
+                    if _input_upd and _tcid_upd in _risk_deferred_tcids:
+                        # The deferred tool.risk annotation, now that the arguments
+                        # exist. Same call, same bounds, same badge; it rides the
+                        # persisted meta and the live update like ``input`` does.
+                        _risk_deferred_tcids.discard(_tcid_upd)
+                        _risk_upd = await _tool_risk_meta(
+                            state,
+                            slot,
+                            event,
+                            session_key=session_key,
+                            message=message,
+                            calls_this_turn=_turn_tool_calls,
+                        )
+                        if _risk_upd:
+                            _meta_patch.update(_risk_upd)
                     # A refinement is the only event carrying the purpose when the
                     # initial tool_call streamed an empty rawInput, so the patch has
                     # to reach the PERSISTED meta too: _tool_meta() wrote "" there,
