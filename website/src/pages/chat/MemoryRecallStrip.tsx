@@ -138,7 +138,10 @@ const MemoryRecallStrip = memo(function MemoryRecallStrip({
       // what Jev kept" is not inferable from the two id lists.
       data-bounded={record.boundedOmitted}
     >
-      <div className="flex items-center gap-1.5 px-2 py-1 min-w-0 text-[12px] leading-5">
+      {/* flex-wrap: on a narrow (phone) viewport the rating control must drop to its own
+          line instead of being pushed over the title; the chips inside the toggle shrink
+          (min-w-0 + truncate) rather than overflow. */}
+      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 px-2 py-1 min-w-0 text-[12px] leading-5">
         <button
           type="button"
           onClick={() => setExpanded(v => !v)}
@@ -184,7 +187,7 @@ const MemoryRecallStrip = memo(function MemoryRecallStrip({
           </span>
           {scores.length > 0 && (
             <span
-              className="shrink-0 tabular-nums"
+              className="min-w-0 truncate tabular-nums"
               title={scoresTitle}
               data-testid="memory-recall-strip-scores"
             >
@@ -193,7 +196,7 @@ const MemoryRecallStrip = memo(function MemoryRecallStrip({
           )}
           {record.charsSaved > 0 && (
             <span
-              className="shrink-0 tabular-nums"
+              className="min-w-0 truncate tabular-nums"
               title={i18nT('pages.chat.decisionStrip.memory_saved_title')}
               data-testid="memory-recall-strip-saved"
             >
