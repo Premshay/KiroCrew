@@ -9601,22 +9601,23 @@ export default function ChatPage({
                             <EdgeFade side="top" anchor="below" />
                           </div>
                         )}
-                        {titleInTopbar && (
-                          /* Fork: the same fade as EdgeFade's `below` anchor, but while a
-                             prompt is pinned it starts 4px (the band's bottom padding)
-                             higher, so its opaque top edge sits behind the card. Hung off
-                             the band's bottom, it left a 4px strip of transcript between
-                             the card and the fade's hard top, cutting the line under the
-                             card in half. */
-                          <div
-                            aria-hidden
-                            className="absolute inset-x-0 h-6 bg-gradient-to-b from-bg to-transparent pointer-events-none"
-                            style={{ top: pinned ? 'calc(100% - 4px)' : '100%' }}
-                          />
-                        )}
                         {/* Fold sentinel — zero-height, always mounted. Its top edge is the
                   line the pinned prompt sticks to (see updatePinnedPrompt). */}
                         <div ref={pinFoldRef} aria-hidden className="h-0" />
+                        {titleInTopbar && (
+                          /* Fork: the phone header fade hangs from the FOLD, not from the
+                             bottom of the pinned band. Hung below the band it sat under the
+                             card, and its opaque top edge (page colour) read as the bottom
+                             of the card failing to render, hiding the line beneath. At the
+                             fold it is behind the card, which paints above it; with nothing
+                             pinned the band is empty and the fold is where it always was. */
+                          <div className="relative h-0">
+                            <div
+                              aria-hidden
+                              className="absolute top-0 inset-x-0 h-6 bg-gradient-to-b from-bg to-transparent pointer-events-none"
+                            />
+                          </div>
+                        )}
                         {pinned && (
                           <PinnedPrompt
                             text={pinned.text}
