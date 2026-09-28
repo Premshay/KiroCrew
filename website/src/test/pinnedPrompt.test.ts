@@ -8,6 +8,7 @@ import {
   promptBody,
   pinnedImageUrl,
   pinHandoffY,
+  pinHandoffBottomY,
   pinPushTravel,
   computeLiveCardH,
   computePinnedCardMaxH,
@@ -47,21 +48,9 @@ describe('pinHandoffY', () => {
     expect(DEFAULT_PINNED_CARD_H).toBeCloseTo(46.75, 2)
   })
 
-  it('hands over as the bubble top reaches the card top, at ANY prompt height', () => {
-    // The row is ROW_PAD_Y + bubble + ROW_PAD_Y and the band puts the card the
-    // same ROW_PAD_Y below the fold, so a row whose TOP is on the hand-off line
-    // has its bubble on the card's top — for every bubble height, which is the
-    // property the bottom-edge rule only had for a one-liner.
-    const foldY = 100
-    const handoffY = pinHandoffY(foldY)
-    for (const bubbleH of [22.75, 46.75, 96, 400]) {
-      const rowTopAtHandoff = handoffY
-      const bubbleTop = rowTopAtHandoff + ROW_PAD_Y
-      expect(bubbleTop).toBe(foldY + ROW_PAD_Y)
-      // Stated explicitly: the bubble's own height never enters the line.
-      expect(pinHandoffY(foldY)).toBe(handoffY)
-      expect(bubbleH).toBeGreaterThan(0)
-    }
+  it('uses a fixed resting band for bottom-edge hand-off', () => {
+    expect(pinHandoffBottomY(100)).toBe(154.75)
+    expect(pinHandoffBottomY(200) - pinHandoffBottomY(100)).toBe(100)
   })
 })
 
