@@ -6275,6 +6275,34 @@ def coerce_model_route(raw: object) -> dict[str, str]:
     return {tier: normalize_agent_model(section.get(tier)) for tier in DECISION_MODEL_ROUTE_TIERS}
 
 
+DECISION_SPAWN_ROUTE_VENDORS = ("claude", "codex", "deepseek", "local", "antigravity")
+DECISION_SPAWN_ROUTE_TIERS = ("large", "small")
+
+
+def coerce_spawn_route(raw: object) -> dict[str, dict[str, list[str]]]:
+    """Normalize ``decisions.spawn_route``: known vendors only, each tier a list of ids.
+
+    A string is accepted for a tier and read as a one-id list. ``"auto"`` and empty
+    ids are dropped (they would pin nothing), exactly as :func:`coerce_role_models`
+    treats them. An unknown vendor is dropped: the point derives the vendor from the
+    seat name, so a key it cannot derive could never be asked for.
+    """
+    section = raw if isinstance(raw, dict) else {}
+    out: dict[str, dict[str, list[str]]] = {}
+    for vendor, tiers in section.items():
+        if vendor not in DECISION_SPAWN_ROUTE_VENDORS or not isinstance(tiers, dict):
+            continue
+        out[vendor] = {}
+        for tier in DECISION_SPAWN_ROUTE_TIERS:
+            ids = tiers.get(tier)
+            if isinstance(ids, str):
+                ids = [ids]
+            out[vendor][tier] = [
+                m for m in (normalize_agent_model(i) for i in (ids or []) if isinstance(i, str)) if m
+            ]
+    return out
+
+
 # The providers ``decisions.nudge_wake.provider`` may name. ``auto`` resolves at
 # decision time -- Jev when the keystone consents to it, the LLM lane otherwise --
 # so a machine that later gains or loses a Jev key needs no config edit.
@@ -6495,6 +6523,19 @@ class DecisionsConfig:
             "picked 'Auto (Jev)' -- a manual model choice is never overridden.",
         ),
     )
+    spawn_route: dict[str, dict[str, list[str]]] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Sub-agent model per vendor and tier",
+            "Which models Jev may pick for a sub-agent spawned without a model pin, "
+            "as {vendor: {large: [ids], small: [ids]}} with vendor one of claude, "
+            "codex, deepseek, local, antigravity. The child's seat decides the "
+            "vendor; Jev picks the tier from the brief and records why on the "
+            "child's card. Empty by default, which means nothing is applied: the "
+            "decision is still recorded so you can see which tier it would pick. "
+            "A per-spawn model pin is never overridden.",
+        ),
+    )
     provider: DecisionProviderConfig = field(
         default_factory=DecisionProviderConfig,
         metadata=_meta("Provider", "Where decisions are sent and what they may cost."),
@@ -6592,6 +6633,7 @@ class DecisionsConfig:
             # map, since this key cannot widen anything -- every id is still held
             # against the provider's advertised list at routing time.
             model_route=coerce_model_route(section.get("model_route")),
+            spawn_route=coerce_spawn_route(section.get("spawn_route")),
             provider=provider,
             nudge_wake=NudgeWakeConfig.from_raw(section.get("nudge_wake")),
         )

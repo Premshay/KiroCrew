@@ -2237,6 +2237,11 @@ class SubagentInfo:
     # ``"auto"`` ⇒ unpinned (no per-spawn pin, no role pin — the provider picks
     # the model). Resolved once at spawn.
     requested_model: str = ""
+    # Why ``spawn.route`` picked the model a model-less spawn runs on, one line
+    # for the child's card (``decisions.points.spawn_route.reason_line``). ``""``
+    # when the seam did not decide: a per-spawn pin, no configured tiers, or a
+    # refusal -- the card then shows nothing rather than an invented reason.
+    route_reason: str = ""
     # Per-call reasoning-effort override (spawn_run ``reasoning_effort``).
     # Wins over the ``role_efforts['subagent']`` pin; ``""`` defers to it.
     # Like ``model``, a non-empty value forces the dedicated-process path.
@@ -2572,6 +2577,7 @@ class _ReportFailureSnapshot:
     conversation_key: str
     model: str
     requested_model: str
+    route_reason: str
     resolved_model: str
     stop_reason: str
     stop_class: str
@@ -2606,6 +2612,7 @@ class _ReportFailureSnapshot:
             conversation_key=bounded(info.conversation_key),
             model=bounded(info.model),
             requested_model=bounded(info.requested_model),
+            route_reason=bounded(info.route_reason),
             resolved_model=bounded(info.resolved_model),
             stop_reason=bounded(info.stop_reason),
             stop_class=bounded(info.stop_class),
@@ -2634,6 +2641,7 @@ class _ReportFailureSnapshot:
             self.conversation_key,
             self.model,
             self.requested_model,
+            self.route_reason,
             self.resolved_model,
             self.stop_reason,
             self.stop_class,
@@ -2667,6 +2675,7 @@ class _ReportFailureSnapshot:
             model=self.model,
             resolved_model=self.resolved_model,
             requested_model=self.requested_model,
+            route_reason=self.route_reason,
             conversation_key=self.conversation_key,
             user_stopped=self.user_stopped,
             _stop_origin=self._stop_origin,
