@@ -13,10 +13,14 @@ import os
 import shutil
 import time
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from kiro_crew.providers.acp import AcpProvider
 
 from kiro_crew import platform_compat
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKENDS_ACP_RUNTIME,
     effort_config_option_id,
     effort_config_option_value,
 )
@@ -371,6 +375,7 @@ class AcpWorker(Worker):
         effort: Optional[str] = None,
     ) -> None:
         self._client: Optional[AcpClient] = None
+        self._provider: Optional[AcpProvider] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
         self._sandbox_mode = sandbox_mode
@@ -382,6 +387,8 @@ class AcpWorker(Worker):
     async def start(self) -> None:
         if AcpClient is None:
             raise RuntimeError("AcpClient not available (kiro_crew.acp.client not installed)")
+        if self._provider is not None:
+            await self.shutdown()
         # Drop any prior client before respawning. send_message re-runs start()
         # when the client is not ready (e.g. a stalled handshake left _session_id
         # None); without this the previous subprocess would be orphaned.
@@ -418,12 +425,32 @@ class AcpWorker(Worker):
             AGENT_NAME,
             sorted(binding) or "none",
         )
-        self._client = AcpClient(
-            agent=AGENT_NAME,
-            sandbox_mode=sandbox_mode,
-            audit_source="subagent",
-            **binding,
-        )
+        if binding.get("acp_backend") in ACP_BACKENDS_ACP_RUNTIME:
+            from kiro_crew.providers.acp import AcpProvider
+
+            self._provider = AcpProvider(
+                agent=AGENT_NAME,
+                sandbox_mode=sandbox_mode,
+                **binding,
+            )
+            try:
+                await self._provider.start()
+            except BaseException:
+                await self.shutdown()
+                raise
+            self._client = self._provider.client
+            logger.info(
+                "AcpWorker: runtime backend=%s served_model=%s",
+                self._client.backend,
+                self._provider.served_model,
+            )
+        else:
+            self._client = AcpClient(
+                agent=AGENT_NAME,
+                sandbox_mode=sandbox_mode,
+                audit_source="subagent",
+                **binding,
+            )
         self._effective_effort = None
         await self._client.ensure_ready()
         await self._apply_effort()
@@ -509,12 +536,25 @@ class AcpWorker(Worker):
             )
 
     async def send_message(self, prompt: str, timeout: float = DEFAULT_TIMEOUT) -> str:
-        if self._client is None or not self._client.is_ready:
+        if self._provider is not None:
+            ready = self._provider.is_alive()
+        else:
+            ready = self._client is not None and self._client.is_ready
+        if not ready:
             await self.start()
         assert self._client is not None
         try:
+            if self._provider is not None:
+                from kiro_crew.llm_helpers import stream_and_collect
+
+                return await asyncio.wait_for(
+                    stream_and_collect(
+                        self._provider, prompt, agent=AGENT_NAME, retry_transient=False
+                    ),
+                    timeout,
+                )
             return await self._client.send_message(prompt, timeout=timeout)
-        except Exception:
+        except BaseException:
             # A timed-out turn is still running in the child, so a reused client
             # answers "Prompt already in progress". Prompts are self-contained,
             # so drop the client on any failure and let acquire respawn it.
@@ -528,7 +568,11 @@ class AcpWorker(Worker):
             except Exception:
                 logger.debug("AcpWorker: unregister protected pid failed", exc_info=True)
             self._protected_pid = None
-        if self._client is not None:
+        if self._provider is not None:
+            provider, self._provider = self._provider, None
+            self._client = None
+            await provider.shutdown()
+        elif self._client is not None:
             try:
                 await self._client.shutdown()
             except Exception:

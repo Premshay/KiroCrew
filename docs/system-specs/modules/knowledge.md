@@ -423,6 +423,13 @@ Both entity extraction (`EntityExtractor`) and internal-URL fetch (`agent_fetch.
 
 ### Sweep shielding + audit source
 
+An explicit engine binding to a backend in `ACP_BACKENDS_ACP_RUNTIME` starts
+through `AcpProvider`, which selects the backend's runtime and owns its teardown.
+The knowledge worker uses `stream_and_collect` for text collection, tool
+permission checks and audit events. Startup failures and timed-out turns close the provider;
+they never fall back to the legacy client's kiro-cli launch. Unbound workers
+and legacy client backends retain their existing path.
+
 `AcpWorker.start()` wires two protections that matter for a long-lived pool worker (`llm_pool.py`):
 
 - **Sweep shielding via `register_protected_pid`** — pool workers are direct `AcpClient` sessions, **not** `SessionMap` sessions or warm-pool providers, so the gateway's periodic orphan sweep cannot see them via `_collect_active_pids` and would SIGKILL a *busy* worker mid-task (surfacing as `ACP process exited (code=1)`). After `ensure_ready()`, `AcpWorker` registers the worker's kiro-cli PID in the sweep-protected set via `register_protected_pid` (`session_pid.py`), and unregisters it in `shutdown()` and on respawn — so the orphan sweep treats it like a live session (the same `register_protected_pid` mechanism the shared `WorkerPool` engine in `acp/worker_pool.py` applies to `ReviewPool`'s `AcpReviewWorker`).

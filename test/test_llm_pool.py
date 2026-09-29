@@ -53,6 +53,105 @@ class TestCleanBinding:
             "model_switch_method": "session_set_model",
         }
 
+
+class TestRuntimeWorker:
+    @pytest.mark.asyncio
+    async def test_codex_uses_runtime_provider_and_collects_text(self):
+        from kiro_crew.acp.types import AcpEvent
+
+        provider = MagicMock()
+        provider.start = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.client = MagicMock()
+        provider.client.ensure_ready = AsyncMock()
+        provider.client._pid = None
+        provider.is_alive.return_value = True
+        provider.stream = None
+
+        async def stream(prompt):
+            assert prompt == "extract this"
+            yield AcpEvent(kind="thinking_chunk", text="omit")
+            yield AcpEvent(kind="text_chunk", text='{"entities":')
+            yield AcpEvent(kind="text_chunk", text="[]}")
+
+        provider.stream = stream
+        binding = {"acp_backend": "codex", "model": "test-model"}
+        worker = AcpWorker(sandbox_mode="auto")
+        with (
+            patch(
+                "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+                return_value=(binding, ""),
+            ),
+            patch("kiro_crew.providers.acp.AcpProvider", return_value=provider) as factory,
+            patch("kiro_crew.knowledge.llm_pool.AcpClient") as legacy,
+        ):
+            await worker.start()
+            assert await worker.send_message("extract this") == '{"entities":[]}'
+            factory.assert_called_once_with(
+                agent="kirocrew-knowledge", sandbox_mode="auto", **binding
+            )
+            legacy.assert_not_called()
+            await worker.shutdown()
+        provider.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_runtime_start_is_closed_without_legacy_fallback(self):
+        provider = MagicMock()
+        provider.start = AsyncMock(side_effect=RuntimeError("adapter failed"))
+        provider.shutdown = AsyncMock()
+        worker = AcpWorker(sandbox_mode="auto")
+        with (
+            patch(
+                "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+                return_value=({"acp_backend": "codex"}, ""),
+            ),
+            patch("kiro_crew.providers.acp.AcpProvider", return_value=provider),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient") as legacy,
+        ):
+            with pytest.raises(RuntimeError, match="adapter failed"):
+                await worker.start()
+            legacy.assert_not_called()
+        provider.shutdown.assert_awaited_once()
+        assert not worker.is_alive()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["timeout", "error", "cancel"])
+    async def test_unfinished_runtime_turn_is_closed(self, failure):
+        from kiro_crew.acp.types import AcpEvent
+
+        entered = asyncio.Event()
+        provider = MagicMock()
+        provider.is_alive.return_value = True
+        provider.shutdown = AsyncMock()
+
+        async def stream(prompt):
+            entered.set()
+            if failure == "error":
+                raise RuntimeError("provider failed")
+            else:
+                await asyncio.Event().wait()
+            yield AcpEvent(kind="complete")
+
+        provider.stream = stream
+        worker = AcpWorker()
+        worker._provider = provider
+        worker._client = MagicMock()
+        task = asyncio.create_task(worker.send_message("extract", timeout=0.05))
+        await asyncio.wait_for(entered.wait(), 1)
+        if failure == "cancel":
+            task.cancel()
+        error = {
+            "timeout": asyncio.TimeoutError,
+            "error": RuntimeError,
+            "cancel": asyncio.CancelledError,
+        }[failure]
+        with pytest.raises(error):
+            await task
+        provider.shutdown.assert_awaited_once()
+        assert not worker.is_alive()
+
+
+class TestBindingValidation:
     def test_drops_keys_outside_the_whitelist(self):
         # audit_source and sandbox_mode belong to the build site, and work_dir
         # would move the worker's whole session. None may arrive from a registry.
@@ -74,9 +173,17 @@ class TestCleanBinding:
     def test_drops_wrong_typed_and_empty_values(self):
         # A hand-edited engine map must not reach AcpClient as an int or a list
         # and fail somewhere far from its cause.
-        assert _clean_binding(
-            {"model": 7, "acp_backend": "", "extra_env": [], "model_switch_method": None}
-        ) == {}
+        assert (
+            _clean_binding(
+                {
+                    "model": 7,
+                    "acp_backend": "",
+                    "extra_env": [],
+                    "model_switch_method": None,
+                }
+            )
+            == {}
+        )
 
 
 class TestResolveClientBinding:
@@ -96,7 +203,10 @@ class TestResolveClientBinding:
         class NexusProviderRegistry:
             def agent_client_binding(self, agent_name):
                 assert agent_name == "kirocrew-knowledge"
-                return {"acp_backend": "claude", "extra_env": {"ANTHROPIC_MODEL": "fast"}}
+                return {
+                    "acp_backend": "claude",
+                    "extra_env": {"ANTHROPIC_MODEL": "fast"},
+                }
 
         with patch(
             "kiro_crew.platform.context.current_context",
@@ -159,10 +269,13 @@ class TestWorkerAppliesBinding:
     async def test_binding_reaches_the_client_without_displacing_pool_kwargs(self):
         worker = AcpWorker(sandbox_mode="off")
         binding = {"acp_backend": "claude", "extra_env": {"ANTHROPIC_MODEL": "fast"}}
-        with patch(
-            "kiro_crew.knowledge.llm_pool._resolve_client_binding",
-            return_value=(binding, ""),
-        ), patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls:
+        with (
+            patch(
+                "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+                return_value=(binding, ""),
+            ),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls,
+        ):
             client_cls.return_value = AsyncMock()
             await worker.start()
 
@@ -187,10 +300,13 @@ class TestWorkerAppliesBinding:
         edition resolved the other way.
         """
         worker = AcpWorker(sandbox_mode="off")
-        with patch(
-            "kiro_crew.knowledge.llm_pool._resolve_client_binding",
-            return_value=({"model": "fast"}, ""),
-        ), patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls:
+        with (
+            patch(
+                "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+                return_value=({"model": "fast"}, ""),
+            ),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls,
+        ):
             client_cls.return_value = AsyncMock()
             await worker.start()
 
@@ -199,18 +315,19 @@ class TestWorkerAppliesBinding:
     @pytest.mark.asyncio
     async def test_unbound_registry_warns_naming_registry_and_agent(self, caplog):
         worker = AcpWorker(sandbox_mode="off")
-        with patch(
-            "kiro_crew.knowledge.llm_pool._resolve_client_binding",
-            return_value=({}, "NexusProviderRegistry"),
-        ), patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls:
+        with (
+            patch(
+                "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+                return_value=({}, "NexusProviderRegistry"),
+            ),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls,
+        ):
             client_cls.return_value = AsyncMock()
             with caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"):
                 await worker.start()
 
         warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert any(
-            "NexusProviderRegistry" in m and "kirocrew-knowledge" in m for m in warnings
-        )
+        assert any("NexusProviderRegistry" in m and "kirocrew-knowledge" in m for m in warnings)
         # No binding to apply: the client is built exactly as it was before.
         assert set(client_cls.call_args.kwargs) == {
             "agent",
@@ -221,9 +338,13 @@ class TestWorkerAppliesBinding:
     @pytest.mark.asyncio
     async def test_default_registry_is_quiet(self, caplog):
         worker = AcpWorker(sandbox_mode="off")
-        with patch(
-            "kiro_crew.knowledge.llm_pool._resolve_client_binding", return_value=({}, "")
-        ), patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls:
+        with (
+            patch(
+                "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+                return_value=({}, ""),
+            ),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls,
+        ):
             client_cls.return_value = AsyncMock()
             with caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"):
                 await worker.start()
@@ -1009,7 +1130,8 @@ class TestAcpWorker:
             patch("pathlib.Path.home", return_value=tmp_path),
             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=fresh),
             patch(
-                "kiro_crew.knowledge.llm_pool.register_protected_pid", side_effect=registered.append
+                "kiro_crew.knowledge.llm_pool.register_protected_pid",
+                side_effect=registered.append,
             ),
             patch(
                 "kiro_crew.knowledge.llm_pool.unregister_protected_pid",
@@ -1038,7 +1160,8 @@ class TestAcpWorker:
             patch("pathlib.Path.home", return_value=tmp_path),
             patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]),
             patch(
-                "kiro_crew.knowledge.llm_pool.register_protected_pid", side_effect=registered.append
+                "kiro_crew.knowledge.llm_pool.register_protected_pid",
+                side_effect=registered.append,
             ),
             patch(
                 "kiro_crew.knowledge.llm_pool.unregister_protected_pid",
