@@ -731,6 +731,22 @@ class TestClientSeam:
         # BROKER_ONLY: the spec's own server is not translated onto this array.
         assert "foo" not in names
 
+    @pytest.mark.parametrize("pooled", [False, True])
+    def test_broker_only_backend_prefers_broker_over_direct_capabilities(
+        self, tmp_path, agents_dir, monkeypatch, pooled
+    ):
+        _write_spec(agents_dir, servers={}, tools=[])
+        client = AcpClient(
+            work_dir=tmp_path, agent="crew-deepseek", acp_backend=ACP_BACKEND_DEEPSEEK
+        )
+        names = ("kirocrew-core", "kirocrew-cron")
+        direct = [{"name": name, "command": "/direct"} for name in names]
+        broker = [{"name": name, "command": "/broker"} for name in names]
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: broker if pooled else [])
+        monkeypatch.setattr(client, "_session_capability_mcp_servers", lambda: direct)
+
+        assert client._session_mcp_servers() == (broker if pooled else direct)
+
     def test_the_seam_hands_down_the_pooled_stub_names(self, tmp_path, agents_dir, monkeypatch):
         # The client owns the overlay, so it is the only layer that can answer
         # which servers will ALSO arrive as broker stubs.

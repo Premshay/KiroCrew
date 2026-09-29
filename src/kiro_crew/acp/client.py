@@ -7321,16 +7321,13 @@ class AcpClient:
                     else self._opencode_session_mcp_servers() if self._is_opencode else translated
                 )
             )
-            # The projected array owns any server that the broker rewrites.  In
-            # particular, a pooled ``kirocrew-core`` must beat the generic
-            # session-capability entry: the latter launches inside Codex's
-            # credential-masked sandbox, while the former reaches the gateway-owned
-            # process that can safely hold Crew state.  Keep capabilities as the
-            # fallback for unpooled control-plane servers.
+            # Projected and pooled servers must beat direct capability entries:
+            # a direct server inside a credential-masked harness cannot read the
+            # Crew state that its gateway-owned counterpart needs to start.
             candidates = [
                 *projected,
-                *self._session_capability_mcp_servers(),
                 *self._pooled_mcp_servers(),
+                *self._session_capability_mcp_servers(),
             ]
         seen: set[str] = set()
         roster: list[dict[str, Any]] = []

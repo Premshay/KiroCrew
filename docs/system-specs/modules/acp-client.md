@@ -1704,6 +1704,13 @@ from authenticated session identity; `member_context` controls native instructio
 deduplication. Memory V2 neither discards the shared broker overlay nor requires
 a member-specific sandbox or direct-MCP capability.
 
+Session MCP rosters prefer projected servers, then pooled broker stubs, then
+direct capability servers when names overlap. This also applies to mirror-less
+backends such as DeepSeek: choosing the direct launcher over its broker stub
+starts the server inside the harness's credential mask, where admission state
+is unavailable and MCP initialization fails. Unpooled capability servers retain
+their direct launcher.
+
 KAS projects the gateway's validated `KIROCREW_BOUND_PORT` as `KIROCREW_PORT`
 for native managed MCP servers because native children do not inherit the
 gateway environment. The listener address comes from the gateway, not an editable
