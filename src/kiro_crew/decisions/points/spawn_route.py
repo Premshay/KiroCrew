@@ -359,6 +359,7 @@ def questions(cands: list[dict[str, str]]) -> list[Question]:
 def build_state(
     brief: str,
     *,
+    agent: str = "",
     vendor: str,
     parent_model: str,
     cands: list[dict[str, str]],
@@ -366,6 +367,8 @@ def build_state(
 ) -> dict[str, Any]:
     return {
         "brief": (brief or "")[:MAX_BRIEF_CHARS],
+        # the child's seat: a conductor/orchestrator agent is itself the orchestration cue
+        "agent": agent or "",
         "parent_vendor": vendor,
         "parent_model": parent_model,
         "candidates": [dict(c) for c in cands],
@@ -416,7 +419,7 @@ async def routed_spawn(
         if not cands:
             return None
         health = await asyncio.to_thread(cached_health)
-        state = build_state(brief, vendor=vendor, parent_model=parent_model, cands=cands, health=health)
+        state = build_state(brief, agent=agent, vendor=vendor, parent_model=parent_model, cands=cands, health=health)
         answers = await core.decide(
             POINT,
             state,

@@ -247,6 +247,7 @@ class TestRoutedSpawn:
         assert sr.reason_line(got).startswith("spawn.route: survey/simple small -> codex small (gpt-5.6-terra) p=0.70")
         state = oracle.states[0]
         assert state["parent_model"] == "gpt-5.6-sol" and state["parent_vendor"] == "codex"
+        assert state["agent"] == "crew-codex"
         assert [c["key"] for c in state["candidates"]] == ["codex/large/0", "codex/small/0"]
         assert oracle.questions[0][0].options == ["codex/large/0", "codex/small/0"]
 
