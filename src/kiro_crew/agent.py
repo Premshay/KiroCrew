@@ -7859,7 +7859,7 @@ _KNOWLEDGE_SYSTEM_PROMPT = (
     "You are a knowledge extraction specialist for KiroCrew's Knowledge Library. "
     "Your job is to analyze documents and extract structured information.\n\n"
     "You ALWAYS output valid JSON. No markdown, no explanation — just the JSON object.\n\n"
-    "Be precise with entity names — use canonical forms (e.g., 'DynamoDB' not 'dynamo' or 'DDB').\n"
+    "Be precise with entity names — use the canonical form the text gives in full, not an abbreviation.\n"
     "Only extract entities explicitly mentioned in the text, do not infer.\n"
     "Relations must reference entities that appear in your entities list."
 )

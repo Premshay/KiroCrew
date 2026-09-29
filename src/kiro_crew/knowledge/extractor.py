@@ -34,7 +34,7 @@ Return valid JSON with:
 
 Rules:
 - Title must be specific to THIS chunk's content, not generic
-- Use canonical entity names (e.g. "DynamoDB" not "dynamo")
+- Use the canonical form of each entity name as the text writes it in full, not an abbreviation or nickname
 - Only extract explicitly mentioned entities
 - Relations must reference entities in your entities list
 
