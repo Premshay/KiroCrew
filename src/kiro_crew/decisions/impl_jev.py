@@ -124,6 +124,10 @@ def _from_wire(body: Any, questions: list[Question]) -> Answers:
     return answers
 
 
+#: Longest ``note`` an answer may carry: one line for a card, not a channel.
+MAX_NOTE_CHARS = 160
+
+
 def _answer_from_wire(q: Question, raw: dict) -> Answer:
     """Validate wire fields before constructing an answer."""
     if raw.get("type") != "choice":
@@ -137,11 +141,13 @@ def _answer_from_wire(q: Question, raw: dict) -> Answer:
     )
     if probability is None or not 0.0 <= probability <= 1.0:
         raise JevProtocolError("answer has no valid chosen probability")
+    note = raw.get("note")
     return Answer(
         id=q.id,
         value=chosen,
         p=probability,
         confidence=_as_float_or_none(raw.get("confidence")),
+        note=note[:MAX_NOTE_CHARS] if isinstance(note, str) else "",
     )
 
 

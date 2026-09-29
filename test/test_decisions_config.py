@@ -46,6 +46,7 @@ class TestDefaults:
             "bucket",
             "history_budget_chars",
             "model_route",
+            "spawn_route",
             "nudge_wake",
             "provider",
         }
@@ -145,6 +146,7 @@ class TestMigrationFromThePreviewSpelling:
             "bucket",
             "history_budget_chars",
             "model_route",
+            "spawn_route",
             "nudge_wake",
             "provider",
         }

@@ -43,6 +43,9 @@ class Answer:
     value: object
     p: float
     confidence: float | None = None
+    #: The provider's one-line account of the answer, when it sent one (``note`` on
+    #: the wire, bounded by the adapter). Display text for a card, never consumed.
+    note: str = ""
 
 
 Answers = dict[str, Answer]

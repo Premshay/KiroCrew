@@ -295,6 +295,7 @@ class TerminalCoordinator(ManagerComponent):
                 # rebuilt from this event alone, so without it the live-downgrade
                 # amber chip would silently vanish from a downgraded finished run.
                 "requested_model": _redact(info.requested_model),
+                "route_reason": info.route_reason,
                 "result": _done_result(info.result),
                 # WHY the run ended and whether ``result`` is a partial, so the
                 # parent does not infer success from ``error`` being unset.

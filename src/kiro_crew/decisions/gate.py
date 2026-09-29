@@ -70,6 +70,7 @@ DECISION_POINT_NAMES = (
     "compaction.keep",
     "memory.recall",
     "nudge.wake",
+    "spawn.route",
 )
 
 #: The ONE point that has two providers, and therefore the one point whose

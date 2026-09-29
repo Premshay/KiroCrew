@@ -134,6 +134,49 @@ class RunEventCoordinator(ManagerComponent):
         """
         return info.max_turns or self._manager._default_turn_limit or _TURN_LIMIT
 
+    async def _route_spawn_model(self, info: SubagentInfo, agent: str) -> dict | None:
+        """``spawn.route`` for a model-less spawn: ``{model, line}`` or ``None``.
+
+        Bounded by the seam's own timeout; every failure is ``None`` so the run
+        keeps the seat's default exactly as before. The parent's served model is
+        read so a review can be routed to a different one.
+        """
+        log = _logging.getLogger(__name__)
+        try:
+            from ..decisions.points import spawn_route as _spawn_route
+            from ..llm_helpers import provider_active_model
+            from ..subagent import sel as _sel
+
+            parent_model = ""
+            if info.parent_session_key:
+                try:
+                    provider = self._manager._sessions.get_provider(info.parent_session_key)
+                    parent_model = provider_active_model(provider) if provider is not None else ""
+                except Exception:
+                    parent_model = ""
+            routed = await _spawn_route.routed_spawn(
+                info.task,
+                agent=agent or "",
+                parent_model=parent_model,
+                session_key=info.parent_session_key or None,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("spawn.route: skipped for %s", info.id, exc_info=True)
+            return None
+        if not routed or not routed.get("model"):
+            return None
+        line = _spawn_route.reason_line(routed)
+        _sel().log_api_access(
+            caller=info.parent_session_key or f"subagent:{info.id}",
+            operation="subagent.spawn_route",
+            outcome="ok",
+            source="subagent",
+            resources=f"subagent_id={info.id},model={routed['model']},tier={routed.get('tier')},p={routed.get('p')}",
+        )
+        return {"model": routed["model"], "line": line}
+
     async def _write_state_off_loop_impl(
         self, info: SubagentInfo, what: str, **fields: object
     ) -> bool:
@@ -1299,6 +1342,17 @@ class RunEventCoordinator(ManagerComponent):
         # that role is unpinned the helper returns "" so we omit the kwarg and
         # keep deferring to the provider's configured default, exactly as before.
         eff_model = info.model or _subagent_default_model()
+        # A spawn that names no model may be routed to a configured tier of the
+        # seat's vendor by ``spawn.route`` (off without consent; ``None`` is every
+        # refusal). A per-spawn pin is the parent's answer and is never asked
+        # about; the role pin is the owner's, and is asked about only so the
+        # decision is RECORDED -- it is applied only when the owner configured
+        # ``decisions.spawn_route`` tiers, which is what makes the answer usable.
+        if not info.model:
+            routed = await self._route_spawn_model(info, agent)
+            if routed:
+                eff_model = routed["model"]
+                info.route_reason = routed["line"]
         # Record the EFFECTIVE pin (per-spawn OR the role_models['subagent']
         # config pin, via ``_subagent_default_model()``) as the requested side of
         # the downgrade comparison — keying off the bare per-spawn ``model`` would
@@ -1659,6 +1713,7 @@ class RunEventCoordinator(ManagerComponent):
                 # unavailable/AKIA-shaped pin must never reach the dashboard
                 # socket raw.
                 "requested_model": _redact(info.requested_model),
+                "route_reason": info.route_reason,
                 # The sub-agent's own session key (see build_subagent_snapshot):
                 # lets a client fetch this node's own context-trace.
                 "child_session": info.conversation_key or f"subagent:{info.id}",
