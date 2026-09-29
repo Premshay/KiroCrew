@@ -31,6 +31,9 @@ from kiro_crew.decisions import log as log_mod
 from kiro_crew.decisions.points import spawn_route as sr
 from kiro_crew.decisions.types import Answer
 
+#: Captured before any fixture stubs it, so the advertised-tier tests run the real one.
+REAL_ADVERTISED_TIERS = sr.advertised_tiers
+
 TIERS = {"codex": {"large": ["gpt-5.6-sol"], "small": ["gpt-5.6-terra"]}, "claude": {"large": [], "small": ["claude-sonnet-5"]}}
 
 
@@ -58,6 +61,12 @@ def consent(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def quiet_log(tmp_path, monkeypatch):
     monkeypatch.setattr(log_mod, "log_dir", lambda: tmp_path / "decisions")
+
+
+@pytest.fixture(autouse=True)
+def no_advertised(monkeypatch):
+    """No adapter list by default, so the config pins alone are the candidates."""
+    monkeypatch.setattr(sr, "advertised_tiers", lambda vendor, advertised=None: {})
 
 
 @pytest.fixture(autouse=True)
@@ -296,3 +305,52 @@ class TestNoteOnTheWire:
         assert a.note == "n" * MAX_NOTE_CHARS
         b = _answer_from_wire(q, {"type": "choice", "choice": "a", "probabilities": {"a": 0.9, "b": 0.1}, "note": {"role": "x"}})
         assert b.note == ""
+
+
+ADVERTISED = {
+    "codex": ["gpt-6-astra[medium]", "gpt-6-astra[high]", "gpt-5.6-sol[medium]", "gpt-5.6-sol[high]",
+              "gpt-5.6-terra[medium]", "gpt-5.6-terra[high]", "gpt-5.6-luna[medium]", "gpt-5.5[high]"],
+    "claude": ["default", "opus[1m]", "claude-fable-5-1[1m]", "sonnet", "haiku", "agent", "subagent"],
+    "deepseek": ['["deepseek-official","deepseek-flash"]', '["deepseek-official","deepseek-v4-pro"]',
+                 '["deepseek-official","deepseek-v4-flash-vision-exp"]'],
+}
+
+
+class TestAdvertisedTiers:
+    """The real function, over the lists this machine's adapters advertised on 2026-09-29."""
+
+    def _tiers(self, vendor):
+        return REAL_ADVERTISED_TIERS(vendor, ADVERTISED.get(vendor, []))
+
+    def test_claude_families(self):
+        assert self._tiers("claude") == {"large": ["opus[1m]", "claude-fable-5-1[1m]"], "small": ["sonnet", "haiku"]}
+
+    def test_codex_families_take_the_tier_effort_and_skip_unlisted_families(self):
+        assert self._tiers("codex") == {
+            "large": ["gpt-5.6-sol[high]", "gpt-6-astra[high]"],
+            "small": ["gpt-5.6-terra[medium]", "gpt-5.6-luna[medium]"],
+        }
+
+    def test_deepseek_pro_and_flash_without_experimental_variants(self):
+        assert self._tiers("deepseek") == {
+            "large": ['["deepseek-official","deepseek-v4-pro"]'],
+            "small": ['["deepseek-official","deepseek-flash"]'],
+        }
+
+    def test_a_vendor_without_families_has_none(self):
+        assert self._tiers("local") == {}
+
+
+class TestEffectiveTiers:
+    def test_a_pinned_tier_replaces_only_that_tier(self, monkeypatch):
+        monkeypatch.setattr(sr, "advertised_tiers", lambda vendor, advertised=None: {"large": ["opus[1m]"], "small": ["sonnet"]})
+        cfg = _config(spawn_route={"claude": {"large": ["claude-fable-5-1[1m]"]}})
+        assert sr.effective_tiers("claude", cfg) == {"large": ["claude-fable-5-1[1m]"], "small": ["sonnet"]}
+
+    def test_no_pins_uses_the_advertised_tiers(self, install_oracle, snapshot, monkeypatch):
+        snapshot(_config(spawn_route={}))
+        monkeypatch.setattr(sr, "advertised_tiers", lambda vendor, advertised=None: {"large": ["gpt-5.6-sol[high]"], "small": ["gpt-5.6-terra[medium]"]})
+        oracle = install_oracle(_Oracle("codex/small/0"))
+        got = _run(sr.routed_spawn("READ-ONLY: list files.", agent="crew-codex", session_key="s1"))
+        assert got["model"] == "gpt-5.6-terra[medium]"
+        assert [c["model"] for c in oracle.states[0]["candidates"]] == ["gpt-5.6-sol[high]", "gpt-5.6-terra[medium]"]

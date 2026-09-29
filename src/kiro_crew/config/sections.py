@@ -6527,12 +6527,14 @@ class DecisionsConfig:
         default_factory=dict,
         metadata=_meta(
             "Sub-agent model per vendor and tier",
-            "Which models Jev may pick for a sub-agent spawned without a model pin, "
-            "as {vendor: {large: [ids], small: [ids]}} with vendor one of claude, "
-            "codex, deepseek, local, antigravity. The child's seat decides the "
-            "vendor; Jev picks the tier from the brief and records why on the "
-            "child's card. Empty by default, which means nothing is applied: the "
-            "decision is still recorded so you can see which tier it would pick. "
+            "Optional override of the models Jev may pick for a sub-agent spawned "
+            "without a model pin, as {vendor: {large: [ids], small: [ids]}} with "
+            "vendor one of claude, codex, deepseek, local, antigravity. By default "
+            "the tiers come from the models each agent advertises (Claude opus and "
+            "fable large, sonnet and haiku small; Codex sol and astra large, terra "
+            "and luna small; DeepSeek pro large, flash small); a tier set here "
+            "replaces that tier only. The child's seat decides the vendor; Jev "
+            "picks the tier from the brief and records why on the child's card. "
             "A per-spawn model pin is never overridden.",
         ),
     )

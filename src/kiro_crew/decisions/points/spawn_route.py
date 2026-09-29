@@ -6,8 +6,11 @@ it is a read-only inventory or a cross-cutting feature. This point asks the orac
 for a spawn that names NO model, which of the owner's configured tiers for the
 child's vendor should run it, and records why on the child's card.
 
-The unit is the model TIER within the child's vendor (``decisions.spawn_route``
-maps ``vendor -> {tier: [model ids]}``); the seat -- crew, memory silo, project
+The unit is the model TIER within the child's vendor: the tiers are derived from
+the models the vendor's adapter ADVERTISES, sorted by the operator's family rule
+(:data:`FAMILY_TIERS` -- Claude opus/fable | sonnet/haiku, Codex sol/astra |
+terra/luna, DeepSeek pro | flash), and ``decisions.spawn_route`` may override a
+tier with explicit ids; the seat -- crew, memory silo, project
 context -- stays what the parent chose. A vendor the tombstones show rate-limited
 is reported in the state so the oracle can say so in its reason; switching the
 seat to another vendor is a follow-up, because a seat carries a memory silo and
@@ -16,9 +19,9 @@ this point must not move one behind the parent's back.
 Never behind the caller's back
 ------------------------------
 A per-spawn ``model`` is the parent's answer to this question and is never
-overridden. Every tier ships EMPTY -- no model id is hardcoded
-(``model-selection.md``) -- so the shipped behaviour is that the decision is
-recorded and nothing is applied until the owner pins ids their account is offered.
+overridden. No model id is hardcoded (``model-selection.md``): a candidate is
+always an id the adapter advertised to this account, or one the owner pinned. The
+point runs only with the Decisions keystone consented, like every other point.
 
 Everything is a refusal back to the seat's own model
 ----------------------------------------------------
@@ -244,6 +247,91 @@ def tier_map(config: Any | None = None) -> dict[str, dict[str, list[str]]]:
     return out
 
 
+#: The provider namespace each vendor's adapter advertises its models under
+#: (``model_registry.advertised_models``), i.e. ``provider_models.json``.
+ADVERTISED_NAMESPACE: dict[str, str] = {"claude": "claude_code", "codex": "codex", "deepseek": "deepseek"}
+
+#: Which model FAMILIES are each tier, per vendor -- the operator's taxonomy
+#: (POLICY.md "Spawn routing policy"), not model ids: the ids come from what the
+#: adapter advertises, so a new version of a family is picked up with no edit.
+#: Order within a tier is preference: the cheaper frontier model first.
+FAMILY_TIERS: dict[str, dict[str, tuple[str, ...]]] = {
+    "claude": {"large": ("opus", "fable"), "small": ("sonnet", "haiku")},
+    "codex": {"large": ("sol", "astra"), "small": ("terra", "luna")},
+    "deepseek": {"large": ("pro",), "small": ("flash",)},
+}
+
+#: Codex advertises one id per reasoning effort (``gpt-5.6-sol[high]``); the
+#: effort a tier runs at when the adapter offers no bare id.
+TIER_EFFORT = {"large": "high", "small": "medium"}
+
+_EFFORT_SUFFIX = re.compile(r"\[(low|medium|high|xhigh|max|ultra)\]$")
+_EXCLUDE = re.compile(r"vision|exp\b|-exp|preview", re.I)
+
+
+def _family_rank(model_id: str, families: tuple[str, ...]) -> int | None:
+    low = model_id.lower()
+    for i, fam in enumerate(families):
+        if re.search(rf"(^|[^a-z]){re.escape(fam)}([^a-z]|$)", low):
+            return i
+    return None
+
+
+def advertised_tiers(vendor: str, advertised: list[str] | None = None) -> dict[str, list[str]]:
+    """``{large: [ids], small: [ids]}`` for *vendor* from its adapter's advertised list.
+
+    An id is in a tier when its name carries one of the tier's families; ids that
+    name none (``default``, ``agent``, an older ``gpt-5.5``) and experimental
+    variants are left out. Per model, one id: the bare id when advertised, else the
+    tier's effort variant. Never raises; a cold cache reads as empty.
+    """
+    families = FAMILY_TIERS.get(vendor)
+    if not families:
+        return {}
+    if advertised is None:
+        try:
+            from kiro_crew import model_registry
+
+            advertised = model_registry.advertised_models(ADVERTISED_NAMESPACE[vendor])
+        except Exception:
+            logger.debug("spawn.route: advertised models unreadable", exc_info=True)
+            return {}
+    out: dict[str, list[str]] = {}
+    for tier, fams in families.items():
+        by_model: dict[str, list[str]] = {}
+        ranks: dict[str, int] = {}
+        for mid in advertised or []:
+            if not isinstance(mid, str) or _EXCLUDE.search(mid):
+                continue
+            rank = _family_rank(mid, fams)
+            if rank is None:
+                continue
+            base = _EFFORT_SUFFIX.sub("", mid)
+            by_model.setdefault(base, []).append(mid)
+            ranks[base] = min(ranks.get(base, rank), rank)
+        picked = []
+        for base in sorted(by_model, key=lambda b: ranks[b]):
+            ids = by_model[base]
+            if base in ids:
+                picked.append(base)
+            else:
+                want = f"{base}[{TIER_EFFORT[tier]}]"
+                picked.append(want if want in ids else ids[0])
+        out[tier] = picked
+    return out
+
+
+def effective_tiers(vendor: str, config: Any | None = None) -> dict[str, list[str]]:
+    """The owner's ``decisions.spawn_route`` pins for *vendor* where set, else the advertised tiers.
+
+    Per TIER: a tier the owner pinned uses the pins, an unpinned tier falls back to
+    what the adapter advertises, so a partial override does not blank the rest.
+    """
+    pinned = tier_map(config).get(vendor, {})
+    derived = advertised_tiers(vendor)
+    return {tier: list(pinned.get(tier) or derived.get(tier) or []) for tier in TIERS}
+
+
 def candidates_for(vendor: str, mapping: Mapping[str, Mapping[str, list[str]]]) -> list[dict[str, str]]:
     """The offered options: one per pinned model id of *vendor*, keyed ``vendor/tier/i``."""
     out = []
@@ -321,8 +409,8 @@ async def routed_spawn(
         vendor = vendor_of_seat(agent, parent_model)
         if not vendor:
             return None
-        mapping = await asyncio.to_thread(tier_map, config)
-        cands = candidates_for(vendor, mapping)
+        tiers = await asyncio.to_thread(effective_tiers, vendor, config)
+        cands = candidates_for(vendor, {vendor: tiers})
         if not cands:
             return None
         health = await asyncio.to_thread(cached_health)
