@@ -1691,6 +1691,10 @@ def _container_cgroup_available_gb() -> float:
                 current = _read_int_file(str(directory / usage_name))
                 if limit is not None and 0 <= limit < _CGROUP_UNLIMITED:
                     # No spare capacity is established when usage is unknown.
+                    # Usage counts page cache; the inactive part is reclaimed
+                    # before the limit binds, so it is headroom, not load.
+                    if current is not None and current >= 0:
+                        current -= min(current, _cgroup_inactive_file(directory, v2))
                     headroom = (
                         max(0.0, (limit - current) / (1024**3))
                         if current is not None and current >= 0
@@ -1701,6 +1705,27 @@ def _container_cgroup_available_gb() -> float:
                 break
             directory = directory.parent
     return available
+
+
+def _cgroup_inactive_file(directory: PurePosixPath, v2: bool) -> int:
+    """Inactive page cache charged to *directory*, in bytes; 0 when unreadable.
+
+    The same "working set" cut kubelet makes: ``usage - inactive_file``. On a
+    long-lived host (a WSL VM with a hard cap on ``/wsl-user``) usage sits near
+    the limit mostly as cache, and counting it refuses every spawn while
+    ``MemAvailable`` shows tens of GB free. Active cache stays counted. An
+    unreadable ``memory.stat`` yields 0, i.e. the previous, stricter reading.
+    """
+    key = "inactive_file" if v2 else "total_inactive_file"
+    try:
+        with open(str(directory / "memory.stat"), encoding="ascii") as fh:
+            for line in fh:
+                name, _, value = line.partition(" ")
+                if name == key:
+                    return max(0, int(value))
+    except (OSError, UnicodeDecodeError, ValueError):
+        pass
+    return 0
 
 
 def _agents_slice_available_gb() -> float:

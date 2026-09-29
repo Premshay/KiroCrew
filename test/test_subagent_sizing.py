@@ -1037,6 +1037,37 @@ class TestCgroupAvailable:
         # The looser parent ceiling still has less headroom due to siblings.
         assert subagent._cgroup_available_gb() == 1.0
 
+    @pytest.mark.parametrize("v2", [True, False])
+    def test_inactive_page_cache_is_headroom(self, cgroup_files, v2):
+        # A WSL-style cap: usage near the limit, most of it inactive cache.
+        membership = "0::" if v2 else "5:memory:"
+        filesystem = "cgroup2 cgroup rw" if v2 else "cgroup cgroup rw,memory"
+        limit = "memory.max" if v2 else "memory.limit_in_bytes"
+        usage = "memory.current" if v2 else "memory.usage_in_bytes"
+        key = "inactive_file" if v2 else "total_inactive_file"
+        cgroup_files.update(
+            {
+                "/proc/self/cgroup": f"{membership}/crew\n",
+                "/proc/self/mountinfo": f"31 20 0:28 / /mem rw - {filesystem}\n",
+                f"/mem/crew/{limit}": 94 * 1024**3,
+                f"/mem/crew/{usage}": 91 * 1024**3,
+                "/mem/crew/memory.stat": f"anon {36 * 1024**3}\n{key} {24 * 1024**3}\n",
+            }
+        )
+        assert subagent._cgroup_available_gb() == pytest.approx(27.0)
+
+    def test_unreadable_stat_keeps_strict_reading(self, cgroup_files):
+        cgroup_files.update(
+            {
+                "/proc/self/cgroup": "0::/crew\n",
+                "/proc/self/mountinfo": "31 20 0:28 / /mem rw - cgroup2 cgroup rw\n",
+                "/mem/crew/memory.max": 8 * 1024**3,
+                "/mem/crew/memory.current": 7 * 1024**3,
+                "/mem/crew/memory.stat": "inactive_file garbage\n",
+            }
+        )
+        assert subagent._cgroup_available_gb() == pytest.approx(1.0)
+
     @pytest.mark.parametrize("usage", [None, PermissionError(), "garbage", "max", -1])
     @pytest.mark.parametrize("v2", [True, False])
     def test_unknown_usage_does_not_become_zero(self, cgroup_files, usage, v2):
