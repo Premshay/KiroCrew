@@ -223,7 +223,7 @@ class TestConfig:
 
     def test_coercion_keeps_known_vendors_and_lists(self):
         got = coerce_spawn_route({"codex": {"large": ["gpt-5.6-sol", "auto", ""], "small": "gpt-5.6-terra"}, "bogus": {"large": ["x"]}})
-        assert got == {"codex": {"large": ["gpt-5.6-sol"], "small": ["gpt-5.6-terra"]}}
+        assert got == {"codex": {"top": [], "large": ["gpt-5.6-sol"], "small": ["gpt-5.6-terra"], "mini": []}}
 
     def test_candidates_are_the_child_vendors_pins_only(self):
         cands = sr.candidates_for("codex", TIERS)
@@ -322,20 +322,19 @@ class TestAdvertisedTiers:
     def _tiers(self, vendor):
         return REAL_ADVERTISED_TIERS(vendor, ADVERTISED.get(vendor, []))
 
-    def test_claude_families(self):
-        assert self._tiers("claude") == {"large": ["opus[1m]", "claude-fable-5-1[1m]"], "small": ["sonnet", "haiku"]}
+    def test_claude_rungs(self):
+        assert self._tiers("claude") == {
+            "top": ["claude-fable-5-1[1m]"], "large": ["opus[1m]"], "small": ["sonnet"], "mini": ["haiku"]}
 
-    def test_codex_families_take_the_tier_effort_and_skip_unlisted_families(self):
+    def test_codex_rungs_take_the_rung_effort_and_skip_unlisted_families(self):
         assert self._tiers("codex") == {
-            "large": ["gpt-5.6-sol[high]", "gpt-6-astra[high]"],
-            "small": ["gpt-5.6-terra[medium]", "gpt-5.6-luna[medium]"],
+            "top": ["gpt-6-astra[high]"], "large": ["gpt-5.6-sol[high]"],
+            "small": ["gpt-5.6-terra[medium]"], "mini": ["gpt-5.6-luna[medium]"],
         }
 
     def test_deepseek_pro_and_flash_without_experimental_variants(self):
-        assert self._tiers("deepseek") == {
-            "large": ['["deepseek-official","deepseek-v4-pro"]'],
-            "small": ['["deepseek-official","deepseek-flash"]'],
-        }
+        pro, flash = ['["deepseek-official","deepseek-v4-pro"]'], ['["deepseek-official","deepseek-flash"]']
+        assert self._tiers("deepseek") == {"top": pro, "large": pro, "small": flash, "mini": flash}
 
     def test_a_vendor_without_families_has_none(self):
         assert self._tiers("local") == {}
@@ -343,9 +342,10 @@ class TestAdvertisedTiers:
 
 class TestEffectiveTiers:
     def test_a_pinned_tier_replaces_only_that_tier(self, monkeypatch):
-        monkeypatch.setattr(sr, "advertised_tiers", lambda vendor, advertised=None: {"large": ["opus[1m]"], "small": ["sonnet"]})
-        cfg = _config(spawn_route={"claude": {"large": ["claude-fable-5-1[1m]"]}})
-        assert sr.effective_tiers("claude", cfg) == {"large": ["claude-fable-5-1[1m]"], "small": ["sonnet"]}
+        monkeypatch.setattr(sr, "advertised_tiers", lambda vendor, advertised=None: {"top": ["claude-fable-5-1[1m]"], "large": ["opus[1m]"], "small": ["sonnet"], "mini": ["haiku"]})
+        cfg = _config(spawn_route={"claude": {"large": ["claude-opus-4.8"]}})
+        assert sr.effective_tiers("claude", cfg) == {
+            "top": ["claude-fable-5-1[1m]"], "large": ["claude-opus-4.8"], "small": ["sonnet"], "mini": ["haiku"]}
 
     def test_no_pins_uses_the_advertised_tiers(self, install_oracle, snapshot, monkeypatch):
         snapshot(_config(spawn_route={}))

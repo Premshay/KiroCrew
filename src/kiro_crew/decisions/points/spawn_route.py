@@ -8,8 +8,8 @@ child's vendor should run it, and records why on the child's card.
 
 The unit is the model TIER within the child's vendor: the tiers are derived from
 the models the vendor's adapter ADVERTISES, sorted by the operator's family rule
-(:data:`FAMILY_TIERS` -- Claude opus/fable | sonnet/haiku, Codex sol/astra |
-terra/luna, DeepSeek pro | flash), and ``decisions.spawn_route`` may override a
+(:data:`FAMILY_TIERS` -- top fable/astra/pro, large opus/sol/pro, small
+sonnet/terra/flash, mini haiku/luna/flash), and ``decisions.spawn_route`` may override a
 tier with explicit ids; the seat -- crew, memory silo, project
 context -- stays what the parent chose. A vendor the tombstones show rate-limited
 is reported in the state so the oracle can say so in its reason; switching the
@@ -52,7 +52,9 @@ QUESTION_ID = "spawn"
 
 #: The vendors a seat name can carry and the tiers the owner may pin per vendor.
 VENDORS: tuple[str, ...] = ("claude", "codex", "deepseek", "local", "antigravity")
-TIERS: tuple[str, ...] = ("large", "small")
+#: Rungs, hardest first: ``top`` is the frontier supervisor (orchestration, long-horizon
+#: builds), ``mini`` the cheapest bounded worker.
+TIERS: tuple[str, ...] = ("top", "large", "small", "mini")
 
 #: Characters of the brief sent with the question -- the bound ``skills.select``
 #: and ``model.route`` apply to a message, and a brief is a message to the child.
@@ -256,14 +258,14 @@ ADVERTISED_NAMESPACE: dict[str, str] = {"claude": "claude_code", "codex": "codex
 #: adapter advertises, so a new version of a family is picked up with no edit.
 #: Order within a tier is preference: the cheaper frontier model first.
 FAMILY_TIERS: dict[str, dict[str, tuple[str, ...]]] = {
-    "claude": {"large": ("opus", "fable"), "small": ("sonnet", "haiku")},
-    "codex": {"large": ("sol", "astra"), "small": ("terra", "luna")},
-    "deepseek": {"large": ("pro",), "small": ("flash",)},
+    "claude": {"top": ("fable",), "large": ("opus",), "small": ("sonnet",), "mini": ("haiku",)},
+    "codex": {"top": ("astra",), "large": ("sol",), "small": ("terra",), "mini": ("luna",)},
+    "deepseek": {"top": ("pro",), "large": ("pro",), "small": ("flash",), "mini": ("flash",)},
 }
 
 #: Codex advertises one id per reasoning effort (``gpt-5.6-sol[high]``); the
 #: effort a tier runs at when the adapter offers no bare id.
-TIER_EFFORT = {"large": "high", "small": "medium"}
+TIER_EFFORT = {"top": "high", "large": "high", "small": "medium", "mini": "medium"}
 
 _EFFORT_SUFFIX = re.compile(r"\[(low|medium|high|xhigh|max|ultra)\]$")
 _EXCLUDE = re.compile(r"vision|exp\b|-exp|preview", re.I)
@@ -346,9 +348,9 @@ def questions(cands: list[dict[str, str]]) -> list[Question]:
         Choice(
             QUESTION_ID,
             "A parent agent is delegating this brief to a sub-agent. Which of the configured "
-            "model tiers should run it? Large tiers hold long-horizon, ambiguous or cross-cutting "
-            "work; small tiers hold bounded, read-mostly work. Prefer a different model from the "
-            "parent's for a review.",
+            "model rungs should run it? top = a supervisor that orchestrates other agents or "
+            "long-horizon cross-cutting work; large = complex work; small = ordinary bounded work; "
+            "mini = simple read-mostly work. Prefer a different model from the parent's for a review.",
             options=[c["key"] for c in cands],
         )
     ]

@@ -6276,7 +6276,7 @@ def coerce_model_route(raw: object) -> dict[str, str]:
 
 
 DECISION_SPAWN_ROUTE_VENDORS = ("claude", "codex", "deepseek", "local", "antigravity")
-DECISION_SPAWN_ROUTE_TIERS = ("large", "small")
+DECISION_SPAWN_ROUTE_TIERS = ("top", "large", "small", "mini")
 
 
 def coerce_spawn_route(raw: object) -> dict[str, dict[str, list[str]]]:
@@ -6528,12 +6528,12 @@ class DecisionsConfig:
         metadata=_meta(
             "Sub-agent model per vendor and tier",
             "Optional override of the models Jev may pick for a sub-agent spawned "
-            "without a model pin, as {vendor: {large: [ids], small: [ids]}} with "
+            "without a model pin, as {vendor: {top|large|small|mini: [ids]}} with "
             "vendor one of claude, codex, deepseek, local, antigravity. By default "
-            "the tiers come from the models each agent advertises (Claude opus and "
-            "fable large, sonnet and haiku small; Codex sol and astra large, terra "
-            "and luna small; DeepSeek pro large, flash small); a tier set here "
-            "replaces that tier only. The child's seat decides the vendor; Jev "
+            "the rungs come from the models each agent advertises: top Fable / "
+            "Astra / DeepSeek pro (orchestrators and long-horizon work), large Opus "
+            "/ Sol / pro, small Sonnet / Terra / flash, mini Haiku / Luna / flash; "
+            "a rung set here replaces that rung only. The child's seat decides the vendor; Jev "
             "picks the tier from the brief and records why on the child's card. "
             "A per-spawn model pin is never overridden.",
         ),
