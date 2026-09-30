@@ -6593,20 +6593,6 @@ def _flush_segment(
     _schedule_widget_registration(state, slot, redacted, str(last_msg.get("ts", "")))
 
 
-def _touch_for_background_work(state: DashboardState, slot: _ChatSlot) -> None:
-    """Refresh the session's idle clock for work Claude did between turns.
-
-    ``last_used`` moves only when a turn is dispatched, so a session woken by its
-    own background tasks looked idle while it worked and the sweep expired it.
-    The same touch ``/api/session-keepalive`` gives a long ``wait``.
-    Best-effort: a missing session has nothing to keep alive.
-    """
-    try:
-        state.sessions.touch(effective_session_key(slot))
-    except Exception:
-        logger.debug("idle-clock touch failed for slot %s", slot.key, exc_info=True)
-
-
 async def _render_claude_idle_event(
     state: DashboardState,
     slot: _ChatSlot,
@@ -6633,7 +6619,6 @@ async def _render_claude_idle_event(
     take the session's stream with it, so a failed row is logged and dropped
     rather than propagated.
     """
-    _touch_for_background_work(state, slot)
     try:
         if event.kind == EVENT_TOOL_CALL:
             payload = _tool_call_ws_payload(event)
@@ -6738,7 +6723,6 @@ async def _persist_claude_autonomous_turn(
             turn.origin,
         )
         return
-    _touch_for_background_work(state, slot)
     if not turn.text.strip():
         return
     if turn.message_id:

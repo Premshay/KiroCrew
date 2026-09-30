@@ -6282,6 +6282,10 @@ class AcpClient:
         # wakes the model when it settles, so the idle sweep must not expire
         # the session while any is live; see ``has_background_work``.
         self._claude_live_background_tasks: set[str] = set()
+        # Monotonic time of the last frame the Claude reader routed. Only the
+        # reader sets it, so a client without one (every other backend on this
+        # transport) reports None and leaves idleness to the turn clock.
+        self._session_activity_at: float | None = None
         # In-flight `_session/steering` requests: JSON-RPC id -> the raw steered
         # text. claude-agent-acp answers a steer with a RESPONSE rather than a
         # `steering_consumed` notification, so the response id is the only thing
@@ -12216,6 +12220,7 @@ class AcpClient:
 
     async def _route_claude_frame(self, msg: JsonRpcMessage) -> None:
         """Keep autonomous Claude cycles out of the next dashboard dispatch."""
+        self._session_activity_at = time.monotonic()
         if msg.is_method(_CLAUDE_SDK_MESSAGE_METHOD):
             await self._handle_claude_sdk_message(msg)
             return
@@ -12372,6 +12377,11 @@ class AcpClient:
                 self._claude_live_background_tasks.discard(task_id)
             elif status in ("running", "pending"):
                 self._claude_live_background_tasks.add(task_id)
+
+    @property
+    def session_activity_at(self) -> float | None:
+        """Monotonic time of the last frame the Claude reader routed."""
+        return self._session_activity_at
 
     @property
     def has_background_work(self) -> bool:
