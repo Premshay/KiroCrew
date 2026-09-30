@@ -626,6 +626,12 @@ class AcpProvider(LLMProvider):
         self._client.restrict_tools(allowed_tools)
 
     @property
+    def session_activity_at(self) -> float | None:
+        # Both transports answer: AcpClient for backends it reads between
+        # turns, AcpSessionProvider for the shared runtime's sessions.
+        return getattr(self._client, "session_activity_at", None)
+
+    @property
     def is_claude_backend(self) -> bool:
         """True when this ACP provider talks to claude-agent-acp (vs kiro-cli).
 

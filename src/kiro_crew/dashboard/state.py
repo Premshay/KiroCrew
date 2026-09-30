@@ -5670,11 +5670,10 @@ class DashboardState:
         # entry path is protected, including task/workflow continuations.
         self.kiro_prerequisite_service: Any = None
         self.subagents = subagents
-        if self.subagents is not None:
-            try:
-                self.sessions.set_idle_expiry_guard(self.subagents.has_pending_work_for)
-            except AttributeError:
-                pass
+        try:
+            self.sessions.set_idle_expiry_guard(self._has_pending_work)
+        except AttributeError:
+            pass
         self.channel_manager: Any = None  # lazy-init in server.py
         # A gateway launch defers legacy channel-agent relaunch until memory
         # preparation settles. Standalone dashboard callers keep the immediate
@@ -6141,6 +6140,23 @@ class DashboardState:
             self.context_builder.memory_mode_for_session = lambda key: resolve_session_memory_mode(
                 self, key
             )
+
+    def _has_pending_work(self, session_key: str) -> bool:
+        """Idle-expiry guard: work this session is still waiting on.
+
+        Two kinds: sub-agents it dispatched through KiroCrew, and background
+        tasks Claude started natively (a backgrounded shell, an async agent).
+        Each wakes the model when it settles, so expiring the session first
+        throws the result away.
+        """
+        if self.subagents is not None and self.subagents.has_pending_work_for(session_key):
+            return True
+        from kiro_crew.providers.acp import is_claude_backend
+
+        provider = self.sessions.get_provider(session_key)
+        if not is_claude_backend(provider):
+            return False
+        return provider.client.has_background_work is True
 
     def register_channel_transport(self, transport: "MessagingTransport") -> None:
         """Register a live channel transport for cross-surface mirror delivery.

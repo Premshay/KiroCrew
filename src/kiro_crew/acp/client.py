@@ -3101,6 +3101,8 @@ _CLAUDE_AUTONOMOUS_ORIGINS = frozenset(
 )
 _MAX_PENDING_CLAUDE_AUTONOMOUS_TURNS = 16
 _CLAUDE_SDK_MESSAGE_METHOD = "_claude/sdkMessage"
+_CLAUDE_TASK_LIFECYCLE_SUBTYPES = frozenset({"task_started", "task_notification", "task_updated"})
+_CLAUDE_TASK_TERMINAL_STATUSES = frozenset({"completed", "failed", "killed", "stopped"})
 # Absolute safety cap for _wait_for_response's activity-based deadline. The
 # per-call deadline resets on every received frame (so a long session/load
 # replay that streams the whole transcript as notifications is not killed),
@@ -6276,6 +6278,14 @@ class AcpClient:
         # a row is cut at the next tool call, which is the boundary the reader
         # can see without a timer.
         self._claude_idle_text: list[str] = []
+        # Native background tasks (``task_started`` not yet settled). Each one
+        # wakes the model when it settles, so the idle sweep must not expire
+        # the session while any is live; see ``has_background_work``.
+        self._claude_live_background_tasks: set[str] = set()
+        # Monotonic time of the last frame the Claude reader routed. Only the
+        # reader sets it, so a client without one (every other backend on this
+        # transport) reports None and leaves idleness to the turn clock.
+        self._session_activity_at: float | None = None
         # In-flight `_session/steering` requests: JSON-RPC id -> the raw steered
         # text. claude-agent-acp answers a steer with a RESPONSE rather than a
         # `steering_consumed` notification, so the response id is the only thing
@@ -7272,6 +7282,12 @@ class AcpClient:
                     # Every result, not only autonomous ones: the end of a
                     # between-turn stretch is what flushes its closing prose.
                     {"type": "result"},
+                    # The background-task lifecycle, so the idle sweep can tell
+                    # a session waiting on its own task from an abandoned one.
+                    *(
+                        {"type": "system", "subtype": subtype}
+                        for subtype in sorted(_CLAUDE_TASK_LIFECYCLE_SUBTYPES)
+                    ),
                 ],
             }
         }
@@ -12204,6 +12220,7 @@ class AcpClient:
 
     async def _route_claude_frame(self, msg: JsonRpcMessage) -> None:
         """Keep autonomous Claude cycles out of the next dashboard dispatch."""
+        self._session_activity_at = time.monotonic()
         if msg.is_method(_CLAUDE_SDK_MESSAGE_METHOD):
             await self._handle_claude_sdk_message(msg)
             return
@@ -12275,6 +12292,9 @@ class AcpClient:
             logger.warning("Ignoring malformed Claude SDK extension frame")
             return
         kind = sdk_message.get("type")
+        if kind == "system":
+            self._track_claude_background_task(sdk_message)
+            return
         origin_data = sdk_message.get("origin")
         origin = origin_data.get("kind") if isinstance(origin_data, dict) else None
         if kind == "user" and origin in _CLAUDE_AUTONOMOUS_ORIGINS:
@@ -12334,6 +12354,39 @@ class AcpClient:
             self._claude_autonomous_session_key = ""
             if turn.text:
                 await self._deliver_claude_autonomous_turn(turn)
+
+    def _track_claude_background_task(self, sdk_message: dict) -> None:
+        """Mirror the adapter's live-task registry from the SDK lifecycle.
+
+        Settled by either ``task_notification`` or a terminal ``task_updated``
+        patch, as the adapter does: only the patch is guaranteed per transition.
+        A non-terminal patch revives a task the SDK resumed under the same id.
+        """
+        task_id = sdk_message.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return
+        subtype = sdk_message.get("subtype")
+        if subtype == "task_started":
+            self._claude_live_background_tasks.add(task_id)
+        elif subtype == "task_notification":
+            self._claude_live_background_tasks.discard(task_id)
+        elif subtype == "task_updated":
+            patch = sdk_message.get("patch")
+            status = patch.get("status") if isinstance(patch, dict) else None
+            if status in _CLAUDE_TASK_TERMINAL_STATUSES:
+                self._claude_live_background_tasks.discard(task_id)
+            elif status in ("running", "pending"):
+                self._claude_live_background_tasks.add(task_id)
+
+    @property
+    def session_activity_at(self) -> float | None:
+        """Monotonic time of the last frame the Claude reader routed."""
+        return self._session_activity_at
+
+    @property
+    def has_background_work(self) -> bool:
+        """Whether a native Claude background task is still unsettled."""
+        return bool(self._claude_live_background_tasks)
 
     async def _collect_claude_autonomous_frame(self, msg: JsonRpcMessage) -> None:
         """Collect one autonomous cycle while declining unsafe server requests.

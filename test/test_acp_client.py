@@ -1290,7 +1290,13 @@ class TestClaudeAutonomousReader:
         # Every result, origin-less: the end of a between-turn stretch is what
         # flushes its closing prose, and autonomous results still match.
         assert [entry for entry in filters if entry["type"] == "result"] == [{"type": "result"}]
-        assert {entry["type"] for entry in filters} == {"user", "assistant", "result"}
+        # The background-task lifecycle feeds the idle sweep.
+        assert {entry["subtype"] for entry in filters if entry["type"] == "system"} == {
+            "task_started",
+            "task_notification",
+            "task_updated",
+        }
+        assert {entry["type"] for entry in filters} == {"user", "assistant", "result", "system"}
 
     def test_explicit_mcp_profile_excludes_user_setting_source(self, tmp_path):
         overlay = tmp_path / "overlay"
