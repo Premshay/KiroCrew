@@ -196,21 +196,6 @@ class LLMProvider(ABC):
         return False
 
     @property
-    def background_activity_at(self) -> float | None:
-        """Monotonic time of the backend's last work outside a dispatched turn.
-
-        The idle sweep otherwise sees only the turns KiroCrew dispatched, so a
-        backend that keeps working between them looks idle. None for backends
-        that do no such work.
-        """
-        return None
-
-    @property
-    def has_background_work(self) -> bool:
-        """Whether the backend has native background work still outstanding."""
-        return False
-
-    @property
     def child_fidelity_aware(self) -> bool:
         """Consumer opt-in for the low-fidelity CHILD permission downgrade.
 

@@ -6278,14 +6278,9 @@ class AcpClient:
         # a row is cut at the next tool call, which is the boundary the reader
         # can see without a timer.
         self._claude_idle_text: list[str] = []
-        # Evidence for the session's idle sweep, which otherwise sees only the
-        # turns KiroCrew dispatched. Claude keeps working between them -- a
-        # background task finishing wakes the model for a whole cycle -- and a
-        # session doing that for an hour looked idle and was torn down under it.
-        # The monotonic time of the last frame read outside a dispatch, and the
-        # native background tasks (``task_started`` not yet settled) that will
-        # wake it again.
-        self._claude_background_activity_at: float | None = None
+        # Native background tasks (``task_started`` not yet settled). Each one
+        # wakes the model when it settles, so the idle sweep must not expire
+        # the session while any is live; see ``has_background_work``.
         self._claude_live_background_tasks: set[str] = set()
         # In-flight `_session/steering` requests: JSON-RPC id -> the raw steered
         # text. claude-agent-acp answers a steer with a RESPONSE rather than a
@@ -12221,8 +12216,6 @@ class AcpClient:
 
     async def _route_claude_frame(self, msg: JsonRpcMessage) -> None:
         """Keep autonomous Claude cycles out of the next dashboard dispatch."""
-        if self._claude_dispatch_depth == 0:
-            self._claude_background_activity_at = time.monotonic()
         if msg.is_method(_CLAUDE_SDK_MESSAGE_METHOD):
             await self._handle_claude_sdk_message(msg)
             return
@@ -12379,11 +12372,6 @@ class AcpClient:
                 self._claude_live_background_tasks.discard(task_id)
             elif status in ("running", "pending"):
                 self._claude_live_background_tasks.add(task_id)
-
-    @property
-    def background_activity_at(self) -> float | None:
-        """Monotonic time of the last frame Claude sent outside a dispatch."""
-        return self._claude_background_activity_at
 
     @property
     def has_background_work(self) -> bool:

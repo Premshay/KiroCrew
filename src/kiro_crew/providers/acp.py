@@ -626,14 +626,6 @@ class AcpProvider(LLMProvider):
         self._client.restrict_tools(allowed_tools)
 
     @property
-    def background_activity_at(self) -> float | None:
-        return self._client.background_activity_at
-
-    @property
-    def has_background_work(self) -> bool:
-        return self._client.has_background_work
-
-    @property
     def is_claude_backend(self) -> bool:
         """True when this ACP provider talks to claude-agent-acp (vs kiro-cli).
 

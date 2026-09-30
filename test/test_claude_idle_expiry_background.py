@@ -5,24 +5,31 @@ Claude background-task continuations until 09:31 and launched another
 background waiter, yet the sweep expired it at 09:43 as idle. ``last_used``
 moves only when KiroCrew dispatches a turn, and none of that work was one.
 
-The client half drives the real ``AcpClient`` routing path; the sweep half
-drives the real ``SessionManager`` with a provider exposing the two signals.
+The fix reuses the two mechanisms the sweep already honours: the
+``sessions.touch`` that ``/api/session-keepalive`` gives a long ``wait``, and
+the dashboard's idle-expiry guard. The client half drives the real
+``AcpClient`` routing path; the sweep half drives the real ``SessionManager``.
 """
 
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kiro_crew.acp.client import AcpClient
+from kiro_crew.acp.client import AcpClient, ClaudeAutonomousTurn
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     METHOD_SESSION_UPDATE,
     JsonRpcMessage,
 )
 from kiro_crew.config import KiroCrewConfig
+from kiro_crew.dashboard import chat_runner
+from kiro_crew.dashboard.chat_runner import _touch_for_background_work
+from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.session import SessionManager
 
 
@@ -64,29 +71,11 @@ def _text_frame(text: str) -> JsonRpcMessage:
 class TestClientSignals:
     def test_the_task_lifecycle_is_requested_from_the_adapter(self, tmp_path):
         """Without the subscription the adapter never forwards these frames."""
-        filters = _client(tmp_path)._claude_session_meta()["claudeCode"]["emitRawSDKMessages"]
+        filters = _client(tmp_path)._claude_session_meta()["claudeCode"][
+            "emitRawSDKMessages"
+        ]
         subtypes = {f.get("subtype") for f in filters if f.get("type") == "system"}
         assert subtypes == {"task_started", "task_notification", "task_updated"}
-
-    @pytest.mark.asyncio
-    async def test_between_turn_frames_stamp_activity(self, tmp_path):
-        client = _client(tmp_path)
-        before = time.monotonic()
-
-        await client._route_claude_frame(_text_frame("still working"))
-
-        assert client.background_activity_at is not None
-        assert client.background_activity_at >= before
-
-    @pytest.mark.asyncio
-    async def test_a_dispatched_turn_does_not_stamp_background_activity(self, tmp_path):
-        """A turn is already on the session's own clock."""
-        client = _client(tmp_path)
-        client._claude_dispatch_depth = 1
-
-        await client._route_claude_frame(_text_frame("in-turn"))
-
-        assert client.background_activity_at is None
 
     @pytest.mark.asyncio
     async def test_a_started_task_is_outstanding_until_notified(self, tmp_path):
@@ -99,12 +88,16 @@ class TestClientSignals:
         assert client.has_background_work is False
 
     @pytest.mark.asyncio
-    async def test_a_terminal_patch_settles_a_task_without_a_notification(self, tmp_path):
+    async def test_a_terminal_patch_settles_a_task_without_a_notification(
+        self, tmp_path
+    ):
         """The adapter guarantees only the patch per transition."""
         client = _client(tmp_path)
         await client._route_claude_frame(_task("task_started"))
 
-        await client._route_claude_frame(_task("task_updated", patch={"status": "killed"}))
+        await client._route_claude_frame(
+            _task("task_updated", patch={"status": "killed"})
+        )
 
         assert client.has_background_work is False
 
@@ -112,7 +105,9 @@ class TestClientSignals:
     async def test_a_running_patch_revives_a_resumed_task(self, tmp_path):
         client = _client(tmp_path)
 
-        await client._route_claude_frame(_task("task_updated", patch={"status": "running"}))
+        await client._route_claude_frame(
+            _task("task_updated", patch={"status": "running"})
+        )
 
         assert client.has_background_work is True
 
@@ -126,26 +121,28 @@ class TestClientSignals:
 
 
 def _provider() -> AsyncMock:
-    """The sweep's usual provider double, with both signals set to real values."""
     m = AsyncMock()
     m.context_usage_pct = lambda: 0.0
     m.has_active_turn = lambda: False
-    m.background_activity_at = None
-    m.has_background_work = False
     return m
+
+
+def _claude_provider(*, background_work: bool) -> MagicMock:
+    provider = MagicMock(spec=AcpProvider)
+    provider.is_claude_backend = True
+    provider.client = SimpleNamespace(has_background_work=background_work)
+    return provider
 
 
 @pytest.fixture
 def manager():
     cfg = KiroCrewConfig()
     cfg.session.timeout_secs = 2
-    providers: list[AsyncMock] = []
 
     def factory(session_key=None, **kwargs):
-        providers.append(_provider())
-        return providers[-1]
+        return _provider()
 
-    return SessionManager(cfg, provider_factory=factory), providers
+    return SessionManager(cfg, provider_factory=factory)
 
 
 async def _stale_session(mgr: SessionManager) -> None:
@@ -155,51 +152,104 @@ async def _stale_session(mgr: SessionManager) -> None:
         mgr._sessions["dashboard:tab1"].last_used = time.monotonic() - 10_000
 
 
-class TestIdleSweep:
+def _guard_state(mgr, provider, *, subagent_work: bool = False) -> SimpleNamespace:
+    """The two attributes ``DashboardState._has_pending_work`` reads."""
+    sessions = SimpleNamespace(get_provider=lambda key: provider)
+    subagents = SimpleNamespace(has_pending_work_for=lambda key: subagent_work)
+    return SimpleNamespace(sessions=sessions, subagents=subagents)
+
+
+class TestBetweenTurnWorkTouchesTheSession:
     @pytest.mark.asyncio
-    async def test_recent_background_activity_keeps_a_stale_session(self, manager):
+    async def test_a_between_turn_row_keeps_a_stale_session(self, manager):
         """The chat-1918 regression: working at 09:31, expired at 09:43."""
-        mgr, providers = manager
-        await _stale_session(mgr)
-        providers[0].background_activity_at = time.monotonic()
+        await _stale_session(manager)
+        state = SimpleNamespace(sessions=manager)
 
-        await mgr._expire_idle(timeout_secs=3600)
+        _touch_for_background_work(state, _ChatSlot("tab1"))
+        await manager._expire_idle(timeout_secs=3600)
 
-        assert "dashboard:tab1" in mgr._sessions
-        await mgr.close_all()
+        assert "dashboard:tab1" in manager._sessions
+        await manager.close_all()
 
     @pytest.mark.asyncio
-    async def test_old_background_activity_still_expires(self, manager):
-        mgr, providers = manager
-        await _stale_session(mgr)
-        providers[0].background_activity_at = time.monotonic() - 5_000
+    async def test_both_between_turn_sinks_touch(self, monkeypatch):
+        touched: list[str] = []
+        state = SimpleNamespace(sessions=SimpleNamespace(touch=touched.append))
+        slot = _ChatSlot("tab1")
+        monkeypatch.setattr(chat_runner, "save_slot_off_loop", AsyncMock())
 
-        await mgr._expire_idle(timeout_secs=3600)
+        await chat_runner._render_claude_idle_event(
+            state, slot, SimpleNamespace(kind="unrendered")
+        )
+        await chat_runner._persist_claude_autonomous_turn(
+            state,
+            slot,
+            ClaudeAutonomousTurn(
+                text="", origin="task-notification", timestamp="", message_id=""
+            ),
+        )
 
-        assert "dashboard:tab1" not in mgr._sessions
-        await mgr.close_all()
+        assert touched == ["dashboard:tab1", "dashboard:tab1"]
+
+    def test_a_missing_session_is_not_an_error(self):
+        state = SimpleNamespace(
+            sessions=SimpleNamespace(touch=MagicMock(side_effect=KeyError))
+        )
+
+        _touch_for_background_work(state, _ChatSlot("tab1"))
+
+
+class TestPendingWorkGuard:
+    def test_an_unsettled_native_task_is_pending_work(self, manager):
+        state = _guard_state(manager, _claude_provider(background_work=True))
+        assert DashboardState._has_pending_work(state, "dashboard:tab1") is True
+
+    def test_a_settled_claude_session_is_not(self, manager):
+        state = _guard_state(manager, _claude_provider(background_work=False))
+        assert DashboardState._has_pending_work(state, "dashboard:tab1") is False
+
+    def test_other_backends_are_not_asked(self, manager):
+        """A double answering truthily must not pin a non-Claude session."""
+        state = _guard_state(manager, _provider())
+        assert DashboardState._has_pending_work(state, "dashboard:tab1") is False
+
+    def test_subagent_work_still_counts(self, manager):
+        state = _guard_state(manager, None, subagent_work=True)
+        assert DashboardState._has_pending_work(state, "dashboard:tab1") is True
 
     @pytest.mark.asyncio
     async def test_an_outstanding_background_task_keeps_a_stale_session(self, manager):
         """The waiter launched at 09:31 would have woken the model again."""
-        mgr, providers = manager
-        await _stale_session(mgr)
-        providers[0].has_background_work = True
+        await _stale_session(manager)
+        state = _guard_state(manager, _claude_provider(background_work=True))
+        manager.set_idle_expiry_guard(
+            lambda key: DashboardState._has_pending_work(state, key)
+        )
 
-        await mgr._expire_idle(timeout_secs=1)
+        await manager._expire_idle(timeout_secs=1)
 
-        assert "dashboard:tab1" in mgr._sessions
-        await mgr.close_all()
+        assert "dashboard:tab1" in manager._sessions
+        await manager.close_all()
 
     @pytest.mark.asyncio
-    async def test_a_closed_tab_still_reaps_despite_background_work(self, manager):
-        """Native work pins the idle axis only, not the orphan axis."""
-        mgr, providers = manager
-        await _stale_session(mgr)
-        providers[0].has_background_work = True
-        mgr.set_active_dashboard_slots(set())
+    async def test_a_closed_tab_reaps_once_the_task_settles(self, manager):
+        """Same contract as KiroCrew sub-agents: pending work holds a closed
+        tab's session only until that work is done."""
+        await _stale_session(manager)
+        client = SimpleNamespace(has_background_work=True)
+        provider = _claude_provider(background_work=True)
+        provider.client = client
+        state = _guard_state(manager, provider)
+        manager.set_idle_expiry_guard(
+            lambda key: DashboardState._has_pending_work(state, key)
+        )
+        manager.set_active_dashboard_slots(set())
 
-        await mgr._expire_idle(timeout_secs=1)
+        await manager._expire_idle(timeout_secs=1)
+        assert "dashboard:tab1" in manager._sessions
 
-        assert "dashboard:tab1" not in mgr._sessions
-        await mgr.close_all()
+        client.has_background_work = False
+        await manager._expire_idle(timeout_secs=1)
+        assert "dashboard:tab1" not in manager._sessions
+        await manager.close_all()

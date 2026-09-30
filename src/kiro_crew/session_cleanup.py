@@ -122,31 +122,6 @@ def _no_pending_injection(key: str) -> bool:
     return False
 
 
-def _last_activity(session: SessionEntry) -> float:
-    """The later of the last dispatched turn and the backend's between-turn work.
-
-    ``last_used`` moves only when KiroCrew dispatches a turn. A Claude session
-    woken by its own background tasks can work for an hour without one, and the
-    sweep expired it mid-stretch. Only a real number counts: anything else (a
-    provider double, a backend without the signal) leaves the turn clock in
-    charge, as before.
-    """
-    at = getattr(session.provider, "background_activity_at", None)
-    if isinstance(at, (int, float)) and not isinstance(at, bool):
-        return max(session.last_used, at)
-    return session.last_used
-
-
-def _has_native_background_work(session: SessionEntry) -> bool:
-    """Whether the backend is waiting on a background task it started itself.
-
-    Such a task wakes the model when it settles, so expiring the session first
-    discards the result. ``is True`` rather than truthiness so a provider double
-    cannot pin a session by accident.
-    """
-    return getattr(session.provider, "has_background_work", False) is True
-
-
 @dataclass(slots=True)
 class CleanupState:
     """Mutable state exclusively owned by :class:`SessionCleanup`."""
@@ -1106,11 +1081,7 @@ class SessionCleanup:
                 total_checked += 1
                 if session.semaphore.locked():
                     continue
-                # Native background work pins the idle axis only; a closed
-                # tab still reaps through the orphan axis below.
-                idle = now - _last_activity(
-                    session
-                ) > timeout_secs and not _has_native_background_work(session)
+                idle = now - session.last_used > timeout_secs
                 guard = self.state.idle_expiry_guard
                 if idle and guard is not None:
                     try:
@@ -1234,10 +1205,7 @@ class SessionCleanup:
             # finished inside the await released the semaphore again but bumped
             # ``last_used`` on its way in, so the session is not idle now.
             # The orphan axis ignores the clock and re-asks the live set below.
-            if not is_orphan and (
-                self._deps.monotonic() - _last_activity(scanned) <= timeout_secs
-                or _has_native_background_work(scanned)
-            ):
+            if not is_orphan and self._deps.monotonic() - scanned.last_used <= timeout_secs:
                 self._deps.logger.info(
                     "Idle sweep: %s took a turn mid-sweep - left running",
                     key,
