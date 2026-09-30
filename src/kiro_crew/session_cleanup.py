@@ -161,6 +161,21 @@ def _no_background_launch(provider: LLMProvider) -> tuple[float, str] | None:
     return None
 
 
+def _last_activity(session: SessionEntry) -> float:
+    """The later of the last dispatched turn and the backend's own last frame.
+
+    ``last_used`` moves only when a turn is dispatched. A backend woken by its
+    own background work, or a child still reporting to it, can work for an hour
+    without one, and the sweep expired it mid-stretch. Only a real number
+    counts: anything else (no provider, a provider double, a transport that
+    does not read between turns) leaves the turn clock in charge, as before.
+    """
+    at = getattr(getattr(session, "provider", None), "session_activity_at", None)
+    if isinstance(at, (int, float)) and not isinstance(at, bool):
+        return max(session.last_used, at)
+    return session.last_used
+
+
 @dataclass(slots=True)
 class CleanupState:
     """Mutable state exclusively owned by :class:`SessionCleanup`."""
@@ -1536,7 +1551,7 @@ class SessionCleanup:
                 total_checked += 1
                 if session.semaphore.locked():
                     continue
-                idle = now - session.last_used > timeout_secs
+                idle = now - _last_activity(session) > timeout_secs
                 orphaned = self._owner_is_gone(key)
                 if idle or orphaned:
                     expired.append((key, orphaned, session))
@@ -1660,7 +1675,7 @@ class SessionCleanup:
             # finished inside the await released the semaphore again but bumped
             # ``last_used`` on its way in, so the session is not idle now.
             # The orphan axis ignores the clock and re-asks the live set below.
-            if not is_orphan and self._deps.monotonic() - scanned.last_used <= timeout_secs:
+            if not is_orphan and self._deps.monotonic() - _last_activity(scanned) <= timeout_secs:
                 self._deps.logger.info(
                     "Idle sweep: %s took a turn mid-sweep - left running",
                     key,
