@@ -5712,18 +5712,22 @@ class TestClaudeIdleEvent:
         slot = state.get_or_create_slot("s1")
 
         await chat_runner._render_claude_idle_event(
-            state, slot,
+            state,
+            slot,
             LLMEvent(kind=EVENT_TOOL_CALL, title="Terminal", tool_call_id="toolu_1"),
         )
         await chat_runner._render_claude_idle_event(
-            state, slot,
+            state,
+            slot,
             LLMEvent(kind=EVENT_TOOL_RESULT, tool_call_id="toolu_1", tool_output="merged"),
         )
 
         row = next(m for m in slot.messages if m.get("role") == "tool")
         assert row["meta"]["done"] is True
         assert row["meta"]["output"] == "merged"
-        results = [c.args[1] for c in state.broadcast_ws.call_args_list if c.args[0] == "tool_result"]
+        results = [
+            c.args[1] for c in state.broadcast_ws.call_args_list if c.args[0] == "tool_result"
+        ]
         assert results == [{"slot": "s1", "tool_call_id": "toolu_1", "output": "merged"}]
 
     @pytest.mark.asyncio
@@ -5804,9 +5808,7 @@ class TestClaudeIdleEvent:
         )
 
         tool_calls = [
-            call.args
-            for call in state.broadcast_ws.call_args_list
-            if call.args[0] == "tool_call"
+            call.args for call in state.broadcast_ws.call_args_list if call.args[0] == "tool_call"
         ]
         chat_frames = [
             call.args
@@ -5849,9 +5851,7 @@ class TestClaudeIdleEvent:
         ]
         assert chat_frames == []
         # chat_segment finalize still fires on the broadcast path.
-        assert any(
-            call.args[0] == "chat_segment" for call in state.broadcast_ws.call_args_list
-        )
+        assert any(call.args[0] == "chat_segment" for call in state.broadcast_ws.call_args_list)
 
 
 class TestFlushSegment:
@@ -5912,8 +5912,12 @@ class TestFlushSegment:
         monkeypatch.setattr(chat_runner.crew_log_emit, "live_turn", lambda _: 7)
         monkeypatch.setattr(chat_runner.crew_log_emit, "on_message_sent", sent)
         chat_runner._flush_segment(
-            state, slot, "partial reply", broadcast=False,
-            message_meta={"between_turn": True}, interrupted=True,
+            state,
+            slot,
+            "partial reply",
+            broadcast=False,
+            message_meta={"between_turn": True},
+            interrupted=True,
         )
         assert slot.messages[-1]["meta"]["between_turn"] is True
         sent.assert_called_once_with("sid", 7, text="partial reply", interrupted=True)
@@ -6222,9 +6226,9 @@ class TestRunChatSegmentFlush:
             for call in state.broadcast_ws.call_args_list
             if call.args[0] == "chat_thinking"
         ]
-        assert "lef" not in "".join(thinking), (
-            "the withheld pre-steer thinking tail was re-broadcast after the steer cut"
-        )
+        assert "lef" not in "".join(
+            thinking
+        ), "the withheld pre-steer thinking tail was re-broadcast after the steer cut"
 
     @pytest.mark.asyncio
     async def test_stop_boundary_drops_withheld_tails(self, tmp_path, monkeypatch):
@@ -6277,7 +6281,9 @@ class TestRunChatSegmentFlush:
             violations.append("thinking tail")
         if "par" in chunks:
             violations.append("text tail")
-        assert not violations, f"withheld pre-stop tails crossed the boundary: {violations} ({events})"
+        assert (
+            not violations
+        ), f"withheld pre-stop tails crossed the boundary: {violations} ({events})"
 
     @pytest.mark.asyncio
     async def test_text_tool_text_complete_produces_two_segments(self, tmp_path, monkeypatch):
@@ -6890,7 +6896,10 @@ class TestRunChatNativeSubagentAttribution:
             ],
         }
         events = [
-            LLMEvent(kind=EVENT_TEXT_CHUNK, text="ordinary assistant response must not be a timeline item"),
+            LLMEvent(
+                kind=EVENT_TEXT_CHUNK,
+                text="ordinary assistant response must not be a timeline item",
+            ),
             LLMEvent(kind=EVENT_TODO_UPDATE, todo=todo),
             LLMEvent(kind=EVENT_TODO_UPDATE, todo=todo),
             LLMEvent(kind=EVENT_COMPLETE),
@@ -7021,16 +7030,12 @@ class TestRunChatCompactDeferredWait:
 
         client.wait_for_compaction.assert_not_called()
         assert not any(
-            c.args
-            and c.args[0] == "chat_message"
-            and c.args[1].get("role") == "compacting"
+            c.args and c.args[0] == "chat_message" and c.args[1].get("role") == "compacting"
             for c in state.broadcast_ws.call_args_list
         )
 
     @pytest.mark.asyncio
-    async def test_native_compaction_events_arm_checkpoint_recovery(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_native_compaction_events_arm_checkpoint_recovery(self, tmp_path, monkeypatch):
         from kiro_crew.providers.base import (
             EVENT_COMPACTION_STATUS,
             EVENT_COMPLETE,
@@ -7048,9 +7053,7 @@ class TestRunChatCompactDeferredWait:
         ):
             state = self._make_state_for_run_chat(tmp_path, monkeypatch)
             slot = state.get_or_create_slot("s1")
-            client = self._make_mock_client(
-                [compaction_event, LLMEvent(kind=EVENT_COMPLETE)]
-            )
+            client = self._make_mock_client([compaction_event, LLMEvent(kind=EVENT_COMPLETE)])
             state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
 
             from kiro_crew.dashboard.chat import _run_chat
@@ -9502,7 +9505,9 @@ class TestRuntimeWiring:
             assert slot.project == "/workspace/new-ws"
 
     @pytest.mark.asyncio
-    async def test_api_chat_slot_agent_resets_model_and_persists_bindings(self, tmp_path, monkeypatch):
+    async def test_api_chat_slot_agent_resets_model_and_persists_bindings(
+        self, tmp_path, monkeypatch
+    ):
         """Switching agents resets the old model and persists both bindings.
 
         Without this, a session resumed after a gateway restart reverts to
@@ -19749,7 +19754,9 @@ class TestAcpProcessDiedRecovery:
         mock_client.stream_command = _raise
 
     @pytest.mark.asyncio
-    async def test_provider_interruption_records_partial_reply_in_ledger(self, tmp_path, monkeypatch):
+    async def test_provider_interruption_records_partial_reply_in_ledger(
+        self, tmp_path, monkeypatch
+    ):
         from kiro_crew.acp.client import AcpProviderStreamInterrupted
         from kiro_crew.dashboard import chat_runner
         from kiro_crew.providers.base import EVENT_TEXT_CHUNK, LLMEvent
