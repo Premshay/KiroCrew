@@ -186,6 +186,12 @@ _LEASE_START = "consolidation_lease_start"
 # Last heartbeat, not acquisition time: refreshed for as long as the holder is
 # working, so the ceiling above measures silence rather than duration.
 _LEASE_AT = "consolidation_lease_at"
+# The same heartbeat on the holder's monotonic clock. Monotonic time is immune
+# to wall-clock jumps (an NTP step, a VM suspend), so a holder that is
+# demonstrably alive with a fresh heartbeat stays excluded through one; the
+# wall-clock field above is the fallback for records written before this field
+# existed.
+_LEASE_AT_MONO = "consolidation_lease_at_mono"
 
 _CONSOLIDATION_META_KEYS: frozenset[str] = frozenset(
     {
@@ -240,9 +246,13 @@ def _lease_holder_is_live(meta: dict, *, now: float) -> bool:
     including Windows, where readable processes have a FILETIME identity.
     An unknown identity is never a mismatch: use pid-exists plus the ceiling.
 
-    The ceiling is checked last and applies on every platform. It is what bounds
-    a holder that is alive but wedged, and what stands in for liveness where the
-    identity is unknown.
+    The holder identity is settled before the heartbeat age, so a wall-clock
+    jump can never release a lease whose holder is demonstrably alive: the age
+    is measured on the holder's monotonic clock where the record carries one,
+    which a forward jump cannot move. The wall-clock field is the fallback for
+    records that predate the monotonic one (the ceiling still applies, exactly
+    as before). The ceiling itself is what bounds a holder that is alive but
+    wedged, and what stands in for liveness where the identity is unknown.
     """
     try:
         pid = int(meta.get(_LEASE_PID, 0) or 0)
@@ -250,20 +260,29 @@ def _lease_holder_is_live(meta: dict, *, now: float) -> bool:
         return False
     if pid <= 0:
         return False
-    try:
-        taken_at = float(meta.get(_LEASE_AT, 0.0) or 0.0)
-    except (TypeError, ValueError, OverflowError):
-        taken_at = 0.0
-    # A clock that moved backwards makes ``now - taken_at`` negative, which is
-    # inside the ceiling — the conservative direction, since the alternative is
-    # stealing a lease from a holder that is demonstrably alive.
-    if not math.isfinite(taken_at) or now - taken_at >= _CONSOLIDATION_LEASE_CEILING_SECS:
-        return False
     if not platform_compat.pid_exists(pid):
         return False
     stored_start = meta.get(_LEASE_START)
     live_start = platform_compat.get_process_start_id(pid)
     if stored_start and live_start and str(stored_start) != str(live_start):
+        return False
+    try:
+        mono_at = float(meta.get(_LEASE_AT_MONO, 0.0) or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        mono_at = 0.0
+    if math.isfinite(mono_at) and mono_at > 0.0:
+        age = _time.monotonic() - mono_at
+    else:
+        try:
+            taken_at = float(meta.get(_LEASE_AT, 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            taken_at = 0.0
+        # A clock that moved backwards makes ``now - taken_at`` negative, which
+        # is inside the ceiling — the conservative direction, since the
+        # alternative is stealing a lease from a holder that is demonstrably
+        # alive.
+        age = now - taken_at
+    if not math.isfinite(age) or age >= _CONSOLIDATION_LEASE_CEILING_SECS:
         return False
     return True
 
@@ -752,6 +771,7 @@ class HistoryConsolidator:
             _LEASE_TOKEN: token,
             _LEASE_PID: pid,
             _LEASE_AT: _time.time(),
+            _LEASE_AT_MONO: _time.monotonic(),
             _LEASE_START: platform_compat.get_process_start_id(pid),
         }
 
@@ -788,7 +808,9 @@ class HistoryConsolidator:
 
         try:
             self._log._meta_cache.pop(key, None)
-            renewed = self._log.update_metadata_if(key, {_LEASE_AT: _time.time()}, _ours)
+            renewed = self._log.update_metadata_if(
+                key, {_LEASE_AT: _time.time(), _LEASE_AT_MONO: _time.monotonic()}, _ours
+            )
             if renewed:
                 return True
             # An unreadable metadata line skips the guard. It proves no token
@@ -833,7 +855,8 @@ class HistoryConsolidator:
             self._log._meta_cache.pop(key, None)
             self._log.update_metadata_if(
                 key,
-                {_LEASE_TOKEN: None, _LEASE_PID: 0, _LEASE_START: None, _LEASE_AT: 0.0},
+                {_LEASE_TOKEN: None, _LEASE_PID: 0, _LEASE_START: None, _LEASE_AT: 0.0,
+                 _LEASE_AT_MONO: 0.0},
                 lambda meta: meta.get(_LEASE_TOKEN) == token,
             )
         except Exception:
@@ -1222,8 +1245,7 @@ class HistoryConsolidator:
             # CLI's `kirocrew consolidate` running against a session the
             # gateway's sweep has already picked up. Taken after the retry gate
             # so a span inside its backoff does not churn the lease it is not
-            # going to use, and before the span identity is frozen so the winner
-            # is the only one that reaches a prompt.
+            # going to use.
             lease = await asyncio.to_thread(self._acquire_consolidation_lease, key)
             if lease is None:
                 self._logger.info(
@@ -1237,6 +1259,24 @@ class HistoryConsolidator:
             lease_heartbeat = asyncio.ensure_future(
                 self._heartbeat_consolidation_lease(key, lease, _abort_lost_lease)
             )
+            # Re-snapshot now that the lease is held. The acquisition is a
+            # window another writer can land in (the CLI's own pass, an
+            # append), and the prompt must cover the span the lease actually
+            # protects: building it from the pre-acquisition snapshot would
+            # mark consolidated messages that prompt never saw. The gate and
+            # the AttemptedSpan below are rebuilt from THIS read, so the
+            # winner is the only process that pays the second one.
+            (
+                unconsolidated,
+                total,
+                generation_at_snapshot,
+            ) = await asyncio.to_thread(self._log.snapshot_for_consolidation, key)
+            unconsolidated = copy.deepcopy(unconsolidated)
+            if not unconsolidated:
+                return None
+            if not self.retry_eligible(key, message_count=total):
+                self._logger.info("_consolidate refused for %s: consolidation retry backoff", key)
+                return _CONSOLIDATION_REFUSED
             # Freeze the whole span identity from that one snapshot. The offset is
             # derived rather than returned because the snapshot slices at it
             # (``messages[offset:]``), so the subtraction is exact and comes from

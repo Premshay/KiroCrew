@@ -30,6 +30,7 @@ from kiro_crew.history_consolidation import (
     _CONSOLIDATION_LEASE_CEILING_SECS,
     _CONSOLIDATION_LEASE_RENEW_SECS,
     _LEASE_AT,
+    _LEASE_AT_MONO,
     _LEASE_PID,
     _LEASE_START,
     _LEASE_TOKEN,
@@ -108,6 +109,23 @@ class TestWhoStillHoldsALease:
         stale = _live_lease(at=time.time() - _CONSOLIDATION_LEASE_CEILING_SECS - 1)
         assert not _lease_holder_is_live(stale, now=time.time())
 
+    def test_a_wall_clock_jump_does_not_release_a_monotonic_holder(self) -> None:
+        """A forward wall-clock jump ages the wall heartbeat past the ceiling,
+        but the monotonic heartbeat is still fresh, so the holder stays
+        excluded — the jump must never steal a live lease."""
+        record = _live_lease()
+        record[_LEASE_AT] = time.time() - _CONSOLIDATION_LEASE_CEILING_SECS - 1
+        record[_LEASE_AT_MONO] = time.monotonic() - 1
+        assert _lease_holder_is_live(record, now=time.time())
+
+    def test_a_stale_monotonic_heartbeat_releases_the_holder(self) -> None:
+        """Silence on the monotonic clock is what a wedged holder looks like,
+        whatever the wall clock says."""
+        record = _live_lease()
+        record[_LEASE_AT] = time.time() - 1
+        record[_LEASE_AT_MONO] = time.monotonic() - _CONSOLIDATION_LEASE_CEILING_SECS - 1
+        assert not _lease_holder_is_live(record, now=time.time())
+
 
 class TestTheHeartbeatKeepsALiveHolder:
     """The ceiling measures SILENCE, not how long the pass has run.
@@ -127,10 +145,15 @@ class TestTheHeartbeatKeepsALiveHolder:
         token = c._acquire_consolidation_lease(KEY)
         assert token
         # Backdate the acquisition past the ceiling, as a pass longer than an
-        # hour would leave it.
+        # hour would leave it: both heartbeats are that old, so the holder
+        # reads as silent on either clock.
         with history_mod.allow_on_loop_persist():
             log.update_metadata(
-                KEY, {_LEASE_AT: time.time() - _CONSOLIDATION_LEASE_CEILING_SECS - 1}
+                KEY,
+                {
+                    _LEASE_AT: time.time() - _CONSOLIDATION_LEASE_CEILING_SECS - 1,
+                    _LEASE_AT_MONO: time.monotonic() - _CONSOLIDATION_LEASE_CEILING_SECS - 1,
+                },
             )
         assert not _lease_holder_is_live(log.get_metadata(KEY), now=time.time())
 
@@ -312,6 +335,35 @@ class TestAPassRefusedByTheLeaseCostsNothing:
         call.assert_not_awaited()
         assert log.unconsolidated_count(KEY) == 3, "the span must stay unconsolidated"
         assert log.consolidation_retry_state(KEY) == (0, 0.0), "a refusal is not an attempt"
+
+    @pytest.mark.asyncio
+    async def test_the_winner_re_snapshots_after_acquisition(self, tmp_path) -> None:
+        """The prompt must cover the span the lease actually protects: the
+        snapshot it is built from lands after the acquisition, so nothing that
+        arrived during the lease negotiation is marked consolidated unseen."""
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        order: list[str] = []
+        real_acquire = c._acquire_consolidation_lease
+        real_snapshot = log.snapshot_for_consolidation
+
+        def _acquire(key):
+            order.append("acquire")
+            return real_acquire(key)
+
+        def _snapshot(key):
+            order.append("snapshot")
+            return real_snapshot(key)
+
+        with (
+            patch.object(c, "_call_llm", AsyncMock(side_effect=RuntimeError("stop after setup"))),
+            patch.object(c, "_acquire_consolidation_lease", _acquire),
+            patch.object(log, "snapshot_for_consolidation", _snapshot),
+        ):
+            with pytest.raises(RuntimeError):
+                await c._consolidate(KEY, include_history=True)
+
+        assert order == ["snapshot", "acquire", "snapshot"]
 
     @pytest.mark.asyncio
     async def test_the_holders_lease_survives_the_refusal(self, tmp_path) -> None:
