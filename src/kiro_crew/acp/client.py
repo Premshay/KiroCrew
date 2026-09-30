@@ -63,6 +63,8 @@ from kiro_crew.acp import seed_provenance
 from kiro_crew.acp._dispatch import (
     ACP_BACKENDS_META_IDENTITY,
     DRAIN_YIELD_AFTER_S,
+    NATIVE_COMPACTION_CANCELLED,
+    NativeCompactionStates,
     _dumps_degraded,
     _loggable_request_id,
     _measure_tool_output,
@@ -82,6 +84,7 @@ from kiro_crew.acp._dispatch import (
     meta_builtin_server_names,
     parse_claude_compaction_notice,
     parse_codex_compaction_update,
+    parse_native_compaction_update,
     parse_prompt_token_usage,
     parse_refusal,
     parse_session_modes,
@@ -129,7 +132,6 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STEER_ADVERTISED,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
-    ACP_CLIENT_CAPABILITIES,
     CLAUDE_STEER_IDLE_BEHAVIOR,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
@@ -193,6 +195,7 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     JsonRpcRequest,
     ProviderChildActivity,
+    acp_client_capabilities,
     effort_config_option_id,
     effort_config_option_value,
     model_registry_namespace,
@@ -11489,7 +11492,7 @@ class AcpClient:
             {
                 "protocolVersion": protocol_version,
                 "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
-                "clientCapabilities": ACP_CLIENT_CAPABILITIES,
+                "clientCapabilities": acp_client_capabilities(self.backend),
             },
         )
         init_resp = await self._wait_for_response(init_id, timeout=_INIT_TIMEOUT)
@@ -16546,37 +16549,11 @@ class AcpClient:
         return AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=redact_text(detail))
 
     def _codex_compaction_event(self, msg: JsonRpcMessage) -> AcpEvent | None:
-        """Reclassify a codex-acp context-compaction frame as an event.
+        """Translate native lifecycle updates and legacy Codex tool markers.
 
-        The codex-side twin of ``_handle_compaction_status`` and
-        ``_claude_compaction_event``: it applies the same state mutation (drop the
-        stale context counts on a terminal) and returns the
-        ``EVENT_COMPACTION_STATUS`` every consumer already understands -- the
-        dashboard notice and context-meter reset, the messaging drivers, and
-        ``wait_for_compaction``. ``None`` means the frame is an ordinary
-        ``tool_call`` and must be handled as one.
-
-        Gated on ``ACP_BACKENDS_INLINE_COMPACTION``, the set of harnesses whose
-        compaction lands INSIDE the prompt turn -- so a harness that earns that
-        membership inherits the translation by joining the set. The MARKER is what
-        actually decides: ``_meta.contextCompaction`` is codex-acp's own, and
-        claude (a member) stamps nothing, so the parser declines its frames.
-
-        Reached on this class through the dormant codex seam -- a live codex
-        session is served by ``AcpRuntime``, whose ``AcpSessionHandle`` carries the
-        same method. Both implementations answer, rather than one, because a
-        capability the two transports disagree about is a capability that works on
-        whichever one a reader did not test (harness-parity H6).
-
-        Callers MUST still forward the frame. This is a SIDE EFFECT, never a
-        substitute: the frame is also a real tool call in the transcript, and a
-        layer that swallowed it would drop a row the user watched appear.
-
-        There is no ``failed`` arm because codex-acp sends no such status -- see
-        ``parse_codex_compaction_update``. A compaction that errors leaves the
-        ``session/prompt`` request unanswered, which the prompt loop's own
-        deadline owns; this method neither invents a terminal nor arms the
-        post-failure budget on a guess.
+        Native terminal-only frames are valid in Claude's boundary path; IDs
+        suppress repeats and late starts after a terminal. Legacy marker pairs
+        still require a live start before resetting the context meter.
         """
         if self.backend not in ACP_BACKENDS_INLINE_COMPACTION:
             return None
@@ -16584,10 +16561,23 @@ class AcpClient:
         update = params.get("update")
         if not isinstance(update, dict):
             return None
-        status_type = parse_codex_compaction_update(update)
+        native = update.get("sessionUpdate") == "compaction_update"
+        if native:
+            if not hasattr(self, "_native_compaction_states"):
+                self._native_compaction_states = NativeCompactionStates()
+            status_type = parse_native_compaction_update(update, self._native_compaction_states)
+        else:
+            status_type = parse_codex_compaction_update(update)
         if status_type is None:
             return None
-        if status_type != "started" and not self._codex_compaction_pending:
+        if status_type == NATIVE_COMPACTION_CANCELLED:
+            # A stopped compaction gives no verdict: no count reset, no failure
+            # streak, and no synthesized failure at turn end -- the same silence
+            # ``_settle_claude_compaction`` keeps when a Stop ends the turn.
+            logger.info("Compaction status (native): cancelled, no verdict")
+            self._codex_compaction_pending = False
+            return None
+        if not native and status_type != "started" and not self._codex_compaction_pending:
             return None
         logger.info("Compaction status (codex): %s", status_type)
         self._codex_compaction_pending = status_type == "started"

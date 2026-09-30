@@ -2342,3 +2342,21 @@ The Codex spawn environment sets `DISABLE_MCP_CONFIG_FILTERING=true` so the
 adapter honors the session's MCP overrides even when a global configuration
 contains the same server name. This applies to both create and load; it changes
 configuration precedence, not authentication or the sandbox's credential mask.
+
+### Native adapter compaction lifecycle
+
+Only the Codex and Claude handshakes advertise `session.compaction = {}`
+(`ACP_BACKENDS_NATIVE_COMPACTION`, via `acp_client_capabilities()` and the Codex
+harness); kiro-cli, KAS and every other backend send the shared set unchanged.
+Codex ACP 2.0.0 and Claude ACP 0.84.0 then emit native `compaction_update`
+frames, observed live on both. Both transports route these through the existing
+compaction event and context-reset handling. Native IDs deduplicate notices,
+retained per session in `NativeCompactionStates`: ids are truncated to
+`NATIVE_COMPACTION_ID_MAX_CHARS`, at most `NATIVE_COMPACTION_STATES_MAX` are
+kept, settled ids are evicted before in-flight ones, and each eviction is
+counted and logged. Failure preserves context counts; `cancelled` (a Stop
+mid-compaction) closes the lifecycle with no event, no failure streak and no
+synthesized failure at turn end.
+Legacy tool-marker/text paths remain available for older adapters. No AIR
+capability is advertised, so read, terminal and MCP output contracts remain
+unchanged. Unknown lifecycle statuses and summary chunks are tolerated.
