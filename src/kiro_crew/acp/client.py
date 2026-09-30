@@ -65,6 +65,7 @@ from kiro_crew.acp._dispatch import (
     DRAIN_YIELD_AFTER_S,
     NATIVE_COMPACTION_CANCELLED,
     NativeCompactionStates,
+    SessionNoticeState,
     _dumps_degraded,
     _loggable_request_id,
     _measure_tool_output,
@@ -6212,6 +6213,7 @@ class AcpClient:
         # per spawn, cleared with the process. See ``process_instance``.
         self._process_instance: str = ""
         self._session_id: str | None = None
+        self._session_notices = SessionNoticeState()
         self._next_id = 1
         self._buffer: deque[JsonRpcMessage] = deque(maxlen=100)
         self._mcp_notifications: list[JsonRpcMessage] = []
@@ -11281,6 +11283,7 @@ class AcpClient:
         # replacement process, so release it with the oracle it sampled into.
         self._retire_liveness_state()
         self._session_id = None
+        self._session_notices = SessionNoticeState()
         # The adapter's cumulative cost counter is in-process: a replacement
         # process restarts it at zero, so the delta baseline must restart with
         # it or spend up to the old total is silently dropped — the monotonic
@@ -12874,6 +12877,10 @@ class AcpClient:
             self._pending_oauth_requests.append({"serverName": server_name, "oauthUrl": oauth_url})
             logger.info("ACP: MCP OAuth request for %s", server_name)
 
+        def _capture_notice(msg: JsonRpcMessage) -> None:
+            # Staged, not yielded: no stream is open yet, so the next one drains it.
+            self._session_notices.accept(msg, self._session_id or "", stage=True)
+
         def _capture_config_update(msg: JsonRpcMessage) -> None:
             if not msg.is_method(METHOD_SESSION_UPDATE):
                 return
@@ -12904,6 +12911,7 @@ class AcpClient:
             _capture_oauth(msg)
             _capture_config_update(msg)
             _capture_available_commands(msg)
+            _capture_notice(msg)
             # Frames below the floor were buffered by an EARLIER session attempt
             # (a session/load that failed before the fallback session/new). The
             # OAuth and config captures above still want them — the user must
@@ -12952,6 +12960,7 @@ class AcpClient:
                 _capture_oauth(read_msg)
                 _capture_config_update(read_msg)
                 _capture_available_commands(read_msg)
+                _capture_notice(read_msg)
                 self._mcp_report.record_frame(read_msg, owned=True)
                 if "mcp" in (read_msg.method or ""):
                     name = ""
@@ -13606,6 +13615,8 @@ class AcpClient:
         saw_agent_switch = False
 
         async for action, msg in self._prompt_loop(req_id, timeout):
+            for notice in self._session_notices.drain(self._session_id or ""):
+                yield notice
             if action != "update":
                 logger.debug(
                     "ACP event: method=%s id=%s action=%s",
@@ -13721,6 +13732,9 @@ class AcpClient:
                 for steer_event in self._steer_events(msg):
                     yield steer_event
             elif action == "update":
+                session_notice = self._session_notices.accept(msg, self._session_id or "")
+                if session_notice is not None:
+                    yield session_notice
                 self._track_usage_update(msg)
                 provider_child = self._extract_provider_child_activity(msg)
                 # codex reports compaction as a marked tool_call pair rather than

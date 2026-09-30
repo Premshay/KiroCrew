@@ -6560,6 +6560,7 @@
       },
       "noticeCard": {
         "blocked": "Blocked",
+        "error": "Error",
         "warning": "Warning"
       },
       "compactionCard": {

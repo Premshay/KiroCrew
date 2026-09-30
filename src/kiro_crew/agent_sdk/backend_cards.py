@@ -445,6 +445,10 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "whether the handshake asks for native compaction frames. The compaction "
         "notice and context reset look the same either way"
     ),
+    "ACP_BACKENDS_SESSION_NOTICES": (
+        "whether provider notices arrive as their own rows or inside the transcript. "
+        "The same notice is shown either way"
+    ),
     "ACP_BACKENDS_STRUCTURED_REFUSAL": (
         "whether a refusal card gains a category line. Visible, and nothing a "
         "reader can act on or would pick a harness for"

@@ -6334,13 +6334,50 @@ class TestRunChatSegmentFlush:
         slot = state.get_or_create_slot("s1")
         client = self._make_mock_client(events)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+        rows = state.conversation_log.read_messages_chained("dashboard:s1")
+        assert any(row.get("content") == "durable result" for row in rows)
+        assert not [m for m in slot.messages if m.get("role") == "chunk"]
+
+    @pytest.mark.asyncio
+    async def test_mid_turn_provider_notice_is_a_segment_boundary(self, tmp_path, monkeypatch):
+        """Text streamed before a provider notice is finalized above it.
+
+        Appending the notice over live chunks would strand them: the trailing
+        chunk walk in `_flush_segment` stops at the notice row, so the answer's
+        opening would render twice when the window is rebuilt.
+        """
+        from kiro_crew.acp.types import EVENT_NOTICE
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        events = [
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="Before notice"),
+            LLMEvent(kind=EVENT_NOTICE, title="Model fallback", notice_severity="warning"),
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="After notice"),
+            LLMEvent(kind=EVENT_COMPLETE),
+        ]
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
 
         from kiro_crew.dashboard.chat import _run_chat
 
         await _run_chat(state, slot, "hello")
 
-        rows = state.conversation_log.read_messages_chained("dashboard:s1")
-        assert any(row.get("content") == "durable result" for row in rows)
+        rows = [
+            (m["role"], m["content"])
+            for m in slot.messages
+            if m.get("role") == "assistant"
+            or (m.get("role") == "notice" and m.get("meta", {}).get("kind") == "provider_notice")
+        ]
+        assert rows == [
+            ("assistant", "Before notice"),
+            ("notice", "Model fallback"),
+            ("assistant", "After notice"),
+        ]
 
     @pytest.mark.asyncio
     async def test_tool_turn_progress_claim_surfaces_idle_notice(self, tmp_path, monkeypatch):

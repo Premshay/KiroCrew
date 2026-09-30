@@ -603,7 +603,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
   {
     id: 'notice',
     roles: ['notice'],
-    render: (m, ctx) => ctx.row(<NoticeCard content={m.content} />),
+    render: (m, ctx) => ctx.row(<NoticeCard content={m.content} severity={m.meta?.kind === 'provider_notice' ? m.meta.severity : undefined} />),
   },
   {
     // Grouped and lifecycle-only roles have no row of their own: a thinking or

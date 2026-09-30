@@ -10223,6 +10223,7 @@
       },
       "noticeCard": {
         "blocked": "已拦截",
+        "error": "错误",
         "warning": "警告"
       },
       "compactionCard": {

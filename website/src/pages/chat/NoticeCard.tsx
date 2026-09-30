@@ -1,10 +1,10 @@
 import { memo } from 'react'
-import { Ban, Info, TriangleAlert } from 'lucide-react'
+import { Ban, CircleAlert, Info, TriangleAlert } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 
-export type NoticeTone = 'info' | 'warn' | 'blocked'
+export type NoticeTone = 'info' | 'warn' | 'blocked' | 'error'
 
 /**
  * Some gateway notices bake a severity emoji into the message text itself
@@ -33,6 +33,7 @@ export function parseNotice(content: string): { tone: NoticeTone; text: string }
 function srSeverity(tone: NoticeTone): string {
   if (tone === 'warn') return i18nT('pages.chat.noticeCard.warning')
   if (tone === 'blocked') return i18nT('pages.chat.noticeCard.blocked')
+  if (tone === 'error') return i18nT('pages.chat.noticeCard.error')
   return ''
 }
 
@@ -56,16 +57,25 @@ function srSeverity(tone: NoticeTone): string {
  * while the glyph is 1em of the fixed 13px type, so a px constant would drift
  * under a non-16px root font-size.
  */
-export default memo(function NoticeCard({ content, tone: toneOverride }: { content: string; tone?: NoticeTone }) {
+export default memo(function NoticeCard({ content, tone: toneOverride, severity: providerSeverity }: { content: string; tone?: NoticeTone; severity?: unknown }) {
   // Language-generation subscription: this memo() boundary renders i18nT()
   // strings, so a language switch must invalidate it.
   useLanguageGeneration()
   const parsed = parseNotice(content)
   // A caller that already localized `content` (transientNotice.ts) has no emoji
   // to parse a tone from, so it names the severity directly.
-  const tone = toneOverride ?? parsed.tone
-  const text = parsed.text
-  const Icon = tone === 'blocked' ? Ban : tone === 'warn' ? TriangleAlert : Info
+  //
+  // A provider's `error` notice is an advisory inside this conversation, not a
+  // failed request: it does not end the turn, and the agent it would hand off to
+  // is the one already talking. So it keeps the notice row with the danger tint
+  // and its own glyph -- not ErrorNotice's failure banner, and not `blocked`,
+  // which claims a policy denial. Unknown severities render as info.
+  const structured = typeof providerSeverity === 'string'
+  const tone: NoticeTone = structured
+    ? providerSeverity === 'warning' ? 'warn' : providerSeverity === 'error' ? 'error' : 'info'
+    : toneOverride ?? parsed.tone
+  const text = structured ? content : parsed.text
+  const Icon = tone === 'blocked' ? Ban : tone === 'error' ? CircleAlert : tone === 'warn' ? TriangleAlert : Info
   const severity = srSeverity(tone)
   return (
     <div
@@ -77,7 +87,7 @@ export default memo(function NoticeCard({ content, tone: toneOverride }: { conte
         <Icon
           size={13}
           className={`lucide-inline shrink-0 mt-[calc((1.25rem-1em)/2)] ${
-            tone === 'blocked' ? 'text-danger' : tone === 'warn' ? 'text-warn' : ''
+            tone === 'blocked' || tone === 'error' ? 'text-danger' : tone === 'warn' ? 'text-warn' : ''
           }`}
           aria-hidden="true"
         />

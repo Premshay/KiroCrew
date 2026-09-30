@@ -10652,6 +10652,7 @@
       },
       "noticeCard": {
         "blocked": "Заблокировано",
+        "error": "Ошибка",
         "warning": "Предупреждение"
       },
       "compactionCard": {

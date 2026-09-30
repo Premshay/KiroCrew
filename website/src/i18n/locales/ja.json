@@ -10223,6 +10223,7 @@
       },
       "noticeCard": {
         "blocked": "ブロック済み",
+        "error": "エラー",
         "warning": "警告"
       },
       "compactionCard": {

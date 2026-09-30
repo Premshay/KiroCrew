@@ -192,3 +192,32 @@ describe('registry wiring', () => {
     expect(container.textContent).not.toContain('\u2139')
   })
 })
+
+
+describe('structured provider notices', () => {
+  it.each(['info', 'warning', 'future-severity'])('renders %s with explicit tone and verbatim text', severity => {
+    const { container } = render(<NoticeCard content="⚠ Provider title\nDetail" severity={severity} />)
+    expect(container.querySelector('[data-testid="notice-card"]')).toHaveAttribute('data-tone', severity === 'warning' ? 'warn' : 'info')
+    expect(container.textContent).toContain('⚠ Provider title')
+    expect(container.textContent).toContain('Detail')
+  })
+
+  it('renders error severity as an error-toned notice row, not a failure banner or a policy block', () => {
+    const { container } = render(<NoticeCard content="Provider advisory" severity="error" />)
+    expect(container.querySelector('[data-testid="notice-card"]')).toHaveAttribute('data-tone', 'error')
+    expect(container.textContent).toContain('Provider advisory')
+    expect(container.textContent).toContain('Error')
+    expect(container.querySelector('[role="alert"]')).toBeNull()
+    expect(container.querySelector('[data-tone="blocked"]')).toBeNull()
+    expect(container.querySelector('button')).toBeNull()
+  })
+
+  it('the shared registry retains severity across live and history message shapes', () => {
+    const entry = defaultMessageRenderers.find(r => r.id === 'notice')!
+    const message = { role: 'notice', content: 'Deprecated configuration', cls: '', ts: '', meta: { kind: 'provider_notice', severity: 'warning' } } as ChatMessage
+    const ctx = { row: (node: React.ReactNode) => node } as unknown as MessageRenderContext
+    const { container } = render(<>{entry.render(message, ctx)}</>)
+    expect(container.querySelector('[data-testid="notice-card"]')).toHaveAttribute('data-tone', 'warn')
+    expect(container.textContent).toContain('Deprecated configuration')
+  })
+})

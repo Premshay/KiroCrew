@@ -10366,6 +10366,7 @@
       },
       "noticeCard": {
         "blocked": "अवरुद्ध",
+        "error": "त्रुटि",
         "warning": "चेतावनी"
       },
       "compactionCard": {

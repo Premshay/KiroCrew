@@ -1437,6 +1437,9 @@ class DiscordRenderer(Renderer):
             DiscordApprovalDecider.retire(key)
             raise
 
+    async def on_notice(self, text: str) -> None:
+        await self._client.send_message(self._channel_id, text)
+
     async def on_compaction(self, context_usage_pct: float) -> None:
         try:
             await self._client.send_message(self._channel_id, "🗜️ Compacting context…")

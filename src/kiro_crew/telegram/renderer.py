@@ -2244,6 +2244,9 @@ class TelegramRenderer(Renderer):
                 rid,
             )
 
+    async def on_notice(self, text: str) -> None:
+        await self._client.send_message(self._chat_id, text, message_thread_id=self._thread_id)
+
     async def on_compaction(self, context_usage_pct: float) -> None:
         self._note_progress()
         try:

@@ -910,7 +910,7 @@ def test_compaction_negotiation_does_not_enable_air() -> None:
     from kiro_crew.acp.types import ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION
 
     assert ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION["session"]["compaction"] == {}
-    assert "_meta" not in ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION
+    assert "airClient" not in ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION
 
 
 def test_native_compaction_is_advertised_only_where_translated() -> None:
@@ -929,7 +929,7 @@ def test_native_compaction_is_advertised_only_where_translated() -> None:
     assert "session" not in KAS_CLIENT_CAPABILITIES
     assert ACP_BACKENDS_NATIVE_COMPACTION <= ACP_BACKENDS_INLINE_COMPACTION
     for backend in (ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX):
-        assert acp_client_capabilities(backend)["session"] == {"compaction": {}}
+        assert acp_client_capabilities(backend)["session"] == {"compaction": {}, "notices": {}}
     for backend in ("kiro", "kas", "opencode", "pi", "goose", "deepseek", None):
         assert acp_client_capabilities(backend) is ACP_CLIENT_CAPABILITIES
     assert "session" in CodexHarness.client_capabilities.fget(None)

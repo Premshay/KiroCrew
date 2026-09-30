@@ -10509,6 +10509,7 @@
       },
       "noticeCard": {
         "blocked": "Bloqué",
+        "error": "Erreur",
         "warning": "Avertissement"
       },
       "compactionCard": {

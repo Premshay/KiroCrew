@@ -32,6 +32,7 @@ from kiro_crew.acp._dispatch import (
     DRAIN_YIELD_AFTER_S,
     NATIVE_COMPACTION_CANCELLED,
     NativeCompactionStates,
+    SessionNoticeState,
     build_permission_event,
     classify_notification,
     error_is_refusal_terminal,
@@ -888,6 +889,7 @@ class AcpSessionHandle:
         session_key: str = "",
     ) -> None:
         self._session_id = session_id
+        self._session_notices = SessionNoticeState()
         # The Kiro Crew session that OWNS this ACP session, threaded from the
         # runtime's create/load paths the way ``crew_agent`` is, and rebound on a
         # warm-pool claim. The hooks execute path keys its listed-id record and
@@ -1498,6 +1500,15 @@ class AcpSessionHandle:
                 stale = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            if stale is not None:
+                if self._session_notices.accept(stale, self._session_id, stage=True) is not None:
+                    continue
+                # A between-turns MCP status snapshot still tells this session
+                # which servers need a sign-in: a server that connected while
+                # no turn was reading leaves the set here, so the turn-start
+                # offer below never resets a connected server (a reset with
+                # startOAuth invalidates its credentials). Read only, no offer:
+                # the offer is made once, after the drain.
             if (
                 stale is not None
                 and stale.method is None
@@ -3437,7 +3448,10 @@ class AcpSessionHandle:
 
         _buffered: list[JsonRpcMessage] = []
         _last_yield = time.monotonic()
+
         try:
+            for notice in self._session_notices.drain(self._session_id):
+                yield notice
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -4775,6 +4789,7 @@ class AcpSessionHandle:
 
     def _apply_init_notification(self, msg: JsonRpcMessage, action: str) -> None:
         """Initialization side effects shared by the drain and readiness barrier."""
+        self._session_notices.accept(msg, self._session_id, stage=True)
         params = msg.params if isinstance(msg.params, dict) else {}
         if action == "update":
             update = params.get("update") or {}
@@ -5386,6 +5401,10 @@ class AcpSessionHandle:
         update = params.get("update") or {}
         if not isinstance(update, dict):
             return []
+
+        if update.get("sessionUpdate") == "notice":
+            notice = self._session_notices.accept(msg, self._session_id)
+            return [notice] if notice is not None else []
 
         # A frame the runtime routed here for a backend-internal subagent
         # carries the CHILD's sessionId. Its tool_call/refinement updates are

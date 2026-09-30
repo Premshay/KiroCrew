@@ -10209,6 +10209,7 @@
       },
       "noticeCard": {
         "blocked": "차단됨",
+        "error": "오류",
         "warning": "경고"
       },
       "compactionCard": {

@@ -2287,6 +2287,7 @@ class AcpProvider(LLMProvider):
             synthesized=e.synthesized,
             control_notice=e.control_notice,
             is_context_compaction=e.is_context_compaction,
+            notice_severity=e.notice_severity,
             runtime_global=e.runtime_global,
             sub_session_id=e.sub_session_id,
             provider_child=e.provider_child,

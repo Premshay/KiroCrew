@@ -52,6 +52,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
     ACP_BACKENDS_SESSION_EVICTION,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
+    ACP_BACKENDS_SESSION_NOTICES,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
     ACP_BACKENDS_STEER,
@@ -80,6 +81,7 @@ from kiro_crew.recovery.ladder import (  # noqa: E402 - see the re-export note a
 # ── ACP Event Kinds ──
 
 EVENT_TEXT_CHUNK = "text_chunk"
+EVENT_NOTICE = "notice"
 EVENT_THINKING_CHUNK = "thinking_chunk"
 EVENT_TOOL_CALL = "tool_call"
 EVENT_TOOL_CALL_UPDATE = "tool_call_update"
@@ -256,12 +258,31 @@ ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION: dict = {
     **ACP_CLIENT_CAPABILITIES,
     "session": {"compaction": {}},
 }
+# `session.notices` moves an adapter's provider notices out of the transcript into
+# `notice` session updates, so it goes only to the backends whose adapters emit
+# them: codex-acp 2.0.0 and claude-agent-acp 0.84.0 (a live Claude hook message
+# arrived as `{"sessionUpdate": "notice", "severity": "info", "title": ...}`).
+# kiro-cli, KAS and every other backend keep the shared set byte-identical -- the
+# rule above again: add a key for a backend in the change that handles it.
+ACP_CLIENT_CAPABILITIES_SESSION_NOTICES: dict = {
+    **ACP_CLIENT_CAPABILITIES,
+    "session": {"notices": {}},
+}
+
+ACP_CLIENT_CAPABILITIES_NATIVE_UPDATES: dict = {
+    **ACP_CLIENT_CAPABILITIES,
+    "session": {"compaction": {}, "notices": {}},
+}
 
 
 def acp_client_capabilities(backend: str | None) -> dict:
     """The ``clientCapabilities`` the standalone transport sends for ``backend``."""
+    if backend in ACP_BACKENDS_NATIVE_COMPACTION and backend in ACP_BACKENDS_SESSION_NOTICES:
+        return ACP_CLIENT_CAPABILITIES_NATIVE_UPDATES
     if backend in ACP_BACKENDS_NATIVE_COMPACTION:
         return ACP_CLIENT_CAPABILITIES_NATIVE_COMPACTION
+    if backend in ACP_BACKENDS_SESSION_NOTICES:
+        return ACP_CLIENT_CAPABILITIES_SESSION_NOTICES
     return ACP_CLIENT_CAPABILITIES
 
 
@@ -801,6 +822,7 @@ class AcpEvent:
     text: str = ""
     tool_call_id: str = ""
     title: str = ""
+    notice_severity: str = ""
     #: The backend's OWN ``title`` for a tool_call / tool_call_update frame,
     #: untouched. ``title`` above is the DISPLAY label ``select_tool_title``
     #: picks, which prefers a shell call's model-authored ``rawInput.description``

@@ -157,6 +157,8 @@ with no row here.
      - driver-internal (whether the metadata refusal parser is consulted)
    * - ``ACP_BACKENDS_NATIVE_COMPACTION``
      - driver-internal (whether ``initialize`` advertises ``session.compaction``)
+   * - ``ACP_BACKENDS_SESSION_NOTICES``
+     - driver-internal (whether ``initialize`` advertises ``session.notices``)
    * - ``ACP_BACKENDS_HOOKS_LIST``
      - driver-internal (whether this harness's agent asks its client for the hooks
        matching a trigger and to run one, read by the session dispatch loop that
@@ -1266,6 +1268,13 @@ ACP_BACKENDS_INLINE_COMPACTION = frozenset(
 # advertisement replaces a legacy path that works rather than sitting inert.
 # kiro and kas are not members: they report compaction on their own channels.
 ACP_BACKENDS_NATIVE_COMPACTION = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX})
+# Backends whose handshake advertises ``clientCapabilities.session.notices``,
+# which moves the adapter's provider notices out of the transcript into
+# ``notice`` session updates. Only adapters that emit them: codex-acp 2.0.0 and
+# claude-agent-acp 0.84.0 (a live Claude hook message arrived as a ``notice``).
+# kiro and kas are not members: neither emits ``notice`` updates, and their
+# handshakes stay byte-identical until one does.
+ACP_BACKENDS_SESSION_NOTICES = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX})
 
 # Backends carrying their OWN internal OS sandbox, which on macOS cannot nest
 # inside Kiro Crew's seatbelt (kernel EPERM) — so ``sandbox.wrap_argv`` skips

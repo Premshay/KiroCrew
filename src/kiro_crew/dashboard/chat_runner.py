@@ -48,6 +48,7 @@ from kiro_crew.acp.types import (
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
+    EVENT_NOTICE,
     EVENT_STEER_CONSUMED,
     STOP_CLASS_FAILED,
     STOP_REASON_CANCELLED,
@@ -14315,7 +14316,26 @@ async def _run_chat(
                     event.kind,
                 )
 
-            if event.kind == EVENT_TEXT_CHUNK:
+            if event.kind == EVENT_NOTICE:
+                # A mid-turn notice is a segment boundary. Finalize the text
+                # streamed so far above it first: `_flush_segment`'s trailing
+                # chunk walk stops at the first non-chunk row, so appending the
+                # notice over live chunks would strand them and render the
+                # answer's opening twice once the window is rebuilt.
+                _flush_text_stream()
+                if assistant_text:
+                    _flush_segment(state, slot, assistant_text)
+                    assistant_text = ""
+                    _turn_flushed_visible_text = True
+                append_and_surface(
+                    state,
+                    slot,
+                    "notice",
+                    event.title + (f"\n{event.text}" if event.text else ""),
+                    "msg msg-info",
+                    meta={"kind": "provider_notice", "severity": event.notice_severity},
+                )
+            elif event.kind == EVENT_TEXT_CHUNK:
                 # If we just exited a tool group, finalize the streaming
                 # message so post-tool text starts a fresh message.
                 if in_tool_group:
