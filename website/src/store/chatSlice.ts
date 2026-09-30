@@ -1003,6 +1003,12 @@ export type SlotStatusDetail = ((ToolPhaseDetail & { toolCallId?: string }) | Ph
 interface ChatState {
   activeSlot: string | null
   messages: ChatMessage[]
+  /** Bumped by every local transcript write the server has not echoed yet: a
+   *  sent or steered bubble, a queued bubble, an edit's truncation. `refreshSlot`
+   *  captures it before its fetch and drops a page that finishes after it moved,
+   *  because that page predates the write and would replace it (see
+   *  `transcriptChangedSince`). */
+  localTranscriptEpoch: number
   slotRunning: boolean
   slotStopping: boolean
   slotState: SlotState
@@ -1428,6 +1434,7 @@ export const FOLDER_SUGGESTION_MAX_TURNS = 3
 const initialState: ChatState = {
   activeSlot: null,
   messages: [],
+  localTranscriptEpoch: 0,
   slotRunning: false,
   slotStopping: false,
   slotState: 'idle',
@@ -3794,11 +3801,21 @@ function mergePreservedClientTs<
  *  shape rather than truncate. */
 export const REFRESH_LIMIT_CEILING = 500
 
+/** Whether a local transcript write landed since `epoch` was read. A page
+ *  fetched across such a write was built before it, and `refreshSlot.fulfilled`
+ *  REPLACES `messages` with it: the just-sent or queued bubble disappears, or an
+ *  edit's discarded tail comes back, until the next refresh. Dropping that page
+ *  is safe, because every such write is followed by its own server round trip
+ *  and a later refresh (`chat_done`, the stall tick) reads the newer state. */
+const transcriptChangedSince = (getState: () => unknown, epoch: number): boolean =>
+  (getState() as { chat: ChatState }).chat.localTranscriptEpoch !== epoch
+
 export const refreshSlot = createAsyncThunk(
   'chat/refreshSlot',
   async (key: string, { getState }) => {
     const state = (getState() as { chat: ChatState }).chat
     if (state.activeSlot !== key) return null
+    const epochAtDispatch = state.localTranscriptEpoch
     // COUNT-MATCHED bound, not a fixed one. The recurring refresh (reconnect,
     // chat_done, variant switch) no longer pulls the whole chained transcript
     // every time — but because it REPLACES `messages` wholesale, a fixed
@@ -3830,7 +3847,10 @@ export const refreshSlot = createAsyncThunk(
       floor: PANE_HYDRATE_LIMIT,
       ceiling: REFRESH_LIMIT_CEILING,
     })
-    if (want === undefined) return fetchSlotDetail(key)
+    if (want === undefined) {
+      const whole = await fetchSlotDetail(key)
+      return transcriptChangedSince(getState, epochAtDispatch) ? null : whole
+    }
     const page = await fetchSlotDetail(key, want)
     /* Is this page safe to hand a reducer that REPLACES the transcript with it?
      * It is, on any one of three counts -- and each is a different relationship
@@ -3871,6 +3891,7 @@ export const refreshSlot = createAsyncThunk(
      * same way the pre-fetch check does. */
     const after = (getState() as { chat: ChatState }).chat
     if (after.activeSlot !== key) return null
+    if (transcriptChangedSince(getState, epochAtDispatch)) return null
     const viewNow = after.messages
     const serverRowsNow = viewNow.filter(
       (m) => isDurableRow(m) && typeof m.meta?.mid === 'string' && m.meta.mid.length > 0,
@@ -3886,7 +3907,9 @@ export const refreshSlot = createAsyncThunk(
      * anchor is guarded rather than indexed blind. */
     const spansView = serverRowsNow.length > 0 && anchors(serverRowsNow[0].meta?.mid)
     const overlapsView = anchors(page.messages[0]?.meta?.mid)
-    return !page.hasMore || spansView || overlapsView ? page : fetchSlotDetail(key)
+    if (!page.hasMore || spansView || overlapsView) return page
+    const whole = await fetchSlotDetail(key)
+    return transcriptChangedSince(getState, epochAtDispatch) ? null : whole
   },
 )
 
@@ -5394,6 +5417,7 @@ const chatSlice = createSlice({
       }
     },
     appendMessage(state, action: PayloadAction<ChatMessage>) {
+      state.localTranscriptEpoch += 1
       // Finalize-on-steer: a mid-turn steer bubble (ChatPage steer(), meta.steer)
       // must freeze the live streaming message BEFORE it is pushed, or the
       // chunk reducer keeps appending the rest of the segment into the stranded
@@ -5424,6 +5448,7 @@ const chatSlice = createSlice({
     appendSlotMessage(state, action: PayloadAction<{ slot: string; message: ChatMessage }>) {
       const { slot, message } = action.payload
       if (isUnsafeKey(slot)) return
+      if (slot === state.activeSlot) state.localTranscriptEpoch += 1
       // Same reasoning as appendMessage: no card retirement on an optimistic
       // append — the server announces the retirement once the user row lands.
       const msgs =
@@ -5929,6 +5954,7 @@ const chatSlice = createSlice({
       evictMcpApps(state, slot)
     },
     truncateAfterIndex(state, action: PayloadAction<number>) {
+      state.localTranscriptEpoch += 1
       state.messages = state.messages.slice(0, action.payload)
     },
     replaceMessages(state, action: PayloadAction<ChatMessage[]>) {
@@ -7819,6 +7845,7 @@ const chatSlice = createSlice({
         }>,
       ) {
         const { slot, content, ts, queueId, meta } = action.payload
+        if (slot === state.activeSlot) state.localTranscriptEpoch += 1
         const msgs =
           slot === state.activeSlot ? state.messages : (state.slotMessages[safeKey(slot)] ??= [])
         // A row with this queueId may ALREADY exist: slot-detail hydration
