@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.handlers import api_file_search
 
@@ -18,8 +19,11 @@ def _make_app() -> web.Application:
     # api_file_search reads app["state"].file_indexes for the index fast path
     state = MagicMock()
     state.file_indexes.get.return_value = None  # no index → always use walk fallback
+    # A MagicMock attribute reads as a non-empty configured owner id, which no
+    # caller can equal, so the owner gate would answer every row alike.
+    state.owner_id = ""
     app["state"] = state
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture()
@@ -180,6 +184,8 @@ class TestFileSearch:
                 assert resp.status == 403
                 data = await resp.json()
                 assert data["error"] == "Access denied"
+                # The UI keys per-cause copy on `code`, never on the human string.
+                assert data["code"] == "access_denied"
 
     @pytest.mark.asyncio
     async def test_path_match_ranked_below_name_match(self, tmp_path, mock_sel):
@@ -207,6 +213,7 @@ class TestFileSearch:
             assert resp.status == 404
             data = await resp.json()
             assert data["error"] == "Project directory not found"
+            assert data["code"] == "project_not_found"
             assert data["results"] == []
 
     @pytest.mark.asyncio

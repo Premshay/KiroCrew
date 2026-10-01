@@ -94,8 +94,9 @@ Both sidecars are reaped by `delete_session`, which is contractually a permanent
 removal: a deleted session must leave no orphaned model-generated text on disk.
 Their user-facing reads validate the transcript's derivation policy through
 `ConversationLog.derivation_hold` while holding the transcript lock; the intent
-panel's GET and the POST's read-back share one helper
-(`chat_handlers._read_intent_summary_if_derivation_is_allowed`), so a `.intents`
+panel's GET, the POST's read-back and the `session_summary` MCP tool's
+`GET /api/session-control/summary` share one helper
+(`chat_summary.read_cached_intent_summary`), so a `.intents`
 file left by the key's earlier persistent life is never served bare to a slot that
 is now restricted. Each writer revalidates through
 `ConversationLog.publication_hold` immediately after the model call and keeps that
@@ -290,8 +291,10 @@ at all until the user reloads. The fallback also dispatches the payload as a
 Notification, adding a `ts`-less entry to the bell feed.
 `test_session_summary_api.py::TestSessionSummaryBroadcast` pins the envelope.
 
-The client closes the same gap on its other edge: `useWebSocket`'s reconnect
-catch-up invalidates `['session-summary']` wholesale, because a summary
+The client closes the same gap on its other edge: the socket's reconnect
+catch-up (`website/src/hooks/websocket/reconnectCatchUp.ts`, through
+`refreshServerStateAfterReconnect` in `website/src/hooks/websocket/serverState.ts`)
+invalidates `['session-summary']` wholesale, because a summary
 regenerated while the socket was down pushed a frame nobody received, and a
 non-polling panel would otherwise keep showing the stale one until the tab
 remounted. `useWebSocket.sessionSummary.test.ts` covers both the live frame and
@@ -312,6 +315,24 @@ more reliably than any phrasing, timestamps separate a daily routine from a fail
 retry, and a user correction is the highest-value signal per character in the file.
 
 ## Endpoint
+
+The Sessions three-dot menu also opens `/session-dashboards`: a read-only
+summary gallery alongside each session's model-authored Dynamic Dashboards.
+A centralized Needs you inbox precedes the gallery, including on phones. Each
+native question or approval has one control there, labeled with its human
+session name and current task context when available; session cards do not
+duplicate those controls. Search filters both sections, but the summary page
+limit never hides pending decisions. The view shares `['session-summary', slot]` with the chat
+panel and its websocket invalidation. Only visible cards read summaries (12
+initially, with explicit Show more); opening, filtering, or refreshing this
+page never calls the generation POST. Disabled, missing, stale, and failed
+summary reads remain distinct. Filtering hides inbox items rather than unmounting
+their unsent answer drafts. Hidden model-authored iframe documents are unloaded;
+the current page mounts at most 12 session cards. This view does not change summary
+generation, privacy, or ownership policy. Automatic HTML status cards are a
+separate opt-in (`dashboard.dynamic_dashboard_cards`), updated from session
+events under their own budget, not by this summary GET or its refresh interval.
+See [automatic session cards](learn-cron-dashboard.md#automatic-session-status-cards).
 
 ```
 GET /api/chat/slots/{slot}/summary

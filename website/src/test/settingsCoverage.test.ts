@@ -76,6 +76,7 @@ const UNMAPPED_PANELS: Record<string, string> = {
   'ReportProblemCard.tsx': 'feedback action card, no settings',
   'SettingsSearch.tsx': 'the settings search box itself — indexing it would be self-referential',
   'ThemeDroppedRulesNotice.tsx': 'informational notice, zero controls',
+  'TranslucentPanelsPreview.tsx': 'aria-hidden illustration under the Translucent panels switch (registry id display.translucent-panels, on DisplayPanel); it holds no control of its own',
   'WebhooksPanel.tsx': 'status summary card; the real controls live on the /webhooks page',
 }
 
@@ -415,7 +416,7 @@ describe('settings coverage gate — Chat rail pages', () => {
   it('leaves panels without a rail untouched', () => {
     const { entries } = extractFromSource(
       `case 'x': return <SettingsToggle label="Mode" checked={x} onChange={f} />`,
-      'website/src/pages/settings/DisplayPanel.tsx',
+      'website/src/pages/settings/BrowserPanel.tsx',
     )
     expect(entries[0].params).toBeUndefined()
   })

@@ -383,6 +383,12 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_wecom_config_get,
     api_wecom_config_save,
 )
+
+# ── Rendered slides for the file panel (handlers/office_slides.py) ──
+from kiro_crew.dashboard.handlers.office_slides import (  # noqa: E402, F401
+    api_file_office_slide,
+    api_file_office_slides,
+)
 from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     MAX_PROMPT_BYTES,
     _extract_sop_description,
@@ -656,6 +662,7 @@ from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     api_update_channel,
     api_update_check,
     api_update_disarm,
+    api_update_revalidate,
     api_update_simulate,
     get_update_info,
     install_log_ring_handler,

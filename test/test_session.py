@@ -57,7 +57,7 @@ def _mock_provider_factory():
         m.context_usage_pct = lambda: 0.0
         m.context_window_tokens = lambda: 0
         m.has_active_turn = lambda: False
-        m.runtime_info = lambda: (None, None)
+        m.runtime_abort_target = lambda: None
         m.stream_command = MagicMock(side_effect=_empty_provider_stream)
         return m
 
@@ -98,7 +98,7 @@ def _alive_provider_factory():
         m.context_usage_pct = lambda: 0.0
         m.context_window_tokens = lambda: 0
         m.has_active_turn = lambda: False
-        m.runtime_info = lambda: (None, None)
+        m.runtime_abort_target = lambda: None
         m.stream_command = MagicMock(side_effect=_empty_provider_stream)
         return m
 
@@ -1551,7 +1551,8 @@ class TestCompactCallback:
         # attempt falls through to the recycle. The callback reports the arm that
         # ran; the key/pct/success threading this case exists for is unchanged.
         cb.assert_awaited_once_with("dashboard:chat-1", 92.0, success=True, outcome="recycled")
-        assert "dashboard:chat-1" not in mgr._sessions
+        # A fresh successor holds the key.
+        assert mgr._sessions["dashboard:chat-1"].first_turn.is_new
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -1586,7 +1587,8 @@ class TestCompactCallback:
         # Turn finishes -> semaphore released -> recycle proceeds.
         mgr.release("dashboard:chat-1")
         await asyncio.wait_for(task, timeout=2)
-        assert "dashboard:chat-1" not in mgr._sessions
+        # A fresh successor holds the key.
+        assert mgr._sessions["dashboard:chat-1"].first_turn.is_new
         # This fixture's provider serves no native compaction, so the in-place
         # attempt falls through to the recycle. The callback reports the arm that
         # ran; the key/pct/success threading this case exists for is unchanged.
@@ -1636,7 +1638,8 @@ class TestCompactCallback:
         cb.assert_awaited_once()
         assert any("Compact callback failed" in r.message for r in caplog.records)
         # Session still recycled, compacting flag cleared
-        assert "dashboard:chat-1" not in mgr._sessions
+        # A fresh successor holds the key.
+        assert mgr._sessions["dashboard:chat-1"].first_turn.is_new
         assert "dashboard:chat-1" not in mgr._compacting
         await mgr.close_all()
 
@@ -4482,7 +4485,7 @@ class TestCompaction:
         await mgr._compact_session("k1", 92.0)
         provider.shutdown.assert_awaited_once()
         assert callback_args == [("k1", 92.0, True)]
-        assert not mgr.has_session("k1")
+        assert mgr._sessions["k1"].first_turn.is_new
 
     @pytest.mark.asyncio
     async def test_compact_session_missing_key_is_safe(self, cfg):
@@ -4738,9 +4741,10 @@ class TestKiroInPlaceCompaction:
 
         await mgr._compact_session("dashboard:chat-1", 92.0)
 
-        # Fallback recycle: entry dropped, process killed, context guaranteed
-        # to clear on the next (re-seeded) message.
-        assert "dashboard:chat-1" not in mgr._sessions
+        # Fallback recycle: the process is killed and a fresh successor takes the
+        # key, so the context is guaranteed to clear.
+        # A fresh successor holds the key.
+        assert mgr._sessions["dashboard:chat-1"].first_turn.is_new
         provider.shutdown.assert_awaited_once()
         # The provider was REPLACED, not summarized, so the callback
         # reports that arm -- what the notice needs to tell the user.
@@ -4762,7 +4766,8 @@ class TestKiroInPlaceCompaction:
 
         await mgr._compact_session("dashboard:chat-1", 92.0)
 
-        assert "dashboard:chat-1" not in mgr._sessions
+        # A fresh successor holds the key.
+        assert mgr._sessions["dashboard:chat-1"].first_turn.is_new
         provider.shutdown.assert_awaited_once()
         # The provider was REPLACED, not summarized, so the callback
         # reports that arm -- what the notice needs to tell the user.
@@ -4943,7 +4948,8 @@ class TestKiroInPlaceCompaction:
         # Kill first, queued turn second: the semaphore was never handed back
         # while the backend could still have been compacting.
         assert order == ["shutdown", "turn"]
-        assert "dashboard:chat-1" not in mgr._sessions
+        # A fresh successor holds the key.
+        assert mgr._sessions["dashboard:chat-1"].first_turn.is_new
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -7350,7 +7356,7 @@ class TestParentEndCancelsItsChildren:
                 _reported_to_parent=False,
                 _digest_held=False,
                 _digest_held_at=0.0,
-                _digest_settle_ids=[],
+                _digest_settle_deliveries=[],
                 _delivery_queued=False,
                 _awaiting_approval=awaiting,
                 _exec_started=started,
@@ -7505,7 +7511,7 @@ class TestParentEndCancelsItsChildren:
         round of review found one more by hitting it: the report returning
         (``_reported_to_parent``), the wave hold (``_digest_held`` and its separate
         timestamp ``_digest_held_at``), the siblings held on this member
-        (``_digest_settle_ids``) and the announce parked in the parent's slot queue
+        (``_digest_settle_deliveries``) and the announce parked in the parent's slot queue
         (``_delivery_queued``). Discovering them one failure at a time is what made the
         teardown gate wrong four times.
 
@@ -7582,7 +7588,11 @@ class TestParentEndCancelsItsChildren:
             if rule == PARKS_WHEN_SET:
                 info = SubagentInfo(id=field_name, task="t", agent="a")
                 info._reported_to_parent = True
-                setattr(info, field_name, [777] if field_name.endswith("_ids") else 1.0)
+                setattr(
+                    info,
+                    field_name,
+                    [777] if field_name.endswith(("_ids", "_deliveries")) else 1.0,
+                )
                 assert delivery_is_parked(info) is True, f"{field_name} does not park"
                 exercised += 1
             elif rule == PARKS_WHEN_UNSET:
@@ -8131,7 +8141,7 @@ class TestParentEndCancelsItsChildren:
             _reported_to_parent=True,
             _digest_held=False,
             _digest_held_at=0.0,
-            _digest_settle_ids=[],
+            _digest_settle_deliveries=[],
             _delivery_queued=False,
             _awaiting_approval=False,
             _exec_started=None,
@@ -8201,7 +8211,7 @@ class TestParentEndCancelsItsChildren:
                         _reported_to_parent=False,
                         _digest_held=False,
                         _digest_held_at=0.0,
-                        _digest_settle_ids=[],
+                        _digest_settle_deliveries=[],
                         _delivery_queued=False,
                         _awaiting_approval=False,
                         _exec_started=1.0,

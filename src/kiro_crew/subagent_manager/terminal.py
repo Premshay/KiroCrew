@@ -27,6 +27,7 @@ if TYPE_CHECKING:
         child_process_helpers,
         ending_fence,
         failure_name,
+        format_subagent_usage,
         join_failures,
         kill_each,
         kill_set,
@@ -97,9 +98,17 @@ class TerminalCoordinator(ManagerComponent):
             # Reporting stays one-shot without the pop: every route here is gated
             # on `_claim_finalize`, which hands out one token.
             elapsed_ms = int(max(0.0, float(info.elapsed or 0.0)) * 1000)
+            # The run's own accumulator, already cumulative across every attempted
+            # turn. Handed over as measured: the emitter is the one place that decides
+            # what a charge has to be to be written, and it refuses anything not
+            # positive and finite. Screening here as well would put that rule in two
+            # places, where only one of them is the writer.
+            credits = float(info.credits or 0.0)
             outcome = info.outcome
             if outcome == "completed":
-                crew_log_emit.on_subagent_completed(sid, agent_id=info.id, duration_ms=elapsed_ms)
+                crew_log_emit.on_subagent_completed(
+                    sid, agent_id=info.id, duration_ms=elapsed_ms, credits=credits
+                )
             else:
                 crew_log_emit.on_subagent_failed(
                     sid,
@@ -107,6 +116,7 @@ class TerminalCoordinator(ManagerComponent):
                     reason=info.error or "",
                     outcome=outcome,
                     duration_ms=elapsed_ms,
+                    credits=credits,
                 )
         except Exception:
             _logger.debug("crew log: closing a subagent entry failed", exc_info=True)
@@ -271,11 +281,14 @@ class TerminalCoordinator(ManagerComponent):
         # the paths that reach a terminal without the run loop.
         self._record_crew_log_terminal(info)
         info.done = True
+        if info._credit_accounting is not None:
+            info._credit_accounting.settle()
         await self._manager._fire_event(
             "subagent_done",
             info,
             {
                 "elapsed": info.elapsed,
+                "credits": info.credits,
                 "error": _redact(info.error) if info.error else None,
                 "stopped": info.user_stopped,
                 "outcome": info.outcome,
@@ -317,7 +330,7 @@ class TerminalCoordinator(ManagerComponent):
             # over. The run's own result file and tombstone are unaffected.
             # Releasing the hold is part of the same statement. A wave member parks
             # its siblings' announces on its own digest (``_digest_held_at``,
-            # ``_digest_settle_ids``), and the reaper's hold-expiry sweep arms a
+            # ``_digest_settle_deliveries``), and the reaper's hold-expiry sweep arms a
             # ``force_digest_flush`` for a batch whose hold has aged out. That flush
             # builds a SYNTHETIC record with a fresh id, so the gate above can never
             # match it: it would reach ``_on_done`` on its own and rebuild the retired
@@ -327,9 +340,9 @@ class TerminalCoordinator(ManagerComponent):
             # never reached a parent, so orphan reconciliation must still be able to
             # find them.
             info._digest_held_at = 0.0
-            held, info._digest_settle_ids = info._digest_settle_ids, []
+            held, info._digest_settle_deliveries = info._digest_settle_deliveries, []
             if held:
-                self._manager._teardown_cancelled_ids.update(held)
+                self._manager._teardown_cancelled_ids.update(delivery.agent_id for delivery in held)
             logger.info("Reaper: skipping parent delivery for %s — its parent ended", info.id)
             # The gate has now done its job for this run: the delivery it existed to stop
             # has been stopped, and ``_on_done`` was never called, so none of the gateway's
@@ -349,7 +362,7 @@ class TerminalCoordinator(ManagerComponent):
                 # _on_done returned without raising, so the wave digest (if this
                 # was the final member) has been handed off. Only NOW settle the
                 # held members' delivery tombstones.
-                self._manager._settle_digest_holds(info)
+                await self._manager._settle_digest_holds(info)
             # Digest-held wave members are NOT marked delivered here: their
             # result has not reached the parent yet (the gateway marks them when
             # the digest fires), so a restart mid-wave leaves them visible to
@@ -379,7 +392,15 @@ class TerminalCoordinator(ManagerComponent):
                 # "delivered" tombstone excludes it from orphan reconciliation;
                 # the reaper prunes it after agent.subagent_result_ttl_secs.
                 try:
-                    mark_delivered(info.id)
+                    # Off the loop: this writes a file and now also reads the
+                    # existing tombstone, so that the terminal outcome an earlier
+                    # write recorded is not erased by this one. The drained path
+                    # offloads the same call for the same reason. The terminal
+                    # usage still travels with it -- offloading must not cost the
+                    # tombstone its elapsed and credits.
+                    await asyncio.to_thread(
+                        mark_delivered, info.id, elapsed=info.elapsed, credits=info.credits
+                    )
                 except Exception:
                     logger.debug("Failed to mark subagent %s delivered", info.id, exc_info=True)
                 # Clean up workspace result file (agent-{id}.md in parent dir).
@@ -795,7 +816,10 @@ class TerminalCoordinator(ManagerComponent):
                         logger.warning("Reaper: reset hung for %s, attempting SIGKILL", agent_id)
                         targets, missing = kill_set(handles, popped, seen=seen)
                         kill_failed = join_failures(
-                            await self._manager._sigkill_sessions(session_key, targets), missing
+                            await self._manager._sigkill_sessions(
+                                session_key, targets, popped=popped
+                            ),
+                            missing,
                         )
                     except Exception:
                         logger.exception(
@@ -803,7 +827,10 @@ class TerminalCoordinator(ManagerComponent):
                         )
                         targets, missing = kill_set(handles, popped, seen=seen)
                         kill_failed = join_failures(
-                            await self._manager._sigkill_sessions(session_key, targets), missing
+                            await self._manager._sigkill_sessions(
+                                session_key, targets, popped=popped
+                            ),
+                            missing,
                         )
                     else:
                         # A completed reset -- True, or False for a key the run's own
@@ -825,7 +852,7 @@ class TerminalCoordinator(ManagerComponent):
                                 agent_id,
                             )
                             kill_failed = await self._manager._sigkill_sessions(
-                                session_key, survivors
+                                session_key, survivors, popped=popped
                             )
                         kill_failed = join_failures(kill_failed, missing)
                     # Read after the passes, fence still up: a cold start under the
@@ -871,6 +898,20 @@ class TerminalCoordinator(ManagerComponent):
             # No live task to cancel above (already exited) — the reap still owns
             # teardown bookkeeping from here, so mark it now.
             info.reaped = True
+            # Cancellation can be draining a state writer rather than unwinding the
+            # consumer. Settle synchronously before either tombstone or WS snapshot;
+            # the consumer's eventual finally shares this once-only accounting.
+            if info._credit_accounting is not None:
+                info._credit_accounting.settle()
+            # Finalize the reap's authoritative elapsed sample BEFORE the
+            # tombstone write below, so the persisted record and the terminal
+            # ``subagent_done`` event carry the same value. ``_write_tombstone``
+            # reads ``info.elapsed`` once it is set; leaving it 0.0 here made the
+            # tombstone self-sample a fresh (and different) wall-clock value than
+            # the ``info.elapsed = elapsed`` assignment at the tail of this
+            # method. The tail assignment remains for the branches that write no
+            # tombstone but still report.
+            info.elapsed = elapsed
             # Guard 1 of 3 — the terminal RECORD (done/error/stat/tombstone/cost) is
             # first-arrival-wins on `info.done`, so it is never written twice. The
             # report task already exists (launched above, before the teardown), so a
@@ -1142,15 +1183,30 @@ class TerminalCoordinator(ManagerComponent):
         return handles
 
     async def _sigkill_sessions_impl(
-        self, session_key: str, handles: list[ProcessHandle]
+        self,
+        session_key: str,
+        handles: list[ProcessHandle],
+        *,
+        popped: "list[tuple[Any, ProcessHandle]] | None" = None,
     ) -> str | None:
-        """Kill every handle's process (:func:`kiro_crew.process_identity.kill_each`); the failures joined, or None."""
+        """Kill every handle's process (:func:`kiro_crew.process_identity.kill_each`); the failures joined, or None.
+
+        ``popped`` is the caller's captured pop, forwarded so each kill can release
+        the lease of the session its own reset destroyed even when that reset was
+        cancelled before ``provider.shutdown()`` -- the case where the manager's
+        torn-down table has already unwound and holds nothing.
+        """
         return await kill_each(
-            handles, lambda handle: self._manager._sigkill_session(session_key, handle)
+            handles,
+            lambda handle: self._manager._sigkill_session(session_key, handle, popped=popped),
         )
 
     async def _sigkill_session_impl(
-        self, session_key: str, handle: ProcessHandle | None
+        self,
+        session_key: str,
+        handle: ProcessHandle | None,
+        *,
+        popped: "list[tuple[Any, ProcessHandle]] | None" = None,
     ) -> str | None:
         """Best-effort SIGKILL when graceful reset hangs.
 
@@ -1187,9 +1243,76 @@ class TerminalCoordinator(ManagerComponent):
         if handle is None:
             logger.warning("Reaper: no session found for %s", session_key)
             return None
-        return await kill_verified_process(
-            handle, who="Reaper", key=session_key, child_helpers=child_process_helpers()
+        # Imported HERE, not at the top of the module, and structurally required
+        # rather than a style choice: ``bind_component_globals`` rebuilds every
+        # ``*_impl`` with ``subagent``'s module dict as its ``__globals__``
+        # (``subagent_manager/_component.py``), whose own docstring states the
+        # consequence -- "an import at the top of its defining module is inert for
+        # it. Every global it loads must resolve in ``namespace`` -- add the name
+        # there, or import it inside the function." A top-level import here would
+        # raise NameError at the first call, and the alternative is adding these two
+        # names to another module's globals.
+        from kiro_crew.process_identity import release_teardown_lease, teardown_barriers
+        from kiro_crew.runtime_ownership import authorize_runtime_kill
+
+        # Ownership, asked once before the verified kill. The recycle check
+        # inside it answers a different question -- whether this pid is still
+        # the process we recorded -- and a yes to that is not a yes to this:
+        # with session sharing on, the process this sub-agent ran on also
+        # carries its parent and its siblings, and the graceful reset this
+        # ladder is the fallback for hung for ONE of them.
+        #
+        # The run's OWN lease goes first, through the helper the cron reaper
+        # shares, so the two teardown paths cannot drift: a gate asked while the
+        # subject still holds its lease lets the session being destroyed refuse
+        # its own last-resort kill. What the release leaves is another owning
+        # session's lease and every tenancy on the process -- and the tenancy is
+        # how a session-sharing sub-agent is represented, since at cap=1 it holds
+        # no lease. The gate reads both, so a co-tenant mid-turn still refuses.
+        # The captured pop goes with it: a reset abandoned on its timeout has
+        # already unwound the scope that made the subject readable through
+        # ``tearing_down``, and the caller's pop is then the only thing that still
+        # names the session whose lease must go before the gate is asked.
+        await release_teardown_lease(
+            self._manager._sessions, session_key, handle, who="Reaper", popped=popped
         )
+
+        # A refusal withholds the tree signal AND the escaped-children sweep. The
+        # recorded child set is the SHARED root's whole descendant tree, not this
+        # run's alone -- with session sharing on it holds the co-tenant's MCP and
+        # node children -- so sweeping it after sparing the root would spare the
+        # process and kill the processes it depends on, which is worse than either
+        # ending it or leaving it alone. The refusal is RETURNED so the caller's
+        # record cannot say the run was reaped, and the surviving tree stays the
+        # reconciler's to count.
+        helpers = child_process_helpers()
+        if handle.pid and not authorize_runtime_kill(
+            handle.pid,
+            reason=f"graceful reset hung for {session_key}",
+            caller="subagent_manager.terminal._sigkill_session_impl",
+        ):
+            logger.warning(
+                "Reaper: another session holds a lease on PID %d; leaving its tree to the "
+                "reconciler for %s",
+                handle.pid,
+                session_key,
+            )
+            return "RuntimeOwnership: a session still holds a lease on the runtime"
+        # Same window as the cron reaper's: the verified kill re-reads the start id,
+        # resolves the group and walks the descendants before its first signal, and a
+        # shared turn can claim a tenancy anywhere in there.
+        with teardown_barriers([handle.pid], who="Reaper") as barriered:
+            if handle.pid and not barriered:
+                logger.warning(
+                    "Reaper: PID %d gained a tenant after the gate allowed it; leaving its "
+                    "tree to the reconciler for %s",
+                    handle.pid,
+                    session_key,
+                )
+                return "a tenant claimed the runtime after the gate allowed it"
+            return await kill_verified_process(
+                handle, who="Reaper", key=session_key, child_helpers=helpers
+            )
 
     def notify_injection_failed_impl(
         self, info: SubagentInfo, reason: str = "delivery timed out"
@@ -1247,6 +1370,7 @@ class TerminalCoordinator(ManagerComponent):
                 f"{SUBAGENT_COMPLETION_PREFIX}\n"
                 f"Agent `{info.id}` ❌ {reason}\n"
                 f"Task: {task_preview}\n"
+                f"Usage: {format_subagent_usage(info.credits, info.elapsed)}\n"
                 f"{_injection_notice_outcome(info)}{result_hint}"
             )
 

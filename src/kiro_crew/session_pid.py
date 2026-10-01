@@ -181,8 +181,8 @@ def _session_pid_file_lock():  # type: ignore[no-untyped-def]
             yield
 
 
-def _track_session_pid(pid: int) -> None:
-    """Append a kiro-cli PID to the session tracking file (dedup).
+def _track_session_pid(pid: int, start_token: str | None = None) -> None:
+    """Record a kiro-cli root in the session tracking file.
 
     Entries are written as ``<gateway_pid>:<child_pid>:<start_token>`` so each
     gateway instance can identify and sweep only its own children, and so the
@@ -195,19 +195,78 @@ def _track_session_pid(pid: int) -> None:
     the backend registry) wherever a command line is readable, and on Windows only an
     image name is -- so an interpreter-hosted adapter reads as ``node.exe`` there and a
     token-less entry for one is not recognised. See :func:`_is_managed_agent_process`.
+
+    *start_token* is the identity the caller read at spawn. Pass it: a caller
+    that also retires by identity (:func:`_untrack_root_by_identity`) must record
+    the SAME token it will later compare, and two probes of one number are two
+    reads that can disagree once the number changes hands. Omitted, the token is
+    probed here, which is what every caller did before spawn learned to keep it.
+    The recorded identity is always the token in hand; the one place this
+    function probes the number again (before replacing another line, below) is an
+    OCCUPANCY check -- does the number still name this process -- never the
+    source of what gets written.
+
+    One line per ``gw:pid`` number. The exact entry already present is a re-track
+    and is left alone. A line under the same number with a DIFFERENT token is a
+    predecessor's: this caller is recording the process that holds the number
+    NOW, so whatever that line named has exited, and it is REPLACED rather than
+    kept. A kept stale line is the hole the identity-bound retirement falls
+    through -- the successor never gets a line of its own, so nothing about it is
+    ever in this file. A token-less write never replaces a tokened line: with no
+    identity to offer it proves nothing about who holds the number, and the sweep
+    prunes a stale tokened line by liveness on its own.
+
+    A refused replacement RAISES, like a refused append: failing to record a live
+    root is the one unrecoverable direction here (see ``_rewrite_pid_file``) -- a
+    root in neither file is unreachable by every reaper until reboot.
     """
-    token = _pid_start_token(pid)
+    token = start_token if start_token else _pid_start_token(pid)
     prefix = f"{os.getpid()}:{pid}"
     entry = f"{prefix}:{token}" if token else prefix
     with _session_pid_file_lock():
         path = _session_pid_file_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
-            # Dedup on the gw:pid prefix (not the full entry) so a re-track
-            # never duplicates a legacy 2-field line with a 3-field one.
-            for line in path.read_text(encoding="utf-8").split():
-                if line == prefix or line.startswith(prefix + ":"):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            kept: list[str] = []
+            already_present = False
+            stale_predecessor = False
+            for ln in lines:
+                stripped = ln.strip()
+                if stripped == entry:
+                    # Ours. Not kept here: the single write below is what puts
+                    # exactly one line for the number back, whichever order
+                    # the file listed ours and a stale one in.
+                    already_present = True
+                    continue
+                if stripped == prefix or stripped.startswith(prefix + ":"):
+                    if not token:
+                        # Dedup on the gw:pid prefix, as before: a token-less
+                        # re-track never duplicates -- or downgrades -- a line
+                        # that carries an identity.
+                        return
+                    stale_predecessor = True
+                    continue
+                kept.append(ln)
+            if already_present and not stale_predecessor:
+                return
+            if stale_predecessor:
+                # The token in hand was read at SPAWN. This write may be late --
+                # a tracker that ran after its own root died and the number was
+                # handed on -- in which case the "stale predecessor" line above
+                # is the live successor's only record, and replacing it would
+                # leave that root reachable by nothing. Re-read the number's
+                # identity NOW, under the lock: only while it still names the
+                # process this token belongs to is the replacement ours to make.
+                # A number that has moved on (or cannot be read) is not recorded
+                # by this caller at all -- deny-by-default, the direction every
+                # writer in this module fails toward.
+                if _pid_start_token(pid) != token:
                     return
+                kept.append(entry)
+                if not _rewrite_pid_file(path, "\n".join(kept) + "\n"):
+                    raise OSError(f"could not record root PID {pid} in {path}")
+                return
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"{entry}\n")
 
@@ -627,11 +686,76 @@ def _collect_active_pids(sessions: "dict") -> tuple[set[int], bool]:
     return pids, True
 
 
-def _kill_pid_tree(pid: int) -> tuple[int, bool]:
+#: Parent links a descendant check will follow before giving up. A real agent tree is
+#: a handful deep; this only bounds the walk against a parent chain that is circular
+#: or being rewritten underneath the read.
+_ANCESTRY_WALK_LIMIT = 32
+
+
+def _is_our_descendant(pid: int, root: int) -> bool:
+    """Whether *pid*'s parent chain reaches *root*.
+
+    The ancestry edge a captured descendant needs. A pid enumerated as part of a tree
+    is only evidence about the instant it was enumerated; walking its parents back to
+    the root proves it is still in that tree NOW, which is what makes capturing its
+    identity mean anything.
+
+    Subtractive, like every other check on this path: an unreadable parent link ends
+    the walk and answers False, so a pid whose ancestry cannot be proven is not
+    signalled rather than signalled on the strength of a stale list.
+    """
+    seen: set[int] = set()
+    current = pid
+    for _ in range(_ANCESTRY_WALK_LIMIT):
+        if current in seen:
+            return False  # a cycle in the parent chain proves nothing
+        seen.add(current)
+        try:
+            parent = platform_compat.get_ppid(current)
+        except Exception:
+            return False
+        if parent == root:
+            return True
+        if parent <= 1:
+            # Reached init, or an unreadable link (-1). Either way the chain never
+            # passed through our root.
+            return False
+        current = parent
+    return False
+
+
+def _kill_pid_tree(pid: int, *, expected_start: str | None = None) -> tuple[int, bool]:
     """Kill *pid* and its descendant agent processes (bottom-up).
 
     Returns ``(total_killed, root_killed)`` so callers can distinguish
     whether the root process itself was sent SIGKILL.
+
+    ``expected_start`` is the root's process-start identity as the CALLER read it,
+    and passing it pins that identity across this function instead of only up to its
+    door. A caller that verified the pid immediately before calling still hands over
+    a verdict with an expiry: the descendant walk below is a ``pgrep``, unbounded in
+    time, and the root's own signal happens after it. A candidate that exits inside
+    that walk frees its number, and a managed runtime taking the number next passes
+    the argv gate -- it IS one of ours -- so the root signal lands on an unrelated
+    live session. Re-checked before the walk and again immediately before the root
+    signal, which is the rule :func:`_root_identity_holds` states for the sibling
+    teardown: before EVERY signal, not once up front.
+
+    Every signal this function sends is judged against a freshly read identity, because
+    a verdict older than the last syscall is a verdict about a pid that may have changed
+    hands. The ROOT is checked before the descendant read, so a pid that has already
+    moved is not walked; again after that read, because the read is itself a window --
+    one procfs children read, or a ``pgrep`` spawn -- and a recycled pid hands over a
+    stranger's child list; and again immediately before the root signal. Each CHILD
+    carries its own token, read when it was discovered, and is re-checked against that
+    token before it is signalled: the argv gate answers from cmdline, so it says a pid
+    is the KIND of process we manage, never that it is the one just found.
+
+    Subtractive, exactly as the token rule below requires. It only ever WITHHOLDS a
+    signal: an identity that differs, or that cannot be read at all, stops the kill
+    and the caller sees zero killed. Omitted -- the default -- leaves every existing
+    caller's behaviour untouched, because a caller with no captured identity has
+    nothing to compare and this adds no evidence it did not have.
 
     The argv gate below is a PID-RECYCLE guard and the only thing that authorizes a
     signal here: it asks whether this PID still names the kind of process the
@@ -649,6 +773,13 @@ def _kill_pid_tree(pid: int) -> tuple[int, bool]:
     """
     if pid <= 0:
         return 0, False
+    pinned = expected_start is not None
+    if pinned and not _root_identity_holds(pid, expected_start, gated=True):
+        logger.warning(
+            "_kill_pid_tree: PID %d is not the process the caller verified; not signalling it",
+            pid,
+        )
+        return 0, False
     killed = 0
     root_killed = False
     try:
@@ -656,8 +787,56 @@ def _kill_pid_tree(pid: int) -> tuple[int, bool]:
         from kiro_crew.acp.client import _get_child_pids
 
         children = _get_child_pids(pid)
+        # Each child's own identity, and the ancestry edge that makes capturing it
+        # meaningful. The loop below signals under the argv gate alone, and that gate
+        # answers from cmdline: it says this pid is the KIND of process we manage,
+        # never that it is the one just discovered. So each child carries its own
+        # token and is re-checked against it before its signal, for the same reason
+        # the root is.
+        #
+        # Identity ALONE is not enough here, because the capture is itself downstream
+        # of the enumeration: a child that exits between the two frees its number, and
+        # a replacement is captured under its own identity, which then matches at
+        # signal time. What rules that out is proving the pid is still OURS at capture
+        # -- ``_is_our_descendant`` walks the parent chain up to this root -- so
+        # everything captured was in this tree at that moment, and the identity check
+        # then holds it to being the same process at signal time.
+        child_ids = (
+            {
+                cpid: platform_compat.get_process_start_id(cpid)
+                for cpid in children
+                if cpid > 0 and _is_our_descendant(cpid, pid)
+            }
+            if pinned
+            else {}
+        )
+        if pinned and not _root_identity_holds(pid, expected_start, gated=True):
+            # The descendant READ is itself the window -- one procfs children read on
+            # Linux, a pgrep spawn on macOS -- and the children below are signalled
+            # under the argv gate alone, with no identity pin of their own. A pid
+            # recycled during that read means this list belongs to somebody else's
+            # runtime, so its children must not be signalled either.
+            logger.warning(
+                "_kill_pid_tree: PID %d changed identity while its descendants were read; "
+                "not signalling them",
+                pid,
+            )
+            return 0, False
         for cpid in reversed(children):
             if cpid <= 0 or not _is_managed_agent_process(cpid):
+                continue
+            if pinned and not _root_identity_holds(cpid, child_ids.get(cpid), gated=True):
+                # This number is not the child that was captured. Withheld, and that
+                # covers three cases with one rule: an identity that changed, one that
+                # could not be read, and a pid whose ancestry could not be proven at
+                # capture -- none of them is in ``child_ids``. This comparison
+                # authorizes a SIGNAL, so every unknown withholds it.
+                logger.warning(
+                    "_kill_pid_tree: child PID %d is not the process discovered under %d; "
+                    "not signalling it",
+                    cpid,
+                    pid,
+                )
                 continue
             try:
                 platform_compat.kill_pid(cpid, platform_compat.SIGKILL)
@@ -667,6 +846,17 @@ def _kill_pid_tree(pid: int) -> tuple[int, bool]:
     except Exception:
         logger.debug("Error killing children of PID %s", pid, exc_info=True)
     if not _is_managed_agent_process(pid):
+        return killed, root_killed
+    if pinned and not _root_identity_holds(pid, expected_start, gated=True):
+        # The descendant walk above is unbounded, so this is the check that matters:
+        # the argv gate says this pid is one of OURS, not that it is still the one
+        # the caller verified. A managed runtime that took the number during the walk
+        # satisfies the first and fails this.
+        logger.warning(
+            "_kill_pid_tree: PID %d changed identity during the descendant walk; "
+            "not signalling its root",
+            pid,
+        )
         return killed, root_killed
     try:
         if platform_compat.IS_WINDOWS:
@@ -3003,7 +3193,11 @@ def _untrack_pid_if_dead(pid: int) -> bool:
     answers the probe and the line is RETAINED, and a dead number does not and
     the line is REMOVED. A retained bare line naming a LIVE successor is exactly
     the line that successor's own ``_track_pid`` writes, so retaining is never
-    wrong, and the sweep prunes any bare line whose pid is dead within its tick.
+    wrong. A bare line retained for a live holder that is NOT one of ours (an
+    unrelated process that inherited the number) simply stays until the number
+    goes dead: the bare-line prune (``_cleanup_orphaned_mcp_servers``) removes a
+    bare line on ``pid_exists`` alone and never signals by it, so the cost of the
+    stale line is one entry, not a kill.
     ``pid_exists`` treats EPERM as alive: deny-by-default, the direction every
     reaper in this module fails toward.
 
@@ -3038,18 +3232,19 @@ def _untrack_root_by_identity(pid: int, start_token: str | None) -> bool:
     (``None``) nothing is touched at all, which is the same deny-by-default every
     reaper in this module fails toward.
 
-    The bare ``<pid>`` root line in ``kiro_pids.txt`` carries no identity, and a
-    successor handed the dead root's number may have no session line of its own
-    (:func:`_track_session_pid` dedups on the ``gw:pid`` prefix, so it returns
-    without writing while OUR line still stands). The session file therefore
-    cannot say whether the number has a new holder; the kernel can. The bare line
-    goes through :func:`_untrack_pid_if_dead`, which probes ``pid_exists`` inside
-    ``_pid_file_lock`` -- the lock ``_track_pid`` appends under -- and removes
-    the line only when the number is dead at that moment; a live holder keeps
-    it. The two per-file locks are taken in turn, never nested, and no lock
-    spans the pair: a successor's tracking may land between the two steps, and
-    then it finds its own bare line retained and its session line written by
-    itself, so neither ordering loses a live root.
+    The bare ``<pid>`` root line in ``kiro_pids.txt`` carries no identity, so the
+    session file is not consulted about the number's new holder even though a
+    successor now REPLACES a stale predecessor line with its own
+    (:func:`_track_session_pid`): a successor whose spawn has not reached that
+    write yet has no line, and one whose identity could not be read writes a
+    token-less line that names nobody. The kernel can say what the file cannot.
+    The bare line goes through :func:`_untrack_pid_if_dead`, which probes
+    ``pid_exists`` inside ``_pid_file_lock`` -- the lock ``_track_pid`` appends
+    under -- and removes the line only when the number is dead at that moment; a
+    live holder keeps it. The two per-file locks are taken in turn, never nested,
+    and no lock spans the pair: a successor's tracking may land between the two
+    steps, and then it finds its own bare line retained and its session line
+    written by itself, so neither ordering loses a live root.
 
     Returns whether the retirement COMMITTED -- every write this call owed, not
     merely the session one: the session rewrite landed AND the bare-line step

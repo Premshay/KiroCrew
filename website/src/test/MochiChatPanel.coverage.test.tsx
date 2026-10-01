@@ -343,7 +343,7 @@ describe('PinnedSidePanel', () => {
     expect(previewFile).not.toHaveBeenCalled()
   })
 
-  it('renders a browser-tab pin with nothing to clear as inert, keeping unpin on hover', async () => {
+  it('renders a browser-tab pin with nothing to clear as inert, keeping unpin reachable', async () => {
     electronShell = false
     render(
       <PinnedSidePanel pins={[pin('/home/u/src/a.ts')]} updatedPaths={new Set()}
@@ -356,20 +356,24 @@ describe('PinnedSidePanel', () => {
     fireEvent.click(label)
     expect(previewFile).not.toHaveBeenCalled()
     expect(markPinnedSeen).not.toHaveBeenCalled()
-    // The unpin affordance is its own HTTP-backed control and stays reachable.
-    await userEvent.hover(label)
-    await userEvent.click(screen.getByRole('button', { name: 'Unpin' }))
+    // The unpin affordance is its own HTTP-backed control, always rendered
+    // (a keyboard tab stop) and named "Unpin <file>". fireEvent, not userEvent:
+    // the control is `pointer-events: none` until the CSS hover/focus reveal,
+    // which happy-dom does not paint.
+    fireEvent.click(screen.getByRole('button', { name: 'Unpin a.ts' }))
     expect(unpinFile).toHaveBeenCalledWith('/home/u/src/a.ts')
   })
 
-  it('reveals Unpin on hover and unpins on click', async () => {
+  it('renders a self-describing unpin control (always present, revealed by CSS) and unpins on click', async () => {
     render(
       <PinnedSidePanel pins={[pin('/home/u/src/a.ts')]} updatedPaths={new Set()}
         deletedPaths={new Set()} visible />,
     )
-    expect(screen.queryByRole('button', { name: 'Unpin' })).not.toBeInTheDocument()
-    await userEvent.hover(screen.getByText('a.ts'))
-    await userEvent.click(screen.getByRole('button', { name: 'Unpin' }))
+    // Always in the DOM as a real tab stop, named with the file; the CSS
+    // :hover/:focus-within rule (not a mount) controls its visibility.
+    const unpin = screen.getByRole('button', { name: 'Unpin a.ts' })
+    expect(unpin).toBeInTheDocument()
+    fireEvent.click(unpin)
     expect(unpinFile).toHaveBeenCalledWith('/home/u/src/a.ts')
   })
 
@@ -378,8 +382,7 @@ describe('PinnedSidePanel', () => {
       <PinnedSidePanel pins={[pin('/home/u/src/gone.ts')]} updatedPaths={new Set()}
         deletedPaths={new Set(['/home/u/src/gone.ts'])} visible />,
     )
-    await userEvent.hover(screen.getByText('gone.ts'))
-    expect(screen.queryByRole('button', { name: 'Unpin' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Unpin gone.ts' })).not.toBeInTheDocument()
   })
 })
 

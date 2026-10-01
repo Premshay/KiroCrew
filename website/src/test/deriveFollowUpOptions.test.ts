@@ -274,8 +274,8 @@ describe('deriveFollowUpOptions', () => {
   // re-keys WITHOUT actually changing frees the latch while the same chips are still on
   // screen — and a stale second click then queues an unintended extra Go. The store keys
   // virtual rows by `clientTs ?? ts` and deliberately carries `clientTs` onto the reloaded
-  // server copy (chatSlice.ts), so this derivation must follow the same order rather than
-  // invent a conflicting one.
+  // server copy (transcript.ts in store/chat), so this derivation must follow the same
+  // order rather than invent a conflicting one.
   describe('row identity stability across hydration', () => {
     const withMeta = (content: string, meta: Record<string, unknown>): ChatMessage =>
       ({ role: 'assistant', content, cls: 'msg msg-a', meta })

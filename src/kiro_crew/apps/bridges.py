@@ -22,7 +22,7 @@ import zipfile
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Container, Iterable, Iterator, Optional
+from typing import Any, Callable, Container, Iterable, Iterator, Optional
 from urllib.parse import urlparse, urlunparse
 
 from kiro_crew import platform_compat
@@ -45,7 +45,11 @@ from kiro_crew.apps.manager import (
     get_app_manifest,
     list_apps,
 )
-from kiro_crew.apps.manifest import AppManifest
+from kiro_crew.apps.manifest import (
+    AppManifest,
+    has_stdio_mcp_server,
+    is_module_style_entry_point,
+)
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     config_dir,
@@ -1539,6 +1543,34 @@ def load_app_cron_defs(app_name: str) -> list[dict[str, Any]]:
     return defs
 
 
+def _resolve_and_vet_app_script(
+    script: str,
+    app_root: Path,
+    vet_script_file: Callable[[str], str | None],
+) -> tuple[str, str, str | None]:
+    """Resolve an app cron's script against its bundle and scan its body.
+
+    One function so ``register_app_crons_with_service`` can hand BOTH filesystem
+    steps to a single ``asyncio.to_thread`` call: resolution stats the script and
+    may walk the builtin manifest sources, and the body scan reads up to
+    ``_MAX_SCRIPT_SCAN_BYTES``. Splitting them across two offloads would pay two
+    thread hops per job for one logically atomic check.
+
+    Returns ``(file_path, func_name, error)``. ``error`` is the body scan's
+    refusal string, or ``None`` when the script passes. Resolution failures
+    propagate as ``PermissionError``/``FileNotFoundError``/``ValueError`` for the
+    caller's existing handler, which audits them as a path rejection -- a
+    distinction the caller keeps, so the SEL trail still separates "path refused"
+    from "body refused".
+
+    ``vet_script_file`` is injected rather than imported here because the import
+    is deferred at the call site to break the ``mcp_cron`` -> ... -> ``bridges``
+    cycle, and re-importing it inside a worker thread would reopen that.
+    """
+    file_path, func_name = resolve_script_path(script, app_root=app_root)
+    return file_path, func_name, vet_script_file(file_path)
+
+
 async def register_app_crons_with_service(app_name: str, cron_service: Any) -> list[str]:
     """Promote admitted app cron definitions into the running CronService.
 
@@ -1608,8 +1640,24 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
             )
         if script:
             try:
-                file_path, _ = resolve_script_path(script)
-                err = _vet_script_file(file_path)
+                # Off-loop, for the same reason as the folder lookup below: this
+                # coroutine is awaited on the gateway loop (app enable, gateway
+                # start), and this step stats the script, may walk the builtin
+                # manifest sources for the bundle, and reads up to
+                # _MAX_SCRIPT_SCAN_BYTES (256 KiB) for the body scan. Inline that
+                # parks every request and the heartbeat for its duration.
+                #
+                # `app_root` is bundle context the generic resolver cannot infer:
+                # an app's manifest names its script RELATIVE to its own tree
+                # ("job.py:run"), and this is that tree -- the immutable package
+                # dir for a shipped builtin, the installed snapshot for a third
+                # party, exactly as `_registration_source` chose it. Without it a
+                # relative spec resolved against the gateway process's CWD, so
+                # vetting looked for the file wherever the process happened to
+                # start and denied the cron on every pass.
+                file_path, func_name, err = await asyncio.to_thread(
+                    _resolve_and_vet_app_script, script, app_root, _vet_script_file
+                )
                 if err:
                     logger.warning("App %s: cron %r script rejected: %s", app_name, name, err)
                     sel().log_api_access(
@@ -1620,6 +1668,13 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
                         error=err,
                     )
                     continue
+                # Persist the RESOLVED spec, not the manifest's relative one.
+                # Every later consumer re-resolves `job.script` with no app
+                # context -- the fire-time governance gate, the launcher, the
+                # dashboard's source endpoint -- so a relative spec on the
+                # record would be re-resolved against their CWD and reproduce
+                # this very bug after registration had already passed.
+                script = f"{file_path}:{func_name}"
                 sel().log_api_access(
                     caller="app_bridge",
                     operation="app_cron_script_vetted",
@@ -1923,9 +1978,10 @@ async def reconcile_app_crons_for_execution(cron_service: Any) -> list[str]:
 # ~/.kiro/settings/mcp.json. That shared file is read by everything else living
 # under ~/.kiro — Kiro IDE and any other kiro-cli agent — so registering an app's
 # tools there leaks them into surfaces that never installed the app (and a dead
-# HTTP entry there breaks EVERY kiro session, see backend.py's warning). KiroCrew
-# sessions read only the agent config (``includeMcpJson`` pinned False in
-# agent.py), so this is both sufficient and correctly scoped.
+# HTTP entry there breaks EVERY kiro session, see the boot-reconcile warning in
+# backend_runtime/startup.py). Kiro Crew sessions read only the agent config
+# (``includeMcpJson`` pinned False in agent.py), so this is both sufficient and
+# correctly scoped.
 def _mcp_json_path() -> Path:
     """KiroCrew's own agent config. A function, not an import-time constant:
     the path must track the live data home, and freezing it at import would
@@ -2060,7 +2116,7 @@ def _resolve_live_mcp_url(app_name: str, url: str, live_port: int | None = None)
     """Rewrite a manifest HTTP MCP url's port to the backend's ACTUALLY-allocated port.
 
     Gateway-managed backends declare ``backend.port:"auto"`` and get a free port at
-    spawn time (``backend.py:_find_free_port`` — 9100 if free, else 9101, …). The
+    spawn time (``backend_runtime/ports.py:_find_free_port`` — 9100 if free, else 9101, …). The
     manifest's ``mcpServers.<name>.url`` carries an illustrative fixed port (e.g.
     ``http://localhost:9100/mcp``). Registering that verbatim is a latent bug: whenever
     the backend lands on a different port, the registered MCP server points at the wrong
@@ -2078,8 +2134,9 @@ def _resolve_live_mcp_url(app_name: str, url: str, live_port: int | None = None)
         return url
     try:
         if live_port is None:
-            # circular import: backend.py imports from bridges (reregister_app_mcp_servers
-            # in its boot path), so bridges can't import backend at module load — defer it.
+            # circular import: backend_runtime/registration.py imports from bridges
+            # (reregister_app_mcp_servers in its health gate), so bridges can't import
+            # backend at module load — defer it.
             from kiro_crew.apps.backend import get_app_backend_port
 
             live_port = get_app_backend_port(app_name)
@@ -2819,14 +2876,10 @@ def _maybe_provision_backendless_deps(app_name: str, manifest: "AppManifest") ->
         # empty deps tree. The stamp gate and the per-app flock make the
         # overlap with a real spawn cheap and safe. A MODULE-style entry
         # (trusted package code, the backend spawn's own trust gate) still
-        # never provisions app-dir requirements.
-        is_module_entry = (
-            "/" not in entry_point
-            and not entry_point.endswith((".py", ".js", ".ts", ".mjs", ".cjs", ".sh"))
-            and "." in entry_point
-            and not (root / entry_point).exists()
-        )
-        if is_module_entry:
+        # never provisions app-dir requirements -- decided by the same
+        # shared predicate the backend spawn and the install-time desktop
+        # gate answer from.
+        if is_module_style_entry_point(entry_point, root):
             return
     if not os.path.lexists(root / "requirements.txt"):
         # True ABSENCE only: is_file() would also answer False for a
@@ -2835,10 +2888,7 @@ def _maybe_provision_backendless_deps(app_name: str, manifest: "AppManifest") ->
         # provision_app_deps, whose failure epilogue surfaces it (ERROR log
         # + SEL event) instead of this fast path eating it.
         return
-    has_stdio = any(
-        isinstance(cfg, dict) and not cfg.get("url") for cfg in manifest.mcpServers.values()
-    )
-    if not has_stdio:
+    if not has_stdio_mcp_server(manifest):
         return
     # Deferred import: bridges is imported during backend's boot path, so it
     # cannot import backend at module load (same pattern as the other

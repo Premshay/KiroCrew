@@ -1076,7 +1076,7 @@ class TestTheRunsOwnReportWaitsForItsTeardown:
         assert seen == [None] or seen == [""], f"a clean completion carried an error: {seen!r}"
         assert info.outcome == "completed"
         group_kill.assert_not_called()
-        delivered.assert_called_once_with(info.id)
+        delivered.assert_called_once_with(info.id, elapsed=info.elapsed, credits=info.credits)
         assert not [
             call
             for call in mock_sel().log_tool_invocation.call_args_list
@@ -1602,6 +1602,7 @@ class TestEveryCandidateUnderTheKeyIsKilledOnItsOwnHandle:
 
         with (
             patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
             patch("kiro_crew.subagent.sel") as mock_sel,
             children,
             alive,
@@ -1669,6 +1670,7 @@ class TestEveryCandidateUnderTheKeyIsKilledOnItsOwnHandle:
 
         with (
             patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
             patch("kiro_crew.subagent.sel") as mock_sel,
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
             patch("kiro_crew.acp.client._kill_escaped_children"),
@@ -1732,6 +1734,7 @@ class TestEveryCandidateUnderTheKeyIsKilledOnItsOwnHandle:
 
         with (
             patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
             patch("kiro_crew.subagent.sel") as mock_sel,
             children,
             alive,
@@ -1778,6 +1781,7 @@ class TestEveryCandidateUnderTheKeyIsKilledOnItsOwnHandle:
 
         with (
             patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
             patch("kiro_crew.subagent.sel") as mock_sel,
             children,
             alive,
@@ -1857,6 +1861,7 @@ class TestEveryCandidateUnderTheKeyIsKilledOnItsOwnHandle:
 
         with (
             patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.05),
             patch("kiro_crew.subagent.sel") as mock_sel,
             children,
             alive,
@@ -3312,7 +3317,7 @@ class TestTheReapFencesTheKey:
             provider.context_usage_pct = lambda: 0.0
             provider.context_window_tokens = lambda: 0
             provider.has_active_turn = lambda: False
-            provider.runtime_info = lambda: (None, None)
+            provider.runtime_abort_target = lambda: None
             provider.shutdown = AsyncMock()
 
             async def _gated_start(*_args: Any, **_kwargs: Any) -> None:

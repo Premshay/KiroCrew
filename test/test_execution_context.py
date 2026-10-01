@@ -418,16 +418,27 @@ def test_every_binder_declares_whether_it_vouches():
 
     # ABSENT means the default: publish the record, claim NO own-store authority.
     # The fork carries its store from the SOURCE session's record, and the subagent
-    # and member-auth binders either run on keys that never reach the vouch or take
-    # their store from a caller argument, so none of them may vouch.
+    # binder runs on keys that never reach the vouch, so neither may vouch.
     #
-    # "True" is an establishing site: the store came from an authorization, not from
-    # a record the session can write. `record_agent_selection` threads the decision
-    # because it serves both shapes.
+    # The vouched population is CALLERS whose session key can reach `create_session`
+    # -- a real dashboard slot key that `caller_slot_key` can resolve -- because a
+    # vouched entry is only ever read for the CALLER slot of `create_session`'s
+    # own-store admission. `hooks.bind_captured` runs on a `hook:` synthetic key in
+    # an EPHEMERAL session `_run_hook_agent` destroys after the turn, which is never
+    # a dashboard slot, so `caller_slot_key` cannot resolve it and it can never be
+    # that caller. It therefore publishes with `vouch=False` and spends no slot in
+    # the capped map.
+    #
+    # "True" is an establishing site whose key IS (or becomes) a real create-capable
+    # slot: `_persist_birth` binds the freshly created child slot, and
+    # `bind_private_session_store` establishes own-store dispatch authority for a
+    # member's dashboard slot from a trusted store argument, not from a record the
+    # session can write. `record_agent_selection` threads the decision because it
+    # serves both shapes.
     expected = {
         ("dashboard/chat_fork.py", "_bind_fork_execution"): "ABSENT",
         ("dashboard/chat_persistence.py", "_pin_private_agent_assignment"): "ABSENT",
-        ("dashboard/handlers/hooks.py", "bind_captured"): "True",
+        ("dashboard/handlers/hooks.py", "bind_captured"): "False",
         ("dashboard/session_control.py", "_persist_birth"): "True",
         ("member_memory_auth.py", "bind_private_session_store"): "True",
         ("session_agent_selection.py", "record_agent_selection"): "vouch",
@@ -450,6 +461,34 @@ def test_a_member_less_publication_is_never_vouched(members):
     execution.bind_session_execution("dashboard:global-vouch", globalish, vouch=True)
     assert execution.read_session_execution("dashboard:global-vouch") == globalish
     assert execution.read_vouched_session_execution("dashboard:global-vouch") is None
+
+
+def test_a_hook_session_publishes_but_is_never_vouched(members):
+    # A vouched entry is only ever read for the CALLER slot of `create_session`'s
+    # own-store admission, so a key that can never be that caller must not be
+    # vouched. A hook session's key is a `hook:` synthetic in an ephemeral session
+    # `dashboard/handlers/hooks._run_hook_agent` destroys after the turn; it is never
+    # a dashboard slot, so `caller_slot_key` cannot resolve it. `hooks.bind_captured`
+    # therefore binds such a key with `vouch=False` (pinned by
+    # `test_every_binder_declares_whether_it_vouches`). This is the OBSERVABLE effect
+    # at the map: the record publishes so the hook turn runs, but no entry is
+    # vouched, so the key spends no slot in the capped `_VOUCHED_EXECUTIONS` map.
+    alice = execution.resolve_member_execution(members, "alice")
+    hook_key = "hook:default:1700000000"
+
+    # The same call `hooks.bind_captured` makes: replace_existing, no vouch.
+    execution.bind_session_execution(hook_key, alice, replace_existing=True, vouch=False)
+
+    assert execution.read_session_execution(hook_key) == alice, "the hook record must publish"
+    assert (
+        execution.read_vouched_session_execution(hook_key) is None
+    ), "a hook session cannot reach create_session, so it must not be vouched"
+
+    # A create-capable dashboard slot binding from independently established identity
+    # still vouches, so own-store dispatch for a real caller keeps working.
+    slot_key = "dashboard:create-capable"
+    execution.bind_session_execution(slot_key, alice, vouch=True)
+    assert execution.read_vouched_session_execution(slot_key).member_id == alice.member_id
 
 
 def test_a_publication_does_not_vouch_unless_it_asks(members):

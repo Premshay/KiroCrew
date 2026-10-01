@@ -4,11 +4,12 @@ import { api } from '../api/client'
 import RestartBlockers, { isRestartAckRequired } from './RestartBlockers'
 
 import { i18nT } from '../i18n/t'
+import ErrorNotice from './ErrorNotice'
 
 export default function RestartButton() {
   const [restarting, setRestarting] = useState(false)
-  const [msg, setMsg] = useState('')
-  const [isError, setIsError] = useState(false)
+  const [ok, setOk] = useState('')
+  const [err, setErr] = useState('')
   const [blocked, setBlocked] = useState(false)
 
   const restart = async () => {
@@ -19,6 +20,8 @@ export default function RestartButton() {
     // reply in progress) before anything happens.
     if (!window.confirm(i18nT('components.restartButton.confirm'))) return
     setRestarting(true)
+    setErr('')
+    setOk('')
     try {
       const res = await api.restartSessions()
       setBlocked(false)
@@ -26,11 +29,13 @@ export default function RestartButton() {
       // against a config that may not match the sources — reporting "config
       // applied" there would be the exact lie this button exists to avoid.
       if (res && res.mcp_sync_ok === false) {
-        setIsError(true)
-        setMsg(i18nT('components.restartButton.sessions_restarted_but_mcp_sync_failed'))
+        setErr(i18nT('components.restartButton.sessions_restarted_but_mcp_sync_failed'))
       } else {
-        setIsError(false)
-        setMsg(i18nT('components.restartButton.sessions_restarted_config_applied'))
+        setOk(i18nT('components.restartButton.sessions_restarted_config_applied'))
+        // Success is a passing confirmation, so it clears itself. A failure
+        // stays until dismissed or the next attempt: an error that vanishes
+        // after five seconds is one the reader may never have seen.
+        setTimeout(() => setOk(''), 5000)
       }
     } catch (e: unknown) {
       // A refused restart is not a message to fade out after five seconds. The
@@ -39,22 +44,42 @@ export default function RestartButton() {
       // two sentences saying the same thing read as two different problems.
       const waiting = isRestartAckRequired(e)
       setBlocked(waiting)
-      setIsError(!waiting)
-      setMsg(
+      // Lead with the page's own sentence and keep the server's reason after
+      // it: a bare "restart refused: …" reads as a log line, not as an answer.
+      setErr(
         waiting
           ? ''
-          : e instanceof Error ? e.message : i18nT('components.restartButton.restart_failed'),
+          : e instanceof Error
+            ? i18nT('components.restartButton.restart_failed_because', { reason: e.message })
+            : i18nT('components.restartButton.restart_failed'),
       )
     } finally {
       setRestarting(false)
-      setTimeout(() => setMsg(''), 5000)
     }
   }
 
   return (
     <div className="flex flex-col items-end gap-1">
-    <div className="flex items-center gap-2">
-      {msg && <span className={`text-[13px] animate-rise ${isError ? 'text-danger' : 'text-ok'}`}>{msg}</span>}
+    // `flex-wrap` + the notice's `basis-full`: a failure gets its own row under
+    // the hint and the button instead of squeezing both into two-line wraps
+    // inside the Connections header band (the ok tick is one short line and
+    // stays beside the button).
+    <div className="flex flex-wrap items-center justify-end gap-2">
+      {ok && <span className="text-[13px] animate-rise text-ok">{ok}</span>}
+      {/* No hand-off: the failure goes through ErrorNotice like every other error the user
+          sees, so the journal lookup applies; `inline` because this sits in a
+          header row, not at the top of a panel. The agent hand-off stays at
+          ErrorNotice's default (off): it navigates to the chat, which unmounts
+          the page this button sits in, and the Connections header sits above
+          an editable MCP server form. */}
+      <div className="order-last basis-full empty:hidden">
+        <ErrorNotice
+          message={err}
+          variant="inline"
+          onDismiss={() => setErr('')}
+          testId="restart-button-error"
+        />
+      </div>
       <button
         onClick={restart}
         disabled={restarting}
@@ -76,7 +101,7 @@ export default function RestartButton() {
       {/* Retrying is the operator's call, not an automatic consequence of a
           clear: another session can start work in the meantime, so the panel
           re-reads the barrier and this button stays the one thing that restarts. */}
-      {blocked && <RestartBlockers onCleared={() => setMsg('')} />}
+      {blocked && <RestartBlockers onCleared={() => setErr('')} />}
     </div>
   )
 }

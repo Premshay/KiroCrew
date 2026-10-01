@@ -32,6 +32,7 @@ from kiro_crew.dashboard.handlers.files import (
     _ZIP_CONTAINER_EXTS,
     _content_matches_ext,
 )
+from kiro_crew.dashboard.origin import is_direct_local_request
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.knowledge.agent_fetch import fetch_url_content
 from kiro_crew.knowledge.agent_source import add_agent_document
@@ -1242,7 +1243,19 @@ def _folder_picker_available(request: web.Request) -> bool:
     only possible answer is a refusal."""
     if sys.platform != "darwin" or not bool(request.app.get("local_only", False)):
         return False
-    return platform_compat.trusted_system_bin("osascript") is not None
+    if platform_compat.trusted_system_bin("osascript") is None:
+        return False
+    # `local_only` is necessary but not sufficient: it describes how the GATEWAY
+    # was started, not where THIS request came from. The gateway binds loopback
+    # and remote access is delivered by a same-host tunnel or reverse proxy, so a
+    # remote user's request arrives from a loopback peer with `local_only` still
+    # True. A host-side native dialog must never open for such a request -- it
+    # would appear on the gateway operator's screen, not the requester's, and
+    # block there for up to `_FOLDER_DIALOG_TIMEOUT`. Require a DIRECT local
+    # request too, so a proxied one fails the gate and falls back to the
+    # typed-path route. The sibling project picker in `handlers/files.py`
+    # gates on the same helper for the same reason.
+    return is_direct_local_request(request)
 
 
 def _run_folder_dialog() -> str | None:
@@ -1683,8 +1696,16 @@ async def _sync_source_body(request: web.Request) -> web.Response:
         return web.json_response({"error": "pipeline not configured"}, status=503)
     pool = request.app.get("knowledge_fetch_pool")
     if pool is None:
-        # Compatibility for minimal callers that predate workload-isolated pools.
-        pool = request.app["knowledge_llm_pool"]
+        # Every production construction site sets knowledge_fetch_pool; a
+        # minimal/hand-built app missing it fails loudly rather than silently
+        # running URL sync through the extraction pool.
+        return web.json_response(
+            {
+                "error": "knowledge_fetch_pool is not configured on this application",
+                "code": "knowledge_fetch_pool_unavailable",
+            },
+            status=503,
+        )
     await _hand_off_under_gate(
         request, pipeline,
         lambda settled: _background_agent_sync(
@@ -3007,7 +3028,6 @@ async def _shutdown_knowledge_pools(app: web.Application) -> None:
     for key in (
         "knowledge_extraction_pool",
         "knowledge_fetch_pool",
-        "knowledge_llm_pool",
     ):
         pool = app.get(key)
         if pool is None or id(pool) in seen:
@@ -3034,16 +3054,11 @@ def setup_knowledge_routes(app: web.Application) -> None:
         cfg = KiroCrewConfig.load()
         extraction_pool = LLMPool(
             pool_size=cfg.knowledge.extraction_pool_size,
-            effort=DEFAULT_EXTRACTION_EFFORT,
-            use_config_pool_size=False,
-            # Seeded from knowledge.extraction_pool_size above, so it follows a
-            # later write to that key (applied at the next idle boundary).
-            track_config_pool_size=True,
+            effort_key="extraction_effort",
+            fallback_effort=DEFAULT_EXTRACTION_EFFORT,
+            config_pool_size_key="extraction_pool_size",
         )
-        fetch_pool = LLMPool(
-            pool_size=1,
-            use_config_pool_size=False,
-        )
+        fetch_pool = LLMPool(pool_size=1)
         embedder = _create_embedder(app)
         pipeline = IngestionPipeline(
             store=store,
@@ -3054,9 +3069,6 @@ def setup_knowledge_routes(app: web.Application) -> None:
         )
         app["knowledge_extraction_pool"] = extraction_pool
         app["knowledge_fetch_pool"] = fetch_pool
-        # Keep the old key as an extraction-only compatibility alias. Production
-        # URL sync uses knowledge_fetch_pool above.
-        app["knowledge_llm_pool"] = extraction_pool
         app["knowledge_embedder"] = embedder
         connectors: dict[str, "BaseConnector"] = {}
         # Local folder connector (always available)

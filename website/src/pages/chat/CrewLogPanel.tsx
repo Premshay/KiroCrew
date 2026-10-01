@@ -623,7 +623,7 @@ export function CrewLogTab({ slot }: { slot: string }) {
   // TWO edges, because two different things append to this session's log and one
   // signal cannot see both. `selectSlotStreamState` falls when the session's own
   // turn stops streaming; `selectComposerBusy` stays true while spawned work runs
-  // (chatSlice.ts:3923,3929) and falls when all of it drains, which is when a
+  // (selectors.ts in store/chat) and falls when all of it drains, which is when a
   // `subagent/spawned` entry gets closed. Watching only the composer meant a turn
   // that finished alongside a long-running subagent showed its pre-turn fold for
   // as long as that subagent lived; watching only the stream would miss the

@@ -140,7 +140,7 @@ Telegram and dashboard paths. Three rules:
 | Provider implementation | `voice_reply.synthesize_speech()`, `streaming_piper_reply()`, `streaming_voice_reply()`, `stream_pocket_speech()`, and `stitch_mp3s()` | Redacts text, selects a provider, streams local PCM, streams Pocket Ogg Opus through the local compatibility executable, and joins completed Polly chunks. |
 | Resident local voice | `piper_runtime.PiperRuntime`, `piper_worker.serve()` | Owns one sandboxed Piper model and serial framed requests, with cancellation, idle, model-change, and shutdown cleanup. |
 | Sentence cutter | `website/src/hooks/sentenceCutter.ts` | Pure boundary logic: where the next speakable span ends (see Dashboard auto-speak). |
-| Streaming playback | `website/src/hooks/useWebSocket.ts`, `website/src/lib/voicePlayback.ts` | Feeds streamed text through the cutter, serializes synthesis requests, coalesces pending requests, schedules PCM on one audio clock, and handles interruption. |
+| Streaming playback | `website/src/hooks/websocket/voicePlayback.ts`, `website/src/lib/voicePlayback.ts` | Feeds streamed text through the cutter, serializes synthesis requests, coalesces pending requests, schedules PCM on one audio clock, and handles interruption. `website/src/hooks/useWebSocket.ts` composes it and routes the `voice_*` frames and the stream and turn boundaries to it. |
 | Playback failures | `website/src/components/VoicePlaybackNotice.tsx` | Displays localized playback or provider failures and retains their machine code in the error report. |
 | Turn-taking hold | `website/src/hooks/useHandsFreeLoop.ts` and `website/src/pages/ChatPage.tsx` | Hands-free conversation mode: the mic stays closed while the reply speaks, with barge-in on a mic tap. |
 | Turn latency marks | `website/src/utils/voiceTurnMetrics.ts` | Debug-level per-turn spans: end-of-speech to first token and to first audio. |
@@ -149,10 +149,12 @@ Telegram and dashboard paths. Three rules:
 
 ## Dashboard auto-speak
 
-`useWebSocket` buffers `chat_chunk` text and, after it updates the Redux
-streaming message, scans the active slot for completed sentence boundaries. It
-submits only text beyond `voiceProgressRef.spokenLen` through
-`enqueueVoiceSynthesis()`. The progress record is keyed by slot and message
+The socket's chat-stream buffer (`website/src/hooks/websocket/streamBuffers.ts`)
+batches `chat_chunk` text and, after it updates the Redux streaming message,
+hands the active slot to the playback owner
+(`website/src/hooks/websocket/voicePlayback.ts`), which scans it for completed
+sentence boundaries. It submits only text beyond `voiceProgressRef.spokenLen`
+through `enqueueVoiceSynthesis()`. The progress record is keyed by slot and message
 identity: this prevents an old segment or a background slot from replaying text
 or resetting the active response.
 
@@ -356,7 +358,8 @@ before any audio has started. `useVoiceInput` also dispatches it when an actual
 batch or streaming recording starts, before microphone acquisition, so the
 recognizer does not capture ongoing synthesized speech. Hover prewarming does
 not interrupt playback. Clicking Read aloud while audio plays stops it.
-`useWebSocket` maps the event to `stopVoice()`, which stops scheduled PCM sources,
+The playback owner (`website/src/hooks/websocket/voicePlayback.ts`) maps the
+event to `stopVoice()`, which stops scheduled PCM sources,
 pauses an active media element, revokes queued blob URLs, invalidates pending
 decodes and synthesis requests, and sets `voiceMutedRef`.
 

@@ -90,13 +90,14 @@ export function pinHandoffY(foldY: number): number {
  * grounds that admit any other typed row: the user wrote it, and inside the reply
  * that followed it, it is the most recent thing they asked. This deliberately
  * differs from the turn-BOUNDARY scans that share its shape —
- * `isTurnBoundaryUser` and the `lastUserIdx` walk in `store/chatSlice.ts`, the
- * turn-head walk in `app-sdk/turnPolicyBlock.ts` — all of which must skip a steer
- * because they answer "where does this turn BEGIN", and a row injected into a
- * running turn cannot end that scan. The banner answers "what did I last ask",
- * so it takes the opposite answer. The row that OPENED a steered turn is not
- * lost: it is the head of the steer's own prompt run, so it is where clicking the
- * banner lands (`jumpAnchorIdx`) or one step further up the chain.
+ * `isTurnBoundaryUser` in `thinking.ts` and the `lastUserIdx` walk in
+ * `selectors.ts` (both in `store/chat`), the turn-head walk in
+ * `app-sdk/turnPolicyBlock.ts` — all of which must skip a steer because they
+ * answer "where does this turn BEGIN", and a row injected into a running turn
+ * cannot end that scan. The banner answers "what did I last ask", so it takes the
+ * opposite answer. The row that OPENED a steered turn is not lost: it is the head
+ * of the steer's own prompt run, so it is where clicking the banner lands
+ * (`jumpAnchorIdx`) or one step further up the chain.
  *
  * A subagent completion in OLDER scrollback was persisted under role `user`
  * (before the `subagent` role existed) and IS excluded, by SHAPE rather than by
@@ -374,7 +375,13 @@ export function promptPreview(content: string): string {
   return content
     .replace(FENCE_RE, ' … ')
     .replace(IMAGE_MD_RE, ' ')
-    .replace(/\[attached_file \d+\]\s*(\S+)/g, (_m, p: string) => p.split('/').pop() || '')
+    // The serializer's hair-space separators around an inline marker exist
+    // for the wire readers; drop only those (one right before a marker, one
+    // right after its path) so `(@a.txt), then` does not read `( a.txt ) , then`.
+    // A hair space anywhere else is the user's and falls to the whitespace
+    // pass below like any other space (fork GPT review).
+    .replace(/\u200a(?=\[attached_file \d+\])/g, '')
+    .replace(/\[attached_file \d+\]\s*(\S+)\u200a?/g, (_m, p: string) => p.split('/').pop() || '')
     .replace(/\s+/g, ' ')
     .trim()
 }

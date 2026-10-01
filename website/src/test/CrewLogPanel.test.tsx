@@ -291,11 +291,11 @@ describe('CrewLogTab', () => {
   })
 
   it('re-reads when the turn ends even while a subagent is still running', async () => {
-    // `selectComposerBusy` stays true while spawned work runs (chatSlice.ts:3923),
-    // so watching only that signal meant a turn which finished alongside a
-    // long-running subagent kept showing its PRE-turn fold for as long as the
-    // subagent lived -- minutes, not a moment. The session's own turn edge has to
-    // be watched as well.
+    // `selectComposerBusy` stays true while spawned work runs (selectors.ts in
+    // store/chat), so watching only that signal meant a turn which finished
+    // alongside a long-running subagent kept showing its PRE-turn fold for as long
+    // as the subagent lived -- minutes, not a moment. The session's own turn edge
+    // has to be watched as well.
     const store = createTestStore()
     store.dispatch(setActiveSlot(SLOT))
     renderWithProviders(<CrewLogTab slot={SLOT} />, { store })

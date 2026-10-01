@@ -1755,6 +1755,96 @@ localised lead, so the hand-off carries the text AWS returned.
 `DrivePage.test.tsx::error surfaces reach the agent`,
 `AwsControlPage.test.tsx::edge states`, and `ConsoleView.test.tsx` pin these.
 
+## The crew bundle builder
+
+`crew/packaging/` curates an owner's local crew into the four-entry bundle the crew image
+copies in: `agent.json`, `mcp.json`, `manifest.json` and `skills/`. It runs as
+`python -m packaging.build` with the crew directory on the import path (the
+`crew/__init__.py` docstring records why that package file has to exist), and it imports as
+`kiro_crew.apps.builtins.aws_control.crew.packaging.build`. `plan` writes a deny-by-default
+review template into `--out` and prints the decision set; `build`, the default verb, writes
+the bundle and prints `SMC_BUNDLE_JSON=<report path>` as its last line. Every refusal is an
+`ExportRefused`, printed as `refused: <reason>` with exit status 2.
+
+The build fails closed. It refuses at its entry on a platform with no descriptor-relative
+no-follow open (Windows, feature-detected rather than named). It refuses a read when
+`kiro_crew.hooks` -- the hard-link, sensitive-path and UNC authority -- is not importable, and
+it refuses an external prompt reference when `kiro_crew.security.is_sensitive_path` is not. It
+ships a skill or MCP server only when a
+signed plan selects it and its content still matches the pin the review recorded. And it
+refuses, rather than skips, anything it cannot read, scan or hash.
+
+### Builder composition and ownership
+
+`packaging.build` is the builder's only import path and patch surface. What it runs lives in
+the private package `packaging.pipeline`, one owner per responsibility, lowest layer first:
+
+| Owner | Holds |
+|---|---|
+| `pipeline/contract.py` | the bundle, plan and report versions, `PLAN_FILENAME`, the staging top-level names, the read ceiling, `ExportRefused` |
+| `pipeline/scan.py` | `scan_text` and its detectors: the local hard patterns, the canonical detector and redactor when importable, the bounded base64 decode pass, the bare-secret detector. A finding carries four characters of the match and its length, never the match |
+| `pipeline/sensitive.py` | `refused_by_name`, `refused_by_location` and the standalone floor `_looks_sensitive_standalone`, checked with the shared validator and never instead of it |
+| `pipeline/pinned.py` | the platform predicate and the entry refusal, redirect detection, the reparse-safe walk, per-component no-follow directory pins, the leaf readers |
+| `pipeline/destination.py` | the `--out` UNC screen, the parent check before a `mkdir`, and the one no-follow writer every plan, marker, report and staged leaf goes through |
+| `pipeline/hashing.py` | the skill content pin `_tree_hash`, that pin over the staged copy, and `bundle_digest` |
+| `pipeline/crew.py` | `_validated_crew_name`, `_refuse_unless_launchable`, `resolve_crew`, and the agent-spec read |
+| `pipeline/candidates.py` | skill and MCP candidate enumeration; a candidate carries its pin or the reason it can never be included |
+| `pipeline/plan.py` | the review template, the guarded `--allow` read, `merge_plans`, `verify` and the decision set |
+| `pipeline/prompt.py` | the `file://` persona read: the UNC and redirect screens before resolution, the fences on the one resolution, the read bound to the pinned anchor's identity |
+| `pipeline/spec.py` | `build_spec`: the inlined prompt, the dropped keys, the approved and cleaned MCP servers, the narrowed tool grants |
+| `pipeline/layout.py` | the staged leaf writes with their last-chance scan, and the selected-skill copy |
+| `pipeline/staging.py` | the per-run staging marker, the ownership proof by path and through a held descriptor, and the private-aside disposal that deletes only the tree that proof verified |
+| `pipeline/report.py` | the report schema, the check that an existing report is this tool's, the hard-link capability probe, the no-replace publish |
+| `pipeline/transaction.py` | `build_bundle` |
+| `pipeline/cli.py` | the two verbs and `main` |
+
+`build_bundle` is one transaction. It claims staging beside `--out` with `mkdir` and a marker
+naming this run, writes every staged leaf relative to the retained staging descriptor,
+re-hashes each selected skill's staged copy against its reviewed pin, and carries the
+operator's plan across. The previous bundle is moved into a run-private directory under the
+pinned parent and verified there before it is kept or deleted, the staging inode is confirmed
+before the pinned-parent rename that promotes it, and the report is published by exclusive
+hard link only after promotion. A refusal before promotion releases this run's staging tree
+and marker and leaves the previous bundle and report in place. The one partial success is a
+promoted bundle whose report did not publish: the report is then absent, and a previous
+report is removed only while its bytes are the ones this run read at the start.
+
+A read through the facade answers from the owner that defines the name, on each access,
+through `sys.modules`: no owner-defined name is bound in the facade, the one-storage rule
+`test_mirrored_owner_storage.py` enforces, and the names are declared to the type checker
+under `TYPE_CHECKING`. A write or a delete through it lands on that owner. Inside the pipeline
+an owner calls a function another owner defines through that owner's module, never through a
+copy imported by name, so `monkeypatch.setattr(build, ...)` reaches every caller the way it
+did when the builder was one module. Classes and constants are imported by name, so a write
+of one through the facade reaches no owner that imported it; neither does a write of a name
+the facade does not forward (such as `os`, which each owner binds for itself), and a write
+that may create the name cannot be undone, because its undo only deletes.
+`test_pipeline_composition.py` reads every test module under `test/` and every `tests`
+directory under `src/` that can reach the builder, resolves each write's target and attribute
+from the syntax tree, and refuses those shapes. It resolves `mock.patch`, `patch.object` and
+`patch.multiple` reached through any import alias, called or used as a decorator, with
+positional, keyword, f-string or concatenated targets; `monkeypatch.setattr` and `delattr`
+in the object and dotted-string forms; the `setattr` and `delattr` builtins; and assignment,
+augmented assignment and `del` of an attribute. The facade it recognises is an import of it,
+a `load_build` copy, a fixture or helper returning one, a helper parameter its callers fill
+with one, or an assignment chain to any of them. A write passing `create` as anything but
+`False` or `raising` as anything but `True`, or naming an attribute the source does not fix, is
+refused, and one deliberate demonstration is exempt by file and enclosing test. The
+standard-library names the one-module builder bound stay bound in the facade, so each still
+resolves there. Run as `python -m packaging.build` the facade is `__main__`, so it resolves its
+owners against `__package__` rather than `__name__`; run by file path (`python .../build.py`)
+it has no package to resolve them against and refuses with exit status 2, naming the
+`python -m` entry.
+
+The suites in `crew/packaging/tests/` load a throwaway copy of the whole package
+(`test_producer.load_build`) so a mutation test can disable one guard in whichever owner holds
+it; an anchor has to occur in exactly one builder file, and a copy leaves `sys.modules` when
+the next test loads one, never from a garbage-collection callback. Source rules read every
+builder file. `test_pipeline_composition.py` pins the frozen name inventory, the export table
+against the owners' own definitions, that the facade's own code reads no forwarded name as a
+bare global, that a loaded owner is read and written without calling
+`importlib.import_module`, the layer order, the late-binding rule and the write rule above.
+
 ## The crew container runtime
 
 `crew/runtime/` is the source of a Linux container image, not code the owner's
@@ -1811,14 +1901,45 @@ existed.
 
 The startup order is a correctness requirement rather than a preference:
 
-1. Gate the environment (path layout, model credential, sandbox) and install the
-   crew bundle. Nothing has started.
+1. Gate the environment (path layout, model credential, sandbox), point the task's
+   kiro home at `<data home>/kiro`, and install the crew bundle. Nothing has started.
 2. Write the container's own configuration. It must land after the bundle, because
    a bundle may ship config and the container's posture has to win on the keys it
    sets, and before the backend, which reads the file at boot.
 3. Start the backend. `wait_until_ready` returns only when the port answers **and**
    the boot secret file exists; process-alive is not ready.
 4. Start the front process.
+
+**The task owns its agent-spec directory, and that is what lets the backend write
+it.** `KIRO_HOME` is set to `<data home>/kiro`, so the crew's spec and Kiro Crew's own
+`kirocrew.json` share one directory under the volume. The default is wrong here and
+fails in a way nothing reports: with `KIRO_HOME` unset the specs resolve to the process
+HOME's `~/.kiro/agents`, which every instance under that `$HOME` shares, and a backend
+on a non-default data home (`KIROCREW_HOME=<data home>`) REFUSES to rewrite a shared
+agents directory -- the specs it writes pin the writer's data home into every managed
+MCP server entry, which breaks strict session identity for a default-home gateway
+(#9690). The refusal is correct and stays. Its consequence in the container was that the
+supervisor's crew spec landed in the shared directory carrying no ownership provenance,
+the backend read it as another home's, declined, and never wrote the default spec at
+all; the boot looked healthy and every turn died at `DerivedSpecStale: the default agent
+spec .../kirocrew.json is missing`.
+
+`<data home>/kiro` is that guard's own private-target case: `<data home>/kiro/agents` is
+exactly `config.paths.isolated_agents_dir(data home)`, a directory this task's teardown
+owns and shares with nobody, so the guard stands aside without being relaxed. The match
+is EXACT rather than by ancestry -- "anywhere beneath the data home" would read the
+machine-wide directory as private whenever the data home is an ancestor of it -- so the
+`kiro` segment is load-bearing and no other nesting works.
+
+Two processes have to agree on that one directory and they reach it by different routes:
+the supervisor's installer mirrors kiro-cli's own `$KIRO_HOME`-or-`~/.kiro` rule from the
+environment (it imports no `kiro_crew`), while the backend goes through Kiro Crew's
+resolver. So the value is exported into the supervisor's environment *and* set on the
+backend's from the settings, and the export then asserts that the installer's resolver
+answers the same path -- a rename on either side fails at boot instead of installing the
+crew where nothing serves it. A directory that cannot be created is a refusal too, since
+the alternative is the backend declining for a second reason minutes later with the
+failure attributed to the guard.
 
 There is no backup sidecar and no restore phase. Durability across task
 replacement is a capability the container does not have; the front still fetches a
@@ -1927,8 +2048,17 @@ healthy and is not.
 
 The front forwards to the gateway's own `POST /v1/chat/completions` with
 `{model, messages, id, stream}`, returning one JSON completion or an SSE stream.
-`model` is set from the DEPLOYED crew name and never copied from the payload, and
+`model` is derived from the DEPLOYED crew and never copied from the payload, and
 `id` is the slot id, which is what continues a conversation.
+
+The value it carries is the crew's AGENT ID -- `crew-<crew_name>`, the name inside the
+crew namespace the supervisor installs the crew's spec under -- rather than the bare
+crew name. The bare name resolves to whatever else in the agents directory declares it,
+and for a crew sharing a name with one of Kiro Crew's own derived specs that is the
+derived spec. The namespace does not leave this process in either direction: a customer
+addresses the crew by its own name, and the front puts that name back into the `model`
+of the completion it returns and of every projected chunk, so a client that reads the
+field and sends it again addresses the same crew.
 
 Facts the front must respect, each established by reading the gateway's source and
 each wrong once in a way that produced no error:
@@ -1998,6 +2128,33 @@ read the task role from its own environment and act as it. The model credential 
 removed on the same grounds, in both of its shapes: the identity reaches the engine
 from the crew's vault through the host auth callback, so the worker needs none in its
 environment.
+
+**The crew's spec is installed inside a namespace the derivation cannot own.** It lands
+at `<kiro agents>/crew-<crew_name>.json` and DECLARES `crew-<crew_name>`; `mcp.json` and
+`skills/` go to the data home unchanged. Kiro Crew derives specs of its own into the same
+agents directory -- `kirocrew.json`, `kirocrew-lite.json`, and the `kirocrew-worker.json`
+mirror it rebuilds from the default -- and rewrites them without reading who wrote what,
+so a crew occupying one of those names is installed, digest-checked and then replaced
+before the first turn. A crew called `kirocrew-worker` is not hypothetical: it is the
+crew the first deployment ships.
+
+The namespace covers the declared name as well as the filename because only one of them
+dispatches: kiro-cli and the gateway's snapshot of dispatchable agents both enumerate
+agents by the spec's declared `name`, so a file renamed without its name is reachable
+under no id at all -- the bare name is then declared twice and refused as ambiguous,
+while the namespaced one is declared by nothing and falls back to the default agent. The
+declared name is therefore the one field the install rewrites; every other key is the
+bundle's own, and the digest still covers the bundle's bytes in the image layer. A crew
+name whose namespaced id cannot fit the gateway's 64-character agent-name grammar is
+refused at boot rather than answering 400 per turn. `crew-` is free of every name Kiro
+Crew manages, and because the container imports no `kiro_crew` that claim is pinned by a
+test that imports both rather than by a comment.
+
+The derivation holds the other end: it refuses to overwrite a `kirocrew-worker.json` that
+does not carry the marks every derived mirror carries -- its declared name and a
+reference to the `kirocrew-work` server -- on the boot path and on the spawn path alike.
+Provenance, not existence, which is what covers a spec placed by hand or by an older
+exporter, neither of which the namespace reaches.
 
 **A reinstall replaces the bundle's own files and prunes nothing else.**
 `install_bundle` runs at every boot and the data home may be a persistent volume, so
@@ -2135,6 +2292,37 @@ reason: the harness strips the key from the relay's environment and the relay as
 host for a token over `_kiro/auth/getAccessToken`, answered by
 `acp/kas_host_auth.answer_get_access_token` inside the backend process.
 
+Seeding the vault is necessary and not sufficient. `kiro-cli acp` validates its OWN
+credential store before it offers an ACP handshake, so on a store it has never signed
+into it exits `rc=1` "You are not logged in" and that token request is never reached:
+the container answers `/health` 200 and every dashboard turn with
+`503 kiro_prerequisite_required`. So `kiro_login.seed_kiro_cli_login` runs immediately
+after `require_model_identity` and writes one row into that store
+(`$XDG_DATA_HOME/kiro-cli/data.sqlite3`, falling back to `$HOME/.local/share/...`;
+table `auth_kv`, plain JSON).
+
+**That row is a non-secret sentinel, not a copy of the credential.** It carries a
+labelled placeholder access token, no refresh token, and a fixed far-future expiry;
+nothing in it comes from the vault, and it takes no argument, so nothing in it is
+worth reading. That is sound because Crew is the auth owner: the engine raises its
+credential request on the wire and `answer_get_access_token` answers it from the
+vault, which the shipped binary confirms by logging `Auth: --auth=acp-callback
+(host-mediated refresh via _kiro/auth/getAccessToken)` with this exact row in the
+store. The row answers only "has this store been signed into".
+
+A real identity here would be strictly worse, and the reason is the same threat model
+as `build_backend_env`'s: this store is pinned OUT of the sandbox masking tiers on
+purpose, so a raw `open()` from a spawned shell reads it, and the model worker
+auto-approves every tool it calls on untrusted prompt content. A sentinel's expiry is also a fixed
+far-future constant rather than the vault's, so a long-lived task's later spawns pass
+the same check as its first, and an aged delivery the vault can still renew does not
+become a startup refusal.
+
+It is written in the container supervisor and nowhere else, which is what keeps it
+internal-only: a desktop host signs kiro-cli in by itself. Every failure inside it is
+a startup refusal, because the alternative is the 503 above with a healthy-looking
+task in front of it.
+
 **That is defence in depth, not a licence to drop the sandbox.** What decides whether
 an auto-approved worker is safe is whether it can REACH a credential, not whether one
 is resident in its own environment, and the vault is a route the container cannot
@@ -2180,6 +2368,17 @@ backend -- stop new turns arriving, then let the backend drain and flush -- and
 anything still alive afterwards is an escaped worker, which the teardown sweeps by
 process group over bounded rounds, because a killed process's children reparent to
 PID 1 and surface in the next round.
+
+A child in the supervisor's OWN process group is withheld from that discovery. The sweep's
+remedy is a group signal, and on its own group that SIGKILLs the supervisor -- so the
+remaining rounds never run and every real orphan is left alive. One such child is enough,
+and it is a reachable shape: a library the supervisor itself uses can hold a pool of helper
+children (the sensitive-path resolver keeps several), and those are its children in its own
+group. Nothing the sweep exists to reach is lost, because every one of those is in a group of
+its own -- an escaped worker by `setsid`, the front and backend by being spawned into theirs
+-- and a same-group child dies with the supervisor when it exits, which is the next thing to
+happen. The group is read from the same `/proc` line the parent is, so a candidate has one
+source of truth and no second syscall on a pid that may already be gone.
 
 The exit code distinguishes the reasons, because it is the only thing the
 platform reads: a stop signal and a spent task lifetime are the success cases, and

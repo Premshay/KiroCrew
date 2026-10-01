@@ -1194,11 +1194,16 @@ async def _run_hook_inner(
             or prior.memory_mode != "persistent"
         ):
             raise ValueError("Hook session no longer matches its registered execution")
-        # Establishing: `execution` is the identity captured when the hook was
-        # registered, and the guard above refuses when the record disagrees with it,
-        # so a forged record raises here rather than being vouched.
+        # Publish the captured identity WITHOUT vouching. A vouched entry is only
+        # ever read for the CALLER slot of `create_session`'s own-store admission,
+        # and a hook session can never be that caller: its key is a `hook:` synthetic
+        # (see `_HOOK_SESSION_PREFIX`) belonging to an ephemeral session that
+        # `_run_hook_agent` destroys after the turn, so it is never a dashboard slot
+        # and `caller_slot_key` cannot resolve it. Vouching it would only occupy a
+        # slot in the capped vouched map for an entry nothing can read. Publishing the
+        # record still lets the hook turn run.
         bind_session_execution(
-            session_key, execution, replace_existing=True, expected=prior, vouch=True
+            session_key, execution, replace_existing=True, expected=prior, vouch=False
         )
 
     await asyncio.to_thread(bind_captured)

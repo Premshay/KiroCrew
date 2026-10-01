@@ -34,8 +34,9 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
+from kiro_crew import runtime_death
 from kiro_crew.acp.client import AcpError
-from kiro_crew.agent_discovery import list_agents
+from kiro_crew.agent_discovery import AgentInfo, list_agents
 from kiro_crew.config import live
 from kiro_crew.config.loader import ACTIVATION_MENTION, ACTIVATION_OFF
 from kiro_crew.config.sections import _clamp_pct
@@ -66,6 +67,7 @@ from kiro_crew.messaging.dispatch import (
     admit_inbound_callback,
     build_auto_approve,
     build_directive_consumer,
+    charge_turn_failure,
     consume_reinjection,
     delivery_is_muted,
     driver_turn_landed,
@@ -428,6 +430,37 @@ _MODEL_PICKER_MAX = 50
 #: are this account's own models and this machine's own agent specs, not
 #: catalogues, so one bound fits both.
 _PICKER_LIMIT = 24
+
+#: An agent kept out of the channel ``/agent`` picker BY DEFAULT: the picker
+#: offers the agents a person driving from Telegram actually chooses between,
+#: not Kiro Crew's own machinery. Two disjoint signals, both authoritative on
+#: their own field rather than on the display name:
+#:
+#: * ``kirocrew_owned`` — the Kiro Crew-generated internal agents (the chat
+#:   agent, the background/heartbeat/conductor/worker/knowledge specs). This is
+#:   the ``name in OWNED_KIRO_AGENT_FILES`` flag ``list_agents`` already sets, so
+#:   a user's OWN hand-authored ``kirocrew-custom.json`` — which merely shares
+#:   the ``kirocrew`` name prefix and is not owned — is NOT hidden. The prefix
+#:   would over-match it; the ownership flag is exactly the set to hide.
+#: * an app-installed agent, whose spec is materialised under the
+#:   ``<app>--<agent>.json`` link filename (see ``apps.bridges``/``apps.execution``).
+#:   These belong to an installed app, not to the person picking an agent, so
+#:   they are hidden alongside the internals. The double-dash is a filename
+#:   convention Kiro Crew writes, not a name a user types, so matching the
+#:   FILENAME (not the possibly-bare declared name) is what identifies them.
+_APP_AGENT_LINK_SEP = "--"
+
+
+def _agent_is_internal(info: AgentInfo) -> bool:
+    """Whether *info* is a system/internal agent hidden from the channel picker.
+
+    See :data:`_APP_AGENT_LINK_SEP`. Purely a function of the roster row, so the
+    picker and any test agree on one definition.
+    """
+    if info.kirocrew_owned or info.source == "kirocrew":
+        return True
+    return _APP_AGENT_LINK_SEP in info.filename
+
 
 #: ``/title`` ceiling. The dashboard sidebar row truncates well before this; the
 #: cap is here so a persisted transcript never carries an unbounded title.
@@ -1149,6 +1182,13 @@ class TelegramDispatcher:
         # on _acquired so we never release a semaphore we didn't hold. Mirrors
         # slack/transport_dispatch.py.
         _acquired = False
+        # The provider THIS turn acquired, for the failure handler's attribution
+        # question. Bound before the try so every handler can read it -- an
+        # attribution flag read on a path its assignment cannot reach is an
+        # UnboundLocalError inside an except arm, not a guard. Stays None when
+        # get_or_create never returned, and an unattributable death charges as
+        # before.
+        _turn_provider: object | None = None
         failure_reason: str | None = None
         attachment_temp_paths: list[str] = []
         # Post-compaction re-injection bookkeeping for the finally: whether this
@@ -1180,6 +1220,12 @@ class TelegramDispatcher:
                 model=(None if resumed_key is not None else self._model_pref.get(route) or None),
             )
             _acquired = True
+            # Hold the provider this turn obtained, for the failure handler's
+            # attribution question. Captured HERE rather than looked up when a
+            # failure is handled: the recovery paths replace a dead session, so a
+            # lookup at failure time answers for the replacement and the question
+            # silently becomes "was the NEW runtime shared".
+            _turn_provider = provider
             if resumed_key is None or channel_namespace_of(session_key):
                 # The session's crew log, opened the moment the allocation lands
                 # and before ANY further await: the work ledger appends every write
@@ -1343,6 +1389,11 @@ class TelegramDispatcher:
             # ── Post-turn bookkeeping (each guarded so a failure here can't
             # fall through to the except and re-record the successful turn). ──
             self.sessions.record_success(session_key)
+            # Beside the counter it stands in for: a landed turn clears the
+            # shared-death streak exactly as it clears the consecutive-failure
+            # count, so the streak stays a consecutive run rather than a lifetime
+            # total whose bound is permanently tripped.
+            runtime_death.clear_shared_deaths(session_key)
             # The prompt (with any re-injected context) reached the model and
             # the turn completed, so the finally must NOT restore the flag --
             # unless the user cancelled it, which discards that prompt.
@@ -1568,7 +1619,18 @@ class TelegramDispatcher:
             # generic retry text; everything else stays generic (None).
             failure_reason = _user_safe_failure_reason(exc)
             if _acquired:
-                await self.sessions.record_failure(session_key)
+                # A dying runtime reaches this generic handler as one more
+                # exception, so without the attribution question every tenant of
+                # one process charges its own breaker for a single process event.
+                # ``_turn_provider`` is the one THIS turn acquired, never a lookup
+                # made while handling the failure.
+                await charge_turn_failure(
+                    self.sessions,
+                    session_key,
+                    exc=exc,
+                    provider=_turn_provider,
+                    channel_type="telegram",
+                )
                 Stats().inc_message_failed()
         finally:
             # An approval window the driver never awaited -- the prompt went out
@@ -2130,10 +2192,10 @@ class TelegramDispatcher:
         can list several principals': a GROUP chat gives every member one chat address
         and one session key, so a drain answering one member must leave the others'
         lines -- and the entry that is their only handle -- alone. REQUIRED and
-        keyword-only, unlike the registry transition it forwards to, which keeps a
-        default for a caller that genuinely cannot name a principal: this wrapper has
-        exactly one caller and that caller always can, so an omission is a type error
-        rather than a silent return to retiring the whole bubble.
+        keyword-only, the same way the registry transition it forwards to spells it:
+        this wrapper has exactly one caller and that caller always can name the
+        principal, so an omission is a type error rather than a silent return to
+        retiring the whole bubble.
 
         ``chat_id`` is the chat the receipt BUBBLE lives in, which the drain takes
         from the queued entry's own origin rather than from the turn that opened the
@@ -2144,7 +2206,7 @@ class TelegramDispatcher:
         """
         assert self.client is not None
         await self._queue.flip_answering_locked(
-            session_key, self._receipt_surface(chat_id, None), answered, deferred, owner
+            session_key, self._receipt_surface(chat_id, None), answered, deferred, owner=owner
         )
 
     async def _handle_dashboard(
@@ -2817,12 +2879,20 @@ class TelegramDispatcher:
 
     @staticmethod
     def _installed_agent_names() -> list[str]:
-        """Every installed agent spec's name, user-level scope.
+        """Selectable agent names for the picker, user-level scope, sorted.
+
+        System and internal agents are excluded (:func:`_agent_is_internal`):
+        the picker offers the agents a person chooses between, so Kiro Crew's own
+        machinery and app-installed agents do not occupy its slots and crowd out
+        the user's own agents. The classification is on the roster row's fields,
+        not the display name, so a user's own ``kirocrew``-prefixed agent stays.
 
         ``list_agents`` caches on a directory signature but still reads and
         parses each JSON on a miss, so callers run it off the loop.
         """
-        return sorted({info.name for info in list_agents() if info.name})
+        return sorted(
+            {info.name for info in list_agents() if info.name and not _agent_is_internal(info)}
+        )
 
     def _agent_choices(self, names: list[str]) -> tuple[tuple[str, str], ...]:
         """``(agent_id, label)`` rows to offer, "" first for the configured default.
@@ -2831,6 +2901,12 @@ class TelegramDispatcher:
         can actually load — a static catalogue would offer an agent whose spec is
         absent and fail at the next session start, which is exactly the failure
         mode the ``/model`` picker avoids by listing only advertised ids.
+
+        Only SELECTABLE rows are returned, and this is the exact set stored in
+        the picker's resolution table: cut to :data:`_PICKER_LIMIT` so the count
+        fits Telegram's keyboard. The count hidden by that cut is surfaced by the
+        caller as a separate, non-selectable keyboard row — it must not live here,
+        or a press would resolve its index back to an agent.
         """
         configured = self._configured_agent()
         rows: list[tuple[str, str]] = [("", f"Default ({configured})")]
@@ -2866,6 +2942,14 @@ class TelegramDispatcher:
             [{"text": f"{'• ' if aid == current else ''}{label}", "callback_data": f"g:{index}"}]
             for index, (aid, label) in enumerate(choices)
         ]
+        # Make truncation VISIBLE instead of silent (the reported harm). More
+        # selectable agents than fit are cut in ``_agent_choices``; this trailing
+        # row names how many were dropped. Its ``callback_data`` matches no picker
+        # prefix, so a press is inert — the callback is already acked, and it is
+        # deliberately NOT a ``g:`` index that would resolve back to an agent.
+        hidden = len(names) - _PICKER_LIMIT
+        if hidden > 0:
+            keyboard.append([{"text": f"… and {hidden} more not shown", "callback_data": "noop"}])
         message_id = await self._reply(
             chat_id, header, thread=thread, reply_markup={"inline_keyboard": keyboard}
         )

@@ -99,11 +99,15 @@
     "session_fork": "Fork session",
     "session_stop": "Stop session",
     "session_set_model": "Set session model",
+    "session_status": "Read session roster",
+    "session_revive": "Reopen session",
     "session_close": "Close session",
     "session_send": "Send to session",
     "session_adopt": "Adopt session",
+    "session_broadcast": "Broadcast to sessions",
     "session_release": "Release session",
-    "session_read_message": "Read session message"
+    "session_read_message": "Read session message",
+    "session_summary": "Read session summary"
   },
   "kirocrew-cron": {
     "cron_list": "List schedules",

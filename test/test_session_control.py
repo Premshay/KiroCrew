@@ -990,6 +990,23 @@ class TestTheRoutesRequireTheInternalSecret:
         assert resp.status == 500
         assert self._body(resp)["code"] == "history_save_failed"
 
+    @pytest.mark.parametrize("code", ["reopen_failed", "reopen_rollback_failed"])
+    def test_revive_keeps_its_503_instead_of_degrading_to_400(self, tmp_path, monkeypatch, code):
+        """`revive_session` promises 503 for a reopen write that could not land and
+        for a refused resume whose closed marker could not be confirmed restored;
+        the route must forward that status, since 400 would tell the caller it
+        sent a bad request when the remedy is to retry or re-close."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/revive")
+
+        async def _boom(*_a, **_kw):
+            raise sc.SessionControlError("try again", status=503, code=code)
+
+        monkeypatch.setattr(sc, "revive_session", _boom)
+        resp = asyncio.run(handlers_sc.api_session_control_revive(req))
+
+        assert resp.status == 503
+        assert self._body(resp)["code"] == code
+
     def test_send_without_the_secret_is_forbidden(self, tmp_path):
         req = self._request(tmp_path, internal=False, path="/api/session-control/send")
         resp = asyncio.run(handlers_sc.api_session_control_send(req))
@@ -3532,6 +3549,55 @@ def test_create_files_the_slot_at_birth(tmp_path):
         "the placement must reach the persist-at-birth metadata -- the save path "
         "writes nothing for an empty session, so this line is the only record"
     )
+
+
+def test_create_inherits_the_folders_project_dir(tmp_path):
+    """A dispatched session filed in a project folder runs in that project."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    folder_project = tmp_path / "folder-project"
+    folder_project.mkdir()
+    _folder(
+        state,
+        "fold00000002",
+        "Project",
+        project_dir=str(folder_project),
+    )
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000002")
+    )
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert child.workspace == caller.workspace
+    assert child.project == str(folder_project.resolve())
+    written = state.conversation_log.get_metadata(slot_history_key(child))
+    assert written.get("project") == str(folder_project.resolve())
+
+
+def test_create_inherits_an_ancestor_folders_project_dir(tmp_path):
+    """Project inheritance follows the same nearest-ancestor rule as dashboard creation."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    folder_project = tmp_path / "ancestor-project"
+    folder_project.mkdir()
+    _folder(
+        state,
+        "fold00000003",
+        "Project",
+        project_dir=str(folder_project),
+    )
+    child_folder = _folder(state, "fold00000004", "Worker")
+    child_folder["parent_id"] = "fold00000003"
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000004")
+    )
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert child.project == str(folder_project.resolve())
 
 
 def test_create_refuses_an_unknown_folder(tmp_path):

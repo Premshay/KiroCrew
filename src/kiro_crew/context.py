@@ -86,7 +86,6 @@ if TYPE_CHECKING:
     from kiro_crew.agent_sdk import ContextPromptProvider
     from kiro_crew.channel_history import ChannelHistory
     from kiro_crew.history import ConversationLog
-    from kiro_crew.session import SessionManager
     from kiro_crew.vector_memory import VectorMemoryStore
 
 logger = logging.getLogger(__name__)
@@ -443,22 +442,21 @@ async def _build_store_vectors(name: str) -> "VectorMemoryStore | None":
             # database must remain a visible loss rather than being recreated by
             # the lazy opener.
             require_memory_store(name)
-            options: dict[str, Any] = dict(
-                confidence_threshold=mem.semantic_confidence_threshold,
-                extra_prefixes=mem.semantic_keys or None,
-                episodic_limit=mem.episodic_max_results,
-                embedding_dim=mem.embedding_dim,
-                decay_rates=mem.decay_rates or None,
-            )
+            # Tuning comes from `config=cfg`, applied through the same `reconfigure`
+            # the live reload calls, so boot and reload cannot drift apart on a
+            # hand-copied list.
             if declaration.memory_version == 2:
                 store = open_member_database(
                     resolve_store_path(name),
                     member_id=declaration.owner_member_id,
                     store_id=name,
-                    **options,
+                    embedding_dim=mem.embedding_dim,
+                    config=cfg,
                 )
             else:
-                store = VectorMemoryStore(db_path=resolve_store_path(name), **options)
+                store = VectorMemoryStore(
+                    db_path=resolve_store_path(name), embedding_dim=mem.embedding_dim, config=cfg
+                )
                 store.init()
             if cancelled.is_set():
                 return None
@@ -565,18 +563,30 @@ UNTRUSTED_CALENDAR_FENCE_CLOSE = ">>>END_UNTRUSTED_CALENDAR_EVENT"
 _CALENDAR_FENCE_OPEN_RE = _fence_marker_regex(UNTRUSTED_CALENDAR_FENCE_OPEN)
 _CALENDAR_FENCE_CLOSE_RE = _fence_marker_regex(UNTRUSTED_CALENDAR_FENCE_CLOSE)
 
+# Delimiters that wrap the agent's own checklist task texts when the dashboard
+# re-states them to a fresh or live session (``_ChatSlot.todo_recovery_prompt``
+# / ``todo_sync_prompt``). A task text is whatever the agent typed into its
+# todo_list tool, which can have been copied from a file or a page, so it is
+# re-sent as data inside this fence, never as an instruction.
+UNTRUSTED_TODO_FENCE_OPEN = "<<<UNTRUSTED_TODO_TEXT"
+UNTRUSTED_TODO_FENCE_CLOSE = ">>>END_UNTRUSTED_TODO_TEXT"
+_TODO_FENCE_OPEN_RE = _fence_marker_regex(UNTRUSTED_TODO_FENCE_OPEN)
+_TODO_FENCE_CLOSE_RE = _fence_marker_regex(UNTRUSTED_TODO_FENCE_CLOSE)
+
 _UNTRUSTED_FENCE_RES: tuple[re.Pattern[str], ...] = (
     _THREAD_FENCE_CLOSE_RE,
     _THREAD_FENCE_OPEN_RE,
     _CALENDAR_FENCE_CLOSE_RE,
     _CALENDAR_FENCE_OPEN_RE,
+    _TODO_FENCE_CLOSE_RE,
+    _TODO_FENCE_OPEN_RE,
 )
 
 
 def _neutralize_fence_markers(text: str) -> str:
     """Replace Unicode-normalized variants of every untrusted fence in *text*.
 
-    Covers the thread-parent and calendar-event fences, open and close. The
+    Covers the thread-parent, calendar-event and todo-text fences, open and close. The
     shared marker matcher supplies NFKC, default-ignorable removal, and
     original-coordinate spans; the replacement remains fence-specific.
     """
@@ -650,6 +660,13 @@ _STRUCTURAL_MARKER_RES: tuple[re.Pattern[str], ...] = (
     # required hyphen separator, per the variable-tail convention above.
     re.compile(r"\[\s*FOLDER\s*STEERING\s*[-]{1,2}", re.IGNORECASE),
     re.compile(r"\[\s*END\s*FOLDER\s*STEERING\s*\]", re.IGNORECASE),
+    # The checklist blocks the runner prepends for a fresh or live session
+    # (``_ChatSlot.todo_recovery_prompt`` / ``todo_sync_prompt``). Minted AFTER
+    # the egress scrub, like folder steering, so a copy in a fetched page or a
+    # tool result is neutralized and only the gateway's own block carries the
+    # frame. The em dash the block uses folds to ``-`` before matching.
+    re.compile(r"\[\s*TASK\s*CHECKLIST\s*[-]{1,2}", re.IGNORECASE),
+    re.compile(r"\[\s*END\s*TASK\s*CHECKLIST\s*\]", re.IGNORECASE),
 )
 _STRUCTURAL_MARKER_NEUTRALIZED = "[marker-removed]"
 
@@ -1526,35 +1543,6 @@ def _build_stop_event_notes(conversation_log: "ConversationLog", session_key: st
     notes.reverse()
     return "\n".join(notes) + "\n\n"
 
-
-# Budget tradeoff: 100 user+assistant msgs covers P90 of sessions.
-# Role filtering excludes tool display titles, so the budget is spent
-# on actual conversation content.
-_COMPRESSION_MAX_MESSAGES = 100
-_HEAD_TAIL_MESSAGES = 2  # verbatim head/tail kept around compressed middle
-
-_COMPRESSION_PROMPT_PREFIX = """\
-You are a conversation compressor. Given a chat transcript and the user's \
-latest query, produce a compressed summary that preserves ALL of the following:
-
-- File paths, URLs, branch names, package names (verbatim)
-- Decisions made and their rationale
-- Code snippets discussed or modified (abbreviated, keep key lines)
-- Error messages and their resolutions
-- Action items and status (done / in-progress / pending)
-- Names, aliases, ticket IDs, CR numbers
-- Any factual information the user or assistant stated
-
-Drop:
-- Greetings, filler, acknowledgments ("sure", "got it", "let me check")
-- Redundant tool output (keep only the conclusion)
-- Build logs (keep only pass/fail and error lines)
-- Repeated explanations of the same concept
-
-Format: dense paragraphs grouped by topic. Bullet points for lists of \
-facts. File paths in backticks.
-
-Respond with ONLY the compressed summary, no preamble."""
 
 # Docs directory bundled inside the kiro_crew package
 _BUNDLED_DOCS_DIR = Path(__file__).resolve().parent / "docs"
@@ -2513,11 +2501,10 @@ _MEMBER_HOW_YOU_WORK = _MEMBER_HOW_YOU_WORK_COMMON + _MEMBER_BRIEFING_ITEM
 def _template_selected_on_member_store(execution_context: Any) -> bool:
     """Whether *execution_context* runs a member's store under a selected TEMPLATE.
 
-    The one predicate behind withholding the member operating protocol, read by
-    every ``_build_member_section`` caller. A member's memory identity and its
+    One of the two reasons :func:`_desk_withheld` gives for delivering a member
+    section without its desk layers. A member's memory identity and its
     persona are two fields of one record: ``member_id`` (bound to the store) says
     whose memory this is, ``selection_kind`` says what was picked to run it. A
-    member picked BY NAME runs its own desk and gets the whole section. A
     template picked on a member's store — a ``session_create(agent=...)`` child
     or a ``spawn_run(agent=...)`` delegate of a member — is that member's
     delegate sent to do the work: it keeps the member's identity, its
@@ -2530,15 +2517,47 @@ def _template_selected_on_member_store(execution_context: Any) -> bool:
     alone, and no record field can say "this member, under that template"
     without losing the member -- and losing the member drops its rules along
     with its persona. The ``session_create`` arm therefore keeps such a member's
-    selection and changes only the template, so that child keeps its whole
-    desk; a ``spawn_run(agent=...)`` child of such a member is a plain template
-    run on the parent's store and has no member section at all.
+    selection and changes only the template. That child is not a template
+    selection, so this predicate is False for it; it still loses the desk
+    layers, because the surface half of :func:`_desk_withheld` answers for it
+    (no caller names its desk). A ``spawn_run(agent=...)`` child of such a member
+    is a plain template run on the parent's store and has no member section at
+    all.
     """
     return (
         execution_context is not None
         and execution_context.member_id is not None
         and execution_context.selection_kind == "template"
     )
+
+
+def _desk_withheld(execution_context: Any, desk_member: str) -> bool:
+    """Whether this turn's member section is identity and permanent rules ONLY.
+
+    The one predicate behind withholding the member DESK — layer 2
+    (``[HOW YOU WORK]``) and layer 4 (``[CURRENT ASSIGNMENT]``, the agent-writable
+    briefing) — read by every ``_build_member_section`` caller. Identity and
+    ``[PERMANENT RULES]`` follow the member's STORE: the execution record's owner
+    (``member_id``, or ``selection_name`` when ``selection_kind == "member"``)
+    receives them on every surface, because the user's bounds on a member follow
+    its memory. The desk follows the SURFACE: the two layers describe how the
+    member runs its own DM thread ("this DM thread is your front desk", "keep
+    your working memory in the briefing file"), so they are delivered only where
+    the caller names that thread by passing ``member=`` — the dashboard's
+    ``mode == "member"`` slot does, an ordinary chat that merely resolved to a
+    crew alias does not, and neither does a cron, channel or delegated turn whose
+    owner comes from the record alone.
+
+    Two reasons withhold, either suffices:
+
+    * *desk_member* is empty — no caller named this turn as the member's desk. The
+      stock ``default`` alias resolves every plain dashboard chat to
+      ``selection_kind == "member"``; without this half every such chat became a
+      member desk that rewrote the briefing file from an ordinary conversation.
+    * :func:`_template_selected_on_member_store` — the record runs the member's
+      store under an explicitly selected template (the member's delegate).
+    """
+    return not desk_member or _template_selected_on_member_store(execution_context)
 
 
 # Runtime sources whose transcript renders tool-call cards (and therefore the
@@ -2770,102 +2789,6 @@ def build_cancelled_turn_preamble(
     return "\n".join(lines)
 
 
-async def compress_thread_history(
-    conversation_log: "ConversationLog",
-    session_key: str,
-    query: str,
-    sessions: "SessionManager",
-    *,
-    exclude_last_n: int = 0,
-    model_window: int | None = None,
-) -> str | None:
-    """Compress full thread history via background LLM call.
-
-    ``is_new`` in callers means a new kiro-cli process (or dashboard tab)
-    attached to an *existing* Slack thread — not a brand-new conversation.
-    The thread already has history from prior processes, so we compress it
-    to fit within the context window of the fresh session.
-
-    Returns the compressed summary string, or None on failure (callers
-    fall back to raw truncation).  This is the ONLY async function in
-    this module — callers await it and pass the result into the sync
-    ``build_session_context`` / ``build_message`` methods.
-
-    The output uses a head/tail pattern: the first and last
-    ``_HEAD_TAIL_MESSAGES`` are kept verbatim while the middle is
-    LLM-compressed, preserving both conversation opening context and
-    the most recent exchanges.
-
-    *exclude_last_n* is forwarded to ``conversation_log.recent`` to drop
-    the just-flushed current-turn user message from history.
-    """
-    from kiro_crew.llm_helpers import (  # circular import
-        background_turn,
-        stream_and_collect,
-    )
-
-    compressed_cap = _resolve_caps(model_window).compressed_history
-
-    # Off-thread because the per-role quota needs the WHOLE file: a tail slice
-    # cannot bound each role, so this read cannot be the cheap one.
-    recent = await asyncio.to_thread(
-        _recall_rows,
-        conversation_log,
-        session_key,
-        conv_max=_COMPRESSION_MAX_MESSAGES,
-        exclude_last_n=exclude_last_n,
-    )
-    if not recent:
-        return None
-
-    lines: list[str] = []
-    for m in recent:
-        # Compression path: no per-message cap, no code stripping.
-        # The LLM compressor sees full content and decides what to keep.
-        lines.append(f"{m['role'].title()}: {m['content']}")
-    transcript = "\n".join(lines)
-
-    if len(transcript) <= compressed_cap:
-
-        transcript, _ = redact_exfiltration_urls(transcript)
-        transcript, _ = redact_credentials(transcript)
-        return transcript.translate(_MULTIBYTE_TABLE)
-
-    head_lines = lines[:_HEAD_TAIL_MESSAGES]
-    tail_lines = lines[-_HEAD_TAIL_MESSAGES:] if len(lines) > _HEAD_TAIL_MESSAGES else []
-
-    prompt = (
-        _COMPRESSION_PROMPT_PREFIX
-        + f"\n\nTarget {compressed_cap} characters max."
-        + "\n\n## Latest user query (for relevance weighting)\n"
-        + query
-        + "\n\n## Transcript to compress\n"
-        + transcript
-    )
-
-    try:
-        async with background_turn(
-            sessions, task="thread_compress", agent="kirocrew-lite"
-        ) as client:
-            result = await stream_and_collect(client, prompt)
-            if not result:
-                return None
-
-            parts: list[str] = []
-            if head_lines:
-                parts.append("## Thread start (verbatim)\n" + "\n".join(head_lines))
-            parts.append("## Compressed history\n" + result[:compressed_cap])
-            if tail_lines:
-                parts.append("## Recent exchanges (verbatim)\n" + "\n".join(tail_lines))
-            final = "\n\n".join(parts)
-            final, _ = redact_exfiltration_urls(final)
-            final, _ = redact_credentials(final)
-            return final.translate(_MULTIBYTE_TABLE)
-    except Exception:
-        logger.warning("Thread history compression failed", exc_info=True)
-        return None
-
-
 # ── Provider-Agnostic Session Replay ──
 
 
@@ -3014,11 +2937,8 @@ def _recall_rows(
     reference is the only thing that would arrive: either as a path the prompt
     builder re-inlines -- resurrecting an image a compaction already dropped --
     or, once the file is gone, as prose naming a picture the model cannot see.
-    Stripping HERE rather than at each consumer is what makes the guarantee hold
-    for all three of them: this recall feeds both the thread-history fallback in
-    ``build_session_context`` and the transcript ``compress_thread_history``
-    hands to the LLM compressor (which returns it VERBATIM under the cap, and
-    above it would be free to narrate a picture it never saw).
+    Stripping HERE is what makes the guarantee hold for its consumer, the
+    thread-history fallback in ``build_session_context``.
     """
     messages = conversation_log.read_messages(session_key)
     if exclude_last_n > 0:
@@ -3617,7 +3537,7 @@ class ContextBuilder:
         *,
         strict: bool = False,
         include_briefing: bool = True,
-        template_selected: bool = False,
+        desk_withheld: bool = False,
     ) -> str:
         """Assemble the four-layer identity for a member's bound execution.
 
@@ -3638,16 +3558,18 @@ class ContextBuilder:
         4. ``[CURRENT ASSIGNMENT]`` — member-owned working memory, read
            (capped) from the member's own agent-writable briefing file.
 
-        ``template_selected`` is the verdict of
-        :func:`_template_selected_on_member_store` for the execution being
-        built: the member's store is running under an explicitly selected
-        template, so the section is the member's identity and rules ONLY. Layers
-        2 and 4 describe how the member runs its own desk — the desk protocol's
-        "hand substantial work to a separate session" item is what a template
-        picked to do that work must not be told — so both are withheld, with no
-        placeholder and no briefing read. Layer 1 stays because the memory the
-        delegate reads and writes is that member's, and layer 3 stays because
-        the user's bounds on a member follow its memory, not its template.
+        ``desk_withheld`` is the verdict of :func:`_desk_withheld` for the turn
+        being built: the section is the member's identity and rules ONLY. Layers
+        2 and 4 describe how the member runs its own desk — the DM thread — so
+        both are withheld, with no placeholder and no briefing read, when no
+        caller named this turn as that desk (an ordinary chat that resolved to
+        the crew alias, a cron, channel or delegated turn) or when the store runs
+        under an explicitly selected template (the desk protocol's "hand
+        substantial work to a separate session" item is what a template picked
+        to do that work must not be told). Layer 1 stays, minus the sentence
+        that describes the DM thread, because the memory the turn reads and
+        writes is that member's; layer 3 stays because the user's bounds on a
+        member follow its memory, not its surface or template.
 
         V1 retains its existing optional-layer failure behavior. V2 passes
         ``strict=True`` with a stable member ID, never a configured-name fallback,
@@ -3700,10 +3622,10 @@ class ContextBuilder:
         # around it (item 6 above, the placeholder below): where the pinned
         # briefing read fails closed (Windows — member_briefing_supported),
         # instructing upkeep of a never-injected file is a futile loop, so the
-        # section says the layer is unavailable instead. A template-selected
-        # delegate gets neither the layer nor a placeholder, so its briefing
+        # section says the layer is unavailable instead. A turn with the desk
+        # withheld gets neither the layer nor a placeholder, so its briefing
         # is not read at all.
-        briefing_ok = include_briefing and not template_selected and member_briefing_supported()
+        briefing_ok = include_briefing and not desk_withheld and member_briefing_supported()
         briefing = ""
         briefing_path = ""
         if briefing_ok:
@@ -3736,15 +3658,19 @@ class ContextBuilder:
             identity.append(f"Your role: {description}")
         if triggers:
             identity.append(f"Your remit — the work that belongs to you: {triggers}")
-        identity.append(
-            "This DM thread is your durable working relationship with the user. It "
-            "continues across sessions: remember what was discussed, refer back to it "
-            "naturally, and speak as a colleague who owns their work — never as a "
-            "support bot."
-        )
+        if not desk_withheld:
+            # The one identity sentence that describes the DM thread itself: an
+            # ordinary chat, a cron turn or a delegate on this member's store is
+            # not that thread, so the sentence goes with the desk layers.
+            identity.append(
+                "This DM thread is your durable working relationship with the user. It "
+                "continues across sessions: remember what was discussed, refer back to it "
+                "naturally, and speak as a colleague who owns their work — never as a "
+                "support bot."
+            )
 
         parts = ["\n".join(identity)]
-        if not template_selected:
+        if not desk_withheld:
             parts.append("\n\n")
             parts.append(
                 _MEMBER_HOW_YOU_WORK
@@ -3756,7 +3682,7 @@ class ContextBuilder:
             # is no "working protocol above" to name, so that clause goes with it.
             outranked = (
                 ""
-                if template_selected
+                if desk_withheld
                 else "the working protocol above included, whose instructions yield "
                 "wherever these rules contradict them — "
             )
@@ -3777,11 +3703,12 @@ class ContextBuilder:
                     "priorities worth remembering)"
                 )
             )
-        elif template_selected:
+        elif desk_withheld:
             # No layer 4 and no placeholder either, the scope notice below
-            # included: the placeholders tell a MEMBER why its own working memory
-            # is missing this turn and not to fill that gap from the briefing file
-            # or recall, and a delegate has no layer 4 to miss. Its memory scope
+            # included: the placeholders tell a MEMBER AT ITS DESK why its own
+            # working memory is missing this turn and not to fill that gap from
+            # the briefing file or recall; a turn off the desk (an ordinary chat
+            # on the alias, a delegate) has no layer 4 to miss. Its memory scope
             # is stated where every non-member session's is -- the [CONTEXT
             # SCOPE] block for a narrowed spawn or a privacy mode, nowhere for
             # the operator's standing toggle -- and this arm is ordered ahead of
@@ -3821,15 +3748,15 @@ class ContextBuilder:
         conditional_index: bool = False,
         trigger_text: str = "",
         steering_dirs: tuple[str, ...] = (),
-        template_selected: bool = False,
+        desk_withheld: bool = False,
         provider_type: str = PROVIDER_ACP,
     ) -> str:
         """Refresh complete member essentials without opening learned memory.
 
-        ``template_selected`` is :func:`_template_selected_on_member_store`'s verdict
-        for the execution being built and is handed to the member-section builder
-        unchanged: the envelope keeps the member's identity, rules, documents and
-        anchors, and withholds only the desk protocol and briefing.
+        ``desk_withheld`` is :func:`_desk_withheld`'s verdict for the turn being
+        built and is handed to the member-section builder unchanged: the
+        envelope keeps the member's identity, rules, documents and anchors, and
+        withholds only the desk protocol and briefing.
 
         ``provider_type`` names the harness serving the session. Only kiro-cli
         (:data:`PROVIDER_ACP`) honours ``chat.disableInheritingDefaultResources``,
@@ -3868,7 +3795,7 @@ class ContextBuilder:
             context_groups, CONTEXT_GROUP_PROJECT
         )
         identity = self._build_member_section(
-            owner, strict=True, include_briefing=reads, template_selected=template_selected
+            owner, strict=True, include_briefing=reads, desk_withheld=desk_withheld
         )
         # A validation pass measures the largest envelope any harness can build,
         # so it keeps inheritance and never reads kiro-cli's opt-out. On a normal
@@ -4078,6 +4005,11 @@ class ContextBuilder:
             from kiro_crew.execution_context import read_session_execution
 
             execution_context = read_session_execution(session_key)
+        # The caller's ``member=`` names this turn as the member's DESK (the
+        # dashboard passes it for a ``mode == "member"`` slot only). It decides
+        # the desk layers and nothing else; the record below decides whose
+        # identity, rules and memory the turn carries.
+        desk_member = member
         if execution_context is not None:
             member = execution_context.member_id or (
                 execution_context.selection_name
@@ -4109,7 +4041,7 @@ class ContextBuilder:
                 context_groups=context_groups,
                 member_template=execution_context.template_id if execution_context else "",
                 steering_dirs=steering_dirs,
-                template_selected=_template_selected_on_member_store(execution_context),
+                desk_withheld=_desk_withheld(execution_context, desk_member),
                 provider_type=provider_type,
             )
 
@@ -4286,7 +4218,7 @@ class ContextBuilder:
         # [PERMANENT RULES] fresh and fails closed on an unreadable file.
         if member_turn_context(member, MemberLifecycle.FRESH).deliver_section and not essentials:
             _member_section = self._build_member_section(
-                member, template_selected=_template_selected_on_member_store(execution_context)
+                member, desk_withheld=_desk_withheld(execution_context, desk_member)
             )
             if _member_section:
                 append_required(_member_section)
@@ -4882,11 +4814,12 @@ class ContextBuilder:
         """
         is_custom = bool(agent) and agent != "kirocrew"
         agent_prompt: str
-        if is_cc and (not is_custom or not private_owner):
+        if is_cc and not is_custom:
             # CC gets the same Kiro Crew persona prompt as kiro — including
             # the Output Format rules (diff blocks, image embeds, OPTIONS)
             # which are dashboard UI contracts, not kiro-specific. Only the
             # kiro-cli *branding* references are rewritten to claude code.
+            # A custom agent keeps its own prompt on every provider.
             try:
                 pp = _prompt_path(mode=mode)
                 agent_prompt = pp.read_text(encoding="utf-8")
@@ -4970,8 +4903,8 @@ class ContextBuilder:
         skills, and hook context. ACP native history is trusted — no parallel
         transcript is injected.
 
-        Pass *compressed_history* (from ``compress_thread_history()``) to
-        inject LLM-compressed thread context instead of naive truncation.
+        Pass *compressed_history* (from ``build_session_replay()``) to
+        inject prepared thread context instead of naive truncation.
 
         Pass *request_prefix_context* for generated procedure/persona context
         that must appear before the current-request boundary while the actual
@@ -4997,6 +4930,11 @@ class ContextBuilder:
             from kiro_crew.execution_context import read_session_execution
 
             execution_context = read_session_execution(session_key)
+        # The caller's ``member=`` names this turn as the member's DESK (the
+        # dashboard passes it for a ``mode == "member"`` slot only). It decides
+        # the desk layers and nothing else; the record below decides whose
+        # identity, rules and memory the turn carries.
+        desk_member = member
         if execution_context is not None:
             member = execution_context.member_id or (
                 execution_context.selection_name
@@ -5094,7 +5032,7 @@ class ContextBuilder:
                 and delivery is not None
                 and not context_provider.native_steering,
                 steering_dirs=steering_dirs,
-                template_selected=_template_selected_on_member_store(execution_context),
+                desk_withheld=_desk_withheld(execution_context, desk_member),
                 provider_type=provider_type,
             )
         if _essentials and not is_new_session:
@@ -5172,7 +5110,10 @@ class ContextBuilder:
                     query_text=text,
                     project=project,
                     include_session_history=include_session_history,
-                    member=member,
+                    # The desk argument, not the record's owner: the callee
+                    # re-derives the owner from the same record and must see
+                    # whether THIS caller named the desk.
+                    member=desk_member,
                     execution_context=execution_context,
                     steering_dirs=steering_dirs,
                     _v2_essentials=_essentials,
@@ -5228,8 +5169,7 @@ class ContextBuilder:
                     _resume_member = ""
                     if _member_turn.deliver_section:
                         _member_section = self._build_member_section(
-                            member,
-                            template_selected=_template_selected_on_member_store(execution_context),
+                            member, desk_withheld=_desk_withheld(execution_context, desk_member)
                         )
                         if _member_section:
                             _resume_member = (
@@ -5467,7 +5407,7 @@ class ContextBuilder:
             # chokepoint consult above).
             if _member_turn.deliver_section:
                 _member_section = self._build_member_section(
-                    member, template_selected=_template_selected_on_member_store(execution_context)
+                    member, desk_withheld=_desk_withheld(execution_context, desk_member)
                 )
                 if _member_section:
                     parts.append(_neutralize_structural_markers(_member_section))
@@ -5861,6 +5801,16 @@ class ContextBuilder:
             # what blocks is the DECISION, not the tool call. [OPTIONS:] remains
             # the cheaper choice mechanism on every interactive surface.
             if has_dashboard_surface(session_key or "") and _agent_includes_crew_context(agent):
+                if not minimal_context:
+                    current_config = live.snapshot() or KiroCrewConfig.load()
+                    if current_config.dashboard.dynamic_dashboard_cards:
+                        _interactive_guidance.append(
+                            "\n\n(Automatic cards: At milestones, failures or human-only "
+                            "decisions, report concise evidence, result and next step. "
+                            "The host queues eligible updates; queued is not published. "
+                            "Do not enable generation, spawn a builder or publish a duplicate "
+                            "status artifact.)"
+                        )
                 _interactive_guidance.append(
                     "\n\n(The ask_question tool posts a NON-BLOCKING dashboard card. "
                     "DEFAULT TO SILENCE: use it only when work cannot continue without a "

@@ -45,6 +45,9 @@ export interface UseVirtualChatOptions<T> {
    * detection stay on the pure sessionId.
    */
   heightScopeKey?: string
+  /** Whether live layout matches the height scope. Checked at every measurement
+   * write (observer, ref seed, farm); a changed callback remeasures mounted rows. */
+  canMeasure?: () => boolean
   /** Items to mount above and below the visible viewport. Default: 5. */
   overscan?: number
   /** Session ID — partitions the persisted height cache. */
@@ -203,6 +206,11 @@ export interface UseVirtualChatReturn<T> {
   topSentinelRef: React.RefObject<HTMLDivElement>
   /** Bottom sentinel — attach for downward expansion detection. */
   bottomSentinelRef: React.RefObject<HTMLDivElement>
+  /** Trailing chrome — attach to the wrapper around content rendered BELOW the
+   *  rows inside the scroller (a working footer, a survey card). The resize
+   *  observer watches it so growth there is followed like tail growth; it is
+   *  not a row and never enters the height cache. */
+  trailingRef: React.RefObject<HTMLDivElement>
   /** Items to render — both mounted React components and placeholder rows. */
   virtualItems: VirtualItem<T>[]
   /** Pixel offset of the first virtual item (top spacer height). */

@@ -22,6 +22,7 @@ from kiro_crew.vector_memory import (
     _HAS_NUMPY,
     _MAX_EPISODIC_RETIRED_PER_WRITE,
     _MMR_MAX_POOL,
+    EpisodicWriteOutcome,
     SemanticRejectCode,
     VectorMemoryStore,
     _contains_injection,
@@ -107,6 +108,32 @@ class TestSemanticCRUD:
         store.delete_semantic("pref.os", "user_explicit")
         assert store.set_semantic("pref.os", "macos", 0.9, "user_explicit") is None
         assert store.get_semantic("pref.os") is not None
+
+    def test_automated_write_does_not_revive_deleted(self, tmp_path: Path, opened) -> None:
+        store = opened(VectorMemoryStore(db_path=tmp_path / "mem.db"))
+        store.init()
+        store.set_semantic("pref.os", "linux", 0.9, "consolidation:chat-1")
+        store.delete_semantic("pref.os", "user_explicit")
+        assert store.set_semantic("pref.os", "macos", 0.9, "consolidation:chat-1") is not None
+        assert store.get_semantic("pref.os") is None
+        row = store.db.execute(
+            "SELECT is_deleted, value_json FROM semantic_memory WHERE key = 'pref.os'"
+        ).fetchone()
+        assert row["is_deleted"] == 1
+        assert row["value_json"] == '"linux"'
+
+    def test_automated_write_does_not_revive_user_deleted_user_fact(
+        self, tmp_path: Path, opened
+    ) -> None:
+        store = opened(VectorMemoryStore(db_path=tmp_path / "mem.db"))
+        store.init()
+        store.set_semantic("pref.os", "linux", 1.0, "user_explicit")
+        store.delete_semantic("pref.os", "user_explicit")
+        assert store.set_semantic("pref.os", "macos", 0.9, "consolidation:chat-1") is not None
+        assert store.get_semantic("pref.os") is None
+        # the user re-adding it still works
+        assert store.set_semantic("pref.os", "windows", 1.0, "user_explicit") is None
+        assert store.get_semantic("pref.os")["value_json"] == '"windows"'
 
 
 class TestKeyValidation:
@@ -482,6 +509,33 @@ class TestConflictResolution:
             ).fetchone()[0]
             == 1
         )
+
+    def test_write_outcome_names_the_refusal_cause(self, tmp_path: Path) -> None:
+        """The tri-state verdict the ops-mission-control ledger indexer cursors on.
+
+        ``write_episodic`` folds every refusal into ``False``; a caller that must
+        retry a capacity refusal but never a duplicate reads the cause from
+        ``write_episodic_outcome``, decided inside the refusing transaction.
+        """
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", episodic_max=1)
+        store.init()
+        try:
+            first = "Outcome contract: the first row takes the only slot."
+            assert store.write_episodic_outcome(first, preserve_existing=True) is (
+                EpisodicWriteOutcome.WRITTEN
+            )
+            assert store.write_episodic_outcome(first, preserve_existing=True) is (
+                EpisodicWriteOutcome.REFUSED
+            )
+            assert store.write_episodic_outcome(
+                "Outcome contract: a second distinct row finds the store full.",
+                preserve_existing=True,
+            ) is (EpisodicWriteOutcome.AT_CAPACITY)
+            assert store.write_episodic_outcome("short") is EpisodicWriteOutcome.REFUSED
+            # The bool wrapper keeps its contract: True only for a written row.
+            assert store.write_episodic(first, preserve_existing=True) is False
+        finally:
+            store.close()
 
     def test_preserving_writes_respect_cap_across_store_instances(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2493,6 +2547,9 @@ class TestEmbeddingDimPlumbing:
             def __init__(self, **kwargs):
                 captured_kwargs.update(kwargs)
 
+            def reconfigure(self, cfg):
+                pass
+
             def init(self):
                 pass
 
@@ -2521,29 +2578,54 @@ class TestEmbeddingDimPlumbing:
         assert captured_kwargs.get("embedding_dim") == 384
 
 
-class TestDedupThresholdPlumbing:
-    """`memory.episodic_dedup_threshold` must reach the store it configures.
+class TestMemoryTuningPlumbing:
+    """Configured ``memory.*`` tuning must reach every store that consumes it.
 
-    The loader parses the key into ``MemorySection``; no production
-    ``VectorMemoryStore(...)`` site passed it on, so the store always used
-    ``_DEFAULT_DEDUP_THRESHOLD`` and the documented knob was inert regardless of
-    faiss (the separate faiss gating of the cosine check is a separate concern, not
-    this one). These tests pin the plumbing only — no embedding or index needed.
+    ``VectorMemoryStore.reconfigure(cfg)`` applies every tunable the class copies
+    out of config, and the live reload path already uses it. Each plumbed site
+    passes its loaded config as ``config=``, which the constructor applies through
+    ``reconfigure`` before subscribing to the watcher, so boot and reload apply the
+    same values by construction, not by a hand-copied keyword list that can drop a
+    key.
     """
 
-    # Production stores whose episodic writes reach the inline similarity check
-    # (history consolidation, migrate_from_markdown, import_memory). Deferred
-    # writers (ledger_index, onboarding_import) skip that check by contract and
-    # the bench harness (eval/bench/ingest.py) supplies its own sweep value, so
-    # neither is required to plumb the config key.
+    # Production stores on the live install whose episodic reads or writes reach
+    # the similarity, cap-eviction or keyword-fallback paths. The cap check runs on
+    # deferred writes too, so the ops-mission-control ledger indexer and lesson
+    # recall are listed, as are the CLI's lesson, carve and import/migrate stores.
     _PLUMBED_SITES = (
         "slack/gateway.py",
         "cli_server.py",
+        "cli_commands.py",
         "dashboard/handlers/memory.py",
+        "apps/builtins/ops_mission_control/backend/dispatch.py",
+        "apps/builtins/ops_mission_control/backend/routes.py",
+        # Named stores: both the V1 constructor and the V2 open_member_database.
+        "context.py",
     )
+    # Every other file that constructs a store, with the reason the AST guard does
+    # not check it. The inventory test fails on a new construction site that is in
+    # neither table, so a new store cannot silently fall back to the defaults.
+    _EXEMPT_SITES = {
+        # Forwards its caller's `**vector_options` unchanged.
+        "vector_memory.py": "open_member_database forwards caller options",
+        # Builds its store on an arbitrary data_home whose config
+        # KiroCrewConfig.load() does not read.
+        "onboarding_import.py": "foreign data_home",
+        # The bench harness sweeps its own values.
+        "eval/bench/ingest.py": "bench sweep values",
+        # The V2 bench harness opens its own throwaway member database.
+        "eval/bench/member_v2.py": "bench V2 member database",
+        # Scenario workspaces are throwaway stores, not the install's memory.
+        "eval/runner.py": "eval scenario workspace",
+        # Read-only injection audit; it never writes an episode.
+        "security/__init__.py": "read-only injection audit",
+    }
 
-    def test_dashboard_fallback_passes_dedup_threshold(self, tmp_path: Path, monkeypatch) -> None:
-        """The dashboard standalone fallback builds a store carrying cfg's value."""
+    def test_dashboard_fallback_passes_configured_options(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The dashboard standalone fallback carries the configured tuning."""
         from unittest.mock import MagicMock
 
         import kiro_crew.dashboard.handlers.memory as mem_mod
@@ -2551,14 +2633,17 @@ class TestDedupThresholdPlumbing:
         mock_cfg = MagicMock()
         mock_cfg.memory.embedding_dim = 1024
         mock_cfg.memory.decay_rates = {}
-        # Deliberately NOT 0.88: a test written against the default would pass
-        # against the module constant even with nothing plumbed.
+        # Deliberately differ from both defaults so omitted keywords cannot pass.
         mock_cfg.memory.episodic_dedup_threshold = 0.42
+        mock_cfg.memory.episodic_max_count = 321
+        mock_cfg.memory.semantic_confidence_threshold = 0.61
+        mock_cfg.memory.episodic_max_results = 7
+        mock_cfg.memory.semantic_keys = ["team."]
 
         built: list[VectorMemoryStore] = []
 
         class TmpPathStore(VectorMemoryStore):
-            """Real store (so __init__ stores the value) on a throwaway db."""
+            """A real store carrying captured configuration on a throwaway DB."""
 
             def __init__(self, **kwargs):
                 kwargs.setdefault("db_path", tmp_path / "dashboard.db")
@@ -2585,42 +2670,61 @@ class TestDedupThresholdPlumbing:
 
         assert len(built) == 1, "fallback did not construct the standalone store"
         assert built[0]._dedup_threshold == 0.42
+        assert built[0]._episodic_max == 321
+        assert built[0]._confidence_threshold == 0.61
+        assert built[0]._episodic_limit == 7
+        assert "team." in built[0]._prefixes
 
     @staticmethod
     def _find_unplumbed_sites(tree, where: str = "") -> list[str]:
-        """Report every ``VectorMemoryStore(...)`` call that drops the key.
+        """Report every store construction that does not take ``config=``.
 
-        Structural rather than behavioural for the gateway and `kirocrew run`:
-        both construct inside long async bootstraps (`_init_services`,
-        `_run_task`) that cannot be driven in a unit test without mocking the
-        whole service graph, and the regression this guards is a missing
-        keyword at a call site.
+        Each ``VectorMemoryStore(...)``, and each ``open_member_database(...)``
+        (which constructs one), must pass the loaded config as ``config=``: the
+        constructor applies it through ``reconfigure`` before it subscribes to
+        the live watcher, so a reload landing during construction is never
+        overwritten by the caller's older snapshot. Checked per call, so each
+        branch that builds a store carries its own ``config=``. A literal value
+        is flagged (``config=None`` is the defaults), and so is a tuning keyword:
+        ``reconfigure`` is the one source, and a second copy is how boot and
+        reload drift apart.
         """
         import ast
 
+        tunables = {
+            "confidence_threshold",
+            "extra_prefixes",
+            "dedup_threshold",
+            "episodic_max",
+            "episodic_limit",
+            "decay_rates",
+        }
         violations: list[str] = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            if name != "VectorMemoryStore":
+            if name not in ("VectorMemoryStore", "open_member_database"):
                 continue
-            kw = next((k for k in node.keywords if k.arg == "dedup_threshold"), None)
-            if kw is None:
+            config = next((kw.value for kw in node.keywords if kw.arg == "config"), None)
+            if config is None:
                 violations.append(
-                    f"{where}line {node.lineno}: VectorMemoryStore(...) omits "
-                    "dedup_threshold — pass memory.episodic_dedup_threshold (#8903)"
+                    f"{where}line {node.lineno}: {name}(...) does not pass config=cfg"
                 )
-                continue
-            if not ast.unparse(kw.value).endswith("memory.episodic_dedup_threshold"):
+            elif isinstance(config, ast.Constant):
                 violations.append(
-                    f"{where}line {node.lineno}: dedup_threshold is not bound to "
-                    f"memory.episodic_dedup_threshold (got {ast.unparse(kw.value)!r})"
+                    f"{where}line {node.lineno}: {name}(...) passes a literal config="
                 )
+            for kw in node.keywords:
+                if kw.arg in tunables:
+                    violations.append(
+                        f"{where}line {node.lineno}: {kw.arg} is set on the "
+                        "constructor — config=cfg is its only source"
+                    )
         return violations
 
-    def test_production_sites_pass_the_configured_threshold(self) -> None:
+    def test_production_sites_pass_configured_options(self) -> None:
         import ast
         import inspect
         from pathlib import Path as _Path
@@ -2634,26 +2738,82 @@ class TestDedupThresholdPlumbing:
             assert src.is_file(), f"construction site moved: {rel}"
             tree = ast.parse(src.read_text(encoding="utf-8"))
             violations.extend(self._find_unplumbed_sites(tree, where=f"{rel}:"))
-        assert not violations, "config key never reaches the store:\n" + "\n".join(violations)
+        assert not violations, "stores built without config=cfg:\n" + "\n".join(violations)
 
-    def test_guard_catches_a_seeded_violation(self) -> None:
-        """The guard must flag both failure shapes and stay quiet on the good
-        one — otherwise a refactor could silently disarm it."""
+    def test_every_construction_site_is_plumbed_or_exempted(self) -> None:
+        """A new production store construction must join one of the tables.
+
+        ``open_member_database(...)`` counts: it constructs a store, and the
+        per-site guard checks it the same way.
+        """
+        import ast
+        import inspect
+        from pathlib import Path as _Path
+
+        import kiro_crew
+
+        pkg_root = _Path(inspect.getfile(kiro_crew)).parent
+        found: set[str] = set()
+        for src in pkg_root.rglob("*.py"):
+            rel = src.relative_to(pkg_root).as_posix()
+            text = src.read_text(encoding="utf-8")
+            if "/tests/" in f"/{rel}" or (
+                "VectorMemoryStore(" not in text and "open_member_database(" not in text
+            ):
+                continue
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name in ("VectorMemoryStore", "open_member_database"):
+                    found.add(rel)
+                    break
+        known = set(self._PLUMBED_SITES) | set(self._EXEMPT_SITES)
+        assert found - known == set(), (
+            "new store construction site(s) neither pass config=cfg nor carry "
+            f"an exemption: {sorted(found - known)}"
+        )
+        assert known - found == set(), f"stale site table entries: {sorted(known - found)}"
+
+    def test_guard_catches_seeded_violations(self) -> None:
+        """The guard flags a missing or literal config= and a constructor tunable."""
         import ast
 
         seeded = ast.parse(
-            "a = VectorMemoryStore(embedding_dim=1024)\n"
-            "b = VectorMemoryStore(dedup_threshold=0.88)\n"
-            "c = VectorMemoryStore(dedup_threshold=cfg.memory.episodic_dedup_threshold)\n"
-            "d = vm.VectorMemoryStore(dedup_threshold=self._cfg.memory.episodic_dedup_threshold)\n"
+            "def a():\n"
+            "    s = VectorMemoryStore(embedding_dim=1024)\n"
+            "def b(cfg):\n"
+            "    s = VectorMemoryStore(embedding_dim=1024, dedup_threshold=0.88, config=cfg)\n"
+            "def c(cfg):\n"
+            "    s = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim, config=cfg)\n"
+            "class D:\n"
+            "    def e(self):\n"
+            "        self.vm = vm.VectorMemoryStore(embedding_dim=1024, config=self._cfg)\n"
+            "def f():\n"
+            "    return VectorMemoryStore(config=None)\n"
+            "def g(path, cfg, v2):\n"
+            "    if v2:\n"
+            "        s = open_member_database(path, member_id='m', store_id='s', config=cfg)\n"
+            "    else:\n"
+            "        s = VectorMemoryStore(db_path=path)\n"
+            "    s.reconfigure(cfg)\n"
         )
         violations = self._find_unplumbed_sites(seeded)
-        # `a` omits the keyword, `b` hardcodes it; `c` and `d` are the two
-        # spellings the production sites use (module-local and attribute call,
-        # plain and `self._cfg`).
-        assert len(violations) == 2
-        assert "omits dedup_threshold" in violations[0]
-        assert "not bound to" in violations[1]
+        # `c`, `e` and g's V2 arm are the production spellings and must stay quiet.
+        # g's V1 arm is caught although the function reconfigures `s` afterwards:
+        # the check is per call, and a late reconfigure is the race config= closes.
+        # Pin each line exactly: a count alone would pass with one kind listed twice.
+        assert sorted(violations) == sorted(
+            [
+                "line 2: VectorMemoryStore(...) does not pass config=cfg",
+                "line 4: dedup_threshold is set on the constructor — "
+                "config=cfg is its only source",
+                "line 11: VectorMemoryStore(...) passes a literal config=",
+                "line 16: VectorMemoryStore(...) does not pass config=cfg",
+            ]
+        )
 
 
 @pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not available (Linux-compiled binary)")
@@ -3672,15 +3832,19 @@ class TestDbLockGuard:
     #: they run before/after the store is shared across threads.
     _RAW_DB_ALLOWED = {"init", "_init_database", "close", "db"}
 
-    @staticmethod
-    def _is_self_attr(node: object, attr: str) -> bool:
+    #: The names a store is reached by: ``self`` inside ``VectorMemoryStore`` and
+    #: ``store``, the first parameter of every ``vector_memory_runtime`` function.
+    _RECEIVERS = ("self", "store")
+
+    @classmethod
+    def _is_self_attr(cls, node: object, attr: str) -> bool:
         import ast
 
         return (
             isinstance(node, ast.Attribute)
             and node.attr == attr
             and isinstance(node.value, ast.Name)
-            and node.value.id == "self"
+            and node.value.id in cls._RECEIVERS
         )
 
     @classmethod
@@ -3694,19 +3858,22 @@ class TestDbLockGuard:
 
         class Visitor(ast.NodeVisitor):
             def __init__(self) -> None:
-                self.lock_depth = 0
+                # The receivers whose ``_db_lock`` is held here: the lock on
+                # ``store`` does not serialize a statement on ``self``.
+                self.locked: tuple[str, ...] = ()
                 self.exit_stacks: set[str] = set()
                 self.func_stack: list[str] = []
 
             def visit_With(self, node: ast.With) -> None:
-                saved_depth, saved_stacks = self.lock_depth, self.exit_stacks.copy()
+                saved_locked, saved_stacks = self.locked, self.exit_stacks.copy()
                 for item in node.items:
                     expr = item.context_expr
-                    if guard._is_self_attr(expr, "_db_lock") or (
-                        isinstance(expr, ast.Call)
-                        and guard._is_self_attr(expr.func, "_vector_commit")
+                    if guard._is_self_attr(expr, "_db_lock"):
+                        self.locked += (expr.value.id,)
+                    elif isinstance(expr, ast.Call) and guard._is_self_attr(
+                        expr.func, "_vector_commit"
                     ):
-                        self.lock_depth += 1
+                        self.locked += (expr.func.value.id,)
                     if (
                         isinstance(expr, ast.Call)
                         and isinstance(expr.func, ast.Name)
@@ -3715,7 +3882,7 @@ class TestDbLockGuard:
                     ):
                         self.exit_stacks.add(item.optional_vars.id)
                 self.generic_visit(node)
-                self.lock_depth, self.exit_stacks = saved_depth, saved_stacks
+                self.locked, self.exit_stacks = saved_locked, saved_stacks
 
             def visit_Expr(self, node: ast.Expr) -> None:
                 self.generic_visit(node)
@@ -3729,39 +3896,39 @@ class TestDbLockGuard:
                     and len(call.args) == 1
                     and guard._is_self_attr(call.args[0], "_db_lock")
                 ):
-                    self.lock_depth += 1
+                    self.locked += (call.args[0].value.id,)
 
             def visit_Try(self, node: ast.Try) -> None:
                 # An enter_context which raises cannot protect its error handler.
-                saved = self.lock_depth
+                saved = self.locked
                 for statement in node.body:
                     self.visit(statement)
                 for statement in node.orelse:
                     self.visit(statement)
-                self.lock_depth = saved
+                self.locked = saved
                 for handler in node.handlers:
                     self.visit(handler)
-                    self.lock_depth = saved
+                    self.locked = saved
                 for statement in node.finalbody:
                     self.visit(statement)
-                self.lock_depth = saved
+                self.locked = saved
 
             def visit_If(self, node: ast.If) -> None:
-                saved = self.lock_depth
+                saved = self.locked
                 self.visit(node.test)
                 for statement in node.body:
                     self.visit(statement)
-                self.lock_depth = saved
+                self.locked = saved
                 for statement in node.orelse:
                     self.visit(statement)
-                self.lock_depth = saved
+                self.locked = saved
 
             visit_While = visit_If
 
             def visit_For(self, node: ast.For) -> None:
-                saved = self.lock_depth
+                saved = self.locked
                 self.generic_visit(node)
-                self.lock_depth = saved
+                self.locked = saved
 
             def visit_ClassDef(self, node) -> None:
                 self.func_stack.append(node.name)
@@ -3770,11 +3937,11 @@ class TestDbLockGuard:
 
             def _visit_func(self, node) -> None:
                 self.func_stack.append(node.name)
-                saved, saved_stacks = self.lock_depth, self.exit_stacks
-                self.lock_depth = 0  # function body runs at call time, not here
+                saved, saved_stacks = self.locked, self.exit_stacks
+                self.locked = ()  # function body runs at call time, not here
                 self.exit_stacks = set()
                 self.generic_visit(node)
-                self.lock_depth, self.exit_stacks = saved, saved_stacks
+                self.locked, self.exit_stacks = saved, saved_stacks
                 self.func_stack.pop()
 
             visit_FunctionDef = _visit_func
@@ -3788,7 +3955,10 @@ class TestDbLockGuard:
                     "executescript",
                 ):
                     where = ".".join(self.func_stack) or "<module>"
-                    if guard._is_self_attr(func.value, "db") and self.lock_depth == 0:
+                    if (
+                        guard._is_self_attr(func.value, "db")
+                        and func.value.value.id not in self.locked
+                    ):
                         violations.append(
                             f"line {node.lineno} ({where}): self.db.{func.attr}() outside "
                             "`with self._db_lock:` — use _fetch_all_locked/_fetch_one_locked "
@@ -3806,6 +3976,14 @@ class TestDbLockGuard:
         Visitor().visit(tree)
         return violations
 
+    @staticmethod
+    def _runtime_sources() -> dict[str, str]:
+        """Every ``vector_memory_runtime`` module's source, keyed by file name."""
+        from kiro_crew import vector_memory
+
+        root = Path(vector_memory.__file__).resolve().with_name("vector_memory_runtime")
+        return {path.name: path.read_text(encoding="utf-8") for path in sorted(root.glob("*.py"))}
+
     def test_every_db_statement_is_lock_serialized(self) -> None:
         import ast
         import inspect
@@ -3816,6 +3994,61 @@ class TestDbLockGuard:
         tree = ast.parse(source)
         violations = self._find_unserialized_statements(tree)
         assert not violations, "unserialized sqlite statement(s):\n" + "\n".join(violations)
+
+    def test_every_runtime_db_statement_is_lock_serialized(self) -> None:
+        """The store's delegates run on ``store.db`` too, under the same rule. A
+        raw ``store._db`` statement is refused (no runtime function is a lifecycle
+        method), and neither handle may be bound to a local name that the guard
+        would then not recognise as the store's connection."""
+        import ast
+
+        sources = self._runtime_sources()
+        assert {"lessons.py", "embedding.py"} <= sources.keys()
+        violations: list[str] = []
+        for name, source in sources.items():
+            tree = ast.parse(source)
+            violations.extend(
+                f"{name}: {item}" for item in self._find_unserialized_statements(tree)
+            )
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+                    and isinstance(node.value, ast.Attribute)
+                    and (
+                        self._is_self_attr(node.value, "db")
+                        or self._is_self_attr(node.value, "_db")
+                    )
+                ):
+                    violations.append(f"{name}:{node.lineno}: the connection bound to a name")
+        assert not violations, "unserialized sqlite statement(s):\n" + "\n".join(violations)
+
+    def test_guard_catches_a_seeded_runtime_violation(self) -> None:
+        """Runtime-style code, with the store as a parameter, is checked too."""
+        import ast
+
+        seeded = ast.parse(
+            "def bad(store):\n"
+            "    return store.db.execute('SELECT 1').fetchone()\n"
+            "def good(store):\n"
+            "    with store._db_lock:\n"
+            "        return store.db.execute('SELECT 1').fetchone()\n"
+            "def committed(store, vec):\n"
+            "    with store._vector_commit(vec):\n"
+            "        store.db.execute('UPDATE x SET y = 1')\n"
+            "def raw(store):\n"
+            "    with store._db_lock:\n"
+            "        return store._db.execute('SELECT 1')\n"
+            "class VectorMemoryStore:\n"
+            "    def merge_from(self, store):\n"
+            "        with store._db_lock:\n"
+            "            return self.db.execute('SELECT 1').fetchall()\n"
+        )
+        violations = self._find_unserialized_statements(seeded)
+        assert len(violations) == 3
+        assert "(bad)" in violations[0]
+        assert "(raw)" in violations[1]
+        # One store's lock does not serialize a statement on another store.
+        assert "(VectorMemoryStore.merge_from)" in violations[2]
 
     def test_guard_catches_a_seeded_violation(self) -> None:
         """The guard itself must fail on an unlocked fetch — otherwise a refactor
@@ -4178,10 +4411,11 @@ class TestHandlerOffload1947:
 
     Both the method set and the caller set are DERIVED, not hand-listed
     (a hand-maintained list re-introduces
-    enforcement-by-convention one level up): the methods come from
-    ``vector_memory.py``'s AST (public methods that reach
-    ``with self._db_lock:`` directly or transitively through other ``self``
-    calls), and the scan covers every module in the ``kiro_crew`` package.
+    enforcement-by-convention one level up): the methods come from the AST of
+    ``vector_memory.py`` and of the ``vector_memory_runtime`` modules it delegates
+    to (public methods that reach a ``with <store>._db_lock:`` directly or
+    transitively through store calls and runtime functions), and the scan covers
+    every module in the ``kiro_crew`` package.
     """
 
     #: Lock-reaching methods exempt from this name-only scan. ``init`` is the
@@ -4196,42 +4430,138 @@ class TestHandlerOffload1947:
 
         return Path(kiro_crew.__file__).resolve().parent
 
+    #: A floor, not the list the scan enforces: the public lock-reaching set as
+    #: it stood before the store delegated to ``vector_memory_runtime``. The
+    #: enforced set stays derived. A derivation that stops following a delegate
+    #: would shrink it and leave that delegate's async callers unflagged, so
+    #: every name here must stay derived; a new locked method only adds to it.
+    _FROZEN_LOCKED = frozenset("""
+        append_history apply_consolidation backfill_missing_embeddings begin_space_change
+        build_faiss_index consolidation_receipt count_by_facet count_lessons delete_episodic
+        delete_lesson delete_semantic embed_episodic embed_lesson embed_semantic
+        embed_semantic_retirement embedding_repair_state find_contradiction_candidates
+        get_all_semantic get_context_preview get_episodic_context get_episodic_list get_events
+        get_lessons get_lessons_context get_preferences_context get_rejection_stats
+        get_retired_episodic get_semantic get_semantic_context has_any_decodable_lesson
+        has_any_lesson has_episodic_text has_pending_embeddings has_stored_embeddings
+        import_memory invalidate_episode_content list_by_facets load_faiss_index
+        log_reject_event memory_stats migrate_from_markdown promote_episodic_patterns
+        propose_semantic_delete read_counters read_editable_history read_history_entries
+        rebuild_memory_index recall reconcile_embedding_space recorded_embedding_space
+        recorded_rebuild_generation replace_today_history restore_episodic rotate_events
+        save_faiss_index search_episodic search_memory search_semantic seed_item_if_absent
+        set_embedding_dim set_semantic set_semantic_if_absent with_record_metadata
+        write_episodic write_lesson
+        """.split())
+
+    @classmethod
+    def _store_sources(cls) -> tuple[str, dict[str, str]]:
+        """The facade's source and every ``vector_memory_runtime`` module's, by stem."""
+        root = cls._package_root()
+        runtime = {
+            path.stem: path.read_text(encoding="utf-8")
+            for path in sorted((root / "vector_memory_runtime").glob("*.py"))
+            if path.stem != "__init__"
+        }
+        return (root / "vector_memory.py").read_text(encoding="utf-8"), runtime
+
     @classmethod
     def _derive_locked_methods(cls) -> set[str]:
         """Public ``VectorMemoryStore`` methods that acquire ``_db_lock``,
-        directly or transitively through other ``self`` method calls."""
+        directly or transitively through other store calls, including the
+        ``vector_memory_runtime`` functions the store delegates to."""
+        facade, runtime = cls._store_sources()
+        return cls._derive_locked_from_sources(facade, runtime)
+
+    @classmethod
+    def _derive_locked_from_sources(cls, facade: str, runtime: dict[str, str]) -> set[str]:
+        """Fixpoint over one call graph spanning the store and its runtime modules.
+
+        Nodes are ``VMS.<method>`` for store methods and ``<module>.<function>``
+        for runtime functions. The receiver is ``self`` in the store and ``store``
+        in a runtime function; a call to a runtime function is resolved through the
+        importing module's own ``from kiro_crew.vector_memory_runtime import mod``
+        aliases and ``from kiro_crew.vector_memory_runtime.mod import name`` names.
+        """
         import ast
 
-        source = (cls._package_root() / "vector_memory.py").read_text(encoding="utf-8")
-        klass = next(
-            node
-            for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.ClassDef) and node.name == "VectorMemoryStore"
-        )
+        package = "kiro_crew.vector_memory_runtime"
+
+        def aliases(tree: ast.Module) -> tuple[dict[str, str], dict[str, str]]:
+            modules: dict[str, str] = {}
+            names: dict[str, str] = {}
+            for node in tree.body:
+                if isinstance(node, ast.ImportFrom) and node.module == package:
+                    for alias in node.names:
+                        modules[alias.asname or alias.name] = alias.name
+                elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                    package + "."
+                ):
+                    owner = node.module.rsplit(".", 1)[-1]
+                    for alias in node.names:
+                        names[alias.asname or alias.name] = f"{owner}.{alias.name}"
+            return modules, names
+
+        def edges(fn, receiver, modules, names, local, own) -> tuple[bool, set[str]]:
+            takes_lock = False
+            called: set[str] = set()
+            for sub in ast.walk(fn):
+                if isinstance(sub, ast.withitem):
+                    expr = sub.context_expr
+                    if (
+                        isinstance(expr, ast.Attribute)
+                        and expr.attr == "_db_lock"
+                        and isinstance(expr.value, ast.Name)
+                        and expr.value.id == receiver
+                    ):
+                        takes_lock = True
+                if not isinstance(sub, ast.Call):
+                    continue
+                func = sub.func
+                if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                    if func.value.id == receiver:
+                        called.add(f"VMS.{func.attr}")
+                    elif func.value.id in modules:
+                        called.add(f"{modules[func.value.id]}.{func.attr}")
+                elif isinstance(func, ast.Name):
+                    if func.id in local:
+                        called.add(f"{own}.{func.id}")
+                    elif func.id in names:
+                        called.add(names[func.id])
+            return takes_lock, called
 
         callees: dict[str, set[str]] = {}
         direct: set[str] = set()
-        for node in klass.body:
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            called: set[str] = set()
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.withitem) and TestDbLockGuard._is_self_attr(
-                    sub.context_expr, "_db_lock"
-                ):
-                    direct.add(node.name)
-                if isinstance(sub, ast.Call):
-                    func = sub.func
-                    if (
-                        isinstance(func, ast.Attribute)
-                        and isinstance(func.value, ast.Name)
-                        and func.value.id == "self"
-                    ):
-                        called.add(func.attr)
-            callees[node.name] = called
 
-        # Fixpoint over the self-call graph: a method that calls a
-        # lock-reaching method is itself lock-reaching.
+        tree = ast.parse(facade)
+        modules, names = aliases(tree)
+        klass = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "VectorMemoryStore"
+        )
+        for node in klass.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                locked, called = edges(node, "self", modules, names, set(), "")
+                callees[f"VMS.{node.name}"] = called
+                if locked:
+                    direct.add(f"VMS.{node.name}")
+
+        for stem, source in runtime.items():
+            tree = ast.parse(source)
+            modules, names = aliases(tree)
+            local = {
+                node.name
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    locked, called = edges(node, "store", modules, names, local, stem)
+                    callees[f"{stem}.{node.name}"] = called
+                    if locked:
+                        direct.add(f"{stem}.{node.name}")
+
         reaching = set(direct)
         changed = True
         while changed:
@@ -4241,7 +4571,11 @@ class TestHandlerOffload1947:
                     reaching.add(name)
                     changed = True
 
-        return {name for name in reaching if not name.startswith("_")} - cls._EXEMPT
+        return {
+            name.removeprefix("VMS.")
+            for name in reaching
+            if name.startswith("VMS.") and not name.removeprefix("VMS.").startswith("_")
+        } - cls._EXEMPT
 
     @classmethod
     def _find_inline_calls(cls, tree, locked: set[str], label: str) -> list[str]:
@@ -4308,6 +4642,57 @@ class TestHandlerOffload1947:
         assert "embed_lesson" in locked
         assert not {"close", "init"} & locked
 
+    def test_delegation_keeps_the_frozen_method_set(self) -> None:
+        """Moving a body into ``vector_memory_runtime`` must not drop a method."""
+        missing = self._FROZEN_LOCKED - self._derive_locked_methods()
+        assert not missing, f"no longer derived as lock-reaching: {sorted(missing)}"
+
+    def test_derivation_follows_delegation_into_runtime_modules(self) -> None:
+        """A delegate that reaches the lock only through a runtime function, or
+        through a store call made BY that function, is still lock-reaching."""
+        import textwrap
+
+        facade = textwrap.dedent("""
+            from kiro_crew.vector_memory_runtime import reads as _reads
+
+            class VectorMemoryStore:
+                def _fetch(self):
+                    with self._db_lock:
+                        return 1
+
+                def through_runtime(self):
+                    return _reads.fetch_rows(self)
+
+                def through_callback(self):
+                    return _reads.back_to_store(self)
+
+                def lock_free(self):
+                    return _reads.pure(self)
+            """)
+        runtime = {
+            "reads": textwrap.dedent("""
+                from kiro_crew.vector_memory_runtime.other import helper
+
+                def fetch_rows(store):
+                    with store._db_lock:
+                        return []
+
+                def back_to_store(store):
+                    return helper(store)
+
+                def pure(store):
+                    return 0
+                """),
+            "other": textwrap.dedent("""
+                def helper(store):
+                    return store._fetch()
+                """),
+        }
+        assert self._derive_locked_from_sources(facade, runtime) == {
+            "through_runtime",
+            "through_callback",
+        }
+
     def test_guard_catches_seeded_violation(self) -> None:
         """The scanner must flag a known-bad inline call, so a visitor
         regression cannot silently turn the guard vacuous."""
@@ -4337,7 +4722,7 @@ class TestHandlerOffload1947:
         root = self._package_root()
         violations: list[str] = []
         for path in sorted(root.rglob("*.py")):
-            if path.name == "vector_memory.py":
+            if path == root / "vector_memory.py":
                 continue  # the store may call its own methods inline
             tree = ast.parse(path.read_text(encoding="utf-8"))
             violations.extend(self._find_inline_calls(tree, locked, str(path.relative_to(root))))
@@ -4529,6 +4914,160 @@ class TestSemanticWriteTimeEmbedding:
         assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
         assert self._stored_embedding(store, "pref.city") == blob
         assert texts.count('pref.city "Paris"') == 1, texts
+
+    def test_semantic_scoring_cache_reuses_rows_without_changing_context(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.embed_fn = self._directional_embed()
+        assert store.set_semantic("pref.travel", "nippon", 1.0, "user_explicit") is None
+        assert store.set_semantic("pref.drink", "coffee", 1.0, "user_explicit") is None
+
+        expected = store.get_semantic_context(query_text="tokyo")
+        assert store._semantic_scoring is not None
+        original_fetch = store._fetch_all_locked
+        scoring_scans = 0
+
+        def count_scoring_scans(sql: str, params: tuple = ()):
+            nonlocal scoring_scans
+            if sql.startswith(
+                "SELECT key, value_json, updated_at, embedding, source FROM semantic_memory"
+            ):
+                scoring_scans += 1
+            return original_fetch(sql, params)
+
+        monkeypatch.setattr(store, "_fetch_all_locked", count_scoring_scans)
+        assert store.get_semantic_context(query_text="tokyo") == expected
+        assert scoring_scans == 0, "unchanged semantic context must reuse its resident scoring rows"
+
+    def test_semantic_scoring_cache_invalidates_for_local_write_and_delete(
+        self, tmp_path: Path
+    ) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        assert "pref.city: Paris" in store.get_semantic_context(query_text="paris")
+        assert store._semantic_scoring is not None
+
+        assert store.set_semantic("pref.city", "Tokyo", 1.0, "user_explicit") is None
+        assert store._semantic_scoring is None
+        assert "pref.city: Tokyo" in store.get_semantic_context(query_text="tokyo")
+
+        assert store.delete_semantic("pref.city", "user_explicit") is True
+        assert store._semantic_scoring is None
+        assert store.get_semantic_context(query_text="tokyo") == ""
+
+    @pytest.mark.parametrize("writer", ["upsert", "insert_if_absent", "delete"])
+    def test_semantic_scoring_invalidation_stays_inside_writer_lock(
+        self, tmp_path: Path, monkeypatch, writer: str
+    ) -> None:
+        class _CheckedRLock:
+            def __init__(self) -> None:
+                self._lock = threading.RLock()
+                self._owner: int | None = None
+                self._depth = 0
+
+            def __enter__(self) -> "_CheckedRLock":
+                self._lock.acquire()
+                current = threading.get_ident()
+                if self._owner == current:
+                    self._depth += 1
+                else:
+                    assert self._owner is None
+                    self._owner = current
+                    self._depth = 1
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback) -> None:
+                assert self._owner == threading.get_ident()
+                self._depth -= 1
+                if self._depth == 0:
+                    self._owner = None
+                self._lock.release()
+
+            def held_by_current_thread(self) -> bool:
+                return self._owner == threading.get_ident()
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        assert store.get_semantic_context(query_text="paris")
+
+        checked_lock = _CheckedRLock()
+        monkeypatch.setattr(store, "_db_lock", checked_lock)
+        original_invalidate = store._invalidate_semantic_scoring
+
+        def invalidate_under_writer_lock() -> None:
+            assert checked_lock.held_by_current_thread()
+            original_invalidate()
+
+        monkeypatch.setattr(store, "_invalidate_semantic_scoring", invalidate_under_writer_lock)
+
+        if writer == "upsert":
+            assert store.set_semantic("pref.city", "Tokyo", 1.0, "user_explicit") is None
+        elif writer == "insert_if_absent":
+            assert (
+                store.set_semantic_if_absent("pref.country", "Japan", 1.0, "user_explicit")
+                == "imported"
+            )
+        else:
+            assert store.delete_semantic("pref.city", "user_explicit") is True
+
+    def test_semantic_scoring_cache_invalidates_after_deferred_vector_backfill(
+        self, tmp_path: Path
+    ) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        assert "pref.city: Paris" in store.get_semantic_context(query_text="paris")
+        assert store._semantic_scoring is not None
+
+        store.embed_fn = self._directional_embed()
+        assert store._backfill_semantic_kv_embeddings(pace=False) == 1
+        assert store._semantic_scoring is None
+        assert store.get_semantic_context(query_text="paris")
+
+    def test_semantic_scoring_cache_detects_an_external_commit(self, tmp_path: Path) -> None:
+        import sqlite3 as stdlib_sqlite3
+
+        db_path = tmp_path / "mem.db"
+        store = VectorMemoryStore(db_path=db_path)
+        store.init()
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        assert "pref.city: Paris" in store.get_semantic_context(query_text="paris")
+        assert store._semantic_scoring is not None
+
+        with stdlib_sqlite3.connect(db_path) as other:
+            other.execute(
+                "UPDATE semantic_memory SET value_json = ?, updated_at = ? WHERE key = ?",
+                ('"Tokyo"', "2099-01-01T00:00:00+00:00", "pref.city"),
+            )
+
+        refreshed = store.get_semantic_context(query_text="tokyo")
+        assert "pref.city: Tokyo" in refreshed
+        assert "pref.city: Paris" not in refreshed
+
+    def test_semantic_scoring_cache_is_dropped_on_a_connection_swap(self, tmp_path: Path) -> None:
+        # The validity token is per-connection (data_version), so a retained
+        # snapshot must not survive a connection swap: a fresh connection's
+        # baseline could equal it and serve stale rows. Both a repeated init()
+        # (swap on a live object) and close() drop it, like the episodic twin.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        assert store.get_semantic_context(query_text="paris")
+        assert store._semantic_scoring is not None
+
+        store.init()  # repeated init swaps the connection
+        assert store._semantic_scoring is None
+        assert store._semantic_scoring_refused is None
+
+        assert store.get_semantic_context(query_text="paris")
+        assert store._semantic_scoring is not None
+        store.close()
+        assert store._semantic_scoring is None
+        assert store._semantic_scoring_refused is None
 
     def test_null_vector_row_does_not_outrank_embedded_row(self, tmp_path: Path, opened) -> None:
         store = opened(VectorMemoryStore(db_path=tmp_path / "mem.db"))
@@ -5119,3 +5658,164 @@ class TestPreferencesStartupCap:
         assert "omitted 3 of 3 preference facts" in ctx
         assert ctx.startswith("[Semantic Memory")
         assert ctx.endswith("\n[End of semantic memory]\n")
+
+
+class TestFaissMmrPoolRecallContract:
+    """FAISS episodic tier must hand MMR the same recall-contract pool as the
+    sqlite tiers.
+
+    The sqlite tiers (per-call and resident) hand ``_mmr_rerank`` their entire
+    embedded population, bounded only by ``_MMR_MAX_POOL`` — the pool comment in
+    ``_mmr_rerank`` declares truncating toward ``limit`` a recall change. The
+    FAISS tier must feed MMR the same full pool rather than a ``limit * 2`` slice
+    (16 at the default ``limit=8``), so it does not drop the relevant-but-diverse
+    tail pick that is the whole point of MMR.
+    """
+
+    dim = 16
+
+    class _MiniFlatIP:
+        """Exact IndexFlatIP semantics over a normalized row matrix.
+
+        ``search`` computes true inner products and honors ``k`` exactly like
+        FAISS: only the top-``k`` hits come back. Records every ``k`` received
+        so tests can pin the pool-size request itself.
+        """
+
+        def __init__(self, mat) -> None:
+            self._mat = mat
+            self.ntotal = len(mat)
+            self.received_k: list[int] = []
+
+        def search(self, vec, k):
+            import numpy as np
+
+            self.received_k.append(int(k))
+            sims = self._mat @ vec.reshape(-1)
+            order = np.argsort(-sims)[: int(k)]
+            return sims[order].reshape(1, -1), order.reshape(1, -1).astype(np.int64)
+
+    def _build_store(self, tmp_path: Path, monkeypatch, texts_and_vecs):
+        """Store with rows in sqlite (real embedding blobs) AND a MiniFlatIP index.
+
+        Both tiers see the identical population, so FAISS-vs-sqlite parity is a
+        true recall comparison, not a mock artifact.
+        """
+        import numpy as np
+
+        import kiro_crew.vector_memory as vm_mod
+
+        monkeypatch.setattr(vm_mod, "_HAS_FAISS", True)
+        monkeypatch.setattr(vm_mod, "_HAS_NUMPY", True)
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=self.dim)
+        store.init()
+
+        today = datetime.now(tz=timezone.utc).isoformat()
+        mat = np.zeros((len(texts_and_vecs), self.dim), dtype=np.float32)
+        id_map: list[str] = []
+        for i, (mem_id, text, vec) in enumerate(texts_and_vecs):
+            v = np.asarray(vec, dtype=np.float32)
+            v /= np.linalg.norm(v)
+            mat[i] = v
+            id_map.append(mem_id)
+            store.db.execute(
+                "INSERT INTO episodic_memories (id, text, embedding, is_deleted, "
+                "importance, created_at, last_accessed_at) VALUES (?, ?, ?, 0, 1.0, ?, ?)",
+                (mem_id, text, v.tobytes(), today, today),
+            )
+        store.db.commit()
+
+        index = self._MiniFlatIP(mat)
+        store._faiss_index = index
+        store._faiss_id_map = id_map
+        return store, index
+
+    def _population(self):
+        """20 near-duplicate rows outranking one diverse row on pure relevance.
+
+        Duplicates share one token set (pairwise Jaccard 1.0) with cosines
+        descending from ~0.995; the diverse row sits at rank 21 with cosine 0.6
+        and zero token overlap. With the old ``limit * 2`` pool (16) the diverse
+        row never reaches MMR; from the full pool MMR must select it (its MMR
+        value 0.6·rel ≈ 0.36 beats a second duplicate's 0.6·rel − 0.4·1.0 ≈ 0.19).
+        """
+        import numpy as np
+
+        rows = []
+        dup_text = "postgres database migration plan step one"
+        for i in range(20):
+            # e0-dominant with a tiny per-row e1 component: cosine to e0 descends
+            # ~0.9950 → ~0.9046 as eps grows, keeping all 20 above the diverse row.
+            eps = 0.1 + i * 0.02
+            vec = np.zeros(self.dim, dtype=np.float32)
+            vec[0], vec[1] = 1.0, eps
+            rows.append((f"dup-{i:02d}", dup_text, vec))
+        diverse = np.zeros(self.dim, dtype=np.float32)
+        diverse[0], diverse[2] = 0.6, 0.8  # cosine 0.6 to e0, disjoint tokens
+        rows.append(("diverse-x", "kubernetes ingress rollout canary window", diverse))
+        return rows
+
+    def _query(self):
+        q = [0.0] * self.dim
+        q[0] = 1.0
+        return q
+
+    def test_mmr_pool_not_truncated_to_limit_window(self, tmp_path: Path, monkeypatch) -> None:
+        """ATTACK: the rank-21 diverse row must be MMR-reachable (full pool)."""
+        store, index = self._build_store(tmp_path, monkeypatch, self._population())
+        result = store.search_episodic(query_embedding=self._query(), limit=8, mmr=True)
+        ids = [r["id"] for r in result]
+        assert "diverse-x" in ids, (
+            "FAISS tier truncated the MMR candidate pool below the recall "
+            f"contract: rank-21 diverse row unreachable (pool k={index.received_k})"
+        )
+        # The pool request itself must follow the contract, not the limit window.
+        assert index.received_k == [21], index.received_k
+
+    def test_faiss_and_sqlite_tiers_return_identical_mmr_results(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """PARITY: identical population → identical MMR selections."""
+        store, _ = self._build_store(tmp_path, monkeypatch, self._population())
+        q = self._query()
+        faiss_ids = [r["id"] for r in store.search_episodic(query_embedding=q, limit=8, mmr=True)]
+        store._faiss_index = None  # falls through to the per-call sqlite tier
+        sqlite_ids = [r["id"] for r in store.search_episodic(query_embedding=q, limit=8, mmr=True)]
+        assert faiss_ids == sqlite_ids
+
+    def test_non_mmr_path_keeps_limit_window(self, tmp_path: Path, monkeypatch) -> None:
+        """CONTROL: mmr=False keeps the cheap limit*2 pool (top-limit slice only)."""
+        store, index = self._build_store(tmp_path, monkeypatch, self._population())
+        result = store.search_episodic(query_embedding=self._query(), limit=8, mmr=False)
+        assert index.received_k == [16]  # limit * 2, unchanged contract
+        assert len(result) == 8
+        assert all(r["id"].startswith("dup-") for r in result)  # pure relevance order
+
+    def test_tag_filtered_mmr_keeps_narrow_window(self, tmp_path: Path, monkeypatch) -> None:
+        """ATTACK: a tag_filter with mmr=True must keep the narrow limit*2 window.
+
+        ``_matches_tags`` screens candidates AFTER the FAISS window, and only
+        ``_sqlite_vector_search`` masks tags over the complete active population.
+        A wide MMR pool would satisfy the ``expected = min(limit, k)`` starvation
+        probe with tagged hits inside the top ``_MMR_MAX_POOL`` and never fall
+        through, dropping a tagged row ranked past the window. The narrow window
+        keeps the probe routing tag-filtered queries to the full-population tier.
+        """
+        store, index = self._build_store(tmp_path, monkeypatch, self._population())
+        store.search_episodic(
+            query_embedding=self._query(), limit=8, mmr=True, tag_filter=["anything"]
+        )
+        assert index.received_k == [16], index.received_k  # limit * 2, not _MMR_MAX_POOL
+
+    def test_small_population_unchanged(self, tmp_path: Path, monkeypatch) -> None:
+        """BENIGN: ntotal below both pool bounds → both tiers identical, no new denials."""
+        rows = self._population()[:5]
+        store, index = self._build_store(tmp_path, monkeypatch, rows)
+        q = self._query()
+        faiss_ids = [r["id"] for r in store.search_episodic(query_embedding=q, limit=8, mmr=True)]
+        assert index.received_k == [5]  # min(_MMR_MAX_POOL, ntotal) = ntotal
+        assert len(faiss_ids) == 5
+        store._faiss_index = None
+        sqlite_ids = [r["id"] for r in store.search_episodic(query_embedding=q, limit=8, mmr=True)]
+        assert faiss_ids == sqlite_ids

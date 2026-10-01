@@ -236,7 +236,7 @@ Frontend badges and affordances read the same three fields
 separate question: `/api/apps/registry` rows carry server-computed
 `provenance` (`"official" | "external" | "builtin"`, with `"core"` accepted by
 clients as the pre-migration spelling of `"official"`) and `verified` fields,
-stamped by `_apply_trust_fields` in `registry.py` where the server-attached
+stamped by `_apply_trust_fields` in `registry_pipeline/catalog.py` where the server-attached
 `_registry` tag is authoritative. The helper OVERWRITES anything an index
 publishes, and derives `verified` from the INDEX-declared author snapshotted
 before the app.json merge — never from the repo-fetched manifest — because
@@ -884,7 +884,7 @@ reaped only groups logs its own summary line, because the count the reap RETURNS
 leaders terminated and would otherwise be zero with nothing said.
 Ordering is deliberate — hooks first, so an app's `on_shutdown` still has its
 own backend alive. Stop targets come from the runtime tracking table
-(`apps/backend.py::spawned_backend_names`), never from persisted `enabled`
+(`apps/backend_runtime/tracking.py::spawned_backend_names`), never from persisted `enabled`
 metadata: the metadata filter is wrong in both directions (it would signal an
 **adopted** externally-managed backend, whose contract is to survive gateway
 exit and be re-adopted on the next start, and it would miss a still-running
@@ -950,9 +950,11 @@ None`) have no spawned root and are never tree-drained. Out of scope, settled by
 the design that landed the drain: a descendant that `setsid`s out of the POSIX
 group, and a kill-on-close Job Object.
 
-Writers: `apps/backend.py::_drain_exited_root_tree`, `_signal_backend_tree`,
-`_start_app_backend_body` (identity capture, `AppProcess.spawn_instance`),
-`stop_app_backend`, `_restart_exited_backend`, `_terminate_retired_spawn`. Pinned by
+Writers: `apps/backend_runtime/termination.py` (`_drain_exited_root_tree`,
+`_signal_backend_tree`, `stop_app_backend`, `_terminate_retired_spawn`),
+`apps/backend.py::_start_app_backend_body` (identity capture),
+`apps/backend_runtime/tracking.py` (`AppProcess.spawn_instance`),
+`apps/backend_runtime/restart.py::_restart_exited_backend`. Pinned by
 `test/test_app_backend_launcher_tree_drain.py`.
 
 The routes' async `app_lifecycle_lock` serializes route handlers only and does
@@ -1232,7 +1234,7 @@ Writers: `apps/dependency_ledger.py`, `apps/dependencies.py`;
 
 ### 11.1 Python runtime dependency installation is serialized
 
-Separately from capability resolution, `apps/backend.py::provision_app_deps`
+Separately from capability resolution, `apps/backend_runtime/provisioning.py::provision_app_deps`
 serializes each app's Python dependency install with `data/.kirocrew-deps.lock`.
 The installer and the data-preserving uninstall path in `apps/manager.py` both
 first create that lock with `O_CREAT | O_EXCL`. Only `FileExistsError`
@@ -1294,8 +1296,9 @@ with it), so it is a trust-scale indicator, not a live metric. Absence means
 "unknown" and renders nothing — never zero.
 
 Writers: `apps/manager.py` (`_BUILTIN_APPS`, `_DEFAULT_ON_BUILTINS`,
-`register_builtin_apps`), `apps/discovery.py::discover_builtin_apps`,
-`apps/registry.py::_apply_trust_fields`;
+`_DEFAULT_ON_BACKFILL`, `register_builtin_apps`, `backfill_default_on_builtins`),
+`agent.py::run_first_run_setup`, `apps/discovery.py::discover_builtin_apps`,
+`apps/registry_pipeline/catalog.py::_apply_trust_fields`;
 consumers: `website/src/pages/apps/useAppsData.ts` (`pickFeatured`),
 `website/src/components/appstore/types.ts` (`isVerified`, `sourceLabel`).
 
@@ -1503,7 +1506,7 @@ authors: [../../architecture/app-platform-trust-model.md](../../architecture/app
 ## 14. The published catalog is the store's inventory
 
 `GET /api/apps/registry` answers from the published catalog when it is reachable:
-`handle_registry` prefers `list_catalog_apps` (`registry.py`), which maps the
+`handle_registry` prefers `list_catalog_apps` (`registry_pipeline/catalog.py`), which maps the
 published `official-registry.json` entries through
 `official_catalog.list_catalog_rows` and then applies the same install-status and
 trust stamping as the seed path. The bundled `app-registry.json` seed is the
@@ -1592,10 +1595,12 @@ A name is a filesystem path on install, so `inventory()` and
 (`asyncio.to_thread`) so a cache-expired request never blocks the gateway loop.
 
 Writers: `apps/official_catalog.py` (`list_catalog_rows`, `inventory`,
-`fetch_inventory_entries`, `inventory_for_install`), `apps/registry.py`
-(`list_catalog_apps`, `_resolve_registry_row`, `_git_fetch_commit`,
-`_append_external_registry_apps`, `_detect_installed_probe`),
-`apps/routes.py` (`handle_registry`).
+`fetch_inventory_entries`, `inventory_for_install`), `apps/registry_pipeline/catalog.py`
+(`list_catalog_apps`, `_resolve_registry_row`, `_append_external_registry_apps`,
+`_detect_installed_probe`), `apps/registry_pipeline/checkout.py` (`_git_fetch_commit`),
+`dashboard/handlers/security.py` (`api_trusted_app_grant`),
+`apps/routes.py` (`handle_registry`, `handle_list_apps`, `handle_get_app`), and
+`website/src/components/appstore/TrustAppModal.tsx`.
 
 ## 15. A registry's credential posture follows its index's change control
 
@@ -1752,10 +1757,11 @@ default into the operator's `config.json`, where a later edition change could no
 longer move it. `PUT` carries `trust` through for the same class of reason —
 dropping it would silently downgrade a registry the operator had marked trusted.
 
-Writers: `apps/registry.py` (`_effective_registries`, `_pinned_registries`,
-`_registry_trust_tier`, `_is_owner_designated_repo`, `_owner_tier_confirmed`,
-`_sel_credential_decision`,
-`anonymous_git_env`), `platform/interfaces.py`
+Writers: `apps/registry_pipeline/sources.py` (`_effective_registries`,
+`_pinned_registries`, `_registry_trust_tier`, `_is_owner_designated_repo`,
+`_sel_credential_decision`), `apps/registry_pipeline/indexes.py`
+(`_owner_tier_confirmed`), `apps/registry_pipeline/subprocess_env.py`
+(`anonymous_git_env`), `platform/interfaces.py`
 (`AppsLoader.default_registries`), `config/loader.py`
 (`ExternalRegistryConfig.trust`), `apps/routes.py` (`handle_registries`).
 
@@ -2011,7 +2017,8 @@ treats any pattern route as a real handler without consulting the regex), so
 The blob proxy keeps serving a **not-installed** external-registry row, which
 genuinely has no local copy; that half of `known_registry_repos` is untouched.
 
-Writers: builtin `app.json` manifests, `apps/registry.py` (`_merge_manifest`),
+Writers: builtin `app.json` manifests, `apps/registry_pipeline/manifests.py`
+(`_merge_manifest`, `_store_asset_path`),
 `apps/routes.py` (`handle_app_art_file`),
 `website/src/components/appstore/appManifest.ts`,
 `website/src/components/appstore/useHeroArt.ts`,
@@ -2350,10 +2357,11 @@ way; the two update paths in `apps/routes.py` now match them, and
 For an adopted backend, where we hold no handle to poll, "we still track it"
 is the only honest answer and `healthy` is the load-bearing signal.
 
-Writers: `apps/backend.py` (`_health_check_loop`, `_watch_backend_health`,
-`_demote`, `_promote`, `_supervise_backend_health`, `_start_health_supervisor`,
-`_start_adopted_health_watch`, `AppProcess.is_running`), `apps/routes.py`
-(`handle_list_apps`).
+Writers: `apps/backend_runtime/supervision.py` (`_health_check_loop`,
+`_watch_backend_health`, `_supervise_backend_health`, `_start_health_supervisor`,
+`_start_adopted_health_watch`), `apps/backend_runtime/registration.py` (`_demote`,
+`_promote`), `apps/backend_runtime/tracking.py` (`AppProcess.is_running`),
+`apps/routes.py` (`handle_list_apps`).
 
 ## 18. An app UI is a dynamically imported ESM module, not an iframe
 
@@ -2431,6 +2439,212 @@ that, the import order, the one-hop facade, and the lock order end to end.
 Writers: `apps/builtins/spec_builder/backend/handlers.py`, `runtime.py`,
 `decisions.py`, `orchestration/`; `apps/builtins/spec_builder/tests/routes_facade.py`
 (`BACKEND_MODULES`).
+
+## 20. The App Registry is composed by pipeline owner
+
+The App Registry runs the whole App Store pipeline: the environment every registry
+child starts with, what a clone URL may be, which registries are in force and what
+each is trusted with, the on-disk caches, the git processes that fill a checkout,
+the store listing, and the install transaction. That behaviour is specified in §0,
+§12 and §14 to §16 above and in [security](security.md) under "Federated registry
+validation & refresh". This section records which module owns which part, so a
+change lands in its owner.
+
+| Module under `src/kiro_crew/apps/` | Owns |
+|---|---|
+| `registry.py` | The facade: the only import path and patch surface, plus the build step (`_run_app_build`) and the two index-entry name gates (`_admit_cached_index_entries`, `_admit_fetched_index_entries`) |
+| `registry_pipeline/subprocess_env.py` | The environments registry children start with: `minimal_env`, the credential-free `anonymous_git_env`, and the `detectInstalled` probe env |
+| `registry_pipeline/git_targets.py` | Clone-target text: the target an entry names, host and SSH parsing, the unsupported query, fragment and ambiguous SSH/SCP forms, userinfo stripping, normalization and comparison, the one-shot credential environment, and the fixed classes credentialed git output is reduced to |
+| `registry_pipeline/caches.py` | Everything under `cache/app-manifests`: manifest-cache and index-cache identity, paths, TTLs, reads and writes, expiry, garbage collection, and the legacy-filename migration |
+| `registry_pipeline/sources.py` | Which registries are in force: the bundled seed and edition rows, pinned and effective registries, identity keys, trust tiers, clone-host trust and sandbox mode, and the owner-designated same-repo carve-out with its SEL records |
+| `registry_pipeline/recovery.py` | The checkout slot (`app_source_dir`), move-aside with a refreshed retention clock, restore, the restorable subset, and the sweep of `.stale-*` / `.partial-*` siblings |
+| `registry_pipeline/checkout.py` | The git processes that fill a checkout: fetch by branch or pinned commit, clone-or-pull with origin and branch re-convergence, the origin read, bounded git-metadata reads, the timeouts, and the process-group kill |
+| `registry_pipeline/indexes.py` | External index fetch, the configured-branch rule, fetch-then-swap caching, load with stale fallback, and the install-time owner-tier confirmation (`_owner_tier_confirmed`) |
+| `registry_pipeline/manifests.py` | An app's `app.json` for the store: subdirectory containment, fetch from the verified checkout or a throwaway clone, resolution through the cache, and the merge with its blob-proxy asset paths |
+| `registry_pipeline/catalog.py` | The store listing and lookups: seed, catalog and external precedence, install status, trust fields, refresh, and the row and candidate resolution install and consent go through |
+| `registry_pipeline/install.py` | The install transaction: every gate before repository bytes run, clone, identity and admission before the build, the rejected-checkout rollback (`_unpoison_rejected_checkout`), `onInstall`, registration, provenance, and the single restore-and-report `finally` |
+
+Imports only point down this order: `subprocess_env`, `git_targets`, `caches`,
+`sources`, `recovery`, `checkout`, `indexes`, `manifests`, `catalog`, `install`, then
+`registry.py`. There is no cycle, and no owner imports the facade. The facade imports
+every owner at its own import, so an owner's `from ... import` bindings are taken
+once, as the one-module registry took them. `registry.py` re-exports every name an
+owner holds, one hop, so `routes.py`, `manager.py`, `execution.py`, the dashboard
+security handler and the platform defaults keep one import path.
+
+Every patch seam stays on the facade. A write to `registry.<name>` reaches every
+module that binds that name, and each owner reads its own bindings, so a
+`monkeypatch.setattr(registry, ...)` or `mock.patch("kiro_crew.apps.registry.<name>")`
+reaches the call site in whichever owner makes the call. That holds because every
+module holding a name holds the same object, every owner logs through the
+`kiro_crew.apps.registry` logger, and `importlib.reload(registry)` reloads each owner
+in layer order. `mock.patch(..., create=True)` on a forwarded name is the one
+spelling the facade cannot undo, and a guard refuses it.
+
+Three placements are constraints rather than style. `_run_app_build` stays in
+`registry.py` because `test_internal_python_isolation.py` reads it there by path, and
+the two `KEBAB_RE.fullmatch` name gates stay there because
+`test_kebab_gates_reject_trailing_newline.py` counts them in the facade's source. The
+three owners that call them (`caches._read_external_registry_cache`,
+`indexes._fetch_and_cache_external_registry`, `install._clone_build_app_locked`)
+resolve the facade at call time through `registry_pipeline._facade()`, and nothing
+else in the pipeline refers to it. `_redact_url_userinfo` and
+`_redacted_git_failure_class` are the two names `test_security_posture.py` classifies
+as redactors, and only the four owners listed in `NON_EGRESS_REDACTION_MODULES`
+(`sources.py`, `git_targets.py`, `indexes.py`, `checkout.py`) call them, so a new
+call to either belongs in one of those or needs its own row there.
+`test_apps_registry_composition_contract.py` pins the surface, the
+one-namespace writes, the import order, the three facade call sites, the reload and
+the `create=True` guard end to end.
+
+Writers: `apps/registry.py`, `apps/registry_pipeline/`.
+
+## 21. The app backend is composed by supervision owner
+
+The app backend supervises every gateway-managed backend process: the process table
+and its lifecycle generations, the dependency provisioning transaction, the spawn and
+adoption, the stops and tree drains, the startup reap, the health watch with its
+MCP transition and restart, and the boot wave. That behaviour is specified in §7.2,
+§11.1 and §17 above, in "Windows stale-backend cleanup capacity" below, and in
+[security](security.md). This section records which module owns which part, so a
+change lands in its owner.
+
+| Module under `src/kiro_crew/apps/` | Owns |
+|---|---|
+| `backend.py` | The facade: the only import path and patch surface, plus the spawn transaction (`start_app_backend`, `_start_app_backend`, `_clear_failed_spawn_state`, and `_start_app_backend_body` with the entry-point classification, child environment, sandbox wrap, and spawn and adoption records it builds) and `_pid_alive` |
+| `backend_runtime/tracking.py` | The process table: `AppProcess`, `_processes` under `_lock`, the STARTING placeholder's owner (`_spawn_publication_owner`), `_restart_attempts`, the lifecycle generation (`_advance_lifecycle_locked`), `_health_reconcile_lock`, the cross-process spawn flock, the wait on an in-flight spawn, and the table reads the proxy and routes use |
+| `backend_runtime/probe.py` | The loopback health probe: the `healthCheck` path gate, `HealthProbeOutcome`, and the failure detail and hint the logs print |
+| `backend_runtime/pidfile.py` | `app_backends.pids.json`: the start-identity probe, the read and the atomic write, the record, the identity-conditional forget, and the strict Windows retirement writer |
+| `backend_runtime/ports.py` | Port reservation (`_find_free_port`, `_reserve_free_port`, `_claim_port`) and listener attribution (the survival check, the bounded ancestry walk, the adoption owner capture), plus the recorded and unstopped port reads uninstall uses |
+| `backend_runtime/provisioning.py` | The dependency transaction: the no-follow requirements read, the stamp and ABI digests, `_PinnedDir`, staging, pip, the markers, the swap, the failure audit, and the activation gate `_deps_tree_stamp_current` |
+| `backend_runtime/termination.py` | Stopping a backend and draining a spawned tree: `stop_app_backend`, `_signal_backend_tree`, `_drain_exited_root_tree`, `_terminate_retired_spawn` |
+| `backend_runtime/stale_reap.py` | The startup reap of a prior generation's leaders and orphaned groups |
+| `backend_runtime/registration.py` | Health-gated MCP registration: `_set_backend_health`, `_gate_mcp_registration`, promote, demote and retry, tri-state enablement, and the disabled-app undo |
+| `backend_runtime/restart.py` | Restarting an exited backend: the activation re-vet, the backoff, the lifecycle-generation handoff (`_settle_superseding_start`), and the thread-waitable shutdown signal |
+| `backend_runtime/supervision.py` | The per-record supervisor thread: the startup poll, the standing watch, the ceiling revocation, and the adopted-owner rebind |
+| `backend_runtime/startup.py` | Boot: the reap, the resource reconcile, the vetting, the concurrent spawn wave with its fixed-port preclaim, and the deferred Dev Fleet spawn |
+
+Imports only point down this order: `tracking`, `probe`, `pidfile`, `ports`,
+`provisioning`, `termination`, `stale_reap`, `registration`, `restart`, `supervision`,
+`startup`, then `backend.py`. There is no cycle, and no owner imports the facade. The
+facade imports every owner at its own import, so an owner's `from ... import`
+bindings are taken once, as the one-module backend took them. `backend.py`
+re-exports every name an owner holds, one hop, so `routes.py`, `teardown.py`,
+`hooks_integration.py`, `bridges.py`, `manager.py`, `interpreter.py`,
+`cli_commands.py`, `member_memory_auth.py`, `platform_compat.py` and the dashboard
+server keep one import path.
+
+Every patch seam stays on the facade. A write to `backend.<name>` reaches every module
+that binds that name, and each owner reads its own bindings, so a
+`monkeypatch.setattr(bmod, ...)` or `mock.patch("kiro_crew.apps.backend.<name>")`
+reaches the call site in whichever owner makes the call. The mutable state is one
+object per name, defined once in its owner and imported by the owners that act on it,
+so `bmod._processes.clear()` empties the table every owner reads and replacing it
+through the facade reaches every holder. The two flags rebound with `global` each have
+one holder: `_warned_unconfined_cache` in `backend.py` and `_DEV_FLEET_DEFERRED` in
+`startup.py`. Every owner logs through the `kiro_crew.apps.backend` logger, and
+`importlib.reload(backend)` reloads each owner in layer order.
+`mock.patch(..., create=True)` on a forwarded name is the one spelling the facade
+cannot undo, and a guard refuses it. The lock order is unchanged: `_health_reconcile_lock`
+first, then `_lock` or bridges' `_mcp_lock`.
+
+The placements are constraints rather than style. The spawn stays in `backend.py`
+because repository guards read it there by path: `test_internal_python_isolation.py`
+names `apps/backend.py::_start_app_backend_body`, `test_spawn_audit.py` names
+`apps/backend.py::_resolve_nvm_path`, and `test_app_off_contract.py`,
+`test_dev_fleet_app.py`, `test_frontend_edition_build.py`,
+`test_sandbox_dev_fleet_live_target.py`, `test_app_bridges.py` and
+`test_app_backend.py` read the spawn's record constructions and environment in the
+facade's source -- including what must NOT be there, so every record construction and
+none of the texts they forbid lives in an owner either. `_pid_alive` stays there because `test_windows_kill_probe_audit.py`
+reads it by path. Four owner call sites reach those residents at call time through
+`backend_runtime._facade()`, and nothing else refers to the facade:
+`termination._drain_exited_root_tree` and `stale_reap._reap_stale_app_backends`
+(`_pid_alive`), `restart._restart_exited_backend` (`_start_app_backend`), and
+`startup._start_backends_concurrently` (`start_app_backend`). The provisioning
+transaction's link-screen sites (`test/link_screen_sites.py`), its internal-Python
+spawn row (`test_internal_python_isolation.py`) and its `NON_EGRESS_REDACTION_MODULES`
+row name `apps/backend_runtime/provisioning.py`, whose pip stderr scrub is the
+backend's only redactor call. `test_app_backend_composition_contract.py` pins the
+surface, the one-namespace writes, the reach of every global a backend function reads,
+the import order, the four facade call sites, the reload and the `create=True` guard
+end to end, and `test_app_backend_refactor_characterization.py` pins the generation,
+ordering and identity guards that cross owners.
+
+Writers: `apps/backend.py`, `apps/backend_runtime/`.
+
+## 22. The app directory's gateway-owned root entries are never the source's
+
+Two root entries of an installed app directory belong to the gateway, not to the
+app that shipped the tree: `.app_secret`, the per-app credential
+`write_app_secret` generates, and `data/`, which an install puts back from the
+preserved previous directory (an update's own, a default uninstall's leftover, or
+a crashed sibling's `.{name}-data-tmp`). The install copy (`_copy_app_tree`)
+carries whatever the source put under those names — it keeps an in-tree symlink
+AS a link — so the install **removes its own entries from the copy without
+following them** (`_remove_any_shape`: a link is unlinked, a directory removed, a
+file deleted) before it writes or restores its own. The order is the contract:
+`write_app_secret` opens the path it is given, so a shipped
+`.app_secret -> ui/leak.js` that was still standing would receive the secret in
+a file the unauthenticated `/apps/{name}/ui/` route serves; a shipped `data`
+link that was still standing would fail the preserved directory's move.
+
+The install-time desktop gate judges a preview copy of the checkout
+(`copy_app_tree_as_installed`) and applies this same removal to it, so what the
+gate sees at those names is what the install leaves there — by the same call,
+not by a prediction of it. A first install with nothing preserved carries the
+source's `data/` as itself, in both.
+
+What stands at `data` once the gateway's part is done must be something the
+app's data directory can be — and something the gateway can move: `app_data_dir`
+is `mkdir(exist_ok=True)` at that name, and every update moves that directory
+aside to `.<name>-data-tmp` beside the app directory and puts it back after the
+copy. A real directory satisfies both. A link at that name is refused whatever
+it resolves to: `mkdir` may follow a link to a directory, but the move relocates
+the link itself, a relative link relocated out of its tree dangles, nothing is
+put back, and the directory it named is retired — and deleted — with the old
+tree on the update's own success path. A shipped FILE named `data` and a
+dangling link are refused for the `mkdir` alone. That question is asked of the
+copied tree **before `installed.json` is written**
+(`gateway_data_dir_obstruction`): `install_app` refuses and removes its copy,
+`update_app` refuses inside its transaction and the rollback restores the old
+tree and record, so a source shipping such an entry never leaves a
+half-installed app (a record, no data directory, no secret) behind a raise. An
+installed `data` that is already a link or a file (an install from before this
+refusal, or the app's own runtime replacing its directory) is refused by
+`update_app`'s preflight **before its transaction opens** — the same question,
+asked of the installed tree, with the old tree and record untouched — instead of
+being skipped by the move-aside and deleted with the retired tree on the update's
+success path; `preserved_data_awaits` never counts a link as a preserved
+directory. The same question is asked by `install_app`, of an app directory
+already standing at its destination with no record (a prior default uninstall's
+leftover, or an orphaned partial copy), **before its transaction opens**: a
+pre-existing link or file at `data` is refused with that sentence instead of
+being unlinked by the orphan cleanup that clears such a directory before the
+copy, the same refusal `update_app` and `uninstall_app` make of that shape before
+they mutate anything.
+The
+preview asks the same question and raises the install's own refusal
+(`InstalledTreeRefused`), which the registry transaction reports as a refusal —
+never as the desktop code, since a browser install refuses the same tree — so
+the gate turns the tree away before any copy into the app directory is made.
+With a preserved `data/` awaiting, the shipped entry is replaced by the
+directory that is put back, and the same source installs.
+
+Writers: `apps/manager.py::install_app`, `update_app`,
+`copy_app_tree_as_installed`, `_remove_any_shape`, `gateway_data_dir_obstruction`;
+`apps/registry.py::_run_app_build`,
+`apps/registry_pipeline/install.py::install_from_registry` (the refusal's two
+call sites). Tests:
+`test/test_app_manager.py::TestInstall` (the shipped `.app_secret` link, the
+shipped `data` link, the root `data` file refused before the record),
+`TestCopyAppTree::test_update_never_keeps_a_shipped_app_secret_link`,
+`TestCopyAppTree::test_an_update_shipping_a_root_data_file_where_none_is_preserved_rolls_back`,
+`TestCopyAppTree::test_an_installed_data_file_refuses_the_update_before_the_transaction`
+(and its link and junction siblings),
+`TestCopyAppTreeAsInstalled`,
+`test/test_apps_registry.py::test_a_root_data_file_is_refused_before_any_record_is_written`.
+
 
 
 ## Windows stale-backend cleanup capacity

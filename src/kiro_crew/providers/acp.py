@@ -574,6 +574,26 @@ class AcpProvider(LLMProvider):
                 pass
 
     @property
+    def model_pin_refused(self) -> str:
+        """The pinned model the adapter refused at startup, or ``""``.
+
+        Both client shapes carry the field: a raw ``AcpClient`` sets it in its
+        startup model push, and an ``AcpSessionProvider`` delegates to its
+        handle's ``set_model``.
+        """
+        value = self._client.model_pin_refused
+        return value if isinstance(value, str) else ""
+
+    @property
+    def model_pin_partial(self) -> str:
+        """The bare model a ``<model>[<effort>]`` pin landed as, or ``""``.
+
+        Set when the base model applied but its effort half did not.
+        """
+        value = self._client.model_pin_partial
+        return value if isinstance(value, str) else ""
+
+    @property
     def served_model(self) -> str:
         """Model id the live session resolved (public — see LLMProvider).
 
@@ -660,6 +680,22 @@ class AcpProvider(LLMProvider):
         backend after this provider was constructed.
         """
         return capabilities_for(self._client.backend)
+
+    @property
+    def kas_auto_approved_capabilities(self) -> frozenset[str] | None:
+        """What this session's registered agent batch auto-approves, or ``None``.
+
+        Only a wire-registered host (KAS) has a batch; see
+        ``AcpSessionHandle.kas_auto_approved``.
+        """
+        value = getattr(self._client, "kas_auto_approved_capabilities", None)
+        return value if isinstance(value, frozenset) else None
+
+    @property
+    def kas_projected_agent(self) -> str:
+        """The agent this session's registered batch was built for, or ``""``."""
+        value = getattr(self._client, "kas_projected_agent", "")
+        return value if isinstance(value, str) else ""
 
     @property
     def is_codex_backend(self) -> bool:
@@ -1924,7 +1960,7 @@ class AcpProvider(LLMProvider):
                         )
             else:
                 self._effort_per_model[model] = _prev
-                if not self._apply_effort_overlay():
+                if not await asyncio.to_thread(self._apply_effort_overlay):
                     # Same divergence the branch above guards: the file keeps the
                     # level the live push never applied and construction re-seeds
                     # from it, so the map follows the file rather than reporting
@@ -2087,8 +2123,11 @@ class AcpProvider(LLMProvider):
             await asyncio.to_thread(mark_run_dir, Path(self._client._work_dir))
         # Re-apply the overlay on every (re)start to cover resume / model swap.
         # (no-op for claude backend — that path applies effort live below.)
-        self._apply_effort_overlay()
-        self._apply_tool_search_overlay()
+        # Off the loop: the cli.json lock is shared with sibling threads and
+        # processes, and an acquire on the loop thread makes one attempt and
+        # never waits, so a brief overlap would refuse the write.
+        await asyncio.to_thread(self._apply_effort_overlay)
+        await asyncio.to_thread(self._apply_tool_search_overlay)
 
         if self.is_acp_runtime_backend:
             # ── Kiro unified path: AcpRuntime + AcpSessionHandle ──
@@ -2475,8 +2514,21 @@ class AcpProvider(LLMProvider):
         """Delegate a mid-turn steer to the inner client, which picks the wire
         method for its backend (``_session/steer`` on kiro-cli and KAS,
         ``_session/steering`` on claude-agent-acp). Fire-and-forget in both
-        cases; returns False if not steerable."""
+        cases; returns False if not steerable.
+
+        Refused (False, so the caller queues) when the inner session can lose a
+        delivered steer to a later denied approval: this wrapper is what the
+        messaging channels, Side Chat and ``spawn_steer`` steer, and only the
+        dashboard composer steers such a session. See
+        :attr:`steer_needs_loss_recovery`."""
+        if self.steer_needs_loss_recovery:
+            return False
         return await self._client.steer(message)
+
+    @property
+    def steer_needs_loss_recovery(self) -> bool:
+        """True when the inner session can lose a steer it reported delivered."""
+        return self._client.steer_needs_loss_recovery is True
 
     @property
     def last_steer_monotonic(self) -> float:
@@ -2485,8 +2537,18 @@ class AcpProvider(LLMProvider):
 
     @property
     def supports_steer(self) -> bool:
-        """True when the inner client supports mid-turn steer."""
-        return bool(getattr(self._client, "supports_steer", False))
+        """True when the inner client supports mid-turn steer through this wrapper.
+
+        False for a session that can lose a delivered steer (codex): only the
+        dashboard composer, which steers the inner client directly, steers it."""
+        return bool(getattr(self._client, "supports_steer", False)) and (
+            not self.steer_needs_loss_recovery
+        )
+
+    @property
+    def supports_refusal_steer(self) -> bool:
+        """True when the inner client can steer a deny notice into a refused turn."""
+        return bool(getattr(self._client, "supports_refusal_steer", False))
 
     def _inline_turn_finished_cleanly(self) -> bool:
         """Whether the last turn reached its own end boundary uncancelled.
@@ -2583,12 +2645,17 @@ class AcpProvider(LLMProvider):
         return self._client.is_responsive()
 
     def is_process_alive(self) -> bool:
-        """True if the underlying OS process has not exited (ignores I/O staleness)."""
+        """True if the runtime process has not exited (ignores I/O staleness).
+
+        Process-level by name as well as by behaviour, and shared by every session
+        the client hosts. Do not read it as "my session is usable" -- see
+        :meth:`is_alive`.
+        """
         return self._client.is_process_alive()
 
     @property
     def process_instance(self) -> str:
-        """Per-spawn identity of the client's current child process (see base).
+        """Per-spawn identity of the client's current runtime process (see base).
 
         A direct read on purpose: a `getattr` hedge would convert a future
         wiring break into "no banner is ever live", indistinguishable from
@@ -2625,7 +2692,11 @@ class AcpProvider(LLMProvider):
 
     @property
     def exit_code(self) -> int | None:
-        """Process exit code, or None if still running."""
+        """The runtime process's exit code, or None if still running.
+
+        One code per process, so every session the client hosted reads the same
+        one: it explains a runtime's death, never one session's stop.
+        """
         return self._client.exit_code
 
     @property
@@ -2657,12 +2728,6 @@ class AcpProvider(LLMProvider):
         session on that process active, not just this one.
         """
         self._client.touch_activity()
-
-    def runtime_info(self) -> tuple[int | None, str | None]:
-        """Return (runtime_pid, gateway_socket_path) for abort propagation."""
-        pid = getattr(self._client, "_pid", None)
-        socket_path = getattr(self._client, "_mcp_gateway_socket", None)
-        return (pid, socket_path)
 
     @property
     def session_id(self) -> str:

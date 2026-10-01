@@ -1,57 +1,26 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { ApiError } from '../api/apiError'
-import {
-  Boxes,
-  FolderOpen,
-  Database,
-  Sparkles,
-  Plus,
-  MessageSquare,
-  Users,
-  Star,
-  LayoutGrid,
-  Rows3,
-  UserPen,
-} from 'lucide-react'
+import { Boxes, FolderOpen, Database, Sparkles, Plus, MessageSquare, Users, LayoutGrid, Rows3, UserPen, ChevronRight } from 'lucide-react'
 import Clickable from '../components/Clickable'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useAppDispatch } from '../store'
 import { createSlot } from '../store/chatSlice'
 import { api, type WebhookTokenEntry } from '../api/client'
-import { useProvider } from '../providers'
 import { useAvailableModels } from '../hooks/useAvailableModels'
-import { modelLabel } from '../lib/model'
 import { FOLDER_COLOR_PALETTE } from '../components/folderColorCatalog'
 import { Btn, SendBtn, Input, Badge, SearchInput, PageHeader, EmptyState } from '../components/ui'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '../components/ui/table'
-import {
-  Dialog,
-  DialogBody,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
+  Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle,
 } from '../components/ui/dialog'
 import SegmentedControl from '../components/SegmentedControl'
+import { modelLabel } from '../lib/model'
 import ErrorBoundary from '../components/ErrorBoundary'
 import InfoTip from '../components/InfoTip'
 import { FOCUSABLE } from '../hooks/useDialogFocusTrap'
 import SimpleSelect from '../components/SimpleSelect'
-import CrewAvatar, {
-  ghostTraitsFrom,
-  imageAvatarFrom,
-  packAvatarFrom,
-  unclaimedAvatarFrom,
-  type CrewAvatarOverride,
-} from '../components/CrewAvatar'
+import CrewAvatar, { ghostTraitsFrom, imageAvatarFrom, packAvatarFrom, unclaimedAvatarFrom, type CrewAvatarOverride } from '../components/CrewAvatar'
 import CrewStateAvatar from '../components/CrewStateAvatar'
 import CrewAvatarBuilder from '../components/CrewAvatarBuilder'
 import {
@@ -70,19 +39,14 @@ import AgentTemplateDetail from '../components/crew/AgentTemplateDetail'
 import CrewCapabilitiesPane from '../components/crew/CrewCapabilitiesPane'
 import { crewCapabilitiesApi, crewCapabilitiesKey } from '../api/crewCapabilities'
 import { useCrewEditorSections, type CrewPaneKey } from '../components/crew/crewEditorSections'
-import {
-  wakesCrew,
-  crewWakeQueryKey,
-  crewWebhooksQueryKey,
-  webhookBoundToCrew,
-  webhookCanCallIn,
-} from '../components/crew/wakesCrew'
+import { wakesCrew, crewWakeQueryKey, crewWebhooksQueryKey, webhookBoundToCrew, webhookCanCallIn } from '../components/crew/wakesCrew'
 import type { CronJob } from '../types'
 import { crewDisplayName, type KiroCrewAgent } from '../components/AgentSelector'
 import { SourceBadge } from '../components/SourceBadge'
 import { errMessage } from '../utils/thunkError'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../lib/effort'
-import { templateSourceBadge, type TemplateProvenance } from '../lib/templateSource'
+import { templateSourceBadge, templateSourceLabel, type TemplateProvenance } from '../lib/templateSource'
+import { DEFAULT_CREWMATE_PATH } from './overview/defaultCrewmateLink'
 
 import { i18nT } from '../i18n/t'
 
@@ -215,10 +179,7 @@ function WorkspaceForm({
   // draft that went with it must not leave the host reading `dirty` as true
   // (its Escape/backdrop guard and the crewmate dialog's navigation stake
   // both consume it).
-  useEffect(() => {
-    onDirtyChange?.(dirty)
-    return () => onDirtyChange?.(false)
-  }, [dirty, onDirtyChange])
+  useEffect(() => { onDirtyChange?.(dirty); return () => onDirtyChange?.(false) }, [dirty, onDirtyChange])
   // Two states, because they are two different things: `wsHint` is client-side
   // validation (nothing failed), `wsError` is the outcome of a request that did.
   const [wsHint, setWsHint] = useState('')
@@ -229,11 +190,7 @@ function WorkspaceForm({
   const handleNameChange = (v: string) => {
     setWsName(v)
     if (!dirTouched) {
-      const slug = v
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-|-$/g, '')
+      const slug = v.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
       setWsDir(slug ? `workspace-${slug}` : 'workspace')
     }
   }
@@ -242,27 +199,16 @@ function WorkspaceForm({
     setWsHint('')
     setWsError('')
     const n = wsName.trim()
-    if (!n) {
-      setWsHint(i18nT('pages.kiroCrewAgentsPage.workspace_name_is_required'))
-      return
-    }
+    if (!n) { setWsHint(i18nT('pages.kiroCrewAgentsPage.workspace_name_is_required')); return }
     setSubmitting(true)
     try {
       const body: Record<string, string> = { name: n, dir: wsDir }
       if (copyFrom) body.copy_from = copyFrom
       const r: AgentMutationResult = await api.createWorkspace(body)
-      if (r.error) {
-        setWsError(r.error)
-        setSubmitting(false)
-        return
-      }
+      if (r.error) { setWsError(r.error); setSubmitting(false); return }
       onCreated(r.name || n)
     } catch (e) {
-      setWsError(
-        e instanceof Error
-          ? e.message
-          : i18nT('pages.kiroCrewAgentsPage.failed_to_create_workspace'),
-      )
+      setWsError(e instanceof Error ? e.message : i18nT('pages.kiroCrewAgentsPage.failed_to_create_workspace'))
     } finally {
       setSubmitting(false)
     }
@@ -278,61 +224,23 @@ function WorkspaceForm({
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-1">
               {/* Native input associated via htmlFor+id; label-has-for's nesting requirement is a false positive. */}
-              <label
-                htmlFor="ws-name"
-                className="text-[11px] text-muted uppercase tracking-wider font-medium"
-              >
-                {i18nT('pages.kiroCrewAgentsPage.name')}
-              </label>
-              <InfoTip
-                text={i18nT(
-                  'pages.kiroCrewAgentsPage.a_unique_identifier_for_this_workspace_agents_re',
-                )}
-              />
+              <label htmlFor="ws-name" className="text-[11px] text-muted uppercase tracking-wider font-medium">{i18nT('pages.kiroCrewAgentsPage.name')}</label>
+              <InfoTip text={i18nT('pages.kiroCrewAgentsPage.a_unique_identifier_for_this_workspace_agents_re')} />
             </div>
-            <Input
-              id="ws-name"
-              placeholder={i18nT('pages.kiroCrewAgentsPage.e_g_oncall')}
-              value={wsName}
-              onChange={(e) => handleNameChange(e.target.value)}
-              autoFocus
-            />
+            <Input id="ws-name" placeholder={i18nT('pages.kiroCrewAgentsPage.e_g_oncall')} value={wsName} onChange={e => handleNameChange(e.target.value)} autoFocus />
           </div>
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-1">
               {/* Native input associated via htmlFor+id; label-has-for's nesting requirement is a false positive. */}
-              <label
-                htmlFor="ws-dir"
-                className="text-[11px] text-muted uppercase tracking-wider font-medium"
-              >
-                {i18nT('pages.kiroCrewAgentsPage.directory')}
-              </label>
-              <InfoTip
-                text={i18nT(
-                  'pages.kiroCrewAgentsPage.subdirectory_inside_kiro_crew_where_this_workspa',
-                )}
-              />
+              <label htmlFor="ws-dir" className="text-[11px] text-muted uppercase tracking-wider font-medium">{i18nT('pages.kiroCrewAgentsPage.directory')}</label>
+              <InfoTip text={i18nT('pages.kiroCrewAgentsPage.subdirectory_inside_kiro_crew_where_this_workspa')} />
             </div>
-            <Input
-              id="ws-dir"
-              placeholder={i18nT('pages.kiroCrewAgentsPage.workspace')}
-              value={wsDir}
-              onChange={(e) => {
-                setDirTouched(true)
-                setWsDir(e.target.value)
-              }}
-            />
+            <Input id="ws-dir" placeholder={i18nT('pages.kiroCrewAgentsPage.workspace')} value={wsDir} onChange={e => { setDirTouched(true); setWsDir(e.target.value) }} />
           </div>
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-1">
-              <span className="text-[11px] text-muted uppercase tracking-wider font-medium">
-                {i18nT('pages.kiroCrewAgentsPage.copy_from_optional')}
-              </span>
-              <InfoTip
-                text={i18nT(
-                  'pages.kiroCrewAgentsPage.copy_the_contents_of_an_existing_workspace_into',
-                )}
-              />
+              <span className="text-[11px] text-muted uppercase tracking-wider font-medium">{i18nT('pages.kiroCrewAgentsPage.copy_from_optional')}</span>
+              <InfoTip text={i18nT('pages.kiroCrewAgentsPage.copy_the_contents_of_an_existing_workspace_into')} />
             </div>
             <SimpleSelect
               options={workspaceOptions}
@@ -353,11 +261,7 @@ function WorkspaceForm({
       </DialogBody>
       <DialogFooter>
         <Btn onClick={onClose}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>
-        <SendBtn onClick={submit} disabled={submitting}>
-          {submitting
-            ? i18nT('pages.kiroCrewAgentsPage.creating')
-            : i18nT('pages.kiroCrewAgentsPage.create')}
-        </SendBtn>
+        <SendBtn onClick={submit} disabled={submitting}>{submitting ? i18nT('pages.kiroCrewAgentsPage.creating') : i18nT('pages.kiroCrewAgentsPage.create')}</SendBtn>
       </DialogFooter>
     </>
   )
@@ -384,9 +288,7 @@ export function WorkspaceModal({
   // `guardAccidentalDismiss`), so grazing the backdrop cannot discard a typed
   // name/directory/copy-from. The explicit Cancel and the X still close.
   const [dirty, setDirty] = useState(false)
-  useEffect(() => {
-    onDirtyChange?.(dirty)
-  }, [dirty, onDirtyChange])
+  useEffect(() => { onDirtyChange?.(dirty) }, [dirty, onDirtyChange])
   /* Also mounted by the Crewmates page's New crewmate dialog
      (`pages/members/NewCrewmateDialog.tsx`), whose Advanced section offers the
      same "new workspace" entry as the editor.
@@ -403,12 +305,7 @@ export function WorkspaceModal({
      content sits at z-[101]; at an equal z-index this would render behind its
      own opener. */
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        if (!next) onClose()
-      }}
-    >
+    <Dialog open={open} onOpenChange={next => { if (!next) onClose() }}>
       <DialogContent
         maxWidth={448}
         className="z-[110]"
@@ -417,19 +314,10 @@ export function WorkspaceModal({
         // preventDefault keeps Radix from dismissing AND marks the Escape as
         // handled, so the layer underneath (the crewmate dialog's own Escape
         // listener skips a defaultPrevented event) does not close either.
-        onEscapeKeyDown={(e) => {
-          if (dirty) e.preventDefault()
-        }}
-        onPointerDownOutside={(e) => {
-          if (dirty) e.preventDefault()
-        }}
+        onEscapeKeyDown={e => { if (dirty) e.preventDefault() }}
+        onPointerDownOutside={e => { if (dirty) e.preventDefault() }}
       >
-        <WorkspaceForm
-          workspaceOptions={workspaceOptions}
-          onCreated={onCreated}
-          onClose={onClose}
-          onDirtyChange={setDirty}
-        />
+        <WorkspaceForm workspaceOptions={workspaceOptions} onCreated={onCreated} onClose={onClose} onDirtyChange={setDirty} />
       </DialogContent>
     </Dialog>
   )
@@ -438,17 +326,7 @@ export function WorkspaceModal({
 /** One labelled control in the editor panel, with an optional explainer. Also the
  *  frame around every field of the Crewmates page's New crewmate dialog
  *  (`pages/members/NewCrewmateDialog.tsx`), so the two forms share one frame. */
-export function Field({
-  label,
-  hint,
-  info,
-  children,
-}: {
-  label: string
-  hint?: string
-  info?: string
-  children: React.ReactNode
-}) {
+export function Field({ label, hint, info, children }: { label: string; hint?: string; info?: string; children: React.ReactNode }) {
   return (
     <div className="flex flex-col gap-1.5">
       <span className="flex items-center gap-1.5 text-[11px] text-muted uppercase tracking-wider font-medium">
@@ -462,13 +340,7 @@ export function Field({
 }
 
 /** One binding shown on a roster card: icon, what it is, what it points at. */
-function Binding({
-  icon,
-  label,
-  value,
-  muted,
-  note,
-}: {
+function Binding({ icon, label, value, muted, note }: {
   icon: React.ReactNode
   label: string
   value: string
@@ -506,18 +378,8 @@ function withCurrent(opts: string[], cur: string): string[] {
  * SAME control rather than two copies that drift. Create composes them through
  * `BindingFields`; the editor mounts them individually, one per rail pane.
  */
-export function TemplateField({
-  label,
-  options,
-  value,
-  onChange,
-  editLaterNote,
-  provenance,
-}: {
-  label: string
-  options: string[]
-  value: string
-  onChange: (v: string) => void
+export function TemplateField({ label, options, value, onChange, editLaterNote, provenance }: {
+  label: string; options: string[]; value: string; onChange: (v: string) => void
   /** Create-only reassurance that the pick is not a commitment. The editor never
    *  sets it: there the fields being edited are themselves the answer. */
   editLaterNote?: boolean
@@ -533,7 +395,7 @@ export function TemplateField({
     <Field label={label} hint={hint}>
       <SimpleSelect
         options={opts}
-        optionBadges={opts.map((o) => {
+        optionBadges={opts.map(o => {
           const p = provenance?.[o]
           const label = templateSourceBadge(p)
           return label ? { label, source: p?.source ?? '' } : undefined
@@ -557,19 +419,8 @@ export function TemplateField({
   )
 }
 
-export function WorkspaceField({
-  options,
-  value,
-  onChange,
-  onNewWorkspace,
-  subject,
-  hint,
-}: {
-  options: string[]
-  value: string
-  onChange: (v: string) => void
-  onNewWorkspace: () => void
-  subject: FormSubject
+export function WorkspaceField({ options, value, onChange, onNewWorkspace, subject, hint }: {
+  options: string[]; value: string; onChange: (v: string) => void; onNewWorkspace: () => void; subject: FormSubject
   /** Replaces the subject's default hint. The defaults are EDIT-time copy
    *  ("new chats start fresh in the new folder"); a create form has no old
    *  chats to worry about, so it passes its own line. */
@@ -578,22 +429,14 @@ export function WorkspaceField({
   return (
     <Field
       label={i18nT('pages.kiroCrewAgentsPage.workspace_2')}
-      hint={
-        hint ??
-        (subject === 'member'
-          ? i18nT('pages.kiroCrewAgentsPage.workspace_hint_member')
-          : i18nT('pages.kiroCrewAgentsPage.isolated_memory_and_files_for_this_crew'))
-      }
+      hint={hint ?? (subject === 'member' ? i18nT('pages.kiroCrewAgentsPage.workspace_hint_member') : i18nT('pages.kiroCrewAgentsPage.isolated_memory_and_files_for_this_crew'))}
       info={i18nT('pages.kiroCrewAgentsPage.bindings_preview_info')}
     >
       <SimpleSelect
         options={withCurrent(options, value)}
         value={value}
         onChange={onChange}
-        action={{
-          label: i18nT('pages.kiroCrewAgentsPage.new_workspace_action'),
-          onSelect: onNewWorkspace,
-        }}
+        action={{ label: i18nT('pages.kiroCrewAgentsPage.new_workspace_action'), onSelect: onNewWorkspace }}
         aria-label={i18nT('pages.kiroCrewAgentsPage.workspace_2')}
       />
     </Field>
@@ -602,42 +445,25 @@ export function WorkspaceField({
 
 export type MemberMemoryState = 'legacy' | 'private' | 'ownership_mismatch' | 'unavailable'
 
-export function memberMemoryState(
-  member: string,
-  store: string,
-  stores: Record<string, { memory_version?: number; owner_member?: string }> | undefined,
-): MemberMemoryState {
+export function memberMemoryState(member: string, store: string, stores: Record<string, { memory_version?: number; owner_member?: string }> | undefined): MemberMemoryState {
   if (member === 'default') return store === 'default' ? 'legacy' : 'unavailable'
   if (!stores) return 'unavailable'
   const config = stores?.[store]
   if (config?.owner_member && config.owner_member !== member) return 'ownership_mismatch'
   if (config?.memory_version === 2 && config.owner_member === member) return 'private'
-  if (Object.values(stores).some((value) => value.owner_member === member)) return 'unavailable'
+  if (Object.values(stores).some(value => value.owner_member === member)) return 'unavailable'
   if (store === 'default') return 'legacy'
   if (!config) return 'unavailable'
   const version = config.memory_version === undefined ? 1 : config.memory_version
-  if (version === 1 && (config.owner_member === undefined || config.owner_member === ''))
-    return 'legacy'
+  if (version === 1 && (config.owner_member === undefined || config.owner_member === '')) return 'legacy'
   return 'unavailable'
 }
 
-export function MemoryStoreField({
-  value = '',
-  member,
-  memoryState = 'unavailable',
-  onManage,
-  busy = false,
-  manageDisabled = false,
-}: {
-  value?: string
-  member?: string
-  memoryState?: MemberMemoryState
-  onManage?: () => void
-  busy?: boolean
-  manageDisabled?: boolean
+export function MemoryStoreField({ value = '', member, memoryState = 'unavailable', onManage, busy = false, manageDisabled = false }: {
+  value?: string; member?: string; memoryState?: MemberMemoryState
+  onManage?: () => void; busy?: boolean; manageDisabled?: boolean
   /** Compatibility for external callers; stores are never selectable here. */
-  options?: string[]
-  onChange?: (value: string) => void
+  options?: string[]; onChange?: (value: string) => void
 }) {
   const isGlobal = member === 'default' && memoryState === 'legacy'
   const hint = !member
@@ -653,11 +479,7 @@ export function MemoryStoreField({
             : `${i18nT('pages.kiroCrewAgentsPage.memory_binding_unavailable')} ${i18nT('pages.kiroCrewAgentsPage.memory_binding_diagnostic', { command: 'kirocrew doctor' })}`
   return (
     <Field label={i18nT('pages.kiroCrewAgentsPage.memory_store')} hint={hint}>
-      {member && (
-        <span className="break-all font-mono text-[12px] text-muted">
-          {isGlobal ? 'default' : value}
-        </span>
-      )}
+      {member && <span className="break-all font-mono text-[12px] text-muted">{isGlobal ? 'default' : value}</span>}
       <div className="flex flex-wrap gap-2">
         {(isGlobal || memoryState === 'private') && onManage && (
           <Btn onClick={onManage} disabled={busy || manageDisabled}>
@@ -666,24 +488,15 @@ export function MemoryStoreField({
         )}
       </div>
       {(isGlobal || memoryState === 'private') && onManage && manageDisabled && (
-        <p className="mt-2 text-[12px] text-muted">
-          {i18nT('components.markdownPanel.save_or_discard_changes_first')}
-        </p>
+        <p className="mt-2 text-[12px] text-muted">{i18nT('components.markdownPanel.save_or_discard_changes_first')}</p>
       )}
+
     </Field>
   )
 }
 
-export function ModelField({
-  options,
-  value,
-  onChange,
-  hint,
-}: {
-  options: string[]
-  value: string
-  onChange: (v: string) => void
-  hint?: string
+export function ModelField({ options, value, onChange, hint }: {
+  options: string[]; value: string; onChange: (v: string) => void; hint?: string
 }) {
   return (
     <Field label={i18nT('pages.kiroCrewAgentsPage.model')} hint={hint}>
@@ -693,9 +506,7 @@ export function ModelField({
         // promises task-based routing, whereas here it means "pin nothing,
         // inherit the next tier" — which can resolve to a concrete model. Label
         // it as the card does so the round trip stays honest.
-        optionLabels={withCurrent(options, value).map((m) =>
-          m === INHERIT_MODEL ? i18nT('pages.kiroCrewAgentsPage.inherited') : modelLabel(m),
-        )}
+        optionLabels={withCurrent(options, value).map(m => (m === INHERIT_MODEL ? i18nT('pages.kiroCrewAgentsPage.inherited') : modelLabel(m)))}
         value={value}
         onChange={onChange}
         aria-label={i18nT('pages.kiroCrewAgentsPage.edit_model')}
@@ -707,19 +518,16 @@ export function ModelField({
 /** The crew's reasoning-effort pin. Rendered only when the model the crew will
  *  actually run on supports effort — the same gate the chat picker uses, so a
  *  crew on Haiku is not offered a control the backend would drop. */
-export function EffortField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+export function EffortField({ value, onChange }: {
+  value: string; onChange: (v: string) => void
+}) {
   return (
-    <Field
-      label={i18nT('pages.kiroCrewAgentsPage.reasoning_effort')}
-      hint={i18nT('pages.kiroCrewAgentsPage.reasoning_effort_hint')}
-    >
+    <Field label={i18nT('pages.kiroCrewAgentsPage.reasoning_effort')} hint={i18nT('pages.kiroCrewAgentsPage.reasoning_effort_hint')}>
       <SimpleSelect
         options={[...EFFORT_LEVELS]}
         // '' is the inherit sentinel, labelled as such rather than as a level:
         // it means "take the global default", which may itself be a level.
-        optionLabels={EFFORT_LEVELS.map((l) =>
-          l === '' ? i18nT('pages.kiroCrewAgentsPage.inherited') : effortLabel(l),
-        )}
+        optionLabels={EFFORT_LEVELS.map(l => (l === '' ? i18nT('pages.kiroCrewAgentsPage.inherited') : effortLabel(l)))}
         value={value}
         onChange={onChange}
         aria-label={i18nT('pages.kiroCrewAgentsPage.edit_reasoning_effort')}
@@ -733,30 +541,20 @@ export function EffortField({ value, onChange }: { value: string; onChange: (v: 
  *  only: the crew's NAME stays the identity crons, spawn params and the CLI
  *  address, so relabelling never breaks a binding — which is exactly why the
  *  label is freely editable while the name is not. */
-export function DisplayNameField({
-  value,
-  onChange,
-  fallback,
-}: {
-  value: string
-  onChange: (v: string) => void
-  fallback: string
-}) {
+export function DisplayNameField({ value, onChange, fallback }: { value: string; onChange: (v: string) => void; fallback: string }) {
   return (
     <Field
       label={i18nT('pages.kiroCrewAgentsPage.display_name')}
       // Names the actual ID, so "the name" is never a reference to something
       // invisible from this pane (the UX lane's finding on this PR).
-      hint={i18nT('pages.kiroCrewAgentsPage.shown_across_the_dashboard_instead_of_the_name_l', {
-        name: fallback,
-      })}
+      hint={i18nT('pages.kiroCrewAgentsPage.shown_across_the_dashboard_instead_of_the_name_l', { name: fallback })}
     >
       <Input
         // The name it would fall back to, so the empty state reads as "shows
         // this" rather than as a missing value.
         placeholder={fallback}
         value={value}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={e => onChange(e.target.value)}
         aria-label={i18nT('pages.kiroCrewAgentsPage.display_name')}
         data-testid="display-name-input"
       />
@@ -766,29 +564,19 @@ export function DisplayNameField({
 
 /** The routing-keyword input. Rendered by the create form and by the editor's
  *  routing pane, so it is a component rather than two copies. */
-export function TriggersField({
-  value,
-  onChange,
-  subject,
-}: {
-  value: string
-  onChange: (v: string) => void
-  subject: FormSubject
-}) {
-  const hint =
-    subject === 'member'
-      ? i18nT('pages.kiroCrewAgentsPage.triggers_hint_member')
-      : i18nT('pages.kiroCrewAgentsPage.triggers_hint')
-  const info =
-    subject === 'member'
-      ? i18nT('pages.kiroCrewAgentsPage.triggers_info_member')
-      : i18nT('pages.kiroCrewAgentsPage.triggers_info')
+export function TriggersField({ value, onChange, subject }: { value: string; onChange: (v: string) => void; subject: FormSubject }) {
+  const hint = subject === 'member'
+    ? i18nT('pages.kiroCrewAgentsPage.triggers_hint_member')
+    : i18nT('pages.kiroCrewAgentsPage.triggers_hint')
+  const info = subject === 'member'
+    ? i18nT('pages.kiroCrewAgentsPage.triggers_info_member')
+    : i18nT('pages.kiroCrewAgentsPage.triggers_info')
   return (
     <Field label={i18nT('pages.kiroCrewAgentsPage.triggers')} hint={hint} info={info}>
       <Input
         placeholder={i18nT('pages.kiroCrewAgentsPage.triggers_placeholder')}
         value={value}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={e => onChange(e.target.value)}
         aria-label={i18nT('pages.kiroCrewAgentsPage.triggers')}
       />
     </Field>
@@ -797,43 +585,20 @@ export function TriggersField({
 
 /** Session color picker for agent configuration. Sets the default session
  *  tint color for new sessions created with this agent. */
-export function SessionColorField({
-  value,
-  onChange,
-  subject,
-}: {
-  value: string
-  onChange: (v: string) => void
-  subject: FormSubject
-}) {
+export function SessionColorField({ value, onChange, subject }: { value: string; onChange: (v: string) => void; subject: FormSubject }) {
   const HEX_RE = /^#[0-9a-f]{6}$/i
   const [draft, setDraft] = useState(value || '')
   // Re-sync the draft when the committed value changes from outside (e.g. the
   // swatch, Clear, or opening the editor on a different crew).
-  useEffect(() => {
-    setDraft(value || '')
-  }, [value])
+  useEffect(() => { setDraft(value || '') }, [value])
   const commit = (raw: string) => {
     const v = raw.trim().toLowerCase()
-    if (v === '') {
-      onChange('')
-      setDraft('')
-    } else if (HEX_RE.test(v)) {
-      onChange(v)
-      setDraft(v)
-    } else {
-      setDraft(value || '')
-    } // invalid on blur → revert to committed
+    if (v === '') { onChange(''); setDraft('') }
+    else if (HEX_RE.test(v)) { onChange(v); setDraft(v) }
+    else { setDraft(value || '') } // invalid on blur → revert to committed
   }
   return (
-    <Field
-      label={i18nT('pages.kiroCrewAgentsPage.session_color')}
-      hint={
-        subject === 'member'
-          ? i18nT('pages.kiroCrewAgentsPage.session_color_hint_member')
-          : i18nT('pages.kiroCrewAgentsPage.session_color_hint')
-      }
-    >
+    <Field label={i18nT('pages.kiroCrewAgentsPage.session_color')} hint={subject === 'member' ? i18nT('pages.kiroCrewAgentsPage.session_color_hint_member') : i18nT('pages.kiroCrewAgentsPage.session_color_hint')}>
       {/* Quick picks first, exact entry below — the order the session
        *  right-click menu uses, so the two surfaces read the same way.
        *
@@ -886,21 +651,21 @@ export function SessionColorField({
         <Input
           type="color"
           value={value || HEX_COLOR_EXAMPLE}
-          onChange={(e) => onChange(e.target.value.toLowerCase())}
+          onChange={e => onChange(e.target.value.toLowerCase())}
           className="h-8 w-8 flex-none cursor-pointer p-0.5"
           aria-label={i18nT('pages.kiroCrewAgentsPage.session_color')}
         />
         <Input
           placeholder={HEX_COLOR_EXAMPLE}
           value={draft}
-          onChange={(e) => {
+          onChange={e => {
             const v = e.target.value.trim().toLowerCase()
             setDraft(v)
             // Live-commit only when the draft is a complete hex or cleared;
             // partial values stay local so typing is never swallowed.
             if (v === '' || HEX_RE.test(v)) onChange(v)
           }}
-          onBlur={(e) => commit(e.target.value)}
+          onBlur={e => commit(e.target.value)}
           className="flex-1 font-mono text-[13px]"
           aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_hex')}
         />
@@ -921,54 +686,21 @@ export function SessionColorField({
 
 /** The create form's binding block. */
 function BindingFields({
-  templateLabel,
-  kiroAgentOptions,
-  kiroAgent,
-  setKiroAgent,
-  templateProvenance,
-  workspaceOptions,
-  workspace,
-  setWorkspace,
-  onNewWorkspace,
-  modelOptions,
-  model,
-  setModel,
-  subject,
+  templateLabel, kiroAgentOptions, kiroAgent, setKiroAgent, templateProvenance,
+  workspaceOptions, workspace, setWorkspace, onNewWorkspace,
+  modelOptions, model, setModel, subject,
 }: {
-  templateLabel: string
-  subject: FormSubject
-  kiroAgentOptions: string[]
-  kiroAgent: string
-  setKiroAgent: (v: string) => void
+  templateLabel: string; subject: FormSubject
+  kiroAgentOptions: string[]; kiroAgent: string; setKiroAgent: (v: string) => void
   templateProvenance?: Record<string, TemplateProvenance>
-  workspaceOptions: string[]
-  workspace: string
-  setWorkspace: (v: string) => void
-  onNewWorkspace: () => void
-  modelOptions?: string[]
-  model?: string
-  setModel?: (v: string) => void
+  workspaceOptions: string[]; workspace: string; setWorkspace: (v: string) => void; onNewWorkspace: () => void
+  modelOptions?: string[]; model?: string; setModel?: (v: string) => void
 }) {
   return (
     <>
-      <TemplateField
-        label={templateLabel}
-        options={kiroAgentOptions}
-        value={kiroAgent}
-        onChange={setKiroAgent}
-        editLaterNote
-        provenance={templateProvenance}
-      />
-      <WorkspaceField
-        options={workspaceOptions}
-        value={workspace}
-        onChange={setWorkspace}
-        onNewWorkspace={onNewWorkspace}
-        subject={subject}
-      />
-      <p className="text-[11.5px] leading-relaxed text-muted">
-        {i18nT('pages.kiroCrewAgentsPage.private_memory_auto')}
-      </p>
+      <TemplateField label={templateLabel} options={kiroAgentOptions} value={kiroAgent} onChange={setKiroAgent} editLaterNote provenance={templateProvenance} />
+      <WorkspaceField options={workspaceOptions} value={workspace} onChange={setWorkspace} onNewWorkspace={onNewWorkspace} subject={subject} />
+      <p className="text-[11.5px] leading-relaxed text-muted">{i18nT('pages.kiroCrewAgentsPage.private_memory_auto')}</p>
       {modelOptions && setModel && model !== undefined && (
         <ModelField options={modelOptions} value={model} onChange={setModel} />
       )}
@@ -976,19 +708,65 @@ function BindingFields({
   )
 }
 
+/** The roster's `default` badge: a status stamp, and only that. The path to
+ *  CHANGE the default is the toolbar's "Change default crewmate ›" link
+ *  (`ChangeDefaultLink`), not the badge — a badge that carried the verb ate the
+ *  card's own name on a 290px card ("d…"), and a card header is one line by
+ *  design. */
+function DefaultBadge() {
+  const label = i18nT('pages.kiroCrewAgentsPage.default_2')
+  return (
+    // `Badge` is an inline-flex box, and `text-overflow` never draws an ellipsis
+    // on a flex container -- the text was clipped mid-glyph ("По умолч") on the
+    // 290px card. The truncation lives on an inner inline span, where it works.
+    <Badge variant="ok" className="min-w-0 max-w-[45%] shrink" title={label}>
+      <span className="min-w-0 truncate">{label}</span>
+    </Badge>
+  )
+}
+
+/** The roster's one visible path to where the default crewmate is changed: a
+ *  link in the toolbar, beside the view toggle, to the Default crewmate row on
+ *  Developer → Config (ringed on arrival), with the row's own sentence as its
+ *  title. Says its destination in words at rest — a hover title is read by
+ *  nobody who did not already dare. Rendered only past one crewmate: with a
+ *  single crewmate there is nothing to change to. It is a link, not a picker:
+ *  the roster still opens on the roster. */
+function ChangeDefaultLink() {
+  return (
+    <Link
+      to={DEFAULT_CREWMATE_PATH}
+      title={i18nT('pages.kiroCrewAgentsPage.change_default_hint')}
+      className="inline-flex min-w-0 items-center gap-0.5 rounded text-[12.5px] leading-snug text-accent hover:underline focus-ring"
+    >
+      <span className="min-w-0">{i18nT('pages.kiroCrewAgentsPage.change_default_crewmate')}</span>
+      <ChevronRight size={13} aria-hidden="true" className="shrink-0" />
+    </Link>
+  )
+}
+
+/** The roster's provenance badge, in the same words the Custom agents tab uses
+ *  for a template's origin (`templateSourceLabel`): a crew record's `source` is
+ *  `kirocrew` | `package` | `builtin` (agent_discovery), where `builtin` is a
+ *  plain `~/.kiro/agents/<name>.json` spec — the classifier's `custom` — and
+ *  never an author claim. An unknown token falls back to itself. */
+function CrewSourceBadge({ source }: { source: string }) {
+  const label = templateSourceLabel({ source }) || source
+  return <SourceBadge source={source}>{label}</SourceBadge>
+}
+
+/** Kiro Crew is product-owned; every other source carries useful provenance. */
+function showsCrewSourceBadge(source?: string): source is string {
+  return Boolean(source && source !== 'kirocrew')
+}
+
 /** One crew in the roster. The whole card opens the editor panel. */
-function CrewCard({
-  agent,
-  isDefault,
-  shared,
-  onOpen,
-}: {
+function CrewCard({ agent, isDefault, shared, onOpen }: {
   agent: KiroCrewAgent
   isDefault: boolean
   shared: SharedKind
   onOpen: () => void
 }) {
-  const provider = useProvider()
   const sharedNote = i18nT('pages.kiroCrewAgentsPage.shared_lower')
   const filesShared = shared === 'files' || shared === 'both'
   const memoryShared = shared === 'memory' || shared === 'both'
@@ -996,18 +774,12 @@ function CrewCard({
   return (
     <Clickable
       onClick={onOpen}
-      aria-label={i18nT('pages.kiroCrewAgentsPage.edit_crew_named', {
-        name: crewDisplayName(agent),
-      })}
+      aria-label={i18nT('pages.kiroCrewAgentsPage.edit_crew_named', { name: crewDisplayName(agent) })}
       data-testid="crew-card"
       className={`group flex flex-col gap-3 rounded-lg border bg-card p-3.5 transition-all
                   hover:border-border-strong hover:shadow-md focus-ring
                   ${isDefault ? 'border-accent-subtle' : 'border-border'}`}
-      style={
-        agent.session_color
-          ? { borderLeftColor: agent.session_color, borderLeftWidth: '3px' }
-          : undefined
-      }
+      style={agent.session_color ? { borderLeftColor: agent.session_color, borderLeftWidth: '3px' } : undefined}
     >
       <div className="flex items-center gap-3">
         <CrewAvatar seed={agent.name} avatar={agent.avatar} size={38} />
@@ -1023,25 +795,14 @@ function CrewCard({
               out of alignment across the row. The name truncates and the
               badges hold their size, so the row can never wrap. */}
           <div className="flex items-center gap-2 min-w-0">
-            <span className="truncate font-mono text-[14px] font-semibold text-text-strong">
-              {crewDisplayName(agent)}
-            </span>
+            <span className="min-w-[3rem] flex-1 truncate font-mono text-[14px] font-semibold text-text-strong">{crewDisplayName(agent)}</span>
             {/* The ID stays discoverable when a label covers it — crons, spawn
                 params and the CLI address the ID, never the label. */}
             {crewDisplayName(agent) !== agent.name && (
-              <span
-                className="truncate font-mono text-[11px] text-muted max-w-[14rem]"
-                title={i18nT('components.agentSelector.agent_id_tooltip', { name: agent.name })}
-              >
-                {agent.name}
-              </span>
+              <span className="truncate font-mono text-[11px] text-muted max-w-[14rem]" title={i18nT('components.agentSelector.agent_id_tooltip', { name: agent.name })}>{agent.name}</span>
             )}
-            {isDefault && (
-              <Badge variant="ok" className="shrink-0">
-                {i18nT('pages.kiroCrewAgentsPage.default_2')}
-              </Badge>
-            )}
-            {agent.source && agent.source !== 'kirocrew' && <SourceBadge source={agent.source} />}
+            {isDefault && <DefaultBadge />}
+            {showsCrewSourceBadge(agent.source) && <CrewSourceBadge source={agent.source} />}
           </div>
           {/* Two lines rather than one. A crew description is a sentence about
               what the crew is FOR, and a single truncated line cut nearly all
@@ -1061,23 +822,9 @@ function CrewCard({
         </div>
       </div>
       <div className="grid grid-cols-2 gap-x-3 gap-y-2 border-t border-border pt-3">
-        <Binding
-          icon={<Boxes className="lucide-inline" aria-hidden="true" />}
-          label={provider.labels.agentTemplateField}
-          value={agent.kiro_agent}
-        />
-        <Binding
-          icon={<FolderOpen className="lucide-inline" aria-hidden="true" />}
-          label={i18nT('pages.kiroCrewAgentsPage.workspace_2')}
-          value={agent.workspace}
-          note={filesShared ? sharedNote : undefined}
-        />
-        <Binding
-          icon={<Database className="lucide-inline" aria-hidden="true" />}
-          label={i18nT('pages.kiroCrewAgentsPage.memory_store')}
-          value={agent.memory_store}
-          note={memoryShared ? sharedNote : undefined}
-        />
+        <Binding icon={<Boxes className="lucide-inline" aria-hidden="true" />} label={i18nT('pages.kiroCrewAgentsPage.built_from')} value={agent.kiro_agent} />
+        <Binding icon={<FolderOpen className="lucide-inline" aria-hidden="true" />} label={i18nT('pages.kiroCrewAgentsPage.workspace_2')} value={agent.workspace} note={filesShared ? sharedNote : undefined} />
+        <Binding icon={<Database className="lucide-inline" aria-hidden="true" />} label={i18nT('pages.kiroCrewAgentsPage.memory_store')} value={agent.memory_store} note={memoryShared ? sharedNote : undefined} />
         <Binding
           icon={<Sparkles className="lucide-inline" aria-hidden="true" />}
           label={i18nT('pages.kiroCrewAgentsPage.model')}
@@ -1100,31 +847,16 @@ function CrewCard({
  * Returns `text` plus whether it is real copy: a placeholder must render italic
  * and must NOT become a tooltip, or every empty crew advertises a blank bubble.
  */
-function describeCrew(
-  agent: KiroCrewAgent,
-  isDefault: boolean,
-): { text: string; placeholder: boolean } {
+function describeCrew(agent: KiroCrewAgent, isDefault: boolean): { text: string; placeholder: boolean } {
   if (agent.description) return { text: agent.description, placeholder: false }
-  if (isDefault)
-    return {
-      text: i18nT('pages.kiroCrewAgentsPage.used_for_all_new_chats'),
-      placeholder: true,
-    }
-  return {
-    text: i18nT('pages.kiroCrewAgentsPage.no_description'),
-    placeholder: true,
-  }
+  if (isDefault) return { text: i18nT('pages.kiroCrewAgentsPage.used_for_all_new_chats'), placeholder: true }
+  return { text: i18nT('pages.kiroCrewAgentsPage.no_description'), placeholder: true }
 }
 
 /** One crew as a table row. The row opens the editor; the accessible target is
  *  the real button in the name cell, so table semantics stay intact — a `<tr>`
  *  given `role="button"` stops being announced as a row at all. */
-function CrewRow({
-  agent,
-  isDefault,
-  shared,
-  onOpen,
-}: {
+function CrewRow({ agent, isDefault, shared, onOpen }: {
   agent: KiroCrewAgent
   isDefault: boolean
   shared: SharedKind
@@ -1145,9 +877,7 @@ function CrewRow({
       // `div[role=button][tabindex=0]`, so a hand-written `closest('button')`
       // would silently never match it, and one definition of "interactive
       // element" cannot drift out of step with itself.
-      onClick={(e) => {
-        if (!(e.target as HTMLElement).closest(FOCUSABLE)) onOpen()
-      }}
+      onClick={e => { if (!(e.target as HTMLElement).closest(FOCUSABLE)) onOpen() }}
     >
       <TableCell>
         <div className="flex items-center gap-2.5 min-w-0">
@@ -1156,24 +886,16 @@ function CrewRow({
             <div className="flex items-center gap-2 min-w-0">
               <Clickable
                 onClick={onOpen}
-                aria-label={i18nT('pages.kiroCrewAgentsPage.edit_crew_named', {
-                  name: crewDisplayName(agent),
-                })}
+                aria-label={i18nT('pages.kiroCrewAgentsPage.edit_crew_named', { name: crewDisplayName(agent) })}
                 className="truncate rounded font-mono text-[12.5px] font-semibold text-text-strong focus-ring"
               >
                 {crewDisplayName(agent)}
               </Clickable>
               {crewDisplayName(agent) !== agent.name && (
-                <span className="truncate font-mono text-[11px] text-muted shrink-0">
-                  {agent.name}
-                </span>
+                <span className="truncate font-mono text-[11px] text-muted shrink-0">{agent.name}</span>
               )}
-              {isDefault && (
-                <Badge variant="ok" className="shrink-0">
-                  {i18nT('pages.kiroCrewAgentsPage.default_2')}
-                </Badge>
-              )}
-              {agent.source && agent.source !== 'kirocrew' && <SourceBadge source={agent.source} />}
+              {isDefault && <DefaultBadge />}
+              {showsCrewSourceBadge(agent.source) && <CrewSourceBadge source={agent.source} />}
             </div>
             {/* One line here is the point of this view — the row is wide, so a
                 single line already carries far more of the sentence than the
@@ -1191,19 +913,11 @@ function CrewRow({
       <TableCell className="font-mono text-muted">{agent.kiro_agent}</TableCell>
       <TableCell className="font-mono text-muted">
         {agent.workspace}
-        {filesShared && (
-          <Badge variant="warn" className="ml-1.5">
-            {sharedNote}
-          </Badge>
-        )}
+        {filesShared && <Badge variant="warn" className="ml-1.5">{sharedNote}</Badge>}
       </TableCell>
       <TableCell className="font-mono text-muted">
         {agent.memory_store}
-        {memoryShared && (
-          <Badge variant="warn" className="ml-1.5">
-            {sharedNote}
-          </Badge>
-        )}
+        {memoryShared && <Badge variant="warn" className="ml-1.5">{sharedNote}</Badge>}
       </TableCell>
       <TableCell className={`font-mono ${agent.model ? 'text-muted' : 'italic text-muted'}`}>
         {agent.model || i18nT('pages.kiroCrewAgentsPage.inherited')}
@@ -1213,7 +927,6 @@ function CrewRow({
 }
 
 export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } = {}) {
-  const provider = useProvider()
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -1239,10 +952,13 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   // `kirocrew doctor`" — for a store the gateway reports as valid. The generic
   // server refresh broadcast (hooks/useWebSocket.ts) heals it eventually;
   // healing it here makes the row correct on the write that caused it.
-  const refetchAgents = useCallback(() => {
-    void queryClient.invalidateQueries({ queryKey: ['kirocrew-agents'] })
-    void queryClient.invalidateQueries({ queryKey: ['kirocrewConfig'] })
-  }, [queryClient])
+  const refetchAgents = useCallback(
+    () => {
+      void queryClient.invalidateQueries({ queryKey: ['kirocrew-agents'] })
+      void queryClient.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+    },
+    [queryClient],
+  )
   // Memoised for the empty case: a bare `|| []` hands out a new array on every
   // render, which defeats every `useMemo` downstream that keys on the roster
   // (`sharedTargets`). React Query's structural sharing keeps `agentsData`
@@ -1262,28 +978,22 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   // model missing from the advertised list.
   const kiroAgentOptions = Array.isArray(installedAgents)
     ? installedAgents
-        .filter((x: { name: string; private_to?: string }) => Boolean(x.name) && !x.private_to)
-        .map((x: { name: string }) => x.name)
+      .filter((x: { name: string; private_to?: string }) => Boolean(x.name) && !x.private_to)
+      .map((x: { name: string }) => x.name)
     : ['kirocrew']
   const templateProvenance: Record<string, TemplateProvenance> = Array.isArray(installedAgents)
     ? Object.fromEntries(
-        installedAgents
-          .filter((x: { name: string }) => Boolean(x.name))
-          .map((x: TemplateProvenance & { name: string }) => [x.name, x]),
-      )
+      installedAgents
+        .filter((x: { name: string }) => Boolean(x.name))
+        .map((x: TemplateProvenance & { name: string }) => [x.name, x]),
+    )
     : {}
 
-  const {
-    data: workspacesData,
-    refetch: refetchWorkspaces,
-    error: workspacesError,
-  } = useQuery({
+  const { data: workspacesData, refetch: refetchWorkspaces, error: workspacesError } = useQuery({
     queryKey: ['workspaces'],
     queryFn: () => api.workspaces(),
   })
-  const workspaceOptions = workspacesData?.workspaces?.map((w: { name: string }) => w.name) || [
-    'default',
-  ]
+  const workspaceOptions = workspacesData?.workspaces?.map((w: { name: string }) => w.name) || ['default']
 
   const { data: kirocrewCfg, error: cfgError } = useQuery({
     queryKey: ['kirocrewConfig'],
@@ -1363,15 +1073,15 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    *  taking the roster down with it is not. */
   const pickView = useCallback((v: CrewView) => {
     setView(v)
-    try {
-      localStorage.setItem(VIEW_KEY, v)
-    } catch {
-      /* preference is best-effort */
-    }
+    try { localStorage.setItem(VIEW_KEY, v) } catch { /* preference is best-effort */ }
   }, [])
 
   const editing = sheet?.mode === 'edit' ? sheet.name : ''
-  const editingAgent = agents.find((a) => a.name === editing)
+  const editingAgent = agents.find(a => a.name === editing)
+  // Model list for the per-agent default, scoped to the agent being edited: its
+  // own runtime advertises the choices, and a runtime that does not (policy not
+  // `selectable`) gets a read-only statement instead of a picker of someone
+  // else's models. INHERIT_MODEL leads so "no pin" is the obvious choice.
   const availableModels = useAvailableModels({
     agent: editingAgent,
     enabled: Boolean(editingAgent),
@@ -1392,17 +1102,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     enabled: !!editing,
     retry: false,
   })
-  useEffect(() => {
-    setCapabilityDirty(false)
-    setCapabilityBusy(false)
-  }, [sheet])
+  useEffect(() => { setCapabilityDirty(false); setCapabilityBusy(false) }, [sheet])
   const capabilityManaged = capabilityQuery.data?.mode === 'inherited'
-  const capabilityReadFailed =
-    capabilityQuery.isError &&
-    !(
-      capabilityQuery.error instanceof ApiError &&
-      [404, 405, 501].includes(capabilityQuery.error.status)
-    )
+  const capabilityReadFailed = capabilityQuery.isError && !(capabilityQuery.error instanceof ApiError && [404, 405, 501].includes(capabilityQuery.error.status))
   useEffect(() => {
     if (editing) void queryClient.invalidateQueries({ queryKey: crewCapabilitiesKey(editing) })
   }, [editing, kiroAgent, queryClient])
@@ -1428,21 +1130,18 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    *  here can know what the inherit chain lands on until the write happens, so
    *  that state reports unresolved and says so. */
   const modelPinPendingClear = editModel === INHERIT_MODEL && !!editingAgent?.model
-  const effortModel =
-    editModel !== INHERIT_MODEL ? editModel : modelPinPendingClear ? '' : resolved?.model || ''
+  const effortModel = editModel !== INHERIT_MODEL
+    ? editModel
+    : modelPinPendingClear ? '' : (resolved?.model || '')
   const effortCapable = modelSupportsEffort(effortModel)
 
   /** Argument-free so a click event is never mistaken for one. */
   const openCreate = useCallback(() => {
     sheetEpoch.current += 1
-    setError('')
-    setSheetHint('')
+    setError(''); setSheetHint('')
     setConfirmDelete(false)
     setAvatarPassthrough(null)
-    setName('')
-    setKiroAgent('')
-    setWorkspace('default')
-    setMemoryStore('default')
+    setName(''); setKiroAgent(''); setWorkspace('default'); setMemoryStore('default')
     setTriggers('')
     setDisplayName('')
     setSessionColor('')
@@ -1451,12 +1150,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
   const openEdit = useCallback((a: KiroCrewAgent) => {
     sheetEpoch.current += 1
-    setError('')
-    setSheetHint('')
+    setError(''); setSheetHint('')
     setConfirmDelete(false)
-    setKiroAgent(a.kiro_agent)
-    setWorkspace(a.workspace)
-    setMemoryStore(a.memory_store)
+    setKiroAgent(a.kiro_agent); setWorkspace(a.workspace); setMemoryStore(a.memory_store)
     setTriggers(a.triggers || '')
     setDisplayName(a.display_name || '')
     setSessionColor(a.session_color || '')
@@ -1528,14 +1224,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     // A bare capabilities URL becomes the mobile root list. An open editor
     // needs an explicit pane route before a resize can remove its ancestry.
     if (!embedded || !sheet || params.get('tab') === 'crews') return
-    setParams(
-      (current) => {
-        const next = new URLSearchParams(current)
-        next.set('tab', 'crews')
-        return next
-      },
-      { replace: true },
-    )
+    setParams(current => {
+      const next = new URLSearchParams(current)
+      next.set('tab', 'crews')
+      return next
+    }, { replace: true })
   }, [embedded, sheet, params, setParams])
   const linkedCrew = params.get('crew')
   const linkedAvatar = params.get('avatar') === '1'
@@ -1545,34 +1238,19 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const linkedPaneRef = useRef<CrewPaneKey | null>(null)
   useEffect(() => {
     if (!linkedCrew || !agentsData || capabilityDirty || capabilityBusy) return
-    const target = agents.find((a) => a.name === linkedCrew)
+    const target = agents.find(a => a.name === linkedCrew)
     if (target) {
       if (linkedCapabilities) linkedPaneRef.current = 'capabilities'
       openEdit(target)
       if (linkedAvatar) setAvatarBuilderOpen(true)
     }
     // An unknown name strips silently: the roster below is the honest answer.
-    setParams(
-      (prev) => {
-        const next = new URLSearchParams(prev)
-        next.delete('crew')
-        next.delete('avatar')
-        next.delete('pane')
-        return next
-      },
-      { replace: true },
-    )
-  }, [
-    linkedCrew,
-    linkedAvatar,
-    linkedCapabilities,
-    agentsData,
-    agents,
-    openEdit,
-    setParams,
-    capabilityDirty,
-    capabilityBusy,
-  ])
+    setParams(prev => {
+      const next = new URLSearchParams(prev)
+      next.delete('crew'); next.delete('avatar'); next.delete('pane')
+      return next
+    }, { replace: true })
+  }, [linkedCrew, linkedAvatar, linkedCapabilities, agentsData, agents, openEdit, setParams, capabilityDirty, capabilityBusy])
 
   /**
    * Deep link: `?new=1` opens the editor in create mode straight away. Unlike
@@ -1586,14 +1264,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   useEffect(() => {
     if (!linkedNew || capabilityDirty || capabilityBusy) return
     openCreate()
-    setParams(
-      (prev) => {
-        const next = new URLSearchParams(prev)
-        next.delete('new')
-        return next
-      },
-      { replace: true },
-    )
+    setParams(prev => {
+      const next = new URLSearchParams(prev)
+      next.delete('new')
+      return next
+    }, { replace: true })
   }, [linkedNew, openCreate, setParams, capabilityDirty, capabilityBusy])
 
   /** This page's own form makes agents; the Crewmates page's dialog composes
@@ -1602,14 +1277,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const formSubject: FormSubject = 'agent'
 
   /** Reset the panel's state; the user stays on this page. */
-  const dismissSheet = useCallback(() => {
-    sheetEpoch.current += 1
-    setSheet(null)
-    setError('')
-    setSheetHint('')
-    setConfirmDelete(false)
-    setTemplateSwitchError('')
-  }, [])
+  const dismissSheet = useCallback(() => { sheetEpoch.current += 1; setSheet(null); setError(''); setSheetHint(''); setConfirmDelete(false); setTemplateSwitchError('') }, [])
   const closeSheet = dismissSheet
 
   /**
@@ -1624,10 +1292,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    * been told to keep. Backing out resolves it `false`, so holding the PUT
    * never kills the save the user asked for.
    */
-  const discardAnswer = useRef<{
-    answered: Promise<boolean>
-    settle: (discarded: boolean) => void
-  } | null>(null)
+  const discardAnswer = useRef<{ answered: Promise<boolean>; settle: (discarded: boolean) => void } | null>(null)
 
   /** Answer a pending discard question, if one is still open. First caller
    *  wins and clears the ref, so a confirm and the sheet-change reset arriving
@@ -1659,29 +1324,19 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    * success then dismisses the replacement and discards its unsaved edits, and
    * a stale failure is reported as though it belonged to whatever is open now.
    */
-  const settleFor = useCallback(
-    (epoch: number, err?: string) => {
-      if (epoch !== sheetEpoch.current) return
-      if (err) {
-        setError(err)
-        return
-      }
-      closeSheet()
-    },
-    [closeSheet],
-  )
+  const settleFor = useCallback((epoch: number, err?: string) => {
+    if (epoch !== sheetEpoch.current) return
+    if (err) { setError(err); return }
+    closeSheet()
+  }, [closeSheet])
 
-  const handleWsCreated = useCallback(
-    (newName: string) => {
-      setWsModalOpen(false)
-      refetchWorkspaces().then(() => setWorkspace(newName))
-    },
-    [refetchWorkspaces],
-  )
+  const handleWsCreated = useCallback((newName: string) => {
+    setWsModalOpen(false)
+    refetchWorkspaces().then(() => setWorkspace(newName))
+  }, [refetchWorkspaces])
 
   const createMut = useMutation({
-    mutationFn: ({ epoch: _epoch, ...data }: CreatePayload & { epoch: number }) =>
-      api.createKirocrewAgent(data),
+    mutationFn: ({ epoch: _epoch, ...data }: CreatePayload & { epoch: number }) => api.createKirocrewAgent(data),
     onSuccess: (r: AgentMutationResult, vars) => {
       refetchAgents()
       settleFor(vars.epoch, r.error)
@@ -1691,64 +1346,25 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     },
   })
   const updateMut = useMutation({
-    mutationFn: ({ name, data }: { name: string; data: AgentUpdatePayload; epoch: number }) =>
-      api.updateKirocrewAgent(name, data),
-    onSuccess: (r: AgentMutationResult, vars) => {
-      settleFor(vars.epoch, r.error)
-      refetchAgents()
-    },
-    onError: (e: Error, vars) =>
-      settleFor(vars.epoch, e.message || i18nT('pages.kiroCrewAgentsPage.failed_to_update_agent')),
-  })
-  /** Promotion is its own write, fired straight from the roster bar — it is not
-   *  part of saving a crew's bindings, so it must not wait for a Save. */
-  const defaultMut = useMutation({
-    mutationFn: (n: string) => api.setDefaultAgent(n),
-    onSuccess: (r: AgentMutationResult) => {
-      if (r.error) {
-        setError(r.error)
-        return
-      }
-      refetchAgents()
-    },
-    onError: (e: Error) =>
-      setError(e.message || i18nT('pages.kiroCrewAgentsPage.failed_to_update_agent')),
+    mutationFn: ({ name, data }: { name: string; data: AgentUpdatePayload; epoch: number }) => api.updateKirocrewAgent(name, data),
+    onSuccess: (r: AgentMutationResult, vars) => { settleFor(vars.epoch, r.error); refetchAgents() },
+    onError: (e: Error, vars) => settleFor(vars.epoch, e.message || i18nT('pages.kiroCrewAgentsPage.failed_to_update_agent')),
   })
   const deleteMut = useMutation({
     mutationFn: ({ name }: { name: string; epoch: number }) => api.deleteKirocrewAgent(name),
-    onSuccess: (r: AgentMutationResult, vars) => {
-      settleFor(vars.epoch, r.error)
-      refetchAgents()
-    },
-    onError: (e: Error, vars) =>
-      settleFor(vars.epoch, e.message || i18nT('pages.kiroCrewAgentsPage.failed_to_delete_agent')),
+    onSuccess: (r: AgentMutationResult, vars) => { settleFor(vars.epoch, r.error); refetchAgents() },
+    onError: (e: Error, vars) => settleFor(vars.epoch, e.message || i18nT('pages.kiroCrewAgentsPage.failed_to_delete_agent')),
   })
 
   const create = () => {
-    setError('')
-    setSheetHint('')
+    setError(''); setSheetHint('')
     const n = name.trim()
-    if (!n) {
-      setSheetHint(i18nT('pages.kiroCrewAgentsPage.name_is_required'))
-      return
-    }
+    if (!n) { setSheetHint(i18nT('pages.kiroCrewAgentsPage.name_is_required')); return }
     // Refuse an unset template rather than letting the server apply its
     // 'kirocrew' default: that default is what silently turns a new crew into an
     // alias for the DEFAULT agent (#1684).
-    if (!kiroAgent) {
-      setSheetHint(i18nT('pages.kiroCrewAgentsPage.agent_template_is_required'))
-      return
-    }
-    createMut.mutate({
-      name: n,
-      kiro_agent: kiroAgent,
-      workspace,
-      memory_store: 'default',
-      display_name: displayName,
-      triggers,
-      session_color: sessionColor,
-      epoch: sheetEpoch.current,
-    })
+    if (!kiroAgent) { setSheetHint(i18nT('pages.kiroCrewAgentsPage.agent_template_is_required')); return }
+    createMut.mutate({ name: n, kiro_agent: kiroAgent, workspace, memory_store: 'default', display_name: displayName, triggers, session_color: sessionColor, epoch: sheetEpoch.current })
   }
 
   /** Template switches from the definition pane persist IMMEDIATELY. The
@@ -1770,11 +1386,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const instantSaveInflight = useRef<Promise<unknown> | null>(null)
   const onPaneSaveChain = useCallback((p: Promise<unknown>) => {
     instantSaveInflight.current = p
-    void p
-      .catch(() => undefined)
-      .then(() => {
-        if (instantSaveInflight.current === p) instantSaveInflight.current = null
-      })
+    void p.catch(() => undefined).then(() => {
+      if (instantSaveInflight.current === p) instantSaveInflight.current = null
+    })
   }, [])
   const latestTemplateSwitch = useRef<string | null>(null)
   /** The binding the SERVER is known to hold — the roster's value, advanced by
@@ -1824,7 +1438,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           // since picked again: that newer pick is now the one in flight.
           try {
             const fresh = (await api.kirocrewAgents()) as { agents?: KiroCrewAgent[] } | undefined
-            const row = fresh?.agents?.find((a) => a.name === editing)
+            const row = fresh?.agents?.find(a => a.name === editing)
             if (row && latestTemplateSwitch.current === v) {
               const actual = row.kiro_agent || ''
               serverTemplateBinding.current = actual
@@ -1988,22 +1602,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     navigate('/chat')
   }
 
-  const filtered = agents.filter(
-    (a) =>
-      !filter ||
-      (
-        a.name +
-        ' ' +
-        (a.display_name ?? '') +
-        ' ' +
-        a.kiro_agent +
-        ' ' +
-        a.workspace +
-        ' ' +
-        a.memory_store
-      )
-        .toLowerCase()
-        .includes(filter.toLowerCase()),
+  const filtered = agents.filter(a =>
+    !filter || (a.name + ' ' + (a.display_name ?? '') + ' ' + a.kiro_agent + ' ' + a.workspace + ' ' + a.memory_store).toLowerCase().includes(filter.toLowerCase())
   )
 
   /** Workspaces and memory stores that more than one crew points at. Surfacing
@@ -2015,7 +1615,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const sharedTargets = useMemo(() => {
     const ws = new Map<string, number>()
     const ms = new Map<string, number>()
-    agents.forEach((a) => {
+    agents.forEach(a => {
       ws.set(a.workspace, (ws.get(a.workspace) || 0) + 1)
       ms.set(a.memory_store, (ms.get(a.memory_store) || 0) + 1)
     })
@@ -2048,21 +1648,17 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    *  against a selection the user has just changed they report the collision the
    *  crew used to have instead of the one it is about to create. */
   const sharingWorkspace = editing
-    ? agents.filter((a) => a.name !== editing && a.workspace === workspace).map((a) => a.name)
+    ? agents.filter(a => a.name !== editing && a.workspace === workspace).map(a => a.name)
     : []
   const sharingMemoryStore = editing
-    ? agents.filter((a) => a.name !== editing && a.memory_store === memoryStore).map((a) => a.name)
+    ? agents.filter(a => a.name !== editing && a.memory_store === memoryStore).map(a => a.name)
     : []
   const collidingCrews = [...new Set([...sharingWorkspace, ...sharingMemoryStore])]
 
   const creating = sheet?.mode === 'create'
   const [avatarUploading, setAvatarUploading] = useState(false)
   const sheetBusy =
-    createMut.isPending ||
-    updateMut.isPending ||
-    deleteMut.isPending ||
-    avatarUploading ||
-    capabilityBusy
+    createMut.isPending || updateMut.isPending || deleteMut.isPending || avatarUploading || capabilityBusy
 
   /**
    * The subset of `sheetBusy` that has already COMMITTED something — a write
@@ -2094,9 +1690,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    *  footer's Save is already disabled for this draft, and a rail click, an
    *  Escape, or the header's chat jump destroying it silently would make the
    *  one tracked-dirty pane the one pane whose work a click erases. */
-  const [discardAsk, setDiscardAsk] = useState<CrewPaneKey | 'close' | 'chat' | 'collapse' | null>(
-    null,
-  )
+  const [discardAsk, setDiscardAsk] = useState<CrewPaneKey | 'close' | 'chat' | 'collapse' | null>(null)
   /** Escape hatch for a hung save: the create POST has no client timeout, so
    *  a stalled request would otherwise lock EVERY exit from the editor for
    *  as long as it stalls. After a grace period with the confirm open and
@@ -2105,10 +1699,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    *  schedule may still be created. */
   const [discardForce, setDiscardForce] = useState(false)
   useEffect(() => {
-    if (discardAsk === null || !schedSaving) {
-      setDiscardForce(false)
-      return
-    }
+    if (discardAsk === null || !schedSaving) { setDiscardForce(false); return }
     const t = setTimeout(() => setDiscardForce(true), DISCARD_FORCE_GRACE_MS)
     return () => clearTimeout(t)
   }, [discardAsk, schedSaving])
@@ -2120,13 +1711,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     // The linked pane is consumed only by the opening that shows it: with cached
     // agent data the link effect can run before `sheet` is set, and a null-sheet
     // pass here would otherwise spend the ref on nothing and land on Overview.
-    if (sheet) {
-      setPane(linkedPaneRef.current ?? 'overview')
-      linkedPaneRef.current = null
-    } else setPane('overview')
-    setSchedDraft(false)
-    setSchedSaving(false)
-    setDiscardAsk(null)
+    if (sheet) { setPane(linkedPaneRef.current ?? 'overview'); linkedPaneRef.current = null } else setPane('overview')
+    setSchedDraft(false); setSchedSaving(false); setDiscardAsk(null)
   }, [sheet])
 
   /** Which panes hold an edit not yet saved. Compared against the SAVED crew,
@@ -2137,10 +1723,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     const out = new Set<CrewPaneKey>()
     if (!editingAgent) return out
     if (kiroAgent !== (editingAgent.kiro_agent || '')) out.add('template')
-    if (
-      workspace !== (editingAgent.workspace || '') ||
-      memoryStore !== (editingAgent.memory_store || '')
-    ) {
+    if (workspace !== (editingAgent.workspace || '') || memoryStore !== (editingAgent.memory_store || '')) {
       out.add('place')
     }
     if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add('model')
@@ -2195,36 +1778,17 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     if (schedDraft) out.add('schedules')
     if (capabilityDirty) out.add('capabilities')
     return out
-  }, [
-    editingAgent,
-    kiroAgent,
-    workspace,
-    memoryStore,
-    editModel,
-    editEffort,
-    triggers,
-    displayName,
-    sessionColor,
-    schedDraft,
-    editAvatar,
-    capabilityDirty,
-  ])
+  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, editEffort, triggers, displayName, sessionColor, schedDraft, editAvatar, capabilityDirty])
 
   /** Rail-driven pane changes route through here: leaving the schedules pane
    *  while a schedule draft is open asks before destroying the typed work
    *  (the form's state is component-local and unmounts with the pane). The
    *  other panes' edits live in this component's state and survive a pane
    *  switch, so only the draft is at stake here. */
-  const requestPane = useCallback(
-    (key: CrewPaneKey) => {
-      if (schedDraft && key !== pane) {
-        setDiscardAsk(key)
-        return
-      }
-      setPane(key)
-    },
-    [schedDraft, pane],
-  )
+  const requestPane = useCallback((key: CrewPaneKey) => {
+    if (schedDraft && key !== pane) { setDiscardAsk(key); return }
+    setPane(key)
+  }, [schedDraft, pane])
 
   /**
    * Editor dismissal (footer Cancel, Escape, overlay click) routes through
@@ -2250,10 +1814,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    */
   const requestClose = useCallback(() => {
     if (capabilityBusy) return
-    if (schedDraft) {
-      setDiscardAsk('close')
-      return
-    }
+    if (schedDraft) { setDiscardAsk('close'); return }
     // A template switch write still in the air cannot be discarded — the
     // request is already sent. Hold the close until it settles (the tracked
     // promise also awaits the roster refetch), then re-evaluate with fresh
@@ -2270,18 +1831,13 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
       void instantSaveInflight.current.catch(() => undefined).then(() => requestCloseRef.current())
       return
     }
-    if (committing || dirtyPanes.size === 0) {
-      closeSheet()
-      return
-    }
+    if (committing || dirtyPanes.size === 0) { closeSheet(); return }
     // Published BEFORE the question goes up so a save still staging an upload
     // sees it and holds its PUT until the answer arrives. Only this leg arms
     // it: the schedule draft disables Save, so no staging save can be in
     // flight behind the draft's own question.
     let settle: (discarded: boolean) => void = () => {}
-    const answered = new Promise<boolean>((resolve) => {
-      settle = resolve
-    })
+    const answered = new Promise<boolean>(resolve => { settle = resolve })
     discardAnswer.current = { answered, settle }
     setDiscardAsk('close')
   }, [schedDraft, committing, dirtyPanes, closeSheet, capabilityBusy])
@@ -2289,19 +1845,14 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   /** Latest requestClose, for the deferred re-invocation above — the settle
    *  callback must not capture a stale closure's dirty state. */
   const requestCloseRef = useRef<() => void>(() => {})
-  useEffect(() => {
-    requestCloseRef.current = requestClose
-  }, [requestClose])
+  useEffect(() => { requestCloseRef.current = requestClose }, [requestClose])
 
   /** The header's "Chat with this crew" routes through here: it creates a
    *  chat slot, closes the sheet and navigates -- three steps that would
    *  destroy an open schedule draft as silently as an unguarded Escape. */
   const requestChat = useCallback(() => {
     if (capabilityBusy) return
-    if (schedDraft || capabilityDirty) {
-      setDiscardAsk('chat')
-      return
-    }
+    if (schedDraft || capabilityDirty) { setDiscardAsk('chat'); return }
     void chatWith(editing)
   }, [schedDraft, editing, capabilityDirty, capabilityBusy]) // eslint-disable-line react-hooks/exhaustive-deps -- chatWith is re-created per render; depping it would make this callback churn for no behavioural gain
 
@@ -2325,10 +1876,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     // sheet open (chatWith settles the error and returns), draft intact.
     if (target === 'close') closeSheet()
     else if (target === 'chat') void chatWith(editing)
-    else if (target === 'collapse') {
-      collapseProceed.current?.()
-      collapseProceed.current = null
-    } else if (target) setPane(target)
+    else if (target === 'collapse') { collapseProceed.current?.(); collapseProceed.current = null }
+    else if (target) setPane(target)
   }, [discardAsk, closeSheet, editing, settleDiscardAnswer]) // eslint-disable-line react-hooks/exhaustive-deps -- same chatWith identity note as requestChat
 
   /** Every exit from the question that is NOT a confirm answers it "keep": the
@@ -2351,8 +1900,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    * narrow question is the true one there and neither escalates.
    */
   const discardTakesSheet =
-    (discardAsk === 'close' || discardAsk === 'chat') &&
-    [...dirtyPanes].some((k) => k !== 'schedules')
+    (discardAsk === 'close' || discardAsk === 'chat')
+    && [...dirtyPanes].some(k => k !== 'schedules')
 
   /** The question stays the NARROW schedule one only while a draft is the
    *  single thing at stake: with other panes going too it must name them, and
@@ -2366,7 +1915,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    *  focus on the rail row and never set this flag. */
   const paneFocusPending = useRef(false)
   const goToPane = useCallback((key: CrewPaneKey) => {
-    setPane((prev) => {
+    setPane(prev => {
       // Arm only on a real change: a same-pane call never reruns the focus
       // effect, so an armed flag would fire on the NEXT rail-driven change and
       // steal focus the rail contract says stays on the rail row. The ref
@@ -2390,10 +1939,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     enabled: !!editing,
   })
   const wakeJobs = useMemo<CronJob[]>(
-    () =>
-      (wakeQuery.data?.jobs || []).filter((j: CronJob) =>
-        wakesCrew(j, editing, editing === defaultAgent),
-      ),
+    () => (wakeQuery.data?.jobs || []).filter(
+      (j: CronJob) => wakesCrew(j, editing, editing === defaultAgent)),
     [wakeQuery.data, editing, defaultAgent],
   )
 
@@ -2405,27 +1952,21 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     enabled: !!editing,
   })
   const boundWebhookTokens = useMemo(
-    () =>
-      (webhooksQuery.data?.tokens || []).filter((t: WebhookTokenEntry) =>
-        webhookBoundToCrew(t, editing),
-      ),
+    () => (webhooksQuery.data?.tokens || []).filter(
+      (t: WebhookTokenEntry) => webhookBoundToCrew(t, editing)),
     [webhooksQuery.data, editing],
   )
   const boundWebhooks = boundWebhookTokens.length
-  const activeWebhooks = boundWebhookTokens.filter((t: WebhookTokenEntry) =>
-    webhookCanCallIn(t, webhooksQuery.data?.switch_on !== false),
-  ).length
+  const activeWebhooks = boundWebhookTokens.filter(
+    (t: WebhookTokenEntry) => webhookCanCallIn(t, webhooksQuery.data?.switch_on !== false)).length
 
   /** Keywords the orchestrator can match, counted the way the field is authored:
    *  comma-separated, blanks ignored, so a trailing comma is not a keyword. */
-  const routingWords = triggers
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean).length
+  const routingWords = triggers.split(',').map(s => s.trim()).filter(Boolean).length
 
   const sections = useCrewEditorSections({
-    templateLabel: provider.labels.agentTemplateField,
-    activeSchedules: wakeJobs.filter((j) => j.enabled).length,
+    templateLabel: i18nT('pages.kiroCrewAgentsPage.built_from'),
+    activeSchedules: wakeJobs.filter(j => j.enabled).length,
     totalSchedules: wakeJobs.length,
     routingWords,
     sharesStorage: collidingCrews.length > 0,
@@ -2446,12 +1987,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
   return (
     <>
-      {!embedded && (
-        <PageHeader
-          title={i18nT('pages.kiroCrewAgentsPage.agents')}
-          subtitle={i18nT('pages.kiroCrewAgentsPage.manage_agent_workspace_memory_store_bindings')}
-        />
-      )}
+      {!embedded && <PageHeader title={i18nT('pages.kiroCrewAgentsPage.agents')} subtitle={i18nT('pages.kiroCrewAgentsPage.manage_agent_workspace_memory_store_bindings')} />}
       <div className={`${embedded ? '' : 'px-4 md:px-6'} pb-8 overflow-y-auto flex-1 min-h-0`}>
         {/* A roster that failed to load must not read as "you have no crews":
             the empty state below would say exactly that. Hand-off only while the
@@ -2472,51 +2008,6 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           askAgent={!sheet}
           testId="crews-editor-options-load-error"
         />
-        {/* New members receive member-scoped V2; existing V1 bindings stay unchanged. */}
-        <div className="mb-3.5 flex items-start gap-2 rounded-lg border border-accent-subtle bg-bg-accent px-3 py-2.5">
-          <Sparkles className="lucide-inline mt-0.5 shrink-0 text-accent" aria-hidden="true" />
-          <span className="text-[12.5px] leading-relaxed text-muted">
-            {i18nT('pages.kiroCrewAgentsPage.bindings_member_memory_notice')}
-          </span>
-        </div>
-
-        {/* Which crew a new chat starts as, hoisted out of the cards. Two jobs:
-            it answers "which one is the default" without hunting for a badge,
-            and it is the one place that CHANGES it — a per-crew toggle could
-            only ever offer promotion (the backend refuses to unset a default
-            without naming a replacement), which read as a broken switch.
-            Pointless with a single crew, so it only appears past that. */}
-        {agents.length > 1 && (
-          <div className="mb-3.5 flex flex-wrap items-center gap-2.5 rounded-lg border border-border bg-bg-accent px-3 py-2.5">
-            <Star className="lucide-inline text-accent" aria-hidden="true" />
-            <span className="text-[13px]">
-              {i18nT('pages.kiroCrewAgentsPage.new_sessions_use')}
-            </span>
-            <SimpleSelect
-              options={agents.map((a) => a.name)}
-              value={defaultAgent}
-              onChange={(n) => {
-                setError('')
-                defaultMut.mutate(n)
-              }}
-              aria-label={i18nT('pages.kiroCrewAgentsPage.new_sessions_use')}
-              style={{ width: 190 }}
-            />
-            {/* `error` is ONE state shared with the crew sheet: settleFor writes
-                the sheet's create / update / delete failures into it too, and
-                those render in the sheet's own footer without a hand-off because
-                dirtyPanes hold unsaved edits. So this copy shows only while the
-                sheet is closed (closeSheet clears the state on the way out) — the
-                only writer then is the select above, which commits immediately on
-                change, so the hand-off has no draft to destroy. */}
-            <ErrorNotice
-              message={sheet ? null : error}
-              variant="inline"
-              askAgent
-              testId="crews-default-agent-error"
-            />
-          </div>
-        )}
 
         <div className="mb-4 flex flex-wrap items-center gap-2">
           {/* No point offering a filter over an empty roster — it just adds a
@@ -2527,7 +2018,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               placeholder={i18nT('pages.kiroCrewAgentsPage.filter_agents')}
               aria-label={i18nT('pages.kiroCrewAgentsPage.filter_agents')}
               value={filter}
-              onChange={(e) => setFilter(e.target.value)}
+              onChange={e => setFilter(e.target.value)}
             />
           )}
           {/* Same control and the same persistence convention as the Artifacts
@@ -2560,8 +2051,18 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               ]}
             />
           )}
-          <div className="flex-1" />
-          <SendBtn onClick={openCreate} data-testid="new-crew">
+          {/* Where the default is changed — a link, shown once there is a second
+              crewmate to change to. Sits with the roster's other controls rather
+              than on the default card, whose one-line header has no room for a
+              verb next to the name. */}
+          {/* The link takes the row's slack and wraps its own text, so a long
+              translation (Russian) folds inside the link instead of pushing Add
+              crewmate onto a second line — the primary action stays put per
+              locale. */}
+          <div className="flex min-w-0 flex-1 basis-0 items-center">
+            {agents.length > 1 && <ChangeDefaultLink />}
+          </div>
+          <SendBtn onClick={openCreate} data-testid="new-crew" className="shrink-0">
             <Plus className="lucide-inline" aria-hidden="true" />
             {i18nT('pages.kiroCrewAgentsPage.add_crew_member')}
           </SendBtn>
@@ -2572,15 +2073,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
             <EmptyState
               icon={<Users className="lucide-inline" aria-hidden="true" />}
               title={i18nT('pages.kiroCrewAgentsPage.no_crews_yet')}
-              subtitle={i18nT(
-                'pages.kiroCrewAgentsPage.create_a_crew_to_give_an_agent_its_own_workspace',
-              )}
+              subtitle={i18nT('pages.kiroCrewAgentsPage.create_a_crew_to_give_an_agent_its_own_workspace')}
             />
             {/* The call to action belongs where the explanation is, not only in
                 the toolbar above it. */}
-            <SendBtn onClick={openCreate}>
-              {i18nT('pages.kiroCrewAgentsPage.create_your_first_crew')}
-            </SendBtn>
+            <SendBtn onClick={openCreate}>{i18nT('pages.kiroCrewAgentsPage.create_your_first_crew')}</SendBtn>
           </div>
         ) : filtered.length === 0 ? (
           <EmptyState
@@ -2593,7 +2090,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead>{i18nT('pages.kiroCrewAgentsPage.crew_column')}</TableHead>
-                  <TableHead>{provider.labels.agentTemplateField}</TableHead>
+                  <TableHead>{i18nT('pages.kiroCrewAgentsPage.built_from')}</TableHead>
                   {/* `aria-label` keeps the column's accessible name to the
                       label itself. Without it the InfoTip's own name is
                       concatenated into the header, and a screen reader
@@ -2615,7 +2112,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filtered.map((a) => (
+                {filtered.map(a => (
                   <CrewRow
                     key={a.name}
                     agent={a}
@@ -2629,7 +2126,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           </div>
         ) : (
           <div className="grid gap-3.5 grid-cols-[repeat(auto-fill,minmax(290px,1fr))]">
-            {filtered.map((a) => (
+            {filtered.map(a => (
               <CrewCard
                 key={a.name}
                 agent={a}
@@ -2646,20 +2143,13 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                          hover:border-accent hover:bg-accent-subtle hover:text-accent"
             >
               <Plus className="lucide-inline" aria-hidden="true" />
-              <span className="text-[13px]">
-                {i18nT('pages.kiroCrewAgentsPage.add_crew_member')}
-              </span>
+              <span className="text-[13px]">{i18nT('pages.kiroCrewAgentsPage.add_crew_member')}</span>
             </Clickable>
           </div>
         )}
       </div>
 
-      <Dialog
-        open={!!sheet}
-        onOpenChange={(next) => {
-          if (!next) requestClose()
-        }}
-      >
+      <Dialog open={!!sheet} onOpenChange={next => { if (!next) requestClose() }}>
         <DialogContent
           /* The rail needs horizontal room; the create form does not have one. */
           maxWidth={creating ? 560 : 790}
@@ -2670,13 +2160,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           /* Asked for from the Crew Members roster, the form speaks that
              page's vocabulary: "Add crew member", the action the user pressed,
              not "Create Agent" — the app never says the two are one thing. */
-          aria-label={
-            creating
-              ? i18nT('pages.kiroCrewAgentsPage.add_crew_member')
-              : i18nT('pages.kiroCrewAgentsPage.edit_crew_named', {
-                  name: displayName.trim() || editing,
-                })
-          }
+          aria-label={creating
+            ? i18nT('pages.kiroCrewAgentsPage.add_crew_member')
+            : i18nT('pages.kiroCrewAgentsPage.edit_crew_named', { name: displayName.trim() || editing })}
           /* Radix closes on an outside pointerdown and on Escape. Dismissing
              mid-write is DELIBERATELY still allowed: the sheetEpoch/settleFor
              machinery below exists to make the abandoned write land harmlessly,
@@ -2699,10 +2185,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 pressable — it is not a peer of the two labelled actions, and
                 the header's action row stays at two (max-two-buttons-per-row
                 counts per visual group). */}
-            <div
-              className="flex w-full min-w-0 items-center gap-3 sm:w-auto sm:flex-1"
-              data-testid="crew-editor-identity"
-            >
+            <div className="flex w-full min-w-0 items-center gap-3 sm:w-auto sm:flex-1" data-testid="crew-editor-identity">
               {!creating && (
                 <CrewAvatarButton
                   size={28}
@@ -2717,54 +2200,27 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                       URL through the same <img>, so one banner for both told a pack
                       crew its "saved picture" was broken — a picture it never had,
                       and advice ("upload it again") it cannot act on. */}
-                  <CrewStateAvatar
-                    seed={editing}
-                    avatar={editAvatar ?? undefined}
-                    size={28}
-                    onImageError={() =>
-                      setError(
-                        i18nT(
-                          packAvatarFrom(editAvatar)
-                            ? 'components.avatarBuilder.pack_load_failed'
-                            : 'components.avatarBuilder.image_load_failed',
-                        ),
-                      )
-                    }
-                  />
+                  <CrewStateAvatar seed={editing} avatar={editAvatar ?? undefined} size={28} onImageError={() => setError(i18nT(packAvatarFrom(editAvatar) ? 'components.avatarBuilder.pack_load_failed' : 'components.avatarBuilder.image_load_failed'))} />
                 </CrewAvatarButton>
               )}
               <DialogTitle className="flex-1 font-mono">
                 {/* The draft label, live: retitling the crew is the one edit
                     whose effect IS this text, so it previews before Save. */}
-                {creating
-                  ? i18nT('pages.kiroCrewAgentsPage.add_crew_member')
-                  : displayName.trim() || editing}
+                {creating ? i18nT('pages.kiroCrewAgentsPage.add_crew_member') : (displayName.trim() || editing)}
               </DialogTitle>
-              {!creating && editingAgent?.source && <SourceBadge source={editingAgent.source} />}
+              {!creating && showsCrewSourceBadge(editingAgent?.source) && <CrewSourceBadge source={editingAgent.source} />}
             </div>
             {!creating && (
               <div className="ml-auto flex items-center gap-2" data-testid="crew-editor-actions">
-                <Btn
-                  onClick={openAvatarBuilder}
-                  disabled={sheetBusy}
-                  data-testid="header-edit-avatar"
-                  title={i18nT('components.avatarBuilder.edit_avatar')}
-                  aria-label={i18nT('components.avatarBuilder.edit_avatar')}
-                >
+                <Btn onClick={openAvatarBuilder} disabled={sheetBusy} data-testid="header-edit-avatar" title={i18nT('components.avatarBuilder.edit_avatar')} aria-label={i18nT('components.avatarBuilder.edit_avatar')}>
                   <UserPen className="lucide-inline" aria-hidden="true" />
                   {/* Both header labels fold to their icon on a phone-width
                       header so the crew name keeps its room (with two labelled
                       buttons the Chat label wrapped to four lines and the
                       title truncated to "on…"); aria-label carries the name. */}
-                  <span className="hidden sm:inline">
-                    {i18nT('components.avatarBuilder.edit_avatar')}
-                  </span>
+                  <span className="hidden sm:inline">{i18nT('components.avatarBuilder.edit_avatar')}</span>
                 </Btn>
-                <Btn
-                  onClick={requestChat}
-                  title={i18nT('memoryV2.chat_member')}
-                  aria-label={i18nT('memoryV2.chat_member')}
-                >
+                <Btn onClick={requestChat} title={i18nT('memoryV2.chat_member')} aria-label={i18nT('memoryV2.chat_member')}>
                   <MessageSquare className="lucide-inline" aria-hidden="true" />
                   <span className="hidden sm:inline">{i18nT('memoryV2.chat_member')}</span>
                 </Btn>
@@ -2775,9 +2231,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           {/* Create is a short form and keeps the stacked layout. Edit is a rail:
               an existing crew has surfaces (schedules, bindings, removal) that a
               new one does not, and a wizard for creation is a separate decision. */}
-          <DialogBody
-            className={creating ? undefined : 'flex flex-col overflow-hidden p-0 sm:flex-row'}
-          >
+          <DialogBody className={creating ? undefined : 'flex flex-col overflow-hidden p-0 sm:flex-row'}>
             {/* The fence that makes the Save-time snapshot honest: while a
                 save is in flight (staged upload, the committing PUT, create
                 or delete), every control in the pane is disabled (fieldset
@@ -2790,156 +2244,115 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               aria-busy={sheetBusy}
               className={`contents ${sheetBusy ? '[&>*]:pointer-events-none [&>*]:opacity-60' : ''}`}
             >
-              {creating ? (
-                <div className="flex flex-col gap-6">
-                  <section className="flex flex-col gap-3">
-                    <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">
-                      {i18nT('pages.kiroCrewAgentsPage.identity')}
-                    </h3>
-                    <Field label={i18nT('pages.kiroCrewAgentsPage.name')}>
-                      <Input
-                        placeholder={i18nT('pages.kiroCrewAgentsPage.e_g_oncall')}
-                        value={name}
-                        // A rejected submit's error is about the name that was
-                        // sent; editing the name answers it, so the notice goes
-                        // and the Create button reads as safe to press again.
-                        onChange={(e) => {
-                          setName(e.target.value)
-                          setError('')
-                        }}
-                        autoFocus
-                      />
-                    </Field>
-                    <DisplayNameField
-                      value={displayName}
-                      onChange={setDisplayName}
-                      fallback={name}
+            {creating ? (
+              <div className="flex flex-col gap-6">
+                <section className="flex flex-col gap-3">
+                  <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">{i18nT('pages.kiroCrewAgentsPage.identity')}</h3>
+                  <Field label={i18nT('pages.kiroCrewAgentsPage.name')}>
+                    <Input
+                      placeholder={i18nT('pages.kiroCrewAgentsPage.e_g_oncall')}
+                      value={name}
+                      // A rejected submit's error is about the name that was
+                      // sent; editing the name answers it, so the notice goes
+                      // and the Create button reads as safe to press again.
+                      onChange={e => { setName(e.target.value); setError('') }}
+                      autoFocus
                     />
-                  </section>
-                  <section className="flex flex-col gap-3">
-                    <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">
-                      {i18nT('pages.kiroCrewAgentsPage.routing')}
-                    </h3>
-                    <TriggersField value={triggers} onChange={setTriggers} subject={formSubject} />
-                    <SessionColorField
-                      value={sessionColor}
-                      onChange={setSessionColor}
-                      subject={formSubject}
-                    />
-                  </section>
-                  <section className="flex flex-col gap-3">
-                    <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">
-                      {i18nT('pages.kiroCrewAgentsPage.runtime_binding')}
-                    </h3>
-                    <BindingFields
-                      subject={formSubject}
-                      templateLabel={provider.labels.agentTemplateField}
-                      kiroAgentOptions={kiroAgentOptions}
-                      kiroAgent={kiroAgent}
-                      setKiroAgent={setKiroAgent}
-                      templateProvenance={templateProvenance}
-                      workspaceOptions={workspaceOptions}
-                      workspace={workspace}
-                      setWorkspace={setWorkspace}
-                      onNewWorkspace={() => setWsModalOpen(true)}
-                    />
-                  </section>
-                </div>
-              ) : (
-                <>
-                  <CrewEditorRail
-                    sections={sections}
-                    value={pane}
-                    onChange={requestPane}
-                    ariaLabel={i18nT('components.crewEditor.rail_label')}
-                    unsavedLabel={i18nT('components.crewEditor.unsaved_changes')}
-                    sharedLabel={i18nT('components.crewEditor.tag_shared')}
-                    panelIdPrefix={panelId}
+                  </Field>
+                  <DisplayNameField value={displayName} onChange={setDisplayName} fallback={name} />
+                </section>
+                <section className="flex flex-col gap-3">
+                  <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">{i18nT('pages.kiroCrewAgentsPage.routing')}</h3>
+                  <TriggersField value={triggers} onChange={setTriggers} subject={formSubject} />
+                  <SessionColorField value={sessionColor} onChange={setSessionColor} subject={formSubject} />
+                </section>
+                <section className="flex flex-col gap-3">
+                  <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">
+                    {i18nT('pages.kiroCrewAgentsPage.runtime_binding')}
+                  </h3>
+                  <BindingFields
+                    subject={formSubject}
+                    templateLabel={i18nT('pages.kiroCrewAgentsPage.built_from')}
+                    kiroAgentOptions={kiroAgentOptions} kiroAgent={kiroAgent} setKiroAgent={setKiroAgent}
+                    templateProvenance={templateProvenance}
+                    workspaceOptions={workspaceOptions} workspace={workspace} setWorkspace={setWorkspace}
+                    onNewWorkspace={() => setWsModalOpen(true)}
                   />
-                  {/* `tabIndex={-1}` so moving focus here after a rail change is
+                </section>
+              </div>
+            ) : (
+              <>
+                <CrewEditorRail
+                  sections={sections}
+                  value={pane}
+                  onChange={requestPane}
+                  ariaLabel={i18nT('components.crewEditor.rail_label')}
+                  unsavedLabel={i18nT('components.crewEditor.unsaved_changes')}
+                  sharedLabel={i18nT('components.crewEditor.tag_shared')}
+                  panelIdPrefix={panelId}
+                />
+                {/* `tabIndex={-1}` so moving focus here after a rail change is
                     possible without adding a Tab stop. The pane scrolls, not the
                     dialog body, which keeps the rail in view at any height. */}
-                  <div
-                    id={`${panelId}-${pane}`}
-                    role="tabpanel"
-                    aria-labelledby={`${panelId}-tab-${pane}`}
-                    tabIndex={-1}
-                    className={
-                      pane === 'capabilities'
-                        ? 'flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden'
-                        : 'flex min-w-0 flex-1 flex-col gap-3.5 overflow-y-auto px-5 py-4'
-                    }
-                  >
-                    {pane === 'overview' && (
-                      <>
-                        {/* Renaming is identity work, so it lives on the pane a
+                <div
+                  id={`${panelId}-${pane}`}
+                  role="tabpanel"
+                  aria-labelledby={`${panelId}-tab-${pane}`}
+                  tabIndex={-1}
+                  className={pane === 'capabilities'
+                    ? 'flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden'
+                    : 'flex min-w-0 flex-1 flex-col gap-3.5 overflow-y-auto px-5 py-4'}
+                >
+                  {pane === 'overview' && (
+                    <>
+                    {/* Renaming is identity work, so it lives on the pane a
                         user opens to answer "who is this crew" — not under
                         routing (the UX lane's finding on this PR). The create
                         form keeps its copy beside Name for the same reason. */}
-                        <DisplayNameField
-                          value={displayName}
-                          onChange={setDisplayName}
-                          fallback={editing}
-                        />
-                        <CrewOverviewPane
-                          // The largest face in the editor opens the builder too, so
-                          // the hub does not teach the opposite lesson from the
-                          // header face (same title, same entry point).
-                          hub={
-                            <CrewAvatarButton
-                              size={34}
-                              onEdit={openAvatarBuilder}
-                              data-testid="hub-avatar-button"
-                            >
-                              <CrewAvatar
-                                seed={editing}
-                                avatar={editAvatar ?? undefined}
-                                size={34}
-                              />
-                            </CrewAvatarButton>
-                          }
-                          templateLabel={provider.labels.agentTemplateField}
-                          template={kiroAgent}
-                          workspace={workspace}
-                          memoryStore={memoryStore}
-                          modelLabel={
-                            editModel === INHERIT_MODEL
-                              ? i18nT('pages.kiroCrewAgentsPage.inherited')
-                              : editModel
-                          }
-                          modelInherited={editModel === INHERIT_MODEL}
-                          resolvedModel={resolved?.model || ''}
-                          activeSchedules={wakeJobs.filter((j) => j.enabled).length}
-                          schedulesUnknown={wakeQuery.isError}
-                          routingWords={routingWords}
-                          sharingCrews={collidingCrews.length}
-                          workspaceShared={sharingWorkspace.length > 0}
-                          memoryShared={sharingMemoryStore.length > 0}
-                          webhookTokens={boundWebhooks}
-                          webhooksUnknown={webhooksQuery.isError}
-                          onNavigate={goToPane}
-                        />
-                      </>
-                    )}
+                    <DisplayNameField value={displayName} onChange={setDisplayName} fallback={editing} />
+                    <CrewOverviewPane
+                      // The largest face in the editor opens the builder too, so
+                      // the hub does not teach the opposite lesson from the
+                      // header face (same title, same entry point).
+                      hub={
+                        <CrewAvatarButton size={34} onEdit={openAvatarBuilder} data-testid="hub-avatar-button">
+                          <CrewAvatar seed={editing} avatar={editAvatar ?? undefined} size={34} />
+                        </CrewAvatarButton>
+                      }
+                      templateLabel={i18nT('pages.kiroCrewAgentsPage.built_from')}
+                      template={kiroAgent}
+                      workspace={workspace}
+                      memoryStore={memoryStore}
+                      modelLabel={editModel === INHERIT_MODEL ? i18nT('pages.kiroCrewAgentsPage.inherited') : editModel}
+                      modelInherited={editModel === INHERIT_MODEL}
+                      resolvedModel={resolved?.model || ''}
+                      activeSchedules={wakeJobs.filter(j => j.enabled).length}
+                      schedulesUnknown={wakeQuery.isError}
+                      routingWords={routingWords}
+                      sharingCrews={collidingCrews.length}
+                      workspaceShared={sharingWorkspace.length > 0}
+                      memoryShared={sharingMemoryStore.length > 0}
+                      webhookTokens={boundWebhooks}
+                      webhooksUnknown={webhooksQuery.isError}
+                      onNavigate={goToPane}
+                    />
+                    </>
+                  )}
 
-                    {editing && (
-                      <CrewCapabilitiesPane
-                        key={editing}
-                        member={editing}
-                        members={agents.map((agent) => agent.name)}
-                        hidden={pane !== 'capabilities'}
-                        onDirtyChange={setCapabilityDirty}
-                        onBusyChange={setCapabilityBusy}
-                        onSaved={() => {
-                          const saved = queryClient
-                            .getQueryData<{ agents: KiroCrewAgent[] }>(['kirocrew-agents'])
-                            ?.agents.find((agent) => agent.name === editing)
-                          if (saved) setKiroAgent(saved.kiro_agent)
-                        }}
-                      />
-                    )}
-                    {pane === 'template' && (
-                      /* The panel owns the selector: the template picker is
+                  {editing && <CrewCapabilitiesPane
+                    key={editing}
+                    member={editing}
+                    members={agents.map(agent => agent.name)}
+                    hidden={pane !== 'capabilities'}
+                    onDirtyChange={setCapabilityDirty}
+                    onBusyChange={setCapabilityBusy}
+                    onSaved={() => {
+                      const saved = queryClient.getQueryData<{ agents: KiroCrewAgent[] }>(['kirocrew-agents'])?.agents.find(agent => agent.name === editing)
+                      if (saved) setKiroAgent(saved.kiro_agent)
+                    }}
+                  />}
+                  {pane === 'template' && (
+                    /* The panel owns the selector: the template picker is
                        the header bar of the container holding the
                        definition it names (v5 design, usability-reviewed).
                        The crew's private copy is filtered from the shared
@@ -2950,309 +2363,222 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                        retryOnly keeps the fallback free of the /chat
                        hand-off, which would discard the sheet's unsaved
                        pane edits (dirtyPanes). */
-                      <ErrorBoundary scope="agent-template-pane" retryOnly>
-                        <>
-                          {/* No askAgent hand-off: it navigates to /chat,
+                    <ErrorBoundary scope="agent-template-pane" retryOnly>
+                      <>
+                        {/* No askAgent hand-off: it navigates to /chat,
                             unmounting this sheet and destroying its
                             unsaved pane edits (dirtyPanes). Errors inside
                             the editor render in place, never as a
                             hand-off. */}
-                          <ErrorNotice
-                            message={
-                              templateSwitchError ||
-                              (capabilityReadFailed ? i18nT('crewCapabilities.failed') : null)
-                            }
-                            variant="inline"
-                            testId="crew-template-switch-error"
-                          />
-                          <AgentTemplateDetail
-                            actionsDisabled={capabilityDirty || capabilityBusy}
-                            readOnly={
-                              capabilityManaged ||
-                              capabilityDirty ||
-                              capabilityBusy ||
-                              capabilityQuery.isLoading ||
-                              capabilityReadFailed
-                            }
-                            onCapabilities={() => requestPane('capabilities')}
-                            template={kiroAgent}
-                            models={(availableModels || [])
-                              .map((m: { name: string }) => m.name)
-                              .filter(Boolean)}
-                            crew={editing || undefined}
-                            onForked={setKiroAgent}
-                            options={kiroAgentOptions}
-                            onSelect={persistTemplateSwitch}
-                            onRebound={setKiroAgent}
-                            provenance={templateProvenance}
-                            fieldLabel={provider.labels.agentTemplateField}
-                            onSaveChain={onPaneSaveChain}
-                          />
-                        </>
-                      </ErrorBoundary>
-                    )}
+                        <ErrorNotice
+                          message={templateSwitchError || (capabilityReadFailed ? i18nT('crewCapabilities.failed') : null)}
+                          variant="inline"
+                          testId="crew-template-switch-error"
+                        />
+                        <AgentTemplateDetail
+                          actionsDisabled={capabilityDirty || capabilityBusy}
+                          readOnly={capabilityManaged || capabilityDirty || capabilityBusy || capabilityQuery.isLoading || capabilityReadFailed}
+                          onCapabilities={() => requestPane('capabilities')}
+                          template={kiroAgent}
+                          models={(availableModels || []).map((m: { name: string }) => m.name).filter(Boolean)}
+                          crew={editing || undefined}
+                          onForked={setKiroAgent}
+                          options={kiroAgentOptions}
+                          onSelect={persistTemplateSwitch}
+                          onRebound={setKiroAgent}
+                          provenance={templateProvenance}
+                          fieldLabel={i18nT('pages.kiroCrewAgentsPage.built_from')}
+                          onSaveChain={onPaneSaveChain}
+                        />
+                      </>
+                    </ErrorBoundary>
+                  )}
 
-                    {pane === 'model' && (
-                      <>
-                        {modelPickerAvailable ? (
-                          <ModelField
-                            options={modelOptions}
-                            value={editModel}
-                            onChange={setEditModel}
-                          />
-                        ) : (
-                          <div className="rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                            <span
-                              className={
-                                editModel === INHERIT_MODEL ? 'italic' : 'font-mono text-text'
-                              }
-                            >
-                              {editModel === INHERIT_MODEL
-                                ? i18nT('pages.kiroCrewAgentsPage.inherited')
-                                : editModel}
-                            </span>
-                            {editModel === INHERIT_MODEL && (
-                              <span>
-                                {' — '}
-                                {i18nT(
-                                  'pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses',
-                                )}
-                              </span>
-                            )}
-                          </div>
-                        )}
-                        {/* Offered when the model the crew will actually run on
+                  {pane === 'model' && (
+                    <>
+                      {modelPickerAvailable ? (
+                        <ModelField options={modelOptions} value={editModel} onChange={setEditModel} />
+                      ) : (
+                        <div className="rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                          <span className={editModel === INHERIT_MODEL ? 'italic' : 'font-mono text-text'}>
+                            {editModel === INHERIT_MODEL ? i18nT('pages.kiroCrewAgentsPage.inherited') : editModel}
+                          </span>
+                          {editModel === INHERIT_MODEL && (
+                            <span>{' — '}{i18nT('pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses')}</span>
+                          )}
+                        </div>
+                      )}
+                      {/* Offered when the model the crew will actually run on
                           accepts effort — OR when a pin is already stored on a
                           model that does not, so the only way to clear a
                           stranded pin is not to first switch the model back. */}
-                        {(effortCapable || !!editEffort) && (
-                          <EffortField value={editEffort} onChange={setEditEffort} />
-                        )}
-                        {!effortCapable && !!editEffort && (
-                          <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                            {/* Two different reasons a stored pin cannot apply, and
+                      {(effortCapable || !!editEffort) && (
+                        <EffortField value={editEffort} onChange={setEditEffort} />
+                      )}
+                      {!effortCapable && !!editEffort && (
+                        <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                          {/* Two different reasons a stored pin cannot apply, and
                               they need different sentences: naming a model only
                               works when there IS one. With nothing resolved,
                               substituting the "Inherited" label would read as
                               "Inherited does not take a reasoning effort", which
                               names no model and states nothing true. */}
-                            {effortModel
-                              ? i18nT('pages.kiroCrewAgentsPage.effort_ignored_on_this_model', {
-                                  model: effortModel,
-                                })
-                              : i18nT('pages.kiroCrewAgentsPage.effort_pin_needs_a_model')}
-                          </div>
-                        )}
-                        {/* No hand-off: the crew sheet's unsaved pane edits
+                          {effortModel
+                            ? i18nT('pages.kiroCrewAgentsPage.effort_ignored_on_this_model', { model: effortModel })
+                            : i18nT('pages.kiroCrewAgentsPage.effort_pin_needs_a_model')}
+                        </div>
+                      )}
+                      {/* No hand-off: the crew sheet's unsaved pane edits
                           (dirtyPanes). Without this a failed resolve just left the
                           readout below absent, as if the crew had no model. */}
-                        <ErrorNotice
-                          message={resolvedError ? errorText(resolvedError) : null}
-                          testId="crew-resolved-model-error"
-                        />
-                        {resolved && (
-                          <div className="flex flex-col gap-1 rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                            <div>
-                              <span className="text-text">
-                                {i18nT('pages.kiroCrewAgentsPage.resolves_to', {
-                                  model:
-                                    resolved.model || i18nT('pages.kiroCrewAgentsPage.inherited'),
-                                })}
-                              </span>
-                              {' — '}
-                              {resolved.pinned
-                                ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
-                                : resolved.model
-                                  ? i18nT(
-                                      'pages.kiroCrewAgentsPage.inherited_from_the_agent_template',
-                                    )
-                                  : i18nT(
-                                      'pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses',
-                                    )}
-                            </div>
-                            {/* The effort half of the same readout. It answers
+                      <ErrorNotice
+                        message={resolvedError ? errorText(resolvedError) : null}
+                        testId="crew-resolved-model-error"
+                      />
+                      {resolved && (
+                        <div className="flex flex-col gap-1 rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                          <div>
+                            <span className="text-text">
+                              {i18nT('pages.kiroCrewAgentsPage.resolves_to', { model: resolved.model || i18nT('pages.kiroCrewAgentsPage.inherited') })}
+                            </span>
+                            {' — '}
+                            {resolved.pinned
+                              ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
+                              : resolved.model
+                                ? i18nT('pages.kiroCrewAgentsPage.inherited_from_the_agent_template')
+                                : i18nT('pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses')}
+                          </div>
+                          {/* The effort half of the same readout. It answers
                               "what will this crew think at" in every case,
                               including the one where no level can apply — an
                               absent control with no line about it is what makes
                               the setting look missing rather than unavailable.
                               Suppressed only for the stranded pin, where the
                               warning above already says it and says what to do. */}
-                            {(effortCapable || !editEffort) && (
-                              <div>
-                                {effortCapable ? (
-                                  <>
-                                    <span className="text-text">
-                                      {i18nT('pages.kiroCrewAgentsPage.effort_resolves_to', {
-                                        effort: resolved.reasoning_effort
-                                          ? effortLabel(resolved.reasoning_effort)
-                                          : i18nT('lib.effort.default'),
-                                      })}
-                                    </span>
-                                    {' — '}
-                                    {resolved.effort_pinned
-                                      ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
-                                      : resolved.reasoning_effort
-                                        ? i18nT(
-                                            'pages.kiroCrewAgentsPage.effort_inherited_from_the_global_default',
-                                          )
-                                        : i18nT(
-                                            'pages.kiroCrewAgentsPage.no_effort_pin_the_model_decides',
-                                          )}
-                                  </>
-                                ) : effortModel ? (
-                                  i18nT(
-                                    'pages.kiroCrewAgentsPage.effort_unavailable_on_this_model',
-                                    { model: effortModel },
-                                  )
-                                ) : (
-                                  i18nT('pages.kiroCrewAgentsPage.effort_needs_a_model')
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </>
-                    )}
-
-                    {pane === 'place' && (
-                      <>
-                        <WorkspaceField
-                          options={workspaceOptions}
-                          value={workspace}
-                          onChange={setWorkspace}
-                          onNewWorkspace={() => setWsModalOpen(true)}
-                          subject="agent"
-                        />
-                        <MemoryStoreField
-                          value={memoryStore}
-                          member={editing}
-                          memoryState={memberMemoryState(
-                            editing,
-                            memoryStore,
-                            kirocrewCfg?.memory_stores,
-                          )}
-                          busy={sheetBusy || !kirocrewCfg}
-                          manageDisabled={dirtyPanes.size > 0 || schedDraft}
-                          onManage={() =>
-                            navigate(
-                              `/settings/overview?view=memory&store=${encodeURIComponent(editing === 'default' ? 'default' : memoryStore)}`,
-                            )
-                          }
-                        />
-                        {/* The default assistant's shared-workspace warning does not
-                          describe another member's memory ownership. */}
-                        {editing === 'default' && collidingCrews.length > 0 && (
-                          <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                            {i18nT('pages.kiroCrewAgentsPage.also_used_by_these_crews', {
-                              crews: collidingCrews.join(', '),
-                            })}
-                          </div>
-                        )}
-                      </>
-                    )}
-
-                    {pane === 'schedules' && (
-                      <CrewWakeSection
-                        crew={editing}
-                        agentTemplate={kiroAgent}
-                        isDefaultCrew={editing === defaultAgent}
-                        onDraftChange={setSchedDraft}
-                        onSavingChange={setSchedSaving}
-                        onRequestCancel={requestCancelDraft}
-                      />
-                    )}
-
-                    {pane === 'webhook' && <CrewWebhookSection crew={editing} />}
-
-                    {pane === 'routing' && (
-                      <>
-                        <TriggersField value={triggers} onChange={setTriggers} subject="agent" />
-                        <SessionColorField
-                          value={sessionColor}
-                          onChange={setSessionColor}
-                          subject="agent"
-                        />
-                        <Field
-                          label={i18nT('components.avatarBuilder.field_label')}
-                          hint={i18nT('components.avatarBuilder.field_hint')}
-                        >
-                          <div className="flex items-center gap-2.5">
-                            <CrewAvatarButton
-                              size={36}
-                              onEdit={openAvatarBuilder}
-                              data-testid="field-avatar-button"
-                            >
-                              <CrewAvatar
-                                seed={editing || ''}
-                                avatar={editAvatar ?? undefined}
-                                size={36}
-                              />
-                            </CrewAvatarButton>
-                            <Btn onClick={openAvatarBuilder} data-testid="open-avatar-builder">
-                              <UserPen className="lucide-inline" aria-hidden="true" />
-                              {i18nT('components.avatarBuilder.edit_avatar')}
-                            </Btn>
-                            {editAvatar && (
-                              <span className="text-[11px] text-muted">
-                                {i18nT('components.avatarBuilder.customized_note')}
-                              </span>
-                            )}
-                          </div>
-                        </Field>
-                      </>
-                    )}
-
-                    {pane === 'danger' && (
-                      <div className="flex flex-col gap-3 rounded-md border border-danger-subtle bg-danger-subtle p-3">
-                        <p className="m-0 text-[12px] leading-relaxed text-muted">
-                          {confirmDelete
-                            ? i18nT('pages.kiroCrewAgentsPage.delete_crew_named_confirm', {
-                                name: editing,
-                              })
-                            : i18nT(
-                                'pages.kiroCrewAgentsPage.deleting_a_crew_unbinds_it_from_new_sessions_its',
+                          {(effortCapable || !editEffort) && (
+                            <div>
+                              {effortCapable ? (
+                                <>
+                                  <span className="text-text">
+                                    {i18nT('pages.kiroCrewAgentsPage.effort_resolves_to', {
+                                      effort: resolved.reasoning_effort
+                                        ? effortLabel(resolved.reasoning_effort)
+                                        : i18nT('lib.effort.default'),
+                                    })}
+                                  </span>
+                                  {' — '}
+                                  {resolved.effort_pinned
+                                    ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
+                                    : resolved.reasoning_effort
+                                      ? i18nT('pages.kiroCrewAgentsPage.effort_inherited_from_the_global_default')
+                                      : i18nT('pages.kiroCrewAgentsPage.no_effort_pin_the_model_decides')}
+                                </>
+                              ) : effortModel ? (
+                                i18nT('pages.kiroCrewAgentsPage.effort_unavailable_on_this_model', { model: effortModel })
+                              ) : (
+                                i18nT('pages.kiroCrewAgentsPage.effort_needs_a_model')
                               )}
-                        </p>
-                        {/* Two-step rather than a one-click destructive button: a
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {pane === 'place' && (
+                    <>
+                      <WorkspaceField
+                        options={workspaceOptions}
+                        value={workspace}
+                        onChange={setWorkspace}
+                        onNewWorkspace={() => setWsModalOpen(true)}
+                        subject="agent"
+                      />
+                      <MemoryStoreField
+                        value={memoryStore}
+                        member={editing}
+                        memoryState={memberMemoryState(editing, memoryStore, kirocrewCfg?.memory_stores)}
+                        busy={sheetBusy || !kirocrewCfg}
+                        manageDisabled={dirtyPanes.size > 0 || schedDraft}
+                        onManage={() => navigate(`/settings/overview?view=memory&store=${encodeURIComponent(editing === 'default' ? 'default' : memoryStore)}`)}
+                      />
+                      {/* The default assistant's shared-workspace warning does not
+                          describe another member's memory ownership. */}
+                      {editing === 'default' && collidingCrews.length > 0 && (
+                        <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                          {i18nT('pages.kiroCrewAgentsPage.also_used_by_these_crews', { crews: collidingCrews.join(', ') })}
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {pane === 'schedules' && (
+                    <CrewWakeSection crew={editing} agentTemplate={kiroAgent} isDefaultCrew={editing === defaultAgent} onDraftChange={setSchedDraft} onSavingChange={setSchedSaving} onRequestCancel={requestCancelDraft} />
+                  )}
+
+                  {pane === 'webhook' && <CrewWebhookSection crew={editing} />}
+
+                  {pane === 'routing' && (
+                    <>
+                      <TriggersField value={triggers} onChange={setTriggers} subject="agent" />
+                      <SessionColorField value={sessionColor} onChange={setSessionColor} subject="agent" />
+                      <Field
+                        label={i18nT('components.avatarBuilder.field_label')}
+                        hint={i18nT('components.avatarBuilder.field_hint')}
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <CrewAvatarButton size={36} onEdit={openAvatarBuilder} data-testid="field-avatar-button">
+                            <CrewAvatar seed={editing || ''} avatar={editAvatar ?? undefined} size={36} />
+                          </CrewAvatarButton>
+                          <Btn onClick={openAvatarBuilder} data-testid="open-avatar-builder">
+                            <UserPen className="lucide-inline" aria-hidden="true" />
+                            {i18nT('components.avatarBuilder.edit_avatar')}
+                          </Btn>
+                          {editAvatar && (
+                            <span className="text-[11px] text-muted">
+                              {i18nT('components.avatarBuilder.customized_note')}
+                            </span>
+                          )}
+                        </div>
+                      </Field>
+                    </>
+                  )}
+
+                  {pane === 'danger' && (
+                    <div className="flex flex-col gap-3 rounded-md border border-danger-subtle bg-danger-subtle p-3">
+                      <p className="m-0 text-[12px] leading-relaxed text-muted">
+                        {confirmDelete
+                          ? i18nT('pages.kiroCrewAgentsPage.delete_crew_named_confirm', { name: editing })
+                          : i18nT('pages.kiroCrewAgentsPage.deleting_a_crew_unbinds_it_from_new_sessions_its')}
+                      </p>
+                      {/* Two-step rather than a one-click destructive button: a
                           misclick in an overlay is far likelier than in a table,
                           and a first-run reviewer flagged it as the one action
                           they would regret. A nested confirm DIALOG was the other
                           option; inline keeps this out of a stacked focus trap. */}
-                        <div ref={confirmRef} className="flex items-center gap-2">
-                          <div className="flex-1" />
-                          {confirmDelete ? (
-                            <>
-                              <Btn
-                                onClick={() => setConfirmDelete(false)}
-                                data-testid="cancel-delete-crew"
-                              >
-                                {i18nT('pages.kiroCrewAgentsPage.cancel')}
-                              </Btn>
-                              <Btn
-                                danger
-                                onClick={() =>
-                                  deleteMut.mutate({
-                                    name: editing,
-                                    epoch: sheetEpoch.current,
-                                  })
-                                }
-                                disabled={sheetBusy}
-                                data-testid="confirm-delete-crew"
-                              >
-                                {i18nT('pages.kiroCrewAgentsPage.yes_delete_it')}
-                              </Btn>
-                            </>
-                          ) : (
-                            <Btn danger onClick={() => setConfirmDelete(true)} disabled={sheetBusy}>
-                              {i18nT('pages.kiroCrewAgentsPage.delete_crew')}
+                      <div ref={confirmRef} className="flex items-center gap-2">
+                        <div className="flex-1" />
+                        {confirmDelete ? (
+                          <>
+                            {/* Not "Cancel": the sheet footer's Cancel is on screen at
+                                the same time, and two Cancels leave the reader asking
+                                which one to press. This one says what pressing it keeps. */}
+                            <Btn onClick={() => setConfirmDelete(false)} data-testid="cancel-delete-crew">{i18nT('pages.kiroCrewAgentsPage.keep_crew')}</Btn>
+                            <Btn danger onClick={() => deleteMut.mutate({ name: editing, epoch: sheetEpoch.current })} disabled={sheetBusy} data-testid="confirm-delete-crew">
+                              {i18nT('pages.kiroCrewAgentsPage.yes_delete_it')}
                             </Btn>
-                          )}
-                        </div>
+                          </>
+                        ) : (
+                          <Btn danger onClick={() => setConfirmDelete(true)} disabled={sheetBusy}>
+                            {i18nT('pages.kiroCrewAgentsPage.delete_crew')}
+                          </Btn>
+                        )}
                       </div>
-                    )}
-                  </div>
-                </>
-              )}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
             </fieldset>
           </DialogBody>
 
@@ -3265,73 +2591,46 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               that pane saves as you go, so a Cancel + "Save changes" footer there
               is a second, contradictory save model (see templatePaneActive). */}
           {!templatePaneActive && pane !== 'capabilities' && (
-            <DialogFooter>
-              {/* No hand-off: the crew sheet's unsaved pane edits (dirtyPanes) —
+          <DialogFooter>
+            {/* No hand-off: the crew sheet's unsaved pane edits (dirtyPanes) —
                 a failed save is exactly what did not persist them. */}
-              <ErrorNotice
-                message={error}
-                variant="inline"
-                className="mr-auto"
-                testId="crew-sheet-error"
-              />
-              {/* Client-side validation hint — the form never reached the server,
+            <ErrorNotice message={error} variant="inline" className="mr-auto" testId="crew-sheet-error" />
+            {/* Client-side validation hint — the form never reached the server,
                 so this is plain text, not an error surface. */}
-              {sheetHint && (
-                <span className="mr-auto text-[12px] text-danger" data-testid="crew-sheet-hint">
-                  {sheetHint}
-                </span>
-              )}
-              {!creating && dirtyPanes.size > 0 && !error && !sheetHint && (
-                <span className="mr-auto text-[11.5px] text-muted" data-testid="crew-unsaved-note">
-                  {/* While the open schedule draft is what disables Save, the note
+            {sheetHint && <span className="mr-auto text-[12px] text-danger" data-testid="crew-sheet-hint">{sheetHint}</span>}
+            {!creating && dirtyPanes.size > 0 && !error && !sheetHint && (
+              <span className="mr-auto text-[11.5px] text-muted" data-testid="crew-unsaved-note">
+                {/* While the open schedule draft is what disables Save, the note
                     names that reason in visible text — the `title` on the button
                     is hover-only, which keyboard and touch users never see. */}
-                  {capabilityDirty
-                    ? i18nT('crewCapabilities.finishDraftFirst')
-                    : schedDraft
-                      ? i18nT('pages.kiroCrewAgentsPage.finish_the_new_schedule_first')
-                      : i18nT('components.crewEditor.unsaved_changes')}
-                </span>
-              )}
-              <Btn onClick={requestClose}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>
-              {creating ? (
-                // whitespace-nowrap: the footer error shares this row, and the
-                // primary action keeps its one-line label rather than folding
-                // under the notice.
-                <SendBtn
-                  onClick={create}
-                  disabled={sheetBusy}
-                  className="whitespace-nowrap shrink-0"
-                >
-                  {/* The primary action names its object in the roster's words when
+                {capabilityDirty
+                  ? i18nT('crewCapabilities.finishDraftFirst')
+                  : schedDraft
+                    ? i18nT('pages.kiroCrewAgentsPage.finish_the_new_schedule_first')
+                    : i18nT('components.crewEditor.unsaved_changes')}
+              </span>
+            )}
+            <Btn onClick={requestClose}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>
+            {creating ? (
+              // whitespace-nowrap: the footer error shares this row, and the
+              // primary action keeps its one-line label rather than folding
+              // under the notice.
+              <SendBtn onClick={create} disabled={sheetBusy} className="whitespace-nowrap shrink-0">
+                {/* The primary action names its object in the roster's words when
                     the roster asked for it — the form's helper copy still says
                     "agent", and the button is where the two names would jar. */}
-                  {createMut.isPending
-                    ? i18nT('pages.kiroCrewAgentsPage.creating')
-                    : i18nT('pages.kiroCrewAgentsPage.create')}
-                </SendBtn>
-              ) : (
-                <SendBtn
-                  onClick={saveEdit}
-                  disabled={
-                    sheetBusy ||
-                    dirtyPanes.size === 0 ||
-                    schedDraft ||
-                    capabilityDirty ||
-                    capabilityBusy
-                  }
-                  title={
-                    capabilityDirty
-                      ? i18nT('crewCapabilities.finishDraftFirst')
-                      : schedDraft
-                        ? i18nT('pages.kiroCrewAgentsPage.finish_the_new_schedule_first')
-                        : undefined
-                  }
-                >
-                  {i18nT('pages.kiroCrewAgentsPage.save_changes')}
-                </SendBtn>
-              )}
-            </DialogFooter>
+                {createMut.isPending
+                  ? i18nT('pages.kiroCrewAgentsPage.creating')
+                  : i18nT('pages.kiroCrewAgentsPage.create')}
+              </SendBtn>
+            ) : (
+              <SendBtn
+                onClick={saveEdit}
+                disabled={sheetBusy || dirtyPanes.size === 0 || schedDraft || capabilityDirty || capabilityBusy}
+                title={capabilityDirty ? i18nT('crewCapabilities.finishDraftFirst') : schedDraft ? i18nT('pages.kiroCrewAgentsPage.finish_the_new_schedule_first') : undefined}
+              >{i18nT('pages.kiroCrewAgentsPage.save_changes')}</SendBtn>
+            )}
+          </DialogFooter>
           )}
 
           {/* Nested INSIDE the editor's DialogContent so Radix treats it as a
@@ -3357,20 +2656,13 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               The `crew-sched-*` test ids predate the generalization and stay
               stable: one dialog now asks about a typed schedule, about unsaved
               pane edits, or about both. */}
-          <Dialog
-            open={discardAsk !== null}
-            onOpenChange={(next) => {
-              if (!next) setDiscardAsk(null)
-            }}
-          >
+          <Dialog open={discardAsk !== null} onOpenChange={next => { if (!next) setDiscardAsk(null) }}>
             <DialogContent
               maxWidth={440}
               className="z-[110]"
-              aria-label={
-                askSchedOnly
-                  ? i18nT('pages.kiroCrewAgentsPage.discard_new_schedule')
-                  : i18nT('pages.kiroCrewAgentsPage.discard_unsaved_changes')
-              }
+              aria-label={askSchedOnly
+                ? i18nT('pages.kiroCrewAgentsPage.discard_new_schedule')
+                : i18nT('pages.kiroCrewAgentsPage.discard_unsaved_changes')}
             >
               <DialogHeader>
                 {/* The shared title truncates by default; at 320px that
@@ -3391,10 +2683,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                     the consequence the narrow question left out, so it must not
                     read as a footnote to it. */}
                 {schedDraft && discardTakesSheet && (
-                  <p
-                    className="mb-0 mt-2 text-sm text-text"
-                    data-testid="crew-sched-discard-also-crew"
-                  >
+                  <p className="mb-0 mt-2 text-sm text-text" data-testid="crew-sched-discard-also-crew">
                     {i18nT('pages.kiroCrewAgentsPage.discard_also_crew_edits')}
                   </p>
                 )}
@@ -3402,10 +2691,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                     `title` never reaches keyboard or touch users, and browsers
                     often suppress titles on disabled controls entirely. */}
                 {schedSaving && (
-                  <p
-                    className="mb-0 mt-2 text-[12px] text-muted"
-                    data-testid="crew-sched-discard-saving-note"
-                  >
+                  <p className="mb-0 mt-2 text-[12px] text-muted" data-testid="crew-sched-discard-saving-note">
                     {discardForce
                       ? i18nT('pages.kiroCrewAgentsPage.discard_anyway_note')
                       : i18nT('pages.kiroCrewAgentsPage.discard_locked_while_saving')}
@@ -3460,7 +2746,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 sounds: soundsFrom(editingAgent?.avatar) !== null,
               }}
               onCancel={() => setAvatarBuilderOpen(false)}
-              onSave={(next) => {
+              onSave={next => {
                 setEditAvatar(next)
                 // Any Apply is the user deciding the avatar, so a record they
                 // never saw must not ride along behind their choice.

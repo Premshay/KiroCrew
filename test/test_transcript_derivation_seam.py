@@ -123,6 +123,9 @@ PLUMBING: frozenset[tuple[str, str]] = frozenset(
         ("kiro_crew/history_projection.py", "_recent_via_tail"),
         ("kiro_crew/history_projection.py", "read_messages_chained"),
         ("kiro_crew/slack/gateway.py", "read_messages"),
+        # A yes/no "does this session already have turns" check on its OWN
+        # transcript, gating a write to that transcript; no rows leave.
+        ("kiro_crew/slack/thread_parent.py", "recent"),
         ("kiro_crew/teams/session_resume.py", "recent"),
     }
 )
@@ -424,7 +427,7 @@ class TestThePublicationFence:
             (
                 "kiro_crew/dashboard/session_export.py",
                 "api_chat_slot_export",
-                "Response",
+                "_StagedExport",
             ),
             (
                 "kiro_crew/dashboard/handlers_instances.py",

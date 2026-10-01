@@ -71,13 +71,19 @@ import asyncio
 import logging
 import os
 import sys
-from collections.abc import Awaitable, Callable, Iterable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 from kiro_crew import platform_compat
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.runtime_ownership import (
+    commit_runtime_teardown,
+    release_runtime_teardown,
+    release_session_lease,
+    tenancy_epoch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -755,6 +761,244 @@ async def _sweep_children(
         f"recorded child pid{plural} {named} survived the escaped-children sweep, identity "
         "verified; not signalled"
     )
+
+
+async def release_teardown_lease(
+    sessions: object,
+    session_key: str,
+    handle: ProcessHandle,
+    *,
+    who: str,
+    popped: "Sequence[tuple[Any, ProcessHandle]] | None" = None,
+) -> None:
+    """Release the lease held by the session a teardown is destroying.
+
+    A teardown's subject must not be able to refuse the teardown. The lease is
+    normally released inside ``provider.shutdown()``, the last step of a reset, so
+    a reset that hung or raised before it still holds one -- and the last-resort
+    kill paths that call this exist precisely for that case. Asking the ownership
+    gate first would let the session being destroyed refuse its own kill: the
+    wedged process would survive and its pid would go on being refused by every
+    sweep for the gateway's life.
+
+    ``sessions.tearing_down(session_key)`` is what makes the subject reachable
+    after its pop: the live map stops naming a session at the pop, before the
+    teardown's awaits, and that table holds the popped session for exactly the life
+    of each teardown. The entry is matched on *handle*'s pid AND start identity, so
+    a key with several teardowns in flight releases the one whose process is about
+    to be signalled and leaves a sibling's lease alone.
+
+    That table alone is NOT enough, and ``popped`` is why. The teardown scope is a
+    context manager, and its ``release`` drops the entry on "return, raise or
+    cancellation alike" -- so a reset the caller abandoned with
+    ``asyncio.wait_for(..., timeout)`` has already unwound the scope by the time
+    this runs, leaving ``tearing_down`` empty, while the lease is still held
+    because ``provider.shutdown()`` -- the only releaser -- sits past the awaits
+    the cancellation interrupted. That is the exact case the last-resort kill
+    exists for, so relying on the table alone would leave the subject refusing its
+    own kill in the one situation this function was written to cover. ``popped`` is
+    the ``(session, handle)`` list the scope's ``on_pop`` hook filled inside the
+    registry-lock hold, which the CALLER holds and no unwinding can take away.
+
+    Both sources are matched by the same rule -- ``handle``'s pid and start
+    identity -- and a provider reached through both is released once: a second
+    release is harmless but the log line would claim two teardowns where there was
+    one.
+
+    What survives is a lease held by a DIFFERENT owning session -- and, separately,
+    every TENANCY on the process, which this never touches and must not. A tenancy
+    says somebody who does not own the process is mid-flight on it, and at ``cap=1``
+    that is how a session-sharing sub-agent is represented at all, since an
+    acquisition cannot join an occupied runtime. Releasing the subject's lease is
+    what stops a teardown refusing itself; a tenant's claim is what still stops it,
+    and correctly.
+
+    Best effort by design: every failure here is a reason to go on and ask the gate,
+    never a reason to abandon the kill. A release that did not happen costs a
+    refusal the caller reports honestly; an exception raised out of here would cost
+    the wedged process its only remaining kill. Shared by the cron run reaper and
+    the sub-agent reset ladder so the two cannot drift.
+    """
+    try:
+        if sessions is None:
+            return
+        pid = getattr(handle, "pid", None)
+        start_id = getattr(handle, "start_id", None)
+        # (session, its handle) from each source, in one list: the torn-down table
+        # for a teardown still inside its scope, the caller's captured pop for one
+        # whose scope has already unwound.
+        candidates: list[tuple[Any, Any]] = []
+        try:
+            for entry in sessions.tearing_down(session_key):  # type: ignore[attr-defined]
+                candidates.append((getattr(entry, "session", None), getattr(entry, "handle", None)))
+        except Exception:
+            # A manager without the table, or one that raised: the captured pop
+            # below is then the only source, which is the stronger one anyway.
+            logger.debug(
+                "%s: could not read the torn-down table for %s", who, session_key, exc_info=True
+            )
+        for popped_session, popped_handle in popped or ():
+            candidates.append((popped_session, popped_handle))
+        released: list[Any] = []
+        for session, entry_handle in candidates:
+            if getattr(entry_handle, "pid", None) != pid:
+                continue
+            if getattr(entry_handle, "start_id", None) != start_id:
+                continue
+            provider = getattr(session, "provider", None)
+            if provider is None:
+                continue
+            if any(existing is provider for existing in released):
+                continue  # reached through both sources; released once
+            released.append(provider)
+            await release_session_lease(provider)
+            logger.debug(
+                "%s: released the teardown's own lease on pid %s for %s", who, pid, session_key
+            )
+    except Exception:
+        logger.debug(
+            "%s: could not release the teardown's own lease for %s; asking the gate anyway",
+            who,
+            session_key,
+            exc_info=True,
+        )
+
+
+def _audit_kill(outcome: str, reason: str, resources: str, *, tool_name: str) -> None:
+    """The one SEL emitter every kill decision and kill phase writes through.
+
+    Never raises. An audit that cannot be written must not stop a sweep.
+    """
+    try:
+        # Imported HERE on purpose, and it is the `top-level-imports` rule's own
+        # rationale that asks for it: 67 test files patch ``kiro_crew.sel.sel``, and a
+        # module-scope ``from ... import sel`` binds the function object into THIS
+        # namespace, where none of those patches can reach it -- the "mock patches
+        # target the wrong module namespace" failure the rule exists to prevent.
+        # Deferring also keeps sel's 19 extra modules (measured) off this file's
+        # import, which the gateway pulls in early.
+        from kiro_crew.sel import sel
+
+        sel().log_tool_invocation(
+            session_key="gateway",
+            agent="kirocrew",
+            source="background",
+            tool_name=tool_name,
+            tool_kind="process_kill",
+            outcome=outcome,
+            resources=resources,
+            metadata={"reason": reason[:200]},
+        )
+    except Exception:
+        logger.debug("SEL kill audit failed for %s", tool_name, exc_info=True)
+
+
+@contextmanager
+def teardown_barriers(pids: Iterable[int | None], *, who: str) -> Iterator[list[int]]:
+    """Hold a tenancy teardown barrier on each of *pids*; yield the ones granted.
+
+    An ownership verdict is a statement about the PAST. Every kill path here computes
+    one and then does real work before signalling -- an executor hop, a pid-file read,
+    token reads, a ``pgrep`` descendant walk -- while a shared turn claims its tenancy
+    on the event loop. A claim landing in that window is invisible to the verdict, and
+    the kill phase's own re-checks cannot see it either: a start token is unchanged by
+    a new TENANT on the same process, and the sweep's live-pid shield was read into a
+    set before the claimant registered.
+
+    So the verdict is made current here and the window is shut in one act:
+    ``tenancy_epoch`` is read per pid, ``commit_runtime_teardown`` decides, and only
+    the pids it granted are yielded. A pid that gained a tenant in between is simply
+    absent from the yielded list, which every caller already treats as "not to be
+    signalled this pass".
+
+    Released in a ``finally`` covering every exit, including a raise: a barrier left
+    standing is a pid no tenant can claim for the life of the gateway, which is a
+    worse leak than the one this closes. One implementation, because four kill paths
+    need it and four copies would drift -- and because a barrier is only correct when
+    its commit and its release are the same piece of code.
+
+    ``None`` and pids at or below 1 are accepted and skipped, because the single-handle
+    callers pass a handle's pid straight through and a handle that names no process is
+    their ordinary "nothing to kill" case, not an error.
+    """
+    granted: list[int] = []
+    try:
+        for pid in pids:
+            if not isinstance(pid, int) or pid <= 1:
+                continue
+            try:
+                if commit_runtime_teardown(pid, tenancy_epoch(pid)):
+                    granted.append(pid)
+                    continue
+                logger.warning(
+                    "%s: pid %s gained a tenant after the ownership gate allowed it; "
+                    "not signalling it this pass",
+                    who,
+                    pid,
+                )
+            except Exception:
+                # An unanswerable tenancy table withholds, like every other
+                # unanswerable input on a kill path.
+                logger.debug(
+                    "%s: could not commit a teardown barrier for pid %s", who, pid, exc_info=True
+                )
+        yield granted
+    finally:
+        for pid in granted:
+            try:
+                release_runtime_teardown(pid)
+            except Exception:
+                logger.debug("%s: could not release the barrier on pid %s", who, pid, exc_info=True)
+
+
+def audit_kill_phase(*, allowed: int, killed: int, reason: str, tool_name: str) -> None:
+    """Emit one SEL audit event for what a kill PHASE actually did.
+
+    A decision row says a signal was permitted; it cannot say the signal happened.
+    The sweep kill phases re-judge every candidate against the file as it reads
+    then -- an entry that has gone, a token that cannot be read, a token proving the
+    number was reused are all "prune, never kill" -- so the count they return is
+    smaller than the count they were handed, and routinely zero. This row is where
+    ``killed`` may finally be written, because this is the first place the signal's
+    result is known.
+
+    ``failed`` for a phase that was handed candidates and signalled none: a sweep
+    that decided to kill and then killed nothing is the shape an operator needs to
+    see when a leak reading will not come down.
+    """
+    if allowed <= 0:
+        return  # nothing was permitted, so the phase has nothing to report
+    _audit_kill(
+        "killed" if killed > 0 else "failed",
+        reason,
+        f"allowed={allowed} killed={killed}",
+        tool_name=tool_name,
+    )
+
+
+def audit_kill_decision(pid: int, outcome: str, reason: str, *, tool_name: str) -> None:
+    """Emit one SEL audit event for a kill DECISION, whatever it decided.
+
+    The ownership gate writes a log line and nothing else, so on its own an
+    allow or a refusal leaves no audit record -- and a process signalled with no
+    record of who decided it is the one thing every other reap path in this
+    gateway does not do. Emitted for the refusal as well as the signal, because
+    "we decided not to" is what an operator needs when a leak reading stays
+    non-zero.
+
+    Written at the DECISION point rather than inside a kill primitive: the
+    primitives are shared by callers that audit through their own attribution, and
+    what matters here is which caller decided and why. ``tool_name`` names that
+    caller.
+
+    ``outcome`` is what was DECIDED -- ``allowed`` or ``refused`` -- for any caller
+    whose signal happens later, behind re-validation it does not perform. Only a
+    caller that has the signal's result in hand may write ``killed``;
+    :func:`audit_kill_phase` is where the sweeps do that.
+
+    Never raises. An audit that cannot be written must not stop a sweep.
+    """
+    _audit_kill(outcome, reason, f"pid={pid}", tool_name=tool_name)
 
 
 async def kill_verified_process(

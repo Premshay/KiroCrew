@@ -54,9 +54,16 @@ from kiro_crew.sandbox import (
     _AGENT_DENIED_ENV_KEYS,
     CANONICAL_TEMP_KEYS,
     CRON_SCRIPT_CHILD_ENV,
+    SandboxCeilingUnsealable,
     SandboxUnavailableError,
+    aliased_app_secret_ids,
+    app_data_window_targets,
     cgroup_scope_argv,
+    credential_mask_applies,
+    masked_dir_identity,
+    materialize_caller_masked_dir,
     popen_limited,
+    refuse_if_an_app_secret_is_linked,
     run_limited,
     wrap_argv,
 )
@@ -208,7 +215,7 @@ _SECRET_ENV_DENIED_PREFIXES: tuple[str, ...] = (
     "PYTHON",  # PYTHONPATH / PYTHONSTARTUP would shadow the launcher's imports
 )
 
-#: Cap mirrors the intent of the per-field caps in cron.py: a grant is a small
+#: Cap mirrors the intent of the per-field caps in cron_service/fields.py: a grant is a small
 #: hand-written map, not a bulk store.
 _SECRET_ENV_MAX_ENTRIES = 16
 
@@ -1189,7 +1196,7 @@ class ScriptContext:
             "X-Session-Key": f"cron:{self.job.id}",
         }
         req = urllib.request.Request(
-            f"http://localhost:{self._port}{path}",
+            f"http://127.0.0.1:{self._port}{path}",
             data=data,
             headers=headers,
             method="POST",
@@ -1520,14 +1527,162 @@ def _split_script_spec(script_path: str) -> tuple[str, str]:
     return script_path[:func_colon], script_path[func_colon + 1 :]
 
 
-def resolve_script_path(script_path: str) -> tuple[str, str]:
+def _trusted_script_bundle_roots() -> tuple[Path, ...]:
+    """Roots, besides ``crons/``, that legitimately hold a cron script.
+
+    An app ships its cron script inside its OWN tree, so a bundle script's
+    resolved path lands outside ``crons/`` by construction. Two kinds of root
+    provide bundles, matching the two sources
+    ``apps.bridges._registration_source`` reads a manifest from:
+
+    * the BUILTIN manifest sources, which is where a shipped builtin's bundle
+      lives, and which the bridge deliberately reads builtins from so a mutable
+      installed directory cannot borrow a builtin's name.
+    * ``<config_dir>/apps``, a third-party app's installed snapshot.
+
+    The builtin leg delegates to ``apps.execution._builtin_manifest_sources``,
+    the SAME function ``shipped_builtin_app_root`` walks to CHOOSE a builtin's
+    root, rather than assuming that root is under this package. It is not: that
+    function also returns the active edition's
+    ``apps_loader.manifest_sources()``, which can sit anywhere. One authority for
+    both ends is what keeps registration and fire time in agreement -- the
+    registrar is handed a builtin's chosen root as ``app_root``, and the
+    context-free consumers must recognise that same root, or a cron registers and
+    is then refused when it fires. The package directory is admitted ONLY when that
+    walk fails, since a successful walk already reports this package's
+    ``apps/builtins`` and no builtin bundle lives under the package outside it.
+
+    Deliberately NOT delegated to ``skills._trusted_skill_roots``, which today
+    computes a similar set for app-shipped SKILLS. The sets overlap by
+    coincidence, not by rule: a skill is prose the scanner reads, a cron script
+    is code the launcher executes, and the two admit different things (a skill
+    root holds a directory tree with ``SKILL.md``, a script root holds a ``.py``
+    file). Sharing one helper would let a future change to which trees may
+    supply ``SKILL.md`` silently change which files are EXECUTABLE as crons, in
+    a module whose tests would not run.
+
+    Imports are function-local because ``cron_script`` is imported by
+    ``mcp_cron``, which ``apps.bridges`` imports back, so a module-level edge
+    into the apps package would close that cycle.
+    """
+    roots: list[Path] = []
+    try:
+        from kiro_crew.apps.execution import _builtin_manifest_sources
+
+        roots.extend(_builtin_manifest_sources())
+    except Exception:  # noqa: BLE001 — an unavailable seam must not stop resolution
+        # Fallback, on THIS leg only: a composition where the platform seam is not
+        # available, which is how ``_builtin_manifest_sources`` itself degrades. It
+        # is deliberately not appended when the walk succeeded -- the walk's own
+        # first entry is this package's ``apps/builtins``, so the only paths this
+        # would add are ones OUTSIDE the builtins tree, and no builtin bundle lives
+        # there. Admitting the package directory wholesale would make every ``.py``
+        # under it resolvable as a bundle script for no bundle that needs it.
+        roots.append(Path(__file__).parent.resolve())
+    try:
+        from kiro_crew.apps.manager import apps_dir
+
+        roots.append(apps_dir().resolve())
+    except (OSError, ValueError, ImportError):  # an unresolvable home must not stop resolution
+        pass
+    # Order-preserving dedupe: _builtin_manifest_sources may already report this
+    # package's builtins dir, and a repeated root would be checked twice.
+    return tuple(dict.fromkeys(roots))
+
+
+def _bundle_relative_spec(module_part: str, app_root: Path) -> str:
+    """Rebase a bundle-RELATIVE script path onto ``app_root``; pass others through.
+
+    Pure path arithmetic. It touches no filesystem: no ``resolve()``, no
+    ``exists()``, no read. Resolution and canonical containment stay in
+    :func:`resolve_script_path`, which is deliberate -- keeping the join here
+    lets that function's ``resolve()`` line stay exactly as it has always been,
+    and keeps this step's only job legible.
+
+    An absolute spec is returned unchanged, so an app naming a full path is
+    judged by containment rather than silently re-rooted.
+
+    A ``..`` segment is refused LEXICALLY, before any join, in the same order and
+    for the same reason as ``apps.manifest._path_escapes_app_root``: the verdict
+    is then identical on every host, where deferring to ``resolve()`` would make
+    it host-dependent (on POSIX ``..\\evil.py`` is one odd filename that stays
+    inside the root; on Windows it escapes). Canonical containment in the caller
+    adds what no lexical check can see -- a link inside the root whose target
+    leaves it.
+    """
+    expanded = Path(os.path.expanduser(module_part))
+    if expanded.is_absolute():
+        return module_part
+    if ".." in expanded.parts:
+        raise PermissionError(f"Script path may not traverse upward: {module_part}")
+    return str(app_root / expanded)
+
+
+def resolve_script_path(
+    script_path: str,
+    *,
+    app_root: Path | None = None,
+    allow_bundle_roots: bool = False,
+) -> tuple[str, str]:
     """Validate and resolve a script path. Returns (file_path, func_name).
 
-    Scripts must be files under ``<config_dir>/crons/``.
-    Format: "<config_dir>/crons/file.py:function" or "/absolute/path.py:function"
+    Format: ``"<path>.py:function"``. Default behaviour is the OPERATOR
+    contract, byte for byte: a relative path resolves against the process CWD,
+    and the resolved file must sit under ``<config_dir>/crons/``. ``cron_add``,
+    the CLI and the vault-grant paths pass neither keyword, so nothing below
+    reaches them.
+
+    An app cron's script legitimately lives in the app's own bundle rather than
+    in ``crons/``, and the two keywords are how a caller says so. They are
+    separate because they answer different questions, and each opens one root.
+
+    ``app_root`` says "this spec belongs to THIS app", and is passed where a
+    manifest's own spec is vetted (``apps.bridges``, ``apps.cron_sdk``). It
+    becomes the base a RELATIVE spec resolves against, because ``"job.py:run"``
+    means "next to my manifest" and is the only spelling an app can write
+    without knowing its install location. With no base that resolved against
+    whatever directory the gateway process happened to start in, naming a file
+    that was never there. Containment is that ONE bundle, so app A cannot name a
+    script inside app B's tree.
+
+    ``allow_bundle_roots`` says "this spec was ALREADY vetted and persisted",
+    and is passed only by the consumers that re-resolve a stored ``job.script``
+    holding no app context: the fire-time governance gate, the launcher, and the
+    dashboard's script-source endpoint. Containment is the shared bundle roots,
+    because a stored absolute bundle path is all those callers have to go on. It
+    widens no authoring path: a freshly authored spec must still be under
+    ``crons/``, so ``cron_add`` cannot register a script inside a bundle.
+
+    A bundle root accepts ``.py`` files only, under either keyword. That is a
+    containment control rather than a style rule, and the surface it guards is
+    EXECUTION: the launcher puts the resolved file's directory on ``sys.path``,
+    imports the file as a module and calls ``func_name``, so whatever this
+    function returns is a path the gateway will run. A bundle holds more than
+    code -- ``.app_secret`` is the app's gateway credential (see
+    ``dashboard.token_auth``) and ``data/`` holds app state -- and nothing later
+    in the chain re-checks the suffix, so without it a manifest could name any
+    bundle file as an entry point and have the launcher try to execute it.
+    ``crons/`` keeps no such rule, because it exists only to hold scripts.
+
+    The dashboard's script-source endpoint is NOT part of that reasoning: its
+    read stays pinned to ``crons/``, so a bundle path is refused there with
+    ``script_read_refused`` whatever its suffix.
+
+    Unchanged on every path: a ``..``-bearing relative spec is refused
+    lexically before any join, so the verdict never depends on the host's path
+    grammar; ``.resolve()`` runs BEFORE containment, so a link pointing out of a
+    trusted root is rejected on its target rather than followed;
+    ``is_sensitive_path`` still vets the resolved path; and the body scan
+    (``mcp_cron._vet_script_file``) is a separate gate this function does not
+    speak for. Vault secret GRANTS stay narrower than all of it: their reader
+    (:func:`_read_script_body`) is pinned to ``crons/`` alone and the grant paths
+    pass neither keyword, so a bundle script can register and run but can never
+    be handed a secret.
     """
     module_part, func_name = _split_script_spec(script_path)
 
+    if app_root is not None:
+        module_part = _bundle_relative_spec(module_part, app_root)
     file_path = Path(os.path.expanduser(module_part)).resolve()
     if not file_path.exists():
         raise FileNotFoundError(f"Script file not found: {file_path}")
@@ -1535,10 +1690,24 @@ def resolve_script_path(script_path: str) -> tuple[str, str]:
         if is_unverifiable_path_refusal(reason):
             raise PermissionError(reason)
         raise PermissionError(f"Script path blocked by security policy: {file_path}")
-    allowed_dir = (config_dir() / "crons").resolve()
-    if not file_path.is_relative_to(allowed_dir):
-        raise PermissionError(f"Script must be under {allowed_dir}, got: {file_path}")
-    return str(file_path), func_name
+    crons_dir = (config_dir() / "crons").resolve()
+    if app_root is None and file_path.is_relative_to(crons_dir):
+        return str(file_path), func_name
+    if app_root is not None:
+        bundle_roots: tuple[Path, ...] = (app_root.resolve(),)
+    elif allow_bundle_roots:
+        bundle_roots = _trusted_script_bundle_roots()
+    else:
+        bundle_roots = ()
+    for root in bundle_roots:
+        if not file_path.is_relative_to(root):
+            continue
+        if file_path.suffix.lower() != ".py":
+            raise PermissionError(f"App bundle script must be a .py file, got: {file_path}")
+        return str(file_path), func_name
+    admitted = bundle_roots if app_root is not None else (crons_dir, *bundle_roots)
+    roots_shown = ", ".join(str(r) for r in admitted)
+    raise PermissionError(f"Script must be under one of {roots_shown}, got: {file_path}")
 
 
 def _resolve_internal_secret(port: int) -> str:
@@ -1562,7 +1731,10 @@ def _resolve_internal_secret(port: int) -> str:
     env_secret = os.environ.get("KIROCREW_INTERNAL_SECRET", "")
     if env_secret:
         return env_secret
-    return read_local_secret(port)
+    # v4 loopback LITERAL, matching the http://127.0.0.1 dial: a single-family
+    # gateway (v4-only or wildcard/container) still authenticates, where the
+    # ambiguous ``localhost`` would demand both families and refuse it.
+    return read_local_secret(port, dial_host="127.0.0.1")
 
 
 def _child_internal_secret(
@@ -1825,7 +1997,9 @@ def run_script_sandboxed(
     (one approved body) or read them as data.
     """
 
-    file_path_str, func_name = resolve_script_path(script_path)
+    # A PERSISTED spec (see resolve_script_path): an app cron's stored path
+    # points into its bundle, which no authoring path may name.
+    file_path_str, func_name = resolve_script_path(script_path, allow_bundle_roots=True)
 
     import_dir_str = os.path.dirname(file_path_str)
     resolved_secret_env: dict[str, str] = {}
@@ -1932,6 +2106,10 @@ def run_script_sandboxed(
         f"sys.path.insert(0, {import_dir_str!r})\n"
         f"mod = types.ModuleType('_cron_script')\n"
         f"mod.__file__ = {file_path_str!r}\n"
+        # Registered before exec: dataclasses, typing.get_type_hints and pickle
+        # resolve a class's names through sys.modules[cls.__module__], which a
+        # postponed-annotations script needs at class-definition time.
+        "sys.modules['_cron_script'] = mod\n"
         # The compile filename stays the original so tracebacks point at the
         # file the operator knows.
         "if _payload:\n"
@@ -2017,6 +2195,20 @@ def run_script_sandboxed(
             if stdin_payload is not None
             else [sys.executable, launcher_path]
         )
+        # Every installed app's ``.app_secret`` lives under ``<config_dir>/apps``, and
+        # that file is a bearer credential rather than a marker:
+        # ``dashboard.token_auth.validate_app_secret`` compares it and issues that app's
+        # scoped token, so a child that can read one can act as the app. A script body
+        # is model-supplied, so it must not reach any of them.
+        #
+        # The containing DIRECTORY is masked, not a list of per-app leaves read out of
+        # it: a mask is applied to the paths named at spawn and is never recomputed for a
+        # live child, so an enumeration cannot name an app installed while this run is
+        # still executing, and that app's secret would stay readable for the rest of the
+        # child's life. Masking the directory covers whatever appears under it
+        # afterwards. Both branches get it -- a granted run's approved isolation is the
+        # stricter of the two, so it may not be the one that keeps the credentials.
+        apps_tree = str(config_dir() / "apps")
         # A granted child must never see the LIVE crons dir OR the script's
         # own parent directory: the launcher's empty-sys.path isolation stops
         # accidental sibling imports, but the verified script itself could
@@ -2035,11 +2227,12 @@ def run_script_sandboxed(
                     (
                         str(config_dir() / "crons"),
                         str(Path(file_path_str).resolve().parent),
+                        apps_tree,
                     )
                 )
             )
         else:
-            hidden = ()
+            hidden = (apps_tree,)
         # Same tier as ``run_command_sandboxed`` below: a script body is
         # agent-written, so it is the HIGHER-capability cron surface, and it
         # ran the WIDER profile — ``standard`` leaves ~/.aws/credentials, the
@@ -2057,8 +2250,56 @@ def run_script_sandboxed(
         # secret_env grant, which runs ``strict`` and injects the one approved
         # secret instead of exposing a store.
         sandbox_mode = "strict" if stdin_payload is not None else "cc"
+        # Create the mask target only when this spawn will actually CARRY the mask.
+        # The apps tree is created on first install, so on a home where no app has ever
+        # been installed the Linux mask loop finds the name absent, skips it, and the
+        # first-ever install appears inside this running child's view -- hence the
+        # create. But ``credential_mask_applies`` is false exactly where the child comes
+        # back unwrapped and every mask is dropped anyway, so creating a directory there
+        # buys no confinement while adding a way for this run to fail. It also keeps
+        # ``wrap_argv``'s own fail-closed refusal the FIRST thing a backend-less host
+        # hears: that refusal names the remedy an operator acts on, and a create error
+        # standing in front of it would replace an actionable message with an incidental
+        # one.
+        if credential_mask_applies(sandbox_mode):
+            try:
+                materialize_caller_masked_dir(apps_tree)
+                # The apps root is the one entry in ``hidden`` under a directory an agent
+                # can rename, so it is the one whose mask needs an identity and not just a
+                # name. Taken here, while this spawn settles which directory it means.
+                apps_mask_ids: tuple[tuple[str, int, int], ...] = (masked_dir_identity(apps_tree),)
+                # Before anything downstream: a LINKED credential puts its bytes outside
+                # this tree, where no mask, window or pre-exec scan reaches them.
+                refuse_if_an_app_secret_is_linked(apps_tree)
+            except SandboxCeilingUnsealable as exc:
+                return {"status": "error", "error": f"❌ {exc}"}
+            # The mask covers ``apps/<app>/data`` as well, which is an app's documented
+            # persistence root, and on Linux it is a WRITABLE empty bind -- so without a
+            # window an app script cron's writes there report success and are discarded.
+            # A window keeps the mask and every ``.app_secret`` denied and re-exposes
+            # only the data directories on their real inodes.
+            apps_windows = app_data_window_targets(apps_tree)
+        else:
+            apps_windows = ()
+            apps_mask_ids = ()
         sandboxed_argv, sandbox_cleanup = wrap_argv(
-            argv, mode=sandbox_mode, extra_hidden_dirs=hidden
+            argv,
+            mode=sandbox_mode,
+            extra_hidden_dirs=hidden,
+            extra_hidden_dir_ids=apps_mask_ids,
+            # An alias to a secret at a path NO mask covers is read through that path, not
+            # through the mask, so withholding windows cannot answer it. The launcher's
+            # pre-exec hardlink scan is what answers it, and it builds its match set one
+            # level deep, which is one level short of ``apps/<app>/.app_secret``. Naming the
+            # root lets those secrets into that set, and the refusal then fires only when an
+            # alias is actually FOUND where the child could read it -- not merely because a
+            # link count is above one, which would let one app's on-disk layout stop every
+            # cron on the host. Read HERE rather than in the child, which masks this tree in
+            # its own process and would stat an empty directory. Non-empty exactly when this
+            # spawn masks the tree.
+            extra_alias_credential_ids=(aliased_app_secret_ids(apps_tree) if apps_mask_ids else ()),
+            extra_private_dirs=tuple(window.path for window in apps_windows),
+            extra_private_dir_ids=tuple(apps_windows),
         )
         if stdin_payload is not None and sandboxed_argv == argv:
             # On a host with no OS sandbox backend, the unsandboxed-exec
@@ -2298,14 +2539,17 @@ def _resolve_command_shell() -> str | None:
     the command language. Returns ``None`` when no POSIX-strict shell can be
     found, which makes the caller refuse the job with a legible error.
 
-    Windows always returns ``None``: neither shipped option preserves the
-    language the vet gate assumed. Verified on a Git-for-Windows install —
-    ``sh.exe -c 'echo test.a{w,w}s'`` prints ``test.aws test.aws``, i.e. it IS
-    bash and performs brace expansion, which is exactly how
-    ``cat ~/.a{w,w}s/credentials`` hides a credential path from a gate that
-    tokenizes the stored string once. Command crons are therefore unavailable on
-    Windows by design; ``script`` crons (whose body is scanned in full) are the
-    supported path there.
+    Windows always returns ``None``, and that is unchanged and deliberate:
+    cmd.exe is not POSIX at all, and the Windows shell layout (Git-for-Windows's
+    ``sh.exe``, its PATH, its trusted-path story) has none of the fixed
+    system-shell guarantees the POSIX branch below relies on. ``script`` crons,
+    whose body is scanned in full, remain the supported path there.
+
+    On POSIX the candidate is probed rather than assumed, because a trusted
+    ``sh`` may be bash: ``/bin/sh -> bash`` is the default on AL2023, RHEL and
+    Fedora, and macOS's ``/bin/sh`` is bash-in-POSIX-mode. Such a shell is
+    accepted when invoked so it refuses brace expansion — see
+    ``_shell_is_posix_strict`` for the two forms and the order they are tried in.
     """
 
     # On Windows there is no shipped shell whose language matches what
@@ -2320,11 +2564,13 @@ def _resolve_command_shell() -> str | None:
     # test, then does something different when called with the real cron. Even
     # inside `cc`-mode isolation the agent-planted binary runs, and `cc` leaves
     # ``.ssh`` reachable, so this is a private-key-exposure vector. Instead,
-    # walk a small fixed list of trusted system shell paths (never a bash
-    # fallback: bash brace expansion hides `cat ~/.a{w,w}s/credentials` from
-    # the tokenizer). Some hosts (macOS /bin/sh is bash-in-POSIX-mode) still
-    # perform brace expansion under the `sh` name, so PROBE the candidate:
-    # dash / ash / a real POSIX sh preserve the literal; bash-in-any-mode fails.
+    # walk a small fixed list of trusted system shell paths. Some hosts perform
+    # brace expansion under the `sh` name (Linux `/bin/sh -> bash` is the default
+    # on AL2023 / RHEL / Fedora; macOS /bin/sh is bash-in-POSIX-mode), so PROBE
+    # the candidate: dash / ash / a real POSIX sh preserve the literal as
+    # invoked, and a bash-as-sh preserves it once brace expansion is switched
+    # off. The probe tries the plain form FIRST, so a genuinely POSIX-strict
+    # shell resolves exactly as it always has and its argv is unchanged.
     for candidate in ("/bin/sh", "/usr/bin/sh"):
         if os.path.isfile(candidate) and _shell_is_posix_strict(candidate):
             return candidate
@@ -2336,18 +2582,71 @@ def _resolve_command_shell() -> str | None:
 # once per gateway process; a subsequent command cron with the same resolved
 # shell does no extra work.
 _POSIX_STRICT_CACHE: dict[str, bool] = {}
+# Shells that need `+B` to stop brace-expanding, recorded BY THE PROBE so the
+# executor runs the form the probe proved. Separate from the boolean cache above
+# because "is this shell usable" and "how must it be invoked" are two answers,
+# and collapsing them is what let the probe and the executor drift apart.
+_BRACE_OFF_SHELLS: dict[str, bool] = {}
+# bash's command-line spelling of `set +B` (brace expansion off). dash/ash reject
+# it, which is exactly why it is never tried first: an unknown-option refusal
+# would look like a failing shell.
+_BRACE_OFF_FLAG = "+B"
+# Serializes the check-probe-record sequence in ``_shell_is_posix_strict``. Up to
+# ``_MAX_CRON_WORKERS`` command crons resolve the shell concurrently, and the two
+# maps above are only coherent if one probe of a shell owns them from the cache
+# miss to the record. Unserialized, a second probe that started on the same cold
+# cache and then failed transiently would pop the brace-off record a first probe
+# had just proved, and the first caller's executor would read the plain form and
+# run with brace expansion ON. A cache hit is the steady state, so the lock is
+# contended only on each shell's first probe.
+_SHELL_PROBE_LOCK = threading.Lock()
+
+
+def _argv_for_form(shell: str, command: str, brace_off: bool) -> list[str]:
+    """Build the argv for one invocation form. The only place the form is spelled."""
+
+    if brace_off:
+        return [shell, _BRACE_OFF_FLAG, "-c", command]
+    return [shell, "-c", command]
+
+
+def _command_argv(shell: str, command: str) -> list[str]:
+    """Build the argv that runs *command* under *shell*, in the PROVEN form.
+
+    The single builder both ``_shell_is_posix_strict`` and
+    ``run_command_sandboxed`` go through. Before this existed each wrote its own
+    ``[shell, "-c", ...]`` literal, so a resolver that accepted a new invocation
+    form would have left the probe proving a form the executor never used — the
+    probe would still pass while the command ran under brace expansion.
+
+    A shell absent from ``_BRACE_OFF_SHELLS`` gets the plain form, which is both
+    the historical behaviour and the right default for a caller that resolved a
+    shell without probing it (tests monkeypatch ``_resolve_command_shell``).
+    """
+
+    return _argv_for_form(shell, command, _BRACE_OFF_SHELLS.get(shell, False))
 
 
 def _shell_is_posix_strict(shell: str) -> bool:
-    """Return True iff *shell* refuses brace expansion (POSIX-sh semantics).
+    """Return True iff *shell* can be invoked so it refuses brace expansion.
 
-    Runs ``<shell> -c 'echo x.{a,a}'`` in an OS sandbox (strict tier, cron env)
-    and requires the OUTPUT to be the literal ``x.{a,a}``. dash / ash / a real
-    POSIX sh preserve it; bash (including macOS's ``/bin/sh`` which is
-    bash-in-POSIX-mode) expands to ``x.a x.a``. Refusing an expanding shell is
-    the only reliable defense: the vet gate (``mcp_cron._vet_shell_command``)
-    tokenizes the stored string once, so any downstream re-expansion silently
-    widens what a legitimate deny-list can see.
+    Runs ``echo x.{a,a}`` under *shell* in an OS sandbox (strict tier, cron env)
+    and requires the OUTPUT to be the literal ``x.{a,a}``. Two forms are tried,
+    in this order, and the one that passes is recorded for the executor:
+
+    1. ``<shell> -c ...`` — dash / ash / a real POSIX sh preserve the literal.
+       Tried first so a POSIX-strict shell keeps its exact current argv.
+    2. ``<shell> +B -c ...`` — bash's brace expansion switched off at the
+       command line. A trusted-path bash-as-``sh`` (the Linux default) then
+       satisfies the same property, instead of the whole feature being refused
+       on the most common Linux configuration.
+
+    Requiring the literal is what protects the vet gate
+    (``mcp_cron._vet_shell_command``), which tokenizes the stored string once:
+    a runtime re-expansion would widen what a deny-list can see. The gate also
+    refuses brace-expansion SYNTAX at storage time, so a command cannot switch
+    expansion back on and have anything left to expand — that refusal is what
+    makes accepting form 2 safe, and removing either half re-opens the hole.
 
     The probe is SANDBOX-ROUTED as a defense-in-depth belt on the fixed
     trusted-path lookup in ``_resolve_command_shell``. If a future change ever
@@ -2355,12 +2654,33 @@ def _shell_is_posix_strict(shell: str) -> bool:
     denies an agent-planted shim the un-isolated execution it would need.
     """
 
-    cached = _POSIX_STRICT_CACHE.get(shell)
-    if cached is not None:
-        return cached
+    with _SHELL_PROBE_LOCK:
+        cached = _POSIX_STRICT_CACHE.get(shell)
+        if cached is not None:
+            return cached
+        for brace_off in (False, True):
+            if _probe_one_form(shell, brace_off):
+                # Record the form only once it has PASSED, and record nothing on the
+                # way there: the executor reads this map, so a form written while
+                # still being tested would be visible to a concurrent command cron.
+                _BRACE_OFF_SHELLS[shell] = brace_off
+                _POSIX_STRICT_CACHE[shell] = True
+                return True
+        # No form worked: leave no brace-off record behind for a shell this resolver
+        # refuses, so a later caller cannot inherit the last form tried.
+        _BRACE_OFF_SHELLS.pop(shell, None)
+        _POSIX_STRICT_CACHE[shell] = False
+        return False
+
+
+def _probe_one_form(shell: str, brace_off: bool) -> bool:
+    """Run the brace-expansion probe once, in the requested invocation form."""
+
     sandbox_cleanup: str | None = None
     try:
-        argv, sandbox_cleanup = wrap_argv([shell, "-c", "echo x.{a,a}"], mode="strict")
+        argv, sandbox_cleanup = wrap_argv(
+            _argv_for_form(shell, "echo x.{a,a}", brace_off), mode="strict"
+        )
         # Same discipline as every other sandbox-routed spawn in this module
         # (test_every_routed_spawn_applies_resource_limits / _cgroup_scope): the
         # probe is a child process, so it observes the same fork-bomb / RSS
@@ -2383,8 +2703,38 @@ def _shell_is_posix_strict(shell: str) -> bool:
                 os.unlink(sandbox_cleanup)
             except OSError:
                 pass
-    _POSIX_STRICT_CACHE[shell] = result
     return result
+
+
+def _no_command_shell_message() -> str:
+    """The refusal a command cron gets when ``_resolve_command_shell`` finds nothing.
+
+    Worded per platform because the two refusals have different causes and
+    different remedies. On Windows it is by design and permanent. On POSIX it is
+    this host: neither trusted ``sh`` passed the probe, and naming Windows there
+    would send a macOS or Linux operator looking for a cause that does not apply
+    to their machine.
+    """
+
+    if platform_compat.IS_WINDOWS:
+        return (
+            "❌ No POSIX shell available to run this command cron. Command "
+            "crons execute with `sh -c` under POSIX-sh semantics (what the "
+            "storage-time vet gate assumes); Windows ships no such shell "
+            "(Git for Windows's sh.exe is bash and would widen the language "
+            "past the vet). Use a script cron or an LLM `message` cron on "
+            "this platform, or run the gateway under POSIX."
+        )
+    return (
+        "❌ No usable POSIX shell to run this command cron. Command crons run "
+        "only under /bin/sh or /usr/bin/sh (never $PATH), and the one used must "
+        "pass a sandboxed probe proving it leaves `echo x.{a,a}` unexpanded when "
+        "invoked as `sh -c` or `sh +B -c` (brace expansion would widen the "
+        "command past what the storage-time vet gate checked). Neither passed on "
+        "this host: the shell is missing, expands braces even with `+B`, or the "
+        "OS sandbox refused to start the probe. Use a script cron or an LLM "
+        "`message` cron until that is fixed."
+    )
 
 
 def run_command_sandboxed(
@@ -2467,20 +2817,54 @@ def run_command_sandboxed(
         # below as a job the scheduler can mark failed.
         shell = _resolve_command_shell()
         if shell is None:
-            return {
-                "status": "error",
-                "output": (
-                    "❌ No POSIX shell available to run this command cron. Command "
-                    "crons execute with `sh -c` under POSIX-sh semantics (what the "
-                    "storage-time vet gate assumes); Windows ships no such shell "
-                    "(Git for Windows's sh.exe is bash and would widen the language "
-                    "past the vet). Use a script cron or an LLM `message` cron on "
-                    "this platform, or run the gateway under POSIX."
-                ),
-                "exit_code": -1,
-            }
-        argv = [shell, "-c", command]
-        sandboxed_argv, sandbox_cleanup = wrap_argv(argv, mode="cc")
+            return {"status": "error", "output": _no_command_shell_message(), "exit_code": -1}
+        argv = _command_argv(shell, command)
+        # The same app-secret mask the script path applies, for the same reason and on
+        # the same trust reading: the comment above says this command string is fully
+        # model-supplied, so the two cron exec paths have one trust level between them
+        # and a control on only one of them is bypassable by choosing the other. The
+        # storage-time vet cannot substitute here -- it denies ``.ssh`` references in the
+        # command TEXT, and a shell can build a path this credential's name never
+        # appears in.
+        apps_tree = str(config_dir() / "apps")
+        # Gated and handled exactly as the script path does it, and for the same two
+        # reasons: a spawn that comes back unwrapped drops the mask, so materializing
+        # the target there adds a failure mode and buys no confinement; and letting a
+        # create error through ahead of ``wrap_argv`` would put an incidental message
+        # where this host needs the fail-closed remedy. The refusal is reported here
+        # rather than left to the generic handler below, which would label it "Command
+        # failed" -- no command runs, the spawn is refused before it happens.
+        if credential_mask_applies("cc"):
+            try:
+                materialize_caller_masked_dir(apps_tree)
+                # Same identity as the script path, for the same reason: this mask root
+                # sits under a directory an agent can rename, so the child gets the
+                # directory it was approved for and not whatever holds the name later.
+                apps_mask_ids: tuple[tuple[str, int, int], ...] = (masked_dir_identity(apps_tree),)
+                # Same as the script path.
+                refuse_if_an_app_secret_is_linked(apps_tree)
+            except SandboxCeilingUnsealable as exc:
+                return {"status": "error", "output": f"❌ {exc}", "exit_code": -1}
+            # Same window as the script path, for the same reason: the mask covers each
+            # app's documented ``data`` root with a writable empty bind, so a command
+            # writing there would be told it succeeded and lose the bytes.
+            apps_windows = app_data_window_targets(apps_tree)
+        else:
+            apps_windows = ()
+            apps_mask_ids = ()
+        sandboxed_argv, sandbox_cleanup = wrap_argv(
+            argv,
+            mode="cc",
+            extra_hidden_dirs=(apps_tree,),
+            extra_hidden_dir_ids=apps_mask_ids,
+            # Same as the script path: the scan, not the windows, is what answers an alias
+            # at a path no mask covers, its match set stops one level above this tree's
+            # per-app secrets, and the inodes are read here because the child cannot see
+            # them through its own mask.
+            extra_alias_credential_ids=(aliased_app_secret_ids(apps_tree) if apps_mask_ids else ()),
+            extra_private_dirs=tuple(window.path for window in apps_windows),
+            extra_private_dir_ids=tuple(apps_windows),
+        )
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
         clean_env = _clean_cron_env()
         if _spawn_cancelled(job_id):

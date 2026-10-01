@@ -1,4 +1,5 @@
 """Tests for to_dict() Board fields: options, waiting_for_input, pending_approval_info, last_activity_ts."""
+
 import asyncio
 import json
 from types import SimpleNamespace
@@ -59,10 +60,11 @@ def test_not_waiting_when_running():
 
 def test_pending_approval_info():
     meta = json.dumps({"tool_input": "ls -la", "tool_kind": "bash", "request_id": "r1"})
-    s = _slot({"role": "permission", "content": "shell", "cls": meta, "ts": "t1"})
+    s = _slot()
+    row = s.append("permission", "shell", meta)
     loop = asyncio.new_event_loop()
     fut = loop.create_future()
-    s._approval_futures["r1"] = fut
+    s.register_approval("r1", fut, row)
     d = s.to_dict()
     assert d["pending_approval"] is True
     assert d["pending_approval_info"]["tool"] == "shell"
@@ -75,11 +77,11 @@ def test_pending_approval_skips_resolved():
     new_meta = json.dumps({"tool_input": "cat foo", "request_id": "r2"})
     s = _slot(
         {"role": "permission", "content": "old_tool", "cls": old_meta, "ts": "t1"},
-        {"role": "permission", "content": "new_tool", "cls": new_meta, "ts": "t2"},
     )
+    row = s.append("permission", "new_tool", new_meta)
     loop = asyncio.new_event_loop()
     fut = loop.create_future()
-    s._approval_futures["r2"] = fut
+    s.register_approval("r2", fut, row)
     d = s.to_dict()
     assert d["pending_approval_info"]["tool"] == "new_tool"
     assert d["pending_approval_info"]["request_id"] == "r2"
@@ -197,6 +199,73 @@ def test_last_turn_ts_empty_for_empty_slot():
     assert d["last_ts"] == ""
 
 
+# ── last_ts is a durable instant ──
+# The dashboard stores `last_ts` as a slot's unread watermark and later clears
+# it only with a `last_ts` that covers it. A row the save path never persists
+# (the turn-end `done` row and the other transient roles) disappears when a
+# gateway restart rebuilds the slot from disk, so a `last_ts` taken from one
+# moves backwards across the restart and strands the watermark.
+
+
+def test_last_ts_skips_the_turn_end_done_row():
+    s = _slot(
+        {"role": "user", "content": "question", "ts": "2026-09-22T22:08:00.000000+00:00"},
+        {"role": "assistant", "content": "final reply", "ts": "2026-09-22T22:08:03.989142+00:00"},
+        {"role": "done", "content": "", "ts": "2026-09-22T22:08:04.001106+00:00"},
+    )
+    d = s.to_dict()
+    assert d["last_ts"] == "2026-09-22T22:08:03.989142+00:00"
+    assert d["last_turn_ts"] == "2026-09-22T22:08:03.989142+00:00"
+
+
+def test_last_ts_is_unchanged_by_a_rebuild_from_disk():
+    # The same transcript before and after a restart: the live slot still holds
+    # the unsaved rows, the rebuilt one holds only what the save path keeps.
+    from kiro_crew.dashboard.chat_persistence import _build_message_entry
+
+    s = _ChatSlot("test-slot")
+    s.append("user", "question", "msg msg-u")
+    s.append("assistant", "final reply", "msg msg-a")
+    s.append("done", "", "done")
+    live = s.to_dict()["last_ts"]
+
+    rebuilt = _ChatSlot("test-slot")
+    rebuilt.messages = [dict(m) for m in s.messages if _build_message_entry(m) is not None]
+    assert live == rebuilt.to_dict()["last_ts"]
+
+
+def test_last_ts_skips_every_transient_role():
+    from kiro_crew.dashboard.state import _TRANSIENT_ROLES
+
+    for role in sorted(_TRANSIENT_ROLES):
+        s = _slot(
+            {"role": "assistant", "content": "reply", "ts": "t1"},
+            {"role": role, "content": "x", "ts": "t2"},
+        )
+        assert s.to_dict()["last_ts"] == "t1", role
+
+
+def test_last_ts_empty_when_only_transient_rows():
+    s = _slot({"role": "done", "content": "", "ts": "t1"})
+    assert s.to_dict()["last_ts"] == ""
+
+
+def test_the_dashboard_unsaved_role_list_matches_the_save_path():
+    # The dashboard refuses to take an unread watermark from a row the gateway
+    # never saves; its copy of the role set must be this one.
+    import re
+    from pathlib import Path
+
+    from kiro_crew.dashboard.state import _TRANSIENT_ROLES
+
+    source = (
+        Path(__file__).resolve().parents[1] / "website/src/hooks/unreadOnAttention.ts"
+    ).read_text(encoding="utf-8")
+    match = re.search(r"UNSAVED_ROLES[^=]*= new Set\(\[([^\]]*)\]\)", source)
+    assert match, "UNSAVED_ROLES not found in unreadOnAttention.ts"
+    assert set(re.findall(r"'([a-z_]+)'", match.group(1))) == set(_TRANSIENT_ROLES)
+
+
 def test_prompt_preview_truncation():
     long_text = "x" * 300 + "\n[OPTIONS: A | B]"
     s = _slot({"role": "assistant", "content": long_text, "ts": "t1"})
@@ -260,7 +329,12 @@ def test_not_interrupted_after_deliberate_stop():
     # the stop card must win.
     s = _slot(
         {"role": "user", "content": "do the thing", "ts": "t1"},
-        {"role": "system", "content": "stopped", "cls": json.dumps({"kind": "stop_event"}), "ts": "t2"},
+        {
+            "role": "system",
+            "content": "stopped",
+            "cls": json.dumps({"kind": "stop_event"}),
+            "ts": "t2",
+        },
     )
     d = s.to_dict()
     assert d["interrupted"] is False
@@ -283,8 +357,18 @@ def test_not_interrupted_while_running():
 def test_interrupted_inject_successor_outranks_older_stop():
     s = _slot(
         {"role": "user", "content": "first", "ts": "t1"},
-        {"role": "system", "content": "stopped", "cls": json.dumps({"kind": "stop_event"}), "ts": "t2"},
-        {"role": "inject", "content": "continue queued work", "ts": "t3", "meta": {"injectKind": "recovery"}},
+        {
+            "role": "system",
+            "content": "stopped",
+            "cls": json.dumps({"kind": "stop_event"}),
+            "ts": "t2",
+        },
+        {
+            "role": "inject",
+            "content": "continue queued work",
+            "ts": "t3",
+            "meta": {"injectKind": "recovery"},
+        },
         {"role": "tool", "content": "read complete", "ts": "t4"},
     )
 

@@ -21,6 +21,7 @@ import pytest
 from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew import platform_compat
+from kiro_crew.instances import run_marker
 from kiro_crew.pod import cli as pod_cli
 from kiro_crew.pod import launchd
 from kiro_crew.pod import provision as prov
@@ -1500,6 +1501,20 @@ class TestPodEnvCredentialScrub:
         assert env["KIROCREW_BIND"] == "127.0.0.1"
 
 
+def _publish_pod_credential(cfg: PodConfig, name: str, port: int, secret: str = "s3cr3t") -> Path:
+    """Publish a per-listener credential for pod *name* the way its gateway does.
+
+    ``_wait_healthy`` only calls a pod ready once the credential the mint will read
+    exists, so every test that drives it to a SUCCESS verdict has to stand one up.
+    Writing the real per-port path rather than stubbing the predicate keeps these
+    tests honest about which file the production reader looks at.
+    """
+    path = cfg.home_dir(name) / run_marker.RUN_DIR_NAME / run_marker.secret_file_name(port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(secret)
+    return path
+
+
 class TestWaitHealthyFailsFast:
     def test_bails_on_failed_unit(self, cfg: PodConfig) -> None:
         with (
@@ -1516,6 +1531,7 @@ class TestWaitHealthyFailsFast:
             assert pod_cli._wait_healthy(cfg, "x", 7999, tries=45) == -1
 
     def test_returns_code_when_healthy(self, cfg: PodConfig) -> None:
+        _publish_pod_credential(cfg, "x", 7999)
         with (
             patch.object(rt, "health", return_value=403),
             patch.object(rt, "unit_state", return_value=("active", 0)),
@@ -1562,6 +1578,7 @@ class TestWaitHealthyFailsFast:
         def _health(*a: object, **k: object) -> int:
             return next(codes, 200)
 
+        _publish_pod_credential(cfg, "x", 7999)
         with (
             patch.object(rt, "health", _health),
             patch.object(rt, "unit_state", return_value=("active", 0)),
@@ -5369,12 +5386,32 @@ class TestCliVerbs:
         assert '"port": 7811' in out and '"health": 403' in out
 
     def test_status(self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+        monkeypatch.setattr(rt, "require_backend", lambda: None)
         monkeypatch.setattr(rt, "derive_port", lambda c, n: 7811)
         monkeypatch.setattr(rt, "is_active", lambda c, n: True)
         monkeypatch.setattr(rt, "health", lambda cfg, name, p: 403)
         pod_cli._status(cfg, argparse.Namespace(name="alpha", json=True))
         out = capsys.readouterr().out
         assert '"status": "up"' in out and '"health": 403' in out
+
+    def test_status_on_linux_refuses_when_the_backend_is_absent(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """With no user manager, `is-active` fails and would read as "down"; the
+        verb must refuse through the backend gate instead of reporting a state."""
+
+        def _absent() -> None:
+            raise rt.PodBackendAbsent("no systemd user session on this host")
+
+        monkeypatch.setattr(rt, "IS_LINUX", True)
+        monkeypatch.setattr(rt, "require_backend", _absent)
+        monkeypatch.setattr(rt, "derive_port", lambda c, n: 7811)
+        monkeypatch.setattr(rt, "is_active", lambda c, n: False)
+        monkeypatch.setattr(rt, "health", lambda cfg, name, p: 0)
+
+        with pytest.raises(rt.PodError, match="no systemd user session"):
+            pod_cli._status(cfg, argparse.Namespace(name="alpha", json=True))
+        assert "down" not in capsys.readouterr().out
 
     def test_url(self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
         monkeypatch.setattr(rt, "derive_port", lambda c, n: 7811)
@@ -5456,7 +5493,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
         pod_cli._up(
@@ -5474,7 +5511,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
         calls: list[tuple[str, str, bool]] = []
@@ -5513,7 +5550,7 @@ class TestUpVerb:
             "start_pod",
             lambda cfg, name: (starts.append(name) or _cp(returncode=0)),
         )
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
         # This wiring test owns the pre-start decision, not POSIX marker I/O.
@@ -5546,7 +5583,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
 
         def _unprovable(cfg: object, n: object, ttl: object) -> str:
             raise rt.PodOwnershipUnproven("could not prove which process holds :7811")
@@ -5576,7 +5613,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
 
         def _foreign(cfg: object, n: object, ttl: object) -> str:
             raise rt.PodError("held by another process")
@@ -5613,7 +5650,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "_port_is_free", lambda p: p != derived)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
 
@@ -5643,7 +5680,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "_port_is_free", lambda _p: False)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: True)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
         monkeypatch.setattr(
@@ -5680,7 +5717,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
 
@@ -5717,7 +5754,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
 
@@ -5754,7 +5791,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)  # nothing is busy
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
 
@@ -5779,7 +5816,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "_port_is_free", lambda p: p != derived)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
         pod_cli._up(
@@ -5831,7 +5868,7 @@ class TestUpVerb:
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
         probed: list[int] = []
         monkeypatch.setattr(
-            pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: (probed.append(p), 403)[1]
+            pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: (probed.append(p), 403)[1]
         )
 
         pod_cli._up(
@@ -5867,7 +5904,7 @@ class TestUpVerb:
         )
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "start_pod", lambda cfg, n: (order.append("start"), _cp())[1])
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
 
@@ -5907,7 +5944,7 @@ class TestUpVerb:
         monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: -1)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: -1)
         monkeypatch.setattr(rt, "recent_journal", lambda cfg, n, ln=30: "ImportError: boom")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
         with pytest.raises(SystemExit):
@@ -7082,6 +7119,14 @@ class TestSessionBus:
         monkeypatch.setattr(rt.shutil, "which", lambda _n: "/usr/bin/systemctl")
         sock = self._bus(monkeypatch, tmp_path / "run", exists=False)
         monkeypatch.setenv("USER", "tester")
+        # Pin the per-user manager as PRESENT so this stays the "instance is not
+        # running" case. Left unpinned the assertion would depend on whether the
+        # runner ships user@.service, and on a host without it the refusal is
+        # deliberately a different one (see the test below). Pinned on the public
+        # probe `require_systemd` consults, not on a private helper behind it.
+        monkeypatch.setattr(
+            rt, "user_manager_unit", lambda _uid=None: "/usr/lib/systemd/system/user@.service"
+        )
         with pytest.raises(rt.PodError) as exc:
             rt.require_systemd()
         msg = str(exc.value)
@@ -7089,6 +7134,158 @@ class TestSessionBus:
         assert "loginctl enable-linger tester" in msg
         # Keyed on the socket's absence, not on matching systemctl's stderr.
         assert "No medium found" not in msg
+
+    def test_require_systemd_refuses_without_a_per_user_manager(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """No ``user@.service`` means no pod is ever possible — say so, don't misdirect.
+
+        A missing bus has two causes with different remedies. When systemd ships
+        the per-user manager template the instance merely is not running, and
+        ``enable-linger`` starts it. When the template is absent (RHEL 7, CentOS 7,
+        Amazon Linux 2 — systemd 219 with the per-user manager left out) linger has
+        nothing to instantiate, so recommending it sends the reader after a fix
+        that provably cannot work.
+        """
+        monkeypatch.setattr(rt, "IS_LINUX", True)
+        monkeypatch.setattr(rt.shutil, "which", lambda _n: "/usr/bin/systemctl")
+        self._bus(monkeypatch, tmp_path / "run", exists=False)
+        monkeypatch.setenv("USER", "tester")
+        # Pin the WIDER predicate, not just the template: `user_manager_unit` falls
+        # through to a real-filesystem probe for `user@<uid>.service`, so pinning
+        # only the template would leave this test dependent on the runner again.
+        monkeypatch.setattr(rt, "user_manager_unit", lambda _uid=None: None)
+        with pytest.raises(rt.PodBackendAbsent) as exc:
+            rt.require_systemd()
+        msg = str(exc.value)
+        # The message may NAME the remedy in order to rule it out — that is the
+        # point, since a host can have Linger=yes and still be unable to run a
+        # pod. What it must not do is RECOMMEND it as the fix.
+        assert "Fix: loginctl enable-linger" not in msg
+        assert "cannot help" in msg
+        # Names the limit and the way forward, like the non-Linux gate does.
+        assert "user@.service" in msg
+        assert "dev-backend.sh" in msg
+
+    def test_user_manager_template_reports_the_path_it_found(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Probed by unit path, so a stray dbus socket cannot fake support.
+
+        The bus socket is the wrong predicate: a session ``dbus-daemon`` can
+        create it on a host with no per-user manager, which is why this probe
+        looks for the template instead.
+        """
+        present = tmp_path / "user@.service"
+        present.touch()
+        monkeypatch.setattr(
+            rt, "_SYSTEMD_SYSTEM_UNIT_DIRS", (str(tmp_path / "absent"), str(tmp_path))
+        )
+        assert rt._user_manager_template() == f"{tmp_path}/user@.service"
+
+        monkeypatch.setattr(rt, "_SYSTEMD_SYSTEM_UNIT_DIRS", (str(tmp_path / "absent"),))
+        assert rt._user_manager_template() is None
+
+    def test_unit_search_covers_systemd_load_path_in_precedence_order(self) -> None:
+        """The search path must be systemd.unit(5) Table 1, complete and in order.
+
+        A short search path is a false "absent": the probe reports no per-user
+        manager on a host that HAS one, and :func:`require_systemd` then names a
+        platform limit instead of telling the reader to start the manager. Three
+        review rounds each found a different missing entry, so this pins the whole
+        documented table rather than a chosen subset.
+
+        Asserted on the DIRECTORY list, which is what both unit shapes derive
+        from. A per-shape assertion would let one shape regress while the other
+        passed, which is the divergence that produced those rounds.
+
+        Order is asserted because the found path is the one a message names, and
+        naming a shadowed lower-precedence unit would mislead the reader.
+        """
+        # systemd.unit(5) Table 1, "Load path when running in system mode",
+        # highest precedence first (verified against the systemd 261 manual).
+        table_1 = (
+            "/etc/systemd/system.control",
+            "/run/systemd/system.control",
+            "/run/systemd/transient",
+            "/run/systemd/generator.early",
+            "/etc/systemd/system",
+            "/etc/systemd/system.attached",
+            "/run/systemd/system",
+            "/run/systemd/system.attached",
+            "/run/systemd/generator",
+            "/usr/local/lib/systemd/system",
+            "/usr/lib/systemd/system",
+            "/run/systemd/generator.late",
+        )
+        dirs = rt._SYSTEMD_SYSTEM_UNIT_DIRS
+
+        found_at = []
+        for directory in table_1:
+            assert directory in dirs, f"systemd searches {directory} but the probe does not"
+            found_at.append(dirs.index(directory))
+        assert found_at == sorted(found_at), f"not in systemd precedence order: {dirs}"
+
+        # `/lib` is the pre-usr-merge alias of `/usr/lib` and is not in Table 1,
+        # so it is asserted separately rather than loosening the check above.
+        assert "/lib/systemd/system" in dirs
+
+        # Both shapes resolve against that one list, so neither can search a
+        # directory the other does not.
+        for name in (rt._USER_MANAGER_TEMPLATE_NAME, "user@1000.service"):
+            assert rt._unit_paths(name) == tuple(f"{d}/{name}" for d in dirs)
+
+    def test_user_manager_unit_finds_a_hand_installed_uid_unit(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A template-less host can still have a manager, so don't refuse it.
+
+        ``docs/guides/remote-and-mobile.md`` tells the reader to write
+        ``/etc/systemd/system/user@$(id -u).service`` by hand and enable it. systemd
+        loads that concrete unit without consulting the template, so a host that
+        followed this repo's own guide has a working per-user instance and no
+        template. Keying the platform gate on the template alone refused pods there.
+        """
+        vendor = tmp_path / "vendor"
+        etc = tmp_path / "etc"
+        vendor.mkdir()
+        etc.mkdir()
+        monkeypatch.setattr(rt, "_SYSTEMD_SYSTEM_UNIT_DIRS", (str(etc), str(vendor)))
+        assert rt.user_manager_unit(4242) is None
+
+        # A uid unit in a NON-`/etc` directory must count. Searching a narrower
+        # list for this shape than for the template is what made the probe report
+        # "absent" on a host with a working manager, which is the bug this PR fixes.
+        (vendor / "user@4242.service").touch()
+        # Build the expectation the way the probe does. These are systemd unit
+        # paths, so the probe joins with "/" on every platform; rendering the
+        # expectation through `Path` would emit a backslash on Windows and fail
+        # this assertion on the separator rather than on the behaviour under test.
+        assert rt.user_manager_unit(4242) == f"{vendor}/user@4242.service"
+        # Another uid's unit says nothing about this one.
+        assert rt.user_manager_unit(99) is None
+
+    def test_a_uid_unit_gets_enable_linger_not_the_platform_refusal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """With a manager unit present the instance is merely stopped — linger works.
+
+        This is the other side of the split: the platform refusal must be reserved
+        for hosts that genuinely cannot run a pod, or it becomes the same misdirection
+        in the opposite direction.
+        """
+        monkeypatch.setattr(rt, "IS_LINUX", True)
+        monkeypatch.setattr(rt.shutil, "which", lambda _n: "/usr/bin/systemctl")
+        self._bus(monkeypatch, tmp_path / "run", exists=False)
+        monkeypatch.setenv("USER", "tester")
+        monkeypatch.setattr(
+            rt, "user_manager_unit", lambda _uid=None: "/etc/systemd/system/user@7.service"
+        )
+        with pytest.raises(rt.PodBackendAbsent) as exc:
+            rt.require_systemd()
+        msg = str(exc.value)
+        assert "Fix: loginctl enable-linger" in msg
+        assert "cannot help" not in msg
 
     def test_missing_bus_is_reported_without_spawning(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -7485,7 +7682,7 @@ class TestBootTimeSettings:
         monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
         monkeypatch.setattr(rt, "is_active", lambda cfg, n: active)
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
-        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0: 403)
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p, tries=0, **_kw: 403)
         monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
         return PodConfig.load()

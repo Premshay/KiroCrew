@@ -46,11 +46,10 @@
  */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Cloud, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Pencil, Plus, RotateCw, Route, Sparkles, Square, Star, Users, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Plus, RotateCw, Route, Sparkles, Square, Star, Users, Zap } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { Btn } from '../../components/ui'
 import { CrewMemberMark } from '../../components/CrewMemberMark'
-import DeployMyCrewDialog from './DeployMyCrew'
 import NewCrewmateDialog, { type CreatedCrewmate } from './NewCrewmateDialog'
 import { sendTurn } from '../../chat-core/transport/sendTurn'
 import { useTranslation } from 'react-i18next'
@@ -83,21 +82,24 @@ import { emitSlotRead, flushSlotRead } from '../../lib/slotReadRelay'
 import { setViewedThreadSlot, clearViewedThreadSlot } from '../../lib/viewedThread'
 import CrewAvatar from '../../components/CrewAvatar'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
+import Glass from '../../components/Glass'
 import ChatPane from '../../components/ChatPane'
 import type { ThreadHooks } from '../../app-sdk/messageRenderers'
 import { threadsApi, threadsQueryKey } from '../../api/threads'
 import ThreadPanel from './ThreadPanel'
 import { useCrewmateThreadsFlag } from '../../hooks/useCrewmateThreadsFlag'
 import CrewWebview from './CrewWebview'
+import CommandCenterPanel from '../chat/command-center/CommandCenterPanel'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
-import { START_MEET_CREWMATES_EVENT } from '../../components/MeetCrewmatesFlow'
+import { CREWMATES_PAGE_ENTERED_EVENT, START_MEET_CREWMATES_EVENT } from '../../components/MeetCrewmatesFlow'
 import { hasNoCrewmates } from '../../hooks/useMeetCrewmatesGate'
 import { useGuardedLeave } from '../../components/NavigationLeaveGuard'
 import CrewNotesTab from './CrewNotesTab'
 import { CrewLogTab } from '../chat/CrewLogPanel'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { useConnected } from '../../hooks/useConnected'
+import { sessionTitleRoster } from '../../utils/sessionRoster'
 import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FilterMenuLabel, FilterMenuContent } from '../../components/SearchFilterBar'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '../../components/ui/dropdown-menu'
 import {
@@ -114,6 +116,7 @@ import { usePanelDocumentActions } from '../../hooks/usePanelDocumentActions'
 import ResizeHandle from '../../components/ResizeHandle'
 import { cn } from '../../lib/utils'
 import { LIST_SHELL_CLS, LIST_HEADER_CLS, LIST_TITLE_CLS, LIST_BODY_CLS, ROW_BOX_CLS, ROW_IDLE_CLS, ROW_ACTIVE_CLS, ROW_TITLE_CLS, ROW_STATUS_CLS } from '../../components/listShell'
+import { ListDock } from '../../components/ListDock'
 import { useColumnResize } from '../../hooks/useColumnResize'
 import { loadColumnWidth } from '../../lib/columnWidth'
 import { tabStatus, type TabStatus } from '../../lib/sessionTabs'
@@ -229,15 +232,16 @@ export const CREW_PANEL_TAB_IDS: readonly string[] = [CREW_NOTES_TAB_ID, CREW_WO
  *  chip on the crewmate panel, the chat page's "Summary" view would be a second,
  *  unrelated summary of this same thread. Exported so the test pins the set. */
 export const MEMBERS_UNFED_VIEWS: readonly ViewKind[] = [...CHAT_TRANSCRIPT_VIEWS, 'summary']
-/** Everything this page withholds once the thread is confirmed. Today that is
- *  exactly the unfed set: Side chat IS offered — its composer draft lives in
+/** Everything this page withholds once the thread is confirmed. The task
+ *  dashboard lives in the permanent Dashboard tab, not a second chat view.
+ *  Side chat IS offered — its composer draft lives in
  *  the chat-core store (`sideChatDrafts`, per slot, persisted), so `SidePanel`
  *  unmounting the body on a tab or member switch loses nothing, and the
  *  selection toolbar's "Ask about this" needs the tab as its landing
  *  (`openMemberSideChat`). Kept as its own name so the "withheld" and "unfed"
  *  reasons stay separable if they diverge again. Exported so the test pins
  *  the set. */
-export const MEMBERS_WITHHELD_VIEWS: readonly SidePanelWithholdable[] = [...MEMBERS_UNFED_VIEWS]
+export const MEMBERS_WITHHELD_VIEWS: readonly SidePanelWithholdable[] = [...MEMBERS_UNFED_VIEWS, 'command-center']
 /** Everything the panel withholds while the thread is UNCONFIRMED: every
  *  classified view, plus Terminal and app tabs. Derived from
  *  `VIEW_DATA_SOURCE` (the exhaustive `Record<ViewKind, …>`) rather than
@@ -485,7 +489,8 @@ function MemberRow({
           className={cn(
             'w-full flex items-center gap-2.5 text-sm text-left transition-all select-none',
             ROW_BOX_CLS, 'pr-8',
-            indented && 'pl-7',
+            // Grouped-row indent = ROW_BOX_CLS left pad (10) + 14: `pl-6` 24.
+            indented && 'pl-6',
             view.name === activeName ? ROW_ACTIVE_CLS : ROW_IDLE_CLS,
           )}
           aria-current={view.name === activeName ? 'true' : undefined}
@@ -692,11 +697,23 @@ export default function MembersPage() {
   // error after a good read keeps showing the last roster.
   const rosterQuery = useQuery(membersRosterQuery)
   const rows = rosterQuery.data ?? EMPTY_ROSTER
-  // The raw roster's names (not the filtered/projected list): what the create
-  // dialog refuses up front, and the premise of its post-failure reconcile.
-  const existingNames = useMemo(() => rows.map((r) => r.name), [rows])
+  // The raw roster's keys and shown names (not the filtered/projected list):
+  // what the create dialog refuses up front, and the premise of its
+  // post-failure reconcile. The server refuses a name another crewmate shows
+  // as well as a taken key (`members.key_new_crew`).
+  const existingNames = useMemo(
+    () => rows.flatMap((r) => (r.display_name ? [r.name, r.display_name] : [r.name])),
+    [rows],
+  )
   const loaded = rosterQuery.data !== undefined || rosterQuery.isError
   const loadError = rosterQuery.data === undefined && rosterQuery.isError
+  // Ask the host to show Meet CrewMates on the first visit. The host decides
+  // whether it is still due (whether this workspace has seen it, nothing
+  // else), so announcing on every mount is safe; the empty-state button stays
+  // the on-demand entry.
+  useEffect(() => {
+    window.dispatchEvent(new Event(CREWMATES_PAGE_ENTERED_EVENT))
+  }, [])
   // ONE source of truth for the roster fields the page derives from (starred
   // count, the Starred filter, search, sort, source chips): the react-query
   // rows merged with each member's pushed `roster` projection, projection
@@ -825,9 +842,6 @@ export default function MembersPage() {
   // '' — no thread opened). The remembered-member fallback never sets it —
   // there the user named nobody. Cleared once a different member opens.
   const [gone, setGone] = useState<{ name: string; shown: string } | null>(null)
-  // Deploy my crew. Page-level because a launch is crew-wide, and the panel's
-  // own read is gated on this, so it stays false until someone asks for it.
-  const [deployOpen, setDeployOpen] = useState(false)
   // New crewmate dialog (header "+" and the empty-state hero open it).
   const [createOpen, setCreateOpen] = useState(false)
   // The crewmate just created here, until its chat has opened and its greeting has
@@ -1344,9 +1358,13 @@ export default function MembersPage() {
       if (greet && !postCreateErrorRef.current && !otherFollowUp) {
         pendingGreets.current.delete(m.name)
         if (pageMounted.current) {
+          // Greet the crewmate by the name it shows: a crewmate made from a
+          // free-form name is keyed by a derived id (`launch-notes`) and shows
+          // the typed text as its label.
+          const shown = m.display_name?.trim() || greet.name
           const message = greet.job
-            ? t('pages.membersPage.greeting_seed_with_job', { name: greet.name, job: greet.job })
-            : t('pages.membersPage.greeting_seed', { name: greet.name })
+            ? t('pages.membersPage.greeting_seed_with_job', { name: shown, job: greet.job })
+            : t('pages.membersPage.greeting_seed', { name: shown })
           void seedGreeting(greet, r.slot_key, message)
         }
       }
@@ -1528,6 +1546,26 @@ export default function MembersPage() {
     if (beside) setDockedOpen(true)
     else setOverlayOpen(true)
   }, [tabsCtl, beside, setDockedOpen])
+  // Session routing inside the DM transcript. A crewmate's prose names sessions
+  // constantly -- "picked this up in `chat-2235-…`", a `/chat?sid=…` link to the
+  // worker it dispatched -- and until now every one of those was inert here
+  // while the same text on the chat page resolved.
+  //
+  // The roster is the WS `slots` frame this page already subscribes to, narrowed
+  // by the shared builder to the slots the DESTINATION can render: the handler
+  // navigates to the unified chat view, so a chip to anything that view drops
+  // would clear itself on arrival. Withheld -- not emptied -- until a real
+  // snapshot has arrived and the socket is up: absent means "this surface does
+  // not know which sessions exist", which is the honest answer then, and it
+  // leaves the link plain rather than live-looking and dead.
+  const sessionRoster = useMemo(() => sessionTitleRoster(liveSlots), [liveSlots])
+  // A foreign slot is NOT hosted in this page's own pane -- it belongs to the
+  // chat page, with its sidebar, its history paging and its composer. Same
+  // primitive the Driving-sessions rows use.
+  const openSessionOnChatPage = useCallback(
+    (key: string) => { navigate(`/chat?sid=${encodeURIComponent(key)}`) },
+    [navigate],
+  )
   // Reply threads (screen 07). The footer data per message is one small read
   // beside the transcript; the open thread takes over the side panel while it
   // is on screen, and closing it hands the panel's tabs back. Keyed on the
@@ -1579,6 +1617,11 @@ export default function MembersPage() {
   const activeTabId = shownTabId ?? tabsCtl.activeId
   const notesVisible = panelVisible && activeTabId === CREW_NOTES_TAB_ID
   const workLogVisible = panelVisible && activeTabId === CREW_WORK_LOG_TAB_ID
+  const dashboardVisible = panelVisible && activeTabId === CREW_DASHBOARD_TAB_ID
+  const [dashboardVisitedFor, setDashboardVisitedFor] = useState<string | null>(null)
+  useEffect(() => {
+    if (dashboardVisible) setDashboardVisitedFor(activeMemberKey)
+  }, [dashboardVisible, activeMemberKey])
   const closeOverlay = useCallback(() => setOverlayOpen(false), [])
   // Mount continuity — the chat page's rule, verbatim: a live Browser tab (its
   // WebContentsView) or a body-owning app tab (any slot's) cannot survive a
@@ -1586,7 +1629,8 @@ export default function MembersPage() {
   // rather than unmounted. There is no find pane on this page.
   const hasLiveAppTab = useAnyLiveAppTab()
   const hasBrowserTab = tabsCtl.tabs.some((tab) => tab.kind === 'browser')
-  const mountInput = { activityOpen: panelVisible, hasLiveAppTab, hasBrowserTab, searchOpen: false }
+  const hasTaskDashboard = dashboardVisible || dashboardVisitedFor === activeMemberKey || tabsCtl.tabs.some(tab => tab.kind === 'command-center')
+  const mountInput = { activityOpen: panelVisible, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: false }
   const panelMounted = shouldMountSidePanel(mountInput)
   const panelHidden = isSidePanelHidden(mountInput)
   // File / artifact / save for the panel's Files, Artifacts and document tabs —
@@ -2422,29 +2466,6 @@ export default function MembersPage() {
             <CrewMemberMark size={15} className="inline-block text-muted shrink-0" />
             <h1 className={LIST_TITLE_CLS}>{t('pages.membersPage.title')}</h1>
           </div>
-          {/* Crew-WIDE, so it sits in the page header rather than in a member's
-              own drawer: one launch ships the whole checkout to one machine and
-              names one stack, so there is no per-member deployment and a
-              per-row placement would draw the same one under every member.
-              Labelled, not icon-only: a bare cloud glyph names nothing a
-              first-time reader can guess, and this is the feature's only
-              entry. A plain `Cloud` glyph, not `CloudUpload`: the arrow-into-cloud
-              reads as "send something up", and a reader who takes the button for
-              an action never opens the read-only panel behind it. Bordered like
-              the secondary `Btn`, unlike its ghost `+`
-              sibling: an icon-plus-word with no edge reads as a status chip,
-              and a reader who takes it for a label never opens the panel.
-              The panel's actions lead into Settings > Remote Crew,
-              which owns the set-up flow. */}
-          <button
-            onClick={() => setDeployOpen(true)}
-            className="flex items-center gap-1 h-7 px-2 rounded-md transition-colors bg-transparent border border-border shrink-0 text-[12px] text-muted hover:text-text hover:border-border-strong hover:bg-bg-hover cursor-pointer"
-            title={t('pages.membersPage.deploy_title')}
-            data-testid="member-deploy-open"
-          >
-            <Cloud size={15} />
-            {t('pages.membersPage.deploy_trigger')}
-          </button>
           {/* Two things can be added here, so the "+" opens a menu: a crewmate
               or a team (the dialogs below). The trigger keeps the bare Plus
               and its label. */}
@@ -2562,14 +2583,17 @@ export default function MembersPage() {
             />
           </div>
         )}
-        {/* The Sessions sidebar's search row (components/SearchFilterBar): the
-            same field, clear button and inline sort/filter menu. The menu holds
-            what the sidebar's holds for sessions, in the roster's terms — a
-            star toggle, the member's live state, its origin, and the sort.
-            Menu rows keep the menu open (preventDefault) so several can be
-            toggled in one visit, as the sidebar's do. */}
+        {/* The floating dock (components/ListDock): the glass search capsule and
+            the filter chip hover over the roster, which scrolls under them. */}
+        <ListDock field={(
+          // The Sessions sidebar's search row (components/SearchFilterBar): the
+          // same field, clear button and inline sort/filter menu. The menu holds
+          // what the sidebar's holds for sessions, in the roster's terms — a
+          // star toggle, the member's live state, its origin, and the sort.
+          // Menu rows keep the menu open (preventDefault) so several can be
+          // toggled in one visit, as the sidebar's do.
         <SearchFilterBar
-          className="px-2 pb-1"
+          className="px-2"
           placeholder={t('pages.membersPage.search_members')}
           clearLabel={t('pages.chatSidebar.clear_search')}
           value={filter}
@@ -2660,6 +2684,8 @@ export default function MembersPage() {
             </DropdownMenu>
           )}
         />
+        )} shelf={(
+          <>
         {/* The at-rest marker that the list is narrowed: ONE aggregate chip in
             the sidebar's chip recipe (components/SearchFilterBar), naming every
             active filter, so a returning user sees WHY the roster is short and
@@ -2688,16 +2714,22 @@ export default function MembersPage() {
         {/* Star-write failure. Falsy message renders nothing. askAgent is ON:
             the roster holds no unsaved draft, so the hand-off's navigation
             destroys nothing (AUTOSDE errors-use-error-notice). */}
-        <div className="px-2">
-          <ErrorNotice
-            message={starError?.message}
-            report={starError?.report}
-            title={t('pages.membersPage.star_failed_title')}
-            onDismiss={() => setStarError(null)}
-            askAgent
-            testId="member-star-error"
-          />
-        </div>
+        {/* Mounted only while there IS an error: the wrapper sits on the dock's
+            shelf, and an empty wrapper would keep the shelf (and its 4px scrim)
+            open under a bare field. */}
+        {starError && (
+          <div className="px-2">
+            <ErrorNotice
+              message={starError.message}
+              report={starError.report}
+              title={t('pages.membersPage.star_failed_title')}
+              onDismiss={() => setStarError(null)}
+              askAgent
+              actionPlacement="below"
+              testId="member-star-error"
+            />
+          </div>
+        )}
         {gone && gone.shown === '' && (
           /* The roster is the answer surface when there is no thread to stand
              in the gone member's place: below md a stale link always lands
@@ -2709,6 +2741,8 @@ export default function MembersPage() {
             {t('pages.membersPage.member_gone_roster', { name: gone.name })}
           </div>
         )}
+          </>
+        )}>
         <ul
           className={`${LIST_BODY_CLS} list-none m-0`}
           style={{ scrollbarWidth: 'none' }}
@@ -2723,11 +2757,10 @@ export default function MembersPage() {
             </li>
           )}
           {loaded && !loadError && hasNoCrewmates(members) && (
-            /* The Meet CrewMates entry point: `hasNoCrewmates` is the gate's own
-               predicate (the built-in `default` row is the main assistant), so the
-               page and the auto-fire can never disagree on "no crewmate yet".
-               Re-opens the first-run flow (App hosts it) — the user asked, so
-               no eligibility check applies. */
+            /* The on-demand Meet CrewMates entry, beside the empty state
+               (the built-in `default` row is the main assistant, not a
+               crewmate). Re-opens the first-run flow (App hosts it) — the user
+               asked, so no check applies. */
             <li className="px-4 py-2">
               <button
                 onClick={() => window.dispatchEvent(new Event(START_MEET_CREWMATES_EVENT))}
@@ -2824,6 +2857,7 @@ export default function MembersPage() {
             )
           })}
         </ul>
+        </ListDock>
         {/* Window-splitter between roster and thread: the same component as the
             Sessions sidebar's grip, sitting on the card's right border the same
             way (absolute, 12px rounded-xl corner inset), so the two pages' edges
@@ -2838,7 +2872,9 @@ export default function MembersPage() {
             min={ROSTER_MIN}
             max={ROSTER_MAX}
             inset={12}
-            className="absolute top-0 -right-[3px] h-full z-10"
+            // z-40: above the floating search dock (ListDock, z-30), whose
+            // opaque shelf would otherwise take the inner half of the grip.
+            className="absolute top-0 -right-[3px] h-full z-40"
           />
         </div>
       </aside>
@@ -2932,66 +2968,94 @@ export default function MembersPage() {
             {/* No rule under the header: it shares the transcript's background
                 and is set off by spacing alone, the way ChatPage's session
                 header sits over its transcript (bg-bg, no border-b). A hairline
-                here read as a second frame inside the pane (issue #9425). */}
-            <header className="flex items-center gap-2.5 px-4 py-2" data-testid="member-thread-header">
-              <button
-                // Back to the roster. When this entry was pushed from the
-                // roster on this page, pop it — the browser's own Back then
-                // lands on whatever preceded the roster, with no duplicate
-                // roster entry. A deep link (no such state) has no roster
-                // entry behind it, so drop the param in place instead.
-                onClick={() => {
-                  if ((location.state as { fromRoster?: boolean } | null)?.fromRoster) navigate(-1)
-                  else setSearchParams({}, { replace: true })
-                }}
-                className="md:hidden inline-flex items-center p-1 -ml-1 rounded hover:bg-accent/40"
-                aria-label={t('pages.membersPage.title')}
-                data-testid="member-back"
-              >
-                <ArrowLeft size={16} className="lucide-inline" />
-              </button>
-              {/* The face is just the face on a chat surface — no hover
-                  scrim, no pencil badge: #9116 tried making the avatar the
-                  edit entry here and it read as an oversized "Edit avatar"
-                  control sitting in the conversation (issue #9425). It is the
-                  same reactive CrewStateAvatar as before. */}
-              <CrewStateAvatar
-                seed={active.name}
-                avatar={active.avatar}
-                slotKey={activeSlot || active.slot_key}
-                running={!!isRunning(active)}
-                size={30}
-                working="full"
-              />
-              {/* Title row = name + a small pencil to its RIGHT. That pencil is
-                  the member's edit entry: invisible at rest, it fades in when
-                  the pointer is over the title row (or the button has focus),
-                  and under (hover: none) it sits at low contrast permanently
-                  — a touch user can never hover it into view. The click opens
-                  the member's WHOLE editor in the crew manager — name,
-                  template, model, workspace, triggers, avatar — not just the
-                  avatar builder, so the label says "Edit member". It navigates
-                  rather than editing here: this page never becomes a second
-                  writer (issue #9103). `group/title` is scoped to this row so
-                  the drawer toggle to the right does not reveal it. */}
-              <div className="group/title min-w-0 flex-1 flex items-center gap-1.5" data-testid="member-title-row">
-                <div className="text-[13.5px] font-semibold truncate">{crewDisplayName(active)}</div>
-                {/* The ID stays visible when a label covers it — routes, crons
-                    and spawn params address the ID, never the label. */}
-                {crewDisplayName(active) !== active.name && (
-                  <div className="text-[11px] font-mono text-muted truncate max-w-[11rem]" title={t('components.agentSelector.agent_id_tooltip', { name: active.name })}>{active.name}</div>
-                )}
+                here read as a second frame inside the pane (issue #9425).
+                Three columns, the outer two equal, so the identity pill in the
+                middle is centred on the pane whether or not the back button
+                (narrow) or the panel opener (docked, panel hidden) is present:
+                a flex row with `flex-1` around the pill would shift it by the
+                width of whichever side control is missing. */}
+            <header className="grid grid-cols-[1fr_minmax(0,auto)_1fr] items-center gap-2 px-3 py-2" data-testid="member-thread-header">
+              <div className="flex items-center justify-start min-w-0">
                 <button
-                  type="button"
-                  onClick={() => navigate(crewEditPath(active.name))}
-                  className="inline-flex shrink-0 items-center justify-center w-6 h-6 rounded-md text-muted hover:text-text hover:bg-bg-hover cursor-pointer focus-ring opacity-0 transition-opacity duration-150 motion-reduce:transition-none group-hover/title:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-60"
-                  aria-label={t('pages.membersPage.edit_member')}
-                  title={t('pages.membersPage.edit_member')}
-                  data-testid="member-edit-name-button"
+                  // Back to the roster. When this entry was pushed from the
+                  // roster on this page, pop it — the browser's own Back then
+                  // lands on whatever preceded the roster, with no duplicate
+                  // roster entry. A deep link (no such state) has no roster
+                  // entry behind it, so drop the param in place instead.
+                  onClick={() => {
+                    if ((location.state as { fromRoster?: boolean } | null)?.fromRoster) navigate(-1)
+                    else setSearchParams({}, { replace: true })
+                  }}
+                  className="md:hidden inline-flex items-center p-1 -ml-1 rounded hover:bg-accent/40"
+                  aria-label={t('pages.membersPage.title')}
+                  data-testid="member-back"
                 >
-                  <Pencil size={13} className="lucide-inline" />
+                  <ArrowLeft size={16} className="lucide-inline" />
                 </button>
               </div>
+              {/* The identity pill: one centred Glass chip holding the face and
+                  the name, the same material as the composer dock and the
+                  follow-up chips (components/Glass.tsx), so the crewmate's name
+                  reads as a floating title over its own thread rather than a
+                  left-aligned toolbar label. The chip solidifies with the rest
+                  of the glass when the Translucent-panels setting is off or
+                  the platform reduces transparency. Only the pill carries the
+                  material — the side controls stay bare so the header has one
+                  pane, not three.
+
+                  The pill IS the member's edit entry: the whole chip is one
+                  button (the pane's host, `as="button"`, so the material and
+                  the control are the same element) that opens the member's
+                  WHOLE editor in the crew manager — name, template, model,
+                  workspace, triggers, avatar — so the label says "Edit
+                  crewmate". It navigates rather than editing here: this page
+                  never becomes a second writer (issue #9103). There is no
+                  separate pencil: the maintainer dropped the hover-revealed
+                  pencil that used to sit right of the name (#9425) once the
+                  identity became one clickable pill — a chip that already reads
+                  as a control does not need a second control inside it. The
+                  face is still not an edit control of its own (#9116): it is a
+                  plain face inside the pill, and the pill's label names the
+                  editor, not the avatar. No hover step: the pane is the same
+                  glass at rest and under the pointer (maintainer decision --
+                  the Glass material carries no hover state of its own), so the
+                  pointer cursor and the tooltip are the affordance; focus is
+                  the app's own ring. The button's accessible NAME is its content — the
+                  crewmate's name — so a screen reader still hears who the
+                  thread is with and voice control can say the name; what the
+                  click does ("Edit crewmate") rides along as the tooltip,
+                  which doubles as the accessible description. An aria-label
+                  would replace the identity with the verb. */}
+              <Glass
+                as="button"
+                type="button"
+                variant="chip"
+                radius={999}
+                onClick={() => navigate(crewEditPath(active.name))}
+                className="glass-shadow flex items-center gap-2.5 pl-2.5 pr-4 py-1.5 min-w-0 max-w-full justify-self-center cursor-pointer text-left focus-ring"
+                title={t('pages.membersPage.edit_member')}
+                data-testid="member-identity-pill"
+              >
+                {/* The same reactive CrewStateAvatar as before — a plain face,
+                    no scrim, no badge (issue #9425). */}
+                <CrewStateAvatar
+                  seed={active.name}
+                  avatar={active.avatar}
+                  slotKey={activeSlot || active.slot_key}
+                  running={!!isRunning(active)}
+                  size={30}
+                  working="full"
+                />
+                {/* Title row = name (+ the ID when a label covers it). */}
+                <div className="min-w-0 flex items-center gap-1.5" data-testid="member-title-row">
+                  <div className="text-[13.5px] font-semibold truncate max-w-[24rem]">{crewDisplayName(active)}</div>
+                  {/* The ID stays visible when a label covers it — routes, crons
+                      and spawn params address the ID, never the label. */}
+                  {crewDisplayName(active) !== active.name && (
+                    <div className="text-[11px] font-mono text-muted truncate max-w-[11rem]" title={t('components.agentSelector.agent_id_tooltip', { name: active.name })}>{active.name}</div>
+                  )}
+                </div>
+              </Glass>
               {/* The panel's opener. Same icon and hit-target as the chat
                   page's side-panel toggle, so the two surfaces teach one
                   gesture, and the dashboard's side-panel chord fires it too.
@@ -3003,21 +3067,22 @@ export default function MembersPage() {
                   construction (a server invariant, not a per-thread state), so
                   announcing it taught the user a term for a thing that can
                   never be otherwise. The member's edit entry is not a peer of
-                  this toggle: it is the pencil inside the title row, revealed
-                  on hover. */}
-              {showOpener && (
-                <button
-                  onClick={togglePanel}
-                  className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
-                  aria-pressed={panelVisible}
-                  aria-controls="member-side-panel"
-                  aria-label={t('pages.membersPage.details')}
-                  title={t('pages.membersPage.details')}
-                  data-testid="member-panel-toggle"
-                >
-                  <PanelRightSolid size={15} />
-                </button>
-              )}
+                  this toggle: it is the identity pill in the middle. */}
+              <div className="flex items-center justify-end min-w-0">
+                {showOpener && (
+                  <button
+                    onClick={togglePanel}
+                    className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
+                    aria-pressed={panelVisible}
+                    aria-controls="member-side-panel"
+                    aria-label={t('pages.membersPage.details')}
+                    title={t('pages.membersPage.details')}
+                    data-testid="member-panel-toggle"
+                  >
+                    <PanelRightSolid size={15} />
+                  </button>
+                )}
+              </div>
             </header>
             {/* A failed document read from the panel's Files / Artifacts tabs.
                 Reported here, above the thread, rather than inside the tab
@@ -3171,7 +3236,16 @@ export default function MembersPage() {
                     openSideChat={openMemberSideChat}
                     crewmate={crewmateIdentity}
                     onOpenCrewWorkLog={openCrewWorkLog}
+                    onOpenCommandCenter={() => {
+                      tabsCtl.setActive(CREW_DASHBOARD_TAB_ID)
+                      if (beside) setDockedOpen(true)
+                      else setOverlayOpen(true)
+                    }}
                     threads={threadHooks}
+                    onFileOpen={openFile}
+                    onSessionOpen={openSessionOnChatPage}
+                    sessions={connected && slotsLoaded ? sessionRoster : undefined}
+                    activeSession={activeSlot}
                   />
                 </ErrorBoundary>
               </div>
@@ -3657,23 +3731,29 @@ export default function MembersPage() {
               visible={notesVisible}
             />
           ) : null
-          // Dashboard — the page the crewmate publishes itself (CrewWebview,
-          // the shipped component: docked summary, expandable to full window).
-          // Its empty state's one action jumps to the crewmate's detail page,
-          // which is where setup lives.
+          // One Dashboard: the existing crew publication is one task view.
+          // Preserve its renderer and exact member identity, while the host
+          // owns live task summaries, questions and approval controls.
           const dashboardBody = (
-            <div className="px-3 py-3" data-testid="member-dashboard" aria-label={t('pages.membersPage.dashboard_tab')}>
-              {identityRow}
-              {activeSlug && activeMemberName ? (
-                <CrewWebview
+            <div className="h-full min-h-0 flex flex-col" data-testid="member-dashboard" aria-label={t('pages.membersPage.dashboard_tab')}>
+              <div className="px-3 pt-3 shrink-0">{identityRow}</div>
+              {!confirmedSlot && !activeThreadFailed && <p role="status" className="px-3 text-sm text-muted">{t('pages.membersPage.opening_thread')}</p>}
+              <div className="flex-1 min-h-0">
+                <CommandCenterPanel
+                  key={activeMemberKey}
+                  slot={activeSlot || null}
+                  active={dashboardVisible && !!confirmedSlot}
+                  sessionReady={!!confirmedSlot}
+                  publishedView={activeSlug && activeMemberName ? { title: crewDisplayName(activeView ?? active), content: <CrewWebview
                   slug={activeSlug}
                   member={activeMemberName}
                   onSetUp={() => {
                     const destination = crewEditPath(activeMemberName)
                     leave(() => navigate(destination), destination)
                   }}
+                /> } : undefined}
                 />
-              ) : null}
+              </div>
             </div>
           )
           // The panel's three host tabs, in strip order. Kind glyphs, not the
@@ -3696,6 +3776,7 @@ export default function MembersPage() {
               id: CREW_DASHBOARD_TAB_ID,
               title: t('pages.membersPage.dashboard_tab'),
               icon: <LayoutDashboard className="lucide-inline" aria-hidden="true" />,
+              keepMounted: dashboardVisitedFor === activeMemberKey,
               render: () => dashboardBody,
             },
           ]
@@ -3718,6 +3799,14 @@ export default function MembersPage() {
           const panelProps = {
             tabsCtl,
             slot: activeSlot,
+            // The member is the chat's identity while its slot is still being
+            // confirmed, so a resize started before the POST answers lands on
+            // the confirmed key, and one that spans a member switch does not.
+            slotOwner: active?.name,
+            // Sizes are SAVED only under the confirmed key: `activeSlot` holds
+            // its last good key through a refusal, and that key now belongs to
+            // another session, whose remembered size a drag here must not take.
+            persistSlot: confirmedSlot,
             hiddenViews,
             onActiveTabChange: setShownTabId,
             projectDir,
@@ -3843,9 +3932,6 @@ export default function MembersPage() {
             </AnimatePresence>
           )
         })()}
-      {/* Crew-wide and read-only. It owns its own Dialog, and its launch read is
-          gated on `open`, so a visit that never opens it costs no request. */}
-      <DeployMyCrewDialog open={deployOpen} onClose={() => setDeployOpen(false)} members={members} />
       {/* New team / Edit team. A saved team opens its team view; a deleted one
           that was open drops `?team=` and the bare URL falls to the page's
           default (the remembered or most recently used crewmate, or the hero

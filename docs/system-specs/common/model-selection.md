@@ -205,6 +205,14 @@ and `same_registered_model` refuses to fold one onto the other -- a pin never
 resolves to its neighbour with a different context window. Two ids the registry
 cannot both place are unknown, not different, and fold on spelling alone.
 
+`resolve_wire_model_id` has one fallback past the spelling fold. An adapter can
+advertise a bare family alias (`fable`, `opus`) where a session stored the dotted
+provider id, and those share no normalized key. When the key compare misses, an
+advertised id that is a VERSION-LESS alias of the stored id's own registry entry
+is accepted. Versioned aliases never qualify: an entry also lists substitution
+aliases (`claude-haiku-4.5` under Sonnet), and an adapter advertising one is
+serving that other model.
+
 Three more sites apply the same rule on the wire, and one on the picker:
 `AcpClient._apply_startup_model`, the shared-runtime cold start in
 `providers/acp.py`, the warm-pool post-claim switch in `session_allocation.py`
@@ -257,14 +265,25 @@ its own once the cache refreshes with a list that carries it.
   and retain the advertised description. Selection and active-state comparison use
   the unchanged model ID, including composite provider/model IDs. The Jev routing
   row keeps its translated label rather than an advertised routing label.
+- Backends with `resolves_model_from_advertised_list` use their own advertised
+  model namespace. Claude retains its registry display-name reconciliation.
+  Other advertised-selection backends use their live session's model ids, then
+  their persisted namespace cache, preserving exact wire ids (including Pi
+  provider/model ids) without substituting the Kiro CLI catalog. A cold cache
+  offers `auto` and a scoped configured default until that backend advertises
+  its choices.
 - The chat composer reads `GET /api/chat/slots/{slot}/selection-capabilities` for
   the active ACP session's backend, effort support, and ordered effort levels. A
   missing session answers `known: false`; the composer then uses its existing
   model-name heuristic until ACP reports the session's actual options. The same
-  endpoint proxies a remote slot to its execution peer. A supported session gets
-  a separate effort button, using its advertised levels, whether the backend is
+  endpoint proxies a remote slot to its execution peer. Model and effort are ONE
+  composer control (`docs/decisions/2026-06-14-chat-composer-model-and-effort-are-one-control.md`):
+  the model chip names the level in force, and the model picker embeds the effort
+  slider below its model list whenever the capability read reports support, offering
+  exactly the advertised levels in their advertised order, whether the backend is
   Claude, Codex, Pi, or another capable ACP harness. A session that reports no
-  effort support gets no effort control. The model picker never owns that slider.
+  effort support gets no effort row inside the picker. The composer never grows a
+  second, standalone effort control.
 - Codex advertises `model[effort]` pairs, but its `model` config option accepts the
   base ID and its `reasoning_effort` option accepts the level. The live capability
   marks only backends in `ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS` for pair grouping;

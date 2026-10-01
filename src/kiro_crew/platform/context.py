@@ -46,6 +46,7 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
         JailProvider,
         KnowledgeProvider,
         McpToolingProvider,
+        MemoryFilesProvider,
         MobileConnectProvider,
         PackageManager,
         PromptSourceProvider,
@@ -129,9 +130,9 @@ RESERVED_SLOTS: "dict[str, str]" = {
         "embeddings.register_embedding_backend() instead."
     ),
     "package_manager": (
-        "no core call site: install paths (ollama, ffmpeg, whisper) are inline "
-        "step-by-step brew/curl/pip logic in cli_doctor.py, not a single "
-        "plan-resolution point this seam could own."
+        "no core call site: external-tool install hints (ffmpeg, faiss, the voice-aws "
+        "extra) are inline brew/winget/pip text in doctor_checks/features.py, not a "
+        "single plan-resolution point this seam could own."
     ),
     "feature_apps": (
         "no core call site: bundled apps are discovered through "
@@ -319,6 +320,13 @@ class PlatformContext:
     apps_loader: "AppsLoader"
     package_manager: "PackageManager"  # [RESERVED] — see RESERVED_SLOTS
     knowledge: "KnowledgeProvider"
+    # Where memory's markdown SOURCE text is read and written. Consumed by
+    # ``MemoryStore`` and by the vector store's document ingestion; memory's
+    # DERIVED state (the FTS index, the SQLite stores, the FAISS vectors) stays on
+    # local disk and does not travel through this seam, because it is rebuilt from
+    # the source text and a cache behind a possibly-remote boundary would cost a
+    # round trip per row to reconstruct something reconstructible by definition.
+    memory_files: "MemoryFilesProvider"
 
     # ── runtime-service / frontend extension points ──
     tunnel: "TunnelProvider"

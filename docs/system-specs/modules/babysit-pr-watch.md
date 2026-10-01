@@ -30,7 +30,8 @@ that names no value resolves toward spending a turn per interval rather than tow
 a watch that deactivates itself.
 
 A gated loop's WATCHED SUBJECT comes from the two strings it holds, resolved in one
-place (`autonudge.infer_subject`) so the monitor and the judge's collector are about
+place (`autonudge.infer_subject`, defined in `autonudge_service/subject.py`) so the monitor
+and the judge's collector are about
 the same pull request. The judge brief's `targets` list is read first, because
 `autonudge_judge.parse_targets` reads it first and asks about nothing else once it is
 present. A brief naming exactly one public GitHub pull request supplies the subject
@@ -78,10 +79,32 @@ budget, alongside a streak-floor delivery, a gate fallback and a post-wake
 follow-up, so reading the cap as a wake count under-states what it spends.
 A gated loop is never starved: after `_MAX_QUIET_STREAK` consecutive quiet
 observations it is delivered anyway, counted apart from wakes in `floor_ticks` so
-a periodic delivery is never read as a real signal. Every uncertain path -- no
-probe, no inferable target, a probe defect, a kernel that reached no verdict --
-fires as before, because a wrongly-quiet tick is silence with half-finished work
-behind it while a wrongly-spent tick costs what every tick costs today.
+a periodic delivery is never read as a real signal. **That forced delivery is owed
+durably, not merely claimed in memory.** The tick that decides it publishes a reset
+`quiet_streak`, which is the only record that a turn was due, so a gateway that
+stops between the decision and the turn landing would keep the half that suppresses
+and lose the half that delivers -- the next tick reads an unchanged subject against
+a baseline written for a turn nobody received and answers quiet, pushing the forced
+delivery out another whole floor. `MonitorState.floor_fire_pending` carries the debt
+across the fire instead: it is set before the write that publishes the reset so the
+two ride one snapshot, a later tick finding it set fires WITHOUT observing, and it is
+discharged at the single point delivery is confirmed -- the same point that charges
+`floor_ticks`. A refusal and a death therefore both leave it owed, and a retried
+delivery is charged once. `followup_ticks` is not that backstop: it answers a fire
+the slot refused, and a process that stopped refuses nothing.
+
+The debt is served **ahead of** the `followup_ticks` allowance, and consumes one of
+its credits when it fires. A refused floor fire leaves both standing for ONE owed
+turn -- the allowance so the next tick retries the delivery, the debt recording that
+the delivery is still owed -- and both survive a restart while the in-process claim
+does not. Behind the allowance, a restart spends the bypass with no claim to charge
+and then spends the debt on the tick after, so one owed delivery buys two turns. The
+retry the allowance exists for IS the debt's own fire.
+
+Every uncertain path -- no probe, no inferable target, a probe defect, a kernel that
+reached no verdict -- fires as before, because a wrongly-quiet tick is silence with
+half-finished work behind it while a wrongly-spent tick costs what every tick costs
+today.
 
 ## Same-session monitor contract
 
@@ -142,7 +165,8 @@ waiting on it could give, stalling every co-hosted session until the timeout.
 costs nothing: the preflight exists to reach the MODEL in the arming turn, which
 only the MCP-side run can do.
 `monitoring.models.retained_outcome_blocks_rearm` is
-the single predicate shared with `autonudge._stopped_row_is_replaceable`, so what
+the single predicate shared with `autonudge._stopped_row_is_replaceable`
+(`autonudge_service/model.py`), so what
 cannot drift is the RULE itself — one outcome classification serves both sites,
 rather than two copies diverging. The replaceable/retained split is pinned as
 explicit data in `test_monitor_retained_stop_false_ack.py`, because a test that
@@ -160,7 +184,8 @@ from postponing monitoring forever while avoiding a nudge racing a user turn;
 `test_autonudge_deadline.py::test_user_turn_resumes_remaining_time_not_full_interval`
 and `test_delivered_fire_clears_deadline_then_turn_end_starts_fresh` pin both
 sides of the contract. Channel-bound loops re-arm after their unattended turn
-in `AutoNudgeService._run_fire_cycle` because they do not use the dashboard
+in `AutoNudgeService._run_fire_cycle` (`autonudge_service/firing.py`) because they do not
+use the dashboard
 turn-lifecycle hooks.
 
 The schemas in `validation.MONITOR_START_SCHEMA` and
@@ -169,10 +194,12 @@ wall-clock budget. `mcp_tools.control.monitor_start` supplies bounded positive
 defaults from `mcp_tools._limits`; zero and negative cycle or runtime limits are
 rejected. The operator ceiling is `monitoring.max_runtime_secs`; setting 2592000
 permits a 30-day request without extending existing loops. The cap is a runaway backstop, not evidence that the watched work
-completed: `AutoNudgeService._timer` deactivates a capped loop and emits
+completed: `AutoNudgeService._timer` (`autonudge_service/firing.py`) deactivates a capped
+loop and emits
 `expired`.
 
-`AutoNudgeService.runtime_budget_exceeded` measures a configured wall-clock
+`autonudge.runtime_budget_exceeded` (a module function in `autonudge_service/model.py`)
+measures a configured wall-clock
 budget from the persisted creation time. `_timer` checks it before a fire and
 `_run_fire_cycle` checks it after a delivered turn, so a running turn is not
 cancelled but an expired loop is not re-armed. `test_autonudge.py` pins budget
@@ -200,7 +227,17 @@ or dropped sentinel deactivated, admits it, and the create-only and
 the four answers. When the wake carries a loop id, its `monitor_update`,
 `monitor_stop`, and `autonudge_stop` directives apply only while that id is the
 monitor currently bound to the session; a replacement monitor is never mutated
-by the stale wake.
+by the stale wake. For a legacy loop, the identity, binding, and person-stop
+retention checks are repeated inside the same service transaction that removes
+the row or writes the research tombstone, so a pause landing after the early
+refusal check survives unchanged. When that transaction finds the row missing,
+it checks the slot in the same hold: a slot with no loop means the stop's goal
+already holds and it succeeds, while a slot holding a different loop means a
+concurrent arm replaced it, so the stop is refused and the replacement keeps
+running. A write that never takes the lock is reported as not stopped. A
+structured monitor needs no such repeat: its
+stop already runs under the service lock and returns a row that carries a
+retained outcome untouched.
 
 `autonudge_stop` is deliberately non-confirming at tool-call time because the
 consumer applies it after the turn result is processed. The applier removes an

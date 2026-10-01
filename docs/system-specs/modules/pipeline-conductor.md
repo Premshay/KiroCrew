@@ -22,9 +22,18 @@ is the contract for the machinery underneath it.
 
 ## Components
 
+Long runs can expose a model-designed `task-dashboard` HTML artifact in the
+shared chat/Crew Dynamic Dashboard, published by an authorized descendant and
+updated under the same slug. This is a presentation of the pipeline's existing
+facts, not a new status store or a broader conductor role. The host independently
+shows native questions and tool approvals for the session subtree; Normal
+permission users can act on an exact request without visiting every worker.
+Publishing never changes permissions. See [artifacts](artifacts.md).
+
 | File | Role |
 |---|---|
-| `src/kiro_crew/agent.py` | `_install_pipeline_conductor_agent`, `_PIPELINE_CONDUCTOR_SYSTEM_PROMPT`, `_PIPELINE_CONDUCTOR_CORE_GRANTS`, `_PIPELINE_CONDUCTOR_DASHBOARD_GRANTS` |
+| `src/kiro_crew/agent.py` | `_PIPELINE_CONDUCTOR_SYSTEM_PROMPT`, `_PIPELINE_CONDUCTOR_CORE_GRANTS`, `_PIPELINE_CONDUCTOR_DASHBOARD_GRANTS` |
+| `src/kiro_crew/agent_materialization/conductor_agents.py` | `_install_pipeline_conductor_agent` |
 | `src/kiro_crew/agent_files.py` | `PIPELINE_CONDUCTOR_AGENT_FILENAME`, and its membership in `OWNED_KIRO_AGENT_FILES` |
 | `src/kiro_crew/subagent.py` | `UNADVERTISED_AGENTS` — the conductor is never offered in a rendered agent roster |
 | `src/kiro_crew/builtin_skills/pipeline-conductor/SKILL.md` | The operating procedure: pipeline spec, claim preflight, work-order brief, probe cycle and action table, intervention ladder, adjudication and override protocol, admission table, credit rules, `conductor-status/v1`, cleanup |

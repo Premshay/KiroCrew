@@ -257,14 +257,22 @@ def _forward_body(payload: dict[str, Any], crew: str) -> tuple[dict[str, Any], s
     serialization; absent, the backend mints one and there is nothing to
     serialize on.
 
-    ``model`` is set from the DEPLOYED crew name, never copied from the payload:
-    the request has already been checked to address this crew, and re-using the
+    ``model`` is set from the DEPLOYED crew, never copied from the payload: the
+    request has already been checked to address this crew, and re-using the
     caller's string would let a differently-cased or padded value reach the
     backend's agent resolver.
+
+    What goes on the wire is the crew's AGENT ID -- its name inside the crew
+    namespace (``common.crew_agent_id``) -- not the bare crew name, because that is
+    the id the supervisor installs the crew's spec under. The bare name resolves to
+    whatever else declares it, which for the crew this deployment ships is Kiro Crew's
+    own ``kirocrew-worker`` mirror. The customer's address is unchanged: they name the
+    crew, the namespace never leaves this process, and the responses carry the crew's
+    own name back (``backend._with_customer_model``, ``stream.project_frame``).
     """
     stream = _require_stream_bool(payload.get("stream"))
     body: dict[str, Any] = {"stream": stream}
-    body["model"] = crew
+    body["model"] = common.crew_agent_id(crew)
     # The ``id`` is forwarded as the caller sent it (after the shape and type
     # checks below) and is NOT bound to an authenticated principal, because this
     # process has no caller identity to bind: reaching the task is an authorised

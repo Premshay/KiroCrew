@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from kiro_crew.config import live
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.frontmatter import SKILL_UPDATE, frontmatter_value
+from kiro_crew.history_projection import DISPLAY_ONLY_ROLES
+from kiro_crew.image_refs import strip_image_refs
 from kiro_crew.lesson_validation import (
     LESSON_APPLIES_INSTRUCTION,
     extracted_lesson_applies,
@@ -348,11 +350,22 @@ def _persistence_disabled() -> bool:
 
 
 def _fmt_message(message: dict) -> str:
-    """Render one transcript message for a consolidation prompt."""
+    """Render one transcript message for a consolidation prompt.
+
+    The row's image references are replaced with a content-free marker before
+    the text is quoted. A consolidation prompt is history ABOUT a session, and
+    the prompt builder (``build_prompt_blocks``) inlines every still-readable
+    image path it finds in a prompt as a real image block. Left in, each
+    screenshot the session ever pasted rides along at full base64 size on every
+    extraction turn: one measured span carried 83 attachments and 67 MB of
+    image data around 600 KB of conversation, and the background session's own
+    transcript grew by that whole record on each retry until its KAS process
+    held 1.9 GB. Memory extraction reads text; it has no use for the pixels.
+    """
     tools = f" [tools: {', '.join(message['tools'])}]" if message.get("tools") else ""
     return (
         f"[{message.get('ts', '?')[:16]}] {message['role'].upper()}"
-        f"{tools}: {message['content']}"
+        f"{tools}: {strip_image_refs(message['content'])}"
     )
 
 
@@ -380,6 +393,9 @@ def _consolidation_chunk(messages: list[dict]) -> list[dict]:
     return chunk
 
 
+def _prompt_rows(messages: list[dict]) -> list[dict]:
+    """*messages* without display-only rows, which no consolidation prompt carries."""
+    return [m for m in messages if m.get("role") not in DISPLAY_ONLY_ROLES]
 _PLACEHOLDER_BODIES = frozenset(
     {
         "unchanged",
@@ -1251,6 +1267,22 @@ class HistoryConsolidator:
             unconsolidated = copy.deepcopy(unconsolidated)
             if not unconsolidated:
                 return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
+            # Display-only rows (``notice``) are text drawn for the person
+            # reading the transcript, not conversation: the Slack thread-parent
+            # row is untrusted text whose only route to a model is a fenced block.
+            # They never reach the prompt below, but they stay in
+            # ``unconsolidated`` and ``total``, so a history pass can move
+            # its offset past them. A span of nothing else has nothing to
+            # learn from, so no model call is made; a history pass also marks
+            # it consolidated, and a skill-detection pass leaves the offset
+            # to that pass as every other early return here does.
+            if not _prompt_rows(unconsolidated):
+                if include_history:
+                    await asyncio.to_thread(
+                        self._log.mark_consolidated, key, total, generation_at_snapshot
+                    )
+                    return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=total)
+                return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
             # Retry-eligibility choke point: every entry point funnels through
             # this function, so a span inside its durable backoff is refused
             # here — before anything that can bill a provider turn — even if a
@@ -1441,7 +1473,7 @@ class HistoryConsolidator:
                         complete=not include_history or new_offset == total,
                     )
 
-            conversation = "\n".join(_fmt_message(m) for m in chunk)
+            conversation = "\n".join(_fmt_message(m) for m in _prompt_rows(chunk))
 
             current_prefs, current_projects = await asyncio.to_thread(
                 lambda: (memory.read_preferences(), memory.read_projects())
@@ -2122,7 +2154,7 @@ class HistoryConsolidator:
                 "if nothing was refined. Do not fabricate refinements."
             )
         numbered = "\n\n".join(f"{i + 1}. {k}" for i, k in enumerate(skill_keys))
-        conversation = "\n".join(_fmt_message(m) for m in window)
+        conversation = "\n".join(_fmt_message(m) for m in _prompt_rows(window))
         prompt = (
             "You are a skill-extraction agent. Review this session excerpt and "
             "return a JSON object with these keys:\n\n"

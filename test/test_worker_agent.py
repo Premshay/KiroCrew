@@ -902,14 +902,22 @@ def test_every_read_and_the_write_sit_in_one_critical_section(tmp_path, monkeypa
     # it hashes the bytes this derivation already mirrored. A stamp that went back to the
     # file would be a separate observation, so it could record a fingerprint for a
     # generation the spec on disk does not mirror.
+    #
+    # The mirror is read ONCE too, first, and both things the writer needs from that file
+    # come out of the one parse: whether it is this derivation's to overwrite at all
+    # (a shared crew parked on the mirror's filename is refused, not replaced) and the
+    # frozen ``model``. It is inside the lock for the same reason the default read
+    # is: an attribution made outside it would vouch for a file a dashboard edit could
+    # replace before the write.
     assert order == [
         "lock",
-        f"read:{AGENT_FILENAME}:{True}",
         f"read:{WORKER_AGENT_FILENAME}:{True}",
+        f"read:{AGENT_FILENAME}:{True}",
         f"write:{True}",
         "unlock",
     ], order
     assert order.count(f"read:{AGENT_FILENAME}:{True}") == 1, order
+    assert order.count(f"read:{WORKER_AGENT_FILENAME}:{True}") == 1, order
 
 
 def test_the_withheld_cron_grants_are_sel_audited(tmp_path, monkeypatch):
@@ -3404,6 +3412,48 @@ def test_a_revocation_between_the_array_build_and_session_new_ends_the_session(
 
     assert sent[:2] == [METHOD_INITIALIZE, METHOD_SESSION_NEW], sent
     assert "changed during worker load" in str(excinfo.value)
+
+
+def test_post_check_uses_snapshot_sent_not_the_reseeded_one(tmp_path, monkeypatch):
+    """The post-check judges the snapshot sent to session/new even after re-seeding
+    invalidates the instance projection for the next composition."""
+    import asyncio
+
+    from kiro_crew import agent_state
+    from kiro_crew.acp.client import AcpError
+    from kiro_crew.acp.types import METHOD_SESSION_NEW
+
+    monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+    monkeypatch.setattr(agent_state, "config_dir", lambda: tmp_path)
+    default = tmp_path / AGENT_FILENAME
+    default.write_text(json.dumps(_DEFAULT_SPEC_ON_DISK), encoding="utf-8")
+    agent._install_worker_agent()
+    sent_snapshot = agent.require_fresh_derived_spec("kirocrew-worker", None)
+
+    c, _sent = _claude_client_at_session_new(tmp_path, sent_snapshot)
+    real_wait = c._wait_for_response
+    real_reseed = c._reseed_after_capture
+    snapshots_after_reseed = []
+
+    async def _wait_then_revoke(rid, timeout=None, *, method="", expected_mcp=None):
+        resp = await real_wait(rid, timeout=timeout, method=method, expected_mcp=expected_mcp)
+        if method == METHOD_SESSION_NEW:
+            revoked = json.loads(json.dumps(_DEFAULT_SPEC_ON_DISK))
+            revoked["mcpServers"].pop("builder-mcp")
+            default.write_text(json.dumps(revoked), encoding="utf-8")
+        return resp
+
+    async def _reseed_and_observe_reset():
+        await real_reseed()
+        snapshots_after_reseed.append(c._session_mcp_snapshot)
+
+    c._wait_for_response = _wait_then_revoke  # type: ignore[method-assign]
+    c._reseed_after_capture = _reseed_and_observe_reset  # type: ignore[method-assign]
+
+    with pytest.raises(AcpError, match="changed during worker load"):
+        asyncio.run(c._initialize_session())
+
+    assert snapshots_after_reseed == [None]
 
 
 def test_an_unchanged_default_lets_the_array_backed_session_proceed(tmp_path, monkeypatch):

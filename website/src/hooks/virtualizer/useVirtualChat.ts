@@ -112,7 +112,7 @@ import { useFollowState, usePinning, useFollowPlacementPins } from './followPoli
 import { useWindowState, useWindowOperations, useCoverageWatchdog, useWindowEdgeTriggers } from './windowRange'
 import { useShiftCapture, useShiftCompensation } from './shiftCompensation'
 import { useReadingPositionEntry, useVisibilityReplacement, useReadingPositionRestore } from './readingPosition'
-import { useHeightOwner, useRowMeasurement } from './measurement'
+import { useHeightOwner, useRowMeasurement, useMeasurementScopeReseed } from './measurement'
 import { useStreamingSettleGrace, useGeometrySync } from './geometryScheduling'
 
 // The hook's public helpers, defined where their rules live and re-exported
@@ -130,6 +130,7 @@ export function useVirtualChat<T>(
     getKey,
     sessionId,
     heightScopeKey,
+    canMeasure,
     estimatedHeight = DEFAULT_ESTIMATED,
     overscan = DEFAULT_OVERSCAN,
     followOutput = true,
@@ -240,6 +241,7 @@ export function useVirtualChat<T>(
     contentRef,
     topSentinelRef,
     bottomSentinelRef,
+    trailingRef,
     leadingOffset,
     scrollerEl,
     syncScrollerEl,
@@ -249,10 +251,12 @@ export function useVirtualChat<T>(
   const follow = useFollowState(followOutput)
   const view = useWindowState(itemCount, overscan, initialPlacement, sessionId)
   const { windowRange, setWindowRange, windowRangeRef } = view
-  // Render phase: TRIGGERS 1-6 capture the reader's row against the PREVIOUS
-  // commit's DOM, and plan this commit's height retirements.
+  // Render phase: TRIGGERS 1-7 capture the reader's row against the PREVIOUS
+  // commit's DOM, and plan this commit's height retirements. The height scope
+  // goes in so TRIGGER 7 sees the swap in the render that constructs the cold
+  // owner below.
   const shift = useShiftCapture({
-    items, getKey, sessionId, itemCount, onTopReached, windowRange, windowRangeRef,
+    items, getKey, sessionId, heightScopeKey, itemCount, onTopReached, windowRange, windowRangeRef,
     scrollerRef, elIndexRef, itemsRef, getKeyRef, getStableIdRef, anchorIdOf, follow,
   })
   // The committed-window mirror advances at COMMIT, right after the shift
@@ -296,7 +300,7 @@ export function useVirtualChat<T>(
   const sync = useGeometrySync({ itemsRef, eagerFirstMeasureRef, heightIndexRef, shift, follow, pinning, ops })
   const measurement = useRowMeasurement({
     itemsRef, getKeyRef, streamingIndexRef, eagerFirstMeasureRef, elIndexRef, resizeObserverRef,
-    heightIndexRef, windowRangeRef, grace, sync,
+    trailingRef, heightIndexRef, canMeasure, windowRangeRef, scrollerRef, grace, sync,
   })
 
   // Layout effects, pre-paint: the shift compensation's consumers, then
@@ -313,21 +317,24 @@ export function useVirtualChat<T>(
   useVisibilityReplacement({
     sessionId, followOutput, bottomThreshold, overscan, scrollerRef, itemsRef, setWindowRange, reading, follow, pinning,
   })
-  useScrollListener({ scrollerEl, bottomThreshold, setIsAtBottom, itemsRef, getKeyRef, follow, pinning, reading, ops })
+  useScrollListener({ scrollerEl, bottomThreshold, setIsAtBottom, itemsRef, getKeyRef, follow, pinning, reading, measurement, ops })
   useCoverageWatchdog({ scrollerEl, leadingOffset, itemsRef, heightIndexRef, windowRangeRef, ops, follow, pinning })
-  useResizeObserver({ scrollerRef, scrollerEl, elIndexRef, resizeObserverRef, measurement, compensation, sync, pinning, ops })
+  useResizeObserver({ scrollerRef, scrollerEl, elIndexRef, trailingRef, resizeObserverRef, measurement, compensation, sync, pinning, ops })
   useWindowEdgeTriggers({
     windowRange, itemCount, overscan, prefetchStartIndex, sessionId, scrollerRef, scrollerEl,
     topSentinelRef, bottomSentinelRef, onTopReachedRef, itemsRef, setWindowRange,
   })
 
-  // The slot-entry placement: the LAST layout effect, after every compensation
-  // and pin of the same commit.
+  // The slot-entry placement: the last layout effect that can place the reader,
+  // after every compensation and pin of the same commit.
   useReadingPositionRestore({
     sessionId, scrollerEl, itemCount, overscan, initialPlacement, followOutput, scrollerRef, elIndexRef,
     itemsRef, getKeyRef, getStableIdRef, heightIndexRef, getH, findAnchorIndex, anchoredRowIdentity,
     setWindowRange, setIsAtBottom, reading, shift, follow, pinning,
   })
+  // After placement: a width-scope change seeds the new owner from mounted rows
+  // (measurements only; the debounced sync owns any geometry that follows).
+  useMeasurementScopeReseed({ heightIndex, canMeasure, measurement })
 
   // ---- Recompute window when item count changes ----
   const { recomputeWindow } = ops
@@ -498,6 +505,7 @@ export function useVirtualChat<T>(
     contentRef,
     topSentinelRef,
     bottomSentinelRef,
+    trailingRef,
     virtualItems,
     offsetBefore,
     offsetAfter,

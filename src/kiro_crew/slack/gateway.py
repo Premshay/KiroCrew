@@ -50,6 +50,7 @@ from kiro_crew import (
     dep_sync,
     name_grant,
     platform_compat,
+    runtime_death,
     session_work_dir,
     shutdown_event,
     work_root,
@@ -68,6 +69,7 @@ from kiro_crew.autonudge import enabled as autonudge_enabled
 from kiro_crew.autonudge import (
     is_channel_key,
     is_structured_monitor_loop,
+    nudge_cycle_header,
     runtime_budget_exceeded,
     terminal_notification_delivery_matches,
 )
@@ -102,6 +104,7 @@ from kiro_crew.constants import SUBAGENT_COMPLETION_META_KEY, strip_control_comm
 from kiro_crew.context import ContextBuilder, session_store_for_turn
 from kiro_crew.context_management import summarize_result
 from kiro_crew.cron import (
+    _AUTO_PAUSE_THRESHOLD,
     _SUBPROC_CLEANUP_ALLOWANCE_SECS,
     CronJob,
     CronService,
@@ -116,8 +119,10 @@ from kiro_crew.dashboard import cautious_boot, start_dashboard
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_runner import (
     _arm_queued_delivery_settlement,
+    _auto_approve_reason,
     _resolve_channel_target,
     _run_chat,
+    _slot_is_trusted,
 )
 from kiro_crew.dashboard.chat_utils import (
     CRON_NOTIFICATION_KIND,
@@ -139,6 +144,7 @@ from kiro_crew.dashboard.handlers.autonudge import (
     compose_nudge_body,
     render_nudge_message,
 )
+from kiro_crew.dashboard.handlers.updates import _update_info
 from kiro_crew.dashboard.handlers.updates import remediation_command as _remediation_command
 from kiro_crew.dashboard.handlers.usage import (
     persist_token_record_async,
@@ -209,6 +215,8 @@ from kiro_crew.llm_helpers import (
     configured_fallback_chain,
     provider_fallback_active,
     provider_last_turn_usage,
+    provider_model_pin_partial,
+    provider_model_pin_refused,
     save_conversation_turn_off_loop,
     stream_and_collect,
     transient_retry_delay,
@@ -277,6 +285,7 @@ from kiro_crew.monitoring.models import (
     MonitorOutcome,
     monitor_state_public_dict,
 )
+from kiro_crew.notifications.bus import MONITOR_CHANNEL
 from kiro_crew.platform import boot_platform
 from kiro_crew.platform.context import (
     PlatformCompositionError,
@@ -295,6 +304,7 @@ from kiro_crew.platform.update_capability import (
     CHECK_SUCCEEDED,
     CHECK_UNCHECKED,
     EXTERNALLY_MANAGED_STAMPS,
+    MANAGED_BY_COMMAND,
 )
 from kiro_crew.platform.update_governance import (
     commits_ahead,
@@ -349,17 +359,19 @@ from kiro_crew.slack.handler import (
 )
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.slack.retry import open_dm_with_retry
-from kiro_crew.slack.scope_probe import warn_unreadable_tracked_channels
+from kiro_crew.slack.scope_probe import log_probe_failure, warn_unreadable_tracked_channels
 from kiro_crew.slack.transport import SlackTransport
 from kiro_crew.subagent import (
     _TRANSIENT_CONTINUE_MSG,
     DIGEST_HOLD_SECS,
     INJECTION_TIMEOUT,
     SpawnApprovalUnreachable,
+    SubagentDelivery,
     SubagentInfo,
     SubagentManager,
     ToolApprovalCallback,
     _injection_notice_outcome,
+    format_subagent_usage,
     resolve_max_subagents,
     stage_boundary_owner_for_run,
 )
@@ -1142,6 +1154,12 @@ def _apply_gate_verdict(job: CronJob, tally: _GateTally) -> bool:
     # failure should always alert fresh. record_success() owns the reset now, so
     # every kind's success path gets it rather than only this one.
     job.record_success()
+    # Same reason record_success resets consecutive_failures: a run that
+    # worked proves the job can work, so the shared-death streak that
+    # substitutes for that counter is reset with it. Without this the
+    # streak is a LIFETIME total, so after enough deaths the bound is
+    # permanently tripped and the exemption silently stops applying.
+    runtime_death.clear_shared_deaths(f"cron:{job.id}")
     return False
 
 
@@ -1202,7 +1220,7 @@ async def _await_cron_fire_time_gate(
         reason = await run_in_cron_gate_pool(vet_job_at_fire_time, job, timeout=budget)
     except CronQueueTimeout as exc:
         # Scoped exactly as _run_job_isolated's own result-less clear
-        # (cron.py:2852). For an agent/message job ``last_result`` is the
+        # (close_run, cron_service/execution.py). For an agent/message job ``last_result`` is the
         # cross-run dedup context build_cron_session_context prepends as "do
         # NOT repeat", and a run starved here produced no result to replace it
         # -- clearing it would make the NEXT run repeat content it had already
@@ -1507,7 +1525,9 @@ def _vet_at_claim_then(
     occupying a cron worker for the queue's duration, and it leaves the gate's
     starvation/retention plumbing (``gate_starved`` ->
     ``run_never_started``) untouched.  The cost is one extra governance
-    evaluation, and for scripts one extra capped body read, per EXECUTED run.
+    evaluation per EXECUTED run, plus for a command one extra composition scan of
+    its body (length-capped by ``mcp_cron._CRON_MAX_COMMAND_SCAN``) and for a
+    script one extra capped body read.
     That work runs inside a worker this job already holds, so unlike gating on
     this pool it puts no policy check behind other jobs' queue -- the property
     the governance-pool split at the call sites protects.  It does count against
@@ -2707,7 +2727,14 @@ class GatewayOrchestrator:
 
                 if _parent_slot_key:
                     _ps = (self.dashboard_state._slots or {}).get(_parent_slot_key)
-                    if _ps and _ps._trust and not _child_grant_eligible:
+                    # The same verdict the slot's own tool approvals take: the
+                    # human's session flag OR a live SafetyOverride scoped grant,
+                    # re-checked here per request and never renewed from here.
+                    _ps_trusted = bool(_ps) and _slot_is_trusted(_ps)
+                    _ps_via_scope = (
+                        _ps_trusted and _auto_approve_reason(_ps, False) == "trust_scope"
+                    )
+                    if _ps_trusted and not _child_grant_eligible:
                         # Slot IS trusted; the fidelity gate is what blocks
                         # the auto-approve. A distinct audit reason — an
                         # auditor reading "not_trusted" for a trusted slot
@@ -2718,7 +2745,15 @@ class GatewayOrchestrator:
                             outcome="not_auto_approved",
                             resources=_safe_title,
                         )
-                    elif _ps and _ps._trust:
+                    elif _ps_via_scope:
+                        _sel_log(
+                            caller=f"slot:{_parent_slot_key}",
+                            operation=f"{source}.trust_scope_auto_approve",
+                            outcome="ok",
+                            resources=f"scope:{getattr(_ps, '_trust_scope', '')} {_safe_title}",
+                        )
+                        return True
+                    elif _ps_trusted:
                         _sel_log(
                             caller=f"slot:{_parent_slot_key}",
                             operation=f"{source}.scoped_trust_auto_approve",
@@ -3542,13 +3577,7 @@ class GatewayOrchestrator:
         from kiro_crew.vector_memory import VectorMemoryStore
 
         self.vector_memory = VectorMemoryStore(
-            confidence_threshold=self._cfg.memory.semantic_confidence_threshold,
-            extra_prefixes=self._cfg.memory.semantic_keys or None,
-            episodic_limit=self._cfg.memory.episodic_max_results,
-            episodic_max=self._cfg.memory.episodic_max_count,
-            embedding_dim=self._cfg.memory.embedding_dim,
-            decay_rates=self._cfg.memory.decay_rates or None,
-            dedup_threshold=self._cfg.memory.episodic_dedup_threshold,
+            embedding_dim=self._cfg.memory.embedding_dim, config=self._cfg
         )
         # Preserve one object for context, consolidation and the dashboard;
         # its database opens only in the authorized preparation worker.
@@ -3963,7 +3992,17 @@ class GatewayOrchestrator:
             # sub-agent's diff or log dump is exactly that shape. The shared
             # splitter seals each chunk with a synthetic closer and reopens the
             # next with the original opener line.
-            parts = chunk_for_transport(safe_text, transport.capabilities)
+            # ``redactor=redact_via_context``: the seam check must grade with the
+            # SAME context-aware pair the display pass above uses, not the shared
+            # sink's default -- a companion-contributed credential split across a
+            # transport seam is invisible to the narrower default pair and would
+            # ship whole across two adjacent messages.
+            parts = await asyncio.to_thread(
+                chunk_for_transport,
+                safe_text,
+                transport.capabilities,
+                redactor=redact_via_context,
+            )
             for part in parts:
                 # Stop on the first UNCONFIRMED part rather than pressing on: the
                 # remaining chunks of a message whose head never landed would arrive
@@ -4488,6 +4527,79 @@ class GatewayOrchestrator:
 
             # Snapshot the job before yielding; reloading a cron cannot rebind it.
             cron_agents = list(job.agent_sequence)
+            # ── Default-agent fallback (LLM jobs) ──
+            # A job with no explicit agent_id must run the configured default
+            # agent (config.agent.default_agent), matching the chat transports'
+            # fallback (transport_dispatch: `self.agent or cfg.agent.default_agent`).
+            # Without it the empty selector reaches dispatch as AcpClient's
+            # "kirocrew" floor -- an agent whose config carries none of the
+            # default agent's MCP servers, so agent-less cron sessions silently
+            # run without the expected toolset.
+            #
+            # Resolved ABOVE the branch and applied BELOW it, to the dispatched
+            # agent only -- never to the captured execution identity -- and only
+            # where the resolved agent is still the bare "kirocrew" floor. All
+            # three halves are load-bearing:
+            #   * Above the branch, because every record created since the
+            #     execution-context migration carries `execution_context` and so
+            #     takes the other arm. Resolving inside `else:` reaches only
+            #     pre-migration jobs and leaves the reported symptom in place for
+            #     everything created since.
+            #   * Not into the capture, because `cron_execution` is what
+            #     `bind_session_execution` publishes under the session key, and a
+            #     persistent_session job (the default) reuses the stable key
+            #     `cron:{job.id}` on every fire. That binder is called
+            #     positionally, so `replace_existing` is False, and it refuses a
+            #     candidate that differs from what is already recorded. A job that
+            #     has already run holds `template_id="kirocrew"`; folding the
+            #     default into the captured identity changes that field, so every
+            #     later fire raises "session already belongs to another execution"
+            #     before get_or_create -- not transient, caught nowhere in this
+            #     callback, one recorded failure per fire until the job
+            #     auto-pauses. Leaving the captured identity alone is also what
+            #     keeps the resolved name out of the durable store.
+            #   * Floor-gated, because a captured `template_id` that names a real
+            #     template is a deliberate selection and must survive; see the
+            #     gate below.
+            # job.agent_id is never mutated: the snapshot is deliberately immune
+            # to later mutation ("captured selectors, never the scheduler's
+            # mutable job"), and a declared agent_sequence owns its own dispatch
+            # and is left untouched. agent_sequence_dispatches is the ONE spelling
+            # of "the sequence owns dispatch": a lone entry is dormant and
+            # dispatch falls through to agent_id, which must still get the default.
+            # Typed deliberately: a malformed or non-str configured default must
+            # not reach the dispatched agent kwarg, so it degrades to the existing
+            # "kirocrew" floor instead of failing the dispatch.
+            _default_agent = ""
+            # True once the dispatched agent came from ``agent.default_agent``.
+            # That field is the TEMPLATE namespace (config/sections.py, free-form
+            # str, no alias validation) -- unlike the alias-namespaced default,
+            # which has its own `default_agent_not_alias` guard. The collapse in
+            # _resolve_cron_agent treats ANY name that keys ``cfg.agents`` as a
+            # crew alias, so without this flag a default that merely shares a
+            # name with a crew member would hand an agent-less cron that crew's
+            # workspace and capability MCP servers -- a silent capability and
+            # identity widening, announced at DEBUG only.
+            _default_substituted = False
+            _agentless_job = not (job.agent_id or "").strip() and not agent_sequence_dispatches(
+                job.agent_sequence
+            )
+            if _agentless_job:
+                try:
+                    # Prefer the last APPLIED reload over the boot snapshot.
+                    # agent.default_agent carries no restart=True mark, so the
+                    # config watcher adopts a dashboard/CLI change live, while
+                    # self._cfg is rebuilt only by unrelated MCP handlers. A
+                    # boot-only read would keep dispatching the "kirocrew" floor
+                    # after an operator sets a default -- the exact symptom this
+                    # hunk removes -- until a gateway restart or an incidental
+                    # reload. Same one-liner the sibling resolver below uses.
+                    _cfg_now = live.snapshot() or self._cfg
+                    _configured = _cfg_now.agent.default_agent
+                    if isinstance(_configured, str):
+                        _default_agent = _configured.strip()
+                except Exception:
+                    _default_agent = ""
             if job.execution_context is not None:
                 cron_execution = execution_from_record({"execution_context": job.execution_context})
             else:
@@ -4514,9 +4626,141 @@ class GatewayOrchestrator:
                 cron_execution.store.legacy_name,
                 cron_execution.template_id,
             )
+            # The configured default lands HERE and nowhere else: cron_agent is
+            # read only by _resolve_cron_agent and the `agent=` kwargs below, none
+            # of which any durable record compares.
+            #
+            # Gated on the resolved agent still being the bare "kirocrew" floor,
+            # which is the whole of what this change replaces. A record whose
+            # captured template_id names a REAL template keeps it: a schedule
+            # created from a template chat with no `agent` argument names its
+            # template ONLY there, `agent_id` staying empty: bind_cron_memory
+            # (cron_service/identity.py:143-152) captures the CREATOR session's
+            # execution, and overwrites template_id only `if job.agent_id`. So
+            # an agent_id-only gate reads that job as agent-less. Overriding it
+            # would re-point the job onto the default on every fire while its
+            # captured execution and memory store stayed the original template's,
+            # and dispatched_agents_from_disk -- the delete guard's ONE walk of
+            # the dispatch-mirroring rule -- still reported the old agent: guard
+            # and dispatch would drift, which is the same silent wrong-agent class
+            # this change removes, reintroduced on the other arm. Compared after
+            # .strip() so a whitespace-only capture counts as the floor, which is
+            # where whitespace agent_id handling lives now that the capture itself
+            # is left byte-for-byte alone.
+            # Also gated on the capture carrying no member_id. A cron created
+            # from a crew member's chat is captured by resolve_member_execution
+            # as a MEMBER execution whose template_id is
+            # `agent.kiro_agent or "kirocrew"` -- so a member whose agent names
+            # no kiro_agent captures the floor spelling with agent_id empty, and
+            # a floor-only gate reads it as "selected nothing". Substituting
+            # there makes build_message inject the substituted template's system
+            # prompt and documents into that member's envelope while
+            # _resolve_cron_agent still dispatches the member's own kiro_agent,
+            # and attributes the usage row to the substituted name. Requiring
+            # member_id to be unset narrows the override to a capture that
+            # really did select nothing.
+            #
+            # member_id ALONE does not narrow it far enough. A member predating
+            # the identity migration persists no member_id at all, and
+            # `with_template` states the rule that admits it: such a record "is
+            # named by ``selection_kind == \"member\"`` and ``selection_name``
+            # alone" (execution_context.py). ExecutionContext.__post_init__
+            # constrains selection_kind to exactly "member" or "template", so
+            # the namespace is the authoritative answer to "did this capture
+            # select a member?" and member_id is only its persisted form.
+            # Requiring BOTH keeps a legacy member on an unmigrated store out of
+            # the override, which a member_id-only gate admitted.
+            #
+            # And BOTH capture gates together are still not enough, because on
+            # the `job.execution_context is None` arm cron_execution is
+            # RECONSTRUCTED, not loaded: resolve_legacy_execution calls
+            # execution_for_store, which for a V1 store returns
+            # `ExecutionContext(None, MemoryStoreRef(name), "template", ...)` --
+            # hardcoding a null member_id and the "template" namespace whatever
+            # the schedule actually selected. A member cron predating the
+            # migration therefore passes both capture gates while job.member_id
+            # still names the member, and resolve_cron_memory deliberately keeps
+            # that record dispatching rather than raising
+            # (cron_service/identity.py: "Older V1 schedules may still carry the
+            # historical member selector beside their explicit legacy store"),
+            # with nothing backfilling execution_context on load. So the JOB is
+            # asked as well: on that arm it is the only surviving evidence of the
+            # selection. A truthy non-str also declines, which is the safe
+            # direction -- declining leaves the pre-change floor behaviour.
+            if (
+                _default_agent
+                and (cron_agent or "").strip() in ("", "kirocrew")
+                and not job.member_id
+                and not cron_execution.member_id
+                and cron_execution.selection_kind != "member"
+            ):
+                # ── Spawn-allowlist divergence gate ──
+                # The substitution reaches the dispatched `agent=` only, while
+                # bind_session_execution publishes the UNSUBSTITUTED capture
+                # under `cron:{job.id}` -- which it must, for the auto-pause
+                # reason above. Both spawn entry points derive the parent's
+                # declaration from that record alone: read_session_execution(
+                # parent) -> parent_spawn_allowlists(execution.template_id), in
+                # dashboard/handlers/messaging.py and the off-loop twin in
+                # subagent.py. The floor spelling resolves to `()`, which
+                # _vet_parent_available_agents admits as "no declaration to
+                # honour" -- so a toolsSettings.subagent.availableAgents list on
+                # the substituted template is never consulted and a child it
+                # forbids starts.
+                #
+                # Honouring it properly means a NON-DURABLE parent execution the
+                # spawn gate reads, in two files this change does not touch and
+                # whose reviewers are scoped to spawn admission, not cron. So
+                # this change narrows itself instead: a default that declares an
+                # allowlist is not substituted, and the job keeps the floor it
+                # already had before this change. Nothing an operator has today
+                # regresses; the capability simply waits for that CR.
+                #
+                # DENY BY DEFAULT. A non-empty tuple declines, and so does the
+                # reader's `None`. Only `()` -- "no readable spec declares this
+                # name, and every spec file parsed" -- permits the substitution.
+                #
+                # An earlier revision substituted on `None`, arguing the spawn
+                # gate would refuse anyway because it asks about the CAPTURE's
+                # floor spelling. That premise is false: `agent.py` generates and
+                # installs `kirocrew.json` into the agents directory and
+                # `config/defaults.json` declares `"name": "kirocrew"`, so a
+                # readable spec DOES declare the floor name -- and
+                # `parent_spawn_allowlists` answers `None` only when NO readable
+                # spec declares the name while some file could not be read. For
+                # the floor it therefore returns `()`, "no declaration to
+                # honour", and the gate ADMITS. `None` is exactly the state where
+                # a restrictive declaration may be sitting in the spec file the
+                # hardened reader refused, in a shared user-writable directory,
+                # so letting a falsy value skip the check is the deny-by-default
+                # violation this clause exists to avoid.
+                from kiro_crew.subagent import parent_spawn_allowlists as _spawn_allowlists
+
+                _declared = await asyncio.to_thread(_spawn_allowlists, _default_agent)
+                if _declared or _declared is None:
+                    logger.warning(
+                        "Cron '%s': default agent %r %s, and the captured "
+                        "execution's floor template cannot carry that declaration to "
+                        "the spawn gate; keeping the floor for this fire rather than "
+                        "dispatching a restricted agent whose allowlist would not be "
+                        "honoured",
+                        job.name,
+                        _default_agent,
+                        (
+                            "declares toolsSettings.subagent.availableAgents"
+                            if _declared
+                            else "has an unreadable agent spec, so its "
+                            "toolsSettings.subagent.availableAgents is unknown"
+                        ),
+                    )
+                else:
+                    cron_agent = _default_agent
+                    _default_substituted = True
 
             def _resolve_cron_agent(
                 alias: str | None,
+                *,
+                template_namespace: bool = False,
             ) -> "tuple[str | None, str | None, str | None]":
                 """Resolve a cron agent alias to (kiro_agent, cwd, crew_alias).
 
@@ -4546,6 +4790,31 @@ class GatewayOrchestrator:
                 """
                 if not alias:
                     return None, None, None
+                # A template-namespace name is NOT a crew alias, even when it
+                # happens to key ``cfg.agents``. ``agent.default_agent`` is a
+                # free-form str in the template namespace with no alias
+                # validation (config/sections.py), so an operator naming a crew
+                # member there is ordinary input -- and the collapse below keys
+                # only on membership in ``cfg.agents``, then returns the alias as
+                # ``crew_agent``, which ``resolve_crew_identity`` honours
+                # verbatim. That would give an agent-less cron the named crew's
+                # workspace, pinned model and capability MCP servers, silently
+                # apart from a DEBUG line. Return the EXPLICIT no-crew spelling
+                # rather than the miss tuple the other early returns use: `""`
+                # is what `resolve_crew_identity` documents as opting out of the
+                # fallback ("an explicit crew_agent wins verbatim -- including
+                # \"\""), while `None` is the fallback-ENABLED spelling, so a
+                # `None` here would still let `if agent and agent in
+                # config.agents` reselect the colliding crew (loader.py) and the
+                # bypass would be a no-op. `kiro_agent`/`cwd` stay None so the
+                # name dispatches as the TEMPLATE it was configured as, in the
+                # default workspace.
+                # Consequence to expect, and the intended one: a default that is
+                # really only a crew alias now fails closed and loudly with
+                # "Agent mode '<name>' is not available", instead of quietly
+                # inheriting that crew's identity.
+                if template_namespace:
+                    return None, None, ""
                 try:
                     from kiro_crew.config.loader import (
                         resolve_agent_bindings,
@@ -4794,6 +5063,12 @@ class GatewayOrchestrator:
                             job.last_status = "ok"
                             job.last_error = ""
                             job.record_success()
+                            # Same reason record_success resets consecutive_failures: a run that
+                            # worked proves the job can work, so the shared-death streak that
+                            # substitutes for that counter is reset with it. Without this the
+                            # streak is a LIFETIME total, so after enough deaths the bound is
+                            # permanently tripped and the exemption silently stops applying.
+                            runtime_death.clear_shared_deaths(f"cron:{job.id}")
                         else:
                             # Cleared so displays fall back to last_error below.
                             job.clear_carried_result()
@@ -4809,6 +5084,12 @@ class GatewayOrchestrator:
                     if result.get("status") == "ok":
                         job.last_status = "ok"
                         job.record_success()
+                        # Same reason record_success resets consecutive_failures: a run that
+                        # worked proves the job can work, so the shared-death streak that
+                        # substitutes for that counter is reset with it. Without this the
+                        # streak is a LIFETIME total, so after enough deaths the bound is
+                        # permanently tripped and the exemption silently stops applying.
+                        runtime_death.clear_shared_deaths(f"cron:{job.id}")
                     else:
                         job.last_status = "error"
                         job.last_error = f"command failed (exit_code={result.get('exit_code')})"
@@ -5145,6 +5426,12 @@ class GatewayOrchestrator:
                         job.last_error = ""
                         job.last_status = "ok"
                         job.record_success()
+                        # Same reason record_success resets consecutive_failures: a run that
+                        # worked proves the job can work, so the shared-death streak that
+                        # substitutes for that counter is reset with it. Without this the
+                        # streak is a LIFETIME total, so after enough deaths the bound is
+                        # permanently tripped and the exemption silently stops applying.
+                        runtime_death.clear_shared_deaths(f"cron:{job.id}")
                         try:
                             sel().log_tool_invocation(
                                 session_key=f"cron:{job.id}",
@@ -5189,6 +5476,12 @@ class GatewayOrchestrator:
                         job.last_error = ""
                         job.last_status = "ok"
                         job.record_success()
+                        # Same reason record_success resets consecutive_failures: a run that
+                        # worked proves the job can work, so the shared-death streak that
+                        # substitutes for that counter is reset with it. Without this the
+                        # streak is a LIFETIME total, so after enough deaths the bound is
+                        # permanently tripped and the exemption silently stops applying.
+                        runtime_death.clear_shared_deaths(f"cron:{job.id}")
                         # Deliver Done message and remove job
                         await _deliver_script_result(job, script_msg, remove=True)
                         try:
@@ -5210,6 +5503,12 @@ class GatewayOrchestrator:
                         job.last_error = ""
                         job.last_status = "ok"
                         job.record_success()
+                        # Same reason record_success resets consecutive_failures: a run that
+                        # worked proves the job can work, so the shared-death streak that
+                        # substitutes for that counter is reset with it. Without this the
+                        # streak is a LIFETIME total, so after enough deaths the bound is
+                        # permanently tripped and the exemption silently stops applying.
+                        runtime_death.clear_shared_deaths(f"cron:{job.id}")
                         # Deliver Report message (keep job running)
                         await _deliver_script_result(job, script_msg)
                         try:
@@ -5539,7 +5838,15 @@ class GatewayOrchestrator:
                         extra_env=_cron_extra_env(),
                         cwd=cwd,
                     )
-                    return client, is_new, resumed, False
+                    # A config-option backend refuses a pin without raising and
+                    # stays on its default: the same downgrade as the except
+                    # below, so report it the same way.
+                    return (
+                        client,
+                        is_new,
+                        resumed,
+                        bool(job.model) and provider_model_pin_refused(client),
+                    )
                 except Exception as model_exc:
                     if not job.model:
                         raise
@@ -5698,10 +6005,16 @@ class GatewayOrchestrator:
                                 # requested id would attribute spend to a model
                                 # that never executed. Blank defers to
                                 # model_source, which reports what actually ran.
+                                # A half-applied pair pin bills the bare
+                                # model that ran, not the suffixed pin.
                                 (
                                     ""
                                     if (_seq_downgraded or provider_fallback_active(client))
-                                    else (job.model or "")
+                                    else (
+                                        (job.model and provider_model_pin_partial(client))
+                                        or job.model
+                                        or ""
+                                    )
                                 ),
                                 _turn_usage,
                                 provider=(
@@ -5779,6 +6092,14 @@ class GatewayOrchestrator:
             # Set when the gate verdict below already counted this run, so the
             # exception handler does not count it a second time.
             _gate_counted = False
+            # The provider THIS run acquired, held for the failure handler's
+            # attribution question. Captured here rather than looked up when the
+            # failure is handled, because by then the runtime is gone: the
+            # ACP-death arm resets the session before it retries, and the retry
+            # frame's own finally resets again on unwind -- so a lookup by key
+            # answers None, or worse the REPLACEMENT provider, and either one
+            # reads as "this job's own fault".
+            _run_provider: object | None = None
             # Post-compaction re-injection bookkeeping for the finally: consumed
             # the one-shot flag / turn landed. Stop reason captured through
             # on_complete, as on the sequential path above.
@@ -5795,11 +6116,102 @@ class GatewayOrchestrator:
                 # Collapse an alias (channel-bound agent) to its real kiro mode
                 # + workspace before dispatch; falls back to the raw value when
                 # it is already a real mode or unset.
-                _single_kagent, _single_cwd, _single_crew = _resolve_cron_agent(cron_agent or None)
+                _single_kagent, _single_cwd, _single_crew = _resolve_cron_agent(
+                    cron_agent or None, template_namespace=_default_substituted
+                )
+                _dispatch_agent = _single_kagent or cron_agent or None
+                # ── Retained-session agent guard (substituted default only) ──
+                # The cron key is the stable f"cron:{job.id}", and the run's
+                # `finally` DEFERS the reset while sub-agents are pending or an
+                # injection is in flight, so a session can outlive its fire. The
+                # claim path then returns that live `session.provider` by key
+                # WITHOUT comparing the `agent` kwarg (session_allocation.py's
+                # `existing is not None and not recycling` arm), so a default
+                # narrowed between fires would build the NEW agent's context and
+                # run it on the OLD agent's process -- keeping MCP servers, a
+                # workspace and a pinned model the operator has just taken away.
+                #
+                # This window is opened by THIS change and by nothing else:
+                # before it an agent-less cron dispatched the constant
+                # "kirocrew" floor on every fire, so no two fires could differ.
+                # Hence the gate on `_agentless_job` -- the predicate that
+                # defines the window -- and NOT on `_default_substituted`, which
+                # failed open in exactly the case this guard exists for: fire N
+                # substitutes and defers its reset, the operator then CLEARS
+                # `agent.default_agent`, and fire N+1 resolves an empty default,
+                # so that flag is False, the guard is skipped, and the fire runs
+                # the FLOOR's context on the process still holding the previous
+                # default's runtime. Every other reason for declining the
+                # substitution below reaches the same hole. Keying on the
+                # mismatch itself costs nothing elsewhere: a job pinning its own
+                # agent_id dispatches one name forever, and a dispatching
+                # sequence runs on per-agent keys (f"cron:{job.id}:{agent}") that
+                # already separate the sessions -- both are excluded by this
+                # predicate, so no fire this change does not touch is deferred.
+                #
+                # DEFER, never reset: a retained session implies pending
+                # sub-agent work -- the no-pending case already reset in the
+                # prior fire's `finally` -- so resetting to get a correct agent
+                # would destroy work in flight, which is strictly worse than
+                # skipping one fire. The retention is temporary by construction
+                # (`_subagent_done` resets after the last one lands) and the
+                # reaper still targets this key if that reset hangs, so the
+                # deferral cannot become permanent. `_defer_cron_before_dispatch`
+                # is the established spelling: the run counts as neither success
+                # nor failure, so a skipped fire cannot walk a job toward
+                # auto-pause, and `run_never_started` keeps a delete_after_run
+                # job from being consumed by a fire that ran no line.
+                #
+                # The active-session-key registration above is deliberately
+                # LEFT in place: a session really is still live under this key,
+                # which is the same reason the deferred-reset arm leaves it.
+                #
+                # POSITIVE EVIDENCE ONLY. A non-empty `str` from the reader that
+                # differs from the name about to be dispatched is a mismatch; a
+                # manager without the reader, an unreadable answer, a non-`str`,
+                # or "" (no session under the key) all leave this dispatch
+                # exactly as it was. Fail-closed here means refusing the unsafe
+                # REUSE, not treating an unanswerable question as a mismatch --
+                # deferring on a silent reader would stall every agent-less cron
+                # on such a host forever, which is a much larger failure than
+                # the widening being closed. `session.agent` is stored as the
+                # `agent` kwarg verbatim (`agent=agent or ""`), so the two sides
+                # of this comparison are the same spelling by construction.
+                if _agentless_job:
+                    _live_agent = None
+                    try:
+                        _reader = getattr(self.sessions, "_get_session_agent", None)
+                        if callable(_reader):
+                            _live_agent = _reader(session_key)
+                    except Exception:
+                        logger.debug(
+                            "cron '%s': live session agent unreadable", job.name, exc_info=True
+                        )
+                        _live_agent = None
+                    if (
+                        isinstance(_live_agent, str)
+                        and _live_agent
+                        and _live_agent != (_dispatch_agent or "")
+                    ):
+                        logger.info(
+                            "Cron '%s': session retained under agent %r but this fire "
+                            "dispatches %r; deferring rather than reusing its runtime",
+                            job.name,
+                            _live_agent,
+                            _dispatch_agent or "",
+                        )
+                        _defer_cron_before_dispatch(
+                            job,
+                            f"session retained under agent {_live_agent!r} with work "
+                            f"pending; this fire dispatches "
+                            f"{_dispatch_agent or ''!r} and will not reuse it",
+                        )
+                        return None
                 client, is_new, _resumed, _model_downgraded = await _acquire_with_model_fallback(
-                    session_key, _single_kagent or cron_agent or None, _single_cwd, _single_crew
+                    session_key, _dispatch_agent, _single_cwd, _single_crew
                 )
                 _acquired = True
+                _run_provider = client
                 # Same identity publish as the sequential site above — the
                 # single-agent cron turn must publish its pidfile mapping or
                 # spawn_run's parent resolution has no source to walk to.
@@ -5894,11 +6306,16 @@ class GatewayOrchestrator:
                     await persist_token_record_async(
                         session_key,
                         # Blank on a downgrade or an active fallback — see the
-                        # sequential site above / provider_fallback_active.
+                        # sequential site above / provider_fallback_active. A
+                        # half-applied pair pin bills the bare model that ran.
                         (
                             ""
                             if (_model_downgraded or provider_fallback_active(client))
-                            else (job.model or "")
+                            else (
+                                (job.model and provider_model_pin_partial(client))
+                                or job.model
+                                or ""
+                            )
                         ),
                         _turn_usage,
                         provider=_provider,
@@ -6279,6 +6696,101 @@ class GatewayOrchestrator:
                 # and advances dedup state, duplicating the outer handler.
                 if getattr(job, "_acp_retried", False):
                     raise
+                # Was this run's failure this JOB's, or its runtime's? A cron
+                # runtime hosts the job's own sub-agents, so a death there is a
+                # process event several accounts witness -- and five of them
+                # auto-pause a job that has done nothing wrong, which is the
+                # threshold this guard protects. Read the record the death wrote
+                # once, through the provider the manager still holds for this key
+                # (never a pid, which a session must not be able to name).
+                # Unattributable, or a runtime this job was alone on: counted
+                # exactly as before.
+                _job_owns_failure = runtime_death.caused_by_this_session(_run_provider)
+                # Set only when the substitute bound reaches its limit below, and
+                # consumed only beside record_failure(), so the three steps of the
+                # hand-over stay contiguous.
+                _hand_over_streak = False
+
+                def _charge_failure() -> None:
+                    """Charge this run's failure, performing any pending hand-over first.
+
+                    The two are one indivisible move. The hand-over raises the
+                    job's counter to one below the threshold so that the charge
+                    below lands ON it, and forgets the streak whose value it just
+                    transferred -- and none of those three steps may be separated
+                    from the others by an await. ``cancel()`` is a plain
+                    ``task.cancel()`` which, unlike the wake-budget timeout,
+                    charges nothing on its way out, so a torn move would leave the
+                    counter and the streak disagreeing with no writer left to
+                    reconcile them.
+                    """
+                    if _hand_over_streak:
+                        job.consecutive_failures = max(
+                            job.consecutive_failures, _AUTO_PAUSE_THRESHOLD - 1
+                        )
+                        runtime_death.clear_shared_deaths(f"cron:{job.id}")
+                    job.record_failure()
+
+                if not _job_owns_failure:
+                    # Not charging is not the same as never charging. A job whose
+                    # shared runtime dies every run would otherwise re-fire on
+                    # every tick forever, because record_failure() is the only
+                    # actuator auto-pause has. So the exemption is bounded by the
+                    # job's own threshold, counted against the shared runtime
+                    # rather than against the job -- the same substitute bound the
+                    # chat runner and the taskrunner use.
+                    # Keyed to the JOB, never to this run's session key. The
+                    # counter this substitutes for -- job.consecutive_failures --
+                    # lives on the job, while a non-persistent job's session key
+                    # is `cron:{id}:{uuid}`, fresh every run: a streak keyed there
+                    # would never reach 2, so the bound would never fire and the
+                    # exemption would be unbounded for exactly the jobs that most
+                    # need it. A substitute bound is keyed to whatever owns the
+                    # counter it replaces.
+                    _shared_streak = runtime_death.note_shared_death(f"cron:{job.id}")
+                    if _shared_streak >= _AUTO_PAUSE_THRESHOLD:
+                        # At the limit the substitute bound HANDS OVER its
+                        # accumulated value to the counter it stood in for,
+                        # instead of adding a single charge to a counter still at
+                        # zero. Adding one would deliver twice the bound this
+                        # claims: the exemption spends the first
+                        # _AUTO_PAUSE_THRESHOLD deaths, and the job's own counter
+                        # would then need that many charges again, so a job whose
+                        # shared runtime dies every run keeps firing for about
+                        # twice as many runs as a job that was never exempted.
+                        # The hand-over leaves the one charge below to land ON the
+                        # threshold, so record_failure() stays the sole owner of
+                        # both the counter and the pause, and the alert's
+                        # displayed count is the number that actually paused it.
+                        #
+                        # The transfer itself is NOT performed here. It is a
+                        # three-step move -- raise the counter, forget the streak,
+                        # charge the failure -- and every await in this handler
+                        # precedes the counter for the reason the comment beside
+                        # record_failure() gives. Splitting the move across those
+                        # awaits leaves a window: `cancel()` is a plain
+                        # ``task.cancel()`` that charges nothing, so a cancellation
+                        # during the failure alert would leave the counter at
+                        # threshold-1 with the streak already erased, and the next
+                        # failure would pause a job that had not reached the
+                        # threshold. So the decision is recorded now and the move
+                        # happens beside record_failure(), where the three steps
+                        # are contiguous and cannot be torn apart.
+                        _hand_over_streak = True
+                        logger.warning(
+                            "Cron '%s': the runtime it shares has died %d times running — "
+                            "handing the streak to the job's own counter so it pauses now",
+                            job.name,
+                            _shared_streak,
+                        )
+                        _job_owns_failure = True
+                    else:
+                        logger.warning(
+                            "Cron '%s': the runtime it shares died (%d running) — recording the "
+                            "error but not counting it toward auto-pause",
+                            job.name,
+                            _shared_streak,
+                        )
                 # ── Failure dedup: suppress repeated identical crash notifications ──
                 # A chain-exhaustion failure carries the fallback story on the
                 # exception (llm_helpers.FALLBACK_STORY_ATTR); append it so the
@@ -6312,9 +6824,10 @@ class GatewayOrchestrator:
                     # the auto-pause threshold like every other failure path —
                     # unless the gate verdict already counted THIS run, in which
                     # case counting again would pause on arithmetic rather than
-                    # on five distinct failures.
-                    if not _gate_counted:
-                        job.record_failure()
+                    # on five distinct failures, or the failure belonged to a
+                    # shared runtime rather than to this job.
+                    if not _gate_counted and _job_owns_failure:
+                        _charge_failure()
                     if job.auto_paused:
                         logger.warning(
                             "Cron '%s' auto-paused after %d consecutive failures",
@@ -6397,13 +6910,17 @@ class GatewayOrchestrator:
                 # made the DM the only failure surface that still withheld what
                 # the caller already knows.
                 safe_reason = self._slack_safe_fenced(exc_detail)
+                # +1 only when the charge below will actually land. This run's
+                # failure is recorded after the awaited Slack attempt, so the
+                # display count has to add it explicitly -- but it is now gated on
+                # _job_owns_failure, and an exempted run that still claimed
+                # "N+1 consecutive failures" would report a number the counter
+                # driving auto-pause never reached.
+                _display_bump = 1 if (_job_owns_failure and not _gate_counted) else 0
                 if is_dup:
-                    # +1: this run's failure is recorded below, after the
-                    # awaited Slack attempt, so the display count must include
-                    # it explicitly.
                     fail_msg = (
                         f"⏰ *Cron: {safe_name}* ❌ _Job still failing on {escape_mrkdwn(host)}"
-                        f" ({job.consecutive_failures + 1} consecutive failures)"
+                        f" ({job.consecutive_failures + _display_bump} consecutive failures)"
                         f" — check logs._\n```{safe_reason}```"
                     )
                 else:
@@ -6426,7 +6943,7 @@ class GatewayOrchestrator:
                 if is_dup:
                     channel_fail_msg = (
                         f"⏰ Cron: {job.name} ❌ Job still failing on {host}"
-                        f" ({job.consecutive_failures + 1} consecutive failures)"
+                        f" ({job.consecutive_failures + _display_bump} consecutive failures)"
                         f" — check logs.\n{exc_detail}"
                     )
                 else:
@@ -6467,9 +6984,10 @@ class GatewayOrchestrator:
                 # awaited Slack attempt so a timeout cancelling this handler
                 # mid-alert cannot leave the run counted here AND again by the
                 # timeout handler. For the same reason it defers when the gate
-                # verdict already counted THIS run.
-                if not _gate_counted:
-                    job.record_failure()
+                # verdict already counted THIS run, or when the failure belonged
+                # to a runtime this job was sharing rather than to the job.
+                if not _gate_counted and _job_owns_failure:
+                    _charge_failure()
                 if job.auto_paused:
                     logger.warning(
                         "Cron '%s' auto-paused after %d consecutive failures",
@@ -6823,7 +7341,7 @@ class GatewayOrchestrator:
             _fired_sentinel = loop.stop_sentinel_path
             _fired_generation = loop.config_generation
             msg_body = await compose_nudge_body(_fired_message, _fired_sentinel, loop.slot_key)
-            tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+            tagged = f"{nudge_cycle_header(loop)}\n{msg_body}"
         else:
             tagged = wake_message
             _fired_generation = loop.config_generation
@@ -7202,7 +7720,7 @@ class GatewayOrchestrator:
             msg_body = await compose_nudge_body(
                 loop.message, loop.stop_sentinel_path, loop.slot_key
             )
-            tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+            tagged = f"{nudge_cycle_header(loop)}\n{msg_body}"
         else:
             tagged = wake_message
 
@@ -7575,7 +8093,7 @@ class GatewayOrchestrator:
             _fired_sentinel = loop.stop_sentinel_path
             _fired_generation = loop.config_generation
             msg = await compose_nudge_body(_fired_message, _fired_sentinel, loop.slot_key)
-            tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg}"
+            tagged = f"{nudge_cycle_header(loop)}\n{msg}"
         else:
             tagged = wake_message
         # ONE STRING, TWO CONSUMERS, and only an opt-in ``banner`` splits them.
@@ -8565,7 +9083,9 @@ class GatewayOrchestrator:
                 body = f"{body}\n\n{monitor.target}"
                 body, _ = redact_exfiltration_urls(body)
                 body, _ = redact_credentials(body)
-                self.dashboard_state.notify("agent", title, body, meta=meta)
+                self.dashboard_state.notify(
+                    "agent", title, body, meta=meta, channel=MONITOR_CHANNEL
+                )
                 return True
             capped_out = loop.max_cycles and loop.cycle_count >= loop.max_cycles
             # Every branch below except the terminal one explains why the loop stopped
@@ -8650,7 +9170,7 @@ class GatewayOrchestrator:
                     "goal may still be unmet. Reopen the goal popover to raise "
                     "the cap or restart it."
                 )
-            self.dashboard_state.notify("agent", title, body, meta=meta)
+            self.dashboard_state.notify("agent", title, body, meta=meta, channel=MONITOR_CHANNEL)
             return True
         except Exception:
             logger.debug("AutoNudge expiry notification failed", exc_info=True)
@@ -8675,7 +9195,8 @@ class GatewayOrchestrator:
         turn has consumed that announce -- including a retry, because a failure
         before the model consumed the prompt re-queues the same text under a newly
         minted queue id, which a debt keyed on the original id could never match. A
-        wave digest carries its held members' ids too: ``_digest_settle_ids`` is
+        wave digest carries its held members' snapshots too:
+        ``_digest_settle_deliveries`` is
         transferred (not copied), so the run loop's ``_settle_digest_holds`` becomes
         a no-op rather than a second writer.
 
@@ -8690,10 +9211,14 @@ class GatewayOrchestrator:
         # nullability idiom reports a user-stopped agent as completed, and a
         # stopped or failed run already carries its own tombstone whose 7-day
         # post-mortem window a "delivered" write would shorten to the result TTL.
-        owed: list[str] = [] if (flush_only or info.outcome != "completed") else [info.id]
-        held = getattr(info, "_digest_settle_ids", None)
+        owed: list[SubagentDelivery] = (
+            []
+            if (flush_only or info.outcome != "completed")
+            else [SubagentDelivery(info.id, info.elapsed, info.credits)]
+        )
+        held = getattr(info, "_digest_settle_deliveries", None)
         if isinstance(held, list):
-            owed.extend(str(h) for h in held)
+            owed.extend(held)
         try:
             slot.note_pending_subagent_delivery(announce, owed)
         except Exception:
@@ -8703,7 +9228,7 @@ class GatewayOrchestrator:
             return
         info._delivery_queued = True
         if isinstance(held, list):
-            info._digest_settle_ids = []
+            info._digest_settle_deliveries = []
 
     @staticmethod
     def _notif_meta(parent_key: str | None) -> dict[str, str] | None:
@@ -9194,14 +9719,27 @@ class GatewayOrchestrator:
                             info.id,
                             label,
                         )
-                        try:
-                            assert self.sessions is not None
-                            await self.sessions.reset(parent_key)
-                        except Exception:
-                            logger.debug(
-                                "Failed to reset %s after busy exhaustion",
+                        # Same ownership question as the AcpProcessDied arm below:
+                        # the provider being dead is a PROCESS fact, and on a
+                        # shared runtime the process that died was carrying the
+                        # parent and its co-tenants too. Resetting the parent for
+                        # a death it did not cause takes their sessions with it.
+                        if runtime_death.caused_by_this_session(client):
+                            try:
+                                assert self.sessions is not None
+                                await self.sessions.reset(parent_key)
+                            except Exception:
+                                logger.debug(
+                                    "Failed to reset %s after busy exhaustion",
+                                    parent_key,
+                                    exc_info=True,
+                                )
+                        else:
+                            logger.warning(
+                                "Subagent %s: the SHARED runtime died — leaving parent %s "
+                                "to re-acquire on its own next turn",
+                                info.id,
                                 parent_key,
-                                exc_info=True,
                             )
                         if self.subagent_mgr:
                             self.subagent_mgr.notify_injection_failed(
@@ -9215,14 +9753,29 @@ class GatewayOrchestrator:
                             info.id,
                             label,
                         )
-                        try:
-                            assert self.sessions is not None
-                            await self.sessions.reset(parent_key)
-                        except Exception:
-                            logger.debug(
-                                "Failed to reset %s after process death",
+                        # The parent is reset only when the death was the
+                        # PARENT's runtime ending. A sub-agent runs on its
+                        # parent's process, so this handler also catches the
+                        # child's own death -- and resetting the parent for that
+                        # tears down a healthy conversation, plus every other
+                        # tenant's session with it, over a child that failed.
+                        # A single-tenant runtime is reset exactly as before.
+                        if runtime_death.caused_by_this_session(client):
+                            try:
+                                assert self.sessions is not None
+                                await self.sessions.reset(parent_key)
+                            except Exception:
+                                logger.debug(
+                                    "Failed to reset %s after process death",
+                                    parent_key,
+                                    exc_info=True,
+                                )
+                        else:
+                            logger.warning(
+                                "Subagent %s: the SHARED runtime died — leaving parent %s "
+                                "to re-acquire on its own next turn",
+                                info.id,
                                 parent_key,
-                                exc_info=True,
                             )
                         if self.subagent_mgr:
                             self.subagent_mgr.notify_injection_failed(
@@ -9437,7 +9990,8 @@ class GatewayOrchestrator:
             task_text, _ = redact_exfiltration_urls(info.task)
             task_text, _ = redact_credentials(task_text)
             task_text = task_text[:100]
-            body = f"{task_text}\n\n{detail}"
+            usage = format_subagent_usage(info.credits, info.elapsed)
+            body = f"{task_text}\n\nUsage: {usage}\n\n{detail}"
             title, _ = redact_exfiltration_urls(title)
             title, _ = redact_credentials(title)
 
@@ -9447,6 +10001,7 @@ class GatewayOrchestrator:
                 f"{f' ({info.agent})' if info.agent else ''}"
                 f" {status} {emoji}\n"
                 f"Task: {task_text}\n\n"
+                f"Usage: {usage}\n\n"
                 f"{detail}"
                 f"{guard_msg}"
             )
@@ -9517,7 +10072,7 @@ class GatewayOrchestrator:
                             "fail_lines": [],
                             "ok_lines": [],
                             "guard_msgs": [],
-                            "held_ok_ids": [],
+                            "held_ok_deliveries": [],
                             # Members whose delivery is currently held, so the
                             # hold-deadline sweep's timestamps can be cleared
                             # when their chunk finally fires.
@@ -9572,12 +10127,13 @@ class GatewayOrchestrator:
                 # successes are one pointer line (full output stays on disk).
                 if _oc == "completed":
                     bp["ok_lines"].append(
-                        f"— `{info.id}` ✅ {task_text[:80]}{_model_tag}"
+                        f"— `{info.id}` ✅ {task_text[:80]}{_model_tag} · {usage}"
                         + (f"\n  → {result_path}" if result_path else "")
                     )
                 else:
                     bp["fail_lines"].append(
                         f"— `{info.id}` {status} {emoji} · {task_text[:80]}{_model_tag}\n"
+                        f"  Usage: {usage}\n"
                         f"  {detail[:400]}{'…' if len(detail) > 400 else ''}"
                     )
                 _last = bp["total"] > 0 and bp["done"] >= bp["total"]
@@ -9668,7 +10224,9 @@ class GatewayOrchestrator:
                         info._digest_held_at = time.time()
                         bp.setdefault("held_infos", []).append(info)
                         if _oc == "completed":
-                            bp["held_ok_ids"].append(info.id)
+                            bp["held_ok_deliveries"].append(
+                                SubagentDelivery(info.id, info.elapsed, info.credits)
+                            )
                         logger.info(
                             "Subagent %s: completion held for digest chunk (%d/%d done)",
                             info.id,
@@ -9683,7 +10241,7 @@ class GatewayOrchestrator:
                     # Stash the ids on the flushing member: the run loop
                     # settles them only after _on_done (which includes the
                     # routing below) returns without raising.
-                    info._digest_settle_ids = list(bp.get("held_ok_ids", []))
+                    info._digest_settle_deliveries = list(bp.get("held_ok_deliveries", []))
                     # These members are no longer held: stop the hold clock so
                     # the reaper's deadline sweep does not force a second flush
                     # for results this chunk already carries.
@@ -9827,7 +10385,7 @@ class GatewayOrchestrator:
                         bp["fail_lines"] = []
                         bp["ok_lines"] = []
                         bp["guard_msgs"] = []
-                        bp["held_ok_ids"] = []
+                        bp["held_ok_deliveries"] = []
 
             # ── Route completion back to the originating session ──
             # Tab open        → that tab (a channel-born tab mirrors on to its channel)
@@ -10062,7 +10620,7 @@ class GatewayOrchestrator:
                         # ids); stays False when there is nothing to owe — a
                         # failed or stopped solo member settles through its own
                         # failure tombstone, not this ledger.
-                        _owes_delivery = bool(info._digest_settle_ids) or (
+                        _owes_delivery = bool(info._digest_settle_deliveries) or (
                             not _flush_only and info.outcome == "completed"
                         )
                         self._defer_queued_delivery(
@@ -10649,11 +11207,13 @@ class GatewayOrchestrator:
                     # every terminal state whose report could not be injected,
                     # not only successful completions.
                     outcome_line = _injection_notice_outcome(info)
+                    usage = format_subagent_usage(info.credits, info.elapsed)
                     slot.append(
                         "assistant",
                         f"{SUBAGENT_COMPLETION_PREFIX}\n"
                         f"Agent `{info.id}` ❌\n"
                         f"Task: {task_preview}\n\n"
+                        f"Usage: {usage}\n\n"
                         f"Error: {error_text}\n"
                         f"⚠️ Result delivery failed — {outcome_line}",
                         "msg msg-a",
@@ -12135,6 +12695,9 @@ class GatewayOrchestrator:
         self.dashboard_state._mcp_gateway_apply = self._apply_mcp_gateway_enabled
         self.dashboard_state._mcp_gateway_apply_stub = self._apply_mcp_stub
         self.dashboard_state._mcp_resolve_refresh = self._refresh_mcp_resolutions
+        # Read by the dashboard restart handler, which execs without running
+        # ``_shutdown``: the broker this process owns must still die with it.
+        self.dashboard_state._mcp_gateway_stop = self._stop_mcp_broker
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -12428,6 +12991,9 @@ class GatewayOrchestrator:
 
         assert isinstance(provider, UpdateProvider)
 
+        # Say who owns updates on every path, "already latest" included, so the
+        # dashboard need not run its own check to learn it.
+        _update_info["managed_by"] = MANAGED_BY_COMMAND
         result = await provider.check()
 
         # The mandatory floor is an enterprise ceiling and is evaluated FIRST,
@@ -12612,6 +13178,19 @@ class GatewayOrchestrator:
                 logger.warning("Update restart fence lost to real shutdown; deferring restart")
                 return
             await sessions.close_all()
+
+        # The broker this gateway spawned dies with it, the same as ``_shutdown``
+        # does on a clean exit; an adopted daemon belongs to its own owner and is
+        # left alone, as ``GatewayManager.shutdown`` already does. The exec below
+        # skips that shutdown, and the successor can only replace a survivor whose
+        # owner pid is its own (an exec that kept the pid) or gone. Through a
+        # launcher that runs the new gateway as a child, this pid lives on as its
+        # supervisor: the daemon's owner-liveness check keeps passing, and the
+        # successor refuses a broker "owned by another live gateway" for its whole
+        # lifetime. Sessions are closed, so nothing is mid-call. The stop never
+        # raises and is bounded: the daemon's own drain budget on SIGTERM, then a
+        # SIGKILL and a reap of its pooled backends if the drain does not finish.
+        await self._stop_mcp_broker()
 
         # Any callback that ran while close_all awaited used the synchronous
         # fenced refusal path. Drain pre-fence workers and registered handlers
@@ -13889,13 +14468,31 @@ class GatewayOrchestrator:
         thread re-clears its own late write. The clear lives in the same
         thread as the write (not an event-loop callback) because
         ``os._exit`` can beat any callback still queued on the loop.
+
+        The clear here is ``clear_late_marker_write``, not ``clear_marker``,
+        and the difference is what makes this thread safe to run at an
+        arbitrary time. The shutdown-side clear holds the listener while it
+        runs, so a location still identifies its owner; this thread may run
+        after the listener is free and a replacement gateway has bound the
+        port, where it does not. ``clear_late_marker_write`` therefore deletes
+        no credential at all, so a replacement gateway's clients keep
+        authenticating whatever this thread does, and it declines the marker
+        files outright when the pid record names another process. Its own
+        docstring states what that second scope does not reach: a late write
+        of this generation rewrites the pid record, so marker files a landed
+        late write produced are always removable.
         """
         try:
             run_marker.write_marker(port)
         finally:
             if self._marker_clear_pending.is_set():
                 try:
-                    run_marker.clear_marker(port)
+                    if not run_marker.clear_late_marker_write(port):
+                        logger.debug(
+                            "Late run-marker self-clear declined for port %s: "
+                            "the pid record names another gateway",
+                            port,
+                        )
                 except Exception:
                     logger.debug("Late run-marker self-clear skipped", exc_info=True)
 
@@ -14466,6 +15063,7 @@ class GatewayOrchestrator:
             )
             self._background_tasks.add(_scope_task)
             _scope_task.add_done_callback(self._background_tasks.discard)
+            _scope_task.add_done_callback(log_probe_failure)
 
         # Block until shutdown
         await shutdown_event.wait()
@@ -14563,8 +15161,18 @@ class GatewayOrchestrator:
         # event because the TCP listener died and could not be rebound, so the
         # process was alive but unreachable. That state must never be an
         # exit 0 either -- the supervisor has to relaunch it.
-        exit_code = shutdown_exit_code(watchdog) or listener_guard_exit_code(
-            getattr(self.dashboard_state, "_listener_guard", None)
+        # BOTH guards, because either can be the one that gave up. The second
+        # loopback family's guard normally degrades instead of exiting, but it
+        # escalates to this exit when its sidecar can be neither removed nor
+        # blanked -- a live credential readable for an address nothing holds --
+        # and reading only the primary would turn that escalation into an exit 0
+        # the supervisor does not relaunch.
+        exit_code = (
+            shutdown_exit_code(watchdog)
+            or listener_guard_exit_code(getattr(self.dashboard_state, "_listener_guard", None))
+            or listener_guard_exit_code(
+                getattr(self.dashboard_state, "_secondary_listener_guard", None)
+            )
         )
 
         # Drop this gateway's run-marker BEFORE _shutdown() releases the
@@ -14583,6 +15191,12 @@ class GatewayOrchestrator:
         # os._exit could beat. TimeoutError and a failed write are both
         # caught HERE (not by the outer except) so they still fall through
         # to the clear.
+        # The clear itself is filesystem work -- unlinking the marker, the pid and
+        # start sidecars, and every credential sidecar the listeners published --
+        # so it is offloaded rather than run on the loop. It is AWAITED, not
+        # queued, because the ordering above is the point: the clear has to land
+        # before _shutdown() frees the listener. An awaited thread also cannot be
+        # beaten by os._exit the way a loop callback can.
         try:
             from kiro_crew.instances import run_marker
 
@@ -14605,7 +15219,7 @@ class GatewayOrchestrator:
                             "Run-marker write failed; clearing anyway",
                             exc_info=True,
                         )
-                run_marker.clear_marker(self._dashboard_port)
+                await asyncio.to_thread(run_marker.clear_marker, self._dashboard_port)
         except Exception:
             logger.debug("Gateway run-marker clear skipped", exc_info=True)
 

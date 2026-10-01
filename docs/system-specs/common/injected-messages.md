@@ -120,6 +120,8 @@ single completion path that serves every terminal outcome:
 Agent `<id>` (<agent name>) <status> <emoji>
 Task: <first 100 chars of the task>
 
+Usage: <credits> credits · <elapsed>
+
 <result detail>
 ```
 
@@ -133,6 +135,17 @@ Task: <first 100 chars of the task>
   content, or in orchestrator mode, it is a summary plus a `result_path` pointer, so
   the parent reads the full transcript on demand (`read`, `grep`, `spawn_status`)
   instead of re-running the sub-agent.
+- Usage is cumulative across all attempted turns in the run, including billed
+  retries that failed before the final turn. Providers that do not report credit
+  billing render this line as `Usage: <elapsed>`; the missing credit label is
+  intentional, and zero is not a claim that the run was free. Reported credits
+  use two decimals below 10 and one decimal at or above 10, matching the
+  dashboard's precision.
+- The same charge is written into the PARENT's crew log as `credits` on
+  `subagent/completed` or `subagent/failed`, and `usage.credits_by_source.subagent`
+  folds it. This line and that entry read the one accumulator, so they cannot
+  disagree; the entry drops an unbilled zero rather than writing it, which is the
+  same posture as this line omitting the credit label.
 - A user-stopped agent says so explicitly and instructs the parent not to treat the
   partial output as a finished result or retry it unprompted.
 - A wide wave is delivered in chunks under a sibling prefix,
@@ -175,6 +188,7 @@ session failed (most commonly a delivery timeout). `subagent.py` builds:
 [Subagent completion event]
 Agent `<id>` ❌ <reason>
 Task: <first 100 chars of the task>
+Usage: <credits> credits · <elapsed>
 <outcome line>
 Result saved at: <path> (<n> bytes)
 Use the read tool to retrieve it if needed.
@@ -200,6 +214,8 @@ The result-path lines are present only when a result file exists. **The result i
 on disk**, so use the `read` tool to retrieve it rather than re-running the work.
 
 Three adjacent variants exist for a gateway restart, same prefix:
+These notices omit usage because an interrupted run has no settled terminal
+billing record:
 
 - `⚠️ orphaned by gateway restart` plus `Result saved at: <path>` and
   `Use the read tool to retrieve it.` — only when the run recorded
@@ -292,8 +308,9 @@ permission request. Holding the unanswered request is what makes that race-free:
 the turn is provably in flight, so the notice is queued and folded in at the next
 model-inference boundary — the one right after the rejected tool resolves — and
 the model adapts inside the SAME turn. It is opt-in by positive capability
-(`supports_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
-steer is unchanged.
+(`supports_refusal_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
+steer is unchanged, and so is codex: its user steer rides `_session/steering`, but its
+approval answer cancels the turn and drops what was injected into it.
 
 `should_queue_refusal_recovery` then suppresses the extra turn only when every
 refusal got a notice AND a `steering_consumed` echo accounted for all of them. An
@@ -326,6 +343,84 @@ was never judged and to state the permission it needs). All three are steered
 once, at the shared reject branch, gated on the host-recorded provenance; a
 genuine user refusal records no cause, so kiro-cli's generic denial stays the
 true attribution there and no notice is sent.
+
+**The headless funnel steers the same notice.** `llm_helpers._resolve_permission`
+answers permissions for every surface without a dashboard slot — cron, Slack and
+channel turns driven through `stream_and_collect`, workflows, heartbeat, Meetings
+transcript turns — and `llm_helpers.run_bg_oneliner` answers them for the
+tool-free background one-liners (titles, labels, summaries). Each host deny there
+awaits `deny_notice.steer_refusal_notice` through the module's
+`_steer_host_deny` immediately before `reject_tool`, naming its cause per site:
+
+- `policy` — a safety rule judged the call itself: an always-deny pattern hit, a
+  hook `deny`, the shared permission floor refusing an `AUTO_APPROVE` call.
+  Carries the class remediation.
+- `surface_policy` — the SURFACE refused the call, not a rule about the call:
+  the reject-all and read-only tool policies, the tool-free one-liner, and a
+  name-based grant withheld on a surface with no approver to fall back to. No
+  remediation, because it is keyed off the reason and the model's own title, and
+  on a surface where no tool can run (or no one can approve) it would name a
+  sanctioned command the model cannot run there; the withheld-grant reason is
+  host-authored and carries no rule identity, so the title would be the only
+  anchor.
+- `invalid_name` — the call carried no title, the one deny the model can fix.
+
+The one genuine user rejection on that funnel (the interactive approver said no)
+sends no notice. Two orderings are load-bearing at every site and are pinned by
+a source-walking test (`test_llm_helpers_deny_notice.py`): the SEL audit row is
+written BEFORE the steer and the reject (both await the ACP pipe, and a stalled
+pipe cancels the coroutine at the turn deadline — an audit sequenced after them
+never runs), and an audit that cannot be written raises before the wire, so a
+deny never proceeds unaudited — the request stays unanswered and the caller's
+own deadline bounds it, exactly as an approval whose audit fails after the wire
+keeps raising. A cancellation that lands inside the
+steer still answers the wire: the reject is scheduled as a strongly referenced
+task whose outcome is read when it settles, and the cancellation re-raises at
+once — the cancellation is the caller's deadline, so nothing waits past it.
+
+**The messaging surfaces steer the same notice.** The native Slack handler
+(`slack/handler.py`) and the channel-neutral `messaging.TurnDriver` each carry
+a thin `_steer_host_deny` that redacts the reason and forwards to
+`deny_notice.steer_refusal_notice`; the channel agent stream (`channel.py`)
+reuses `llm_helpers`' helper (passing the rendered tool name as `title`), since
+its cancellation shape is the same. Each is
+awaited immediately before each host-deny `reject_tool` with the SEL row
+written first. Per site:
+
+- Slack: the PreToolUse hook's `deny` on the message path — `policy`, with the
+  hook's reason; the approval prompt expiring unanswered — `approval_timeout`.
+  A Deny click in
+  `handle_interaction` and the teardown-only `_reject_orphaned_tool` send no
+  notice.
+- Channel agents: the containment boundary refusing a direct-to-user messaging
+  tool — `surface_policy` (the model's way forward is a channel post); the
+  PreToolUse gate's deny — `policy`, with the gate's reason; an approval card the
+  channel cannot show in full — the new `approval_oversize` (nothing was judged;
+  the model can split the request, and the notice says so — kept apart from
+  `approval_undeliverable`, whose guidance is to state the permission needed); a
+  card that expired unanswered — `approval_timeout`. The reader's own Deny on
+  that same card shares its `reject_tool` line and sends no notice: the steer sits
+  under the timeout flag alone.
+- TurnDriver: the deny-every-tool switch for a sender other than the operator —
+  `surface_policy`; the PreToolUse gate's deny — `policy`. A gate built by
+  `messaging.dispatch.build_tool_gate` leaves the hook's reason on itself as
+  `last_deny_reason` (the same attribute-on-a-callable shape as
+  `ApprovalDecider.last_deny_cause`), so the notice names the rule; a plain
+  callable gets a notice naming the gate. The decider path is unchanged: only a
+  recorded `approval_timeout` steers, a human's Deny stays bare.
+
+A cancellation inside any of these steers answers the wire through an orphan
+reject, and that reject audits ONLY where the caller audits after the wire (the
+Slack approval-timeout arm, the TurnDriver's decider path -- `audited=False`);
+an audit-first site (`audited=True`) already has its SEL row, and the ledger is
+append-only, so a second row for one decision would be a duplicate nothing
+reconciles.
+
+`test_messaging_deny_notice.py` enumerates every `reject_tool(` on the three
+surfaces with its verdict (host deny / user rejection / cleanup / mixed) and
+fails when a site is missing from the enumeration, a host deny is not preceded
+by the steer, a user rejection is, or a mixed site's steer is not under its host
+guard.
 
 The recovery classification for the last two rows of the marker table above
 is **structural**: the queue entry
@@ -417,10 +512,16 @@ next turn into the same slot:
 
 ```
 [auto-nudge cycle <N>]
+[patrol budget: cycle <N>/<max_cycles>, <left>s/<max_runtime_secs>s runtime left]
 <nudge message>
 ```
 
 - `N` is `cycle_count + 1`. Only DELIVERED nudges count toward `max_cycles`.
+- The `[patrol budget: ...]` line appears only on a loop with a cycle or runtime
+  cap, and names only the caps it has; an uncapped loop's tag is unchanged. It
+  ends `; 10% or less left` once either budget is at or under 10% of its cap. It states a
+  fact and asks for nothing; the goal-conductor skill is what tells its agent to
+  renew on those cycles (`nudge_cycle_header`).
 - `{{STOP_FILE}}` in the configured message is substituted with the resolved stop
   sentinel path before the tag is prepended.
 - The slot entry uses role `nudge` with a structured `nudge` meta block (`cycle`,
@@ -549,9 +650,9 @@ speech rather than as the user.
 |---|---|---|
 | `[work ledger — …]` | `session_ledger.py` snapshot builder, composed into a nudge by `dashboard/handlers/autonudge.py` | Durable per-session state that outranks the model's recollection of earlier cycles. |
 | `[Hook context:]` … `[End of hook context]` | `context.py` hook-context assembly | Context supplied by a configured hook whose action is `HOOK_INJECT_CONTEXT`; webhook-restored workflow state is one producer, not the envelope's only meaning. The payload is untrusted third-party data. |
-| `[Previous run result — do NOT repeat the same content]` | `cron.py` | A recurring cron's own last output, so the turn reports only what changed. |
+| `[Previous run result — do NOT repeat the same content]` | `cron_service/identity.py` (`build_cron_session_context`) | A recurring cron's own last output, so the turn reports only what changed. |
 | `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`; take the lighter path this turn. |
-| `[Relevant skills for this message]` | `skills.py` pointer renderer | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
+| `[Relevant skills for this message]` | `skill_runtime/delivery.py` pointer renderer (`trigger_hint`) | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
 | `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and learns nothing from the chat — the transcript itself is kept in History for the user, but no lesson, memory or summary is derived from it. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the transcript. |
 
 ## Adding a new envelope

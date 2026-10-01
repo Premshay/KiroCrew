@@ -24,6 +24,7 @@ import { metricColor } from './utils/metricColor'
 import { fetchNotifications, ackNotification, armBootNotificationsFallback } from './store/notificationsSlice'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useDashboardHealthProbe } from './hooks/useDashboardHealthProbe'
+import { useConfigAutolinkRules } from './hooks/useConfigAutolinkRules'
 import { useTheme } from './hooks/useTheme'
 import { useBranding } from './hooks/useBranding'
 import { useRumPageView } from './hooks/useRumPageView'
@@ -36,6 +37,7 @@ import { useFocusMode, useFocusChromeVisible, setFocusChromeVisible, FOCUS_INSET
 import { APP_NAV_ORDER_KEY, buildReorderBaseline, mergeVisibleReorder, readAppNavOrder, useAppNavHidden } from './lib/appNavHidden'
 import { useNavPinned } from './lib/navPinned'
 import { computeHeaderDragGaps, type DragGap } from './lib/dragGaps'
+import { haptic } from './lib/haptic'
 import { isEmbeddedPane } from './lib/embedded'
 import { OVERLAY_Z_MAX, THEME_DECOR_SLOT_ID, TOPBAR_FOCUS_Z, TOPBAR_Z, registerThemeDecorSlot } from './lib/themeDecorLayer'
 import { useHoverIntent } from './hooks/useHoverIntent'
@@ -54,7 +56,7 @@ import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCir
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Btn, Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
-import MeetCrewmatesFlow, { MeetCrewmatesEligibilityNotice } from './components/MeetCrewmatesFlow'
+import MeetCrewmatesFlow from './components/MeetCrewmatesFlow'
 import { useMeetCrewmatesGate } from './hooks/useMeetCrewmatesGate'
 import AgentImportFlow from './components/AgentImportFlow'
 import ErrorNotice from './components/ErrorNotice'
@@ -111,6 +113,10 @@ import LogsPage from './pages/LogsPage'
 // chunk sits at its size budget — the import() boundary keeps the page (and
 // its drawer/roster tree) out of the initial bundle.
 const MembersPage = lazy(() => import('./pages/members/MembersPage'))
+// Lazy for the same reason: the crew work-item board is opened from a conductor
+// session or the Crew page, never at startup.
+const CrewBoardPage = lazy(() => import('./pages/CrewBoardPage'))
+const SessionDashboardsPage = lazy(() => import('./pages/chat/command-center/SessionDashboardsPage'))
 import ArtifactDetailPage from './pages/ArtifactDetailPage'
 import { InAppUpdateFlow } from './pages/settings/AboutPanel'
 import KiroCrewNavBridge from './components/KiroCrewNavBridge'
@@ -119,6 +125,9 @@ import InstancesViewport from './components/InstancesViewport'
 import EmbeddedHostBridge from './components/EmbeddedHostBridge'
 import EmbeddedDragRegionReporter from './components/EmbeddedDragRegionReporter'
 import EmbedTabStrip from './components/EmbedTabStrip'
+// Dev-only layout-editor harness (RFC §7 PR 2). Lazy so it never weighs the main
+// bundle — it is a developer route, not a shipped surface.
+const LayoutEditorHarnessPage = lazy(() => import('./pages/LayoutEditorHarnessPage'))
 import { useUpdateSubscription, type UpdateState } from './hooks/useUpdateSubscription'
 import UpdateModal from './components/UpdateModal'
 
@@ -133,6 +142,7 @@ import { useTerminalPoppedOut, focusPopout as focusTerminalPopout } from './util
 import { setTerminalEnabledFlag } from './utils/terminalRegistry'
 import MigrationCheck from './components/MigrationCheck'
 import CrashReportNotice from './components/CrashReportNotice'
+import { ImportSessionOutcomeNotice } from './components/ImportSessionItem'
 import BuiltinAppRoute from './apps/BuiltinAppRoute'
 import { getBuiltinIcon } from './apps/builtinIcons'
 import { getThemeBranding } from './themeBranding'
@@ -1653,6 +1663,11 @@ export default function App() {
   // in-window navigation back to this frame instead of escaping to '/'.
   const initialPopoutPath = useRef(window.location.pathname + window.location.search).current
   const dispatch = useAppDispatch()
+  // Register the operator's link rules (dashboard.link_patterns) into the
+  // autolink registry from the shell, so every surface linkifies — not only
+  // after a chat page has rendered. Owns the registry; the chat page reuses
+  // the same ['dashboardConfig'] query for its source hosts.
+  useConfigAutolinkRules()
   // The slice also carries the slot list and the subagent maps, so selecting all of
   // it would re-render the root on dashboard traffic neither of these fields reads.
   const connected = useAppSelector(s => s.dashboard.connected)
@@ -1673,6 +1688,9 @@ export default function App() {
   const canApplyUpdate = useAppSelector(s => s.dashboard.status?.update_can_apply)
   const canArmUpdate = useAppSelector(s => s.dashboard.status?.update_can_arm)
   const updateCommand = useAppSelector(s => s.dashboard.status?.update_command) || ''
+  // A policy-pinned command owns updates here and can update on its own, so
+  // the popup shows the policy note; Settings keeps the switch.
+  const updatesManagedByCommand = useAppSelector(s => s.dashboard.status?.update_managed_by) === 'command'
   const updateTargetVersion = useAppSelector(
     s => s.dashboard.status?.update_latest_version_display
       || s.dashboard.status?.update_latest_version
@@ -2438,7 +2456,10 @@ export default function App() {
       sortedAppGroup: sortedAll.filter(n => !appNavHidden.has(n.id)),
     }
   }, [advertisedNavItems, appNavItems, appNavOrder, appNavHidden])
-  const handleAppDragStart = useCallback((e: DragStartEvent) => setActiveAppDragId(e.active.id as string), [])
+  // dnd-kit fires this once the sensor's constraint is met (the 250ms touch hold
+  // or the mouse distance), so the tap marks the pick-up itself, not the touch.
+  // Touch is the only sensor with an engine under it; elsewhere haptic no-ops.
+  const handleAppDragStart = useCallback((e: DragStartEvent) => { haptic('medium'); setActiveAppDragId(e.active.id as string) }, [])
   // Materialize implicit sidebar positions the moment an app is HIDDEN: once
   // an id is in the hidden set, its position must live in the persisted
   // order, because every later event that could erase the implicit source —
@@ -2476,6 +2497,8 @@ export default function App() {
     setActiveAppDragId(null)
     const { active, over } = e
     if (!over || active.id === over.id) return
+    // Past the guard, so the tap means the rail really reordered.
+    haptic('light')
     const ids = sortedAppGroup.map(n => n.id)
     const from = ids.indexOf(active.id as string)
     const to = ids.indexOf(over.id as string)
@@ -2783,6 +2806,7 @@ export default function App() {
   // changelog is going to show" — the startup-video gate needs the second one.
   const [changelogDecided, setChangelogDecided] = useState(false)
   const [autoUpdate, setAutoUpdate] = useState(true)
+  const [autoUpdateError, setAutoUpdateError] = useState('')
   const [fullChangelog, setFullChangelog] = useState('')
   const [showFull, setShowFull] = useState(false)
   const [devMode, setDevMode] = useState(() => localStorage.getItem('mc-dev-mode') === '1')
@@ -3346,7 +3370,7 @@ export default function App() {
       // No qualifying section means this build's release has no notes yet, which
       // is the normal state on a dev build. Say nothing: the modal exists to
       // deliver notes, and one carrying someone else's is worse than none.
-      if (text) { setChanges(text); setShowChangelog(true) }
+      if (text) { setChanges(text); setAutoUpdateError(''); setShowChangelog(true) }
     }).then(() => {
       // Stamp the version ONLY on a response we actually read. The old `finally`
       // stamped it either way, so a single failed fetch retired that version's
@@ -3869,6 +3893,9 @@ export default function App() {
   return (
     <ZoomProvider>
     <WsContext.Provider value={{ subscribeLogs, subscribeSubagents, forceReconnect }}>
+    {/* Above the layout branch, so every layout that can host the import row
+        also hosts its outcome: the row's menu has closed by the time it lands. */}
+    <ImportSessionOutcomeNotice />
     {isPopout ? (
       <Routes>
         <Route path="/popout/chat/:slug?" element={<ErrorBoundary><PopoutFrame /></ErrorBoundary>} />
@@ -4679,11 +4706,16 @@ export default function App() {
             ) : (
               <div className="text-sm text-muted py-4 text-center"><CheckCircle className="lucide-inline" /> {i18nT('app.you_re_on_the_latest_version')}</div>
             )}
-            <div className="flex items-center justify-between mt-4 pt-3 border-t border-border">
-              <span className="text-[13px] text-muted">{i18nT('app.auto_update_on_restart')}</span>
-              <Toggle checked={autoUpdate} label={i18nT('app.auto_update_on_restart')}
-                onChange={async next => { setAutoUpdate(next); await api.setAutoUpdate(next) }} />
-            </div>
+            {updatesManagedByCommand ? (
+              <p className="text-[13px] text-muted mt-4 pt-3 border-t border-border">{i18nT('pages.settings.aboutPanel.updates_managed_by_policy')}</p>
+            ) : (
+              <div className="flex items-center justify-between mt-4 pt-3 border-t border-border">
+                <span className="text-[13px] text-muted">{i18nT('app.auto_update_on_restart')}</span>
+                <Toggle checked={autoUpdate} label={i18nT('app.auto_update_on_restart')}
+                  onChange={async next => { setAutoUpdate(next); setAutoUpdateError(''); try { await api.setAutoUpdate(next) } catch (e) { setAutoUpdate(!next); setAutoUpdateError(String(e instanceof Error ? e.message : e)) } }} />
+              </div>
+            )}
+            {autoUpdateError && <ErrorNotice className="mt-3" askAgent title={i18nT('pages.overview.agentCfgTab.save_failed')} message={autoUpdateError} onHandoff={() => setShowChangelog(false)} />}
             <div className="mt-3 pt-3 border-t border-border">
               <button className="text-[13px] text-muted cursor-pointer hover:text-text transition-colors bg-transparent border-none p-0 font-body" onClick={async () => {
                 if (!showFull) { if (!fullChangelog) { const d = await api.changelog(); setFullChangelog(d.content || '') }; setShowFull(true) } else { setShowFull(false) }
@@ -4782,16 +4814,11 @@ export default function App() {
           onComplete={endFirstRun}
           onSkipAll={endFirstRun}
         />
-        {/* First-run chapter 4 — Meet CrewMates. Fires once, after the tour,
-            only for a user with no crewmates and no custom agents; also
-            reopened from the Crewmates page (mc-start-meet-crewmates). */}
+        {/* First-run chapter 4 — Meet CrewMates. Fires once per workspace:
+            after the tour for a new user, or on the first Crewmates page
+            visit; also reopened from that page (mc-start-meet-crewmates). */}
         <MeetCrewmatesFlow open={meetCrewmates.open} onDone={meetCrewmates.onDone} onCreated={meetCrewmates.onCreated} persistFailed={meetCrewmates.persistFailed} />
       </OnboardingShellHost>
-      {meetCrewmates.eligibilityError && !meetCrewmates.open && (
-        /* The Meet CrewMates eligibility read failed, so the chapter cannot
-           decide whether to fire. Said here rather than swallowed. */
-        <MeetCrewmatesEligibilityNotice onDismiss={meetCrewmates.dismissEligibilityError} />
-      )}
 
       {/* Mobile backdrop — opacity is animated by animateDrawer in lockstep
           with the panel (compositor), so there is no framer fade here; it
@@ -5217,7 +5244,11 @@ export default function App() {
                       the mark-to-text distance to 6px and cost 4px the budget
                       below never accounts for. Spacing is explicit per child instead. */}
                   <span className="flex items-center shrink-0 text-muted"><GithubIcon size={15} /></span>
-                  <div className="rail-community-links flex items-center gap-[5px] flex-1 min-w-0 ml-1.5 text-[12px]">
+                  {/* `flex-wrap`: in a locale where "Star us" and "Report issue" together
+                      outrun the rail (the pseudolocale does, and so will any long-word
+                      language), the second link drops to its own line with the full
+                      row width instead of truncating to a third of itself. */}
+                  <div className="rail-community-links flex flex-wrap items-center gap-x-[5px] gap-y-0.5 flex-1 min-w-0 ml-1.5 text-[12px]">
                     <a href="https://github.com/kirodotdev/KiroCrew" target="_blank" rel="noopener noreferrer" title={i18nT('app.star_kirocrew_on_github')} aria-label={i18nT('app.star_kirocrew_on_github')} className="shrink-0 rounded text-muted hover:text-text transition-colors">{i18nT('app.star_us')}</a>
                     <span aria-hidden="true" className="shrink-0 opacity-40">·</span>
                     {/* "Report issue" opens the SAME diagnostics flow as Settings ›
@@ -5343,11 +5374,13 @@ export default function App() {
             {/* Bookmarkable session chooser: neutral list, no auto-select; rows
                 open the full /chat/<key> experience inside this same shell. */}
             <Route path="/sessions" element={<ErrorBoundary><Suspense fallback={null}><SessionsPage /></Suspense></ErrorBoundary>} />
+            <Route path="/session-dashboards" element={<ErrorBoundary><Suspense fallback={null}><SessionDashboardsPage /></Suspense></ErrorBoundary>} />
             {/* Knowledge moved into Agent Capabilities; old bookmarks land on its tab. */}
             <Route path="/knowledge" element={<Navigate to="/capabilities?tab=knowledge" replace />} />
 
             <Route path="/members" element={<ErrorBoundary><Suspense fallback={null}><MembersPage /></Suspense></ErrorBoundary>} />
             <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
+            <Route path="/crew-board" element={<ErrorBoundary><Suspense fallback={null}><CrewBoardPage /></Suspense></ErrorBoundary>} />
             <Route path="/schedule" element={<SchedulePage />} />
             {/* Agents and Connections live in the Agent Capabilities panel. */}
             <Route path="/agents" element={<Navigate to="/capabilities" replace />} />
@@ -5377,6 +5410,9 @@ export default function App() {
                 Matches bare /settings too (empty splat). */}
             <Route path="/settings/*" element={<SettingsPage />} />
             <Route path="/developer" element={<DeveloperPage />} />
+            {/* Dev-only layout-editor harness (RFC §7 PR 2) — a standalone route
+                to exercise the editor in isolation. Not linked from nav. */}
+            <Route path="/developer/layout-editor" element={<ErrorBoundary><Suspense fallback={null}><LayoutEditorHarnessPage /></Suspense></ErrorBoundary>} />
             <Route path="/artifacts" element={<ArtifactsPage />} />
             <Route path="/artifacts/deploy" element={<Navigate to="/deploy" replace />} />
             <Route path="/artifacts/remote/:provider/:externalId" element={<ErrorBoundary><RemoteArtifactDetailPage /></ErrorBoundary>} />

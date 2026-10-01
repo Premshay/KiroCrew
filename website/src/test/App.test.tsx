@@ -433,7 +433,7 @@ describe('App routing', () => {
   })
 
   // CapabilitiesPage is a lazy route chunk, so it lands after a Suspense tick.
-  it('redirects /agents to the Agent Capabilities panel', async () => {
+  it('redirects /agents to the Customize panel', async () => {
     renderWithProviders(<App />, { route: '/agents' })
     expect(await screen.findByTestId('capabilities-page')).toBeInTheDocument()
   })
@@ -511,7 +511,7 @@ describe('App routing', () => {
   it('renders nav items', () => {
     renderWithProviders(<App />, { route: '/chat' })
     expect(screen.getByText('Sessions')).toBeInTheDocument()
-    expect(screen.getByText('Agent Capabilities')).toBeInTheDocument()
+    expect(screen.getByText('Customize')).toBeInTheDocument()
     expect(screen.getByText('Settings')).toBeInTheDocument()
     // PR1 App Store split: the single 'Explore' entry is gone — the sidebar
     // now carries TWO App Store rows, Discover (/apps) and Library
@@ -2271,5 +2271,21 @@ describe('Kiro credits pill — edge cases', () => {
     // pill (which would otherwise show "NaN / NaN") never appears.
     await waitFor(() => expect(screen.queryByTitle('Kiro credit usage')).not.toBeInTheDocument())
     expect(screen.queryByText(/NaN/)).not.toBeInTheDocument()
+  })
+})
+
+describe('import outcome notice', () => {
+  it('is mounted once, above the layout branch, so every layout renders it', () => {
+    // The row's menu closes on the picker's blur, so an import's outcome only
+    // reaches the user through this notice. The popout, embed and dashboard
+    // layouts each render a session menu; mounting above the branch that picks
+    // among them is what keeps a new layout from shipping without it.
+    // Read from source: standing up the popout and embed shells here would
+    // mean faking the window-level flags each branch keys on.
+    const src = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8')
+    const mounts = src.split('<ImportSessionOutcomeNotice />').length - 1
+    expect(mounts).toBe(1)
+    expect(src.indexOf('<ImportSessionOutcomeNotice />')).toBeLessThan(src.indexOf('{isPopout ? ('))
+    expect(src.indexOf('<ImportSessionOutcomeNotice />')).toBeGreaterThan(src.indexOf('<WsContext.Provider'))
   })
 })

@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
 
-from kiro_crew import name_grant
+from kiro_crew import name_grant, runtime_death
 from kiro_crew.acp.client import AcpError, AcpProcessDied, AcpPromptBusy, AcpTimeoutError
 from kiro_crew.acp.types import (
     STOP_REASON_CANCELLED,
@@ -60,6 +60,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.config.paths import kiro_agents_dir, peek_data_home
 from kiro_crew.constants import (
     DENY_CAUSE_APPROVAL_TIMEOUT,
+    DENY_CAUSE_POLICY,
     STEER_NOTICE_BOUND_SECS,
     is_control_tag_tail,
     strip_control_comments,
@@ -67,7 +68,7 @@ from kiro_crew.constants import (
 from kiro_crew.context import (
     ContextBuilder,
     build_cancelled_turn_preamble,
-    compress_thread_history,
+    build_session_replay,
     session_store_for_turn,
     window_for_provider_client,
 )
@@ -83,7 +84,7 @@ from kiro_crew.dashboard.chat_utils import (
 from kiro_crew.dashboard.state import append_and_surface
 from kiro_crew.deny_notice import steer_refusal_notice
 from kiro_crew.executors import run_in_embed_pool
-from kiro_crew.history import ConversationLog, HistoryConsolidator
+from kiro_crew.history import HUMAN_TURN_META_KEY, ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import (
     HOOK_REPLY,
     TOOL_AUTO_APPROVE,
@@ -152,7 +153,7 @@ from kiro_crew.security import (
     redact_local_paths,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session import SessionClosingError, SessionManager
+from kiro_crew.session import _CIRCUIT_BREAKER_THRESHOLD, SessionClosingError, SessionManager
 from kiro_crew.slack.blocks import build_working_blocks, deprecation_warning_block
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.format import (
@@ -167,11 +168,18 @@ from kiro_crew.slack.format import (
 )
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.slack.sessions_view import (
-    _SESSIONS_DEFAULT_LIMIT,
     SESSIONS_INCLUDE_ENDED_ARGS,
     _build_sessions_blocks,
     _collect_recent_sessions_off_loop,
+    _message_surface_limit,
     sessions_include_ended,
+)
+from kiro_crew.slack.thread_parent import (
+    fetch_thread_parent,
+    has_prior_turns,
+    is_slack_born,
+    parent_prompt_text,
+    record_thread_parent,
 )
 from kiro_crew.stats import Stats
 from kiro_crew.subagent import SubagentManager
@@ -3907,14 +3915,15 @@ async def handle_message(
         # Auto/unknown ⇒ None ⇒ the 1M reference (unchanged default).
         _model_window = window_for_provider_client(client)
         # is_new = new kiro-cli/dashboard process, NOT new conversation.
-        # The Slack thread persists across processes, so we compress its
-        # history to bootstrap the fresh session's context window.
+        # The Slack thread persists across processes, so we replay its history
+        # to bootstrap the fresh session. Same lossless tail-first replay the
+        # dashboard uses: a process death is not a context overflow, so code
+        # and tool output must come back verbatim, not as an LLM summary.
         if is_new and not resumed and context_builder and context_builder.conversation_log:
-            compressed = await compress_thread_history(
+            compressed = await asyncio.to_thread(
+                build_session_replay,
                 context_builder.conversation_log,
                 session_key,
-                text,
-                sessions,
                 model_window=_model_window,
             )
 
@@ -3950,18 +3959,30 @@ async def handle_message(
         # Fetch thread parent message when starting a new session in an
         # existing thread (e.g. replying to a cron thread).  Gives the LLM
         # context about what started the thread without requiring manual
-        # batch_get_thread_replies.
+        # batch_get_thread_replies. This path persists the user's row only
+        # after the turn, so ``compressed`` is non-empty only when earlier
+        # turns exist. A Slack-born session also records the parent as the
+        # transcript's first row (see ``slack/thread_parent.py``).
         thread_parent_text: str | None = None
         if is_new and not resumed and thread_ts and context_builder:
             if not compressed:
-                thread_parent_text = await slack.fetch_message(channel, thread_ts)
-            if thread_parent_text:
-                thread_parent_text = redact(thread_parent_text)
-                if len(thread_parent_text) > 3000:
-                    thread_parent_text = (
-                        thread_parent_text[:3000]
-                        + "\n[truncated — use batch_get_thread_replies for full text]"
-                    )
+                _record_parent = bool(
+                    conversation_log
+                    and thread_ts != msg_ts
+                    and is_slack_born(session_key)
+                    and not _is_slack_restricted(session_key)
+                    and not await has_prior_turns(conversation_log, session_key)
+                )
+                _thread_parent = await fetch_thread_parent(
+                    slack, channel, thread_ts, with_author=_record_parent
+                )
+                if _thread_parent is not None:
+                    thread_parent_text = parent_prompt_text(_thread_parent)
+                    if _record_parent:
+                        assert conversation_log is not None
+                        await record_thread_parent(
+                            conversation_log, session_key, _thread_parent, agent=_agent
+                        )
 
         if context_builder:
             # Thread-scoped temporary mode: blocks memory reads.
@@ -4414,12 +4435,11 @@ async def handle_message(
                             sel_factory=sel,
                         )
                     if tool_result.action == TOOL_DENY:
-                        await client.reject_tool(event.request_id)
-                        Stats().inc_tool_denial()
-                        # event.title is LLM-authored — redact before posting.
-                        _blocked_title, _ = redact_exfiltration_urls(event.title)
-                        _blocked_title, _ = redact_credentials(_blocked_title)
-                        accumulated += f"\n🚫 _Tool `{_blocked_title}` blocked by hooks._"
+                        # Audit FIRST, then steer, then reject: the steer and
+                        # the reject both await the ACP pipe, and a backend that
+                        # stops reading stdin cancels this coroutine at the
+                        # turn deadline -- an SEL row sequenced after them
+                        # never runs (the chat runner's audit-first rule).
                         sel().log_tool_invocation(
                             session_key=session_key,
                             source="slack",
@@ -4429,6 +4449,22 @@ async def handle_message(
                             request_id=event.request_id,
                             error="hook_deny",
                         )
+                        # A hook deny is a HOST verdict on the call, not the
+                        # person's: tell the model so in-band before the reject
+                        # hands it kiro-cli's "User denied tool execution".
+                        await _steer_host_deny(
+                            client,
+                            event,
+                            tool_result.reason,
+                            cause=DENY_CAUSE_POLICY,
+                            audited=True,
+                        )
+                        await client.reject_tool(event.request_id)
+                        Stats().inc_tool_denial()
+                        # event.title is LLM-authored — redact before posting.
+                        _blocked_title, _ = redact_exfiltration_urls(event.title)
+                        _blocked_title, _ = redact_credentials(_blocked_title)
+                        accumulated += f"\n🚫 _Tool `{_blocked_title}` blocked by hooks._"
                         continue
 
                 # auto_approve_subagent_spawn → auto-approve spawn_run tool calls
@@ -4768,7 +4804,62 @@ async def handle_message(
         _had_error = True
         accumulated = accumulated or "💀 Agent process died. Please try again."
         task.fail("process_died")
-        await sessions.record_failure(session_key)
+        # The circuit breaker counts a session's OWN consecutive failures, and
+        # trips into a reset. A process this session was sharing dying is not
+        # this session's failure, and counting it there is how N co-tenants each
+        # marched their own breaker toward tripping over one process event. The
+        # death was classified once where it was detected; this reads that record.
+        # A single-tenant runtime is charged exactly as before.
+        if runtime_death.caused_by_this_session(client):
+            await sessions.record_failure(session_key)
+        else:
+            # Bounded, like every other exemption: the breaker is what resets a
+            # session whose runtime keeps dying, so an unbounded skip would leave
+            # a session on a permanently dying shared process never recovering.
+            # The streak is counted against that runtime rather than the session.
+            #
+            # At the limit the substitute bound PERFORMS the actuator rather than
+            # adding one charge to the counter it stood in for. Charging instead
+            # would deliver twice the bound it claims: the exemption spends the
+            # first `_CIRCUIT_BREAKER_THRESHOLD` deaths, and a counter still at
+            # zero then needs that many charges again, so a session on a
+            # permanently dying shared runtime would lose about twice as many
+            # turns as one that was never exempted. `record_failure` trips into
+            # exactly this reset, so calling it here is the same recovery at the
+            # limit the breaker would have reached -- and it leaves the session's
+            # own failure count untouched, which is the whole point: the session
+            # never misbehaved.
+            _shared_streak = runtime_death.note_shared_death(session_key)
+            if _shared_streak >= _CIRCUIT_BREAKER_THRESHOLD:
+                logger.warning(
+                    "session %s: the runtime it shares has died %d times running — "
+                    "resetting it now, the same recovery the breaker performs",
+                    session_key,
+                    _shared_streak,
+                )
+                try:
+                    await sessions.reset(session_key)
+                    # The reset IS the hand-over, so the streak is spent: clear it
+                    # or the next shared death hands over again and every death
+                    # from here on performs the actuator, which is the unexempted
+                    # behaviour the bound exists to replace. Cleared only once the
+                    # reset has returned -- a reset that raised transferred
+                    # nothing, and keeping the streak is what makes the next death
+                    # retry it.
+                    runtime_death.clear_shared_deaths(session_key)
+                except Exception:
+                    logger.warning(
+                        "session %s: reset after a shared runtime's deaths failed",
+                        session_key,
+                        exc_info=True,
+                    )
+            else:
+                logger.warning(
+                    "session %s lost a turn to a SHARED runtime's death (%d running) — "
+                    "not counting it toward the circuit breaker",
+                    session_key,
+                    _shared_streak,
+                )
         Stats().inc_message_failed()
     except AcpPromptBusy as e:
         _had_error = True
@@ -4902,6 +4993,11 @@ async def handle_message(
                 return
             _verdict_booked = True
             sessions.record_success(session_key)
+            # Reset with the counter it substitutes for: record_success clears
+            # consecutive_failures, so a completed turn must clear the shared-death
+            # streak too. Otherwise the streak is a LIFETIME total and the bound
+            # stays permanently tripped, silently ending the exemption.
+            runtime_death.clear_shared_deaths(session_key)
             Stats().inc_message_success()
             if client is not None:
                 record_interaction_event(client, session_key, "slack")
@@ -5690,7 +5786,10 @@ async def handle_message(
                 slot_name = linked_session_key.removeprefix("dashboard:")
                 slot = getattr(ds, "_slots", {}).get(slot_name)
                 if slot:
-                    slot.append("user", text, "msg msg-u")
+                    # The person typed this in Slack; mirroring it into the
+                    # linked slot keeps it a human turn (see
+                    # history.HUMAN_TURN_META_KEY).
+                    slot.append("user", text, "msg msg-u", meta={HUMAN_TURN_META_KEY: True})
                     slot.append("assistant", accumulated, "msg msg-a")
                     if slot._on_message:
                         slot._on_message(
@@ -5803,7 +5902,9 @@ async def _maybe_auto_title_slack(
     )
 
 
-async def _reject_orphaned_tool(provider: LLMProvider, request_id: "str | int") -> bool:
+async def _reject_orphaned_tool(
+    provider: LLMProvider, request_id: "str | int", *, audit: bool = True
+) -> bool:
     """Reject a pending ACP permission request that we can no longer surface.
 
     Both the pre-approval stream-prep and the approval-prompt post happen BEFORE
@@ -5811,7 +5912,10 @@ async def _reject_orphaned_tool(provider: LLMProvider, request_id: "str | int") 
     unanswered and the agent subprocess wedges forever (every later turn blocks
     behind it). Callers invoke this on failure, then re-raise. Swallows any
     reject failure, and audit failure after a successful rejection, so the
-    original error still propagates.
+    original error still propagates. ``audit=False`` is for a caller whose
+    decision already has its SEL row (the audit-first deny sites): the wire
+    still gets answered, but the ledger is append-only and a second row for
+    one decision would be a duplicate nothing reconciles.
     """
     try:
         await provider.reject_tool(request_id)
@@ -5821,6 +5925,8 @@ async def _reject_orphaned_tool(provider: LLMProvider, request_id: "str | int") 
     # The fallback arms re-raise past the normal permission audit, so record
     # the denial here: a rejection that reached the wire but never reached the
     # audit trail is a silent gap in a security control.
+    if not audit:
+        return True
     try:
         sel().log_tool_invocation(
             session_key="",
@@ -5833,6 +5939,66 @@ async def _reject_orphaned_tool(provider: LLMProvider, request_id: "str | int") 
     except Exception:
         logger.warning("Failed to audit orphaned tool %s", request_id, exc_info=True)
     return True
+
+
+async def _steer_host_deny(
+    provider: Any, event: Any, reason: str, *, cause: str, audited: bool
+) -> None:
+    """Tell the model, in-band, that the HOST denied this call -- not the person.
+
+    A rejected permission reaches the model as kiro-cli's fixed "User denied
+    tool execution", so without this it reads a refusal that never happened.
+    Awaited immediately BEFORE a host-deny ``reject_tool`` in this module: while
+    the permission request is unanswered the turn is provably in flight, which
+    is what gets the notice queued rather than dropped (``kiro_crew.deny_notice``).
+    The Slack handler has two host denies -- a hook ``deny`` on the message
+    path (``DENY_CAUSE_POLICY``, the hook's reason) and the approval prompt
+    expiring unanswered (``DENY_CAUSE_APPROVAL_TIMEOUT``). *cause* is REQUIRED
+    because the wrong noun sends the model the wrong way. The two genuine USER
+    rejections (a Deny click in ``handle_interaction``) and the teardown-only
+    ``_reject_orphaned_tool`` must NOT call this: there kiro-cli's wording is
+    the truth, and "this was NOT a user action" would be a lie.
+    ``test_messaging_deny_notice`` walks the file to keep both halves honest.
+
+    *reason* may echo agent-authored text (a hook's reason quotes the matched
+    path), so it is redacted here; the shared helper redacts the title.
+    Best-effort by construction: ``steer_refusal_notice`` probes the capability
+    and swallows every failure, so a backend without a steer channel behaves
+    exactly as before and the caller's reject always runs.
+
+    Cancellation mid-steer (teardown) must still answer the wire: a stranded
+    ``session/request_permission`` blocks the subprocess forever and wedges
+    every later turn behind it. The reject is scheduled as a strongly referenced
+    referenced task and awaited through ``asyncio.shield`` so it is stepped
+    while this coroutine unwinds; ``_reject_orphaned_tool`` retrieves its
+    exception so teardown stays quiet. *audited* is REQUIRED and says whether
+    the caller wrote the decision's SEL row BEFORE this await (the hook deny
+    does) or writes it after the wire (the approval-timeout arm, whose
+    caller audits both outcomes once the request is answered). The orphan
+    reject audits only in the second case: the SEL ledger is append-only,
+    and a decision already on it must not gain a second row nothing
+    reconciles.
+    """
+    safe_reason, _ = redact_exfiltration_urls(reason or "")
+    safe_reason, _ = redact_credentials(safe_reason)
+    try:
+        await steer_refusal_notice(
+            provider,
+            str(getattr(event, "title", "") or ""),
+            safe_reason,
+            cause=cause,
+            bound_secs=_STEER_NOTICE_BOUND_SECS,
+        )
+    except asyncio.CancelledError:
+        reject = asyncio.ensure_future(
+            _reject_orphaned_tool(provider, event.request_id, audit=not audited)
+        )
+        _orphan_rejects.add(reject)
+        reject.add_done_callback(_orphan_rejects.discard)
+        with contextlib.suppress(BaseException):
+            if await asyncio.shield(reject):
+                Stats().inc_tool_denial()
+        raise
 
 
 class _LinkedApprovalEvent:
@@ -6080,33 +6246,23 @@ async def _request_approval(
         # dashboard chat runner's host-decline arms. On Slack the driver stops
         # rendering after a rejection, so this corrects the model-side
         # transcript attribution only; the notice's continue-guidance has no
-        # Slack consumer. Best-effort: steer_refusal_notice (capability probe,
-        # redaction, build, bounded send -- the same helper the messaging
-        # TurnDriver uses) swallows every failure, so the reject below still
-        # runs; only cancellation escapes it, handled next.
-        try:
-            if claimed:
-                await steer_refusal_notice(
-                    provider,
-                    event.title,
-                    "the Slack approval prompt went unanswered for "
-                    f"{max(1, round(_APPROVAL_TIMEOUT))}s",
-                    cause=DENY_CAUSE_APPROVAL_TIMEOUT,
-                    bound_secs=_STEER_NOTICE_BOUND_SECS,
-                )
-        except asyncio.CancelledError:
-            # Teardown while steering must still answer the wire: a stranded
-            # session/request_permission blocks the subprocess forever and
-            # wedges every later turn behind it. Shield the reject so it is
-            # stepped even while this coroutine unwinds; _reject_orphaned_tool
-            # retrieves its exception so teardown stays quiet.
-            reject = asyncio.ensure_future(_reject_orphaned_tool(provider, event.request_id))
-            _orphan_rejects.add(reject)
-            reject.add_done_callback(_orphan_rejects.discard)
-            with contextlib.suppress(BaseException):
-                if await asyncio.shield(reject):
-                    Stats().inc_tool_denial()
-            raise
+        # Slack consumer. Best-effort: _steer_host_deny (capability probe,
+        # redaction, build, bounded send -- the same shared helper the
+        # messaging TurnDriver uses) swallows every failure, so the reject
+        # below still runs; a cancellation mid-steer schedules the orphan
+        # reject itself before re-raising, so teardown still answers the wire.
+        if claimed:
+            await _steer_host_deny(
+                provider,
+                event,
+                "the Slack approval prompt went unanswered for "
+                f"{max(1, round(_APPROVAL_TIMEOUT))}s",
+                cause=DENY_CAUSE_APPROVAL_TIMEOUT,
+                # The caller audits this outcome after the wire is answered;
+                # a cancellation here would skip that row, so the orphan
+                # reject writes it.
+                audited=False,
+            )
         if claimed:
             # Only the claim winner answers the wire. A lost claim means a
             # click is answering (or answered) this request itself; a second
@@ -6618,7 +6774,9 @@ async def _handle_sessions_command(
     # Mirrors the slash and Home Tab error-path patterns.
     try:
         rows = await _collect_recent_sessions_off_loop(
-            sessions, limit=_SESSIONS_DEFAULT_LIMIT, include_ended=include_ended
+            sessions,
+            limit=_message_surface_limit(slack_cfg().slack.sessions_limit),
+            include_ended=include_ended,
         )
     except Exception as exc:
         # Redact-then-truncate: redact() first so credential / exfil

@@ -19,6 +19,7 @@ import asyncio
 import functools
 import glob
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -35,7 +36,9 @@ from collections import OrderedDict, deque
 from contextlib import aclosing, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     AsyncIterator,
@@ -56,10 +59,11 @@ from kiro_crew import (
     model_registry,
     model_scope,
     permission_floor,
+    pinned_fs,
     platform_compat,
 )
 from kiro_crew import sel as sel_module
-from kiro_crew.acp import seed_provenance
+from kiro_crew.acp import runtime_models, runtime_process_tree, seed_provenance, transport_framing
 from kiro_crew.acp._dispatch import (
     ACP_BACKENDS_META_IDENTITY,
     DRAIN_YIELD_AFTER_S,
@@ -106,7 +110,43 @@ from kiro_crew.acp.liveness import (
 from kiro_crew.acp.mcp_ref_guard import warn_unresolved_server_refs
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
+from kiro_crew.acp.runtime_models import (
+    DEFAULT_MODEL,
+    _extract_advisory_detail,
+    _is_model_substitution_advisory,
+    _substitute_model_from_advisory,
+    model_is_unusable,
+    pick_served_default,
+)
+from kiro_crew.acp.runtime_process_tree import ChildRecord
 from kiro_crew.acp.session_mcp import agent_spec_snapshot, session_mcp_deny_rules
+from kiro_crew.acp.transport_errors import (
+    AcpAuthRequired,
+    AcpContextWindowExceeded,
+    AcpConversationPayloadExceeded,
+    AcpError,
+    AcpModelUnavailable,
+    AcpProviderStreamInterrupted,
+    AcpProcessDied,
+    AcpSandboxInitFailed,
+    AcpTimeoutError,
+    AcpToolGateUnroutable,
+    PiGateExtensionTampered,
+    _raise_acp_error,
+    compaction_failure_detail,
+    compaction_failure_is_transient,
+    is_sandbox_init_failure_output,
+    registration_rate_limited_error,
+    registration_throttle_line,
+    sandbox_init_failure,
+)
+from kiro_crew.acp.transport_framing import (
+    _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
+    _STDOUT_BUFFER_LIMIT,
+    response_write_window_secs,
+    write_notification_best_effort,
+    write_response_frame_bounded,
+)
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
@@ -118,7 +158,6 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_PI,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
-    ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_LOAD_WITHOUT_MODES,
@@ -229,7 +268,7 @@ from kiro_crew.constants import (
     KIROCREW_SPAWNED_ENV,
     KIROCREW_SPAWNED_VALUE,
 )
-from kiro_crew.credential_errors import is_credential_propagation_delay
+from kiro_crew.dashboard.side_readonly_spec import unavailable_mode_explanation
 from kiro_crew.env import (
     augmented_path,
     describe_search_path,
@@ -268,10 +307,7 @@ from kiro_crew.recovery.ladder import L3_ACP_RUNTIME as _L3_ACP_RUNTIME
 from kiro_crew.recovery.ladder import LADDER as _LADDER
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
-    LAUNCHER_EXIT_PREFIXES,
     RLIMIT_PROFILE_SESSION_HOST,
-    SANDBOX_LAYER_CREW,
-    SANDBOX_LAYER_HARNESS,
     BoundWorkspaceMismatch,
     _forward_ssh_auth_sock,
     agent_env_scrub_prefixes,
@@ -279,13 +315,10 @@ from kiro_crew.sandbox import (
     assert_voice_runtime_outside_agent_workspace,
     bind_voice_safe_agent_workspace_async,
     cgroup_scope_argv,
-    corroborate_launcher_refusal,
     create_subprocess_limited,
     delegated_workspace_exposes_sealed_target,
-    launcher_refusal,
     release_bound_agent_workspace,
     resolve_bound_session_workspace,
-    sandbox_init_remediation,
     scrub_agent_subprocess_env,
     wrap_argv,
     wrap_argv_async,
@@ -401,7 +434,6 @@ _PROTOCOL_VERSION_BY_BACKEND: dict[str, int | str] = {
     # its own release cadence, and none has a launch record to read.
     **{backend: record.protocol_version for backend, record in sorted(ACP_BACKEND_LAUNCH.items())},
 }
-DEFAULT_MODEL = "auto"
 
 # Consolidation turns are JSON-only and enforce REJECT_ALL at dispatch.  The
 # Claude ACP adapter nevertheless receives its session capability MCP server
@@ -2272,28 +2304,6 @@ def _resolve_claude_code_executable() -> str | None:
     return _normalize_exe_casing(shutil.which(CLAUDE_CODE_BIN, path=search_path))
 
 
-def _permission_surface_owned(client: object) -> bool:
-    """Whether *client*'s native permission file says what Crew requires.
-
-    The precondition the session ``mcpServers`` array is withheld on. Two ways to
-    satisfy it, and the difference between them is the TEARDOWN: Crew authored the
-    file (and removes it on reset), or a sibling of the same agent in the same
-    ``work_dir`` wrote byte for byte the seed this session would have, so the gate is
-    already in force and there is nothing here to write or to remove. What the mirror
-    needs is that the ``defaultMode`` and ``permissions.deny`` the adapter reads are
-    this session's; both cases give it that.
-
-    A module-level function taking the client rather than a property, because
-    ``_append_member_dispatch_server`` is also reached unbound with a duck-typed
-    object. ``getattr`` on both attributes for the same reason: an object that never
-    ran ``__init__`` reads as not-owned rather than raising, and withholding is the
-    safe direction.
-    """
-    return getattr(client, "_claude_settings_authored", False) or getattr(
-        client, "_claude_settings_governed", False
-    )
-
-
 # Upper bound on a settings file Crew will parse to compare permission blocks. A
 # seed is a few hundred bytes, so this is roomy for a hand-edited project file and
 # still refuses anything a caller would not want to load into memory and decode.
@@ -2785,64 +2795,6 @@ def apply_pod_bundle_spawn(
     return [bundle, *argv[1:]], False
 
 
-# Subprocess stdout buffer — kiro-cli can send large JSON-RPC lines (tool outputs)
-_STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
-# Ceiling on the bytes discarded while draining ONE oversize line. Per drain call
-# and expressed in BYTES: each call provably ends ON a frame boundary, so a replay
-# of many legitimately-oversize-but-terminated frames each gets its own budget and
-# stays survivable. A count of oversize FRAMES would kill the runtime on exactly
-# that replay. Only a single blob that never terminates can exhaust this.
-_OVERSIZE_DRAIN_MAX_BYTES = 16 * _STDOUT_BUFFER_LIMIT  # 160MB
-
-
-class OversizeLineUnrecoverable(Exception):
-    """An oversize stdout line exceeded the drain budget without terminating."""
-
-
-async def _drain_oversize_line(reader: asyncio.StreamReader, exc: asyncio.LimitOverrunError) -> int:
-    """Discard one oversize line ENTIRELY, leaving the stream on a frame boundary.
-
-    Called after ``readuntil(b"\\n")`` raised ``LimitOverrunError``, which consumes
-    nothing. ``exc.consumed`` is the already-buffered prefix that provably holds no
-    separator, so consuming it cannot cross into the next frame; retrying
-    ``readuntil`` then either returns the remainder of the line or raises for
-    another step. Same consume-prefix-and-retry drain as
-    ``mcp_gateway/backend.py::run_stdout_pump``; a plain ``read(n)`` would instead
-    eat into the NEXT frame.
-
-    The recovered remainder is **discarded, never parsed**. It is a byte-slice of
-    the line cut at an arbitrary offset, so it can split a multibyte UTF-8
-    character — and ``json.loads`` on that raises ``UnicodeDecodeError``, which is
-    NOT a ``json.JSONDecodeError`` and would escape the caller's non-JSON guard
-    into its crash handler, killing every multiplexed session over one oversize
-    frame.
-
-    Returns the bytes discarded. Raises ``OversizeLineUnrecoverable`` past
-    ``_OVERSIZE_DRAIN_MAX_BYTES`` (the stream is garbage, not merely verbose) and
-    propagates ``IncompleteReadError`` on EOF mid-drain so the caller can use its
-    normal end-of-stream path.
-    """
-    discarded = 0
-    while True:
-        if exc.consumed <= 0:
-            # Unreachable via CPython, whose consumed always exceeds the reader's
-            # limit; guarded because a zero would make this loop spin without
-            # awaiting and starve the event loop.
-            raise OversizeLineUnrecoverable(
-                f"stream reported a {exc.consumed}-byte oversize prefix"
-            )
-        discarded += len(await reader.readexactly(exc.consumed))
-        if discarded > _OVERSIZE_DRAIN_MAX_BYTES:
-            raise OversizeLineUnrecoverable(
-                f"discarded {discarded} bytes with no frame boundary "
-                f"(limit {_OVERSIZE_DRAIN_MAX_BYTES})"
-            )
-        try:
-            return discarded + len(await reader.readuntil(b"\n"))
-        except asyncio.LimitOverrunError as again:
-            exc = again
-
-
 # Max consecutive empty reads before checking if process is alive
 _MAX_CONSECUTIVE_EMPTY = 5
 
@@ -3116,280 +3068,6 @@ _WAIT_RESPONSE_MAX_TIMEOUT = 600.0  # 10 min absolute ceiling
 # and must never gate tool dispatch, so a wedged SEL backend is abandoned (the
 # worker thread may leak, which is survivable) after this timeout.
 _SEL_AUDIT_TIMEOUT_SECONDS = 5.0
-# No-progress bound on delivering a response or error frame to the backend's
-# stdin (permission answers, unknown-method errors). ``StreamWriter.drain()``
-# returns at once while the pipe has room; it only parks when the writer is
-# flow-control paused -- the kernel pipe buffer is full and the transport's
-# own buffer is past its high-water mark. That is what a backend that has
-# stopped reading stdin looks like once frames have backed up behind it, but
-# it is ALSO what a healthy backend looks like while it consumes a multi-MB
-# prompt frame queued ahead of the response on the same writer (the shared
-# runtime multiplexes sessions on one stdin). The two are told apart by
-# progress, not by elapsed time: the bound is the longest the transport's
-# write buffer may go without shrinking. A reader that is consuming, however
-# slowly, keeps the wait alive; a reader that consumed nothing for this long
-# is gone, and the write is raised as the process death it is (AcpProcessDied
-# / AcpRuntimeDead) so the caller takes the same session-reset + bounded-
-# requeue recovery the broken-pipe case already uses. The bound cannot observe
-# delivery of a frame the pipe accepted (the protocol gives no ack for a
-# response); it bounds the wait on a paused writer. Sized like chat_runner's
-# _STEER_NOTICE_BOUND_SECS: far below the turn deadline.
-_RESPONSE_WRITE_BOUND_SECS = 5.0
-# The least the write-buffer level must DROP within one window for the drop
-# to count as the reader consuming. Without a floor, a reader that takes one
-# byte per window extends the wait forever; with a flat elapsed cap instead, a
-# healthy-but-slow reader draining a co-tenant's multi-MB frame would be
-# killed by the cap -- the very failure the progress bound exists to avoid.
-# 4 KiB per 5s window is under 1 KB/s: a reader that slow would need hours
-# for a single image frame, which is dead for every practical purpose.
-_RESPONSE_WRITE_MIN_PROGRESS_BYTES = 4096
-# The wait is bounded in TOTAL by construction, not by a flat figure: no fixed
-# ceiling can be right when the largest frame is unbounded (a prompt may carry
-# any number of 5 MiB image blocks) -- a fixed one either kills a live reader
-# on a valid large frame or lets a trickling one run long. Instead: the write
-# buffer's level is finite and non-negative, and every window that continues
-# the wait removed at least the floor from it, so a wait on a backlog of B
-# bytes lasts at most B / _RESPONSE_WRITE_MIN_PROGRESS_BYTES + 1 windows (plus
-# the same for any frame a sibling writer appends meanwhile). That is the
-# derived ceiling -- backlog over the minimum accepted rate -- and it needs no
-# constant of its own.
-# Window used when the transport cannot show progress at all. Windows's
-# proactor pipe transport reports ``get_write_buffer_size()`` as the whole
-# in-flight overlapped write until that write completes, so its level is flat
-# for the entire time a healthy reader consumes a large frame -- flatness is
-# not a stall there, and the only signal left is elapsed time. With no backlog
-# to derive from, this is the one place a fixed figure remains, sized for the
-# largest frame a healthy local reader plausibly drains: ~30 MiB at ~40 KiB/s
-# (test-pinned). Platform-limited, like the Windows watchdog: a dead reader is
-# detected in 15 minutes there instead of 5 seconds.
-_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS = 900.0
-
-
-def _is_proactor_loop(loop: asyncio.AbstractEventLoop) -> bool:
-    """Whether ``loop`` is Windows's proactor loop (the only loop that drives
-    subprocess pipes through overlapped I/O). Keyed to the public
-    ``asyncio.ProactorEventLoop`` class the platform owns, which exists only
-    on Windows, rather than to a private transport class name."""
-    proactor = getattr(asyncio, "ProactorEventLoop", None)
-    return proactor is not None and isinstance(loop, proactor)
-
-
-def _level_is_progress_signal(transport: object) -> bool:
-    """Whether a transport's write-buffer level moves as the reader consumes.
-
-    True under the selector loops (the pipe transport trims its buffer per
-    readiness callback). False under the proactor loop Windows uses for
-    subprocess pipes: the level is the whole in-flight overlapped write until
-    it completes, so it is flat while a live reader consumes a large frame.
-    Decided from the running loop, not the transport's class name.
-    """
-    return not _is_proactor_loop(asyncio.get_running_loop())
-
-
-def _pending_write_bytes(stdin: asyncio.StreamWriter) -> int | None:
-    """Bytes the writer still holds for the pipe, or ``None`` when that level
-    is not a progress signal.
-
-    ``None`` -- a transport without ``get_write_buffer_size`` (a test double),
-    or one whose level does not move mid-frame (``_level_is_progress_signal``)
-    -- means progress cannot be observed; the bounded wait then falls back to
-    the platform-limited elapsed window, ``_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS``.
-    """
-    transport = getattr(stdin, "transport", None)
-    size = getattr(transport, "get_write_buffer_size", None)
-    if not callable(size) or not _level_is_progress_signal(transport):
-        return None
-    value = size()
-    return value if isinstance(value, int) else None
-
-
-async def await_under_no_progress_bound(
-    aw: Awaitable[Any],
-    stdin: asyncio.StreamWriter,
-    *,
-    bound_secs: float,
-) -> bool:
-    """Await ``aw`` while the writer behind ``stdin`` keeps showing activity.
-
-    Returns ``True`` when ``aw`` completed (its exception, if any, propagates).
-    Returns ``False`` -- after cancelling ``aw`` -- when the transport's write
-    buffer showed no activity for ``bound_secs``. The total wait is bounded by
-    construction -- each continued window removed at least the floor from a
-    finite, non-negative level, so a backlog of B bytes is waited on for at
-    most B / floor + 1 windows (plus the same for any frame a sibling writer
-    appends meanwhile). Activity at a window's end
-    is either a DROP of at least ``_RESPONSE_WRITE_MIN_PROGRESS_BYTES`` (the reader consumed a
-    real amount; a large frame ahead of this one is being drained) or a RISE
-    (a frame from a writer the lock woke ahead of this caller landed on the
-    pipe); both continue the wait, measured again from the new level. A level
-    that held still, or dropped by less than the floor, is a reader that is
-    gone -- the floor is what keeps a byte-per-window trickle from extending
-    the wait forever without capping a genuinely draining frame.
-
-    When the level is not a progress signal at all (``_pending_write_bytes``
-    returns ``None``: a proactor transport, or a test double without one) the
-    single window is ``_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS`` and elapsed
-    time alone decides
-    -- platform-limited, never extended, since nothing can be observed to
-    extend it on.
-
-    ``aw`` is shielded from the caller's cancellation so a window closing does
-    not abort it; an awaitable found complete when a window closes counts as
-    completed, never as a stall. On a stall verdict or a cancellation it is
-    cancelled if still pending. An awaitable that completed in the meantime is
-    NOT undone here -- a caller whose awaitable acquires something must release
-    it on those paths (see ``write_response_frame_bounded`` /
-    ``_release_if_acquired``).
-
-    The level measurement needs one writer in flight at a time to mean
-    anything, which is why every stdin write on a transport goes through that
-    transport's write lock. Without it, concurrent appends interleave with the
-    reader's consumption and a level that merely looks flat could hide both.
-    """
-    task = asyncio.ensure_future(aw)
-    last = _pending_write_bytes(stdin)
-    window = _RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS if last is None else bound_secs
-    try:
-        while True:
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=window)
-            except asyncio.TimeoutError:
-                if task.done():
-                    task.result()  # completed as the window closed; re-raise its error
-                    return True
-                now = _pending_write_bytes(stdin)
-                if now is not None and last is not None:
-                    if now > last or last - now >= _RESPONSE_WRITE_MIN_PROGRESS_BYTES:
-                        last = now  # the level moved: activity, measure again from here
-                        continue
-                task.cancel()
-                return False
-            return True
-    finally:
-        if not task.done():
-            task.cancel()
-
-
-def _release_if_acquired(lock: asyncio.Lock, acquire: "asyncio.Future[bool]") -> None:
-    """Undo a ``lock.acquire()`` whose caller has given up on it.
-
-    ``await_under_no_progress_bound`` shields the acquire task, so an outer
-    cancellation (or a stall verdict) can land AFTER the acquire completed and
-    the task holds the lock with nobody left to release it -- and this lock is
-    the one every stdin write on the transport waits for. If the acquire is
-    done and succeeded, release now; otherwise cancel it and release from its
-    done callback should it still complete with the lock.
-    """
-
-    def _done(task: "asyncio.Future[bool]") -> None:
-        if not task.cancelled() and task.exception() is None and task.result():
-            lock.release()
-
-    if acquire.done():
-        _done(acquire)
-    else:
-        acquire.cancel()
-        acquire.add_done_callback(_done)
-
-
-async def write_response_frame_bounded(
-    stdin: asyncio.StreamWriter,
-    lock: asyncio.Lock,
-    data: bytes,
-    *,
-    bound_secs: float,
-    before_write: Callable[[], None] | None = None,
-) -> bool:
-    """Write one response/error frame under the transport's write lock and a
-    no-progress bound on BOTH waits -- for the lock and for the drain.
-
-    ``before_write`` runs under the lock, just before the frame is written, and
-    may raise to abort the write -- the shared runtime uses it to re-check that
-    it was not marked dead while this caller waited for the lock, so no frame
-    is written into a pipe whose owner has already been torn down.
-
-    Waiting for the lock is waiting for the previous frame's drain: a
-    flow-control-paused writer holding a multi-MB prompt is a live reader as
-    long as its buffer level moves, and a dead one when it does not. Returns
-    ``False`` on a stall in either phase without writing (lock phase) or after
-    cancelling the drain (drain phase); the caller maps that to its own
-    process-death exception. Pipe errors from ``drain()`` propagate. The lock
-    is never left held: a stall verdict or a cancellation that lands after the
-    shielded acquire completed releases it (``_release_if_acquired``).
-    """
-    acquire: asyncio.Future[bool] = asyncio.ensure_future(lock.acquire())
-    try:
-        acquired = await await_under_no_progress_bound(acquire, stdin, bound_secs=bound_secs)
-    except BaseException:
-        _release_if_acquired(lock, acquire)
-        raise
-    if not acquired:
-        _release_if_acquired(lock, acquire)
-        return False
-    try:
-        if before_write is not None:
-            before_write()
-        stdin.write(data)
-        return await await_under_no_progress_bound(stdin.drain(), stdin, bound_secs=bound_secs)
-    finally:
-        lock.release()
-
-
-def response_write_window_secs(stdin: asyncio.StreamWriter, bound_secs: float) -> float:
-    """The no-progress window ``await_under_no_progress_bound`` applies to this
-    writer -- ``bound_secs`` when its level is a progress signal, the
-    platform-limited window when it is not -- so a stall log line states the
-    window that was actually measured."""
-    return (
-        bound_secs
-        if _pending_write_bytes(stdin) is not None
-        else _RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS
-    )
-
-
-async def write_notification_best_effort(
-    stdin: asyncio.StreamWriter,
-    lock: asyncio.Lock,
-    data: bytes,
-    *,
-    bound_secs: float,
-    before_write: Callable[[], None] | None = None,
-) -> str:
-    """Write a fire-and-forget notification (``session/cancel``) without letting
-    the write lock swallow it.
-
-    A cancel is the one cooperative signal that can end a wedged turn, so it
-    must not queue forever behind a holder parked on a reader that stopped. Wait
-    for the lock under the no-progress bound; if the lock does not come, append
-    the frame UNLOCKED (no drain) so the transport enqueues it the moment the
-    pipe has room -- a single extra append the lock-holder's measurement reads
-    as activity for one window, which is the price of delivering the cancel.
-    Under the lock the drain is bounded the same way. Returns what happened, for
-    the caller's log line: ``"drained"`` (written and drained under the lock),
-    ``"appended_unlocked"`` (the lock did not come; the frame sits in the
-    transport's buffer with no drain observed), or ``"stalled"`` (the locked
-    drain made no progress). Pipe errors propagate.
-    """
-    acquire: asyncio.Future[bool] = asyncio.ensure_future(lock.acquire())
-    try:
-        acquired = await await_under_no_progress_bound(acquire, stdin, bound_secs=bound_secs)
-    except BaseException:
-        _release_if_acquired(lock, acquire)
-        raise
-    if not acquired:
-        _release_if_acquired(lock, acquire)
-        if before_write is not None:
-            before_write()
-        stdin.write(data)
-        return "appended_unlocked"
-    try:
-        if before_write is not None:
-            before_write()
-        stdin.write(data)
-        drained = await await_under_no_progress_bound(stdin.drain(), stdin, bound_secs=bound_secs)
-        return "drained" if drained else "stalled"
-    finally:
-        lock.release()
 
 
 # Canonical ACP tool-kind value for shell/exec tools. kiro-cli and
@@ -3418,1435 +3096,6 @@ class ClaudeAutonomousTurn:
 def _is_shell_kind(kind: str | None) -> bool:
     """True when an ACP tool_kind denotes a shell/exec command (kind-only view)."""
     return kind == _ACP_SHELL_KIND
-
-
-# Cap for the failure detail carried into the compaction notice: it is
-# backend-echoed text on a chat row, not a log line.
-_COMPACTION_DETAIL_MAX_CHARS = 200
-
-
-# Keys that may carry a human-readable failure reason, MOST preferred first.
-# The rank is what makes extraction deterministic on a payload carrying several
-# of them: KAS nests a machine reason (``cause.reason`` =
-# ``MODEL_TEMPORARILY_UNAVAILABLE``) beside a sentence written for the user
-# (``userFacingSessionErrorMessage``), and the sentence is the one that tells a
-# reader what to DO about it.
-_COMPACTION_DETAIL_KEYS = (
-    "userFacingSessionErrorMessage",
-    "reason",
-    "message",
-    "error",
-    "detail",
-    "name",
-)
-
-# A named reason holding one of these words says nothing the notice does not
-# already say. KAS's ``summarization_failed`` frame reported literally "error",
-# which rendered as "Compaction failed: error" — no reason, and nothing to grep
-# server-side. Rejecting them falls through to the raw shape, which at least
-# carries the payload the backend actually sent.
-_COMPACTION_DETAIL_PLACEHOLDERS = frozenset(
-    {"error", "errored", "failed", "failure", "none", "null", "unknown", "unknown error"}
-)
-
-# Reason markers that make a failed compaction RETRYABLE: the summarization
-# model call was throttled or 5xx'd, so the same conversation can succeed on a
-# later attempt or on another model. Deliberately EXCLUDES the
-# context/too-large family — retrying one of those replays the same overflow,
-# which is the case the no-retry policy was written for.
-_COMPACTION_TRANSIENT_MARKERS = (
-    "temporarily unavailable",
-    "throttl",
-    "too many requests",
-    "rate limit",
-    "high volume of traffic",
-    "service unavailable",
-    "internalserverexception",
-    "internal server error",
-    "timed out",
-    "timeout",
-)
-
-# Depth bound for the payload walk. The shapes we read are three levels at
-# most (``status`` -> ``error`` -> ``cause``); the bound only stops a
-# pathological or cyclic frame from walking forever.
-_COMPACTION_WALK_MAX_DEPTH = 6
-
-
-def _walk_compaction_payload(value: object, depth: int = 0):
-    """Yield ``(key, leaf)`` pairs from a compaction notification payload.
-
-    One walker serves both readers below, so the reason a notice DISPLAYS and
-    the verdict that decides whether to RETRY are derived from the same view of
-    the frame — a backend that moves a field cannot make them disagree.
-    """
-    if depth > _COMPACTION_WALK_MAX_DEPTH:
-        return
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if isinstance(child, (dict, list)):
-                yield from _walk_compaction_payload(child, depth + 1)
-            else:
-                yield str(key), child
-    elif isinstance(value, list):
-        for child in value:
-            yield from _walk_compaction_payload(child, depth + 1)
-
-
-def compaction_failure_detail(params: dict) -> str:
-    """Best-effort reason text from a ``failed`` compaction notification.
-
-    kiro-cli carries no dedicated error field today: ``summary`` is
-    populated on success but typically empty on failure, which collapses the
-    user-facing notice to "unknown error" with nothing to report or grep.
-    Prefer any named reason the payload does carry, else fall
-    back to the raw shape so the notice says something concrete. Redacted
-    here (not at each call site) because this reaches the dashboard.
-
-    Nested by design: KAS reports the real reason under ``cause``, and the
-    previous one-level read saw only the flat sibling — a placeholder word —
-    so the notice said "error" while the payload carried the whole throttle.
-    """
-    best_rank = len(_COMPACTION_DETAIL_KEYS)
-    detail = ""
-    for key, value in _walk_compaction_payload(params):
-        if not isinstance(value, str):
-            continue
-        text = value.strip()
-        if not text or text.lower() in _COMPACTION_DETAIL_PLACEHOLDERS:
-            continue
-        try:
-            rank = _COMPACTION_DETAIL_KEYS.index(key)
-        except ValueError:
-            continue
-        if rank < best_rank:
-            best_rank, detail = rank, text
-    if not detail:
-        # No named reason anywhere — the raw params ARE the only evidence.
-        detail = f"no reason reported by the agent (raw: {params})"
-    # redact_text is the single-source scrub (exfil URLs + credentials) every
-    # other LLM-influenced surface uses, including the sibling KAS summary.
-    return redact_text(detail)[:_COMPACTION_DETAIL_MAX_CHARS]
-
-
-def compaction_failure_is_transient(params: dict) -> bool:
-    """True when a ``failed`` compaction is worth attempting again.
-
-    Read from the STRUCTURED payload rather than the rendered notice: the
-    notice is truncated, redacted and sometimes only a raw ``repr``, so
-    matching prose would both miss real throttles and fire on a digit that
-    happened to land in a summary. An HTTP status is therefore compared as a
-    number under its own key, never as a substring.
-
-    The distinction is load-bearing. A compaction that failed because the
-    conversation overflows the window fails again identically, which is why
-    the turn is abandoned without a retry; a compaction whose summarization
-    call was throttled has nothing wrong with it and succeeds on the next
-    attempt. Treating the second as permanent is what dropped the user's
-    message with a bare "error" on the row.
-    """
-    for key, value in _walk_compaction_payload(params):
-        if key == "httpStatusCode":
-            # ``bool`` is an ``int`` subclass, so a stray True would otherwise
-            # compare as 1 and read as a status code.
-            if isinstance(value, int) and not isinstance(value, bool):
-                if value == 429 or 500 <= value < 600:
-                    return True
-            continue
-        if not isinstance(value, str):
-            continue
-        # Only REASON-BEARING keys are scanned -- the same set the reason reader
-        # ranks. The frame also carries backend-echoed, conversation-derived text
-        # (conversationSummary rides in the very payload the KAS branch passes
-        # whole), so matching every string leaf would let a summary that merely
-        # mentions "timeout" upgrade a permanent context overflow to transient
-        # and replay it. A control decision must not be reachable from content
-        # the model wrote -- the same reasoning that made this read the payload
-        # instead of the rendered notice.
-        if key not in _COMPACTION_DETAIL_KEYS:
-            continue
-        # Separators folded to spaces before matching: the same fault is spelled
-        # as prose in the user-facing sentence ("temporarily unavailable") and as
-        # a SCREAMING_SNAKE enum in the machine reason
-        # ("MODEL_TEMPORARILY_UNAVAILABLE"), and a marker list that matched only
-        # one spelling would classify the same failure two different ways
-        # depending on which field the backend happened to fill.
-        low = value.lower().replace("_", " ").replace("-", " ")
-        if any(marker in low for marker in _COMPACTION_TRANSIENT_MARKERS):
-            return True
-    return False
-
-
-class AcpError(Exception):
-    """Base ACP error.
-
-    ``transient`` carries the retry-eligibility verdict computed from the RAW
-    JSON-RPC error at raise time (see :func:`_is_transient_raw_error`), so the
-    retry layer (``llm_helpers``, ``chat_runner``) decides retryability
-    independently of how :func:`_format_acp_error` words the user-facing
-    message. ``None`` means "unclassified" — callers fall back to
-    string-matching the formatted message.
-
-    ``code`` is the raw JSON-RPC error code when the failure came back as an
-    error frame (``-32602`` Invalid params, ``-32601`` Method not found, ...),
-    else ``None``. Carried as data so a caller can classify a rejection by code
-    instead of parsing the redacted message: a codex session dies at startup on
-    a bare ``{"code": -32602, "message": "Invalid params"}`` with no ``data``,
-    which no message match can tell from a protocol error.
-    """
-
-    def __init__(
-        self, *args: object, transient: bool | None = None, code: int | None = None
-    ) -> None:
-        super().__init__(*args)
-        self.transient = transient
-        self.code = code
-        # Reactive-fallback metadata, set by :func:`_raise_acp_error` when a
-        # prompt-time error names a rejected model (so run_bg_oneliner can retry
-        # once with a served model). Guarded so AcpModelUnavailable — which sets
-        # ``advertised`` BEFORE calling super().__init__ — is not clobbered.
-        if not hasattr(self, "rejected_model"):
-            self.rejected_model: str | None = None
-        if not hasattr(self, "advertised"):
-            self.advertised: list[str] = []
-        # Sign-in failure tag, set by :func:`_raise_acp_error` when the raw frame
-        # is a session-expiry / rejected-credential answer, so the dashboard's
-        # error row can offer the Kiro sign-in card instead of a retry.
-        self.auth_required: bool = False
-        # Spent-allowance tag, set by :func:`_raise_acp_error` when the raw
-        # frame is a usage-limit answer ("The monthly usage limit has been
-        # reached"), so the dashboard's error row can offer a route that needs
-        # no inference where one exists (the feature-request form) instead of a
-        # retry that reproduces the rejection. Terminal like ``auth_required``
-        # and, like it, decided from the raw frame rather than the prose.
-        self.usage_limit: bool = False
-        # Structural-rejection tag, set by :func:`_raise_acp_error` when the raw
-        # frame is a malformed-request answer ("Improperly formed request"). A
-        # DETERMINISTIC rejection of the payload's SHAPE: unlike a transient
-        # backend fault, re-sending the identical context reproduces it exactly.
-        # ``transient`` already carries the retry-layer verdict for the SAME
-        # frame (both False here); this is the narrower fact that the failure is
-        # a structural rejection specifically, so a self-driving caller (the
-        # auto-nudge loop) can stop re-firing the same context rather than
-        # merely declining an in-turn retry. Only structural terminality sets
-        # it — a spent usage limit or an unentitled model are also terminal but
-        # a NEW context can succeed, so they are not this fact.
-        self.structural_terminal: bool = False
-        # Whether this error happened while STARTING a session rather than on a
-        # prompt or another request. The twin of
-        # ``AcpRequestTimeout.session_start_failed`` on the runtime path: the two
-        # exception families share no base, so a self-driving caller reads the
-        # fact with ``getattr`` and both halves must spell it the same way. Only
-        # the raise sites that know the method set it True.
-        self.session_start_failed: bool = False
-
-
-class AcpTimeoutError(AcpError):
-    """Prompt timed out."""
-
-    def __init__(self, partial_output: str = "", *, message: str = "ACP prompt timed out"):
-        self.partial_output = partial_output
-        super().__init__(message)
-
-
-class AcpPermissionNeeded(AcpError):  # noqa: N818
-    """Tool approval required."""
-
-    def __init__(self, prompt: str, response_so_far: str = ""):
-        self.prompt = prompt
-        self.response_so_far = response_so_far
-        super().__init__("Permission needed")
-
-
-class AcpProcessDied(AcpError):  # noqa: N818
-    """kiro-cli process exited unexpectedly."""
-
-
-class AcpAuthRequired(AcpError):  # noqa: N818
-    """The harness is not authenticated — the user must sign in again.
-
-    Non-retryable: respawning the process hits the same wall, so callers must
-    surface the actionable message and skip the retry ladder rather than
-    reset-and-requeue the turn.
-
-    ``backend`` decides whose sign-in fixes it. Only a harness that authenticates
-    through Crew's own identity (``ACP_BACKENDS_HOST_AUTH_CALLBACK``, harness
-    parity H6) is tagged ``auth_required`` so the dashboard offers the Kiro
-    sign-in card; for every other harness that card would sign in the wrong
-    thing, so the row stays a plain error carrying that harness's own remedy.
-    """
-
-    def __init__(self, message: str = "", *, backend: str = "") -> None:
-        super().__init__(message)
-        self.auth_required = backend in ACP_BACKENDS_HOST_AUTH_CALLBACK
-
-
-class AcpSandboxInitFailed(AcpError):  # noqa: N818
-    """An OS sandbox refused to initialize, so the agent child never started.
-
-    Non-retryable, for the reason :class:`AcpAuthRequired` and
-    :class:`AcpToolGateUnroutable` are: the refusal is a property of the host and
-    its configuration, so the respawn the reconnect ladder would make hits the
-    same wall, and every attempt costs a spawn plus a teardown before reporting
-    the same thing. ``transient`` is fixed ``False`` so the retry ladders that
-    read the verdict off the exception (``llm_helpers.acp_error_is_transient``,
-    and through it every consumer from the dashboard turn to a cron tick) stop on
-    the first one without any of them matching on wording.
-
-    A DISTINCT type rather than a flag on ``AcpProcessDied``, because the two
-    answer different questions. ``AcpProcessDied`` says the child is gone and
-    leaves whether to resubmit the turn to its own classification; this says the
-    child cannot be started at all until a human changes something.
-
-    The message names which of the two isolation layers wrapped the spawn and what
-    to do about it, and ``corroborated`` decides how far that goes: the switch that
-    turns a layer OFF is emitted only when a TRUSTED run reached that verdict, never
-    on the strength of the dead child's own stderr -- see
-    :func:`sandbox.sandbox_init_remediation`.
-
-    Deliberately NOT an automatic downgrade to an unconfined spawn. Falling back
-    to no isolation on a sandbox failure is refused by design -- it would turn a
-    broken host into a silently unsandboxed agent -- so the useful thing this can
-    do is fail fast and say which layer to look at, loudly.
-    """
-
-    def __init__(self, *, layer: str, detail: str = "", corroborated: bool = False) -> None:
-        # Layer and remedy are LOCALS folded into the message, not attributes: the
-        # message is what an operator and every error surface read, and a
-        # structured field with no reader is a promise nobody keeps.
-        remediation = sandbox_init_remediation(layer, corroborated=corroborated)
-        # ``detail`` is the child's own stderr, already redacted by the caller
-        # that captured it (both transports redact before retaining: the text is
-        # untrusted subprocess output that can echo a token, and this message
-        # reaches a session card, the security event log, and a cron job's
-        # persisted last_error).
-        said = f" -- {detail}" if detail.strip() else ""
-        super().__init__(
-            f"the {layer} sandbox failed to initialize, so the agent process could "
-            f"not start{said}. Retrying cannot fix this: {remediation}",
-            transient=False,
-        )
-
-
-class AcpRegistrationRateLimited(AcpProcessDied):  # noqa: N818
-    """The runtime died after its dynamic registration was throttled (HTTP 429).
-
-    A SUBCLASS of :class:`AcpProcessDied`, because the process IS gone and every
-    existing death handler must keep treating it as a death; the narrower fact is
-    WHY: the child's registration calls were rate-limited by the endpoint, which
-    is a transient property of the endpoint's capacity, not of this host or this
-    request. ``transient`` is fixed True so the retry ladders that read the
-    verdict off the exception (``llm_helpers.acp_error_is_transient``, and
-    through it the sub-agent run loop and ``stream_and_collect``) retry with
-    their existing bounded backoff instead of surfacing a terminal generic
-    death. Replay SAFETY stays where it already lives: every consumer's
-    zero-activity gate decides between a verbatim replay and a continue, so this
-    classification never widens what a retry may re-run.
-
-    The message carries ONE retained cause rather than the full stderr tail: the
-    throttle prints the identical line on every attempt, and five copies of it
-    behind a death summary is the repetitive wall this type exists to replace.
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message, transient=True)
-
-
-class AcpToolGateUnroutable(AcpError):  # noqa: N818
-    """The harness's tool calls would not reach Kiro Crew's PreToolUse gate.
-
-    Non-retryable, and a DISTINCT type from the transport errors around it: the
-    condition is a configuration fact, so a respawn re-reads the same answer and
-    refuses again while consuming a reconnect budget meant for transport faults.
-
-    Wraps :class:`kiro_crew.acp_tool_gate.ToolGateUnroutable`, which cannot
-    subclass ``AcpError`` itself -- it lives in a LEAF module that must not import
-    this one (import cycle, and a forbidden-root edge for the SDK boundary gate).
-    Branchless callers keep degrading through their generic ``AcpError`` handling.
-    """
-
-
-class PiGateExtensionTampered(AcpError):  # noqa: N818
-    """The shipped gate extension's bytes do not match the digest this build pinned.
-
-    Raised before any harness child is started: a gate whose code is not the code
-    this build was tested with is not a gate, whatever its probe command says.
-    """
-
-
-class AcpModelUnavailable(AcpError):  # noqa: N818
-    """An explicitly requested model is not available to this account.
-
-    A DISTINCT type because the semantics differ from every other ``set_model``
-    failure. The generic ones ("the call didn't land") are legitimately handled
-    by tearing the session down and cold-starting. This one means "the request
-    itself is invalid, and no amount of restarting changes that" — falling back
-    to a reset would destroy a live conversation and then quietly land on a
-    different model, reporting success. Callers must surface it (4xx / user
-    error), not recover from it.
-
-    Non-retryable: ``transient`` is fixed False, since no retry earns an
-    entitlement.
-    """
-
-    def __init__(
-        self,
-        model_id: str,
-        advertised: Sequence[str] | None = None,
-        *,
-        advertised_but_refused: bool = False,
-    ) -> None:
-        self.model_id = model_id
-        self.advertised = list(advertised or [])
-        usable = ", ".join(self.advertised) if self.advertised else "none advertised"
-        # The identity hint is CONDITIONAL by construction ("if you expected") and
-        # names only a read-only probe. A user genuinely on a free tier is
-        # correctly served by the first sentence and should not be nudged toward
-        # re-authenticating, so this must never read as an instruction to log out:
-        # `whoami` answers "which tier am I actually on" for the user who signed in
-        # to the wrong one, and merely confirms the situation for everyone else.
-        if advertised_but_refused:
-            # The adapter ADVERTISED this id and then refused it, on a harness
-            # whose advertised list IS its entitlement: that is a spelling gap
-            # between the list and the switch channel (a codex
-            # ``<model>[<effort>]`` pair its ``model`` option does not take), not
-            # an entitlement verdict. Pointing the user at their sign-in here
-            # would send them to fix an account that is fine.
-            #
-            # The CALLER decides, because "advertised implies entitled" is a
-            # per-harness fact that holds only for
-            # ``ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS`` members. Read off
-            # ``model_id in advertised`` alone it also fires for a harness that
-            # advertises models an account cannot run, and tells a user on the
-            # wrong tier their account is fine.
-            super().__init__(
-                f"The adapter advertised the model {model_id!r} but refused to "
-                f"switch to it. This is a mismatch inside the adapter, not an "
-                f"account restriction; try another entry from the list or restart "
-                f"the session. Available models: {usable}.",
-                transient=False,
-            )
-            return
-        super().__init__(
-            f"The model {model_id!r} is not available on your account. "
-            f"Available models: {usable}. "
-            f"If you expected this model to be included in your plan, check which "
-            f"account you are signed in as with `kiro-cli whoami` — a Builder ID "
-            f"sign-in carries a different entitlement than organization SSO.",
-            transient=False,
-        )
-
-
-class AcpPromptBusy(AcpError):  # noqa: N818
-    """A prompt is already in progress on this session.
-
-    The backend still has an in-flight prompt (tool stall, timeout, or race
-    between messages). Callers should reset the session so the next message
-    cold-starts cleanly.
-    """
-
-
-class AcpProviderStreamInterrupted(AcpError):  # noqa: N818
-    """A provider ended a turn before it emitted a terminal result.
-
-    This is deliberately distinct from a content refusal: interactive callers
-    may cold-start and replay only when no text or tool activity was observed.
-    A normal reset would preserve the provider's broken native conversation.
-    """
-
-
-class AcpContextWindowExceeded(AcpError):  # noqa: N818
-    """The upstream model rejected a prompt that exceeds its context window.
-
-    Interactive callers must start a fresh native session before retrying: a
-    normal reset preserves the stored native session ID and would resume the
-    same oversized history.
-    """
-
-
-class AcpConversationPayloadExceeded(AcpContextWindowExceeded):  # noqa: N818
-    """The provider retained attachments beyond its native request-size limit.
-
-    KiroCrew cannot inspect provider-owned retained attachments.  Interactive
-    callers must therefore discard that native conversation and rebuild it
-    from bounded dashboard history before retrying, just as for a token-window
-    overflow.
-    """
-
-
-# Auth failure on stderr is detected during spawn/prompt so we can raise
-# AcpAuthRequired (non-retryable) instead of churning through the retry ladder.
-# The detector is `is_auth_failure_output` below; there is deliberately no
-# separate "not logged in" pattern here, because having one was the defect —
-# `_RE_SESSION_EXPIRED` already carries that wording alongside the rest of the
-# auth vocabulary, and a second narrower copy is what let the spawn path miss
-# every expiry that does not use the banner's exact words.
-#
-# The DETECTION lives here; the MESSAGE does not. What an operator must do to sign
-# a harness back in is a property of that harness, so every raise site reads
-# `host_auth.signed_out_message(backend)` instead of a literal in this module. A
-# literal here spelled `kiro-cli login` for whichever harness happened to fail,
-# which is wrong the moment a harness signs in through its own credential file.
-
-
-# ── Transient-error classification (shared by _format_acp_error and
-# _is_transient_raw_error) ──
-#
-# Single source of truth for "is this ACP backend error a momentary,
-# retry-worthy hiccup?". The user-facing message formatter AND the
-# retry-eligibility classifier both key off these patterns, so the two can
-# never drift again: otherwise the formatter could rewrite a generic 5xx into a
-# friendly string the marker-based retry classifier does not recognise, silently
-# preventing the retry from firing.
-#
-# Scopes mirror _format_acp_error's if/elif chain: model-unavailable matches
-# the provider `data` field only (it extracts the model name from a structured
-# string); throttle, auth, and the 5xx family match the combined
-# `data + message` haystack so a 5xx token in either field is caught.
-_RE_MODEL_UNAVAILABLE = re.compile(r"[Tt]he model '([^']+)' is not available")
-# kiro-cli >= 2.16 rewording of the same capacity/rollout rejection, which
-# names NO model: "The model you've selected is temporarily unavailable.
-# Please use '/model' to select a different model and try again." Without its
-# own pattern this wording fell through to the unknown-shape branch and was
-# classified terminal, so unattended callers (cron, subagents, consolidation)
-# failed fast on a momentary blip their retry ladder exists to absorb — the
-# exact drift hazard the marker-coupling note above warns about. The quote
-# class covers both the straight and typographic apostrophe in "you've".
-_RE_MODEL_TEMP_UNAVAILABLE = re.compile(
-    r"[Tt]he model you['\u2019]ve selected is temporarily unavailable"
-)
-# MPS ValidationException wording for a model the partition/account does not
-# serve — distinct from the "is not available" capacity string above. Covers the
-# ``auto`` sentinel in partitions that do not serve it.
-_RE_INVALID_MODEL_ID = re.compile(r"[Ii]nvalid model ID:\s*([^\s,;'\"]+)")
-_RE_THROTTLE_NAMED = re.compile(
-    r"\b(ThrottlingException|TooManyRequestsException|ServiceQuotaExceededException)\b"
-)
-_RE_THROTTLE_GENERIC = re.compile(
-    r"\b(rate.?limit|throttl(?:e|ed|ing)|too many requests)\b", re.IGNORECASE
-)
-_RE_AUTH = re.compile(
-    r"\b(AccessDenied(?:Exception)?|UnauthorizedException|ExpiredToken(?:Exception)?"
-    r"|InvalidSignatureException|UnrecognizedClientException)\b"
-)
-_5XX_SEP = r"[ \t_-]?"
-_RE_5XX_NAMED = re.compile(
-    rf"\b(internal{_5XX_SEP}server{_5XX_SEP}error|internal{_5XX_SEP}failure"
-    rf"|service{_5XX_SEP}unavailable(?:{_5XX_SEP}exception)?"
-    rf"|dispatch{_5XX_SEP}failure|connection{_5XX_SEP}reset(?:{_5XX_SEP}error)?)\b",
-    re.IGNORECASE,
-)
-_RE_5XX_STATUS = re.compile(
-    r"(?:HTTP|status|API\s+Error:?)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE
-)
-_RE_CONNECTION = re.compile(
-    r"\bE(?:CONNREFUSED|CONNRESET|CONNABORTED|TIMEDOUT|PIPE|HOSTUNREACH|AI_AGAIN)\b"
-    r"|\bsocket hang ?up\b"
-    r"|\bfetch failed\b"
-    r"|\bconnection (?:refused|reset|closed|error|timed ?out)\b",
-    re.IGNORECASE,
-)
-_RE_5XX_PHRASE = re.compile(
-    r"\binternal server error\b|\bservice unavailable\b|\bno available lane\b", re.IGNORECASE
-)
-# Genuine retry hint only. "response stream" is deliberately NOT matched here,
-# because that would make this branch a catch-all: kiro-cli wraps EVERY mid-stream
-# provider failure as "Encountered an error in the response stream: <real cause>",
-# so the wrapper prefix alone — present on quota exhaustion, validation errors,
-# anything — would classify the error as a momentary 5xx, tell the user to retry,
-# and DISCARD the real cause. A monthly-usage-limit rejection would surface as
-# "The model backend hit a transient error (HTTP 5xx)" and burn the retry ladder.
-# The wrapper is a transport envelope, not a signal about the failure inside it;
-# classification reads the inner detail (see _provider_detail).
-#
-# The hint wordings are PROVIDER-scoped, so onboarding a backend means auditing
-# this alternation. "please try again" is Kiro/Bedrock. "try your request again"
-# is the claude-agent-acp seam's generic upstream 500 ("Internal error: API
-# Error: The system encountered an unexpected error during processing. Try your
-# request again." with data {'errorKind': 'unknown'}): that frame carries no
-# named exception and no HTTP status token, so its retry hint is the ONLY
-# transient signal in it, and without this token the momentary blip reached the
-# user as a terminal error card and the backoff ladder never engaged.
-_RE_5XX_HINT = re.compile(r"(please try again|try your request again)", re.IGNORECASE)
-# Session expiry, by HTTP status. An expired session is rejected with 401/403,
-# and nothing else in this module recognised those codes: the error fell through
-# to the 5xx family (a co-occurring DispatchFailure/ConnectionReset from the
-# aborted request is enough to match) and the user was told to retry or switch
-# models, neither of which can succeed against an expired login. Status is the
-# primary signal because the rejection carries no explanatory wording.
-_RE_AUTH_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:401|403)\b", re.IGNORECASE)
-# Session expiry, by wording. Complements the status match for backends that
-# describe the expiry in prose without a machine-readable code. Deliberately
-# excludes Bedrock's named exceptions, which _RE_AUTH already owns.
-_RE_SESSION_EXPIRED = re.compile(
-    r"\b(?:session\s+(?:has\s+)?expired|session\s+timed?\s*out"
-    r"|login\s+(?:has\s+)?expired|authentication\s+(?:has\s+)?expired"
-    r"|not\s+logged\s+in|not\s+authenticated|not\s+signed\s+in"
-    r"|re-?authenticate|login\s+required|auth(?:entication)?\s+required)\b",
-    re.IGNORECASE,
-)
-# Credential REJECTED rather than expired. Switching the active Kiro account
-# invalidates the credential a long-lived kiro-cli child still holds, and the
-# upstream rejection reports only that the bearer token is invalid: it carries
-# no status code and never uses expiry wording, so neither _RE_AUTH_STATUS nor
-# _RE_SESSION_EXPIRED matches it and the failure reaches the user as the raw
-# upstream string with no sign-in affordance. Grouped with session expiry
-# because the remedy is identical — sign in again; no retry can make a rejected
-# credential valid. The gap between the two words is fenced to one sentence and
-# one line so the pattern cannot span unrelated errors in a combined haystack.
-_RE_INVALID_BEARER = re.compile(
-    r"\b(?:bearer\s+token\b[^.\n]{0,80}?\binvalid|invalid\s+bearer\s+token)\b",
-    re.IGNORECASE,
-)
-
-
-def _is_session_expired(haystack: str) -> bool:
-    """True when the session credential is expired or rejected, not a backend fault.
-
-    All three signals are terminal: retrying can neither refresh a login nor
-    revive a credential the upstream has rejected. Checked before the 5xx family
-    so an aborted request's transport error does not shadow the real cause.
-    """
-    return bool(
-        _RE_AUTH_STATUS.search(haystack)
-        or _RE_SESSION_EXPIRED.search(haystack)
-        or _RE_INVALID_BEARER.search(haystack)
-    )
-
-
-def is_auth_failure_output(haystack: str) -> bool:
-    """True when free-form kiro-cli output reports an auth failure.
-
-    Companion to :func:`_is_session_expired` for output that is NOT a JSON-RPC
-    error frame — i.e. whatever the CLI writes to stderr while starting up. It is
-    the union of the two terminal auth families this module already recognises:
-    ``_is_session_expired`` (401/403, expiry wording, rejected bearer token) and
-    ``_RE_AUTH`` (the named service exceptions, which ``_is_session_expired``
-    deliberately leaves to ``_RE_AUTH``). Both are terminal for the same reason —
-    no retry refreshes a login — so for the single question "is this stderr an
-    auth problem" they belong together.
-
-    This exists because the two auth vocabularies had drifted apart by call path,
-    not by intent. Everything above was reachable only from the error-frame path;
-    the spawn / ``session/new`` path had its own detector matching the single
-    literal banner ``not logged in``. Real expiry output does not use that
-    wording — an expired bearer token produces ``AccessDeniedException: "Invalid
-    token"`` and ``the bearer token included in the request is invalid`` — so the
-    spawn path discarded an auth signal this module could already read, and the
-    operator got a 90-second timeout instead of a sign-in prompt.
-
-    Keeping one detector rather than widening the banner regex is the same
-    anti-drift argument the module makes for its other shared patterns: a second
-    vocabulary is what created the gap.
-
-    :func:`kiro_crew.credential_errors.is_credential_propagation_delay` is the
-    single carve-out: an auth-shaped rejection a retry DOES fix, so latching it
-    would raise the explicitly non-retryable ``AcpAuthRequired`` and skip the
-    ladder — and a cold-start burst is exactly when kiro-cli prints it on stderr.
-    It lives in ``credential_errors.py``, not here, so consumers outside the ACP
-    layer share the verdict without a fresh agent-SDK boundary import edge.
-    """
-    if is_credential_propagation_delay(haystack):
-        return False
-    return bool(_RE_AUTH.search(haystack)) or _is_session_expired(haystack)
-
-
-# An OS sandbox that refused to initialize, read off the dead child's stderr.
-# Detected during spawn/init for the same reason the auth vocabulary above is: the
-# condition is DETERMINISTIC, so the respawn the reconnect ladder is about to make
-# reproduces it exactly, and the operator gets a generic "process exited" card
-# several failed attempts later instead of the one line that names the fix.
-#
-# Anchored on a sandbox token in every alternative, deliberately. The failure
-# arrives as a three-line burst whose other two lines are a bare spawn error
-# (``Failed to spawn child process`` / ``Invalid argument (os error 22)``) and a
-# bare errno (``Operation not permitted``) -- neither is sandbox-specific, both
-# are ordinary output for a missing binary, a bad interpreter or a denied
-# credential file, and matching either alone would latch a PERMANENT verdict onto
-# a class of deaths a respawn legitimately fixes. Whichever layer refused prints a
-# sandbox token of its own, so requiring one costs no coverage:
-#
-# * ``sandbox initialization failed`` / ``sandbox_apply`` -- Seatbelt's own
-#   refusal, printed by whichever process called it (the harness's internal
-#   sandbox, or ``sandbox-exec`` under Crew's wrap).
-# * ``sandbox-exec:`` -- the macOS wrapper Crew's own seatbelt path execs.
-# * Crew's Linux namespace launcher refusing after the spawn, classified by
-#   :func:`sandbox.launcher_refusal` rather than by its prefixes. The prefixes
-#   alone are the WRONG test: that function deliberately answers ``None`` for
-#   launcher lines that are not sandbox failures at all, and two of them are
-#   actively retryable -- ``FATAL ... did not publish`` is a failed parent/child
-#   pipe handshake it classifies as ``transient`` (it self-heals on the next
-#   spawn), and the hardlinked-credential refusal means the sandbox WORKED and
-#   found host state it must not paper over. Only its ``no_backend`` kind -- the
-#   host cannot build the sandbox -- is this signature. Classified per LINE
-#   because that function returns on its first matching line, so a hardlink line
-#   above a real ``unshare`` refusal would otherwise hide it.
-#
-# The EMITTER does not identify the responsible LAYER, which is why the raise site
-# supplies that separately -- see :func:`sandbox_init_failure`. A harness sandbox
-# nested inside Crew's wrap fails with the harness's own wording while the layer
-# to turn off is Crew's.
-_RE_SANDBOX_INIT_FAILURE = re.compile(
-    r"sandbox\s+initialization\s+failed|\bsandbox_apply\b|^\s*sandbox-exec:",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
-def is_sandbox_init_failure_output(haystack: str) -> bool:
-    """True when *haystack* (a child's stderr) carries an OS-sandbox init refusal.
-
-    Shared by both ACP transports -- ``AcpClient`` reads its own stderr ring
-    buffer, ``AcpRuntime`` latches per line at its drain -- so the two cannot come
-    to disagree about what the signature IS, the same anti-drift reason
-    :func:`is_auth_failure_output` is one function.
-    """
-    if _RE_SANDBOX_INIT_FAILURE.search(haystack):
-        return True
-    for line in haystack.splitlines():
-        if not line.strip().startswith(LAUNCHER_EXIT_PREFIXES):
-            continue
-        classified = launcher_refusal(line)
-        if classified is not None and classified[0] == "no_backend":
-            return True
-    return False
-
-
-async def sandbox_init_failure(
-    detail: str,
-    *,
-    crew_wrap: bool,
-    mode: str = "",
-    extra_hidden_dirs: tuple[str, ...] = (),
-    corroboration_output: str = "",
-) -> "AcpSandboxInitFailed":
-    """Build the classified error for a spawn an OS sandbox refused.
-
-    *crew_wrap* is the one fact the stderr cannot carry: WHICH layer wrapped the
-    spawn. Callers read it from the argv their own wrap returned
-    (:func:`sandbox.wrapped_by_crew_sandbox`) rather than from the signature,
-    because a harness sandbox nested inside Crew's wrap prints the harness's
-    wording while the layer the operator must change is Crew's -- the field
-    reports this exists for were resolved by Crew's own switch, on stderr that
-    named the harness. When Crew's wrap is NOT in the chain the harness's own
-    sandbox is the only one left. Two layers, no third state: a spawn with neither
-    cannot produce this signature at all.
-
-    ASYNC because of the second question, which is the one that decides whether the
-    message may hand out a disable switch: does a TRUSTED run agree that the layer
-    refuses on this host? ``corroborate_launcher_refusal`` answers it by re-running
-    the real launcher around a trusted no-op, whose stderr no child wrote -- and it
-    blocks on a subprocess, so it goes off the loop exactly as the first-run gate
-    runs it. It answers ``None`` off Linux and for output carrying no launcher line,
-    and ``transient`` for a failed launcher readiness handshake; only its
-    ``no_backend`` verdict -- the host cannot build the sandbox -- corroborates.
-
-    *extra_hidden_dirs* is the refused spawn's own mask set so the trusted run
-    exercises the same mounts. Omitting it can only make the trusted run refuse
-    LESS, which withholds the switch rather than handing it out wrongly -- the safe
-    direction for a default.
-
-    *corroboration_output* is the stderr to CLASSIFY, separate from *detail* which
-    is the stderr to SHOW, because the two need different shapes. The launcher's
-    refusal is recognised per LINE, and a caller whose display string folds the tail
-    onto one line behind a summary prefix (the shared runtime's ``death_summary()``
-    does exactly that) would present nothing a line test can match -- corroboration
-    would silently never run and the switch would never be reachable. Defaults to
-    *detail*, which is the right answer for a caller holding the raw tail.
-    """
-    layer = SANDBOX_LAYER_CREW if crew_wrap else SANDBOX_LAYER_HARNESS
-    corroborated = False
-    to_classify = corroboration_output or detail
-    if launcher_refusal(to_classify) is not None:
-        verdict = await asyncio.to_thread(
-            functools.partial(
-                corroborate_launcher_refusal,
-                to_classify,
-                mode=mode or "strict",
-                extra_hidden_dirs=extra_hidden_dirs,
-            )
-        )
-        # ``no_backend`` ONLY. The same function answers ``("transient", ...)``
-        # for a failed launcher readiness handshake, which says nothing about the
-        # host and self-heals on the next spawn, so treating it as corroborated
-        # would hand out the disable switch for a condition that fixes itself.
-        # The identical test the signature detector applies to a launcher line,
-        # for the identical reason.
-        corroborated = verdict is not None and verdict[0] == "no_backend"
-    return AcpSandboxInitFailed(layer=layer, detail=detail, corroborated=corroborated)
-
-
-async def sandbox_init_failure_for_runtime(runtime: Any) -> "AcpSandboxInitFailed | None":
-    """The classified error when *runtime* observed a sandbox refusal, else ``None``.
-
-    ONE function for the three sites that translate a shared-runtime STARTUP
-    failure, so they cannot answer this differently. All three are in
-    ``providers/acp.py`` -- the first ``spawn()``, the resume respawn, and
-    ``create_session()`` -- and each already restates the auth translation inline.
-    A third restatement of THIS one is how one startup path ends up classifying
-    what another does not, which is the shape that let the shared-runtime startup
-    miss the latch entirely in the first place.
-
-    Three and not four: the per-turn death translation reads no latch, because the
-    latch is spent when ``initialize`` completes and a live session exists only
-    after that.
-
-    Duck-typed rather than annotated against ``AcpRuntime``: this module is below
-    the runtime in the import order and cannot name it.
-
-    Settles the stderr drain FIRST, and that is not a nicety. The latch is written
-    by the drain task, while the death that brings a caller here is discovered on
-    the stdout side and fails the pending ``initialize`` synchronously -- so both
-    are runnable at once and a straight read can see ``False`` for a line already
-    in the pipe. That is the ordinary shape of a real refusal, not a corner: the
-    child writes its signature and closes stdout together. Bounded and swallowing
-    (see :meth:`AcpRuntime.settle_stderr`), the same pattern ``AcpClient`` applies
-    at its own EOF. Because every caller asks this BEFORE the auth translation,
-    the settle covers that read too.
-    """
-    await runtime.settle_stderr()
-    if not runtime.saw_sandbox_init_failure():
-        return None
-    # The retained summary already carries the redacted stderr tail; it is empty
-    # on a restricted session, where the latch still fires and the remedy is what
-    # matters.
-    return await sandbox_init_failure(
-        runtime.death_summary() or "",
-        crew_wrap=runtime.sandbox_wrapped_by_crew,
-        mode=runtime.sandbox_mode,
-        extra_hidden_dirs=runtime.sandbox_hidden_dirs,
-        # The retained summary is what an operator READS -- one line, the tail
-        # folded behind a returncode prefix. Corroboration needs the lines
-        # themselves, so it gets them separately; passing the summary would leave
-        # the launcher's own refusal unrecognisable and the trusted run unmade.
-        corroboration_output=runtime.redacted_stderr_tail(),
-    )
-
-
-# A dynamic-registration call the endpoint throttled, read off the dead child's
-# stderr. Deliberately CONJUNCTIVE per line: a line must carry both the
-# registration context and an unambiguous too-many-requests marker before it
-# classifies, so neither a model-turn throttle (429 with no registration
-# context, which the provider-error path already classifies from its structured
-# frame) nor an unrelated registration failure (auth rejection, malformed
-# response — both terminal) can fire this. A bare ``429`` is deliberately NOT a
-# marker: a digit that lands in an exit code or a byte count must not upgrade a
-# crash to a throttle.
-#
-# Free-text stderr is an accepted evidence source here for the same reason it
-# is for :func:`is_auth_failure_output` and the sandbox latch: the child's
-# stderr is subprocess diagnostic output, not the structured frame the
-# compaction classifier insists on — but it is also the ONLY surface this
-# failure reaches, because the child dies before any frame can carry it. The
-# consequence of a false positive is bounded (a budgeted retry of a turn whose
-# replay safety is gated on observed activity by every consumer), which is why
-# the conjunctive signature above is the whole defence this needs.
-_RE_REGISTRATION_FAILED = re.compile(r"\bregistration failed\b", re.IGNORECASE)
-_RE_REGISTRATION_THROTTLE_MARK = re.compile(
-    r"\bHTTP 429\b|\btoo many requests\b|\brequested too many times\b", re.IGNORECASE
-)
-
-
-def registration_throttle_line(haystack: str) -> str | None:
-    """The first line of *haystack* showing a throttled registration, or ``None``.
-
-    *haystack* is a child's retained stderr (newline-joined lines). Matched per
-    LINE so the two tokens must describe the same event: a registration failure
-    early in the tail plus an unrelated throttle mention later must not combine
-    into a verdict neither line supports. Returns the line itself so the caller
-    can retain ONE sanitized cause instead of the tail's repeated copies.
-    """
-    for line in haystack.splitlines():
-        if _RE_REGISTRATION_FAILED.search(line) and _RE_REGISTRATION_THROTTLE_MARK.search(line):
-            return line.strip()
-    return None
-
-
-def is_registration_throttle_output(haystack: str) -> bool:
-    """True when *haystack* (a child's stderr) shows a throttled registration.
-
-    Shared by both ACP transports — ``AcpClient`` reads its own stderr ring
-    buffer, the shared-runtime death translations read
-    ``AcpRuntime.redacted_stderr_tail()`` — so the two cannot come to disagree
-    about what the signature IS, the same anti-drift reason
-    :func:`is_auth_failure_output` is one function.
-    """
-    return registration_throttle_line(haystack) is not None
-
-
-def registration_rate_limited_error(base: str, cause: str) -> "AcpRegistrationRateLimited":
-    """Build the typed error for a death whose evidence shows a registration throttle.
-
-    ONE composer for every translation site (the shared-runtime ``_died``, the
-    provider's ``_translate_dead``, the direct client's own death paths), so the
-    guidance and the one-retained-cause shape cannot drift apart. *base* is the
-    site's own death context; *cause* is the single matched stderr line, already
-    redacted by whichever reader captured it.
-    """
-    return AcpRegistrationRateLimited(
-        f"{base} — dynamic registration was rate-limited by the endpoint "
-        f"(HTTP 429); this is endpoint throttling, not a crash — retry later. "
-        f"Cause: {cause}"
-    )
-
-
-# Account/plan capacity is EXHAUSTED — terminal. Distinct from a throttle: a
-# throttle clears in seconds and a retry is the right move, whereas a spent
-# monthly allowance does not come back until it resets, so retrying only adds
-# latency before the same rejection. Checked BEFORE the throttle branch because
-# some limit messages also carry rate-limit-ish wording.
-_RE_USAGE_LIMIT = re.compile(
-    r"\b(?:monthly|daily|weekly)\s+(?:usage\s+)?limit\b"
-    r"|\busage\s+limit\s+has\s+been\s+reached\b"
-    r"|\b(?:MonthlyLimitError|FreeTierLimitExceeded)\b",
-    re.IGNORECASE,
-)
-# kiro-cli's generic wrapper for a backend generation failure that died BEFORE
-# the response stream was established (so no request_id, no error class, and
-# none of the tokens above). Observed a case where data was exactly "Kiro
-# failed to generate a response" while an independent gateway was
-# simultaneously getting model-unavailable for the same model family. These
-# pre-stream failures are overwhelmingly momentary capacity or rollout blips,
-# so they are retry-worthy. Matched against the provider `data` field only
-# (like model-unavailable): the phrase is a provider wrapper, never JSON-RPC
-# boilerplate, and scoping to `data` keeps a stray echo in `message` from
-# flipping an otherwise-terminal error.
-_RE_GENERATE_FAILED = re.compile(r"failed to generate a response", re.IGNORECASE)
-# kiro-cli's sibling wrapper for the same class of backend failure, observed
-# AFTER tool results had landed and carrying a request_id: "The service failed
-# to process the request (request_id: ...)". Same momentary-blip reasoning and
-# the same `data`-only scoping as _RE_GENERATE_FAILED; kept as its own pattern
-# so the two branches can word their guidance for the moment each one fails.
-_RE_PROCESS_FAILED = re.compile(r"failed to process the request", re.IGNORECASE)
-
-# kiro-cli's structural rejection of a payload the backend could not parse:
-# "Improperly formed request". This string has NO source-side handling and
-# passes through the unknown-shape branch verbatim, so the user gets
-# the raw provider text with no repair affordance. This is a DETERMINISTIC
-# rejection (the payload was rejected for its shape, not a momentary backend
-# fault), so retrying the identical payload can only reproduce the same
-# rejection: it is TERMINAL (non-retryable). Matched against the provider `data`
-# field only (like model-unavailable / generate-failed), so a stray echo of the
-# phrase in the JSON-RPC `message` cannot flip an unrelated error into this
-# branch. Drives BOTH _format_acp_error (repair guidance) and
-# _is_transient_raw_error (terminal verdict) so wording and retry-eligibility
-# never drift.
-_RE_MALFORMED_REQUEST = re.compile(r"[Ii]mproperly formed request", re.IGNORECASE)
-
-# kiro-cli's wording for a concurrent in-flight prompt on the session, read by
-# the user-facing formatter below and by `_raise_acp_error`'s AcpPromptBusy
-# classification. One pattern, but two haystacks: the formatter scopes to the
-# provider `data` field while the classifier also searches the JSON-RPC
-# `message`, so an echo carried only by `message` raises AcpPromptBusy under the
-# unrecognised-shape text.
-_PROMPT_BUSY_RE = re.compile(r"already in progress", re.IGNORECASE)
-
-# kiro-cli's envelope for a failure that happened mid-stream. The text after the
-# colon is the provider's own message — the same words the CLI prints in a
-# terminal — so it is what a user needs to see.
-_RE_STREAM_ENVELOPE = re.compile(
-    r"^\s*Encountered an error in the response stream:\s*", re.IGNORECASE
-)
-# Trailing "(request_id: ...)" is stripped from the detail because every branch
-# re-appends it via req_id_suffix; leaving it would print the id twice.
-_RE_TRAILING_REQ_ID = re.compile(r"\s*\(request_id:\s*[0-9a-fA-F-]+\)\s*$")
-
-
-def _provider_detail(data: str) -> str:
-    """The provider's own error text, unwrapped from kiro-cli's stream envelope.
-
-    Returns "" when *data* carries nothing worth showing. Used by the
-    unknown-shape fallback so an unrecognised provider failure surfaces its real
-    message (CLI parity) instead of a ``repr`` of the JSON-RPC dict. Recognised
-    failure modes keep their curated guidance and do not call this.
-    """
-    detail = _RE_STREAM_ENVELOPE.sub("", str(data or "")).strip()
-    detail = _RE_TRAILING_REQ_ID.sub("", detail).strip()
-    return detail
-
-
-def _model_is_unentitled(data: str, available_models: Sequence[str] | None) -> str | None:
-    """Return the rejected model name iff the account is not entitled to it.
-
-    Upstream reports entitlement failures and transient capacity failures with
-    the SAME string ("The model 'X' is not available"), so the string alone
-    cannot tell them apart. The advertised model list can: it is captured at
-    session init from what this account is actually served, so a rejected model
-    that is absent from it was never on offer -- an entitlement problem no retry
-    can fix. A rejected model that IS advertised really is a transient
-    capacity/rollout blip.
-
-    Returns None when the model is advertised, when nothing was rejected, or
-    when *available_models* is None/empty (entitlement unknowable -- treat as
-    transient rather than telling a user their plan lacks a model on no
-    evidence).
-
-    Both :func:`_format_acp_error` and :func:`_is_transient_raw_error` route
-    through this single helper so the user-facing wording and the retry verdict
-    cannot drift apart -- see the drift warning above.
-    """
-    # Two wordings name the rejected id: kiro-cli's "The model 'X' is not
-    # available" and the MPS validation frame "Invalid model ID: X" (the shape
-    # the background path's ``_rejected_model_from_error`` already accepts).
-    # Both are judged against the same served list so the entitlement wording
-    # and the retry verdict cannot depend on which frame the backend emitted.
-    match = _RE_MODEL_UNAVAILABLE.search(data) or _RE_INVALID_MODEL_ID.search(data)
-    if not match:
-        return None
-    if not available_models:
-        return None
-    rejected = match.group(1)
-    # Route the served-list membership through the canonical helper: casing has
-    # no meaning in these ids, and an entitled-but-differently-cased match must
-    # not be reported as unentitled. The empty-list guard above preserves the
-    # None-on-empty contract, so the helper's empty-means-usable answer is
-    # never consulted here.
-    if not model_is_unusable(rejected, available_models):
-        return None
-    return rejected
-
-
-def _is_transient_raw_error(error: object, available_models: Sequence[str] | None = None) -> bool:
-    """True iff a raw ACP JSON-RPC ``error`` is a retryable transient backend
-    failure (Bedrock 5xx / throttle / model-unavailable rollout) rather than an
-    auth/validation/unknown error that a retry cannot fix.
-
-    Classifies from the RAW ``{code, message, data}`` — never the formatted
-    user-facing string — so the retry decision is independent of message
-    wording. :class:`AcpError` carries this verdict (``.transient``) to the
-    retry layer (``llm_helpers``, ``chat_runner``). Precedence:
-    unentitled-model(terminal) → usage-limit(terminal) →
-    malformed-request(terminal) → model-unavailable → throttle →
-    credential-propagation(transient) → auth(terminal) →
-    session-expiry(terminal) → connection failure(transient) →
-    generic 5xx / pre-stream generation failure → unknown(terminal). Every step
-    mirrors :func:`_format_acp_error`'s if/elif order EXCEPT malformed-request,
-    which that formatter checks LAST: this classifier deliberately hoists it
-    above the 5xx family so a co-occurring connector token or retry hint cannot
-    rescue a payload the backend rejected for its shape (see
-    ``test_terminal_branches_outrank_a_co_occurring_dispatch_failure``). A frame
-    carrying both wordings therefore reads as 5xx prose with a terminal verdict;
-    only the verdict drives retries.
-
-    *available_models* is this account's advertised set when the caller knows
-    it. It only ever makes the verdict MORE conservative: a model the account
-    was never offered is terminal instead of being retried to no purpose. Omit
-    it and behaviour is unchanged from before this parameter existed.
-    """
-    if not isinstance(error, dict):
-        return False
-    data = str(error.get("data", "") or "")
-    message = str(error.get("message", "") or "")
-    haystack = f"{data} {message}"
-    if _model_is_unentitled(data, available_models):
-        # Terminal: the account is not entitled to this model, so every retry
-        # spends latency to reproduce the same rejection.
-        return False
-    if _RE_USAGE_LIMIT.search(haystack):
-        # Terminal: the allowance is spent until it resets. Ahead of the throttle
-        # check so limit wording that also reads as rate-limiting stays terminal.
-        return False
-    if _RE_MALFORMED_REQUEST.search(data):
-        # Terminal: a payload rejected for its STRUCTURE will be
-        # rejected identically on every retry, so there is no momentary fault to
-        # wait out. Scoped to `data` (mirrors _format_acp_error) so a phrase
-        # echo in the JSON-RPC `message` can't flip an unrelated error. Stated
-        # explicitly and terminal-first (like _RE_USAGE_LIMIT) so the verdict is
-        # intentional and self-documenting, not incidental to the False
-        # fall-through, and so a future transient marker added below cannot
-        # accidentally match malformed-request wording.
-        return False
-    if _RE_MODEL_UNAVAILABLE.search(data):
-        return True
-    if _RE_MODEL_TEMP_UNAVAILABLE.search(data):
-        # Nameless capacity rejection (kiro-cli >= 2.16 wording). Matched
-        # against `data` only, like its named sibling above, so a phrase echo
-        # in the JSON-RPC `message` can't flip an otherwise-terminal error.
-        # No entitlement check is possible (the wording names no model), but
-        # the bounded retry budget caps the cost if one ever slips through.
-        return True
-    if _RE_THROTTLE_NAMED.search(haystack) or _RE_THROTTLE_GENERIC.search(haystack):
-        return True
-    if is_credential_propagation_delay(haystack):
-        # Transient: the credential is valid, IAM has just not propagated it yet.
-        # Checked BEFORE both auth branches below, which match this very frame
-        # (UnrecognizedClientException, HTTP 403) and would return terminal.
-        return True
-    if _RE_AUTH.search(haystack):
-        # Auth is terminal — a retry can't fix an expired/denied credential.
-        return False
-    if _is_session_expired(haystack):
-        # An expired or rejected kiro-cli login is terminal too.  Keep this
-        # before connection/5xx handling because aborted requests often carry
-        # a transport wrapper beside the credential failure.
-        return False
-    if _RE_CONNECTION.search(haystack):
-        # Recognized terminal signals above take precedence; an otherwise unknown
-        # cause with connection wording may consume only this bounded retry budget.
-        return True
-    return bool(
-        _RE_5XX_NAMED.search(haystack)
-        or _RE_5XX_STATUS.search(haystack)
-        or _RE_5XX_HINT.search(haystack)
-        or _RE_5XX_PHRASE.search(haystack)
-        or _RE_GENERATE_FAILED.search(data)
-        or _RE_PROCESS_FAILED.search(data)
-    )
-
-
-#: ``ProviderErrorClass.kind`` values, in the precedence
-#: :func:`classify_provider_error` applies (first match wins).
-PROVIDER_ERROR_USAGE_LIMIT = "usage_limit"
-PROVIDER_ERROR_MALFORMED_REQUEST = "malformed_request"
-PROVIDER_ERROR_MODEL_UNAVAILABLE = "model_unavailable"
-PROVIDER_ERROR_THROTTLE = "throttle"
-PROVIDER_ERROR_CREDENTIAL_PROPAGATION = "credential_propagation"
-PROVIDER_ERROR_AUTH = "auth"
-PROVIDER_ERROR_SESSION_EXPIRED = "session_expired"
-PROVIDER_ERROR_CONNECTION = "connection"
-PROVIDER_ERROR_HTTP_5XX = "http_5xx"
-PROVIDER_ERROR_UNKNOWN = "unknown"
-
-
-@dataclass(frozen=True)
-class ProviderErrorClass:
-    """One provider-error verdict: what the text says and whether a retry can help.
-
-    ``kind`` is one of the ``PROVIDER_ERROR_*`` tokens; ``retryable`` is exactly
-    the answer :func:`_is_transient_raw_error` gives for the same text, so the
-    two can never disagree about a frame; ``matched`` is the token the pattern
-    hit (for logs), never the whole message.
-    """
-
-    kind: str
-    retryable: bool
-    matched: str = ""
-
-    @property
-    def terminal(self) -> bool:
-        return not self.retryable
-
-
-def classify_provider_error(haystack: str, *, data: str | None = None) -> ProviderErrorClass:
-    """Name the provider failure in *haystack* using this module's ONE pattern set.
-
-    *haystack* is the message text (formatted or raw); *data* is the raw JSON-RPC
-    ``error.data`` field when the caller has it (defaults to *haystack*), because
-    the malformed-request and model-unavailable patterns are matched against the
-    provider's own field only, never against a phrase echo in ``message``.
-
-    Precedence mirrors :func:`_is_transient_raw_error` exactly: usage-limit →
-    malformed-request → model-unavailable → throttle → credential-propagation →
-    auth → session-expiry → connection → 5xx (named / status / retry hint) →
-    unknown. ``unknown`` is terminal. This is the public face of the private
-    ``_RE_*`` patterns: the dependency coordinator's ACP adapter and any other
-    reader classify through it so a third copy of the vocabulary cannot drift.
-    """
-    text = haystack or ""
-    data_field = text if data is None else data
-    if _RE_USAGE_LIMIT.search(text):
-        return ProviderErrorClass(PROVIDER_ERROR_USAGE_LIMIT, False, "usage limit")
-    if _RE_MALFORMED_REQUEST.search(data_field):
-        return ProviderErrorClass(PROVIDER_ERROR_MALFORMED_REQUEST, False, "malformed request")
-    if _RE_MODEL_UNAVAILABLE.search(data_field) or _RE_MODEL_TEMP_UNAVAILABLE.search(data_field):
-        return ProviderErrorClass(PROVIDER_ERROR_MODEL_UNAVAILABLE, True, "model unavailable")
-    match = _RE_THROTTLE_NAMED.search(text) or _RE_THROTTLE_GENERIC.search(text)
-    if match:
-        return ProviderErrorClass(PROVIDER_ERROR_THROTTLE, True, match.group(0))
-    if is_credential_propagation_delay(text):
-        return ProviderErrorClass(
-            PROVIDER_ERROR_CREDENTIAL_PROPAGATION, True, "credential propagation"
-        )
-    match = _RE_AUTH.search(text)
-    if match:
-        return ProviderErrorClass(PROVIDER_ERROR_AUTH, False, match.group(0))
-    if _is_session_expired(text):
-        return ProviderErrorClass(PROVIDER_ERROR_SESSION_EXPIRED, False, "session expired")
-    match = _RE_CONNECTION.search(text)
-    if match:
-        return ProviderErrorClass(PROVIDER_ERROR_CONNECTION, True, match.group(0))
-    match = (
-        _RE_5XX_NAMED.search(text)
-        or _RE_5XX_STATUS.search(text)
-        or _RE_5XX_HINT.search(text)
-        or _RE_GENERATE_FAILED.search(data_field)
-        or _RE_PROCESS_FAILED.search(data_field)
-    )
-    if match:
-        return ProviderErrorClass(PROVIDER_ERROR_HTTP_5XX, True, match.group(0))
-    return ProviderErrorClass(PROVIDER_ERROR_UNKNOWN, False)
-
-
-def advertised_model_ids(entries: object) -> list[str]:
-    """Model ids out of an ``availableModels``-shaped list, defensively.
-
-    The advertised list is remote input reshaped by several backends, so this
-    tolerates anything that is not a list of ``{"modelId": ...}`` dicts and
-    returns what it can. Shared by the three call sites that pre-flight a model
-    so none of them re-derives the shape — and so a surprising payload degrades
-    to "entitlement unknown" (empty list -> :func:`model_is_unusable` allows the
-    send) instead of raising inside session startup.
-    """
-    if not isinstance(entries, (list, tuple)):
-        return []
-    ids: list[str] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        model_id = entry.get("modelId") or entry.get("value") or ""
-        if isinstance(model_id, str) and model_id.strip():
-            ids.append(model_id)
-    return ids
-
-
-def model_is_unusable(model_id: str, advertised: Sequence[str] | None) -> bool:
-    """True when *advertised* is known and excludes *model_id*.
-
-    The counterpart to :func:`_model_is_unentitled`, moved BEFORE the wire: that
-    one explains a rejection after the fact, this one declines to send a model
-    the backend already told us the account cannot run. Deliberately ONE shared
-    predicate rather than a copy per call site — the same reason that keeps the
-    formatter and the retry classifier share a discriminator: two spellings of
-    "can this account use it" would eventually disagree.
-
-    Returns False — allow the send — whenever entitlement is unknowable: an
-    empty/None advertised set (no session yet, or a backend that omits
-    ``models``) must not be read as "nothing is allowed", which would withhold
-    every model on a backend that simply does not advertise.
-
-    Only meaningful where the advertised ids share a namespace with *model_id*,
-    and callers gate on that. kiro-cli's advertised ids are exactly the ids
-    ``session/set_model`` accepts, so an id absent from the list is genuinely
-    unusable. The claude backend advertises BARE ids (``claude-opus-4-8[1m]``)
-    while the configured model is the prefixed provider id
-    (``global.anthropic.claude-opus-4-8[1m]``), so comparing those two
-    namespaces would call every legitimate model unusable; that backend
-    announces its own substitutions through the ``session/new`` advisory
-    instead (see ``_new_session_following_substitution``).
-
-    A pin carrying a stale ``<namespace>::<bare-id>`` qualifier (stored when a
-    catalog advertised the qualified spelling, judged against one advertising
-    the bare id) is the one comparable mismatch, and it is deliberately NOT
-    folded here: this predicate's permissive answer feeds the wire sites, and
-    a still-qualified id on the wire is a spelling the backend never
-    advertised. :func:`resolve_pin_spelling` is the shared fold for that case —
-    it answers with the advertised spelling, so a caller can compare AND send
-    one consistent id.
-    """
-    if not advertised:
-        return False
-    wanted = model_id.strip().lower()
-    return wanted not in {m.strip().lower() for m in advertised if m and m.strip()}
-
-
-def resolve_pin_spelling(model_id: str, advertised: Sequence[str] | None) -> str:
-    """The advertised spelling *model_id* resolves to, or ``""`` when none.
-
-    The companion to :func:`model_is_unusable` for values that arrive from
-    storage rather than from the live picker: a persisted pin can carry a
-    ``<namespace>::<bare-id>`` qualifier from the catalog that advertised it
-    (for example ``openrouter::z-ai/glm-5.3-flash``), while the session being
-    judged advertises the BARE id. The literal membership test then misses for
-    a model the backend fully serves. This fold recovers the match without
-    per-provider exemptions: the full id is tried first, and only on a miss is
-    ONE leading ``<namespace>::`` qualifier peeled and the tail retried — so a
-    pin the backend genuinely does not serve still resolves to ``""`` under
-    either spelling, and an id advertised verbatim (qualifier and all) never
-    gets peeled at all.
-
-    When the peel misses too, both sides are folded with
-    :func:`model_registry.catalog_key` — the same fold
-    :func:`model_registry.namespace_vocabulary` judges nativeness with. That
-    fold strips an inference-profile prefix, the ``[1m]`` window marker and an
-    effort suffix, so a pin spelled in another namespace's provider-id form
-    (``global.anthropic.claude-opus-4-8[1m]``) meets the bare id this harness
-    advertises for the same model (``claude-opus-4.8``). Without it the two
-    sides fold with different functions: the vocabulary side calls the pin
-    native, this side finds no spelling, and the cold start reports an
-    entitlement problem for what is a spelling one. The fold is a SPELLING fold,
-    not a model fold: a candidate the static registry places as a DIFFERENT
-    canonical model from the pin (``claude-opus-4-8`` at 200K against a pin
-    naming the 1M ``claude-opus-4.8``) is rejected even though ``catalog_key``
-    folds the window marker away -- see
-    :func:`model_registry.same_registered_model` -- so a pin never resolves to
-    its neighbour with another context window. Several advertised spellings of
-    the SAME model can remain (a base and a 1M variant the registry lists as one
-    model); the winner is :func:`model_registry.preferred_advertised_spelling`,
-    the tie-break :func:`model_registry.resolve_wire_model_id` applies, so the
-    two folds cannot prefer different spellings.
-
-    Returns the ADVERTISED spelling of the match, not the caller's: the result
-    is meant to be sent on the wire (``session/set_model`` accepts advertised
-    ids), and it keeps the display verdict and the wire withhold answering from
-    one fold so the two cannot disagree about what "usable" means. Matching is
-    case/whitespace-insensitive on both sides, mirroring
-    :func:`model_is_unusable`.
-
-    An empty/unknown *advertised* set returns ``""`` — NOT as a "withheld"
-    answer, but as "nothing to resolve against": callers must keep routing the
-    withhold decision itself through :func:`model_is_unusable`, whose
-    empty-set-means-allow contract (harness-parity H12) this function does not
-    replace.
-    """
-    ids = [m.strip() for m in (advertised or []) if m and m.strip()]
-    if not ids:
-        return ""
-    by_key = {m.lower(): m for m in ids}
-    wanted = model_id.strip().lower()
-    if wanted in by_key:
-        return by_key[wanted]
-    namespace, sep, bare = wanted.partition("::")
-    if sep and namespace and bare in by_key:
-        return by_key[bare]
-    wanted_key = model_registry.catalog_key(wanted)
-    if not wanted_key:
-        return ""
-    folded = [
-        m
-        for m in ids
-        if model_registry.catalog_key(m) == wanted_key
-        and model_registry.same_registered_model(model_id, m)
-    ]
-    return model_registry.preferred_advertised_spelling(folded)
-
-
-def catalog_row_would_drop(model_id: str, advertised: Sequence[str] | None) -> bool:
-    """True when the picker filter drops catalog row *model_id* against *advertised*.
-
-    The one keep/drop verdict the dashboard model picker applies to a
-    ``--list-models`` row, shared with the read-path revalidation that decides
-    whether a snapshot is worth probing, so the two cannot disagree about which
-    rows a snapshot hides. A row is KEPT when it is the ``auto`` sentinel
-    (``auto`` or ``default``), when *advertised* lists it
-    (:func:`model_is_unusable` is False — which includes an unknown/empty
-    advertised set), or when :func:`resolve_pin_spelling` folds it onto an
-    advertised spelling (a ``<namespace>::<bare-id>`` row the picker rewrites
-    to the bare id). Every other row — an empty id included — drops.
-
-    This is the per-row verdict only. The picker additionally de-duplicates
-    rows that resolve to one advertised spelling, and shows the whole catalog
-    when no non-``auto`` row survives against a set that does not advertise
-    ``auto`` (a namespace mismatch); those are decisions about the list, made
-    by the caller.
-    """
-    wanted = (model_id or "").strip().lower()
-    if wanted in ("auto", "default"):
-        return False
-    if not model_is_unusable(model_id or "", advertised):
-        return False
-    return not resolve_pin_spelling(model_id or "", advertised)
-
-
-def resolve_usable_model(preferred: str, advertised: Sequence[str] | None) -> str:
-    """Resolve a SUBSTITUTE (non-explicit) model choice to what the account can
-    run, mirroring the interactive path's reset-to-default (``_wire_model_id``).
-
-    Returns ``""`` to mean **"do NOT override — inherit the session's backend
-    default"** (the served model ``session/new`` already assigned), so the wire
-    never receives a model the partition does not serve. Rules:
-
-      - empty ``preferred``           -> ``""`` (already inheriting the default);
-      - ``advertised`` unknown/empty  -> ``""`` for the ``"auto"`` sentinel (never
-        send a literal ``"auto"`` we cannot verify — some partitions do not
-        serve it), else trust a concrete caller-supplied id (nothing to check
-        it against);
-      - ``"auto"``                    -> ``"auto"`` IFF the backend advertises it,
-        else ``""`` — exactly ``_wire_model_id``'s
-        ``"auto" if "auto" in advertised else ""``;
-      - concrete + usable             -> that id;
-      - concrete, served only under its peeled spelling -> the ADVERTISED
-        spelling. A persisted pin can carry a stale ``<namespace>::<bare-id>``
-        qualifier while the session advertises the bare id; the literal miss is
-        retried through
-        :func:`resolve_pin_spelling`, and the fold's answer — not the caller's
-        spelling — goes on the wire, because the qualified spelling is one the
-        backend never advertised;
-      - concrete + not served under either spelling -> ``""`` (inherit the
-        served default rather than substituting a possibly-unavailable
-        ``"auto"``).
-
-    The EXPLICIT user-pick paths do NOT use this: they ``raise``
-    (``model_is_unusable``) so a user who chose a model sees an error, not a swap.
-    A reactive retry (``run_bg_oneliner``) remains a thin backstop for the
-    fail-open case where ``advertised`` was unknown at send time.
-    """
-    if not preferred:
-        return ""
-    if not advertised:
-        return "" if preferred == "auto" else preferred
-    ids = [m for m in advertised if m and m.strip()]
-    if preferred == "auto":
-        return "auto" if not model_is_unusable("auto", ids) else ""
-    if not model_is_unusable(preferred, ids):
-        return preferred
-    # Literal miss: the pin may only differ by a stale ``<namespace>::``
-    # qualifier. The fold answers with the advertised spelling on a hit and
-    # ``""`` when the model is absent under both spellings — exactly the
-    # inherit-the-default answer this path wants.
-    return resolve_pin_spelling(preferred, ids)
-
-
-def pick_served_default(current: str, advertised: Sequence[str] | None) -> str:
-    """The served model a session on *current* must switch to, or ``""``.
-
-    ``session/new`` picks the model itself and reports it as
-    ``currentModelId``, and that choice is the backend's own default rather
-    than anything Crew asked for. A partition does not have to serve the model
-    its backend defaults to: an account whose region omits ``"auto"`` can be
-    handed ``"auto"`` at birth, and then every ``session/prompt`` dies with
-    "your account does not have access to model 'auto'". So inheriting the
-    backend default is only safe when the inherited model is one the same
-    response advertised, and this answers which served model to move to when it
-    is not.
-
-    Returns ``""`` — nothing to do, keep inheriting — whenever the question
-    cannot be answered or the answer is already right:
-
-      - ``advertised`` empty/None: entitlement is unknowable, exactly
-        :func:`model_is_unusable`'s empty-set-means-allow contract. Reading an
-        absent list as "nothing is served" would switch every session on a
-        backend that simply does not advertise;
-      - empty ``current``: the backend echoed no model, so there is no evidence
-        it picked an unserved one. Fail open rather than override a default we
-        cannot see;
-      - ``current`` served, under its own spelling or under a peeled
-        ``<namespace>::`` one (:func:`resolve_pin_spelling`, the shared fold):
-        the session is already on a model the account can run.
-
-    Otherwise the default is genuinely unserved and the session needs a real
-    model: ``"auto"`` when the backend advertises it — the same
-    "let the backend choose" id ``resolve_usable_model`` and the dashboard's
-    ``_wire_model_id`` send — else the FIRST advertised id, because a served
-    model chosen for the user beats a session that cannot answer a single
-    prompt.
-    """
-    ids = [m for m in (advertised or []) if m and m.strip()]
-    if not ids:
-        return ""
-    if not current.strip():
-        return ""
-    if not model_is_unusable(current, ids):
-        return ""
-    if resolve_pin_spelling(current, ids):
-        return ""
-    return "auto" if not model_is_unusable("auto", ids) else ids[0]
-
-
-def _auto_remedy(available_models: Sequence[str] | None) -> str:
-    """The "set agent.model to 'auto'" remediation step, or nothing when the
-    partition does not serve ``auto``.
-
-    The capacity-blip messages list three remedies, and the second is the
-    ``auto`` sentinel. On a partition whose advertised list lacks ``auto`` that
-    advice re-opens the circle the unentitled-``auto`` branch closes: the user
-    follows it and the next turn dies on "no access to model 'auto'". So the
-    step is emitted only when ``auto`` is served, or when the served list is
-    unknown (nothing to check against, keep the historical advice). The
-    numbering of the remaining step shifts so the list still reads (1)(2)(3)
-    or (1)(2).
-    """
-    if model_is_unusable(DEFAULT_MODEL, available_models):
-        return "or (2) "
-    return f"(2) set agent.model to '{DEFAULT_MODEL}' in ~/.kiro/crew/config.json, or (3) "
 
 
 def _jsonrpc_error_code(error: object) -> int | None:
@@ -4929,6 +3178,10 @@ async def _push_model_via_effort_split(driver: Any, backend: str, model_id: str)
     effort, which this id does not overclaim), and ``""`` when the model half was
     refused too -- the caller's exhaustion path then decides. Ids without an
     effort suffix (and ``[1m]`` window ids) return ``""`` without a write.
+
+    The bare-model outcome is also recorded as ``driver.model_pin_partial``: the
+    pin did not fully apply, but its base model runs, so a caller billing by the
+    pin bills that base instead of the suffixed id.
     """
     if backend not in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS:
         return ""
@@ -4964,6 +3217,7 @@ async def _push_model_via_effort_split(driver: Any, backend: str, model_id: str)
             effort_option,
             _effort_log,
         )
+        driver.model_pin_partial = applied_base
         return applied_base
     try:
         await driver.set_config_option(effort_option, effort)
@@ -4978,653 +3232,9 @@ async def _push_model_via_effort_split(driver: Any, backend: str, model_id: str)
             _base_log,
             _effort_log,
         )
+        driver.model_pin_partial = applied_base
         return applied_base
     return model_id
-
-
-def _format_acp_error(
-    error: object,
-    available_models: Sequence[str] | None = None,
-    *,
-    backend: str = "",
-) -> str:
-    """Format a JSON-RPC error from the ACP backend into actionable user text.
-
-    The ACP backend (kiro-cli or claude-agent-acp) surfaces upstream Bedrock
-    failures as JSON-RPC ``error`` objects with shape
-    ``{"code": int, "message": str, "data": str}``.  The ``data`` field
-    typically contains the raw provider error string and a request_id.
-
-    For known failure modes (model unavailable, throttling, auth) we rewrite
-    the message into concrete recovery steps.  For everything else we fall
-    back to the previous behaviour ``"Prompt error: <raw dict>"`` so we don't
-    swallow new error shapes.
-
-    The provider request_id is preserved in every variant so that operators
-    can correlate against support tickets and Bedrock logs.
-
-    Security: the ``data`` field originates from upstream and may contain
-    credential patterns or exfiltration URLs (especially in the fallback
-    path that echoes the raw dict).  The return value is therefore passed
-    through ``redact_credentials`` and ``redact_exfiltration_urls`` before
-    being raised to the dashboard / Slack / CLI surfaces.
-    """
-    if isinstance(error, dict):
-        data = str(error.get("data", "") or "")
-        message = str(error.get("message", "") or "")
-        haystack = f"{data} {message}"
-
-        req_id_match = re.search(r"request_id:\s*([0-9a-fA-F-]+)", data)
-        req_id_suffix = f" (request_id: {req_id_match.group(1)})" if req_id_match else ""
-        unentitled = _model_is_unentitled(data, available_models)
-
-        # The fleet router admits requests before forwarding.  Its machine code
-        # tells interactive callers to rebuild from bounded KiroCrew history;
-        # do not leak the router's JSON error envelope to the user.
-        if _CONVERSATION_PAYLOAD_EXCEEDED_RE.search(haystack):
-            formatted = (
-                "The provider conversation retained too much attachment data. "
-                "The session must be rebuilt from bounded history before this request can run."
-                f"{req_id_suffix}"
-            )
-        elif _CONTEXT_WINDOW_EXCEEDED_RE.search(haystack):
-            formatted = (
-                "The local model context window is full. The conversation must "
-                "be rebuilt from a shorter history before this request can run."
-                f"{req_id_suffix}"
-            )
-        # Entitlement failure: this account was never offered the model, so the
-        # capacity/rollout advice below would be actively misleading (there is
-        # nothing to wait for). Checked before the generic model-unavailable
-        # branch because upstream uses the same string for both cases.
-        elif unentitled:
-            usable = [m.strip() for m in (available_models or []) if m and m.strip()]
-            # Cap the list: an account with many models would otherwise bury the
-            # message, and the picker shows the full set anyway.
-            shown = ", ".join(usable[:8])
-            more = f" (+{len(usable) - 8} more)" if len(usable) > 8 else ""
-            if unentitled.strip().lower() == DEFAULT_MODEL:
-                # The rejected id IS the "let the backend choose" sentinel: some
-                # partitions do not serve it, so the usual "set agent.model to
-                # 'auto'" advice would send the user in a circle. Every layer
-                # that can name a model (session picker, per-agent pin, the
-                # global default under Settings -> Chat) has to move off it.
-                # The CAUSE is not named: the served list looks the same for a
-                # regional partition and a plan/tier exclusion, so the message
-                # states only what the evidence supports — not on this account.
-                # The same row reaches the CLI, subagents and messaging
-                # channels, where there is no picker and no Settings page, so
-                # the config.json spelling of the default is named too.
-                formatted = (
-                    f"Your account does not have access to model '{unentitled}' — "
-                    f"the automatic model choice is not available on your account. "
-                    f"Available to you: {shown}{more}. Pick one of these in the "
-                    f"model picker for this session, and change the default model "
-                    f"under Settings → Chat (agent.model in ~/.kiro/crew/config.json) "
-                    f"so new sessions do not start on 'auto' again. Retrying will "
-                    f"not help."
-                    f"{req_id_suffix}"
-                )
-            elif not model_is_unusable(DEFAULT_MODEL, available_models):
-                # Same two-step shape as the branches around it (the error card
-                # says "do both" under every entitlement row): the picker fixes
-                # this session, the default stops the next one -- and here
-                # 'auto' is served, so it is the natural value for the default.
-                formatted = (
-                    f"Your account does not have access to model '{unentitled}'. "
-                    f"Available to you: {shown}{more}. Pick one of these in the "
-                    f"model picker for this session, and change the default model "
-                    f"under Settings → Chat if it is set to '{unentitled}' — set "
-                    f"agent.model to 'auto' in ~/.kiro/crew/config.json to let the "
-                    f"backend choose a model your plan includes. Retrying will not help."
-                    f"{req_id_suffix}"
-                )
-            else:
-                # A pinned model rejected on a partition that does not serve
-                # ``auto`` either: recommending ``auto`` here would re-open the
-                # circle the branch above closes, so only the picker is offered.
-                formatted = (
-                    f"Your account does not have access to model '{unentitled}'. "
-                    f"Available to you: {shown}{more}. Pick one in the model picker "
-                    f"for this session, and change the default model under "
-                    f"Settings → Chat (agent.model in ~/.kiro/crew/config.json) if "
-                    f"it is set to '{unentitled}'. Retrying will not help."
-                    f"{req_id_suffix}"
-                )
-        # Bedrock model alias resolved to a version that is currently
-        # unavailable (capacity throttle, region rollout in progress,
-        # deprecated, etc.).
-        elif _RE_USAGE_LIMIT.search(haystack):
-            # Plan allowance exhausted. Quote the provider's own sentence rather
-            # than paraphrasing it: it is the authoritative statement of WHICH
-            # limit was hit, and the CLI shows exactly this, so the dashboard
-            # matching it means the two surfaces cannot tell different stories.
-            _limit_detail = _provider_detail(data)
-            # The provider sentence has no trailing period, so add one before
-            # appending guidance or the two run together as one sentence.
-            if _limit_detail and _limit_detail[-1] not in ".!?":
-                _limit_detail += "."
-            formatted = (
-                f"{_limit_detail} Retrying will not help until the limit resets. "
-                f"Check your plan's usage allowance, or switch to a model or "
-                f"account tier with remaining capacity."
-                f"{req_id_suffix}"
-            )
-        elif _RE_MODEL_UNAVAILABLE.search(data):
-            model = str(_RE_MODEL_UNAVAILABLE.search(data).group(1))  # type: ignore[union-attr]
-            formatted = (
-                f"Model '{model}' is unavailable on the backend right now "
-                f"(capacity throttle or region rollout). Try: (1) pick a "
-                f"different model in the model picker, {_auto_remedy(available_models)}"
-                f"wait a minute and retry."
-                f"{req_id_suffix}"
-            )
-        elif _RE_MODEL_TEMP_UNAVAILABLE.search(data):
-            # Same capacity/rollout rejection as above in kiro-cli >= 2.16
-            # wording, which names no model. Rewritten for the same reasons as
-            # its named sibling: the provider's advice quotes the '/model' TUI
-            # command, which does nothing in the dashboard, Slack, or a cron —
-            # and the "is unavailable on the backend" prose keeps the
-            # _TRANSIENT_MARKERS string fallback recognising it for free.
-            formatted = (
-                f"The selected model is unavailable on the backend right now "
-                f"(capacity throttle or region rollout). Try: (1) pick a "
-                f"different model in the model picker, {_auto_remedy(available_models)}"
-                f"wait a minute and retry."
-                f"{req_id_suffix}"
-            )
-        elif _RE_THROTTLE_NAMED.search(haystack) or _RE_THROTTLE_GENERIC.search(haystack):
-            # Bedrock throttle / rate limit. Cover both AWS service exception
-            # names and the generic phrasing the ACP backend sometimes uses.
-            formatted = (
-                "Bedrock is throttling requests. Try: (1) wait a few seconds and "
-                "retry, or (2) switch to a different model in the picker (e.g. sonnet)."
-                f"{req_id_suffix}"
-            )
-        elif is_credential_propagation_delay(haystack):
-            # Not-yet-propagated credential (see is_credential_propagation_delay).
-            # Ahead of the Bedrock-auth and session-expiry branches, which match
-            # the same frame and would tell the operator to re-authenticate a
-            # credential that is already valid. Names "credential-propagation
-            # delay" because llm_helpers._TRANSIENT_MARKERS keys on that phrase,
-            # so the string-fallback classifier recognises this wording too.
-            formatted = (
-                "The AWS credential was rejected as invalid — usually a transient IAM "
-                "credential-propagation delay right after a credential is minted, in "
-                "which case the same credential works within a few seconds. Retry in a "
-                "moment; if it keeps failing the access key itself is invalid (deleted, "
-                "rotated, or mistyped) — refresh your AWS credentials."
-                f"{req_id_suffix}"
-            )
-        elif _RE_AUTH.search(haystack):
-            # Bedrock auth failure — almost always missing/expired AWS
-            # credentials.
-            formatted = (
-                "Bedrock authentication failed. Refresh your AWS credentials "
-                "(e.g. re-run your SSO/login or 'aws sso login'), then retry. If "
-                "the failure persists, check that the configured AWS profile has "
-                "Bedrock InvokeModel access."
-                f"{req_id_suffix}"
-            )
-        elif _is_session_expired(haystack):
-            # Session expiry (401/403, or prose saying as much) — distinct from
-            # the Bedrock credential errors above. Retrying or switching models
-            # cannot succeed, so the message must not suggest either.
-            #
-            # The sign-in half comes from the harness's own declaration: which
-            # command re-authenticates is a per-harness fact. This arm HAS
-            # evidence -- a 401/403 or prose saying the session expired -- so it
-            # takes the signed-out message, which is allowed to assert the state;
-            # the standing caveat the panel renders unprobed is not.
-            #
-            # An empty *backend* resolves to the kiro declaration, because the
-            # kiro id IS the empty string. That is correct rather than a fallback:
-            # a caller reaching here with no backend in hand is on the shared
-            # runtime, whose harnesses are the two on the host identity store.
-            # The retry verdict stays hard-coded -- that is this arm's own finding
-            # about the error, not sign-in advice.
-            formatted = (
-                "Your session has expired. "
-                f"{host_auth.signed_out_message(backend)} "
-                "Retrying or switching models will not help — this is a "
-                "sign-in issue, not a backend error."
-                f"{req_id_suffix}"
-            )
-        elif _RE_CONNECTION.search(haystack):
-            formatted = (
-                "Could not reach the model backend (connection refused, reset, "
-                "or timed out). On a local lane this is usually a router "
-                "restart or a model swap and clears within seconds — retry in "
-                "a moment. If it keeps happening, check that the backend "
-                "endpoint is up and listening."
-                f"{req_id_suffix}"
-            )
-        elif (
-            _RE_5XX_NAMED.search(haystack)
-            or _RE_5XX_STATUS.search(haystack)
-            or _RE_5XX_HINT.search(haystack)
-            or _RE_5XX_PHRASE.search(haystack)
-        ):
-            # Transient backend 5xx — Bedrock/Codewhisperer surfaces a
-            # momentary InternalServerError (often wrapped in a
-            # CodewhispererChatResponseStream ServiceError with a
-            # "please try again" hint). Distinct from throttling: this is a
-            # server-side blip, not a rate limit, so the guidance is just to
-            # retry rather than switch models or back off.
-            #
-            # Match the combined `data + message` haystack so a 5xx token in
-            # either field is caught. Scanning `message` is safe
-            # here precisely because we require a real transient *token* (named
-            # exception, HTTP/status-50[0234]/529, or an explicit retry hint):
-            # -32603's canonical message is literally "Internal error", which
-            # carries no such token, so a bare uncaught -32603 (malformed-
-            # request, context-length, deterministic backend bug) still falls
-            # through to the unknown-shape branch rather than being mis-told to
-            # retry a condition that will never succeed. A bare numeric like
-            # "max_tokens 500" is likewise not a status code and won't match.
-            formatted = (
-                "The model backend hit a transient error (HTTP 5xx). This is "
-                "usually momentary — retry in a moment. If it keeps happening, "
-                "switch to a different model in the picker."
-                f"{req_id_suffix}"
-            )
-        elif _RE_GENERATE_FAILED.search(data):
-            # kiro-cli's generic pre-stream generation failure ("Kiro failed
-            # to generate a response"): the backend call died before a
-            # response stream existed, so there is no request_id and no error
-            # class. Almost always a momentary model capacity / rollout blip
-            # — same guidance as the 5xx branch. Kept as its own branch (not
-            # folded into _RE_5XX_HINT) because it matches `data` only, so a
-            # stray phrase echo in the JSON-RPC `message` can't flip an
-            # otherwise-terminal error to transient.
-            formatted = (
-                "The model failed to generate a response (transient error — the "
-                "backend call died before streaming started, usually a momentary "
-                "capacity blip). Retry in a moment; if it keeps happening, switch "
-                "to a different model in the picker."
-                f"{req_id_suffix}"
-            )
-        elif _CONTEXT_WINDOW_EXCEEDED_RE.search(haystack):
-            formatted = (
-                "The local model context window is full. The conversation must "
-                "be rebuilt from a shorter history before this request can run."
-                f"{req_id_suffix}"
-            )
-        elif _RE_PROCESS_FAILED.search(data):
-            # kiro-cli's sibling wrapper ("The service failed to process the
-            # request (request_id: ...)"): the backend call failed after the
-            # turn was under way, so a request_id exists but no error class.
-            # Same momentary-blip guidance as the branch above, scoped to
-            # `data` for the same reason. The phrase is kept in the rewrite so
-            # the string classifier in llm_helpers matches either form.
-            formatted = (
-                "The model backend failed to process the request (transient error, "
-                "usually a momentary capacity blip). Retry in a moment; if it keeps "
-                "happening, switch to a different model in the picker."
-                f"{req_id_suffix}"
-            )
-        elif _RE_MALFORMED_REQUEST.search(data):
-            # Structural rejection: the backend refused the payload
-            # because of its shape, not a momentary fault. Retrying the same
-            # payload will be rejected identically, so the guidance is to REPAIR
-            # or reset the conversation rather than retry. /compact shrinks and
-            # rebuilds the conversation; a new conversation drops whatever in the
-            # accumulated context tripped the parser. Kept plain and
-            # non-alarmist, matching the other branches. Matched against `data`
-            # only via the shared _RE_MALFORMED_REQUEST, so a phrase echo in the
-            # JSON-RPC `message` can't flip an unrelated error into this branch.
-            #
-            # Only `/compact` is named, because this formatter does not know
-            # which surface renders its output and the reset command differs per
-            # surface -- see docs/system-specs/common/error-handling.md.
-            formatted = (
-                "The request was rejected as malformed. This is a structural "
-                "problem with the request, so retrying it as-is will not help. "
-                "Try `/compact` to shrink and repair the conversation, or start "
-                "a new conversation."
-                f"{req_id_suffix}"
-            )
-        elif _PROMPT_BUSY_RE.search(data):
-            # The backend still has an in-flight prompt on this session.
-            # This means a previous turn didn't complete cleanly (tool stall,
-            # timeout, or race between messages). The session will auto-recover
-            # on the next attempt once the stale turn expires.
-            #
-            # Names no command, for the reason given in the malformed-request
-            # branch above: this formatter is surface-blind. The text used to say
-            # "send `!restart`", which was wrong three ways -- it is a Slack-only
-            # bang alias, it is owner-gated even there, and it restarts the
-            # GATEWAY rather than the session. It was also unnecessary: the
-            # handlers reset and re-queue on AcpPromptBusy by themselves (see
-            # dashboard/chat_runner.py's retry-eligible branch).
-            formatted = (
-                "I'm still processing a previous request. Please wait a moment "
-                "and try again; it clears on its own once the stale turn "
-                "expires. If it persists, start a new conversation."
-            )
-        elif host_auth.reports_signed_out(backend, haystack):
-            # The harness's OWN words for "no provider / no key", declared per
-            # harness in ``host_auth``. Without this the answer fell through to the
-            # branch below and reached the user as a raw -32603 frame that names
-            # no fix; the declared message names the one that works.
-            formatted = f"{host_auth.signed_out_message(backend)}{req_id_suffix}"
-        else:
-            # Unrecognised failure mode. Show the PROVIDER'S OWN message when
-            # there is one — it is the true error, and the same words the CLI
-            # prints, so the two surfaces agree. This is the path every provider
-            # failure without a curated branch above takes; an over-broad 5xx
-            # match would swallow such an error and report a momentary blip, so
-            # the real cause would never reach the user at all.
-            #
-            # Falls back to the raw dict only when there is no usable detail
-            # (empty/odd data), so a genuinely opaque shape still loses nothing.
-            # Redaction below scrubs any embedded secrets either way.
-            _detail = _provider_detail(data)
-            if _detail:
-                # Keep the JSON-RPC `message` too when it carries signal. For
-                # -32603 it is the fixed boilerplate "Internal error" (pure
-                # noise next to the provider text), but other codes use it as
-                # the actual summary, and dropping it there would lose the only
-                # description the error has.
-                _summary = "" if message.strip().lower() == "internal error" else message.strip()
-                if _summary and _summary.lower() not in _detail.lower():
-                    formatted = f"{_summary}: {_detail}{req_id_suffix}"
-                else:
-                    formatted = f"{_detail}{req_id_suffix}"
-            else:
-                formatted = f"Prompt error: {error}"
-    else:
-        formatted = f"Prompt error: {error}"
-
-    # Defense-in-depth: scrub any credentials or suspicious exfiltration URLs
-    # that may have been embedded in the upstream provider response before
-    # the message reaches dashboard / Slack / CLI surfaces.
-    redacted, url_warnings = redact_exfiltration_urls(formatted)
-    redacted, cred_warnings = redact_credentials(redacted)
-    if url_warnings or cred_warnings:
-        # Log so security review can spot when an upstream provider is
-        # echoing sensitive content back. The warning lists are bounded
-        # (one entry per match) and intentionally do NOT include the matched
-        # values themselves — those have already been redacted.
-        logger.warning(
-            "ACP error contained sensitive content (scrubbed before raise): "
-            "%d suspicious url(s), %d credential pattern(s)",
-            len(url_warnings),
-            len(cred_warnings),
-        )
-    return redacted
-
-
-# ---------------------------------------------------------------------------
-_CONTEXT_WINDOW_EXCEEDED_RE = re.compile(r"\bcontext_window_exceeded\b", re.IGNORECASE)
-_CONVERSATION_PAYLOAD_EXCEEDED_RE = re.compile(
-    r"request too large\s*\(max\s*\d+\s*mb\).*accumulated images and attachments",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _rejected_model_from_error(error: object) -> str | None:
-    """Return the model id a prompt-time error reports as invalid/unavailable.
-
-    Powers the reactive fallback in ``run_bg_oneliner``: on the SUBSTITUTE
-    (background) path, a rejected model is retried once against the account's
-    advertised list. Matches both the MPS ``Invalid model ID: X``
-    ValidationException (including the ``auto`` sentinel where a partition does
-    not serve it) and the ``The model 'X' is not
-    available`` wording. Returns None when the error names no specific model.
-    """
-    if not isinstance(error, dict):
-        return None
-    data = f"{error.get('data', '')} {error.get('message', '')}"
-    m = _RE_INVALID_MODEL_ID.search(data) or _RE_MODEL_UNAVAILABLE.search(data)
-    return m.group(1) if m else None
-
-
-def _raise_acp_error(
-    error: object,
-    available_models: Sequence[str] | None = None,
-    *,
-    backend: str = "",
-) -> None:
-    """Format and raise the appropriate AcpError subclass for *error*.
-
-    Delegates formatting to ``_format_acp_error`` and raises a typed error for
-    known recovery paths, including ``AcpPromptBusy`` and a context-window
-    admission rejection. All other errors remain generic ``AcpError`` values.
-
-    *available_models* is passed to BOTH the formatter and the transient
-    classifier so a model-rejection's wording and its retry verdict are decided
-    from the same evidence.
-
-    *backend* only reaches the formatter, where an auth-expiry needs the failing
-    harness's own sign-in message. It defaults to empty, which is the KIRO id
-    rather than a sentinel: a caller with no backend in reach is on the shared
-    runtime, and both harnesses there resolve tokens from kiro-cli's own store,
-    so kiro's message is the right answer for it. The retry verdict does not
-    depend on it.
-    """
-    formatted = _format_acp_error(error, available_models, backend=backend)
-    # Detect prompt-busy from the raw error (before formatting rewrites it)
-    raw_data = ""
-    if isinstance(error, dict):
-        raw_data = f"{error.get('data', '')} {error.get('message', '')}"
-    if _CONVERSATION_PAYLOAD_EXCEEDED_RE.search(raw_data):
-        raise AcpConversationPayloadExceeded(formatted, transient=False)
-    if _CONTEXT_WINDOW_EXCEEDED_RE.search(raw_data):
-        raise AcpContextWindowExceeded(formatted, transient=False)
-    if _PROMPT_BUSY_RE.search(raw_data):
-        raise AcpPromptBusy(formatted)
-    err = AcpError(formatted, transient=_is_transient_raw_error(error, available_models))
-    # Tag a STRUCTURAL rejection ("Improperly formed request") so a self-driving
-    # caller can stop re-sending the same context rather than merely decline an
-    # in-turn retry. Scoped to the provider `data` field only -- exactly the
-    # scope `_is_transient_raw_error` and `_format_acp_error` use for this
-    # pattern -- so a phrase echo carried only by the JSON-RPC `message` cannot
-    # flip an unrelated error into a structural verdict. The frame is already
-    # terminal via `transient=False`; this narrows WHY (shape, not a momentary
-    # fault), which is the fact the auto-nudge storm fix reads.
-    raw_data_field = str(error.get("data", "") or "") if isinstance(error, dict) else ""
-    if _RE_MALFORMED_REQUEST.search(raw_data_field):
-        err.structural_terminal = True
-    # Tag a model-rejection so the SUBSTITUTE (background) retry layer can pick a
-    # served model; harmless on every other error (attributes just stay unset).
-    rejected = _rejected_model_from_error(error)
-    if rejected:
-        err.rejected_model = rejected
-        err.advertised = list(available_models or [])
-    # Tag a session-expiry / rejected-credential answer so the dashboard can offer
-    # the fix -- the Kiro sign-in card -- instead of a Continue that hits the same
-    # wall. Decided from the raw frame, never from the prose, and only when the
-    # formatter would have reached its sign-in branch: a Bedrock-named credential
-    # exception (`_RE_AUTH`, a different remedy) or a usage-limit answer that
-    # happens to carry a 401/403 is not a Kiro sign-in problem. Gated on the
-    # harness signing in through Crew's own identity (harness parity H6): for a
-    # harness with its own credential store the card would sign in the wrong
-    # thing, so its 401 stays a plain error carrying that harness's remedy.
-    if (
-        not rejected
-        and backend in ACP_BACKENDS_HOST_AUTH_CALLBACK
-        and _is_session_expired(raw_data)
-        and not _RE_AUTH.search(raw_data)
-        and not _RE_USAGE_LIMIT.search(raw_data)
-    ):
-        err.auth_required = True
-    # Tag a spent plan allowance the same way: from the raw frame, and only when
-    # the formatter reached its usage-limit branch -- an entitlement rejection
-    # that happens to carry limit wording keeps its own (served-model) remedy.
-    # The sign-in tag above already withholds itself for this wording, so the
-    # two tags are exclusive and the row's kind is unambiguous.
-    if _RE_USAGE_LIMIT.search(raw_data) and not _model_is_unentitled(
-        raw_data_field, available_models
-    ):
-        err.usage_limit = True
-    raise err
-
-
-# Matches claude-agent-acp policy-substitution advisories:
-#   Model "X" is restricted by your organization's settings. Using Y instead.
-# Emitted when admin-tier policy (managed-settings / policyHelper) or the
-# Bedrock headless tier substitutes the requested model. The substitute is
-# already in effect and the session is live; claude-agent-acp wraps it as a
-# JSON-RPC -32603 error frame only because requested != applied. Informational,
-# not fatal -- so we keep the session instead of raising.
-_MODEL_SUBSTITUTION_ADVISORY_RE = re.compile(
-    r"is\s+restricted\b.+\bUsing\s+\S+\s+instead",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _extract_advisory_detail(error: object) -> str:
-    """Pull the ``data.details`` (or plain string ``data``) out of an ACP error.
-
-    Centralizes the shape-handling for the model-substitution advisory so the
-    detector, the substitute-extractor, and the runtime advisory handler all
-    move in lockstep when the advisory format evolves. Returns an empty string
-    if the error is not a dict, has no data, or carries no details.
-    """
-    if not isinstance(error, dict):
-        return ""
-    data = error.get("data")
-    if isinstance(data, dict):
-        return str(data.get("details", "") or "")
-    if isinstance(data, str):
-        return data
-    return ""
-
-
-def _is_model_substitution_advisory(error: object) -> bool:
-    """True iff *error* is a claude-agent-acp model-substitution advisory.
-
-    The adapter emits this on session/new (and session/load /
-    set_config_option) when policy substitutes the requested model. The
-    substitution is already applied -- the session is live on the substitute
-    -- but the response carries an error frame rather than a warning. Treat it
-    as non-fatal: log and continue. The match is deliberately narrow (code
-    -32603 AND a detail string containing BOTH 'is restricted' and 'Using X
-    instead') so genuine -32603 internal errors, invalid params, malformed
-    sessions, throttles, etc. still raise.
-    """
-    if not isinstance(error, dict):
-        return False
-    if error.get("code") != -32603:
-        return False
-    detail = _extract_advisory_detail(error)
-    if not detail:
-        return False
-    return bool(_MODEL_SUBSTITUTION_ADVISORY_RE.search(detail))
-
-
-# Captures the model id the backend says it will serve instead, from the same
-# advisory: "... Using <model-id> instead." The substitute id is whitespace-free
-# (e.g. ``global.anthropic.claude-sonnet-4-6[1m]``), so ``\S+`` lifts it cleanly.
-_MODEL_SUBSTITUTE_RE = re.compile(
-    r"\bUsing\s+(?P<model>\S+)\s+instead\b",
-    re.IGNORECASE,
-)
-
-
-def _substitute_model_from_advisory(error: object) -> str | None:
-    """Return the model id the gateway substituted to, or None.
-
-    Parses the ``-32603`` advisory ("Model X is restricted ... Using Y
-    instead.") and returns ``Y`` -- the model the gateway will actually serve.
-    The caller adopts it and re-issues ``session/new`` so a real session is
-    created (the advisory itself returns no sessionId). Returns None when the
-    error is not a substitution advisory or the substitute can't be parsed.
-    """
-    if not _is_model_substitution_advisory(error):
-        return None
-    detail = _extract_advisory_detail(error)
-    match = _MODEL_SUBSTITUTE_RE.search(detail)
-    if not match:
-        return None
-    # Strip surrounding quotes/trailing punctuation a variant phrasing might add.
-    model = match.group("model").strip().strip("\"'").rstrip(".,;")
-    return model or None
-
-
-def _get_child_pids(parent_pid: int | None, _visited: set[int] | None = None) -> list[int]:
-    """Return PIDs of all descendants recursively (best-effort).
-
-    Uses a visited set to prevent infinite loops from PID cycles.
-    On Linux, reads /proc/<pid>/task/*/children (kernel-provided, fast).
-    Falls back to pgrep -P on other platforms.
-    """
-    if not parent_pid:
-        return []
-    if _visited is None:
-        _visited = set()
-    if parent_pid in _visited:
-        return []
-    _visited.add(parent_pid)
-
-    direct = _direct_children(parent_pid)
-    all_pids = []
-    for cpid in direct:
-        if cpid not in _visited:
-            all_pids.append(cpid)
-            all_pids.extend(_get_child_pids(cpid, _visited))
-    return all_pids
-
-
-def _direct_children(pid: int) -> list[int]:
-    """Return direct child PIDs. Uses /proc on Linux, pgrep on other POSIX.
-
-    Windows: returns ``[]`` — there is no pgrep, and the tree kill goes through
-    ``kill_process_tree`` (``taskkill /T``), which walks descendants itself, so
-    the escaped-child sweep this feeds is a POSIX-only concern.
-    """
-    if platform_compat.IS_WINDOWS:
-        return []
-    if sys.platform == "linux":
-        try:
-            children: list[int] = []
-            tasks_dir = Path(f"/proc/{pid}/task")
-            if tasks_dir.is_dir():
-                for tid in tasks_dir.iterdir():
-                    cf = tid / "children"
-                    if cf.exists():
-                        children.extend(int(p) for p in cf.read_text().split() if p.strip())
-            if children:
-                return children
-        except Exception:
-            pass  # fall through to pgrep
-    try:
-        # timeout so a hung pgrep cannot occupy a subprocess_executor worker
-        # indefinitely (the ps spawns in _get_start_time/_read_basename already
-        # cap at 2s; this path must match or a wedged pgrep starves the pool).
-        out = subprocess_mod.check_output(
-            ["pgrep", "-P", str(pid)], stderr=subprocess_mod.DEVNULL, timeout=2
-        )
-        return [int(p) for p in out.decode().split() if p.strip()]
-    except Exception:
-        return []
-
-
-def _get_start_time(pid: int) -> int | None:
-    """Read process start time to detect PID recycling.
-
-    Windows: returns ``None``. It feeds the POSIX-only escaped-child sweep
-    (a no-op on win32, where ``taskkill /T`` already walks the tree), so a
-    missing start time has no effect there and avoids spawning a failing ``ps``.
-    """
-    if platform_compat.IS_WINDOWS:
-        return None
-    try:
-        if sys.platform == "linux":
-            stat = Path(f"/proc/{pid}/stat").read_text()
-            fields = stat.rsplit(")", 1)[1].split()
-            return int(fields[19])  # field 22 = starttime
-        # macOS: use ps -o lstart= (absolute start timestamp, constant for process lifetime)
-        ps_bin = platform_compat.trusted_system_bin("ps")
-        if ps_bin is None:
-            return None
-        out = subprocess_mod.check_output(
-            [ps_bin, "-o", "lstart=", "-p", str(pid)], stderr=subprocess_mod.DEVNULL, timeout=2
-        )
-        return hash(out.strip())  # stable per-process, changes on recycle
-    except Exception:
-        return None
 
 
 def finish_suspended_spawn(process: asyncio.subprocess.Process, pid: int, *, label: str) -> None:
@@ -5711,153 +3321,6 @@ def finish_suspended_spawn(process: asyncio.subprocess.Process, pid: int, *, lab
                 "handshake will report the real failure",
                 pid,
             )
-
-
-def _read_basename(pid: int) -> bytes | None:
-    """Read the executable basename for a PID (platform-aware).
-
-    POSIX only in practice — the escaped-child sweep that consumes this value is a
-    Windows no-op — but the helper still short-circuits on win32 (returning None)
-    so a stray future caller doesn't crash trying to invoke ``ps`` / read /proc.
-    """
-    if platform_compat.IS_WINDOWS:
-        return None
-    try:
-        if sys.platform == "linux":
-            cmdline_path = Path(f"/proc/{pid}/cmdline")
-            if not cmdline_path.exists():
-                return None
-            cmdline = cmdline_path.read_bytes()
-            if not cmdline:
-                return None
-            return cmdline.split(b"\x00", 1)[0].rsplit(b"/", 1)[-1]
-        else:
-            ps_bin = platform_compat.trusted_system_bin("ps")
-            if ps_bin is None:
-                return None
-            out = subprocess_mod.check_output(
-                [ps_bin, "-o", "comm=", "-p", str(pid)], stderr=subprocess_mod.DEVNULL, timeout=2
-            )
-            name = out.strip()
-            if not name:
-                return None
-            return name.rsplit(b"/", 1)[-1]
-    except Exception:
-        return None
-
-
-# Type alias for child PID records: (start_id, recorded_basename).
-#
-# The identity half is ``platform_compat.get_process_start_id``, NOT the local
-# ``_get_start_time``. That matters on macOS, where ``_get_start_time`` returns
-# ``hash(ps -o lstart=)``: ``ps`` reports whole seconds, so two processes started
-# in the same second alias to one value and a recycled pid can FALSE-MATCH, and
-# ``hash()`` is PYTHONHASHSEED-randomized so the value is not comparable outside
-# the interpreter that produced it. ``get_process_start_id`` is microsecond
-# libproc on macOS, 100 ns creation FILETIME on Windows and stat field 22 on
-# Linux, is stable to persist and compare across processes, and spawns nothing.
-# Being a neutral value also lets the pid-lifecycle layer verify these records
-# with platform_compat alone, instead of importing this module to do it.
-ChildRecord = tuple[str | None, bytes | None]
-
-
-def _capture_child_records(pids: list[int]) -> dict[int, ChildRecord]:
-    """Capture (start_id, basename) for each pid as a ChildRecord map.
-
-    On macOS ``_read_basename`` shells out to ``ps`` (and ``_get_child_pids`` to
-    ``pgrep``), which can block during the subprocess spawn (fork/exec). Callers
-    running on the event loop MUST invoke this via
-    ``run_in_executor(subprocess_executor(), ...)`` so the spawns happen on a
-    worker thread and never wedge the loop. Only the basename half needs that:
-    the identity half spawns nothing on any platform.
-    """
-    return {p: (platform_compat.get_process_start_id(p), _read_basename(p)) for p in pids}
-
-
-def _is_our_child(
-    pid: int, expected_start: str | None = None, expected_basename: bytes | None = None
-) -> bool:
-    """Verify a PID still belongs to a process we spawned (deny-by-default).
-
-    Compares recorded basename and start id against live values. No hardcoded
-    allowlist — any binary recorded at spawn time is automatically supervised.
-    Returns False for recycled PIDs or unreadable processes.
-
-    The start id comes from ``platform_compat.get_process_start_id`` so it is
-    read the same way it was recorded (see :data:`ChildRecord` for why that is
-    not ``_get_start_time``).
-    """
-    try:
-        # Start-id check: definitive PID recycling detection (always required)
-        actual_start = platform_compat.get_process_start_id(pid)
-        if expected_start is None or actual_start is None:
-            logger.debug("PID %d start time unavailable — denying (fail-closed)", pid)
-            return False
-        if actual_start != expected_start:
-            logger.debug("PID %d start time mismatch (recycled)", pid)
-            return False
-        # Basename check: catches recycling to a different binary with same start slot.
-        # Deny-by-default: if no basename was recorded (a legacy record predating
-        # basename recording), we deny rather than skip the check. Returning False here
-        # causes the caller (_kill_escaped_children) to SKIP the kill — we won't
-        # SIGKILL a process we can't positively confirm is ours. This is the safe
-        # direction: avoids killing a recycled PID that belongs to another user.
-        # Trade-off: legacy in-memory records (no basename) are left alive until
-        # the session restarts and re-records them with basenames.
-        if expected_basename is None:
-            logger.debug("PID %d has no recorded basename — denying (fail-closed)", pid)
-            return False
-        actual_basename = _read_basename(pid)
-        if actual_basename is None:
-            return False  # process gone
-        if actual_basename != expected_basename:
-            logger.debug(
-                "PID %d basename mismatch (recorded=%r, actual=%r)",
-                pid,
-                expected_basename,
-                actual_basename,
-            )
-            return False
-        return True
-    except Exception:
-        return False
-
-
-def _kill_escaped_children(child_pids: dict[int, int | None] | dict[int, ChildRecord]) -> None:
-    """SIGKILL descendants that survived killpg (different PGID). Kills leaf-first.
-
-    POSIX-only sweep: it cleans up children that reparented out of the killed
-    process group (e.g. MCP servers). On Windows there are no process groups —
-    ``kill_process_tree`` already used ``taskkill /T`` to walk the whole child
-    tree — so there is nothing left to sweep, and the POSIX signal APIs are
-    unavailable there. No-op on win32.
-    """
-    if platform_compat.IS_WINDOWS:
-        return
-    for cpid in reversed(list(child_pids.keys())):
-        try:
-            if not platform_compat.pid_exists(cpid):
-                continue  # gone — nothing to sweep
-            record = child_pids.get(cpid)
-            # Support both the legacy (int|None) and current (tuple) record shapes.
-            # A legacy int is a pre-neutral-start-id reading and can never equal a
-            # ``get_process_start_id`` value, so it is carried as unproven rather
-            # than compared: _is_our_child then denies, which is the same outcome a
-            # mismatch would produce, and keeps this branch honest about what it can
-            # actually verify.
-            expected_start: str | None = None
-            expected_basename: bytes | None = None
-            if isinstance(record, tuple):
-                expected_start, expected_basename = record
-            if not _is_our_child(
-                cpid, expected_start=expected_start, expected_basename=expected_basename
-            ):
-                logger.debug("Skipping PID %d — not our process (recycled?)", cpid)
-                continue
-            platform_compat.kill_pid(cpid, platform_compat.SIGKILL)
-            logger.debug("Killed escaped child PID %d", cpid)
-        except (ProcessLookupError, OSError):
-            pass
 
 
 def _make_unified_diff(old: str, new: str, path: str, max_len: int = 65536) -> str:
@@ -6069,7 +3532,7 @@ class AcpClient:
         # is then governed exactly as this session requires, which is the whole
         # precondition the MCP array is withheld on, so the array is delivered. Kept
         # apart from _claude_settings_authored on purpose: this session did not write
-        # the file and must never delete it. Only _permission_surface_owned reads it.
+        # the file and must never delete it. Only _permission_surface_governed reads it.
         self._claude_settings_governed = False
         # The exact bytes this session last wrote to that path, held as the str
         # whose utf-8 encoding IS those bytes -- the writer emits binary so no
@@ -6079,6 +3542,25 @@ class AcpClient:
         # theirs. So the flag says "Crew created it" and this says "and it is still
         # Crew's content" -- the re-seed and the reset unlink both require BOTH.
         self._claude_settings_written: str | None = None
+        # True while a durable OWNER holder of this client's is still on disk for a
+        # file whose bytes are not Crew's: a user replaced the seed and the hand-back
+        # (``forget``, then ``release``) could not reach the sidecar. Authorship
+        # drops the moment the bytes are observed foreign -- governance is about the
+        # file, not the record -- so this carries the one thing teardown still owes:
+        # another attempt at the hand-back. It feeds NO governance decision.
+        self._claude_settings_claim_unrevoked = False
+        # True while this session holds a durable reader lease on a sibling
+        # Crew client's seed. The lease pins that file's lifecycle even after a
+        # later byte re-validation fails, so it is deliberately distinct from
+        # whether the current bytes still govern this session's permission
+        # surface. A sharer never removes the owner's file or live claim.
+        self._claude_settings_shared = False
+        # True only while the sibling seed's CURRENT on-disk bytes have passed
+        # byte-for-byte validation against this session's rendered permission
+        # surface. Unlike the retained reader lease above, every re-validation
+        # clears this flag on entry and only full success re-earns it; the MCP
+        # array is withheld after every non-success exit.
+        self._permission_surface_share_validated = False
         # Identity this client claims its seed under, in the durable record. Two
         # keyless clients share the default work_dir, so a token is what keeps
         # "Crew wrote it" from collapsing into "any Crew client may take it": the
@@ -6201,6 +3683,11 @@ class AcpClient:
         self._spawn_work_dir = str(self._work_dir)
         self._process: asyncio.subprocess.Process | None = None
         self._pid: int | None = None
+        # The root's process-start identity, read once at spawn and handed to
+        # both the session-file tracker and the identity-bound retirement in
+        # _reset_state, so the line written and the line later compared are one
+        # read of the identity rather than two (see session_pid._pid_start_token).
+        self._spawn_start_token: str | None = None
         # False until shutdown confirms both the root's exit and every tracked
         # descendant's exit. A work-directory reclaim reads this fail-closed
         # verdict after shutdown.
@@ -6343,6 +3830,14 @@ class AcpClient:
         # model the gateway will actually serve (the advisory carries no
         # sessionId, so the first attempt creates nothing). None = no substitution.
         self._last_substitution_model: str | None = None
+        # The pinned model a startup config-option push was refused on, or
+        # ``""``. That push is non-strict, so a refusal leaves the session on
+        # the backend default without raising. Callers that bill or label a
+        # turn by the pin read this to learn the pin never ran.
+        self.model_pin_refused: str = ""
+        # The bare model a ``<model>[<effort>]`` pin landed as when its effort
+        # half was refused, or ``""``. Set by ``_push_model_via_effort_split``.
+        self.model_pin_partial: str = ""
         self._child_pids: dict[int, ChildRecord] = {}  # pid → (start_time, basename)
         self.last_prompt_stats = AcpPromptStats()
         self._tool_call_inputs: dict[str, str] = {}
@@ -6687,11 +4182,13 @@ class AcpClient:
         projection takes: it re-declares a stubbed server, where the injection
         still outranks it, rather than withholding a server nothing else supplies.
 
-        ``permission_surface_owned`` carries whether Crew authored this session's
-        native permission file, because a mirror cannot know that on its own. It
+        ``permission_surface_owned`` carries whether Crew GOVERNS this session's
+        native permission file, because a mirror cannot know that on its own:
+        either this client authored it, or it verified the file is a sibling
+        session's byte-identical live seed (``_permission_surface_governed``). It
         is a precondition on delivering tools at all: Crew's gate fires on
         ``session/request_permission``, and a tool pre-approved in a file Crew does
-        not own never sends one. The claude mirror fails closed on it; a backend
+        not govern never sends one. The claude mirror fails closed on it; a backend
         that gates natively ignores it. Read here, AFTER the writer has run on the
         spawn path, so the value describes this session's real state.
         """
@@ -6725,7 +4222,7 @@ class AcpClient:
                 return []
             self._session_mcp_withheld = False
             return []
-        owned = _permission_surface_owned(self)
+        owned = self._permission_surface_governed
         # Recorded HERE, beside the call that decides it, because the caller cannot
         # recover it from the returned list: an authorized array and a withheld one
         # are both empty when every entry is a pooled stub.
@@ -6749,7 +4246,7 @@ class AcpClient:
             # so one withhold rule covers both halves of the array (codex). A mirror
             # that leaves them to the shared append ignores them.
             stub_elements=self._pooled_broker_stubs(),
-            permission_surface_owned=owned,
+            permission_surface_owned=self._permission_surface_governed,
             work_dir=self._work_dir,
             # A codex stdio child starts from env_clear() plus an allowlist, so
             # Crew's own servers reach it with an identity only if the ELEMENT
@@ -6928,9 +4425,10 @@ class AcpClient:
                 capability,
             )
             return True
-        # An unenforced routing is the ONLY case the owned-file fallback answers for;
-        # see the precondition paragraph above for why an enforced one must not read it.
-        if not acp_tool_gate.is_enforced(self.backend) and not _permission_surface_owned(self):
+        # An unenforced routing is the ONLY case the governed-surface fallback answers
+        # for; see the precondition paragraph above for why an enforced one must not
+        # read it.
+        if not acp_tool_gate.is_enforced(self.backend) and not self._permission_surface_governed:
             logger.warning(
                 "member session %s: permission surface not Crew-owned -- %s is not mounted",
                 self._session_key,
@@ -7036,6 +4534,15 @@ class AcpClient:
         diagnostic to report.
         """
         self._work_dir.mkdir(parents=True, exist_ok=True)
+        # A stored skill-view name is never the agent to launch: it maps back to
+        # the agent it was built from, whose current view the spawn prepares.
+        # Folded into this hop for the reason above (it may read one sidecar).
+        from kiro_crew.acp.skill_projection import RetiredSkillView, source_agent_name
+
+        try:
+            self._agent = source_agent_name(self._agent)
+        except RetiredSkillView as exc:
+            raise AcpError(str(exc)) from exc
         self._mcp_ref_spec = self._read_mcp_ref_spec()
 
     def _read_mcp_ref_spec(self) -> dict[str, Any] | None:
@@ -7331,7 +4838,11 @@ class AcpClient:
             # stubs and the capability server below were discarded by a return
             # that was meant to enforce authorization and instead enforced "the
             # agent declares a server the broker does not pool".
-            if self._session_mcp_withheld:
+            # A withheld verdict is overridden by a LIVE-governed surface: a cache
+            # warmed without re-running the translation leaves the flag at its
+            # fail-closed default even though Crew governs the file now.
+            live_governed = self._seeds_local_settings and self._permission_surface_governed
+            if self._session_mcp_withheld and not live_governed:
                 return []
             projected = (
                 self._claude_session_mcp_servers()
@@ -7549,7 +5060,9 @@ class AcpClient:
             os.close(fd)
 
     @staticmethod
-    def _claim_pathname_if_ours(path: Path, expectation: tuple[int, str] | None) -> Path | None:
+    def _claim_pathname_if_ours(
+        path: Path, expectation: tuple[int, str] | None
+    ) -> tuple[Path, tuple[int, int]] | None:
         """Atomically move *path* aside into a fresh name; return it IFF it is Crew's.
 
         Closes the window between an ownership check and the delete or overwrite that
@@ -7569,10 +5082,12 @@ class AcpClient:
         pathname over. ``os.replace`` onto our own fresh temp destroys only the empty
         temp we just made.
 
-        ``None`` (nothing for the caller to mutate) when the path is gone, cannot be
-        moved, or holds a file that is not Crew's. A crash between the move and the
-        caller's follow-up leaves at most one such ``.crew-gc`` temp beside the target,
-        which the next session's fresh seed ignores.
+        ``(aside, identity)`` -- the moved file and ``(st_dev, st_ino)`` captured at
+        the move, which every later restore and cleanup pins against. ``None``
+        (nothing for the caller to mutate) when the path is gone, cannot be moved, or
+        holds a file that is not Crew's. A crash between the move and the caller's
+        follow-up leaves at most one such ``.crew-gc`` temp beside the target, which
+        the next session's fresh seed ignores.
         """
         try:
             fd, tmp_name = tempfile.mkstemp(
@@ -7580,6 +5095,7 @@ class AcpClient:
             )
         except OSError:
             return None
+        tmp_st = os.fstat(fd)
         os.close(fd)
         aside = Path(tmp_name)
         try:
@@ -7588,20 +5104,27 @@ class AcpClient:
             # Nothing to capture (path gone, or it cannot be moved): drop the empty
             # temp so a refusal never litters a stray file beside the target.
             with suppress(OSError):
-                aside.unlink()
+                pinned_fs.unlink_verified_by_name(
+                    path.parent, aside.name, (tmp_st.st_dev, tmp_st.st_ino)
+                )
+            return None
+        try:
+            moved = os.lstat(aside)
+            moved_ident = (moved.st_dev, moved.st_ino)
+        except OSError:
+            # The moved entry vanished under us (a racing unlink): nothing left
+            # to validate or restore. The empty temp name is gone with it.
             return None
         if AcpClient._settings_path_holds(aside, expectation):
-            return aside
-        # Not Crew's after all (a replacement raced in, or a symlink O_NOFOLLOW
-        # rejected): restore it exactly as found and touch nothing.
-        try:
-            os.replace(aside, path)
-        except OSError:  # pragma: no cover - defensive; a racing writer took the name
-            logger.warning(
-                "could not restore %s after it proved not to be Crew's; it is at %s",
-                path,
-                aside.name,
-            )
+            return aside, moved_ident
+        # Not Crew's after all: a replacement raced in, or the user's own file --
+        # a different regular file, a symlink the verifying open refuses to
+        # follow, a file of any size. Put the moved entry back AS IT IS, without
+        # clobbering whatever else may have taken the vacated name in the
+        # meantime. No-clobber preserves the NEWER occupant and keeps the moved
+        # entry recoverable beside it, where a replace-semantics restore would
+        # silently destroy the newer one.
+        AcpClient._restore_aside_without_clobber(aside, path, moved_ident)
         return None
 
     def _expected_settings_fingerprint(self) -> tuple[int, str] | None:
@@ -7630,83 +5153,6 @@ class AcpClient:
         return seed_provenance.recorded(
             self._claude_local_settings_path(), getattr(self, "_seed_owner", "")
         )
-
-    @staticmethod
-    def _settings_path_document(path: Path) -> tuple[bool, dict[str, Any] | None]:
-        """``(True, document)`` parsed from *path*, or ``(False, None)`` if it cannot be.
-
-        A bounded, symlink-refusing read in the same discipline as
-        :meth:`_settings_path_holds`: ``O_NOFOLLOW`` so a planted link cannot redirect
-        it, a regular-file check so a FIFO cannot block it, and a size cap so an
-        arbitrarily large file is refused rather than parsed. A settings seed is a few
-        hundred bytes; anything near the cap is not one.
-
-        The two-part return keeps "no answer" distinct from "answered, and the value
-        is absent" -- a distinction the callers depend on, since an absent key is a
-        legitimate value that must compare equal to another absent key.
-        """
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        try:
-            fd = os.open(path, flags)
-        except OSError:
-            return (False, None)
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_size > _SETTINGS_READ_CAP_BYTES:
-                return (False, None)
-            raw = os.read(fd, _SETTINGS_READ_CAP_BYTES)
-        except OSError:
-            return (False, None)
-        finally:
-            os.close(fd)
-        try:
-            data = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            return (False, None)
-        if not isinstance(data, dict):
-            return (False, None)
-        return (True, data)
-
-    def _await_sibling_seed_governance(
-        self, path: Path, attempts: int = 5, pause: float = 0.01
-    ) -> bool:
-        """:meth:`_settings_surface_already_says_what_we_would`, tolerant of a half-written file.
-
-        For the create race ONLY. The winner creates with ``O_EXCL`` and writes its
-        payload on the next statement, so the loser -- whose own create raised
-        precisely because the winner's succeeded -- can arrive while the file is
-        still empty. A single check there would decide against bytes nobody meant to
-        publish, and the outcome would be a coin flip.
-
-        Waiting is confined to that one case: an UNREADABLE file may still be
-        filling, so retry; a file that parses and does not match is a real
-        disagreement, and no amount of waiting changes it, so return at once. The
-        bound is a few milliseconds against a process spawn, and exhausting it falls
-        back to the old leave-it-alone behaviour rather than hanging the seed path.
-
-        Blocking, like its caller: ``_write_claude_local_settings`` already runs in a
-        thread.
-        """
-        for remaining in range(attempts - 1, -1, -1):
-            readable, document = self._settings_path_document(path)
-            if readable and document is not None:
-                if not self._seed_document_governs(document):
-                    return False
-                self._claude_settings_governed = True
-                return True
-            if not remaining:
-                return False
-            time.sleep(pause)
-        return False
-
-    def _seed_document_governs(self, document: dict[str, Any]) -> bool:
-        """Whether *document* puts this session under the gate its own seed would.
-
-        The comparison itself, factored out so the two callers -- the ordinary
-        ownership branch and the create-race wait -- can never drift into asking
-        different questions of the same file, and so each reads the path once.
-        """
-        return document.get("permissions") == self._claude_local_settings_data().get("permissions")
 
     def _settings_surface_already_says_what_we_would(self, path: Path) -> bool:
         """Whether *path* already governs this session the way its own seed would.
@@ -7760,89 +5206,6 @@ class AcpClient:
             return False
         self._claude_settings_governed = True
         return True
-
-    def _claude_local_settings_payload(self, local_settings: Path) -> str:
-        """The exact bytes this session's seed holds, as the str whose utf-8 IS them.
-
-        The serialisation of :meth:`_claude_local_settings_data`, kept separate from
-        it because the ownership branches compare a SUBSET of that structure against
-        a file they may not write, while the writer needs the whole document as
-        bytes. One builder either way, so the two can never describe different seeds.
-        """
-        return (
-            json.dumps(
-                self._claude_local_settings_data(local_settings), indent=2, ensure_ascii=False
-            )
-            + "\n"
-        )
-
-    def _claude_local_settings_data(self, local_settings: Path | None = None) -> dict[str, Any]:
-        """This session's seed as a structure, before it is rendered to bytes.
-
-        Split out of :meth:`_write_claude_local_settings` so the ownership branches
-        there can compare a file they may not write against the content they would
-        have written. Pure: it reads this client's own resolved state and the
-        advertised-model cache, and touches no path. ``local_settings`` names the
-        path only for the cold-cache log line below.
-        """
-        data: dict[str, Any] = {}
-        perms: dict[str, Any] = {}
-        if self._permission_mode:
-            perms["defaultMode"] = self._permission_mode
-        # Same resolution as the wire array: a project-only agent's disabledTools
-        # are a restriction, and resolving only the user level would drop them.
-        deny_rules = session_mcp_deny_rules(self._agent, work_dir=self._work_dir)
-        if deny_rules:
-            perms["deny"] = list(deny_rules)
-        if perms:
-            data["permissions"] = perms
-        # Namespace-keyed (claude_code here), the registry index this backend's ids
-        # live in — see _model_registry_namespace. Provider-ONLY: the ids the
-        # backend actually advertised (cached from a prior session/new), so the seed
-        # reflects what the account is served and a served-but-unregistered model
-        # gets its real window. A cold cache returns nothing rather than falling
-        # back to the static registry, and the else branch below omits both model
-        # keys — the adapter's own provider list is already right, and a stale
-        # allowlist merged over it is not.
-        allowlist = model_registry.seed_available_models(self._model_registry_namespace)
-        if allowlist:
-            data["availableModels"] = allowlist
-            # DEFAULT_MODEL ("auto") is not a provider id, and omitting the key is
-            # what lets the adapter pick the allowlist head. Written only ALONGSIDE
-            # the allowlist: a model key that names no entry in the list it ships
-            # with is the exact shape that resolves to the base window.
-            if self._model and self._model != DEFAULT_MODEL:
-                # Folded onto the advertised spelling HERE rather than trusting a
-                # caller to have folded self._model first. The re-seed runs beside
-                # the model-cache persist, which is BEFORE _apply_startup_model, so
-                # depending on that fold would be an ordering coupling between two
-                # distant steps -- and the failure it buys is silent (a bare id
-                # writes a model key that is not in the allowlist beside it, i.e.
-                # exactly the base-window bug this file exists to close). The
-                # allowlist above is non-empty here, so the cache is warm and the
-                # fold is the same one _apply_startup_model and set_model perform.
-                data["model"] = model_registry.resolve_wire_model_id(
-                    self._model, self._model_registry_namespace
-                )
-        else:
-            # Cold advertised-model cache -- the first session on this install,
-            # before any session/new has been captured. Both model keys are
-            # OMITTED rather than filled from the static registry, and that is the
-            # fix, not a degradation: the adapter merges availableModels
-            # union+dedup across settings sources, so a partial list here replaces
-            # a correct provider-derived one with a stale one, and a model id that
-            # matches nothing in it resolves to the base window. Writing neither
-            # key leaves the adapter on its own provider list, which already
-            # carries the versioned [1m] ids. This session's capture then warms the
-            # cache and the post-capture re-seed fills both keys in.
-            logger.info(
-                "advertised-model cache is cold; seeding %s without availableModels/model so "
-                "claude-agent-acp resolves the model from its own provider list. The re-seed "
-                "after this session's model capture fills both keys in.",
-                local_settings,
-            )
-
-        return data
 
     def _opencode_routing_config(self) -> str:
         """The inline harness config that makes this session ask, as one env value.
@@ -8236,6 +5599,430 @@ class AcpClient:
             return issue, acp_tool_gate.remediation_for(self.backend)
         return "", ""
 
+    @staticmethod
+    def _settings_path_document(path: Path) -> tuple[bool, dict[str, Any] | None]:
+        """``(True, document)`` parsed from *path*, or ``(False, None)`` if it cannot be.
+
+        A bounded, symlink-refusing read in the same discipline as
+        :meth:`_settings_path_holds`: ``O_NOFOLLOW`` so a planted link cannot redirect
+        it, a regular-file check so a FIFO cannot block it, and a size cap so an
+        arbitrarily large file is refused rather than parsed. A settings seed is a few
+        hundred bytes; anything near the cap is not one.
+
+        The two-part return keeps "no answer" distinct from "answered, and the value
+        is absent" -- a distinction the callers depend on, since an absent key is a
+        legitimate value that must compare equal to another absent key.
+        """
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            return (False, None)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > _SETTINGS_READ_CAP_BYTES:
+                return (False, None)
+            raw = os.read(fd, _SETTINGS_READ_CAP_BYTES)
+        except OSError:
+            return (False, None)
+        finally:
+            os.close(fd)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return (False, None)
+        if not isinstance(data, dict):
+            return (False, None)
+        return (True, data)
+
+    def _seed_document_governs(self, document: dict[str, Any], payload: str) -> bool:
+        """Whether *document* puts this session under the gate its own seed would.
+
+        Fork rule, layered on the byte-identical share: equality is on the
+        ``permissions`` block ALONE. ``availableModels`` and ``model`` are
+        model-resolution metadata that cannot pre-approve a tool, and they differ
+        routinely between sessions of one agent in one ``work_dir`` (an unpinned
+        session omits the ``model`` key a pinned one writes), so a whole-document
+        test leaves every later session in a repository without Crew's MCP tools.
+        *payload* is this session's rendered seed.
+        """
+        try:
+            ours = json.loads(payload)
+        except ValueError:
+            return False
+        return isinstance(ours, dict) and document.get("permissions") == ours.get("permissions")
+
+    def _adopt_permission_block_governance(self, local_settings: Path, payload: str) -> bool:
+        """Govern (without writing, claiming or removing) a foreign seed whose
+        ``permissions`` block is this session's; see :meth:`_seed_document_governs`.
+
+        The fallback both foreign-file paths take once the byte-identical share has
+        declined. Teardown never reads the flag this sets, so a governed file is
+        never deleted by this session.
+        """
+        readable, document = self._settings_path_document(local_settings)
+        if not readable or document is None or not self._seed_document_governs(document, payload):
+            return False
+        try:
+            if document == json.loads(payload):
+                # The same document, yet the byte-identical share declined: that
+                # decline is a safety refusal (an owner whose identity cannot be
+                # proven, a lease that cannot be recorded), not the model-metadata
+                # difference this fallback exists for. It stands.
+                return False
+        except ValueError:
+            return False
+        self._claude_settings_governed = True
+        logger.info(
+            "%s already governs this session the way its own seed would; adopting "
+            "that governance without claiming the file, so this session keeps Crew's "
+            "MCP tools without a second client rewriting a file the first one is "
+            "running against.",
+            local_settings,
+        )
+        return True
+
+    @property
+    def _permission_surface_governed(self) -> bool:
+        """Whether Crew controls this session's native permission surface.
+
+        The precondition for delivering the ``mcpServers`` array, in either of
+        its two shapes: this client authored ``settings.local.json`` itself
+        (``_claude_settings_authored``), or the file's CURRENT on-disk bytes
+        passed the sibling-seed validation
+        (``_permission_surface_share_validated``). The durable reader lease is
+        tracked separately in ``_claude_settings_shared`` because it survives a
+        failed re-validation to keep the file pinned for a later re-earn, and the
+        owner's un-revoked durable claim (``_claude_settings_claim_unrevoked``) is
+        deliberately not read here either: it says a hand-back is still owed for
+        a file already observed to be someone else's, never that Crew governs it.
+        ``getattr`` on both governed flags because tests build clients without
+        ``__init__``.
+        """
+        return (
+            getattr(self, "_claude_settings_authored", False)
+            or getattr(self, "_permission_surface_share_validated", False)
+            or getattr(self, "_claude_settings_governed", False)
+        )
+
+    def _invalidate_session_mcp_projection(self) -> None:
+        """Drop the MCP array and the spec snapshot that authorized it."""
+        self._session_mcp_cache = None
+        self._session_mcp_snapshot = None
+
+    def _withdraw_shared_reader_lease(self, path: Path, owner: str) -> bool:
+        """Withdraw the durable reader lease before clearing its lease flag."""
+        if not seed_provenance.unshare(path, owner):
+            return False
+        self._claude_settings_shared = False
+        return True
+
+    def _share_settings_seed_if_identical(self, local_settings: Path, payload: str) -> bool:
+        """Take the shared-reader state when the existing seed IS this client's payload.
+
+        The relaxation of the one-live-holder rule for the case where refusing
+        buys nothing: two sessions of the same agent in the same ``work_dir``
+        render byte-identical settings, and before this state existed the
+        second one fell to the leave-it-alone branch and ran with the whole
+        ``mcpServers`` array withheld -- one session per project directory got
+        Crew's tools, every sibling ran toolless. The hazard the live-holder
+        rule guards against (re-seeding with a DIFFERENT
+        ``permissions.defaultMode``, or unlinking the file out from under the
+        owner) only exists when the payloads differ, so byte-equality is the
+        exact boundary of the relaxation. Both halves are required:
+
+        * :func:`seed_provenance.share` -- Crew's durable record names
+          exactly *payload*'s bytes, checked ignoring the live holder. This is
+          the provenance half: the file is Crew's own seed, not a user file
+          that merely looks right.
+        * :meth:`_settings_path_holds` -- the file on disk still holds those
+          bytes. The record alone can describe a file a user has since
+          replaced, and a replacement is theirs whatever it contains.
+
+        A differing payload -- another agent spec, another permission mode,
+        another allowlist -- fails the digest half and is refused exactly as
+        before.
+
+        The state taken is deliberately NOT ownership: no live claim is made,
+        ``_claude_settings_written`` stays ``None`` and
+        ``_claude_settings_authored`` stays ``False``, so this client's
+        teardown neither unlinks a file the owning session is still running
+        against nor pops that owner's live slot. What the sharer DOES take is a
+        live registration in :func:`seed_provenance.share` -- taken BEFORE the
+        byte checks, so the owner's teardown can never validate-race it -- and
+        that registration is what pins the file's future: while any sharer is
+        registered, the owner's teardown leaves the file in place and
+        :func:`seed_provenance.claim` refuses new adoptions, so no Crew session
+        can put different permission bytes at a path this session already
+        delivered its MCP array against. The durable registration is withdrawn
+        off-loop by ``_discard_claude_settings_seed``; ``_reset_state`` then drops
+        only its in-memory half. ``_permission_surface_share_validated`` alone
+        feeds the sharer half of :attr:`_permission_surface_governed`; every
+        validation clears it on entry, and only full success re-earns it for the
+        current bytes rather than the lease lifetime.
+        """
+        self._permission_surface_share_validated = False
+        encoded = payload.encode("utf-8")
+        owner = getattr(self, "_seed_owner", "")
+        # The lease-take and its validation run under the settle lock, so they
+        # are atomic against an owner teardown's move/restore transaction:
+        # either this validation happens before the move (and the registration
+        # it takes pins the teardown's post-move barrier), or after the whole
+        # transaction settled (and the disk check sees its outcome -- the
+        # restored seed, a preserved user replacement, or an empty name --
+        # never the manufactured vacancy in the middle, where a racing
+        # replacement could slip under an already-granted lease).
+        with seed_provenance.SETTLE_LOCK:
+            # Register FIRST, validate second (see seed_provenance.share): either the
+            # owner's teardown sees this registration and keeps the file, or it beat
+            # the registration and the disk check below fails on the unlinked path.
+            if not seed_provenance.share(local_settings, payload, owner):
+                return False
+            if not self._settings_path_holds(
+                local_settings, (len(encoded), hashlib.sha256(encoded).hexdigest())
+            ):
+                # Withdraw only a registration THIS validation created, mirroring
+                # share()'s own rule: a sharer re-validating on a later pass keeps
+                # the lease its original validation earned -- that lease is what
+                # pins the file its already-delivered MCP array runs against.
+                if not getattr(self, "_claude_settings_shared", False):
+                    if not self._withdraw_shared_reader_lease(local_settings, owner):
+                        # The durable withdrawal failed, but this client never
+                        # became a sharer -- its validation failed right here, so
+                        # no delivered MCP array depends on the file. unshare()'s
+                        # retain-on-refusal rule exists for REAL sharers; kept
+                        # here it would pin the owner's seed behind a phantom
+                        # lease for the process lifetime (teardown skips
+                        # withdrawal when the shared flag is off). Drop the
+                        # in-memory half unconditionally; the durable holder
+                        # entry self-heals through process-liveness reclaim.
+                        seed_provenance.unshare_local(local_settings, owner)
+                return False
+            self._claude_settings_shared = True
+            self._permission_surface_share_validated = True
+        logger.info(
+            "%s already holds exactly the settings seed this session would have written "
+            "(a sibling Crew session in this work dir owns it); treating the permission "
+            "surface as governed for this session too, without rewriting the file.",
+            local_settings,
+        )
+        return True
+
+    @staticmethod
+    def _rename_aside_noreplace(aside: Path, path: Path) -> bool:
+        """Move *aside* back to an ABSENT *path* as the entry it is; ``False`` with no primitive.
+
+        A rename moves the directory entry itself, whatever its type -- a regular
+        file, a symlink, a directory -- and reads none of its bytes, so it needs no
+        size cap and no follow check. Windows holds
+        :func:`platform_compat.pin_directory` across ``os.rename``, which refuses a
+        reparse point already at the shared parent and prevents that parent or its
+        ancestors from being swapped while held. POSIX uses
+        :func:`platform_compat.rename_noreplace` with both names relative to their
+        shared parent's descriptor. Raises :class:`FileExistsError` when *path* is
+        occupied, so the caller never replaces a file that arrived while the entry
+        was out. ``False`` means the host or filesystem has no no-clobber rename,
+        the POSIX parent cannot be pinned, or the names do not share a parent. A
+        cross-parent Windows aside therefore fails closed and stays aside.
+        """
+        if platform_compat.IS_WINDOWS:
+            if aside.parent != path.parent:
+                return False
+            pin = platform_compat.pin_directory(path.parent)
+            try:
+                os.rename(aside, path)
+            finally:
+                os.close(pin)
+            return True
+        if not platform_compat.RENAME_NOREPLACE_AVAILABLE or aside.parent != path.parent:
+            return False
+        try:
+            parent_fd = os.open(os.fspath(path.parent), pinned_fs.dir_flags())
+        except OSError:
+            return False
+        try:
+            platform_compat.rename_noreplace(
+                aside.name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+            )
+        except NotImplementedError:
+            return False
+        finally:
+            os.close(parent_fd)
+        return True
+
+    @staticmethod
+    def _restore_aside_without_clobber(aside: Path, path: Path, expect: tuple[int, int]) -> bool:
+        """Put a moved-aside entry back under *path* without replacing a new occupant.
+
+        A same-directory no-clobber rename (:meth:`_rename_aside_noreplace`), so a
+        symlink, a directory or a file of any size the user placed at the settings
+        path is restored exactly as it was captured -- no copy, no size cap, no read
+        of its bytes -- and the aside name is consumed by the move. An occupant that
+        arrived at the pathname while the entry was out is newer, so the rename
+        refuses it and the moved entry stays recoverable beside it as ``.crew-gc``
+        litter. Where no no-clobber rename primitive exists the restore falls back
+        to the validated byte copy :func:`pinned_fs.put_back_no_clobber`, pinned to
+        the moved inode *expect*; that path restores only a regular file.
+        """
+        try:
+            if AcpClient._rename_aside_noreplace(aside, path):
+                return True
+        except FileExistsError:
+            back: str | None = pinned_fs.PUT_BACK_NAME_TAKEN
+        except OSError:
+            logger.warning("could not restore %s; it is at %s", path, aside.name)
+            return False
+        else:
+            back = AcpClient._copy_aside_back_without_clobber(aside, path, expect)
+            if back is None:
+                return True
+        if back == pinned_fs.PUT_BACK_NAME_TAKEN:
+            logger.info(
+                "%s was recreated while Crew's seed was moved aside; leaving the new "
+                "file in place (the moved seed remains at %s).",
+                path,
+                aside.name,
+            )
+            return False
+        logger.warning("could not restore %s; it is at %s", path, aside.name)
+        return False
+
+    @staticmethod
+    def _copy_aside_back_without_clobber(
+        aside: Path, path: Path, expect: tuple[int, int]
+    ) -> str | None:
+        """The validated-copy restore, for a POSIX host without a no-clobber rename.
+
+        Publishes the moved inode's bytes under *path* through
+        :func:`pinned_fs.put_back_no_clobber`, both names pinned to the shared
+        parent's descriptor, and, once the name is back, removes the aside only
+        while it still holds the inode *expect*. Returns the put-back outcome:
+        ``None`` when the name is back. A parent that cannot be opened is
+        :data:`pinned_fs.PUT_BACK_FAILED` outright: the pinned copy is the only
+        restore that verifies what it publishes, so with no descriptor the caller
+        keeps the aside as ``.crew-gc`` litter rather than copying by name.
+        """
+        try:
+            parent_fd = os.open(os.fspath(path.parent), pinned_fs.dir_flags())
+        except OSError:
+            return pinned_fs.PUT_BACK_FAILED
+        try:
+            try:
+                back = pinned_fs.put_back_no_clobber(
+                    parent_fd, parent_fd, aside.name, path.name, expect_ino=expect[1]
+                )
+            except NotImplementedError:
+                back = pinned_fs.PUT_BACK_FAILED
+            if back is None:
+                pinned_fs.unlink_verified(parent_fd, aside.name, expect)
+        finally:
+            os.close(parent_fd)
+        return back
+
+    def _retract_reseed(
+        self,
+        local_settings: Path,
+        payload: str,
+        reseed_aside: "tuple[Path, tuple[int, int]]",
+    ) -> None:
+        """Undo a re-seed whose grant did not become durable.
+
+        Takes back the just-written *payload* file -- and ONLY that file, via the
+        same inode-pinned capture the write path uses, so a replacement that
+        raced into the pathname is detected and preserved -- then puts the
+        moved-aside prior bytes back without clobbering whatever else may hold
+        the name. The prior bytes are the ones the durable record still names
+        (the record for *payload* publishes only once its persist lands), so the
+        path returns to exactly the recognized, repairable state it was in
+        before the write: for a riding sharer, the very bytes it validated.
+        """
+        encoded = payload.encode("utf-8")
+        taken = self._claim_pathname_if_ours(
+            local_settings, (len(encoded), hashlib.sha256(encoded).hexdigest())
+        )
+        if taken is not None:
+            with suppress(OSError):
+                pinned_fs.unlink_verified_by_name(local_settings.parent, taken[0].name, taken[1])
+        self._restore_aside_without_clobber(reseed_aside[0], local_settings, reseed_aside[1])
+
+    def _log_declined_share(self, local_settings: Path) -> None:
+        """Log that an existing settings file was left authoritative."""
+        logger.info(
+            "%s already exists; leaving it as the authoritative project settings. This "
+            "session therefore runs without Crew's availableModels allowlist and without "
+            "the permissions.deny rules from the agent spec.",
+            local_settings,
+        )
+
+    def _render_claude_settings_payload(self) -> str:
+        """The exact ``settings.local.json`` payload this session would write.
+
+        Pure reads, no side effects on the path -- split out of
+        :meth:`_write_claude_local_settings` so the seed path can render the
+        payload BEFORE deciding whether to write it: the shared-reader check
+        compares these bytes against a sibling's live seed, and the write
+        branches then publish the same string. Blocking (reads the agent
+        spec); it runs on the same off-loop path as the writer.
+        """
+        data: dict[str, Any] = {}
+        perms: dict[str, Any] = {}
+        if self._permission_mode:
+            perms["defaultMode"] = self._permission_mode
+        # Same resolution as the wire array: a project-only agent's disabledTools
+        # are a restriction, and resolving only the user level would drop them.
+        deny_rules = session_mcp_deny_rules(self._agent, work_dir=self._work_dir)
+        if deny_rules:
+            perms["deny"] = list(deny_rules)
+        if perms:
+            data["permissions"] = perms
+        # Namespace-keyed (claude_code here), the registry index this backend's ids
+        # live in — see _model_registry_namespace. Provider-ONLY: the ids the
+        # backend actually advertised (cached from a prior session/new), so the seed
+        # reflects what the account is served and a served-but-unregistered model
+        # gets its real window. A cold cache returns nothing rather than falling
+        # back to the static registry, and the else branch below omits both model
+        # keys — the adapter's own provider list is already right, and a stale
+        # allowlist merged over it is not.
+        allowlist = model_registry.seed_available_models(self._model_registry_namespace)
+        if allowlist:
+            data["availableModels"] = allowlist
+            # DEFAULT_MODEL ("auto") is not a provider id, and omitting the key is
+            # what lets the adapter pick the allowlist head. Written only ALONGSIDE
+            # the allowlist: a model key that names no entry in the list it ships
+            # with is the exact shape that resolves to the base window.
+            if self._model and self._model != DEFAULT_MODEL:
+                # Folded onto the advertised spelling HERE rather than trusting a
+                # caller to have folded self._model first. The re-seed runs beside
+                # the model-cache persist, which is BEFORE _apply_startup_model, so
+                # depending on that fold would be an ordering coupling between two
+                # distant steps -- and the failure it buys is silent (a bare id
+                # writes a model key that is not in the allowlist beside it, i.e.
+                # exactly the base-window bug this file exists to close). The
+                # allowlist above is non-empty here, so the cache is warm and the
+                # fold is the same one _apply_startup_model and set_model perform.
+                data["model"] = model_registry.resolve_wire_model_id(
+                    self._model, self._model_registry_namespace
+                )
+        else:
+            # Cold advertised-model cache -- the first session on this install,
+            # before any session/new has been captured. Both model keys are
+            # OMITTED rather than filled from the static registry, and that is the
+            # fix, not a degradation: the adapter merges availableModels
+            # union+dedup across settings sources, so a partial list here replaces
+            # a correct provider-derived one with a stale one, and a model id that
+            # matches nothing in it resolves to the base window. Writing neither
+            # key leaves the adapter on its own provider list, which already
+            # carries the versioned [1m] ids. This session's capture then warms the
+            # cache and the post-capture re-seed fills both keys in.
+            logger.info(
+                "advertised-model cache is cold; the settings payload for %s omits "
+                "availableModels/model so claude-agent-acp resolves the model from its own "
+                "provider list. The re-seed after this session's model capture fills both "
+                "keys in.",
+                self._claude_local_settings_path(),
+            )
+        return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
     def _write_claude_local_settings(self) -> None:
         """Seed ``<work_dir>/.claude/settings.local.json`` for this session.
 
@@ -8320,6 +6107,8 @@ class AcpClient:
                 "session-scoped settings.",
                 local_settings,
             )
+            self._permission_surface_share_validated = False
+            self._invalidate_session_mcp_projection()
             return
         authored = getattr(self, "_claude_settings_authored", False)
         if authored and not local_settings.exists():
@@ -8329,6 +6118,7 @@ class AcpClient:
             authored = False
             self._claude_settings_authored = False
             self._claude_settings_written = None
+            self._invalidate_session_mcp_projection()
         if authored and not self._claude_settings_is_still_ours():
             # Created by Crew, but the bytes are no longer Crew's: a user replaced
             # the file atomically after the create. That file is theirs -- drop the
@@ -8340,10 +6130,44 @@ class AcpClient:
                 "agent spec.",
                 local_settings,
             )
+            # The file is now foreign; drop the projection unconditionally.
+            self._invalidate_session_mcp_projection()
+            # Try the whole-record revoke first (correct when nothing else holds it).
+            if seed_provenance.forget(local_settings, self._seed_owner):
+                self._claude_settings_authored = False
+                self._claude_settings_written = None
+                return
+            # forget fails closed while a live sibling sharer holds the record
+            # (require_unheld). Hand back only THIS owner's claim: release drops the
+            # owner holder and its in-memory _LIVE slot even while the sharer lease
+            # remains, so the owner claim is not leaked for the process lifetime --
+            # which would wedge every later session on this work_dir
+            # (held_by_another / claim refuse it) and, once the pathname is vacant,
+            # run each with mcpServers withheld.
+            if seed_provenance.release(local_settings, self._seed_owner):
+                self._claude_settings_authored = False
+                self._claude_settings_written = None
+                return
+            # Neither hand-back reached the sidecar. The file is the user's by
+            # OBSERVATION, so authorship -- the half _permission_surface_governed
+            # reads -- drops here regardless: retaining it delivered the mcpServers
+            # array under a permission file whose permissions.allow never reaches
+            # session/request_permission. What is still owed is the durable owner
+            # holder, and that rides its own flag for teardown to retry.
+            logger.warning(
+                "could not durably hand back Crew's claim on %s; dropping Crew's authorship "
+                "of the replaced file now and retrying the hand-back at teardown",
+                local_settings,
+            )
             self._claude_settings_authored = False
             self._claude_settings_written = None
-            seed_provenance.forget(local_settings, self._seed_owner)
+            self._claude_settings_claim_unrevoked = True
             return
+        # Rendered BEFORE the ownership decision below, because the decision now
+        # depends on it: a sibling's live seed that holds exactly these bytes is
+        # shareable, and only the payload says whether the bytes match. Pure
+        # reads, so rendering ahead of a branch that may not write costs nothing.
+        payload = self._render_claude_settings_payload()
         # Set only when the live slot was taken from an ORPHAN below, so the write
         # failure handler knows whether it owes a release().
         adopted = False
@@ -8353,9 +6177,15 @@ class AcpClient:
             # same orphan as adoptable. Only the one that wins the live slot rewrites
             # it; the loser falls to the leave-it-alone branch below rather than
             # writing its own permission mode over a session that is already using
-            # the file.
-            if self._claude_settings_is_still_ours() and seed_provenance.claim(
-                local_settings, self._seed_owner
+            # the file. The SAME fingerprint feeds the byte check and the claim, so
+            # the digest the claim revalidates against the durable entry is the one
+            # this client actually verified on disk -- not a second read that could
+            # disagree with the first.
+            adoption_fingerprint = self._expected_settings_fingerprint()
+            if self._settings_path_holds(
+                local_settings, adoption_fingerprint
+            ) and seed_provenance.claim(
+                local_settings, self._seed_owner, expect_digest=adoption_fingerprint
             ):
                 # Crew's OWN seed, orphaned: a previous session (or an older Crew)
                 # wrote exactly these bytes and never got to clean up -- a kill -9,
@@ -8386,56 +6216,28 @@ class AcpClient:
                 # write is wrapped below to hand it back if it does not land.
                 authored = True
                 adopted = True
-            elif self._settings_surface_already_says_what_we_would(local_settings):
-                # Someone else's file, already carrying THIS session's
-                # ``defaultMode`` and ``permissions.deny``: a sibling of the same
-                # agent in the same work_dir. The surface is governed as required and
-                # there is nothing left to write. Take the governance without taking
-                # the ownership -- see
-                # :meth:`_settings_surface_already_says_what_we_would` for why those
-                # two must stay apart.
-                logger.info(
-                    "%s already governs this session the way its own seed would; adopting that "
-                    "governance without claiming the file, so this session keeps Crew's MCP tools "
-                    "without a second client rewriting a file the first one is running against.",
-                    local_settings,
-                )
-                # The permission block matched; the REST of the document may not
-                # have. Saying so is the disclosure half of the trade: a sharer
-                # writes nothing, so where the incumbent's model metadata differs
-                # this session resolves its model from the adapter's provider list
-                # instead of from the seed -- the cold-cache path, which can hand it
-                # the base context window rather than the one its id names. Logged
-                # rather than silently accepted, and never a reason to withhold the
-                # tools, because model metadata gates no permission.
-                readable, incumbent = self._settings_path_document(local_settings)
-                if readable and incumbent is not None:
-                    ours = self._claude_local_settings_data(local_settings)
-                    keys = ("availableModels", "model")
-                    if {k: incumbent.get(k) for k in keys} != {k: ours.get(k) for k in keys}:
-                        logger.info(
-                            "%s carries different availableModels/model than this session would "
-                            "have written; the sharer leaves them in place, so this session's "
-                            "model resolves from claude-agent-acp's own provider list rather than "
-                            "from the seed.",
-                            local_settings,
-                        )
-                return
             else:
                 # Someone else's file: either the user's own project settings, or a
                 # live sibling session's seed (``work_dir`` is caller-supplied and
                 # every keyless client shares one default) -- including a sibling that
-                # won the same orphan a moment ago. Crew authors none of those, so it
-                # touches none of them.
-                logger.info(
-                    "%s already exists; leaving it as the authoritative project settings. This "
-                    "session therefore runs without Crew's availableModels allowlist and without "
-                    "the permissions.deny rules from the agent spec.",
-                    local_settings,
-                )
+                # won the same orphan a moment ago. When that sibling's seed is
+                # byte-identical to what this session would have written, the surface
+                # already governs this session and is shared rather than refused --
+                # without a write, a claim, or any right to remove it later.
+                shared = self._share_settings_seed_if_identical(local_settings, payload)
+                self._invalidate_session_mcp_projection()
+                if shared:
+                    return
+                # Not byte-identical, but the permissions block may still be this
+                # session's: govern without writing, claiming, or ever removing it
+                # (see _seed_document_governs). Teardown never reads this flag.
+                if self._adopt_permission_block_governance(local_settings, payload):
+                    return
+                # Crew authors none of the rest, so it touches none of them and
+                # reports that this session runs without Crew's seeded settings.
+                self._log_declined_share(local_settings)
                 return
 
-        payload = self._claude_local_settings_payload(local_settings)
         # An adoption already holds the path's live slot, because ``claim`` above
         # has to be the race arbiter -- it cannot be deferred until after a
         # successful write without letting two clients both decide the same orphan
@@ -8449,7 +6251,7 @@ class AcpClient:
         # alone (``release``, not ``forget``): it is what keeps the path adoptable.
         # The re-seed moves Crew's current file aside before overwriting, so this
         # holds it for the ``except`` to restore if the write does not land.
-        reseed_aside: Path | None = None
+        reseed_aside: tuple[Path, tuple[int, int]] | None = None
         try:
             local_settings.parent.mkdir(parents=True, exist_ok=True)
             # BYTES on both branches, never text mode: Python's text layer rewrites
@@ -8459,6 +6261,26 @@ class AcpClient:
             # session read as "not ours" -- the re-seed declined, reset never removed
             # its own file, and the MCP array was withheld. 0o600 either way.
             if authored:
+                # The prior payload this session wrote (None on the adoption
+                # path). Both sharer barriers below compare the whole payload
+                # against it, so it is read once, up front.
+                written = getattr(self, "_claude_settings_written", None)
+                # A live sharer was delivered its MCP array under this file's
+                # exact bytes. Any digest-changing re-seed is declined while a
+                # sharer holds the file: ``seed_provenance._persist`` refuses it
+                # anyway (it holds only the digest, so it cannot tell a model-key
+                # refresh from a permissions change), so decline before the write
+                # rather than write-then-retract. Model keys and spec edits are
+                # picked up once no sibling is reading the file.
+                if seed_provenance.has_sharers(local_settings):
+                    if written is not None and written != payload:
+                        logger.info(
+                            "%s is shared by a live sibling session; keeping the file the "
+                            "sharer validated rather than re-seeding it. Model keys and any "
+                            "spec change are picked up once no sibling is reading this file.",
+                            local_settings,
+                        )
+                        return
                 # The re-seed of a file Crew owns, STAGED AND RENAMED rather than
                 # truncated in place. O_TRUNC destroyed the recorded bytes before the
                 # new ones landed, so a write that failed part-way (ENOSPC, EIO, a
@@ -8495,20 +6317,105 @@ class AcpClient:
                     # a file Crew already owned but that is now the user's -> forget the
                     # durable record too, exactly as the replaced-after-create branch does.
                     if adopted:
-                        seed_provenance.release(local_settings, self._seed_owner)
+                        if not seed_provenance.release(local_settings, self._seed_owner):
+                            logger.warning(
+                                "could not durably release Crew's adopted claim on %s; "
+                                "retaining it until a later retry or process exit",
+                                local_settings,
+                            )
                     else:
-                        seed_provenance.forget(local_settings, self._seed_owner)
+                        if not seed_provenance.forget(local_settings, self._seed_owner):
+                            # Same exit as the replaced-after-create branch: the file is
+                            # observably the user's, so authorship drops now and only
+                            # the un-revoked durable holder is carried for teardown.
+                            logger.warning(
+                                "could not durably forget Crew's settings seed at %s; dropping "
+                                "Crew's authorship of the replaced file now and retrying the "
+                                "hand-back at teardown",
+                                local_settings,
+                            )
+                            self._claude_settings_claim_unrevoked = True
                     self._claude_settings_authored = False
                     self._claude_settings_written = None
+                    self._invalidate_session_mcp_projection()
                     return
                 atomic_write(local_settings, payload.encode("utf-8"), mode=0o600)
-                # New payload is published; drop the moved old seed. Best-effort: a
-                # leftover ``.crew-gc`` is litter the next fresh seed ignores, not a
-                # reason to fail a write that already landed.
-                with suppress(OSError):
-                    reseed_aside.unlink(missing_ok=True)
-                reseed_aside = None
+                # Re-checked AFTER the write, because registration races it: a
+                # sharer arriving between the pre-write probes and the
+                # atomic_write validated the OLD bytes. An ADOPTION stands down
+                # for any sharer (claim() refused adoption while sharers
+                # existed, so whoever is here arrived inside the window). An
+                # owner's re-seed stands down for ANY digest change (model keys
+                # or permissions): ``_persist`` refuses it under a live sharer,
+                # so a rider re-seed cannot land -- restore the bytes the sharer
+                # validated. Sound against a sharer arriving AFTER the write too:
+                # the new bytes do not match the still-prior record, so share()
+                # declines until record() publishes -- there is no third
+                # interleaving.
+                if seed_provenance.has_sharers(local_settings) and (
+                    adopted or written is None or written != payload
+                ):
+                    self._retract_reseed(local_settings, payload, reseed_aside)
+                    reseed_aside = None
+                    if adopted:
+                        logger.info(
+                            "%s gained a live sharer while this session was adopting it; "
+                            "restoring the seed it validated and standing down. This session "
+                            "runs without Crew's availableModels allowlist and without the "
+                            "permissions.deny rules from the agent spec.",
+                            local_settings,
+                        )
+                        if not seed_provenance.release(local_settings, self._seed_owner):
+                            logger.warning(
+                                "could not durably release Crew's adopted claim on %s; "
+                                "retaining it until a later retry or process exit",
+                                local_settings,
+                            )
+                    else:
+                        # The owner keeps its live slot and its prior written
+                        # payload: the restored file is still its own seed.
+                        logger.info(
+                            "%s gained a live sharer while a re-seed was in flight; "
+                            "restoring the bytes that sharer validated. Model keys and any "
+                            "spec change are picked up once no sibling is reading this file.",
+                            local_settings,
+                        )
+                    return
+                # The moved old seed is deliberately KEPT until the durable record
+                # for the new bytes lands below: a failing sidecar persist then has
+                # the still-recorded prior bytes to put back, instead of leaving an
+                # unrecorded file nothing on the host can repair.
             else:
+                # Authorship of a vacant pathname is serialized against BOTH
+                # live registries. A LIVE OWNER first: a sibling recreating a
+                # vanished seed would have record() displace that owner's
+                # slot, and the sibling's teardown would then remove a file
+                # the owner still governs.
+                if seed_provenance.held_by_another(local_settings, self._seed_owner):
+                    logger.info(
+                        "%s is held by a live sibling session; declining to recreate "
+                        "the seed under its claim.",
+                        local_settings,
+                    )
+                    self._permission_surface_share_validated = False
+                    self._invalidate_session_mcp_projection()
+                    return
+                # Then the sharer registry: a registered reader validated the
+                # RECORDED bytes,
+                # so a session whose payload differs may not take the vacant
+                # pathname -- it would put its own permission mode under a
+                # sibling's governed surface. Byte-identical re-creation stays
+                # allowed: that is a sharer repairing its own vanished seed.
+                if seed_provenance.has_sharers(local_settings):
+                    rec = seed_provenance.recorded_durable(local_settings)
+                    if rec is None or rec != (
+                        len(payload.encode("utf-8")),
+                        hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                    ):
+                        self._log_declined_share(local_settings)
+                        self._permission_surface_share_validated = False
+                        self._invalidate_session_mcp_projection()
+                        return
                 # O_EXCL on the create is the whole ownership claim: if a sibling
                 # session (or the user) created the file between the check above and
                 # here, this raises rather than clobbering it. That is why the create
@@ -8519,46 +6426,61 @@ class AcpClient:
                 try:
                     fd = os.open(local_settings, flags, 0o600)
                 except FileExistsError:
-                    # A sibling won the create between the exists() check above and
-                    # this open. What it wrote is THIS session's seed whenever the
-                    # permission blocks agree, so ask -- the loser used to return
-                    # here and spend the rest of its life without Crew's MCP tools,
-                    # which is the same defect as the leave-it-alone branch, reached
-                    # by a different route.
-                    if self._await_sibling_seed_governance(local_settings):
-                        logger.info(
-                            "%s was created concurrently by a sibling, and it governs this "
-                            "session the way this session's own seed would; adopting that "
-                            "governance rather than losing Crew's MCP tools to a create race.",
-                            local_settings,
-                        )
-                    else:
-                        logger.info(
-                            "%s was created concurrently and does not carry this session's "
-                            "permission block; leaving it alone. This session runs without "
-                            "Crew's MCP tools.",
-                            local_settings,
-                        )
+                    # A sibling won the create race. When its just-written seed is
+                    # already recorded and byte-identical to this payload, share it
+                    # exactly as the pre-existing-file branch above does. The poll
+                    # exists ONLY for the winner's persist still being in flight
+                    # (one local sidecar write, ordinarily milliseconds). It ends
+                    # early only once a durable record naming THIS payload's bytes
+                    # exists: that is the winner's record for a byte-identical
+                    # seed, so a share attempted AFTER seeing it either lands or
+                    # can never converge (the disk differs from the record). A
+                    # record with any OTHER digest ends nothing -- it may be a
+                    # stale entry a killed session left for a file since gone,
+                    # published before the winner's matching one -- so the poll
+                    # waits for the deadline, which bounds everything else. The
+                    # record is read BEFORE each share, never after a failed one:
+                    # a matching record landing between the two would otherwise
+                    # end the poll on a share that never saw it.
+                    want = (len(payload.encode("utf-8")), seed_provenance.digest(payload))
+                    deadline = time.monotonic() + 2.0
+                    while True:
+                        settled = seed_provenance.recorded_durable(local_settings) == want
+                        if self._share_settings_seed_if_identical(local_settings, payload):
+                            self._invalidate_session_mcp_projection()
+                            return
+                        if settled or time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
+                    self._invalidate_session_mcp_projection()
+                    # Not byte-identical: the winner may still have written this
+                    # session's permissions block (see _seed_document_governs).
+                    if self._adopt_permission_block_governance(local_settings, payload):
+                        return
+                    self._log_declined_share(local_settings)
                     return
                 with os.fdopen(fd, "wb") as handle:
                     handle.write(payload.encode("utf-8"))
         except BaseException:
             if reseed_aside is not None:
-                # The overwrite did not land after Crew's file was moved aside, so the
-                # pathname is empty and the recorded bytes are at ``reseed_aside``.
-                # Put them back so the path stays the adoptable orphan it was before.
+                # The re-seed did not complete: whatever the pathname holds, take
+                # back only a file whose bytes are this write's own, and put the
+                # still-recorded prior bytes back without clobbering anything
+                # else. The path stays the adoptable seed it was before.
                 with suppress(OSError):
-                    if local_settings.exists():
-                        reseed_aside.unlink(missing_ok=True)
-                    else:
-                        os.replace(reseed_aside, local_settings)
+                    self._retract_reseed(local_settings, payload, reseed_aside)
             if adopted:
                 logger.info(
                     "re-seed of the orphaned settings seed at %s did not land; releasing the "
                     "claim so a later session can still adopt and repair it",
                     local_settings,
                 )
-                seed_provenance.release(local_settings, self._seed_owner)
+                if not seed_provenance.release(local_settings, self._seed_owner):
+                    logger.warning(
+                        "could not durably release Crew's adopted claim on %s; retaining it "
+                        "until a later retry or process exit",
+                        local_settings,
+                    )
             raise
         # Durable half of the same claim, so the NEXT process can still recognize
         # this file as Crew's after a kill that skips the reset path.
@@ -8573,33 +6495,116 @@ class AcpClient:
         # is the same thing a cold advertised-model cache already does.
         if not seed_provenance.record(local_settings, payload, self._seed_owner):
             logger.warning(
-                "could not durably record Crew's claim on %s; removing the seed just written "
-                "rather than leaving a permission mode no later session is allowed to clean "
-                "up. This session runs without Crew's availableModels allowlist and without "
-                "the permissions.deny rules from the agent spec.",
+                "could not durably record Crew's claim on %s; withdrawing the seed just "
+                "written rather than leaving a permission mode no later session is allowed "
+                "to clean up. This session runs without Crew's availableModels allowlist "
+                "and without the permissions.deny rules from the agent spec.",
                 local_settings,
             )
-            # Safe to remove precisely because we are inside the branch that proved
-            # ownership a moment ago: either O_EXCL created the file, or its bytes
-            # matched Crew's record and this client holds the live claim.
+            if reseed_aside is not None:
+                # A re-seed: the prior bytes are still the ones the durable record
+                # names (the record for the NEW bytes publishes only once its
+                # persist lands), so putting them back returns the path to exactly
+                # the recognized, repairable state it was in before this write --
+                # and, for a sharer riding the owner's re-seeds, the very bytes it
+                # validated. No sharer can exist for the NEW bytes: a record that
+                # never became durable is invisible to share().
+                self._retract_reseed(local_settings, payload, reseed_aside)
+                reseed_aside = None
+                if adopted:
+                    # Back to the adoptable orphan it was; hand the slot back.
+                    if not seed_provenance.release(local_settings, self._seed_owner):
+                        logger.warning(
+                            "could not durably release Crew's adopted claim on %s; "
+                            "retaining it until a later retry or process exit",
+                            local_settings,
+                        )
+                # An owner (adopted=False) keeps its live slot and its prior
+                # written payload: the restored file is still its own seed.
+                return
+            # O_EXCL create: settle atomically against a sibling's share validation.
+            # A sharer that validated this exact payload keeps the pathname and
+            # durable record; otherwise take back only the inode that still holds
+            # this session's payload. A foreign replacement stays in place.
+            with seed_provenance.SETTLE_LOCK:
+                if seed_provenance.has_sharers(local_settings):
+                    logger.warning(
+                        "could not durably record Crew's claim on %s; a live sibling "
+                        "validated these bytes, so leaving the seed in place for it "
+                        "rather than unlinking a permission file its tools were "
+                        "delivered against",
+                        local_settings,
+                    )
+                    if not seed_provenance.release(local_settings, self._seed_owner):
+                        logger.warning(
+                            "could not durably release Crew's failed seed claim on %s; "
+                            "retaining it until a later retry or process exit",
+                            local_settings,
+                        )
+                    self._permission_surface_share_validated = False
+                    self._invalidate_session_mcp_projection()
+                    return
+                encoded = payload.encode("utf-8")
+                taken = self._claim_pathname_if_ours(
+                    local_settings, (len(encoded), hashlib.sha256(encoded).hexdigest())
+                )
+                if taken is not None:
+                    with suppress(OSError):
+                        pinned_fs.unlink_verified_by_name(
+                            local_settings.parent, taken[0].name, taken[1]
+                        )
+                if not seed_provenance.forget(local_settings, self._seed_owner):
+                    # The sidecar is unwritable, which is why we are here at all. It
+                    # still names the PREVIOUS digest, and the file it described is now
+                    # gone, so ``_persist``'s prune drops the entry on the next
+                    # successful write and nothing matches it in the meantime. Hand the
+                    # live slot back so a replacement client in this process is not
+                    # wedged behind a claim nobody is using.
+                    if not seed_provenance.release(local_settings, self._seed_owner):
+                        logger.warning(
+                            "could not durably release Crew's failed seed claim on %s; "
+                            "retaining it until a later retry or process exit",
+                            local_settings,
+                        )
+                # Nothing Crew governs is at the pathname now (the seed was taken back,
+                # or a foreign file this session never validated stands there), so the
+                # sharer half of the governance flag must not carry in from entry: a
+                # validated sharer re-creating its vanished seed arrives here with it
+                # still set. Same pair as the two vacant-pathname declines above -- the
+                # flag, and the projection cached under it, because the cache serves
+                # without re-reading the flag. The reader lease itself is retained, as
+                # at those declines: it does not feed governance, and teardown
+                # withdraws it only while the lease flag is set.
+                self._permission_surface_share_validated = False
+                self._invalidate_session_mcp_projection()
+                return
+        if reseed_aside is not None:
+            # The grant for the new bytes is durable; the moved old seed is done.
+            # Best-effort: a leftover ``.crew-gc`` is litter the next fresh seed
+            # ignores, not a reason to fail a write that already landed.
             with suppress(OSError):
-                local_settings.unlink(missing_ok=True)
-            if not seed_provenance.forget(local_settings, self._seed_owner):
-                # The sidecar is unwritable, which is why we are here at all. It
-                # still names the PREVIOUS digest, and the file it described is now
-                # gone, so ``_persist``'s prune drops the entry on the next
-                # successful write and nothing matches it in the meantime. Hand the
-                # live slot back so a replacement client in this process is not
-                # wedged behind a claim nobody is using.
-                seed_provenance.release(local_settings, self._seed_owner)
-            return
+                pinned_fs.unlink_verified_by_name(
+                    local_settings.parent, reseed_aside[0].name, reseed_aside[1]
+                )
+            reseed_aside = None
         # Only a file Crew created AND still owns is ever overwritten or removed.
         # Set AFTER the write and after the durable record, so a failure in either
         # propagates with the claim exactly as it was: an adoption leaves no instance
         # flag for reset to act on, and a re-seed of Crew's own file leaves the
         # record describing the bytes that are still on disk.
+        # A client that arrived as a SHARED READER becomes the AUTHOR here.
+        # ``record`` atomically removed its reader lease in the same durable
+        # transaction, so the mirrored flag moves only after that call succeeds.
+        if getattr(self, "_claude_settings_shared", False):
+            self._claude_settings_shared = False
+        self._permission_surface_share_validated = False
         self._claude_settings_authored = True
         self._claude_settings_written = payload
+        # The durable owner holder ``record`` just published IS this client's claim
+        # again, so nothing is left un-revoked from an earlier foreign replace:
+        # teardown's ordinary settle transaction hands it back from here.
+        self._claude_settings_claim_unrevoked = False
+        self._invalidate_session_mcp_projection()
 
     @property
     def is_ready(self) -> bool:
@@ -8678,9 +6683,10 @@ class AcpClient:
         """Re-key this client for a different session (used by warm pool).
 
         ``crew_agent`` and ``watchdog`` exist only for signature parity with
-        AcpSessionProvider.rekey (session.py calls provider.client.rekey
-        uniformly): this client's dispatch loop carries no per-agent watchdog
-        snapshot, so both are accepted and deliberately not stored."""
+        AcpSessionProvider.rekey (session_allocation.py calls
+        provider.client.rekey uniformly): this client's dispatch loop carries no
+        per-agent watchdog snapshot, so both are accepted and deliberately not
+        stored."""
         self._discard_claude_autonomous_delivery("re-key")
         self._session_key = session_key
         self._channel_id = channel_id
@@ -8830,6 +6836,7 @@ class AcpClient:
                 {"sessionId": self._session_id, "modelId": model_id},
             )
         self._model = model_id
+        self.model_pin_refused = ""
         self._resolved_model_id = self._last_substitution_model or model_id
         if self._seeds_local_settings:
             # Re-seed the per-session settings file: a pooled runtime seeded it at
@@ -9013,6 +7020,8 @@ class AcpClient:
         it re-raised, the session init failed, and a stale model pin from another
         backend killed every codex session at startup.
         """
+        # Each push describes only itself; the split below sets it again.
+        self.model_pin_partial = ""
         last_exc: AcpError | None = None
         for cand in self._model_config_candidates(model_id):
             try:
@@ -9195,7 +7204,9 @@ class AcpClient:
             # display verdict uses (chat_runner._pinned_model_verdict), so the
             # chip and the wire cannot disagree about what "usable" means. A
             # pin absent under either spelling still takes the withhold below.
-            _resolved = resolve_pin_spelling(self._model, self._advertised_model_ids())
+            _resolved = runtime_models.resolve_pin_spelling(
+                self._model, self._advertised_model_ids()
+            )
             if _resolved:
                 logger.info(
                     "ACP model %s resolves to advertised %s; sending the advertised spelling",
@@ -9234,9 +7245,12 @@ class AcpClient:
                 # Every spelling refused: record the session as running the
                 # default (the warm-pool re-apply path reads this field, so
                 # leaving the refused id here would re-offer it every claim)
-                # and let session/new's own model stand.
+                # and let session/new's own model stand. Remember the refused
+                # pin so a caller billing by it can tell it never ran.
+                self.model_pin_refused = self._model
                 self._model = DEFAULT_MODEL
                 return
+            self.model_pin_refused = ""
             self._model = sent
         else:
             await self._send_request(
@@ -10811,6 +8825,12 @@ class AcpClient:
                 _track_pid,
                 _track_session_pid,
             )
+            from kiro_crew.session_pid import _pid_start_token
+
+            # Read BEFORE the appends: the identity of the process that holds the
+            # number NOW, kept for the identity-bound retirement in _reset_state
+            # and handed to the tracker so it records this same token.
+            self._spawn_start_token = _pid_start_token(self._pid)
 
             # The PID-file trackers each take an exclusive file lock and do a
             # read-modify-append under it — blocking syscalls that must not run
@@ -10821,14 +8841,18 @@ class AcpClient:
             _loop = asyncio.get_running_loop()
             await _loop.run_in_executor(subprocess_executor(), _track_pid, self._pid)
             # Separate file for startup cleanup.
-            await _loop.run_in_executor(subprocess_executor(), _track_session_pid, self._pid)
+            await _loop.run_in_executor(
+                subprocess_executor(), _track_session_pid, self._pid, self._spawn_start_token
+            )
             await asyncio.sleep(0.3)
             early_descendants = await _loop.run_in_executor(
-                subprocess_executor(), _get_child_pids, self._pid
+                subprocess_executor(), runtime_process_tree._get_child_pids, self._pid
             )
             if early_descendants:
                 self._child_pids = await _loop.run_in_executor(
-                    subprocess_executor(), _capture_child_records, early_descendants
+                    subprocess_executor(),
+                    runtime_process_tree._capture_child_records,
+                    early_descendants,
                 )
                 await _loop.run_in_executor(
                     subprocess_executor(), _track_child_pids, self._child_pids, self._pid or 0
@@ -10912,18 +8936,22 @@ class AcpClient:
         (the internal MCP server, node) may not exist until after _initialize_session().
         """
         _loop = asyncio.get_running_loop()
-        descendants = await _loop.run_in_executor(subprocess_executor(), _get_child_pids, self._pid)
+        descendants = await _loop.run_in_executor(
+            subprocess_executor(), runtime_process_tree._get_child_pids, self._pid
+        )
         if not descendants:
             # Retry once — children may not have forked yet
             await asyncio.sleep(0.5)
             descendants = await _loop.run_in_executor(
-                subprocess_executor(), _get_child_pids, self._pid
+                subprocess_executor(), runtime_process_tree._get_child_pids, self._pid
             )
 
         new_pids = [p for p in descendants if p not in self._child_pids]
         if new_pids:
             self._child_pids.update(
-                await _loop.run_in_executor(subprocess_executor(), _capture_child_records, new_pids)
+                await _loop.run_in_executor(
+                    subprocess_executor(), runtime_process_tree._capture_child_records, new_pids
+                )
             )
 
         if self._child_pids:
@@ -10970,7 +8998,9 @@ class AcpClient:
         # Merge stored snapshot (from init, catches reparented-to-init PIDs)
         # with fresh scan (catches children spawned after init).
         _loop = asyncio.get_running_loop()
-        fresh = await _loop.run_in_executor(subprocess_executor(), _get_child_pids, pid)
+        fresh = await _loop.run_in_executor(
+            subprocess_executor(), runtime_process_tree._get_child_pids, pid
+        )
         stored = self._child_pids
         # Build merged dict: pid → (start_time, basename) (stored has both, fresh needs capture)
         merged: dict[int, ChildRecord] = dict(stored)
@@ -10978,7 +9008,9 @@ class AcpClient:
         if new_pids:
             # capture (start_time, basename) off-loop — on macOS these spawn `ps`
             merged.update(
-                await _loop.run_in_executor(subprocess_executor(), _capture_child_records, new_pids)
+                await _loop.run_in_executor(
+                    subprocess_executor(), runtime_process_tree._capture_child_records, new_pids
+                )
             )
 
         if not force:
@@ -10996,7 +9028,9 @@ class AcpClient:
                 await asyncio.wait_for(self._process.wait(), timeout=3.0)
                 # _kill_escaped_children -> _is_our_child -> _get_start_time/
                 # _read_basename spawn `ps` on macOS; run it off the loop.
-                await _loop.run_in_executor(subprocess_executor(), _kill_escaped_children, merged)
+                await _loop.run_in_executor(
+                    subprocess_executor(), runtime_process_tree._kill_escaped_children, merged
+                )
                 return
             except asyncio.TimeoutError:
                 pass
@@ -11008,7 +9042,9 @@ class AcpClient:
                 self._process.kill()
             except (ProcessLookupError, OSError):
                 pass
-        await _loop.run_in_executor(subprocess_executor(), _kill_escaped_children, merged)
+        await _loop.run_in_executor(
+            subprocess_executor(), runtime_process_tree._kill_escaped_children, merged
+        )
         try:
             await asyncio.wait_for(self._process.wait(), timeout=1.0)
         except asyncio.TimeoutError:
@@ -11061,7 +9097,7 @@ class AcpClient:
         Async, because the disk half is blocking and this is teardown on the event
         loop: the ownership hash, the durable revoke and the unlink all block, and a
         heartbeat must not queue behind them. ``_reset_state`` keeps only the
-        in-memory ``release``.
+        in-memory ``release_local`` half.
 
         **The whole disk half is ONE shielded thread, not a sequence of awaited
         steps, and that is the cancellation contract.** Teardown runs on paths that
@@ -11077,14 +9113,40 @@ class AcpClient:
         ``finally`` for the mirror-image reason: the in-memory reset must happen
         even when the await is cancelled.
         """
-        if not getattr(self, "_claude_settings_authored", False):
+        authored = getattr(self, "_claude_settings_authored", False)
+        shared = getattr(self, "_claude_settings_shared", False)
+        claim_unrevoked = getattr(self, "_claude_settings_claim_unrevoked", False)
+        if not authored and not shared and not claim_unrevoked:
+            return
+        path = self._claude_local_settings_path()
+        owner = getattr(self, "_seed_owner", "")
+        if claim_unrevoked and not authored:
+            # A user replaced Crew's seed and the in-session hand-back could not
+            # reach the sidecar. The file at the path is THEIRS, so none of the
+            # move/unlink transaction below applies -- only the durable owner
+            # holder is still Crew's to withdraw. Same refused-withdrawal
+            # contract as the reader lease: a refusal here leaves the flag set,
+            # and the caller's ``_reset_state`` drops the in-memory live slot.
+            hand_back = asyncio.ensure_future(
+                asyncio.to_thread(self._hand_back_unrevoked_claim, path, owner)
+            )
+            await asyncio.shield(hand_back)
+            if not shared:
+                return
+        if shared and not authored:
+            # A refused durable withdrawal deliberately leaves the instance flag
+            # set. The caller's ``_reset_state`` then drops only the in-memory
+            # half; the persisted pid+start-id lease is stale and reclaimable
+            # once this process exits, matching the recorded-orphan residual.
+            release = asyncio.ensure_future(
+                asyncio.to_thread(self._withdraw_shared_reader_lease, path, owner)
+            )
+            await asyncio.shield(release)
             return
         # Captured HERE, on the loop, so the transaction is a pure function of its
         # arguments: the ``finally`` below may clear these flags while the thread is
         # still running, and a transaction that re-read them could decide ownership
         # against state that changed underneath it.
-        path = self._claude_local_settings_path()
-        owner = getattr(self, "_seed_owner", "")
         payload = getattr(self, "_claude_settings_written", None)
         expectation = self._expected_settings_fingerprint()
         # A task rather than a bare coroutine: ``shield`` protects a future that
@@ -11101,6 +9163,30 @@ class AcpClient:
         finally:
             self._claude_settings_authored = False
             self._claude_settings_written = None
+
+    def _hand_back_unrevoked_claim(self, path: Path, owner: str) -> None:
+        """Retry the durable hand-back of an owner holder on a file that is not Crew's.
+
+        The disk half of ``_claude_settings_claim_unrevoked``: the same two steps
+        the foreign-replace branch took in-session, in the same order. ``forget``
+        drops the whole record and fails closed while a live sibling sharer still
+        validates against it; ``release`` then drops only this owner's holder and
+        leaves the record and the sharer's lease standing. Never touches the
+        pathname -- the file there is the user's. Never raises, for the reason the
+        settle transaction never raises: the caller shields it. Blocking; runs off
+        the loop.
+        """
+        try:
+            if seed_provenance.forget(path, owner) or seed_provenance.release(path, owner):
+                self._claude_settings_claim_unrevoked = False
+                return
+            logger.warning(
+                "could not durably hand back Crew's claim on %s; retaining it until process "
+                "exit, after which the persisted holder is stale and reclaimable",
+                path,
+            )
+        except Exception:  # pragma: no cover - defensive; teardown must not raise
+            logger.debug("could not hand back Crew's claim on %s", path, exc_info=True)
 
     def _settle_claude_settings_seed(
         self,
@@ -11128,15 +9214,98 @@ class AcpClient:
         Never raises, because the caller shields it: an exception here would reach
         nobody but the "never retrieved" logger, and a half-settled transaction that
         also lost its error is worse than one that logged and left the file owned.
+
+        The whole transaction runs under ``seed_provenance.SETTLE_LOCK``, the
+        same lock a sharer's validate-then-take-lease sequence holds: without
+        it, this transaction's own move-aside manufactures a vacancy at the
+        pathname, and a user replacement racing into that vacancy is
+        (correctly) preserved by the no-clobber restore -- leaving a sharer
+        that validated the ORIGINAL bytes governed against a file it never
+        verified. Under the lock a sharer validates either before the move
+        (its registration then pins the post-move barrier below) or after the
+        transaction settles, never inside the window.
         """
+        with seed_provenance.SETTLE_LOCK:
+            self._settle_claude_settings_seed_locked(path, owner, payload, expectation)
+
+    def _settle_claude_settings_seed_locked(
+        self,
+        path: Path,
+        owner: str,
+        payload: str | None,
+        expectation: tuple[int, str] | None,
+    ) -> None:
         try:
-            aside = self._claim_pathname_if_ours(path, expectation)
-            if aside is None:
+            if seed_provenance.has_sharers(path):
+                # A live SHARER session in this process delivered its MCP array
+                # against exactly the bytes at this path, and it can neither see
+                # nor stop whatever would occupy the pathname next. Unlinking here
+                # would free the name for a different permission file -- another
+                # session's mode, up to bypassPermissions -- under tools already
+                # delivered. So the file and its durable record both stay: that is
+                # precisely the recorded-orphan shape a kill -9 leaves, which the
+                # next session adopts and repairs once the sharers are gone (claim
+                # refuses adoption while any remain). Only this owner's live slot
+                # is handed back.
+                logger.info(
+                    "%s is still shared by a live sibling session; leaving the seed in "
+                    "place for it rather than deleting a permission file its tools were "
+                    "delivered against. The next session adopts and cleans it up once "
+                    "the sharers are gone.",
+                    path,
+                )
+                if not seed_provenance.release(path, owner):
+                    logger.warning(
+                        "could not durably release Crew's claim on %s; retaining the claim "
+                        "with the seed until a later retry or process exit",
+                        path,
+                    )
+                return
+            claimed = self._claim_pathname_if_ours(path, expectation)
+            if claimed is None:
                 logger.info(
                     "%s no longer holds the bytes Crew wrote; leaving the replacement in "
                     "place instead of deleting a file Crew does not own.",
                     path,
                 )
+                # Nothing at the pathname is Crew's to move, revoke or delete, but
+                # the durable owner holder ``record`` published still carries this
+                # live process's identity. Handed back here, as the sibling arms do:
+                # left standing, no prune reclaims it while this process lives, and
+                # every later session on this work_dir reads the pathname as held
+                # by a live sibling. ``release`` drops only this owner's holder --
+                # never the record, the file, or a sharer's lease.
+                if not seed_provenance.release(path, owner):
+                    logger.warning(
+                        "could not durably release Crew's claim on %s; retaining the claim "
+                        "until a later retry or process exit",
+                        path,
+                    )
+                return
+            aside, aside_ident = claimed
+            # Re-checked AFTER the move-aside, not only at the top: the probe above
+            # and the move are not one atomic step, and a sharer registers BEFORE it
+            # validates -- so a sharer whose disk check passed read the file before
+            # the move, and its registration is necessarily visible here. Without
+            # this barrier the interleaving "probe sees none -> sharer registers and
+            # validates -> move/forget/unlink proceed" frees the pathname under a
+            # governed reader. Restore the moved inode and stand down instead.
+            if seed_provenance.has_sharers(path):
+                logger.info(
+                    "%s gained a live sharer while its teardown was starting; restoring "
+                    "the seed and leaving it in place for that session.",
+                    path,
+                )
+                # No-clobber, because the pathname has been free since the
+                # move-aside: a settings file the user recreated in that window is
+                # theirs, and a replace-semantics restore would silently destroy it.
+                self._restore_aside_without_clobber(aside, path, aside_ident)
+                if not seed_provenance.release(path, owner):
+                    logger.warning(
+                        "could not durably release Crew's claim on %s; retaining the claim "
+                        "with the restored seed until a later retry or process exit",
+                        path,
+                    )
                 return
             # The file is now the moved inode ``aside`` and the pathname is free, so a
             # user replacement racing in lands at a fresh ``path`` this never touches.
@@ -11150,14 +9319,24 @@ class AcpClient:
                     "behind a revocation that never reached the disk",
                     path,
                 )
-                try:
-                    os.replace(aside, path)
-                except OSError:  # pragma: no cover - defensive; a racing writer took the name
-                    logger.warning("could not restore %s; it is at %s", path, aside.name)
-                seed_provenance.release(path, owner)
+                self._restore_aside_without_clobber(aside, path, aside_ident)
+                if not seed_provenance.release(path, owner):
+                    logger.warning(
+                        "could not durably release Crew's claim on %s; retaining the claim "
+                        "with the restored seed until a later retry or process exit",
+                        path,
+                    )
                 return
             try:
-                aside.unlink(missing_ok=True)
+                unlink_errors: list[OSError] = []
+                pinned_fs.unlink_verified_by_name(
+                    path.parent,
+                    aside.name,
+                    aside_ident,
+                    on_error=unlink_errors.append,
+                )
+                if unlink_errors:
+                    raise unlink_errors[0]
             except OSError:
                 # Revoke landed but the moved inode will not delete. Put it back under
                 # the pathname and re-record, so the path is a repairable orphan rather
@@ -11169,15 +9348,20 @@ class AcpClient:
                     exc_info=True,
                 )
                 if payload is not None:
-                    restored = True
-                    try:
-                        os.replace(aside, path)
-                    except OSError:  # pragma: no cover - defensive
-                        restored = False
-                        logger.warning("could not restore %s; it is at %s", path, aside.name)
-                    if restored:
-                        seed_provenance.record(path, payload, owner)
-                        seed_provenance.release(path, owner)
+                    if self._restore_aside_without_clobber(aside, path, aside_ident):
+                        if seed_provenance.record(path, payload, owner):
+                            if not seed_provenance.release(path, owner):
+                                logger.warning(
+                                    "could not durably release Crew's re-recorded claim on "
+                                    "%s; retaining it until a later retry or process exit",
+                                    path,
+                                )
+                        else:
+                            logger.warning(
+                                "could not durably re-record Crew's restored seed at %s; "
+                                "leaving the recoverable bytes in place",
+                                path,
+                            )
         except Exception:  # pragma: no cover - defensive; teardown must not raise
             logger.debug("could not settle Crew's settings seed at %s", path, exc_info=True)
 
@@ -11232,28 +9416,46 @@ class AcpClient:
         # the durable revoke and the unlink are all blocking, and this method is
         # synchronous and runs on the event loop. That pairing also means this may
         # run because the discard's await was CANCELLED: the flags below are already
-        # cleared by then, so this branch is skipped and the shielded transaction
-        # still finishes the disk half. getattr: _reset_state runs on clients built
-        # without __init__ in tests.
+        # cleared by then, and the shielded transaction still finishes the disk
+        # half. getattr: _reset_state runs on clients built without __init__ in
+        # tests, and such a client has no work_dir to derive the seed's path from.
+        owner = getattr(self, "_seed_owner", "")
         if getattr(self, "_claude_settings_authored", False):
-            # The seed itself is removed by ``_discard_claude_settings_seed``, which
-            # is awaited off the loop by every caller that reaches here. All this
-            # sync path does is hand back the LIVE claim, which is in-memory only
-            # and takes no lock -- so a client that is discarded without the async
-            # step (a test, or a future caller that forgets it) still cannot wedge
-            # the path behind a claim nobody is using: a replacement client in this
-            # process reads the seed as an adoptable orphan and repairs it. The
-            # durable record deliberately survives, because the file does.
-            seed_provenance.release(
-                self._claude_local_settings_path(), getattr(self, "_seed_owner", "")
-            )
             self._claude_settings_authored = False
             self._claude_settings_written = None
-        # Unconditional, and outside the branch above: a sharer never sets
-        # ``_claude_settings_authored``, so gating this on it would carry a stale
-        # "already governed" into the next spawn, where the sibling seed it matched
-        # may be gone. Like the MCP array below, it is re-derived per spawn.
-        self._claude_settings_governed = False
+        self._claude_settings_claim_unrevoked = False
+        if getattr(self, "_work_dir", None) is not None:
+            path = self._claude_local_settings_path()
+            # The seed itself and its durable holder are removed by
+            # ``_discard_claude_settings_seed``, which every production caller
+            # awaits off the loop before reaching here. This synchronous fallback
+            # hands back only the in-memory slot, taking no lock and doing no I/O,
+            # so an interrupted discard cannot leave the event loop blocked.
+            #
+            # Unconditional, not gated on the instance flags: ``release_local`` is
+            # a no-op unless ``_LIVE[key] == owner``, so it never touches a sibling
+            # client object's lease held under a different token. It covers both
+            # refused durable withdrawals -- the authored discard whose ``forget``
+            # and ``release`` were refused with the seed restored, and the
+            # un-revoked hand-back whose retry was refused -- and the authored one
+            # is the case a flag-gated drop leaks: the refused ``release`` puts the
+            # in-memory slot back while the discard's ``finally`` has already
+            # cleared authorship, so nothing flag-gated runs and every later
+            # session on this work_dir in this process is wedged
+            # (``held_by_another`` and ``claim`` consult that slot first). The
+            # persisted holder is the half this cannot reach: it carries this
+            # process's live identity, so it stands until this process exits.
+            seed_provenance.release_local(path, owner)
+            # A sharer never wrote the file and never held the live claim; its
+            # whole teardown is withdrawing the shared-reader registration, so
+            # the owner's teardown (or a later adoption) stops holding the file
+            # for a reader that is gone.
+            if getattr(self, "_claude_settings_shared", False):
+                seed_provenance.unshare_local(path, owner)
+        # The trailing plain assignments are unconditional so a client built
+        # without __init__ in tests resets clean too.
+        self._claude_settings_shared = False
+        self._permission_surface_share_validated = False
         # Drop the translated MCP array: the spec is read PER SPAWN, which is what
         # lets installing or toggling a server take effect on the next session, so
         # a replacement process must not inherit this one's snapshot. The verdict
@@ -11273,9 +9475,11 @@ class AcpClient:
         # unreadable PID is not enough to reclaim its working directory.
         root_confirmed_dead = bool(self._process and self._process.returncode is not None)
         saved_pid = None if platform_compat.IS_WINDOWS else self._pid
+        saved_start_token = self._spawn_start_token
         saved_child_pids = self._child_pids
         self._process = None
         self._pid = None
+        self._spawn_start_token = None
         # The instance id names the process that just ended; a replacement spawn
         # mints its own, so nothing may keep answering with this one in between.
         self._process_instance = ""
@@ -11339,7 +9543,11 @@ class AcpClient:
         # These untrack helpers live in kiro_crew.session, which imports this
         # module transitively, so they must be imported inline.
         from kiro_crew.session import _untrack_child_pids, _untrack_pid, _untrack_session_pid
-        from kiro_crew.session_pid import _pid_gone_or_unmanaged
+        from kiro_crew.session_pid import (
+            _pid_gone_or_unmanaged,
+            _untrack_pid_if_dead,
+            _untrack_root_by_identity,
+        )
 
         survivors: list[int] = []
         if saved_child_pids:
@@ -11361,17 +9569,25 @@ class AcpClient:
                     len(survivors),
                     survivors,
                 )
-        # Untrack parent kiro-cli PID (only if confirmed dead)
+        # Untrack parent kiro-cli PID (only if confirmed dead) -- by IDENTITY,
+        # the way AcpRuntime retires on both its paths. "Confirmed dead" is a
+        # fact about the process, not about its number: the kernel can hand the
+        # number to a root spawned since, and a prefix-matched untrack would take
+        # the successor's lines with it. The token read at spawn names the line
+        # that is ours; the bare line goes only while the number is dead at that
+        # moment. A root whose identity could not be read at spawn keeps the
+        # prefix-matched untrack it always had.
         if saved_pid is not None:
             if _pid_gone_or_unmanaged(saved_pid):
                 try:
-                    _untrack_pid(saved_pid)
+                    if saved_start_token:
+                        if not _untrack_root_by_identity(saved_pid, saved_start_token):
+                            _untrack_pid_if_dead(saved_pid)
+                    else:
+                        _untrack_pid(saved_pid)
+                        _untrack_session_pid(saved_pid)
                 except Exception:
                     logger.debug("untracking PID %s failed", saved_pid, exc_info=True)
-                try:
-                    _untrack_session_pid(saved_pid)
-                except Exception:
-                    logger.debug("untracking session PID %s failed", saved_pid, exc_info=True)
             else:
                 logger.warning(
                     "Retained tracking for live root PID %s that survived "
@@ -11473,6 +9689,21 @@ class AcpClient:
                 # adapter resolves to whatever it had cached and we still
                 # retry session/new on the substitute path.
                 logger.warning("re-seed of settings.local.json failed", exc_info=True)
+            # The writer owns every transition in the native permission surface
+            # and invalidates the frozen MCP projection when that state changes.
+            # Re-resolve off the event loop, then rebuild the exact array the retry
+            # will send so a failed byte re-validation withholds rather than
+            # re-delivering the first attempt's stale roster.
+            resolved_mcp = await asyncio.to_thread(self._resolve_session_mcp_servers)
+            self._session_mcp_cache = resolved_mcp
+            new_params["mcpServers"] = [
+                *(self._claude_session_mcp_servers() if self._is_claude else []),
+                *(self._opencode_session_mcp_servers() if self._is_opencode else []),
+                *(self._goose_session_mcp_servers() if self._is_goose else []),
+                *(await asyncio.to_thread(self._pooled_mcp_servers)),
+            ]
+            self._begin_session_report(new_params.get("mcpServers"))
+            self._guard_unresolved_mcp_refs(new_params.get("mcpServers"))
             self._last_substitution_model = None
             retry_id = await self._send_request(METHOD_SESSION_NEW, new_params)
             session_resp = await self._wait_for_response(
@@ -11565,6 +9796,7 @@ class AcpClient:
         self._resumed = False
         resume_sid = self._resume_session_id
         self._resume_session_id = None  # consume — no retry loop
+        sent_snapshot: DerivedSpecSnapshot | None = None
 
         if resume_sid and self._can_load_session:
             # Only attempt session/load when the prior session transcript
@@ -11613,8 +9845,8 @@ class AcpClient:
                         "cwd": await self._session_work_dir(),
                         # kiro-cli gets its servers via --agent; a session-array
                         # backend must receive them here as well -- a resumed
-                        # session re-declares its whole MCP surface or comes back
-                        # with no tools (see session/new above). Pooled stubs are
+                        # session re-declares everything Crew mounts on it or comes
+                        # back with no tools (see session/new above). Pooled stubs are
                         # re-declared so a resumed session keeps talking to the
                         # broker. Built by the same gated roster, in the same
                         # single worker-thread hop, as session/new above.
@@ -11629,8 +9861,8 @@ class AcpClient:
                         # it would not know what to do with.
                         load_params["_meta"] = {"_kiro.dev/session_file": session_file}
                     self._begin_session_report(load_params.get("mcpServers"))
-                    # A resumed session re-declares its whole MCP surface, so it can
-                    # be short of a referenced server exactly as a fresh one can.
+                    # A resumed session re-declares everything Crew mounts on it, so it
+                    # can be short of a referenced server exactly as a fresh one can.
                     self._guard_unresolved_mcp_refs(load_params.get("mcpServers"))
                     load_id = await self._send_request(restore_method, load_params)
                     load_resp = await self._wait_for_response(
@@ -11650,6 +9882,7 @@ class AcpClient:
                         self._session_id = resume_sid
                         self._resumed = True
                         self._capture_available_models(load_resp)
+                        sent_snapshot = self._session_mcp_snapshot
                         if self._uses_advertised_model_selection:
                             await self._persist_advertised_models_if_changed()
                             await self._reseed_after_capture()
@@ -11690,6 +9923,7 @@ class AcpClient:
             # before vs after is the reliable signal.
             model_before = self._model
             session_resp = await self._new_session_following_substitution()
+            sent_snapshot = self._session_mcp_snapshot
             self._session_id = session_resp.get("sessionId")
             self._capture_available_models(session_resp)
             if self._uses_advertised_model_selection:
@@ -11757,7 +9991,7 @@ class AcpClient:
         # ``ensure_ready`` handles, and its handler is what ends the child and drops
         # the half-registered session state.
         try:
-            await asyncio.to_thread(require_unchanged_derived_spec, self._session_mcp_snapshot)
+            await asyncio.to_thread(require_unchanged_derived_spec, sent_snapshot)
         except DerivedSpecStale as exc:
             raise AcpError(str(exc)) from exc
 
@@ -11778,12 +10012,11 @@ class AcpClient:
                 )
                 logger.info("ACP agent activated: %s", self._agent)
             else:
+                cause, remedy = await asyncio.to_thread(unavailable_mode_explanation, self._agent)
                 raise AcpError(
                     f"Agent mode {self._agent!r} is not available on this session "
-                    f"(advertised modes: {self._available_mode_ids or 'none'}); its "
-                    f"~/.kiro/agents/{self._agent}.json is likely missing. Refusing "
-                    f"to run the backend default mode in its place. Run "
-                    f"`kirocrew setup --agent-only` to materialize the agent config."
+                    f"(advertised modes: {self._available_mode_ids or 'none'}); {cause} "
+                    f"Refusing to run the backend default mode in its place. {remedy}"
                 )
 
         # 5. Set model — override if KiroCrew config specifies non-default.
@@ -11826,7 +10059,10 @@ class AcpClient:
             )
         ):
             await self._kill_process(force=True)
-            self._reset_state()
+            try:
+                await self._discard_claude_settings_seed()
+            finally:
+                self._reset_state()
         if not self._work_dir_ready:
             await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
             self._work_dir_ready = True
@@ -12149,11 +10385,13 @@ class AcpClient:
             self._process.stdin,
             self._stdin_write_lock(),
             data,
-            bound_secs=_RESPONSE_WRITE_BOUND_SECS,
+            bound_secs=transport_framing._RESPONSE_WRITE_BOUND_SECS,
         ):
             return
         safe_id = _loggable_request_id(request_id)
-        window = response_write_window_secs(self._process.stdin, _RESPONSE_WRITE_BOUND_SECS)
+        window = response_write_window_secs(
+            self._process.stdin, transport_framing._RESPONSE_WRITE_BOUND_SECS
+        )
         logger.warning(
             "ACP stdin stalled: no write progress for %gs (floor %d bytes/window) while "
             "delivering response to req=%s; treating the backend as dead",
@@ -12706,7 +10944,7 @@ class AcpClient:
                         # Redact before logging. The advisory payload originates
                         # from the ACP backend and flows to the dashboard activity
                         # feed and Slack via the gateway log. Match the existing
-                        # _format_acp_error pattern in this file.
+                        # _format_acp_error pattern (acp/transport_errors.py).
                         _payload_log = detail if detail else str(msg.error)
                         _payload_log, _ = redact_exfiltration_urls(_payload_log)
                         _payload_log, _ = redact_credentials(_payload_log)
@@ -14287,7 +12525,7 @@ class AcpClient:
                 self._process.stdin,
                 self._stdin_write_lock(),
                 data.encode(),
-                bound_secs=_RESPONSE_WRITE_BOUND_SECS,
+                bound_secs=transport_framing._RESPONSE_WRITE_BOUND_SECS,
             )
             # Only a drained frame is evidence the backend moved: an unlocked
             # append or a stall must not refresh the activity clock the
@@ -14499,6 +12737,21 @@ class AcpClient:
         if self.backend in ACP_BACKENDS_STEER_ADVERTISED:
             return self._steering_advertised
         return True
+
+    @property
+    def supports_refusal_steer(self) -> bool:
+        """True when a deny notice steered into the refused turn reaches the model.
+
+        The same set as :attr:`supports_steer` on this client, which speaks only
+        kiro-cli's ``_session/steer``. The session handle answers the two apart.
+        """
+        return self.backend in ACP_BACKENDS_STEER
+
+    @property
+    def steer_needs_loss_recovery(self) -> bool:
+        """Always False: this client speaks only kiro-cli's ``_session/steer``,
+        whose clean reject keeps the turn and every steer delivered into it."""
+        return False
 
     def turn_finished_cleanly(self) -> bool:
         """Whether the last turn reached its own end boundary uncancelled.
@@ -16252,7 +14505,9 @@ class AcpClient:
             return []
         results: list[AcpEvent] = []
         try:
-            with open(jsonl_path, "r") as f:
+            # kiro-cli writes the transcript as UTF-8. Without an explicit
+            # encoding a Windows interpreter decodes with the ANSI code page.
+            with open(jsonl_path, "r", encoding="utf-8") as f:
                 f.seek(self._jsonl_pos)
                 while True:
                     line = f.readline()
@@ -16767,3 +15022,289 @@ class AcpClient:
                 continue
             if msg.method and not msg.id:
                 self._mcp_notifications.append(msg)
+
+
+# --------------------------------------------------------------------------- #
+# Compatibility facade. The module-level code for the stdio framing, the error
+# taxonomy and its classifiers, the model catalog and the process-tree helpers lives
+# in the owner modules imported above, and every name that moved stays readable as
+# ``kiro_crew.acp.client.<name>``:
+#
+# * A moved name this module's own code reads, and that nothing patches through
+#   this module, is an ordinary import above: the owner's object, bound here.
+# * Every other moved name is FORWARDED. ``__getattr__`` reads it from its owner,
+#   and ``_ReExportModule`` sends a write or delete there, so a patch of
+#   ``kiro_crew.acp.client.<name>`` reaches the owner's own callers. A forwarded name
+#   is absent from this module's namespace on purpose -- a binding here would
+#   shadow the owner for every later read -- and this module's code reads it as
+#   ``<owner>.<name>``. An import only moved code reads, and that a test reads or
+#   patches through this module, is forwarded to the owner that reads it, for the
+#   same reason; an import nothing reaches through this module is not re-exported.
+# * The modules the moved process-tree helpers probe with (``platform_compat``,
+#   ``sys``, ``Path``, ``subprocess_mod``) stay bound here. Each helper listed in the
+#   facade test's ``_SEAM_IMPORTS`` imports them from this module when it runs, so a
+#   test that rebinds one here reaches the moved helper as it did before the move.
+#
+# ``test/test_acp_refactor_facade.py`` pins both halves: a name a test patches
+# through this module is forwarded, and a forwarded name is never bound here.
+# --------------------------------------------------------------------------- #
+#: Owner module -> every name this module forwards to it.
+_EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
+    "kiro_crew.acp.transport_framing": (
+        "_OVERSIZE_DRAIN_MAX_BYTES",
+        "OversizeLineUnrecoverable",
+        "_drain_oversize_line",
+        "_RESPONSE_WRITE_BOUND_SECS",
+        "_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS",
+        "_is_proactor_loop",
+        "_level_is_progress_signal",
+        "_pending_write_bytes",
+        "await_under_no_progress_bound",
+        "_release_if_acquired",
+    ),
+    "kiro_crew.acp.transport_errors": (
+        "_COMPACTION_DETAIL_MAX_CHARS",
+        "_COMPACTION_DETAIL_KEYS",
+        "_COMPACTION_DETAIL_PLACEHOLDERS",
+        "_COMPACTION_TRANSIENT_MARKERS",
+        "_COMPACTION_WALK_MAX_DEPTH",
+        "_walk_compaction_payload",
+        "AcpPermissionNeeded",
+        "AcpRegistrationRateLimited",
+        "AcpPromptBusy",
+        "_RE_MODEL_UNAVAILABLE",
+        "_RE_MODEL_TEMP_UNAVAILABLE",
+        "_RE_INVALID_MODEL_ID",
+        "_RE_THROTTLE_NAMED",
+        "_RE_THROTTLE_GENERIC",
+        "_RE_AUTH",
+        "_5XX_SEP",
+        "_RE_5XX_NAMED",
+        "_RE_5XX_STATUS",
+        "_RE_CONNECTION",
+        "_RE_5XX_HINT",
+        "_RE_AUTH_STATUS",
+        "_RE_SESSION_EXPIRED",
+        "_RE_INVALID_BEARER",
+        "_is_session_expired",
+        "is_auth_failure_output",
+        "_RE_SANDBOX_INIT_FAILURE",
+        "sandbox_init_failure_for_runtime",
+        "_RE_REGISTRATION_FAILED",
+        "_RE_REGISTRATION_THROTTLE_MARK",
+        "is_registration_throttle_output",
+        "_RE_USAGE_LIMIT",
+        "_RE_GENERATE_FAILED",
+        "_RE_PROCESS_FAILED",
+        "_RE_MALFORMED_REQUEST",
+        "_RE_IMAGE_FORMAT_UNSUPPORTED",
+        "_PROMPT_BUSY_RE",
+        "_RE_STREAM_ENVELOPE",
+        "_RE_TRAILING_REQ_ID",
+        "_provider_detail",
+        "_model_is_unentitled",
+        "_is_transient_raw_error",
+        "PROVIDER_ERROR_USAGE_LIMIT",
+        "PROVIDER_ERROR_MALFORMED_REQUEST",
+        "PROVIDER_ERROR_MODEL_UNAVAILABLE",
+        "PROVIDER_ERROR_THROTTLE",
+        "PROVIDER_ERROR_CREDENTIAL_PROPAGATION",
+        "PROVIDER_ERROR_AUTH",
+        "PROVIDER_ERROR_SESSION_EXPIRED",
+        "PROVIDER_ERROR_CONNECTION",
+        "PROVIDER_ERROR_HTTP_5XX",
+        "PROVIDER_ERROR_UNKNOWN",
+        "ProviderErrorClass",
+        "classify_provider_error",
+        "_auto_remedy",
+        "_format_acp_error",
+        "_rejected_model_from_error",
+        "corroborate_launcher_refusal",
+        "is_credential_propagation_delay",
+    ),
+    "kiro_crew.acp.runtime_models": (
+        "advertised_model_ids",
+        "resolve_pin_spelling",
+        "catalog_row_would_drop",
+        "resolve_usable_model",
+        "_MODEL_SUBSTITUTION_ADVISORY_RE",
+        "_MODEL_SUBSTITUTE_RE",
+    ),
+    "kiro_crew.acp.runtime_process_tree": (
+        "_get_child_pids",
+        "_direct_children",
+        "_get_start_time",
+        "_read_basename",
+        "_capture_child_records",
+        "_is_our_child",
+        "_kill_escaped_children",
+    ),
+}
+
+
+def _index_exports() -> dict[str, str]:
+    """Invert the owner table into forwarded name -> owner."""
+    return {name: owner for owner, names in _EXPORTS_BY_OWNER.items() for name in names}
+
+
+#: Forwarded name -> the dotted NAME of its owner, never the module object: the owner
+#: is read from :data:`sys.modules` on each use, so a module purged and imported again
+#: is seen at once instead of this table forwarding to the old copy.
+_EXPORTS: dict[str, str] = _index_exports()
+
+
+def _owner(name: str) -> ModuleType:
+    """Return the module that owns forwarded *name*, resolved on each access.
+
+    ``importlib.import_module`` answers from :data:`sys.modules`, the one place a
+    module is stored, so a purged or replaced owner is seen at once; and it waits on
+    that module's import lock while its body is still running, where a bare
+    ``sys.modules`` read would hand a second thread a half-built owner.
+    """
+    return importlib.import_module(_EXPORTS[name])
+
+
+# Hidden from type checkers: mypy types every unknown attribute of a module that
+# defines ``__getattr__`` as ``Any``, so a mistyped ``client.<name>`` would type-check.
+# mypy sees the forwarded names through the ``TYPE_CHECKING`` imports below instead.
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> Any:
+        """Read a forwarded name from the module that owns it (:pep:`562`)."""
+        if name not in _EXPORTS:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        return getattr(_owner(name), name)
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS))
+
+
+class _ReExportModule(ModuleType):
+    """Send a write or delete of a forwarded name to the module that owns it.
+
+    Binding it here instead would shadow the owner for every later read, because
+    ``__getattr__`` runs only for a name this module does not hold. Forwarded, a
+    ``monkeypatch`` or ``mock.patch`` round-trips: ``mock.patch`` restores a name this
+    module does not hold by deleting it and setting it back. With ``create=True`` it
+    skips the set, which would leave the owner without the name, so
+    ``test/test_acp_refactor_create_guard.py`` fails on any such patch. Every other
+    name, a module this one imports included, is an ordinary attribute write: tests
+    rebind those on purpose, for the code that stays here and for the moved helpers
+    listed in the facade test's ``_SEAM_IMPORTS``, which read ``platform_compat``,
+    ``sys``, ``Path`` and ``subprocess_mod`` from this module at call time.
+    """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _EXPORTS:
+            setattr(_owner(name), name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in _EXPORTS:
+            delattr(_owner(name), name)
+        else:
+            super().__delattr__(name)
+
+
+# Installed last, so the forwarding is live for every caller but never runs while this
+# module is still binding its own names.
+sys.modules[__name__].__class__ = _ReExportModule
+
+# ``from kiro_crew.acp.client import *`` binds only the names this list holds: nothing
+# can enumerate what ``__getattr__`` would serve, so a forwarded name reaches a star
+# importer only by being listed here. The list is DERIVED from what this module binds
+# plus the forwarding table, so it is not a third list of names to keep in step.
+__all__ = sorted(name for name in set(globals()) | set(_EXPORTS) if not name.startswith("_"))
+
+if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
+    from kiro_crew.acp.runtime_models import (  # noqa: F401
+        _MODEL_SUBSTITUTE_RE,
+        _MODEL_SUBSTITUTION_ADVISORY_RE,
+        advertised_model_ids,
+        catalog_row_would_drop,
+        resolve_pin_spelling,
+        resolve_usable_model,
+    )
+    from kiro_crew.acp.runtime_process_tree import (  # noqa: F401
+        _capture_child_records,
+        _direct_children,
+        _get_child_pids,
+        _get_start_time,
+        _is_our_child,
+        _kill_escaped_children,
+        _read_basename,
+    )
+    from kiro_crew.acp.transport_errors import (  # noqa: F401
+        _5XX_SEP,
+        _COMPACTION_DETAIL_KEYS,
+        _COMPACTION_DETAIL_MAX_CHARS,
+        _COMPACTION_DETAIL_PLACEHOLDERS,
+        _COMPACTION_TRANSIENT_MARKERS,
+        _COMPACTION_WALK_MAX_DEPTH,
+        _PROMPT_BUSY_RE,
+        _RE_5XX_HINT,
+        _RE_5XX_NAMED,
+        _RE_5XX_STATUS,
+        _RE_AUTH,
+        _RE_AUTH_STATUS,
+        _RE_CONNECTION,
+        _RE_GENERATE_FAILED,
+        _RE_IMAGE_FORMAT_UNSUPPORTED,
+        _RE_INVALID_BEARER,
+        _RE_INVALID_MODEL_ID,
+        _RE_MALFORMED_REQUEST,
+        _RE_MODEL_TEMP_UNAVAILABLE,
+        _RE_MODEL_UNAVAILABLE,
+        _RE_PROCESS_FAILED,
+        _RE_REGISTRATION_FAILED,
+        _RE_REGISTRATION_THROTTLE_MARK,
+        _RE_SANDBOX_INIT_FAILURE,
+        _RE_SESSION_EXPIRED,
+        _RE_STREAM_ENVELOPE,
+        _RE_THROTTLE_GENERIC,
+        _RE_THROTTLE_NAMED,
+        _RE_TRAILING_REQ_ID,
+        _RE_USAGE_LIMIT,
+        PROVIDER_ERROR_AUTH,
+        PROVIDER_ERROR_CONNECTION,
+        PROVIDER_ERROR_CREDENTIAL_PROPAGATION,
+        PROVIDER_ERROR_HTTP_5XX,
+        PROVIDER_ERROR_MALFORMED_REQUEST,
+        PROVIDER_ERROR_MODEL_UNAVAILABLE,
+        PROVIDER_ERROR_SESSION_EXPIRED,
+        PROVIDER_ERROR_THROTTLE,
+        PROVIDER_ERROR_UNKNOWN,
+        PROVIDER_ERROR_USAGE_LIMIT,
+        AcpPermissionNeeded,
+        AcpPromptBusy,
+        AcpRegistrationRateLimited,
+        ProviderErrorClass,
+        _auto_remedy,
+        _format_acp_error,
+        _is_session_expired,
+        _is_transient_raw_error,
+        _model_is_unentitled,
+        _provider_detail,
+        _rejected_model_from_error,
+        _walk_compaction_payload,
+        classify_provider_error,
+        corroborate_launcher_refusal,
+        is_auth_failure_output,
+        is_credential_propagation_delay,
+        is_registration_throttle_output,
+        sandbox_init_failure_for_runtime,
+    )
+    from kiro_crew.acp.transport_framing import (  # noqa: F401
+        _OVERSIZE_DRAIN_MAX_BYTES,
+        _RESPONSE_WRITE_BOUND_SECS,
+        _RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS,
+        OversizeLineUnrecoverable,
+        _drain_oversize_line,
+        _is_proactor_loop,
+        _level_is_progress_signal,
+        _pending_write_bytes,
+        _release_if_acquired,
+        await_under_no_progress_bound,
+    )

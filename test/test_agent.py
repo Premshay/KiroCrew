@@ -6945,6 +6945,43 @@ class TestRefreshDynamicFieldsStripsStaleUrl:
         assert entry["scopes"] == ["read:user", "read:org"]
         assert entry["clientId"] == "public-client-id"
 
+    def test_edition_extra_invocation_refreshed_user_keys_kept(self):
+        """An edition extra's command/args are the edition's; everything else is
+        the user's. A stale versioned interpreter must be replaced on refresh."""
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        extra = {
+            "edition-extra": {"command": "/v2/python3", "args": ["-m", "extra"]},
+            "cmd-only": {"command": "/v2/tool"},
+            "user-nulled": {"command": "/v2/python3"},
+        }
+        mine = {"command": "/opt/mine", "args": ["serve"], "env": {"K": "v"}}
+        config = {
+            "mcpServers": {
+                "edition-extra": {
+                    "command": "/v1/python3",
+                    "args": ["-m", "old"],
+                    "env": {"TOKEN_PATH": "/home/u/t"},
+                    "disabled": True,
+                },
+                "mine": dict(mine),
+                "cmd-only": {"command": "/v1/tool", "args": ["--user-flag"]},
+                "user-nulled": None,
+            }
+        }
+        with patch("kiro_crew.agent._extra_mcp_servers", return_value=extra):
+            _refresh_dynamic_fields(config)
+        entry = config["mcpServers"]["edition-extra"]
+        assert entry["command"] == "/v2/python3"
+        assert entry["args"] == ["-m", "extra"]
+        assert entry["env"] == {"TOKEN_PATH": "/home/u/t"}
+        assert entry["disabled"] is True
+        assert config["mcpServers"]["mine"] == mine
+        # Only invocation keys the edition supplies are re-pinned.
+        assert config["mcpServers"]["cmd-only"] == {"command": "/v2/tool", "args": ["--user-flag"]}
+        # A non-object entry occupies the name as the user's.
+        assert config["mcpServers"]["user-nulled"] is None
+
     def test_refresh_strips_legacy_denied_commands(self):
         # Upgrade path: an existing config injected by an older build carries a
         # stale toolsSettings.deniedCommands + autoAllowReadonly that kiro-cli
@@ -7212,18 +7249,21 @@ class TestRebuildReconcileRetainsEnabledAppServers:
     app's tools would vanish. It must drop a server only when its app is
     confirmed not enabled (a concurrent deregister).
 
-    Pinned by source inspection: the reconcile is an inline block in
-    ``install_agent`` gated on ``is_kirocrew_json`` (the written path equalling
-    ``bridges._mcp_json_path()``), which the merge-priority harness does not
-    reproduce — so the guarantee is asserted structurally.
+    Pinned by source inspection: the reconcile is an inline block in the
+    rebuild's commit phase (``default_spec_commit.write_default_spec``, which
+    ``install_agent`` calls) gated on ``is_kirocrew_json`` (the written path
+    equalling ``bridges._mcp_json_path()``), which the merge-priority harness does
+    not reproduce — so the guarantee is asserted structurally.
     """
 
     def test_reconcile_drops_by_enabled_state_not_ondisk_absence(self) -> None:
         import inspect
 
         from kiro_crew import agent
+        from kiro_crew.agent_materialization import default_spec_commit
 
-        src = inspect.getsource(agent.install_agent)
+        assert "default_spec_commit.write_default_spec(" in inspect.getsource(agent.install_agent)
+        src = inspect.getsource(default_spec_commit.write_default_spec)
         # The drop must be gated on the app being DISABLED (deregistered), not on
         # mere absence from on_disk — else a clean rebuild with an empty on_disk
         # would delete an enabled app's manifest-derived server.
@@ -8087,6 +8127,12 @@ class TestForkModeRefresh:
             custom = {"prompt": "file:///Users/someone/Documents/prompt.md", "mcpServers": {}}
             agent_mod._refresh_dynamic_fields(custom, gated_off=frozenset(), fork=True)
             assert custom["prompt"] == "file:///Users/someone/Documents/prompt.md"
+            nested = {
+                "prompt": "file:///old/lib/site-packages/kiro_crew/apps/builtins/mochi/agents/context/prompt.md",
+                "mcpServers": {},
+            }
+            agent_mod._refresh_dynamic_fields(nested, gated_off=frozenset(), fork=True)
+            assert nested["prompt"].endswith("/mochi/agents/context/prompt.md")
 
     def test_prompt_always_overwritten_when_not_fork(self, tmp_path: Path):
         import kiro_crew.agent as agent_mod
@@ -8106,7 +8152,24 @@ class TestForkModeRefresh:
         with _fork_env(tmp_path) as (_kiro, prompt):
             assert agent_mod.is_managed_prompt(agent_mod._NATIVE_PROMPT_STUB)
             assert agent_mod.is_managed_prompt(f"file://{prompt}")
+            assert agent_mod.is_managed_prompt("file:///old-home/.kiro/crew/prompt.md")
+            assert agent_mod.is_managed_prompt(
+                "file:///old-venv/lib/python3.12/site-packages/kiro_crew/prompt.md"
+            )
+            assert agent_mod.is_managed_prompt(
+                "file:///Applications/KiroCrew.app/Contents/Resources/backend-dist/"
+                "kirocrew-backend-arm64/lib/python3.12/site-packages/kiro_crew/config/prompt.md"
+            )
             assert not agent_mod.is_managed_prompt("file:///Users/someone/persona.md")
+            assert not agent_mod.is_managed_prompt(
+                "file:///Users/someone/src/kiro_crew/config/prompt.md"
+            )
+            assert not agent_mod.is_managed_prompt(
+                "file:///Users/someone/.kiro/crew/workspace/.kiro/agents/prompt.md"
+            )
+            assert not agent_mod.is_managed_prompt(
+                "file:///old/lib/site-packages/kiro_crew/apps/builtins/mochi/agents/context/prompt.md"
+            )
             assert not agent_mod.is_managed_prompt("You are a bespoke reviewer.")
             assert not agent_mod.is_managed_prompt("")
 

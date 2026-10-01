@@ -36,6 +36,7 @@ import { usePreviewFlag } from '../hooks/usePreviewFlag'
 import { PREVIEW_ARTIFACT_DEPLOY } from '../utils/previewFlags'
 import { markJustCreatedBlank } from '../lib/blankHandoff'
 import { IMPORT_ACCEPT, IMPORTABLE_EXT_LIST, MAX_IMPORT_BYTES, planFileImport, wasContentRedacted, type ImportPlan, type ImportRejection } from '../lib/artifactImport'
+import { haptic } from '../lib/haptic'
 import type { Artifact, ArtifactFolder, PublishProviderDescriptor, RemoteArtifact, SessionDoc } from '../types'
 import { KIND_BADGE, isoToTs, docFileType, FolderColorSwatches, FolderGlyph, FolderNameInput, FolderMenu, SessionDocStar, LibraryTable, LibraryTree } from '../components/library/LibraryTable'
 import SessionDocPreview from '../components/library/SessionDocPreview'
@@ -1285,6 +1286,8 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     setOverFolderId(null)
   }, [])
   const handleDragStart = useCallback((e: DragStartEvent) => {
+    // Past the sensor's hold/distance constraint: the card is really picked up.
+    haptic('medium')
     const d = e.active.data.current as LibraryDrag | undefined
     if (d?.type === 'artifact' || d?.type === 'folder') setActiveDrag(d)
   }, [])
@@ -1300,6 +1303,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
       // folder the artifact already sits in arms (and moves, and dismisses)
       // nothing.
       if ((a.folderId || '') === target) return
+      // Past the guards: the move really arms, so the drop seats here and a
+      // same-folder release is felt as nothing, like a release over empty space.
+      haptic('light')
       dismissFolderMove()
       armArtifactMove({
         itemKey: a.slug,
@@ -1320,6 +1326,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     const dragged = folders.find(f => f.id === a.id)
     if (!dragged) return
     if ((dragged.parent_id || '') === target) return
+    haptic('light')
     dismissArtifactMove()
     armFolderMove({
       itemKey: a.id,

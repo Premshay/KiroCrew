@@ -12,6 +12,14 @@ clean up. Every rule below closes a named failure mode.
 
 ## What you track: two columns
 
+For long runs, load the `artifacts` skill's Dynamic Dashboard contract. An
+authorized descendant may publish a `task-dashboard` HTML artifact tailored
+to this pipeline and update the same slug at milestones. Design is free; the
+two facts below remain the source of truth. The page is not a second status
+store, does not authorize reading more worker context, and cannot approve tools.
+The host's native approval inbox names each waiting session, including Normal
+permission mode. Never broaden your role or change permission mode to publish.
+
 Per work item, exactly two:
 
 1. **Is this session still working?**
@@ -263,7 +271,12 @@ never relabel it success in the friction report.
    with `monitor_start`, never `wait`.** If live work needs a larger or renewed
    bound, raise it with `monitor_update` before it expires; `monitor_start` is
    create-only. Call `autonudge_stop` yourself when the exit condition fires —
-   coasting into the cycle cap is a failure, not a finish.
+   coasting into the cycle cap is a failure, not a finish. That ~90s interval is
+   also what sizes your panel's stale window: `BOARD_STALE_AFTER_SECONDS` in
+   `kiro_crew.dashboard.handlers.agent_panel` is about ten of these intervals, so a
+   board reads stale only after the log has been quiet across many cycles rather
+   than after one quiet cycle. Change the cadence here and that constant needs the
+   same look.
 
 Standing patrol instruction template (keep it CURRENT — steering edits go here
 via `monitor_update`, see "Live steering"):
@@ -297,6 +310,25 @@ via `monitor_update`, see "Live steering"):
 > slot is a supply reading, not a gap to fill. Quiet cycle = one line, end
 > turn. EXIT when queue empty and fleet drained: final tally, then
 > `autonudge_stop`.
+
+## Your panel: publish JUDGMENTS, never numbers
+
+`panel_publish` with template `kirocrew-pipeline-conductor` takes exactly four keys,
+and nothing else — an unknown key is refused and the refusal names it:
+
+| key | shape | what it is |
+|---|---|---|
+| `lede` | string | the one sentence a reader should start from |
+| `you` | object, item id -> string | what a person must DO about that ONE item |
+| `notes` | object, metric key -> string | the gloss on a metric tile |
+| `checks` | object, item id -> string | a CI check tally, `N/M` only |
+
+Every number on that board is derived from your work log by the host, so you cannot
+type one: counts, column names, the revision, the board's age and the dropped-entry
+count all come from the `work` projection. `you` and `checks` are keyed by ITEM ID,
+not by column, so a sentence lands on the card it is about. A `checks` value that is
+not a bare `N/M` is dropped and the cell reads as not said — that cell means a tally
+you read off a forge, and the work log has none.
 
 ## How the ledger behaves
 
@@ -992,10 +1024,11 @@ banned-process rule whose match selected the pid. A value prefixed `argv:` names
 shape the probe recognises from the argv tokens instead, because the joined command
 line cannot express it: `argv:pytest-runner-uncapped` is a runner spelling that is
 also a well-formed filename or path component — a versioned alias (`pytest-3`),
-`py.test`, or `pytest.exe` — standing in the program position with no numeric worker
-cap among its own arguments. There is no regex to look up for such a row, so `cmd=`
-is the corroborating field: the runner name prints there, because an `argv:` row has
-no rule text to identify it by. An `argv:` shape is offered whatever the rule list
+`py.test`, or `pytest.exe` — standing in the program position with an explicit numeric
+worker count of two or more among its own arguments (the budget-bypassing form). There
+is no regex to look up for such a row, so `cmd=` is the corroborating field: the runner
+name prints there, because an `argv:` row has no rule text to identify it by. An
+`argv:` shape is offered whatever the rule list
 holds, because rule ORIGIN is what carries built-in authority here — the same basis
 the wrapper exemption is written against — so a `banned_process_res` edit cannot
 switch it off. What can is the named opt-out `argv_runner_detection: false`, which
@@ -1308,13 +1341,18 @@ line, recorded while the evidence still exists. That is also why the legacy-line
 fallback above is a bounded best effort and not the mechanism: it attempts the
 same read, expects it to fail, and declines to guess an owner when it does.
 
-What the pytest rule flags is **a run whose worker count is not explicitly
-chosen**, not "an unbounded `-n`". A bare `pytest` is therefore flagged: it
-inherits the project's `addopts`, so it is not a single-process run and its
-worker count was decided by the config rather than by the person who typed it.
-`-n0` satisfies the rule; so does any explicit number, which is why the brief
-also forbids a small `-n <N>` on grounds the probe cannot check. The other
-banned shape is a full-suite runner invoked with no file argument.
+What the pytest rule flags is **a run whose worker pool bypasses the budget**:
+an explicit numeric `-n` of two or more (`-n 4`, `-n=4`, `-n4`, `-n 32`,
+`--numprocesses 2`), because `xdist_budget.py`'s hook only ever sizes `auto`, so
+a number is a count the host's memory and the other runs on it are never
+consulted about. `-n auto`, `-n logical` and a bare `pytest` are quiet: the
+bare form inherits the project's `addopts`, which supply `-n auto`, so its pool
+is budgeted by the same hook. `-n0` and `-n 1` are quiet too, as single-process
+runs with xdist inactive. Where `-n` is given twice the last one wins, as pytest
+resolves it. The brief still mandates `-n0` on a worker's own test runs -- a
+budgeted pool is still a pool -- but the probe only reports the shape that
+escapes the budget. The other banned shape is a full-suite runner invoked with
+no file argument.
 
 Standing constants: `session_ceiling` machine-wide, `-n0` on every worker test
 run, targeted tests only, ≤2 subagents per worker. `-n0` rather than a small

@@ -379,9 +379,9 @@ always returning to the current item, which is what the derived default shows.
 See §11 open question 2.
 
 **On reload**, markers arrive with the transcript through both existing doors —
-the HTTP slot-detail rebuild (`store/chatSlice.ts:1448 fetchSlotDetail`, reducers
-`hydrateSlotMessages` `:3426` / `replaceMessages` `:3411`) and the live
-`chat_message` websocket frame (`hooks/useWebSocket.ts:1229`) — and the default
+the HTTP slot-detail rebuild (`fetchSlotDetail` in `store/chat/wire.ts`, reducers
+`hydrateSlotMessages` / `replaceMessages` in `store/chat/messages.ts`) and the live
+`chat_message` websocket frame (the `chat_message` arm of the `/api/ws` router in `hooks/useWebSocket.ts`) — and the default
 viewport is recomputed. No new transport.
 
 **One interaction to resolve.** `EarlierMessagesBar` already occupies the top of

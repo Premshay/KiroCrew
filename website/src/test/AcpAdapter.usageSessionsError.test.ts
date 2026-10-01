@@ -145,8 +145,8 @@ describe('AcpAdapter.fetchUsage — a payload with no sessions half', () => {
     expect(err).toBeInstanceOf(Error)
     // The message is what the Overview card and the Usage tab print, so it has
     // to be a catalog string: setup pins i18next to English, and the key is the
-    // one `api/client.ts` already uses for a body that is not what the route
-    // promised.
+    // one `api/client/files.ts` (`uploadFiles`) already uses for a body that
+    // is not what the route promised.
     expect((err as Error).message).toBe('Unexpected server response')
     expect((err as Error).message).not.toMatch(/undefined|total_sessions/)
   })

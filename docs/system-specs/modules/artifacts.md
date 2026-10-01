@@ -32,6 +32,124 @@ Loading, empty results, filtering, and read errors therefore keep the same mode.
 
 ## Storage Layout
 
+### Dynamic Dashboard presentation
+
+Automatic session status cards and saved task views have different owners.
+With `dashboard.dynamic_dashboard_cards` enabled, host session events queue a
+bounded background update using only that session's recent, redacted messages.
+Team workers (sessions another session created) get no automatic card.
+The model chooses the card's HTML/CSS and flat text fields; subsequent updates
+can omit HTML and reuse the prior layout with exactly the same data field names.
+A field-name change requires explicit replacement HTML; invalid data-only output
+does not blank the valid prior publication. Large prior layouts stay on the host
+when necessary to leave room for recent evidence in the bounded model input.
+Generation failure retains prior content only while its source and privacy remain
+valid. These cards are transient, not saved
+artifacts, and do not require a conductor or worker to call `artifact_update`.
+The host shows their content publication time separately from live run state.
+The event, privacy and resource contract is in
+[learn-cron-dashboard](learn-cron-dashboard.md#automatic-session-status-cards).
+The Needs you inbox precedes cards, and all answer/approval authority stays in
+native controls. Disabling automatic content does not disable those controls.
+
+An HTML/widget artifact tagged `task-dashboard` is a model-authored task view,
+not a fixed dashboard schema. The chat's **Dynamic Dashboard** side-panel tab
+(labelled **Dashboard**; a one-time hint card above the composer opens it once
+and then stays gone for that session, the tab being the way back) and Crew's
+single **Dashboard** tab select
+only artifacts whose recorded originating slot is the current slot or a durable
+`created_by` descendant. A presentation-only child session can therefore publish
+without impersonating its conductor. The same slug is updated at milestones;
+visible hosts poll the artifact inventory every ten seconds and load new revisions.
+Session matching strips the dashboard scope and normalizes registered channel
+keys with the history safe-key rules, retaining the channel namespace. Unknown
+prefixes are not folded; missing task roots remain fail-closed.
+Models choose the layout and task-specific content; no particular board or graph
+is mandatory. The `artifacts` skill documents this publishing contract.
+Crew's existing member-published webview shares this presentation selector, not
+its renderer or permissions. Its member-panel API and sandbox remain unchanged;
+a pipeline publication is one view within the same dashboard. The global session
+dashboard supplies the cross-session summary and Needs you inbox, while questions
+and approvals remain native host controls outside every published document.
+The Crew entry stays **Dashboard**; the publication's expand/collapse, dialog,
+loading and error chrome consistently names the **published view**.
+
+The host independently projects live sessions, subagents, workflows and accepted
+conductor work. It never treats idle sessions as completed work, nor worker
+`done` reports as conductor acceptance. Missing/failed sources are shown as
+unknown or stale, not as an empty successful run. Questions and approvals have
+native host controls, exact session/request identities and explicit submission;
+Normal/Reads/Trust/YOLO mode is explicitly labeled as the permission mode, never
+changed by the dashboard. Native Reject once addresses both the owning slot and
+exact request ID through the slot approval endpoint, which preserves the
+`rejected_once` decision without rejecting the remaining batch. Connection-scoped
+request IDs may collide across unrelated sessions and must never be resolved by
+a global ID scan. Dashboard actions bind the request's origin as well: native
+actions send `origin: native` and require that exact slot's live request; coordinator
+actions send `origin=coordinator` and the inventory record's exact raw slot. The
+server checks the coordinator record and resolves its state-only future without
+an intervening await. Stale/missing/mismatched targets return 404, never fall
+through to another origin, and retire the displayed controls without claiming
+success. Origin-qualified card identity prevents a coordinator's delivered state
+from hiding a colliding native request after the inventory changes. Existing
+callers that omit origin retain their legacy fallback behavior.
+Command input stays verbatim in a keyboard-accessible scrolling
+preview, including on narrow screens. No bulk approval is implied. A failed or
+uncertain send retains the answer and
+does not automatically retry. Native answers steer their own waiting turn when
+either live run state or that slot's reloaded dashboard snapshot is running;
+sibling sessions never determine this decision. Approvals are separate from informational blockers.
+
+`TaskDashboardFrame` uses the sandbox-document service with an empty sandbox:
+no scripts, same-origin, forms, popups or control bridge. A dedicated document
+builder removes executable code, resource hints, nested documents and outbound
+navigation before rendering. It inspects actual attributes irrespective of SVG
+namespace and keeps only fragment hrefs; empty hrefs are navigation too.
+Models freely design supported HTML/CSS/SVG layouts and native
+disclosures; dynamic evidence arrives through published revisions, not model
+JavaScript. Deny-by-default CSP permits only inline styling and data fonts; no
+image loads, since an image is bytes the browser decodes for display and the
+backend text scan cannot read them, so image-source attributes are removed too.
+An automatic card is held to the text the backend scanned: its CSP also refuses
+fonts and its `@font-face` rules are deleted (a font remaps the glyphs shown),
+declarations that draw characters absent from the markup (`content`, `quotes`,
+`list-style*`, `hyphenate-character`, `text-emphasis*`, `text-overflow`) are
+removed, and so are the `alt`, `title`, `start` and `value` attributes the
+browser displays as text. Saved views keep their authored CSS and attributes.
+The page receives no credentials or host state. Model-authored status is labeled a
+published view; it never replaces the host's trusted approval inventory.
+Automatic card data binds through `data-dashboard-field` text containers using
+`textContent`, never HTML interpolation or an executable update script. An absent
+field clears the old text. Only visible frames obtain a sandbox document; hiding
+or paging them out releases it. The fleet keeps wrappers for the bounded live
+slot inventory (`MAX_LIVE_SLOTS`, 500) to retain each saved-view selection. Twelve
+session summaries are active on a page, with one automatic card and at most one
+selected saved view each: at most 24 iframe documents, not twelve mounted wrappers.
+Native attention controls remain mounted independently to preserve drafts across
+filters and pages. The task panel
+mounts at most twelve session frames (workers among them carry no automatic card)
+plus its selected task publication; Crew's
+existing protected-template renderer retains its own lifecycle.
+The optional creation request is a model-facing English prompt; translated UI
+copy names the published view, and the artifacts skill owns its technical
+publishing contract. Source failures render through the shared error notice in
+both the dock and panel, with no navigation hand-off beside unsent answer drafts.
+No command-center source polls. The dock, panel and all-session view read each
+source once and re-read it on the frame that announces its change: `approval` and
+`approval_resolved` for both approval systems, `question_card` and its retirement
+for questions, `artifact_update` for a task dashboard, the crew log's
+`slot_projection` for the work board of a team holding that slot, and workflow
+events into the store, with a finished, failed or cancelled run also re-reading
+the workflow snapshot the store's live runs are laid over, and the store's own
+workflow heal read replacing that snapshot; a reconnect re-reads all of them. The work board is the one host source the crew log
+owns, a checkpointed slot fold. Pending approvals and questions stay on the live
+host inventory rather than a crew-log projection: a card needs the request's tool
+input, which the crew log only digests, and a decision needs the live future the
+resolve endpoints check, which a recorded request cannot prove still exists.
+Incognito/temporary artifact persistence restrictions remain unchanged.
+
+### Artifact files
+
 ```
 ~/.kiro/crew/artifacts/
 └── <slug>/
@@ -87,13 +205,14 @@ for isolated test instances.
 `kiro_crew.artifacts` is the facade every caller imports. It owns the store and
 keeps its whole import surface, re-exporting each moved name with one identity:
 `kiro_crew.artifacts.ArtifactFolderStore` and
-`kiro_crew.artifact_store.folders.ArtifactFolderStore` are the same class. The
-`records` and `comments` helpers the store calls are internal to it and are
-imported from their owner.
+`kiro_crew.artifact_store.folders.ArtifactFolderStore` are the same class. Its
+`__all__` lists that complete public surface, the moved names included, so a
+star import exposes them. The `records` and `comments` helpers the store calls
+are internal to it and are imported from their owner.
 
 | Owner | Responsibility |
 |---|---|
-| `kiro_crew.artifacts` | `ArtifactStore`: the shared per-root lock, the directory layout, the fenced file IO (`_read_text` / `_write_text` / `_read_bytes` / `_write_bytes`), versions and pruning, the live `source_path` pointer and its allowed roots, publication-record reads and writes, comment and retention orchestration, the change listener and the `kirocrew.artifact.created` counter. Also the caps (`MAX_VERSIONS`, `MAX_CONTENT_BYTES`, `MAX_COMMENTS_PER_ARTIFACT`, `MAX_EVENTS_PER_ARTIFACT`, `MAX_AUTO_WIDGET_ARTIFACTS`), the clock (`_now_iso`) and the `get_default_store` / `get_default_folder_store` singletons |
+| `kiro_crew.artifacts` | `ArtifactStore`: the shared per-root lock, the directory layout, the fenced file IO (`_read_text` / `_write_text` / `_read_bytes` / `_write_bytes`), versions and pruning, the live `source_path` pointer and its allowed roots, publication-record reads and writes, comment and retention orchestration, the change listener and the `kirocrew.artifact.created` counter. Also the caps (`MAX_VERSIONS`, `MAX_CONTENT_BYTES`, `MAX_COMMENTS_PER_ARTIFACT`, `MAX_EVENTS_PER_ARTIFACT`, `MAX_AUTO_WIDGET_ARTIFACTS`), the clock (`_now_iso`), the `slug_is_well_formed` predicate and the `get_default_store` / `get_default_folder_store` singletons |
 | `kiro_crew.artifact_store.model` | The error hierarchy, the `EXPECT_ABSENT` generation sentinel and the record dataclasses (`Artifact`, `ArtifactPublication`, `ForkMetadata`, `ArtifactComment`, `ImageMetadata`) |
 | `kiro_crew.artifact_store.rules` | Field limits and grammar (slug, tag, name, description, `source_path`), `slugify`, the kind policy (`_infer_kind`, `detect_editor_kind`, `USER_SELECTABLE_KINDS`), the theme-colour lint, the document-path test and session-scope matching |
 | `kiro_crew.artifact_store.images` | The raster mime allowlist and the standard-library header sniffers |
@@ -111,15 +230,43 @@ inside `_strip_session_scope` because both import the facade back. The moved
 classes keep `kiro_crew.artifacts` as their `__module__`, so tracebacks and type
 names in logs are unchanged.
 
-What the store reads from the facade at call time stays patchable there:
-`_now_iso`, `MAX_VERSIONS`, `MAX_CONTENT_BYTES`, `MAX_COMMENTS_PER_ARTIFACT`,
+The store's seams belong to the facade, which hands them to the owners at call
+time, so they are patched on `kiro_crew.artifacts`: `config_dir`, `_now_iso`,
+`MAX_VERSIONS`, `MAX_CONTENT_BYTES`, `MAX_COMMENTS_PER_ARTIFACT`,
 `MAX_EVENTS_PER_ARTIFACT`, the fence helpers (`_open_pinned_for_read`,
 `canonical_path_refusal`, `sensitive_path_refusal`, `is_sensitive_path`) and the
-`_default_store` / `_default_folder_store` singletons; the store hands the clock
-and caps to the owners. The field limits, kind sets and helpers that
-`kiro_crew.artifact_store.rules` owns are read from that module, so a test that
-rebinds one patches it there. `MAX_AUTO_WIDGET_ARTIFACTS` is the default argument
-of `prune_auto_widgets`, bound when the class is defined.
+`_default_store` / `_default_folder_store` singletons. `get_default_folder_store`
+builds its store on the facade's `config_dir`, so the default
+`artifact_folders.json` follows the same patch as the default store's root.
+
+The store calls every owner helper through its facade name, so rebinding one on
+`kiro_crew.artifacts` steers the store: `slugify`, `_validate_slug`,
+`_validate_name`, `_validate_description`, `_validate_tags`, `_validate_kind`,
+`_validate_source`, `_validate_source_path`, `_infer_kind`, `detect_editor_kind`,
+`_markdown_misclassification_reason`, `_session_touched` and
+`_sniff_image_dimensions`. `slug_is_well_formed` lives in the facade on the same
+`_validate_slug` binding, so it cannot disagree with the store. A call a helper
+makes inside its owner module resolves there: `_session_touched` calls `rules`'
+`_strip_session_scope`, `slugify` calls `rules`' `slug_hash_fallback`, and
+`_sniff_image_dimensions` calls `images`' per-format sniffers
+(`_sniff_jpeg_dimensions`, `_sniff_webp_dimensions`). Owner modules bind their
+own imports too: a directly constructed `ArtifactFolderStore` takes its default
+path from `folders`' `config_dir` and logs through `folders`' `logger`, which is
+the same `kiro_crew.artifacts` logger object.
+
+Rule data an owner's own code reads has one live binding, in the owner, and the
+store reads it through the owner module too (`create_image` truncates to
+`MAX_NAME_LEN` / `MAX_DESCRIPTION_LEN`, and `update` pre-checks
+`ALLOWED_EVENT_TYPES`). That covers the field limits and grammar
+(`MAX_NAME_LEN`, `MAX_DESCRIPTION_LEN`, `MAX_TAGS`, `MAX_SOURCE_PATH_LEN`,
+`_SLUG_RE`, `_TAG_RE`), the kind sets and inference maps (`ALLOWED_KINDS`,
+`ALLOWED_SOURCES`, `_EXT_KIND_MAP`, `_HTML_SNIFF_MARKERS`) in `rules`, the
+event-type vocabulary (`ALLOWED_EVENT_TYPES`) in `records`, and the folder path
+limits (`FOLDER_PATH_SEP`, `MAX_FOLDER_DEPTH`) in `folders`. The facade copy of
+such a name is an import-compatible re-export that steers nothing, so patch the
+owner module. `_IMAGE_MIME_EXT` is read only by the store, so its facade binding
+is the live one. `MAX_AUTO_WIDGET_ARTIFACTS` is the default argument of
+`prune_auto_widgets`, bound when the class is defined.
 
 `list()` returns newest first on a TOTAL order, `(updated_at, slug)` descending.
 The tie-break is load-bearing, not cosmetic: `updated_at` is microsecond ISO, so

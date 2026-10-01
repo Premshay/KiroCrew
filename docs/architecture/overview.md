@@ -692,7 +692,7 @@ detail; this table is only an index.
 |---|---|---|
 | ACP client (JSON-RPC transport to kiro-cli) | `src/kiro_crew/acp/` | [acp-client.md](../system-specs/modules/acp-client.md) |
 | App Kit platform contracts | `src/kiro_crew/apps/` | [app-kit-platform.md](../system-specs/modules/app-kit-platform.md) |
-| Artifacts (persisted generated UI) | `src/kiro_crew/artifacts.py` | [artifacts.md](../system-specs/modules/artifacts.md) |
+| Artifacts (persisted generated UI) | `src/kiro_crew/artifacts.py`, `artifact_store/` | [artifacts.md](../system-specs/modules/artifacts.md) |
 | Browser automation auth layer | `src/kiro_crew/browser/` | [browser.md](../system-specs/modules/browser.md) |
 | Channel history buffer | `src/kiro_crew/channel_history.py` | [channel-history.md](../system-specs/modules/channel-history.md) |
 | CLI surface | `src/kiro_crew/cli.py` | [cli.md](../system-specs/modules/cli.md) |
@@ -706,7 +706,7 @@ detail; this table is only an index.
 | Instances (multi-instance over SSH) | `src/kiro_crew/instances/` | [instances.md](../system-specs/modules/instances.md) |
 | Issue Radar app | `src/kiro_crew/apps/builtins/issue_radar/` | [issue-radar.md](../system-specs/modules/issue-radar.md) |
 | Knowledge library (ingest + hybrid retrieval) | `src/kiro_crew/knowledge/` | [knowledge.md](../system-specs/modules/knowledge.md) |
-| Self-learning, cron, and dashboard API | `src/kiro_crew/learn.py`, `cron.py`, `dashboard/` | [learn-cron-dashboard.md](../system-specs/modules/learn-cron-dashboard.md) |
+| Self-learning, cron, and dashboard API | `src/kiro_crew/learn.py`, `cron.py`, `cron_service/`, `dashboard/` | [learn-cron-dashboard.md](../system-specs/modules/learn-cron-dashboard.md) |
 | MCP Apps (interactive `ui://` rendering) | `src/kiro_crew/mcp_gateway/` | [mcp-apps.md](../system-specs/modules/mcp-apps.md) |
 | Markdown Notebook app | `src/kiro_crew/apps/builtins/md_notebook/` | [md-notebook.md](../system-specs/modules/md-notebook.md) |
 | Meetings app | `src/kiro_crew/apps/builtins/meetings/` | [meetings.md](../system-specs/modules/meetings.md) |
@@ -714,7 +714,7 @@ detail; this table is only an index.
 | Messaging transport abstraction | `src/kiro_crew/messaging/` | [messaging.md](../system-specs/modules/messaging.md) |
 | Metrics telemetry (default off) | `src/kiro_crew/metrics/` | [metrics.md](../system-specs/modules/metrics.md) |
 | Mochi app (desktop pet) | `src/kiro_crew/apps/builtins/mochi/` | [mochi.md](../system-specs/modules/mochi.md) |
-| Foreign-agent onboarding import | `src/kiro_crew/onboarding_import.py` | [onboarding-import.md](../system-specs/modules/onboarding-import.md) |
+| Foreign-agent onboarding import | `src/kiro_crew/onboarding_import.py`, `onboarding_scan.py`, `onboarding_plan.py`, `onboarding_apply.py`, `onboarding_sources/` | [onboarding-import.md](../system-specs/modules/onboarding-import.md) |
 | Papyrus app (LaTeX authoring) | `src/kiro_crew/apps/builtins/papyrus/` | [papyrus.md](../system-specs/modules/papyrus.md) |
 | Persistent agent channels | `src/kiro_crew/channel.py` | [persistent-agent-channels.md](../system-specs/modules/persistent-agent-channels.md) |
 | Platform context (CPP seam) | `src/kiro_crew/platform/` | [platform-context.md](../system-specs/modules/platform-context.md) |

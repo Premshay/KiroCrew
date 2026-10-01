@@ -73,6 +73,7 @@ from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     api_chat_slot_reset_conversation,
     api_chat_slot_resume,
     api_chat_slot_selection_capabilities,
+    api_chat_slot_source_link_unlink,
     api_chat_slot_source_links,
     api_chat_slot_stop,
     api_chat_slot_summary,
@@ -158,6 +159,7 @@ from kiro_crew.dashboard.chat_title import (  # noqa: F401
     api_chat_slot_generate_title,
     api_chat_slot_rename,
 )
+from kiro_crew.dashboard.chat_todo import api_chat_slot_todo  # noqa: F401
 from kiro_crew.dashboard.chat_utils import (  # noqa: F401
     _BLOCKED_SLASH_COMMANDS,
     _SLASH_COMMANDS,

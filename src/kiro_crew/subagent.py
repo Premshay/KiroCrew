@@ -57,11 +57,19 @@ from kiro_crew.agent_discovery import (
     _kiro_agents_dir,
     _read_agent_spec,
     cached_project_agent_names,
+    is_internal_agent_spec,
     list_agents,
     plain_markdown_document,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_CLAUDE_CODE
+from kiro_crew.agent_sdk.spec_hooks import (
+    invalidate_stale_kas_session,
+    refuse_stale_switch,
+    replace_stale_shared_session,
+    reproject_claimed_session,
+    turn_spec_hooks,
+)
 from kiro_crew.agent_spec_format import is_markdown_spec, iter_agent_spec_files
 from kiro_crew.config import live
 from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig
@@ -85,6 +93,7 @@ from kiro_crew.context_management import (
     cap_result_file,
     evict_completed_agents,
 )
+from kiro_crew.dashboard.side_readonly_spec import readonly_base_name
 from kiro_crew.effort import effort_settings_key, model_supports_effort
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.hooks import (
@@ -94,18 +103,22 @@ from kiro_crew.hooks import (
     fire_tool_hooks,
     hook_gate_kwargs,
     identity_grant_covers_child,
+    permission_pre_tool_block,
 )
 from kiro_crew.llm_helpers import (
     FALLBACK_CANDIDATE_ATTEMPTS,
     FALLBACK_STORY_ATTR,
     TRANSIENT_RETRIES,
     FallbackState,
+    _billing_stats,
+    _sum_usage,
     acp_error_is_transient,
     advance_fallback_candidate,
     annotate_model_fallback,
     append_fallback_story,
     configured_fallback_chain,
     provider_fallback_active,
+    provider_last_turn_usage,
     transient_retry_delay,
 )
 from kiro_crew.mcp_gateway import STUB_MODULE
@@ -128,6 +141,7 @@ from kiro_crew.process_identity import (  # noqa: F401 - resolved by run.py/term
     with_kill_failure,
 )
 from kiro_crew.providers.base import (
+    EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -157,15 +171,9 @@ from kiro_crew.subagent_completion_meta import (
     single_completion_meta,
 )
 from kiro_crew.subagent_cost import (
-    _SAMPLE_MAX_AGE_SECS,
     append_cost_sample,
-    cap_buckets,
     compact_cost_log,
-    cost_log_identity,
-    learned_cost_for,
     read_learned_cost,
-    read_learned_costs,
-    read_learned_costs_checked,
 )
 from kiro_crew.subagent_manager import (
     CancellationCoordinator,
@@ -185,6 +193,7 @@ from kiro_crew.subagent_manager.monitoring import (  # noqa: F401 - resolved by 
     tombstone_recovery_action,
 )
 from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone resolved by run.py via bind_component_globals
+    DISMISSAL_FAILED,
     _agent_dir,
     _cleanup_session_files_sync,
     _subagents_dir,
@@ -196,7 +205,9 @@ from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone reso
     prune_stale_tombstones,
     read_state,
     read_tombstone,
+    record_panel_dismissal_outcome,
     record_slow_command,
+    settle_delivered_batch,
     update_state,
     write_result_chunk,
     write_tombstone,
@@ -279,6 +290,36 @@ AGENT_NOT_FOUND_CODE = "agent_not_found"
 #: Same single-definition rule: ``mcp_tools.spawn`` imports it for the wave
 #: short-circuit, and the gateway handler forwards the field without naming it.
 AGENT_NOT_AVAILABLE_CODE = "agent_not_available"
+
+#: Wire code for the refusal ``_validate_agent`` returns when the named agent is
+#: one of Kiro Crew's own generated specs (:func:`is_internal_agent_spec`): the
+#: file exists, but it is machinery, not a sub-agent. A third refusal kind, so it
+#: carries its own identifier: ``agent_not_found`` would send the caller looking
+#: for a typo in a name it can see on disk. Same single-definition rule as the
+#: two codes above.
+AGENT_INTERNAL_CODE = "agent_internal"
+
+
+def _internal_agent_refusal(requested: str, available: list[str]) -> str:
+    """Refusal prose for a spawn that names a generated spec (see :func:`is_internal_agent_spec`).
+
+    Names the base agent a read-only spec was derived from when that base is on
+    offer -- it is the agent the caller most likely meant -- and otherwise leaves
+    the roster to say what can be named. A base that is not offered (the host
+    default, reached by omitting ``agent``) is not suggested by name.
+    """
+    base = readonly_base_name(requested)
+    what = (
+        f"the read-only spec Kiro Crew derives from {base!r} for side replies"
+        if base
+        else "a spec Kiro Crew generates for its own use"
+    )
+    suggestion = f"; name {base!r} to spawn that agent" if base in available else ""
+    return (
+        f"agent {requested!r} is {what}, not a sub-agent"
+        f"{suggestion}{_available_agents_hint(available)}"
+    )
+
 
 #: Grammar an ``availableAgents`` glob must satisfy to be RENDERED into a refusal:
 #: the agent-name alphabet plus the fnmatch metacharacters. Matching never
@@ -384,7 +425,11 @@ def _validate_app_agent_ownership(agent: str, app: str) -> str:
     or ``""`` when the agent is the app's own."""
     prefix = f"{app}--"
     try:
-        known = {a.name for a in list_agents() if a.filename.startswith(prefix)}
+        known = {
+            a.name
+            for a in list_agents()
+            if a.filename.startswith(prefix) and not is_internal_agent_spec(a)
+        }
     except Exception as exc:  # noqa: BLE001 - cannot confirm -> refuse
         return f"cannot verify agent {agent!r} for app {app!r}: {exc}"
     if agent not in known:
@@ -424,12 +469,20 @@ def _validate_agent(requested: str, project_dir: str = "") -> tuple[str, str, st
     """
     if not requested:
         return "", "", ""
-    known = {a.name for a in list_agents()}
+    agents = list_agents()
+    # Kiro Crew's own generated specs are on disk but are not sub-agents (see
+    # ``is_internal_agent_spec``): they are neither accepted nor offered. A
+    # project agent that declares the same name is the user's own and still wins.
+    internal = {a.name for a in agents if is_internal_agent_spec(a)}
+    known = {a.name for a in agents} - internal
     if project_dir:
         known |= set(cached_project_agent_names(project_dir) or frozenset())
     if requested in known:
         return requested, "", ""
     available = sorted(known - UNADVERTISED_AGENTS)
+    if requested in internal:
+        logger.warning("Agent %r is a generated internal spec; refusing spawn", requested)
+        return "", _internal_agent_refusal(requested, available), AGENT_INTERNAL_CODE
     # REFUSE a named-but-unknown agent rather than silently falling back to the
     # host default: that fallback runs the full default agent (frequently at
     # approval_mode="auto"), so a typo'd — or malicious — agent name was a silent
@@ -939,6 +992,93 @@ def _done_result(text: str) -> str:
 # ``constants`` because the MCP gateway's hard-wedge ceiling has to sit above
 # it (see ``mcp_gateway/backend.py``).
 _TIMEOUT_SECS = SUBAGENT_TIMEOUT_SECS
+
+
+def _finite_nonnegative_number(value: object) -> float | None:
+    """Return a safe numeric telemetry value, excluding booleans and NaN/inf."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) and number >= 0.0 else None
+
+
+def format_subagent_usage(credits: object, elapsed: object) -> str:
+    """Format the terminal usage line shared by all subagent delivery surfaces."""
+    credit_value = _finite_nonnegative_number(credits)
+    elapsed_value = _finite_nonnegative_number(elapsed)
+    if credit_value is None or elapsed_value is None:
+        return ""
+    # Match the dashboard's Math.round for non-negative elapsed telemetry;
+    # Python's round uses ties-to-even and would render 12.5 differently.
+    total_seconds = math.floor(elapsed_value + 0.5)
+    elapsed_text = (
+        f"{total_seconds // 60}m {total_seconds % 60}s"
+        if total_seconds >= 60
+        else f"{total_seconds}s"
+    )
+    # Zero also represents a provider that does not report credit billing.
+    if credit_value == 0:
+        return elapsed_text
+    digits = 1 if credit_value >= 10 else 2
+    return f"{credit_value:.{digits}f} credits · {elapsed_text}"
+
+
+@dataclass(frozen=True)
+class SubagentDelivery:
+    """Terminal usage captured when a completion acquires delivery debt."""
+
+    agent_id: str
+    elapsed: float
+    credits: float
+
+
+@dataclass
+class _RunCreditAccounting:
+    """Settle each attempted turn once, including consumer-side interruptions."""
+
+    info: SubagentInfo
+    provider: object | None = None
+    stats_before: object | None = None
+    pending: bool = False
+    total: Any = field(default_factory=lambda: provider_last_turn_usage(None))
+
+    def __post_init__(self) -> None:
+        self.total.credits = self._valid_credits(self.info.credits) or 0.0
+
+    @staticmethod
+    def _valid_credits(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            credits = float(value or 0.0)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return credits if math.isfinite(credits) and credits >= 0.0 else None
+
+    def begin(self, provider: object) -> None:
+        self.provider = provider
+        self.stats_before = _billing_stats(provider)
+        self.pending = True
+
+    def settle(self, completion: object | None = None) -> None:
+        if not self.pending:
+            return
+        self.pending = False
+        event_usage = getattr(completion, "usage", None)
+        usage = event_usage
+        if usage is None or not hasattr(usage, "credits"):
+            usage = provider_last_turn_usage(self.provider, since=self.stats_before)
+        # Provider usage is an external boundary. Reject malformed credit values
+        # before accumulation so they cannot poison persisted or JSON telemetry.
+        if self._valid_credits(getattr(usage, "credits", None)) is None:
+            return
+        self.total = _sum_usage(self.total, usage)
+        self.info.credits = self._valid_credits(self.total.credits) or 0.0
+
+
 _TURN_LIMIT = DEFAULT_SUBAGENT_MAX_TURNS
 _REAPER_INTERVAL = 60  # seconds between reaper sweeps
 # Idle TTL for continuable conversations (keep=True): a conversation with no
@@ -1574,6 +1714,50 @@ def _read_int_file(path: str) -> int | None:
         return None
 
 
+#: Upper bound on one ``memory.stat`` read; the real file is a few KB.
+_MEMORY_STAT_READ_CAP = 64 * 1024
+
+
+def _read_inactive_file_bytes(directory: PurePosixPath | Path, v2: bool) -> int:
+    """Inactive page cache charged to a cgroup, in bytes; 0 when unreadable.
+
+    A cgroup's ``memory.current`` (v1: ``memory.usage_in_bytes``) counts the
+    page cache its members touched. On a build-heavy host that cache fills the
+    group up to its ceiling and stays there, so ``limit - usage`` reads as zero
+    headroom while almost all of it is cache the kernel drops on demand.
+    Inactive file pages are the part it reclaims first and cheaply; subtracting
+    them gives the working set, the same figure the kubelet and cAdvisor evict
+    on. Active cache and anonymous memory stay counted as used.
+
+    v2 ``memory.stat`` is hierarchical, so ``inactive_file`` covers the whole
+    subtree. v1 keeps the subtree figure in ``total_inactive_file``. Read
+    through this module's ``open`` for the same reason as :func:`_read_int_file`.
+    """
+    key = "inactive_file" if v2 else "total_inactive_file"
+    try:
+        with open(str(directory / "memory.stat"), encoding="ascii") as fh:
+            # A kernel-written file of ~40 short lines; the cap only keeps a
+            # read on a fabricated or unexpected file bounded.
+            text = fh.read(_MEMORY_STAT_READ_CAP)
+        for line in text.splitlines():
+            name, _, value = line.partition(" ")
+            if name == key:
+                return max(0, int(value))
+    except (OSError, UnicodeDecodeError, ValueError):
+        pass
+    return 0
+
+
+def _working_set(directory: PurePosixPath | Path, v2: bool, usage: int) -> int:
+    """*usage* minus the group's inactive page cache, never below zero.
+
+    The two files are read at different instants, so the cache figure can
+    briefly exceed the usage figure; the floor keeps headroom from ever
+    reading larger than the limit itself.
+    """
+    return max(0, usage - _read_inactive_file_bytes(directory, v2))
+
+
 def _cgroup_memory_roots() -> list[tuple[PurePosixPath, PurePosixPath, bool]]:
     """Return (process directory, mount boundary, v2) for visible memory mounts."""
     try:
@@ -1654,10 +1838,14 @@ def _cgroup_available_gb() -> float:
     The slice is a sibling of the gateway's own cgroup, not an ancestor, so the
     ancestry walk never sees it; and the walk reads hard limits only, never
     ``memory.high``, which is the ceiling the kernel throttles at. Without the
-    slice term a bare host with tens of GB free reads as "ample" while the
-    kernel is already throttling the whole agent subtree, so admission keeps
-    admitting into the throttle. The tighter of the two readings is returned;
-    -1.0 only when neither constrains (``dynamic-subagent-sizing.md`` §9).
+    slice term a bare host with tens of GB free reads as "ample" while agent
+    process memory has already filled that ceiling, so admission keeps
+    admitting into a throttle that reclaim cannot relieve. Both terms measure
+    the working set, so a slice held at ``memory.high`` only by inactive page
+    cache is not refused; ``sandbox.agents_slice_throttling`` still reports
+    that state to the cold-start handshake. The tighter of the two readings is
+    returned; -1.0 only when neither constrains (``dynamic-subagent-sizing.md``
+    §9).
     """
     readings = [
         gb for gb in (_container_cgroup_available_gb(), _agents_slice_available_gb()) if gb >= 0
@@ -1673,7 +1861,8 @@ def _container_cgroup_available_gb() -> float:
     cgroup and its visible ancestors. Each limit is paired with usage at the
     SAME level, including siblings charged to a parent. A finite limit with
     unknown usage contributes zero headroom, never zero usage. Ancestors
-    hidden above a mount cannot be measured.
+    hidden above a mount cannot be measured. Usage excludes the level's
+    inactive page cache (:func:`_read_inactive_file_bytes`).
     """
     available = -1.0
     for leaf, mount, v2 in _cgroup_memory_roots():
@@ -1696,7 +1885,7 @@ def _container_cgroup_available_gb() -> float:
                     if current is not None and current >= 0:
                         current -= min(current, _cgroup_inactive_file(directory, v2))
                     headroom = (
-                        max(0.0, (limit - current) / (1024**3))
+                        max(0.0, (limit - _working_set(directory, v2, current)) / (1024**3))
                         if current is not None and current >= 0
                         else 0.0
                     )
@@ -1734,9 +1923,13 @@ def _agents_slice_available_gb() -> float:
     The slice carries two ceilings: ``memory.high`` (past it the kernel
     throttles-and-reclaims the whole subtree) and ``memory.max`` (past it the
     kernel OOM-kills a scope). The lower one binds, so headroom is
-    ``min(high, max) - current``, floored at zero: usage can sit ABOVE
+    ``min(high, max) - working set``, floored at zero: usage can sit ABOVE
     ``memory.high`` while the kernel reclaims, and a negative figure would
-    mislead every threshold comparison downstream.
+    mislead every threshold comparison downstream. The working set is
+    ``memory.current`` minus inactive page cache
+    (:func:`_read_inactive_file_bytes`); without that, a slice whose cache has
+    filled it to ``memory.high`` reads as zero headroom and raises a critical
+    memory alert on a host with hundreds of GB available.
 
     The slice directory comes from ``sandbox._agents_slice_cgroup_dir`` (which
     knows systemd's dash-hierarchy); the files are read through the same
@@ -1758,7 +1951,7 @@ def _agents_slice_available_gb() -> float:
     if not ceilings:
         return -1.0
     current = _read_int_file(str(slice_dir / "memory.current")) or 0
-    return max(0.0, (min(ceilings) - current) / (1024**3))
+    return max(0.0, (min(ceilings) - _working_set(slice_dir, True, current)) / (1024**3))
 
 
 def compute_max_subagents(cfg: KiroCrewConfig) -> int:
@@ -1844,10 +2037,11 @@ def _host_mem_term(cfg: KiroCrewConfig) -> int | None:
     return math.floor((avail_gb * buf - pool_size * mem_cost) / mem_cost)
 
 
-# Sweeps that must have measured a dedicated worker before the guard trusts its
-# own reading over the learned per-start price. One reading can land mid-growth
-# (a runtime started just before a sweep reads at a fraction of its size); two
-# readings an interval apart bound that exposure to one ``_REAPER_INTERVAL``.
+# Sweeps that must have measured a dedicated worker before it counts as settled
+# (its RSS already inside the free-memory reading) rather than warming (still
+# owing the configured start price). One reading can land mid-growth (a runtime
+# started just before a sweep reads at a fraction of its size); two readings an
+# interval apart bound that exposure to one ``_REAPER_INTERVAL``.
 _RSS_SAMPLES_TO_SETTLE = 2
 
 
@@ -1856,28 +2050,11 @@ def _live_dedicated(agents: list[SubagentInfo]) -> tuple[list[SubagentInfo], lis
     return live, [info for info in live if not info._session_sharing]
 
 
-def _effective_next_start_gb(
-    agents: list[SubagentInfo], *, cost_gb: float, next_start_gb: float | None
-) -> float:
-    """What the NEXT dedicated start is actually priced at.
-
-    The larger of the configured cost, the caller's learned figure and every
-    live dedicated peak: a worker observed above the learned p90 is evidence
-    that starts on this host can cost that much. Shared by the reserve and by
-    the gate's deferral record, so the price an operator is shown is the price
-    the arithmetic used.
-    """
-    _live, dedicated = _live_dedicated(agents)
-    expected = max([0.0, cost_gb, *(info.peak_rss_gb for info in dedicated)])
-    return max([expected, next_start_gb if next_start_gb is not None else 0.0])
-
-
 def _startup_memory_reserve_gb(
     agents: list[SubagentInfo],
     *,
     running_count: int,
     cost_gb: float,
-    next_start_gb: float | None = None,
 ) -> float:
     """Memory promised to cold dedicated starts but not observed in RSS yet.
 
@@ -1887,82 +2064,40 @@ def _startup_memory_reserve_gb(
     reservation. Until sharing is known, a row is priced as a warming
     dedicated start, since it may yet become one.
 
-    Two prices, because two kinds of worker are live at once:
+    Every start is priced at ``cost_gb`` (``agent.subagent_cost_gb``): what a
+    runtime needs to START, not what the work it later runs may grow to. A
+    run's peak RSS is its whole process subtree -- test suites, builds and MCP
+    servers it launched included -- so pricing the next start at a learned p90
+    or a live peak held ordinary spawns at 10 GB+ on a laptop while the start
+    itself needs a fraction of that.
 
-    * A start that is not SETTLED yet -- the next one, a claim awaiting
-      registration, and a dedicated worker fewer than ``_RSS_SAMPLES_TO_SETTLE``
-      sweeps have measured -- owes ``next_start_gb`` (default ``cost_gb``; see
-      :func:`_effective_next_start_gb`) less whatever RSS it already holds. A
-      single reading can land mid-growth, so one sample does not yet say what
-      the worker will weigh; what it holds is subtracted so nothing is counted
-      twice, but the remainder stays reserved at the learned figure.
-    * A SETTLED dedicated worker owes only the gap between the larger of
-      ``cost_gb`` and its OWN peak and what it holds now. Its reservation retires
-      as its RSS is observed: a learned p90 far above what this particular
-      worker turned out to need must not become a phantom reserve that no later
-      sample can close -- and the phantom a warming worker can hold is bounded
-      to the sweeps before it settles.
+    A dedicated worker fewer than ``_RSS_SAMPLES_TO_SETTLE`` sweeps have
+    measured owes ``cost_gb`` less whatever RSS it already holds; a settled one
+    owes nothing, since its memory is already inside the free-memory reading.
     """
     live, dedicated = _live_dedicated(agents)
-    next_start = _effective_next_start_gb(agents, cost_gb=cost_gb, next_start_gb=next_start_gb)
+    cost = max(0.0, cost_gb)
     unregistered = max(0, running_count - sum(not info._slot_released for info in live))
-    gaps = 0.0
-    for info in dedicated:
-        if info._rss_samples < _RSS_SAMPLES_TO_SETTLE:
-            gaps += max(0.0, next_start - info.last_rss_gb)
-        else:
-            gaps += max(0.0, max(cost_gb, info.peak_rss_gb) - info.last_rss_gb)
-    return next_start * (1 + unregistered) + gaps
+    gaps = sum(
+        max(0.0, cost - info.last_rss_gb)
+        for info in dedicated
+        if info._rss_samples < _RSS_SAMPLES_TO_SETTLE
+    )
+    return cost * (1 + unregistered) + gaps
 
 
 def _cost_bucket(agent: str, execution: Any) -> str:
-    """The cost-store key one run's samples are written under and priced from.
+    """The cost-store key one run's samples are written under.
 
     The explicit ``agent`` when the spawn named one, else the template the run
     actually executes (``execution.template_id`` -- an agent-less spawn inherits
-    its parent's), so an inherited heavy template builds and reads its OWN
-    bucket instead of mixing into the default one. ONE function for the write
-    (``_record_cost``) and the read (the spawn guard), because a key that
-    differs between the two never converges. Empty when neither is known; the
-    store normalizes that to its default agent.
+    its parent's), so an inherited heavy template builds its OWN bucket instead
+    of mixing into the default one. ``_record_cost`` is the only caller. Empty
+    when neither is known; the store normalizes that to its default agent.
     """
     if agent:
         return agent
     return str(getattr(execution, "template_id", "") or "")
-
-
-def _startup_cost_gb(agent: Any, learned_gb: float | None) -> float:
-    """What one unmeasured dedicated start is priced at by the spawn guard.
-
-    The larger of the configured first-boot fallback (``subagent_cost_gb``) and
-    *learned_gb*, this run's own bucket's dedicated p90
-    (:func:`~kiro_crew.subagent_cost.read_learned_costs` with ``dedicated_only``,
-    refreshed off-loop by the reaper sweep and held on the manager, so this is
-    arithmetic only; ``None`` when the bucket has no such history). The
-    reserve is the ONLY thing that prices a start between admission and the
-    reaper's first RSS sample (60 s), and a dedicated runtime takes tens of
-    seconds to reach its resident size, so a burst of starts inside that window
-    is bounded by this number alone. Pricing it at the 0.5 GB fallback while the
-    store already knew a ~6 GB p90 let four starts each clear a raw free-memory
-    check and then grow into the same headroom together.
-
-    ``max`` rather than the cap's learned-over-configured
-    (:func:`_host_mem_term`), deliberately: the cap is a COUNT, and a learned
-    cost below the configured one should raise it -- that is what learning is
-    for -- while the reserve is a safety floor against an unrecoverable OOM, so
-    an operator's higher pin must never be lowered by a learned figure.
-    Over-reserving here only defers a start until the next sample; under-reserving
-    is the failure being guarded against.
-    """
-    try:
-        configured = float(agent.subagent_cost_gb)
-    except (AttributeError, TypeError, ValueError):
-        configured = 0.5
-    try:
-        learned = float(learned_gb) if learned_gb is not None else 0.0
-    except (TypeError, ValueError):
-        learned = 0.0
-    return max(configured, learned)
 
 
 def resolve_max_subagents(cfg: KiroCrewConfig) -> int:
@@ -2218,13 +2353,13 @@ class SubagentInfo:
         """
         return self._reap_reason in _NEUTRAL_REAP_REASONS
 
-    # Set by the gateway on the wave's FINAL member only: the held OK member
-    # ids whose delivery tombstones must be settled once the digest has been
+    # Set by the gateway on the wave's FINAL member only: terminal snapshots
+    # whose delivery tombstones must be settled once the digest has been
     # successfully handed off (i.e. after _on_done returns without raising —
     # the same contract as the per-agent mark_delivered). Settling these at
     # digest COMPOSITION would re-open the restart-loss window between
     # composing and routing.
-    _digest_settle_ids: list[str] = field(default_factory=list)
+    _digest_settle_deliveries: list[SubagentDelivery] = field(default_factory=list)
     # True when the gateway QUEUED this completion's injection because the
     # parent's slot was busy. Delivery is not consumption: the announce sits in
     # the slot queue until a turn drains it, and that wait is bounded only by the
@@ -2239,6 +2374,13 @@ class SubagentInfo:
     reaped: bool = False
     streaming_text: str = ""
     elapsed: float = 0.0
+    # Cumulative across every attempted turn, including transient retries that
+    # consumed credits before failing. Providers that do not bill in credits
+    # report zero through the shared TurnUsage contract.
+    credits: float = 0.0
+    # Shared with terminal reporters so a reap need not wait for a cancelled
+    # consumer's state-write drain before settling the active attempt.
+    _credit_accounting: _RunCreditAccounting | None = field(default=None, repr=False, compare=False)
     _raw_task: str = ""  # unredacted task for kiro-cli execution prompt
     # CC-specific overrides (ignored for ACP)
     model: str = ""
@@ -2610,8 +2752,10 @@ class _ReportFailureSnapshot:
     batch_total: int
     _digest_held: bool
     _digest_flush_only: bool
-    _digest_settle_ids: tuple[str, ...]
+    _digest_settle_deliveries: tuple[SubagentDelivery, ...]
     _delivery_queued: bool
+    credits: float
+    _credit_accounting: None = None
 
     @classmethod
     def capture(cls, info: SubagentInfo) -> "_ReportFailureSnapshot":
@@ -2645,8 +2789,9 @@ class _ReportFailureSnapshot:
             batch_total=int(info.batch_total),
             _digest_held=bool(info._digest_held),
             _digest_flush_only=bool(info._digest_flush_only),
-            _digest_settle_ids=tuple(str(agent_id) for agent_id in info._digest_settle_ids),
+            _digest_settle_deliveries=tuple(info._digest_settle_deliveries),
             _delivery_queued=bool(info._delivery_queued),
+            credits=float(info.credits),
         )
 
     @property
@@ -2671,7 +2816,7 @@ class _ReportFailureSnapshot:
             self.stop_reason,
             self.stop_class,
             self.batch_id,
-            *self._digest_settle_ids,
+            *(delivery.agent_id for delivery in self._digest_settle_deliveries),
         )
         return sum(len(value.encode("utf-8")) for value in text)
 
@@ -2694,9 +2839,10 @@ class _ReportFailureSnapshot:
             batch_total=self.batch_total,
             _digest_held=self._digest_held,
             _digest_flush_only=self._digest_flush_only,
-            _digest_settle_ids=list(self._digest_settle_ids),
+            _digest_settle_deliveries=list(self._digest_settle_deliveries),
             _delivery_queued=self._delivery_queued,
             elapsed=self.elapsed,
+            credits=self.credits,
             model=self.model,
             resolved_model=self.resolved_model,
             requested_model=self.requested_model,
@@ -2808,7 +2954,7 @@ DELIVERY_ROUTING_FIELDS: "dict[str, str]" = {
     "_digest_held_at": PARKS_WHEN_SET,
     # The held SIBLINGS whose delivery tombstones this member owes once its digest is
     # handed off. Non-empty means other runs' deliveries are parked ON this record.
-    "_digest_settle_ids": PARKS_WHEN_SET,
+    "_digest_settle_deliveries": PARKS_WHEN_SET,
     # The announce sits in the parent's slot queue because the slot was busy. Delivery is
     # not consumption: a turn has to drain it.
     "_delivery_queued": PARKS_WHEN_SET,
@@ -3088,19 +3234,6 @@ class SubagentManager:
         except Exception:
             self._max_per_parent = 0
             self._max_per_parent_by_agent = {}
-        # The learned per-run memory p90s (``read_learned_costs("mem_gb")``,
-        # keyed by cost bucket) the spawn guard prices a warming start from
-        # (``learned_cost_for`` → ``_startup_cost_gb``; a bucket with no
-        # dedicated history answers None and the configured cost plus live
-        # peaks prices it). Empty until the first off-loop
-        # refresh: the reaper sweep reads the cost log on the maintenance
-        # executor and publishes here, so the gate -- which runs on the event
-        # loop -- never opens the file itself. Stale by at most one sweep, far
-        # below the rate a 50-sample p90 can move at.
-        self._learned_costs_gb: dict[str, float] = {}
-        # The log identity the map was last merged from (``cost_log_identity``),
-        # so a replaced log -- new inode or shrunk -- is read fresh, not merged.
-        self._learned_costs_source: tuple[object, ...] | None = None
         # Strong refs to in-flight shielded terminal reports (see
         # `_spawn_terminal_report`); drained in `cancel_all`.
         self._report_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
@@ -3234,6 +3367,10 @@ class SubagentManager:
         # own, and without this memory each re-emit would flip a memory-deferred
         # wave back to the default (concurrency) text.
         self._queue_wait: dict[str, dict[str, Any]] = {}
+        # Rows the pump has popped from the window but not yet claimed. Their
+        # durable state is still QUEUED, so without this set every store-backed
+        # depth read between pop and claim counts them as waiting.
+        self._dispatching_ids: set[str] = set()
         # Batch ids whose spawn_batch_started event has already fired.
         self._seen_batches: set[str] = set()
         # Submission accounting per wave: batch_id -> (submitted, expected).
@@ -3620,16 +3757,18 @@ class SubagentManager:
         # must not permanently disable the run's replay budget.
         if approval_sent is not False and info is not None and event.sub_session_id:
             info.tool_count += 1
+        if approval_sent is False:
+            outcome = OUTCOME_REJECTED_TRANSPORT_FLOOR
+        elif metadata and metadata.get("reason"):
+            outcome = "auto_approved"
+        else:
+            outcome = "approved"
         sel().log_tool_invocation(
             session_key=session_key,
             source="subagent",
             tool_name=event.title,
             tool_kind=event.tool_kind,
-            outcome=(
-                "auto_approved"
-                if approval_sent is not False and metadata and metadata.get("reason")
-                else "approved" if approval_sent is not False else OUTCOME_REJECTED_TRANSPORT_FLOOR
-            ),
+            outcome=outcome,
             request_id=request_id,
             metadata=metadata,
         )
@@ -3753,9 +3892,6 @@ class SubagentManager:
     def _sample_live_costs(self) -> None:
         return self._monitor._sample_live_costs_impl()
 
-    def _refresh_learned_cost(self) -> None:
-        return self._monitor._refresh_learned_cost_impl()
-
     def _record_cost(self, info: SubagentInfo) -> None:
         return self._monitor._record_cost_impl(info)
 
@@ -3805,6 +3941,13 @@ class SubagentManager:
             dispatch_parked_secs=0.0,
             is_shell=bool(getattr(event, "is_shell", False)),
             tool_name=getattr(event, "tool_name", "") or "",
+            # Only a provenance-verified identity names the server, so a frame
+            # without one cannot select the trusted wait contract.
+            mcp_server_name=(
+                getattr(event, "mcp_server_name", "") or ""
+                if getattr(event, "mcp_identity_trusted", False) is True
+                else ""
+            ),
         )
         oracle = info._stall_oracle
         info._stall_oracle = oracle.fresh() if oracle is not None else None
@@ -4221,6 +4364,24 @@ class SubagentManager:
                 self._clear_report_failure(snapshot)
             elif owner:
                 self.discard_report_failures(info.parent_session_key, owner)
+        # The pop is only half of a dismissal. The panel's durable half reads run
+        # folders, so without a record of its own the next rebuild found this
+        # run's folder and sent the card again -- the dismissal lasted exactly as
+        # long as the process. Recorded here rather than in the route so the two
+        # halves cannot come apart, and OFF the loop, because the record is a
+        # synchronous file write and this is a coroutine.
+        #
+        # Written BEFORE the pop, because the pop is the PUBLISH. With the write
+        # second, an unwritable store still popped the run and still answered
+        # "delivered", which the DELETE route reports as success -- and the card
+        # came back on the next reconnect with nothing to explain it. A failed
+        # write now returns the retryable result this coroutine already uses
+        # above, leaving the run in the manager so the operator can dismiss it
+        # again. The two falsy cases are NOT the same: a run with no folder has
+        # nothing durable to resurrect its card, so its dismissal stands.
+        outcome = await asyncio.to_thread(record_panel_dismissal_outcome, agent_id)
+        if outcome == DISMISSAL_FAILED:
+            return "pending"
         self._agents.pop(agent_id, None)
         self._tasks.pop(agent_id, None)
         return "delivered"
@@ -4370,11 +4531,23 @@ class SubagentManager:
     ) -> None:
         return await self._terminal._reap_once_impl(agent_id, info, elapsed, reason=reason)
 
-    async def _sigkill_session(self, session_key: str, handle: ProcessHandle | None) -> str | None:
-        return await self._terminal._sigkill_session_impl(session_key, handle)
+    async def _sigkill_session(
+        self,
+        session_key: str,
+        handle: ProcessHandle | None,
+        *,
+        popped: "list[tuple[Any, ProcessHandle]] | None" = None,
+    ) -> str | None:
+        return await self._terminal._sigkill_session_impl(session_key, handle, popped=popped)
 
-    async def _sigkill_sessions(self, session_key: str, handles: list[ProcessHandle]) -> str | None:
-        return await self._terminal._sigkill_sessions_impl(session_key, handles)
+    async def _sigkill_sessions(
+        self,
+        session_key: str,
+        handles: list[ProcessHandle],
+        *,
+        popped: "list[tuple[Any, ProcessHandle]] | None" = None,
+    ) -> str | None:
+        return await self._terminal._sigkill_sessions_impl(session_key, handles, popped=popped)
 
     def _sessions_under(self, session_key: str) -> list[tuple[Any, ProcessHandle]]:
         return self._terminal._sessions_under_impl(session_key)
@@ -5379,11 +5552,11 @@ class SubagentManager:
     async def _announce_digest_flush(self, info: SubagentInfo) -> None:
         return await self._waves._announce_digest_flush_impl(info)
 
-    async def settle_queued_delivery(self, agent_ids: list[str]) -> None:
-        return await self._waves.settle_queued_delivery_impl(agent_ids)
+    async def settle_queued_delivery(self, deliveries: list[SubagentDelivery]) -> None:
+        return await self._waves.settle_queued_delivery_impl(deliveries)
 
-    def _settle_digest_holds(self, info: SubagentInfo) -> None:
-        return self._waves._settle_digest_holds_impl(info)
+    async def _settle_digest_holds(self, info: SubagentInfo) -> None:
+        return await self._waves._settle_digest_holds_impl(info)
 
     def get(self, agent_id: str) -> SubagentInfo | None:
         return self._run_events.get_impl(agent_id)
@@ -5439,8 +5612,8 @@ class SubagentManager:
             return "terminal"
         return "unknown"
 
-    def _queued_depth(self, parent_session_key: str) -> int:
-        return self._run_events._queued_depth_impl(parent_session_key)
+    def _queued_depth(self, parent_session_key: str, *, for_dispatch: bool = False) -> int:
+        return self._run_events._queued_depth_impl(parent_session_key, for_dispatch=for_dispatch)
 
     async def _queued_depth_async(self, parent_session_key: str) -> int:
         return await self._run_events._queued_depth_async_impl(parent_session_key)
@@ -5483,6 +5656,18 @@ class SubagentManager:
         """
         if info.memory_mode != "persistent":
             return
+        # Finalize the run's elapsed time ONCE, here, before any abnormal-exit
+        # tombstone is written. Every abnormal arm (timeout, cancel, reap,
+        # error) writes the tombstone before ``_run``'s finally / the reaper
+        # assigns ``info.elapsed`` (subagent_manager/run.py, terminal.py), so
+        # sampling the wall clock inline at write time produced a DIFFERENT
+        # value than the terminal ``subagent_done`` event later carried, and a
+        # replayed ``spawn_status`` (which reads this tombstone) disagreed with
+        # the terminal event. Setting ``info.elapsed`` once and persisting that
+        # single field makes both writers read the same value; the later
+        # finalizers preserve an already-set value rather than re-sampling.
+        if info.elapsed <= 0:
+            info.elapsed = time.time() - info.started
         try:
 
             write_tombstone(
@@ -5493,6 +5678,8 @@ class SubagentManager:
                 turns=info.turns,
                 last_tool=info.last_tool,
                 outcome=info.outcome,
+                elapsed=info.elapsed,
+                credits=info.credits,
                 # ``cause`` is a coarse bucket ("error", "timeout"), which is
                 # not enough to act on. ``info.error`` is in-memory only and
                 # dies with the gateway, so without this the specific reason is
@@ -5506,7 +5693,18 @@ class SubagentManager:
         return await self._run_events._write_state_off_loop_impl(info, what, **fields)
 
     async def _run_inner(self, info: SubagentInfo, session_key: str) -> None:
-        return await self._run_events._run_inner_impl(info, session_key)
+        usage = _RunCreditAccounting(info)
+        info._credit_accounting = usage
+        try:
+            return await self._run_events._run_inner_impl(info, session_key, usage)
+        finally:
+            # Cancellation may land in the event consumer, outside the stream
+            # generator's exception handlers. Settle before terminal reporting.
+            try:
+                usage.settle()
+            finally:
+                if info._credit_accounting is usage:
+                    info._credit_accounting = None
 
     # Facades for the completion / stop-reason handling and the lane-slot
     # waits that live in subagent_manager/run.py.
@@ -5810,6 +6008,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     CONTEXT_GROUP_LESSONS,
     CONTEXT_GROUP_MEMORY,
     CONTEXT_GROUP_PROJECT,
+    EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -5836,7 +6035,6 @@ _COMPONENT_GLOBAL_BINDINGS = (
     VERDICT_UNKNOWN,
     VERDICT_WORKING,
     _AGENT_NAME_RE,
-    _SAMPLE_MAX_AGE_SECS,
     _agent_dir,
     _cleanup_session_files_sync,
     _subagents_dir,
@@ -5847,7 +6045,6 @@ _COMPONENT_GLOBAL_BINDINGS = (
     annotate_model_fallback,
     append_cost_sample,
     append_fallback_story,
-    cap_buckets,
     apply_completion_keep,
     asyncio,
     cached_admission_check,
@@ -5857,14 +6054,11 @@ _COMPONENT_GLOBAL_BINDINGS = (
     configured_fallback_chain,
     _cost_bucket,
     consult_offloaded,
-    cost_log_identity,
     create_agent_folder,
-    learned_cost_for,
-    read_learned_costs,
-    read_learned_costs_checked,
     evict_completed_agents,
     extract_options,
     fire_tool_hooks,
+    format_subagent_usage,
     hook_gate_kwargs,
     identity_grant_covers_child,
     has_dashboard_surface,
@@ -5881,11 +6075,18 @@ _COMPONENT_GLOBAL_BINDINGS = (
     redact_exfiltration_urls,
     run_in_embed_pool,
     sel,
+    settle_delivered_batch,
     single_completion_meta,
     stage_boundary_owner_for_run,
     subprocess_executor,
     time,
     transient_retry_delay,
+    permission_pre_tool_block,
+    turn_spec_hooks,
+    invalidate_stale_kas_session,
+    refuse_stale_switch,
+    replace_stale_shared_session,
+    reproject_claimed_session,
     update_state,
     window_for_provider_client,
     write_result_chunk,

@@ -244,7 +244,7 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 # category breakdown and follow-up hardening candidates.
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
-        "acp/runtime.py::_get_rss_mb",
+        "acp/runtime_process_tree.py::_get_rss_mb",
         # Fixed fixture Git operations and a test-owned executable under tmp_path;
         # no repository or agent input. authenticated_run calls asyncio.run only.
         "apps/builtins/auto_improvement/tests/test_environment.py::repository_runner",
@@ -279,8 +279,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_red_base_staging_does_not_dereference_a_credential_symlink",
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_the_pin_refuses_a_symlink_and_fails_closed",
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_the_pin_survives_a_normal_repo",
-        # Four pre-existing spawns in ``acp/client.py`` that the scan could not see
-        # until receivers were derived from each file's imports (it binds the module
+        # Four pre-existing spawns in ``acp/client.py`` and
+        # ``acp/runtime_process_tree.py`` that the scan could not see until receivers
+        # were derived from each file's imports (``acp/client.py`` binds the module
         # as ``subprocess_mod``). None is
         # agent-influenced and each is a fixed argv with a bounded timeout and no
         # shell: ``mise which <tool>`` where the tool is a module-level binary-name
@@ -292,9 +293,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # observe the machine, and the sandbox they would route through is a thing
         # they run underneath.
         "acp/client.py::_mise_which",
-        "acp/client.py::_direct_children",
-        "acp/client.py::_get_start_time",
-        "acp/client.py::_read_basename",
+        "acp/runtime_process_tree.py::_direct_children",
+        "acp/runtime_process_tree.py::_get_start_time",
+        "acp/runtime_process_tree.py::_read_basename",
         # The opencode routing read-back. ONE fixed argv -- the resolved harness
         # binary plus the two literal words in ``_OPENCODE_CONFIG_READBACK_ARGS``
         # (``debug config``) -- with no shell, a 30s timeout, and a cwd that is the
@@ -435,7 +436,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # timeout, no shell, no cwd, and no arguments at all — nothing here is
         # agent-influenced, and the binary is resolved through
         # platform_compat.trusted_system_bin (a vetted absolute path), not PATH.
-        "acp/runtime.py::_ps_process_table",
+        "acp/runtime_process_tree.py::_ps_process_table",
         # (_bootstrap.py::_self_heal removed — the console-entry self-heal now
         # delegates its install to dep_sync.sync_or_reinstall, so the spawn lives
         # at that key below and an entry here would be stale.)
@@ -1212,7 +1213,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # The binary is pinned via ``platform_compat.trusted_system_bin("ps")``;
         # a miss means no spawn at all. Operator-invoked doctor, 2s-capped, no
         # shell. Same classification as the ``ps``-based probe in
-        # ``acp/runtime.py::_get_rss_mb``.
+        # ``acp/runtime_process_tree.py::_get_rss_mb``.
         "cli_doctor.py::_gateway_rss_bytes",
         # ``<kiro-cli> acp --help`` readiness probe for the KAS backend: fixed
         # argv (subcommand and flag are module constants), 15s-capped, no shell,
@@ -1447,7 +1448,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # Messages.app through the operator's own Full Disk Access and
         # Automation grants, which a scrubbed-env sandbox strips.
         "imessage/rpc.py::start",
-        "mcp_core.py::_get_ppid",
         "mcp_gateway/backend.py::spawn_backend",
         # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
         # ``run`` on base ``asyncio``), used here only to drive the one-shot
@@ -1510,7 +1510,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # and every failure (openssl missing included) already fails safe to
         # "no floor".
         "platform/feed_trust.py::_verify_signature",
-        "mcp_shared.py::_get_ppid",
         # File-manager launchers for the dashboard's reveal action. The
         # command is an absolute literal resolved in this module (never a bare
         # argv name, so an agent-writable PATH entry cannot supply it), the

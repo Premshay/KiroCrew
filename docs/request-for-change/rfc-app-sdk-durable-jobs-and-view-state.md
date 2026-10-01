@@ -47,12 +47,12 @@ work.
 returns its terminal record (`src/kiro_crew/apps/builtins/aws_control/backend/routes.py`,
 `_handle_backup_run`). The runner records completed backup metadata through
 `_record_run`, and `last_runs` reads that per-account terminal ledger
-(`backend/backup.py`, `_record_run` and `last_runs`). The status endpoint
+(`backend/backup_parts/ledger.py`, `_record_run` and `last_runs`). The status endpoint
 returns that ledger as `runs` (`backend/routes.py`, `_handle_backup_status`).
 There is no backup job identifier or persisted in-flight registry in this path.
 
 A worker thread cannot be killed by cancelling the awaiting coroutine, and
-`_STOP` only prevents an upload reached after app teardown (`backend/backup.py`,
+`_STOP` only prevents an upload reached after app teardown (`backend/backup_parts/uploads.py`,
 `_STOP` and `_authorize_upload`). A client disconnect therefore does not create
 a cancelable or reattachable backup job.
 
@@ -120,7 +120,7 @@ registration path.
 Together the two produce a record that contradicts the work it describes. At
 gateway startup `_reap_stale_app_backends` terminates a backend left by a prior
 gateway generation only when the pid's identity positively matches the recorded
-one; when identity cannot be confirmed the pid is left alone (`backend.py`,
+one; when identity cannot be confirmed the pid is left alone (`backend_runtime/stale_reap.py`,
 `_reap_stale_app_backends`). A backend spared by that check keeps executing, and
 the new gateway's reconciliation marks its runs `INTERRUPTED`, recording that the
 gateway restarted while the run was executing and that no runner is registered for

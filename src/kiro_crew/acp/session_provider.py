@@ -388,6 +388,17 @@ class AcpSessionProvider(LLMProvider):
             logger.debug("set_keep_transcript: handle rejected attribute", exc_info=True)
 
     @property
+    def kas_auto_approved_capabilities(self) -> frozenset[str] | None:
+        """See ``AcpSessionHandle.kas_auto_approved``."""
+        return getattr(self._handle, "kas_auto_approved", None)
+
+    @property
+    def kas_projected_agent(self) -> str:
+        """See ``AcpSessionHandle.kas_projected_agent``."""
+        value = getattr(self._handle, "kas_projected_agent", "")
+        return value if isinstance(value, str) else ""
+
+    @property
     def work_scratch_dir(self) -> Path | None:
         """The session tree's ``$KIROCREW_SCRATCH`` directory (see ``AcpRuntime.work_scratch_dir``)."""
         return self._runtime.work_scratch_dir
@@ -607,8 +618,18 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def supports_steer(self) -> bool:
-        """True when the backing handle supports mid-turn steer (kiro-cli)."""
+        """True when the backing handle takes a user's mid-turn steer."""
         return self._handle.supports_steer
+
+    @property
+    def steer_needs_loss_recovery(self) -> bool:
+        """True when a delivered steer can still be lost (see the handle)."""
+        return self._handle.steer_needs_loss_recovery is True
+
+    @property
+    def supports_refusal_steer(self) -> bool:
+        """True when the backing handle can steer a deny notice into a refused turn."""
+        return self._handle.supports_refusal_steer
 
     async def stream_command(self, command: str) -> AsyncIterator[LLMEvent]:
         """Execute a slash command natively via ``_kiro.dev/commands/execute``.
@@ -835,11 +856,11 @@ class AcpSessionProvider(LLMProvider):
         watchdog: WatchdogSettings | None = None,
     ) -> None:
         """Re-key for a different session on warm-pool claim (parity with
-        AcpClient.rekey). session.py:1309 calls provider.client.rekey(...); when
-        the pooled provider is kiro-shared, provider.client is THIS class, so a
-        missing rekey() would AttributeError on claim. Stores the correlation
-        keys and refreshes runtime activity so the just-claimed process is not
-        idle-reaped.
+        AcpClient.rekey). session_allocation.py calls provider.client.rekey(...)
+        on claim; when the pooled provider is kiro-shared, provider.client is
+        THIS class, so a missing rekey() would AttributeError on claim. Stores
+        the correlation keys and refreshes runtime activity so the just-claimed
+        process is not idle-reaped.
 
         ``crew_agent`` is the claiming session's canonical crew identity: the
         pooled runtime was spawned before any crew claimed it, so both the
@@ -1143,6 +1164,16 @@ class AcpSessionProvider(LLMProvider):
     def _model(self, value: str) -> None:
         """Set model name (AcpClient-compatible attribute)."""
         self._handle._model = value
+
+    @property
+    def model_pin_refused(self) -> str:
+        """The model a non-strict push was refused on — see the handle's field."""
+        return self._handle.model_pin_refused
+
+    @property
+    def model_pin_partial(self) -> str:
+        """The bare model a pair pin landed as — see the handle's field."""
+        return self._handle.model_pin_partial
 
     @property
     def served_model(self) -> str:

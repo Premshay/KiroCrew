@@ -1,6 +1,6 @@
 # Steering Viewer
 
-The Steering tab under Agent Capabilities lists the standard user and workspace steering roots and reads, creates, edits, and deletes their Markdown files; `POST` / `PUT` / `DELETE` are filesystem mutations, not a read-only viewer. `handlers/steering.py:api_steering`, `api_steering_create`, and `api_steering_detail` enforce the surface. It also lets an author set the `inclusion` mode each document declares.
+The Steering tab under Customize lists the standard user and workspace steering roots and reads, creates, edits, and deletes their Markdown files; `POST` / `PUT` / `DELETE` are filesystem mutations, not a read-only viewer. `handlers/steering.py:api_steering`, `api_steering_create`, and `api_steering_detail` enforce the surface. It also lets an author set the `inclusion` mode each document declares.
 
 **Kiro Crew reports and edits the declaration; it does not act on it.** What a mode causes is the harness's own behaviour, it moves between kiro-cli releases (see [kiro-cli steering](../../reference/kiro-cli/steering.md)), and a client that reimplemented any part of it would duplicate whatever the harness does next.
 
@@ -101,7 +101,7 @@ Behavior is pinned by `test/test_steering_api.py`, `website/src/test/SteeringTab
 - `src/kiro_crew/frontmatter.py` — `STEERING_LOADER`, `set_frontmatter_fields()`, `_render_frontmatter_value()`, the dialect `_head_meta()` parses steering front matter with. A separate constant from `SKILL_LOADER` rather than a second reference to it: the two document families have no reason to move together.
 - `website/src/pages/overview/SteeringTab.tsx` — `InclusionChip` (rendered only when the mode departs from the default, or the declared spelling is not a mode); `LinkedChip` (rendered on `linked: true` entries, tooltip naming the resolved target; Edit/Delete are disabled — not hidden — on `editable: false`, with the same sentence as their `title`); list-detail layout (React Query keys `['steering', slotKey]`, `['steering-file', key, slotKey, projectKey]` — `project_key` is part of the file's identity, since `workspace/api.md` names a different file in a different project), `MarkdownRenderer` for view, textarea for edit, `Modal` for create with a scope selector. Workspace writes send the listed `project_key`; an in-progress edit sends the key **captured when the draft loaded**, not the live one, so a draft typed against project A fails the precondition for B (409, draft still on screen) instead of satisfying it and overwriting B's same-named file.
 - `website/src/pages/CapabilitiesPage.tsx` — the `steering` tab (Compass icon) between Skills and Hooks.
-- `website/src/api/client.ts` — `steeringFiles`, `steeringFile`, `createSteering`, `updateSteering`, `deleteSteering`; the three write helpers take the project key and set `X-Steering-Project` from it.
+- `website/src/api/client/steering.ts` — `steeringFiles`, `steeringFile`, `createSteering`, `updateSteering`, `deleteSteering`; the three write helpers take the project key and set `X-Steering-Project` from it through `projectHeader()`. `website/src/api/client.ts` exposes them on the `api` object and supplies the transport they send through.
 
 ## Non-goals
 

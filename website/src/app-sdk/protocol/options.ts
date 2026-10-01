@@ -74,10 +74,10 @@ export interface FollowUpDerivation {
  * because it is the only component guaranteed stable for the whole life of a
  * row. The store stamps it on any row lacking a server `ts` and then
  * deliberately CARRIES it onto the reloaded server copy (see
- * `chatSlice.ts` — "the renderer keys virtual rows by `clientTs ?? ts`, so
- * without this the row's key flips bornKey -> serverTs"), so this helper
- * matches the store's own keying convention rather than inventing a second,
- * conflicting one.
+ * `transcript.ts` in `store/chat` — "the renderer keys virtual rows by
+ * `clientTs ?? ts`, so without this the row's key flips bornKey -> serverTs"),
+ * so this helper matches the store's own keying convention rather than
+ * inventing a second, conflicting one.
  *
  * Checking `mid` first would break that: a reconnect refresh preserves
  * `clientTs` but ADDS a server `mid`, so the same row would re-key mid-flight,

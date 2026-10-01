@@ -19,6 +19,7 @@ import {
   Palette,
   PawPrint,
   Pin,
+  PinOff,
   RotateCcw,
   Settings,
   Shield,
@@ -133,6 +134,17 @@ export const PinnedSidePanel: React.FC<PinnedSidePanelProps> = ({ pins, updatedP
           0%, 100% { opacity: 1; transform: scale(1); }
           50% { opacity: 0.6; transform: scale(0.85); }
         }
+        /* Chip row highlight + unpin reveal on hover OR keyboard focus. Using
+           :focus-within (not JS hover state) means the keyboard path matches the
+           pointer path with no extra handlers, and the always-rendered unpin
+           button — hidden here until reveal — is the chip's natural tab stop. */
+        .pin-chip:hover, .pin-chip:focus-within { background: rgba(255,255,255,0.07) !important; }
+        .pin-chip-unpin { opacity: 0; pointer-events: none; transition: opacity 0.15s ease; }
+        .pin-chip:hover .pin-chip-unpin,
+        .pin-chip:focus-within .pin-chip-unpin { opacity: 1; pointer-events: auto; }
+        /* The control must be reachable and visible whenever it itself has focus,
+           even if a browser scopes :focus-within differently. */
+        .pin-chip-unpin:focus, .pin-chip-unpin:focus-visible { opacity: 1; pointer-events: auto; }
       `}</style>
       <div style={{
         flex: 1,
@@ -225,7 +237,6 @@ const PinnedChip: React.FC<{
   lang?: string
   onMarkSeen?: (path: string) => void
 }> = ({ pin, isUpdated, isDeleted, onMarkSeen }) => {
-  const [hovered, setHovered] = useState(false)
   // Same native-path rule as the grouping above. `add_pin` fills `label` with
   // `os.path.basename`, so this fallback is only reached by an entry that
   // reached the store without one — the reader tolerates arbitrary shapes in
@@ -263,7 +274,11 @@ const PinnedChip: React.FC<{
     padding: '5px 8px',
     borderRadius: 8,
     cursor: clickable ? 'pointer' : 'default',
-    background: clickable && hovered ? 'rgba(255,255,255,0.07)' : 'transparent',
+    // Hover / keyboard-focus highlight is applied via the `.pin-chip` CSS class
+    // (see PinnedSidePanel's <style>): `:hover` and `:focus-within` both light
+    // the row and reveal the unpin control, so the keyboard path matches the
+    // pointer path without any React hover state.
+    background: 'transparent',
     transition: 'background 0.15s ease',
     position: 'relative',
     opacity: isDeleted ? 0.35 : 1,
@@ -303,31 +318,37 @@ const PinnedChip: React.FC<{
         }} />
       )}
 
-      {/* Dismiss button — appears on hover, macOS red dot style */}
-      {hovered && !isDeleted && (
+      {/* Unpin control. Rendered ALWAYS (not hover-gated) so it is a real
+          keyboard tab stop and discoverable by screen-reader virtual cursor and
+          touch; the `.pin-chip-unpin` class hides it visually until the chip is
+          hovered OR focus lands inside it. A pin-off icon PLUS a visible "Unpin"
+          word — the panel otherwise shows no pin vocabulary, so text on reveal
+          is what tells the user this removes (not adds) the pin, and the
+          accessible name carries the filename too. */}
+      {!isDeleted && (
         <button
           onClick={handleDismiss}
+          className="pin-chip-unpin"
           title={i18nT('apps.mochi.pinned.unpin')}
-          aria-label={i18nT('apps.mochi.pinned.unpin')}
+          aria-label={`${i18nT('apps.mochi.pinned.unpin')} ${displayName}`}
           style={{
-            width: 14,
-            height: 14,
-            borderRadius: '50%',
-            background: 'rgba(239,68,68,0.85)',
-            border: 'none',
-            color: '#fff',
-            fontSize: 8,
-            lineHeight: '14px',
-            textAlign: 'center',
-            cursor: 'pointer',
-            padding: 0,
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'center',
+            gap: 3,
+            height: 16,
+            borderRadius: 4,
+            padding: '0 4px',
+            background: 'transparent',
+            border: 'none',
+            color: 'var(--text-muted, rgba(255,255,255,0.6))',
+            fontSize: 10,
+            lineHeight: 1,
+            cursor: 'pointer',
             flexShrink: 0,
           }}
         >
-          <X size={12} />
+          <PinOff size={12} />
+          <span>{i18nT('apps.mochi.pinned.unpin')}</span>
         </button>
       )}
     </>
@@ -335,14 +356,18 @@ const PinnedChip: React.FC<{
 
   if (!clickable) {
     return (
-      // Hover intent only: the two listeners reveal the chip's own unpin button and
-      // nothing else. This branch is the chip that has no path to open, so the
-      // wrapper carries no action a keyboard could reach — the reachable control is
-      // the <button> inside `body`.
-      // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- passive hover reveal, not an interaction; the only action lives on the nested <button>
+      // Inert chip: no path to open, so the wrapper carries no click action and
+      // is not itself a tab stop — the real keyboard tab stop is the always-
+      // rendered unpin <button> inside `body`, which lands focus on an
+      // actionable control rather than a silent wrapper. `role="group"` +
+      // `aria-label={pin.path}` give the chip an accessible name (the full path)
+      // that a screen reader announces in browse mode, where before the path
+      // lived only in the mouse-only `title`. `.pin-chip` drives the hover /
+      // focus-within reveal of the unpin control.
       <div
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
+        role="group"
+        aria-label={pin.path}
+        className="pin-chip"
         title={pin.path}
         style={chipStyle}
       >
@@ -354,8 +379,8 @@ const PinnedChip: React.FC<{
   return (
     <Clickable
       onClick={handleClick}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      className="pin-chip"
+      aria-label={pin.path}
       title={pin.path}
       style={chipStyle}
     >

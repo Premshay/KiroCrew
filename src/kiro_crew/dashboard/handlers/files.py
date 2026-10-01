@@ -65,7 +65,11 @@ from kiro_crew.dashboard.chat_utils import (
     run_config_write,
 )
 from kiro_crew.dashboard.file_index import _SKIP_DIRS as _WALK_SKIP_DIRS
-from kiro_crew.dashboard.handlers._shared import _probe_persisted_session, read_bounded_json
+from kiro_crew.dashboard.handlers._shared import (
+    _probe_persisted_session,
+    read_bounded_json,
+    require_owner_dashboard_request,
+)
 from kiro_crew.dashboard.handlers.messaging import _resolve_session_target
 from kiro_crew.dashboard.origin import is_direct_local_request
 from kiro_crew.dashboard.state import (
@@ -74,7 +78,7 @@ from kiro_crew.dashboard.state import (
     append_and_surface,
 )
 from kiro_crew.doc_blocks import extract_blocks
-from kiro_crew.doc_parser import extract_text
+from kiro_crew.doc_parser import extract_slides, extract_text, join_slides
 from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 from kiro_crew.github_runner import validate_provider_executable
 from kiro_crew.hooks import (
@@ -1502,6 +1506,23 @@ _VIDEO_EXT_MIME: dict[str, str] = {
     ".mov": "video/mp4",
     ".webm": "video/webm",
 }
+#: Audio containers accepted at the upload boundary. Every entry must be
+#: verifiable by :func:`_sniff_media_type` and playable by ``<audio>``.
+_ALLOWED_AUDIO_EXT = {".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus", ".flac"}
+#: Media type :func:`_sniff_media_type` must report for each audio extension.
+#: Ogg carries Vorbis and Opus alike. ``.m4a`` shares the BMFF ``ftyp`` family
+#: with MP4, which the sniffer reports as ``video/mp4`` regardless of track type.
+_AUDIO_EXT_MIME: dict[str, str] = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "video/mp4",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".flac": "audio/flac",
+}
+#: Every media extension whose bytes are gated by :func:`_sniff_media_type`.
+_MEDIA_EXT_MIME: dict[str, str] = {**_VIDEO_EXT_MIME, **_AUDIO_EXT_MIME}
 
 
 def _write_file_restricted(path: Path, data: bytes) -> None:
@@ -1587,7 +1608,7 @@ def _content_matches_ext(ext: str, data: bytes) -> bool:
         # OOXML / ODF / zip all begin with a local-file-header, empty-archive,
         # or spanned-archive PK signature.
         return data[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
-    expected_media = _VIDEO_EXT_MIME.get(ext)
+    expected_media = _MEDIA_EXT_MIME.get(ext)
     if expected_media is not None:
         # Reuses the read path's container sniffer so the upload boundary and
         # /api/file-stream agree on what each signature means. ``data`` may be
@@ -1665,50 +1686,45 @@ def _content_mismatch_message(ext: str, data: bytes) -> str:
     return f"File content does not match its type: {ext}"
 
 
-async def _stream_video_part(
+async def _stream_media_part(
     part: BodyPartReader,
     dest: Path,
+    *,
+    max_bytes: int,
+    accepted_exts: set[str],
+    media_name: str,
 ) -> tuple[int, tuple[str, str, str] | None]:
-    """Stream a video *part* to *dest*, gating on its container signature.
+    """Stream a media *part* to *dest*, gating on its container signature.
 
     Returns ``(bytes_written, None)`` on success, or ``(bytes_written,
-    (audit_reason, error_code, user_message))`` on refusal. The code is a
-    machine-readable id the caller maps to a CONSTANT HTTP status: returning a
-    status from here would make the response's `status=` an expression at the
-    call site, which the error-code contract rejects because it defeats static
-    analysis of what the endpoint can return.
+    (audit_reason, refusal_kind, user_message))`` on refusal. The caller maps
+    the refusal kind to constant response codes and statuses, preserving the
+    endpoint's statically readable error contract.
 
-    All the file handling lives in :func:`~kiro_crew.dashboard.part_stream.
-    stream_part_to_file`, which owns the temp through a synchronous context
-    manager. This function is only the translation between that helper's
-    exceptions and this endpoint's audit reasons and error codes: a cancellable
-    coroutine cannot own a file safely, so ownership stays in that module,
-    whose docstring carries the invariant.
+    :func:`~kiro_crew.dashboard.part_stream.stream_part_to_file` owns the temp
+    through a synchronous context manager. A cancellable coroutine cannot own a
+    file safely, so this function only translates the helper's exceptions.
     """
     ext = dest.suffix.lower()
     try:
         total = await part_stream.stream_part_to_file(
             part,
             dest,
-            max_bytes=_MAX_VIDEO_UPLOAD_BYTES,
+            max_bytes=max_bytes,
             accepts=lambda head: _content_matches_ext(ext, head),
         )
     except part_stream.PartTooLarge as too_large:
-        cap_mb = _MAX_VIDEO_UPLOAD_BYTES // 1024 // 1024
+        cap_mb = max_bytes // 1024 // 1024
         return too_large.total, (
             f"too_large:{too_large.total}",
-            "video_too_large",
-            f"Video too large (max {cap_mb}MB)",
+            "too_large",
+            f"{media_name.title()} too large (max {cap_mb}MB)",
         )
     except part_stream.PartContentMismatch:
-        accepted = ", ".join(sorted(_ALLOWED_VIDEO_EXT))
+        accepted = ", ".join(sorted(accepted_exts))
         return 0, (
             f"content_signature_mismatch:{ext}",
-            "video_content_mismatch",
-            # Names the remedy for the same reason the unsupported-container
-            # refusal does: "does not match its type" tells the user their file
-            # is wrong without telling them what to do about it, and the fix
-            # (re-export) is not guessable from the sentence.
+            "content_mismatch",
             f"This file is not really a {ext} — re-export it as one of: {accepted}",
         )
     return total, None
@@ -1726,7 +1742,13 @@ async def api_upload_file(request: web.Request) -> web.Response:
     upload_dir.mkdir(parents=True, exist_ok=True)
     reader = await request.multipart()
     paths: list[str] = []
-    allowed = _ALLOWED_IMAGE_EXT | _ALLOWED_TEXT_EXT | _ALLOWED_DOC_EXT | _ALLOWED_VIDEO_EXT
+    allowed = (
+        _ALLOWED_IMAGE_EXT
+        | _ALLOWED_TEXT_EXT
+        | _ALLOWED_DOC_EXT
+        | _ALLOWED_VIDEO_EXT
+        | _ALLOWED_AUDIO_EXT
+    )
     caller = request.get("user", "dashboard")
 
     async def _cleanup(*also: Path) -> None:
@@ -1796,8 +1818,8 @@ async def api_upload_file(request: web.Request) -> web.Response:
                     status=400,
                 )
             # UUID prefix guarantees uniqueness even within a single request.
-            # Resolved BEFORE any byte is read because the video branch streams
-            # straight to this destination rather than buffering the part first.
+            # Resolved before any byte is read because media streams straight
+            # to this destination rather than buffering the part first.
             dest = upload_dir / f"{uuid.uuid4().hex}_{safe_name}"
             if not dest.resolve().is_relative_to(upload_dir.resolve()):
                 await _cleanup()
@@ -1809,29 +1831,32 @@ async def api_upload_file(request: web.Request) -> web.Response:
                     resources=f"file:{fname} reason:path_traversal",
                 )
                 return web.json_response({"error": "Invalid filename"}, status=400)
-            if ext in _ALLOWED_VIDEO_EXT:
-                # Video takes the streaming route for two reasons: a screen
-                # recording is far too large to buffer, and its CONTENT is not
-                # something the model can read anyway (ACP has no video content
-                # block). So the bytes land on disk, the PATH reaches the agent
-                # as an [attached_file N] token, and the chat renders a <video>
-                # off /api/file-stream. An agent that needs frames runs ffmpeg
-                # on the path.
+            if ext in _ALLOWED_VIDEO_EXT or ext in _ALLOWED_AUDIO_EXT:
+                is_video = ext in _ALLOWED_VIDEO_EXT
+                max_bytes = _MAX_VIDEO_UPLOAD_BYTES if is_video else _MAX_UPLOAD_BYTES
+                accepted_exts = _ALLOWED_VIDEO_EXT if is_video else _ALLOWED_AUDIO_EXT
+                media_name = "video" if is_video else "audio"
+                # Media streams to an unpublished temp file because neither ACP
+                # content blocks nor the player need the whole body in memory.
+                # The shared helper checks the signature before its first write
+                # and atomically publishes only a complete, accepted file.
                 try:
-                    written, refusal = await _stream_video_part(part, dest)
+                    written, refusal = await _stream_media_part(
+                        part,
+                        dest,
+                        max_bytes=max_bytes,
+                        accepted_exts=accepted_exts,
+                        media_name=media_name,
+                    )
                 except (Exception, asyncio.CancelledError):
-                    # CancelledError derives from BaseException, not Exception, so
-                    # a bare `except Exception` lets a gateway shutdown mid-stream
-                    # past every cleanup: the partial video AND the siblings this
-                    # request already wrote stay in uploads/, and the partial is
-                    # indistinguishable from a complete file to everything
-                    # downstream. Cleanup here rather than relying on the outer
-                    # handler, which has the same blind spot.
+                    # CancelledError derives from BaseException. Name it so a
+                    # disconnect or shutdown cannot leave a partial media file
+                    # or an earlier sibling from this request behind.
                     await _cleanup(dest)
                     raise
                 if refusal is not None:
                     await _cleanup(dest)
-                    reason, code, message = refusal
+                    reason, refusal_kind, message = refusal
                     _sel().log_api_access(
                         caller=caller,
                         operation="upload.file",
@@ -1839,21 +1864,30 @@ async def api_upload_file(request: web.Request) -> web.Response:
                         source="dashboard",
                         resources=f"file:{fname} reason:{reason}",
                     )
-                    # Branched rather than parameterised: each response states a
-                    # CONSTANT status and its own `code`, which is what keeps the
-                    # endpoint's possible outcomes statically readable (and is
-                    # what the error-code contract checks for).
-                    if code == "video_too_large":
+                    # Each response states constant status and code values so
+                    # the endpoint's error contract remains statically readable.
+                    if refusal_kind == "too_large":
+                        if is_video:
+                            return web.json_response(
+                                {"error": message, "code": "video_too_large"},
+                                status=413,
+                            )
                         return web.json_response(
-                            {"error": message, "code": "video_too_large"},
+                            {"error": message, "code": "audio_too_large"},
                             status=413,
                         )
+                    if is_video:
+                        return web.json_response(
+                            {"error": message, "code": "video_content_mismatch"},
+                            status=400,
+                        )
                     return web.json_response(
-                        {"error": message, "code": "video_content_mismatch"},
+                        {"error": message, "code": "audio_content_mismatch"},
                         status=400,
                     )
                 logger.info(
-                    "upload.file video: name=%s ext=%s size=%d",
+                    "upload.file %s: name=%s ext=%s size=%d",
+                    media_name,
                     safe_name,
                     ext,
                     written,
@@ -2177,9 +2211,8 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
     # below receives this same object: a second resolve after the checks would
     # follow a parent swapped for a link in between, and the pinned create can
     # only refuse a swap that happens AFTER the path it is handed was resolved.
-    validated_dir = (  # lgtm[py/path-injection]
-        Path(ws_dir).expanduser() if _abs else data_home() / ws_dir
-    ).resolve()
+    unresolved_dir = Path(ws_dir).expanduser() if _abs else data_home() / ws_dir
+    validated_dir = unresolved_dir.resolve()  # lgtm[py/path-injection]
 
     # Check for directory collision with existing workspaces (resolve both sides)
     existing_resolved = {_resolve_ws_dir(ws.dir) for ws in cfg.workspaces.values()}
@@ -2318,7 +2351,7 @@ async def api_workspaces_create(request: web.Request) -> web.Response:
         # a concurrent create can already have adopted and registered it.
         else:
             try:
-                materialize_workspace_dir(validated_dir, display=ws_dir)
+                materialize_workspace_dir(validated_dir, leaf=unresolved_dir, display=ws_dir)
             except WorkspaceDirUnusable as exc:
                 raise _WorkspaceConflict(409, str(exc), exc.code) from exc
         workspaces[name] = asdict(WorkspaceConfig(dir=ws_dir))
@@ -2898,6 +2931,9 @@ def _read_request_path(raw: str, read_cap: int) -> _TextRead:
 
 async def api_file_watch(request: web.Request) -> web.StreamResponse:
     """GET /api/file-watch?path=... — SSE stream of file content changes."""
+    owner_denied = await require_owner_dashboard_request(request, "file_watch")
+    if owner_denied is not None:
+        return owner_denied
     raw_path = request.query.get("path", "")
     try:
         validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
@@ -3040,6 +3076,9 @@ async def _owner_view_bypasses_credential_pass(request: web.Request) -> bool:
 
 async def api_file_read(request: web.Request) -> web.Response:
     """GET /api/file-read?path=... — read file content for the markdown panel."""
+    owner_denied = await require_owner_dashboard_request(request, "file_read")
+    if owner_denied is not None:
+        return owner_denied
     from kiro_crew.validation import (  # noqa: F811
         FILE_READ_SCHEMA,
         ValidationError,
@@ -3457,6 +3496,9 @@ async def api_file_download(request: web.Request) -> web.Response:
     disposition + nosniff prevents inline rendering on the dashboard
     origin.
     """
+    owner_denied = await require_owner_dashboard_request(request, "file_download")
+    if owner_denied is not None:
+        return owner_denied
     # Path validation now happens inside ``_open_checked``, which keeps the
     # late-binding ``handlers`` alias so tests can still monkey-patch
     # ``_validate_dashboard_path`` (legitimate circular-import workaround,
@@ -3641,6 +3683,31 @@ class _PreviewUnsupported(Exception):
     """
 
 
+def _cap_slides(slides: list[tuple[int, str]], cap: int) -> list[dict[str, object]]:
+    """Redact each slide's text and bound the slides' TOTAL text to *cap*.
+
+    The same two rules the flat ``text`` field follows, applied per slide so
+    the structured form never carries more than the flat one would: redact
+    first (a credential must not be cut in half by the cap and slip past the
+    redactor), then spend one budget across the deck in slide order -- a
+    slide that does not fit is cut to the remaining budget and the slides
+    after it are dropped. Slide numbers are the deck's own (``slideN.xml``),
+    so a gap tells the reader a slide carried no text rather than that one
+    went missing.
+    """
+    out: list[dict[str, object]] = []
+    budget = cap
+    for index, raw in slides:
+        if budget <= 0:
+            break
+        text = redact(raw)
+        if len(text) > budget:
+            text = text[:budget]
+        budget -= len(text)
+        out.append({"index": index, "text": text})
+    return out
+
+
 async def api_file_office_preview(request: web.Request) -> web.Response:
     """GET /api/file-office-preview?path=...[&format=blocks] — inline preview of a .docx/.pptx.
 
@@ -3661,6 +3728,17 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
     frontend falls back to it whenever blocks comes back empty. python-docx /
     python-pptx are not required by either path.
 
+    For a .pptx the ``text`` response also carries
+    ``"slides": [{"index", "text"}, ...]``. The panel renders a deck slide
+    by slide from ``slides`` (a deck flattened into one string reads as a
+    parse failure, not a preview); ``text`` stays the flat form for the
+    .docx path and for any consumer that predates ``slides``. Both fields
+    come from ONE slide walk (``kiro_crew.doc_parser.extract_slides`` /
+    ``join_slides``), so they cannot disagree. This endpoint returns only a
+    document's text; a deck's rendered slide IMAGES (layout, charts,
+    positions) come from the separate ``/api/file-office-slides`` route,
+    which needs an office suite to rasterize the deck.
+
     Not supported (fall through to download): .doc, .ppt, .xls, .xlsx,
     .odt, .ods, .odp. The frontend keeps the download card for these.
 
@@ -3675,6 +3753,9 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
     applied. All of it — validation, open, fstat, ZIP+XML parsing,
     redaction — runs in ONE worker-thread hop, like ``api_file_sheet``.
     """
+    owner_denied = await require_owner_dashboard_request(request, "file_office_preview")
+    if owner_denied is not None:
+        return owner_denied
     raw_path = request.query.get("path", "")
 
     def _log(outcome: str, res: str, error: str = "") -> None:
@@ -3765,7 +3846,8 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
             return checked
         res_path = checked.path
         with checked.file as fobj:
-            if os.path.splitext(checked.path)[1].lower() not in _OFFICE_PREVIEWABLE_EXT:
+            ext = os.path.splitext(checked.path)[1].lower()
+            if ext not in _OFFICE_PREVIEWABLE_EXT:
                 raise _PreviewUnsupported(checked.path)
             if fmt == "blocks":
                 # Same handle, same one-hop discipline as the text branch:
@@ -3785,19 +3867,32 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
                     "blocks": _redact_blocks(blocks),
                     "truncated": blocks_truncated,
                 }
-            # extract_text parses through the SAME handle the prefix opened
-            # and fstat-ed (its opt-in fileobj parameter), so the bytes
+            # The extractors parse through the SAME handle the prefix opened
+            # and fstat-ed (their opt-in fileobj parameter), so the bytes
             # parsed are exactly the bytes measured — no stat→open TOCTOU
             # window. max_chars bounds AGGREGATE extraction (cap + 1 keeps
             # the truncation flag detectable): a deck with thousands of
             # slides stops parsing at the budget instead of accumulating
-            # unbounded text. It never raises — returns "" on any failure.
-            text = extract_text(
-                checked.path,
-                filename=os.path.basename(checked.path),
-                max_chars=_OFFICE_PREVIEW_CAP + 1,
-                fileobj=fobj,
-            )
+            # unbounded text. Neither raises — an empty result on any failure.
+            slides: list[tuple[int, str]] = []
+            if ext == ".pptx":
+                # One walk of the deck feeds both fields: `text` is the flat
+                # join of the same slides, never a second extraction that
+                # could read a different budget or a different byte range.
+                slides = extract_slides(
+                    checked.path,
+                    filename=os.path.basename(checked.path),
+                    max_chars=_OFFICE_PREVIEW_CAP + 1,
+                    fileobj=fobj,
+                )
+                text = join_slides(slides)
+            else:
+                text = extract_text(
+                    checked.path,
+                    filename=os.path.basename(checked.path),
+                    max_chars=_OFFICE_PREVIEW_CAP + 1,
+                    fileobj=fobj,
+                )
         truncated = len(text) > _OFFICE_PREVIEW_CAP
         # Redact BEFORE truncating: slicing first could cut a credential
         # across the cap boundary, leaving an unmatched prefix the redactor
@@ -3806,7 +3901,7 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
         text = redact(text)
         if truncated:
             text = text[:_OFFICE_PREVIEW_CAP]
-        return {
+        payload: dict[str, object] = {
             "text": text,
             "truncated": truncated,
             # No `empty` field: doc_parser returns "" for both a genuinely
@@ -3814,6 +3909,9 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
             # indistinguishable here. The frontend treats empty `text` as
             # "no preview available" and falls back to the download card.
         }
+        if slides:
+            payload["slides"] = _cap_slides(slides, _OFFICE_PREVIEW_CAP)
+        return payload
 
     try:
         result = await _run_path_probe(_open_and_extract, transfer=True)
@@ -3895,6 +3993,12 @@ async def api_file_office_preview(request: web.Request) -> web.Response:
 
 async def api_file_raw(request: web.Request) -> web.Response:
     """GET /api/file-raw?path=... — serve a file with its native content type (images, etc.)."""
+    # A named App Kit app keeps its manifest-scoped path; the owner gate
+    # binds the dashboard-user class, whose reach is the whole host.
+    if not request.get("app"):
+        owner_denied = await require_owner_dashboard_request(request, "file_raw")
+        if owner_denied is not None:
+            return owner_denied
     # Envelope (validate -> sensitive -> nofollow-open -> bounded read) is
     # shared with api_file_download so a hardening change lands on both.
     # Offloaded to a worker thread: the envelope is synchronous file I/O and
@@ -4094,6 +4198,9 @@ async def api_file_stream(request: web.Request) -> web.StreamResponse:
     (file-raw) performs no content scan at all. The probe exists to catch
     the honest-mistake shape: a text file wearing a forged media magic.
     """
+    owner_denied = await require_owner_dashboard_request(request, "file_stream")
+    if owner_denied is not None:
+        return owner_denied
 
     def _log(outcome: str, res: str) -> None:
         _sel().log_tool_invocation(
@@ -4507,16 +4614,74 @@ def _fuzzy_score(q: str, name: str, rel: str) -> float:
     return score
 
 
+async def _audit_file_search_exit(
+    caller: str, resources: str, error: str = ""
+) -> None:
+    """Record one file-search outcome without blocking the loop or raising.
+
+    Two properties this endpoint needs and a bare ``_sel()`` call does not give:
+
+    * The singleton is warmed at gateway start, but a FAILED warm leaves
+      construction to the first caller -- key load and a tail read of the log --
+      and this runs on the event loop. Same gate and hop as
+      ``handlers/decisions._audit`` and ``server._audit_middleware_denial``: two
+      attribute reads on the healthy path, a worker thread on the degraded one
+      (``no-blocking-call-on-event-loop``).
+    * Best-effort. These calls sit on EARLY-EXIT paths that answered cleanly
+      before, so an audit that raised would turn a 200 or a 404 into a 500. The
+      record is what degrades, never the response.
+    """
+    from kiro_crew.sel import sel_is_warm
+
+    def _write() -> None:
+        _sel().log_api_access(
+            caller=caller,
+            operation="file_search",
+            outcome="allowed",
+            resources=resources,
+            error=error,
+        )
+
+    try:
+        if sel_is_warm():
+            _write()
+        else:
+            await asyncio.to_thread(_write)
+    except Exception:  # noqa: BLE001 - the record degrades, not the answer
+        logger.warning("SEL logging failed for file_search", exc_info=True)
+
+
 async def api_file_search(request: web.Request) -> web.Response:
-    """GET /api/file-search?q=... — fuzzy filename search for the @-mention file picker."""
+    """GET /api/file-search?q=... — fuzzy filename search for the @-mention file picker.
+
+    OWNER-ONLY, like every other reader in this module (``file_read``,
+    ``file_grep``, ``browse_dirs``, ``browse_files`` and the rest). The gate
+    matters more here than on any of them, because this is the one path reader
+    that takes an ARBITRARY root: ``?project=`` names any directory on the host
+    and only ``is_sensitive_path`` is consulted, so without the gate a non-owner
+    dashboard session could walk the host outside the credential set and read
+    back real names, sizes and mtimes. ``/api/path-complete`` answers the same
+    picker and is not in that position: it resolves the SERVER-HELD value its
+    ``path`` matched against the known project directories.
+    """
     # Re-imported at call time (not reused from the module-level binding) so a
     # test that stubs ``kiro_crew.security.is_sensitive_path`` is observed by the
     # project-root rejection below.
     from kiro_crew.security import is_sensitive_path  # noqa: F811
 
+    owner_denied = await require_owner_dashboard_request(request, "file_search")
+    if owner_denied is not None:
+        return owner_denied
     caller = request.get("user", "dashboard")
     query = request.query.get("q", "").strip().lower()
     if len(query) < 2:
+        # Audited like every other exit of this handler. The shared gate records
+        # only denials, so an exit that answers without an audit of its own leaves
+        # a SUCCESSFUL authorization with no SEL event at all -- the access was
+        # granted and nothing says so. Same idiom as ``api_file_diff``'s early
+        # ``allowed`` events: the ordinary outcome vocabulary, distinguished by
+        # ``resources``, rather than a marker only this handler emits.
+        await _audit_file_search_exit(caller, "short_query")
         return web.json_response({"results": []})
 
     # Result page size. Default mirrors SEARCH_RESULT_CAP in FolderPanel.tsx;
@@ -4552,12 +4717,24 @@ async def api_file_search(request: web.Request) -> web.Response:
             return _probe_busy_response(resource=project, operation="file_search", caller=caller)
         if is_sensitive_path(project):
             _sel().log_api_access(caller=caller, operation="file_search", outcome="denied", resources=project, error="sensitive path")
-            return web.json_response({"error": "Access denied"}, status=403)
+            return web.json_response(
+                {"error": "Access denied", "code": "access_denied"}, status=403
+            )
         if project_is_dir:
             search_roots.append(project)
         else:
+            # Audited for the same reason as the short-query exit above: the
+            # authorization succeeded, so the record must not end at the gate.
+            await _audit_file_search_exit(
+                caller, f"project={project}", error="not a directory"
+            )
             return web.json_response(
-                {"results": [], "error": "Project directory not found"}, status=404
+                {
+                    "results": [],
+                    "error": "Project directory not found",
+                    "code": "project_not_found",
+                },
+                status=404,
             )
     elif ws_name:
         from kiro_crew.config.loader import workspace_dir_for  # noqa: F811
@@ -5898,6 +6075,9 @@ async def api_file_grep(request: web.Request) -> web.Response:
     loop. The search takes a TRANSFER slot, not a probe slot, because it holds
     its worker for the length of the search.
     """
+    owner_denied = await require_owner_dashboard_request(request, "file_grep")
+    if owner_denied is not None:
+        return owner_denied
     caller = request.get("user", "dashboard")
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
@@ -5996,6 +6176,9 @@ async def api_file_grep(request: web.Request) -> web.Response:
 
 async def api_file_diff(request: web.Request) -> web.Response:
     """GET /api/file-diff?path=... — returns git diff and HEAD content for a file."""
+    owner_denied = await require_owner_dashboard_request(request, "file_diff")
+    if owner_denied is not None:
+        return owner_denied
     raw_path = request.query.get("path", "").strip()
     if not raw_path:
         _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources="empty_path")
@@ -6249,6 +6432,9 @@ async def api_browse_dirs(request: web.Request) -> web.Response:
     knows it is at the top. On other platforms the flag is a 400: there is no
     such level to show.
     """
+    owner_denied = await require_owner_dashboard_request(request, "browse_dirs")
+    if owner_denied is not None:
+        return owner_denied
     caller = request.get("user", "dashboard")
     if request.query.get("drives") == "1":
         if not platform_compat.IS_WINDOWS:
@@ -6268,10 +6454,16 @@ async def api_browse_dirs(request: web.Request) -> web.Response:
     except _PathProbeBusy:
         return _probe_busy_response(resource=raw, operation="browse_dirs", caller=caller)
     if not base_is_dir:
-        return web.json_response({"error": "Not a directory", "path": base}, status=400)
+        # Coded so the UI can name a permanent path refusal: without `code` the
+        # cause classifier degrades this to the recoverable arm and offers a
+        # Refresh that can never succeed.
+        return web.json_response(
+            {"error": "Not a directory", "code": "not_a_directory", "path": base},
+            status=400,
+        )
     if is_sensitive_path(base):
         _sel().log_api_access(caller=caller, operation="browse_dirs", outcome="denied", resources=base, error="sensitive path")
-        return web.json_response({"error": "Access denied"}, status=403)
+        return web.json_response({"error": "Access denied", "code": "access_denied"}, status=403)
     skip = {".git", "node_modules", "__pycache__", ".cache", ".venv", "venv", "env", ".kirocrew", ".kiro", ".aim"}
     try:
         dirs = await _run_path_probe(_browse_dirs_sync, base, skip, transfer=True)
@@ -6381,6 +6573,91 @@ def _match_known_project(raw: str, known: list[str]) -> str | None:
     return None
 
 
+_MACOS_TEMP_PROJECT_PREFIX_RE = re.compile(
+    r"\A/private/var/folders/[a-z0-9]{2}/[a-z0-9_]{30}/T(?=/|\Z)"
+)
+
+
+def _redact_project_path(path: str) -> str:
+    """Redact a project path without treating Darwin's temp root as a secret.
+
+    The generic bare-secret detector includes ``/`` because credentials may
+    contain base64 characters.  A macOS per-user temp prefix can therefore look
+    like one long high-entropy token even though its two variable components are
+    OS-owned and fixed-width.  Withhold those OS-owned components from the scan;
+    everything else still goes through the canonical redactor.
+
+    BOUNDARY CONTRACT -- WHERE THE SPLIT GOES, AND WHY IT STOPS THERE.
+    ``_contains_bare_secret`` slides an exactly-40-character window across a
+    complete base64-alphabet run precisely so that adjacent bytes cannot make a
+    credential invisible, and an AWS secret key may itself contain ``/``.  So a
+    window is a real credential candidate whenever every one of its bytes is
+    either fixed or user-controlled -- ``/T/`` followed by 37 user-controlled
+    characters is a well-formed 40-byte key, not a window that merely "borrows
+    OS bytes".  Two earlier splits were wrong for that reason: giving the scan
+    only ``path[match.end():]`` dropped every window crossing the boundary, and
+    giving it ``T`` + suffix still dropped the one starting at the ``/`` before
+    it.  Each produced a class where ``redact(path) != path`` while this helper
+    returned ``path`` unchanged -- the helper weakening the canonical output
+    policy rather than narrowing a false positive.
+
+    THE RESIDUAL OF THAT CLASS, MEASURED.  One such class survives this split, and
+    it is not a weakening: a 40-char key carrying MORE than
+    ``_SECRET_MAX_SLASHES`` separators.  Standalone, such a key is masked -- a
+    40-char run is the token somebody wrote, so the separator ceiling is
+    deliberately not applied to it.  Prepending ``/T`` makes the scanned run
+    longer than one whole key, which is exactly the condition that switches the
+    ceiling on, and every window is then declined.  Canonical on the whole path
+    still masks it, but NOT by recognising the key: the id supplies a slash-free
+    stretch that lets an id-straddling window clear the ceiling, i.e. it masks it
+    by the very false positive this exemption exists to remove.  The control is
+    that the same key also survives canonical on an ordinary deep path with no
+    exemption anywhere near it (``/srv/<key>``, ``/tmp/<key>``, ``/<key>``), so
+    the separator ceiling loses slash-dense keys everywhere in the product and
+    this helper is no weaker than the treatment the same key already gets
+    elsewhere.  Pinned by
+    ``test_a_slash_dense_key_is_treated_as_on_any_other_path``.
+
+    The split therefore sits at the END of the variable region, not one byte
+    inside it.  The prefix regex ends in the literal ``/T``, and everything to
+    the left of that literal is the OS-generated ``[a-z0-9]{2}/[a-z0-9_]{30}``
+    id.  Scanning ``/T`` + suffix covers EVERY window composed entirely of fixed
+    or user-controlled bytes, so there is no next byte to concede: a window
+    reaching further left necessarily contains id bytes, which the OS generates
+    and no caller can choose.  That is the terminating argument, and it is why
+    this is not "one more byte" a third time.
+
+    Withholding the id is the whole point of the exemption -- it is high-entropy
+    and self-flagging, and letting it into the scan is the false positive this
+    exemption exists to remove.
+    Measured over ordinary project names, pytest temp-dir names, truncated
+    sha-256 digests and uuid hex (300 samples each, under both a self-flagged and
+    a non-self-flagged prefix): the two-byte boundary costs ZERO additional
+    redactions, the same as the one-byte split it replaces.  The only names it
+    newly redacts are uniformly-random base64 runs of 37-38 characters, which the
+    canonical redactor already redacts on this path, so the boundary stays
+    strictly narrower than canonical rather than becoming a second policy.
+    DARWIN ONLY.  The withheld region is safe to withhold only because the OS
+    generates it: off Darwin ``/private/var/folders/<id>/T`` names nothing the OS
+    owns, so a caller who can choose a project directory can choose those bytes
+    outright and place a credential inside the one region this helper never
+    scans.  Everywhere but macOS the canonical redactor therefore decides alone,
+    which also keeps the exemption exactly as wide as the false positive it was
+    measured against.
+    Regression-guarded by ``TestMacosPrefixBoundary``.
+    """
+    if not platform_compat.IS_MACOS:
+        return redact(path)
+    match = _MACOS_TEMP_PROJECT_PREFIX_RE.match(path)
+    if match is None:
+        return redact(path)
+    prefix = match.group(0)
+    # Split at the end of the OS-generated id: the trailing ``/T`` is fixed, so
+    # it belongs to the scanned text. Preserving it instead would hide the
+    # 40-char window that starts on that ``/``.
+    return prefix[:-2] + redact(prefix[-2:] + path[match.end():])
+
+
 def _project_git_branch(base: str) -> dict:
     """Resolve the checked-out branch for ``base``.
 
@@ -6405,9 +6682,10 @@ def _project_git_branch(base: str) -> dict:
         return {"repo": False}
     # ``root`` is derived from an allow-listed project directory, but a directory
     # NAME is itself agent-influenceable via set_project and this value is echoed
-    # to the dashboard, so it goes through the same egress redaction as the branch
-    # label. A normal path is unchanged.
-    out: dict = {"repo": True, "repoRoot": redact(root)}
+    # to the dashboard, so it goes through egress redaction. It is a path rather
+    # than a label, so it uses the path-aware wrapper: a normal path is unchanged,
+    # including a macOS temp root the bare detector would read as one secret.
+    out: dict = {"repo": True, "repoRoot": _redact_project_path(root)}
     head_path = _git_head_path(root)
     if head_path is None:
         return out
@@ -6500,7 +6778,7 @@ async def api_project_git(request: web.Request) -> web.Response:
         # known project directory is deleted or replaced between the allow-list
         # match and the stat, so it is a live egress surface, not a dead branch.
         return web.json_response(
-            {"error": "Not a directory", "path": redact(base)}, status=400
+            {"error": "Not a directory", "path": _redact_project_path(base)}, status=400
         )
     if status == "sensitive":
         _sel().log_api_access(
@@ -6516,7 +6794,7 @@ async def api_project_git(request: web.Request) -> web.Response:
     )
     # The SEL audit above records the real path; the response body is an egress
     # surface the dashboard renders, so the echoed path is redacted like the rest.
-    return web.json_response({"path": redact(base), **info})
+    return web.json_response({"path": _redact_project_path(base), **info})
 
 
 async def api_browse_files(request: web.Request) -> web.Response:
@@ -6527,6 +6805,9 @@ async def api_browse_files(request: web.Request) -> web.Response:
     are sorted dirs-first then alphabetically; hidden files and common build dirs
     are skipped.
     """
+    owner_denied = await require_owner_dashboard_request(request, "browse_files")
+    if owner_denied is not None:
+        return owner_denied
     caller = request.get("user", "dashboard")
     raw = request.query.get("path", "").strip()
     # Off-loop: realpath then the isdir probe, on a caller-supplied root (the
@@ -6537,10 +6818,14 @@ async def api_browse_files(request: web.Request) -> web.Response:
     except _PathProbeBusy:
         return _probe_busy_response(resource=raw, operation="browse_files", caller=caller)
     if not base_is_dir:
-        return web.json_response({"error": "Not a directory", "path": base}, status=400)
+        # Same code as browse_dirs: the folder panel classifies both listings.
+        return web.json_response(
+            {"error": "Not a directory", "code": "not_a_directory", "path": base},
+            status=400,
+        )
     if is_sensitive_path(base):
         _sel().log_api_access(caller=caller, operation="browse_files", outcome="denied", resources=base, error="sensitive path")
-        return web.json_response({"error": "Access denied"}, status=403)
+        return web.json_response({"error": "Access denied", "code": "access_denied"}, status=403)
     skip = {".git", "node_modules", "__pycache__", ".cache", ".venv", "venv", "env", ".kirocrew", ".kiro", ".aim", "build", "dist", ".next"}
     try:
         dirs, files = await _run_path_probe(_browse_files_sync, base, skip, transfer=True)
@@ -7375,6 +7660,9 @@ async def api_file_sheet(request: web.Request) -> web.Response:
     dashboard egress. openpyxl is soft-imported: without it the endpoint
     answers 501 and the frontend degrades to the download card.
     """
+    owner_denied = await require_owner_dashboard_request(request, "file_sheet")
+    if owner_denied is not None:
+        return owner_denied
 
     def _log(outcome: str, res: str) -> None:
         _sel().log_tool_invocation(
@@ -8063,9 +8351,11 @@ async def api_project_git_status(request: web.Request) -> web.Response:
     # Egress redaction: repo content (paths, branch label, repo root) is
     # agent-influenceable and this response body is rendered by the dashboard,
     # so it goes through the same redaction as api_project_git. Normal values
-    # pass through unchanged.
+    # pass through unchanged. ``repoRoot`` is an absolute path and takes the same
+    # path-aware wrapper that endpoint uses, so the two stay consistent; the
+    # branch label and the repo-relative file paths keep the bare detector.
     if result.get("repoRoot"):
-        result["repoRoot"] = redact(result["repoRoot"])
+        result["repoRoot"] = _redact_project_path(result["repoRoot"])
     if result.get("branch"):
         result["branch"] = redact(result["branch"])
     # Redact each file path with redact_path_segments over the same
@@ -8263,7 +8553,7 @@ async def api_project_tree(request: web.Request) -> web.Response:
     if not await asyncio.to_thread(os.path.isdir, base):
         return web.json_response(
             {
-                "root": redact(base),
+                "root": _redact_project_path(base),
                 "paths": [],
                 "directories": [],
                 "repo": False,
@@ -8469,7 +8759,7 @@ async def api_project_tree(request: web.Request) -> web.Response:
     result = await asyncio.to_thread(_run)
     # Egress redaction, same rationale as api_project_git_status: listed names
     # are repo content and this body is rendered by the dashboard.
-    result["root"] = redact(result["root"])
+    result["root"] = _redact_project_path(result["root"])
     # Redact each path with redact_path_segments over the same context-aware
     # redact(): the whole-string redact() collapses each matched token to a
     # fixed placeholder, so two genuinely-different project-relative paths

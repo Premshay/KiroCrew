@@ -52,38 +52,62 @@ async def test_chat_slots_are_guarded(gateway_boot) -> None:
         assert "memory_mode" in (await bad.json())["error"]
 
 
-@pytest.mark.asyncio
-async def test_persistent_chat_survives_a_restart_and_incognito_does_not(gateway_boot) -> None:
-    """Documents the CURRENT contract of ``memory_mode`` at the persistence
-    seam: a persistent slot comes back after a restart, a non-persistent one
-    does not (bug 11). ``open_slots.json`` is the only restart-restore
-    set and it lists persistent slots alone.
+async def _one_turn(gw, slot: str, message: str) -> None:
+    """Drive one ``POST /api/chat`` turn on *slot* to its ``[DONE]``."""
+    resp = await gw.post("/api/chat", {"message": message, "slot": slot}, timeout=45)
+    assert resp.status == 200, await resp.text()
+    async for raw in resp.content:
+        if raw.decode("utf-8", "replace").strip() == "data: [DONE]":
+            return
+    pytest.fail(f"{slot}: stream ended without [DONE]")
 
-    If the product decision on bug 11 is Option A (non-persistent affects
-    learnings only, chats persist), flip the incognito half of this test to
-    ``assert incognito in names_after`` and it becomes the regression pin.
+
+@pytest.mark.asyncio
+async def test_an_incognito_chat_survives_a_restart_in_history(gateway_boot) -> None:
+    """Pins the bug-11 contract at the persistence seam: a non-persistent mode
+    withholds LEARNING from a chat, not the chat itself.
+
+    A persistent tab is reopened by the next boot; an incognito tab is not
+    (``open_slots.json`` lists persistent slots alone, so a later process never
+    resurrects a private tab on its own). But the incognito conversation is in
+    History after the restart with its rows and its mode, and resuming it from
+    there gives a tab that still runs as incognito.
     """
     async with gateway_boot() as gw:
         persistent = (await gw.post_json("/api/chat/slots", {"memory_mode": "persistent"}))["key"]
         incognito = (await gw.post_json("/api/chat/slots", {"memory_mode": "incognito"}))["key"]
-        names_before = {s["key"] for s in await gw.get_json("/api/chat/slots")}
-        assert {persistent, incognito} <= names_before
+        await asyncio.wait_for(_one_turn(gw, incognito, "hello from an incognito tab"), timeout=60)
+        history_key = next(
+            s["key"]
+            for s in (await gw.get_json("/api/sessions"))["sessions"]
+            if incognito in s["key"]
+        )
 
         await gw.restart()
 
-        # The restore set is written at shutdown; the first boot's shutdown just
-        # wrote it, and it lists the persistent slot alone.
+        # The restore set is written at shutdown and lists the persistent tab alone.
         open_slots = json.loads((gw.home / "open_slots.json").read_text(encoding="utf-8"))
         assert persistent in open_slots["keys"]
         assert incognito not in open_slots["keys"]
-
         names_after = {s["key"] for s in await gw.get_json("/api/chat/slots")}
         assert persistent in names_after
-        assert incognito not in names_after, (
-            "an incognito slot came back after a restart: if that is the product "
-            "decision on GH #13398 (non-persistent affects learnings only), flip this "
-            "assertion; otherwise open_slots.json is restoring a non-persistent slot"
+        assert incognito not in names_after
+
+        # The chat itself is kept: listed in History with its mode, its rows readable.
+        listed = {s["key"]: s for s in (await gw.get_json("/api/sessions"))["sessions"]}
+        assert listed[history_key]["memory_mode"] == "incognito"
+        rows = await gw.get_json(f"/api/sessions/{history_key}")
+        assert [r["role"] for r in rows] == ["user", "assistant"]
+        assert rows[0]["content"] == "hello from an incognito tab"
+
+        # Reopening it from History gives a tab that still runs as incognito.
+        resumed = await gw.post_json(
+            f"/api/chat/slots/{history_key}/resume",
+            {"name": history_key, "key": history_key, "title": history_key},
         )
+        assert resumed["ok"] is True
+        assert resumed["memory_mode"] == "incognito"
+        assert [m["content"] for m in resumed["messages"]][:1] == ["hello from an incognito tab"]
 
 
 # ---------------------------------------------------------------- bug 12 ---

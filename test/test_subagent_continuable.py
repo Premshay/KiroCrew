@@ -142,6 +142,7 @@ def _stop_reason(info: SubagentInfo) -> str:
 @pytest.mark.parametrize("continuation", [False, True])
 async def test_run_execution_publication_is_off_loop(monkeypatch, continuation):
     from kiro_crew import execution_context, subagent_persistence
+    from kiro_crew.subagent import _RunCreditAccounting
 
     manager = _manager()
     manager.dependency_coordinator_async = AsyncMock(return_value=None)
@@ -172,7 +173,9 @@ async def test_run_execution_publication_is_off_loop(monkeypatch, continuation):
     monkeypatch.setattr(execution_context, "read_session_execution", read)
     monkeypatch.setattr(execution_context, "bind_session_execution", bind)
     with pytest.raises(Published):
-        await asyncio.wait_for(manager._run_events._run_inner_impl(info, key), 10)
+        await asyncio.wait_for(
+            manager._run_events._run_inner_impl(info, key, _RunCreditAccounting(info)), 10
+        )
     assert [operation[0] for operation in operations] == (
         ["read", "bind"] if continuation else ["bind"]
     )
@@ -1844,6 +1847,22 @@ class TestSteerRun:
             ok, _ = await manager.steer_run("a1", "adjust")
         assert ok
         shared.steer.assert_awaited_once_with("adjust")
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_can_lose_a_delivered_steer_is_refused(self) -> None:
+        """codex can drop a steer it reported delivered; a subagent run cannot
+        requeue it, so the steer is refused and the parent is told to follow up."""
+        manager = _manager()
+        shared = AsyncMock()
+        shared.steer = AsyncMock(return_value=True)
+        shared.steer_needs_loss_recovery = True
+        info = SubagentInfo(id="a1", task="t")
+        info._session_sharing = True
+        info._shared_provider = shared
+        manager._agents["a1"] = info
+        ok, detail = await manager.steer_run("a1", "adjust")
+        assert not ok and detail.startswith("steer_unsupported") and "follow_up" in detail
+        shared.steer.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_session_reachable(self) -> None:

@@ -751,7 +751,13 @@ def _gateway_base() -> str:
         return _RESOLVED_BASE
     ports = _candidate_ports()
     for port in ports:
-        base = f"http://localhost:{port}"
+        # Dial the IPv4 loopback LITERAL (not the ambiguous ``localhost``): the
+        # credential is paired to the address dialled, and a literal reaches one
+        # family, so a gateway that bound only v4 -- or a wildcard/v4-only
+        # container that publishes a single v4-family entry -- still authenticates.
+        # Dialling ``localhost`` would demand BOTH families be covered and refuse
+        # such an ordinary single-family gateway. Mirrors cli_server's _CLI_LOOPBACK.
+        base = f"http://127.0.0.1:{port}"
         # Each candidate is probed with ITS OWN credential. A single secret read
         # before the loop comes from the home-wide file, which holds one slot per
         # data home: on a host running more than one gateway that names whichever
@@ -766,17 +772,21 @@ def _gateway_base() -> str:
     # happens to own that port. When no source names a port at all, there is no base
     # to justify -- return empty so _api_request fails closed with a clear error
     # rather than authenticating against a stranger.
-    return f"http://localhost:{ports[0]}" if ports else ""
+    return f"http://127.0.0.1:{ports[0]}" if ports else ""
 
 
 def _local_secret(port: int) -> str:
     """Credential for the gateway on *port*, via the shared resolver.
 
     The per-port-then-shared order lives in ``config.loader.read_local_secret``;
-    duplicating it here would give this surface its own copy to drift. Only the
-    fallback differs: this app addresses its data home through ``store.crew_home()``,
-    so a home-wide read is retried against that when the shared resolver finds
-    nothing.
+    duplicating it here would give this surface its own copy to drift. This app
+    addresses its data home through ``store.crew_home()``, so a home-wide read is
+    the resolution used ONLY when the package import is unavailable (standalone
+    mode). When the import succeeds the shared resolver is authoritative,
+    INCLUDING its fail-closed refusal (a ``""`` return for an uncovered family or
+    an unreadable ``run/``): this never falls through to the home-wide file on
+    that refusal, which would send a different listener's credential and
+    reintroduce the desync the shared resolver closes.
 
     *port* is required for the same reason it is required there: the credential is
     only valid for the gateway it belongs to, so the dial target is never inferred.
@@ -787,16 +797,20 @@ def _local_secret(port: int) -> str:
         # crew_home() read below is the only resolution available. A module-scope
         # import would make the module itself unimportable there.
         from kiro_crew.config.loader import read_local_secret
-
-        secret = read_local_secret(port)
-        if secret:
-            return secret
     except Exception:
-        pass
-    try:
-        return (store.crew_home() / ".local_secret").read_text(encoding="utf-8").strip()
-    except Exception:
-        return ""
+        # Import unavailable -> standalone mode: the crew_home() read is the ONLY
+        # resolution path here.
+        try:
+            return (store.crew_home() / ".local_secret").read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+    # Import available -> the shared resolver is authoritative, INCLUDING its
+    # fail-closed refusal. When it returns "" because the dialled family is
+    # uncovered (or run/ is unreadable), that is a REFUSAL, not "not found": we
+    # must NOT fall through to the home-wide ``.local_secret``, which would send a
+    # different listener's credential and reintroduce the exact desync this closes.
+    # The crew_home() fallback above is reachable only when the import itself fails.
+    return read_local_secret(port, dial_host="127.0.0.1")
 
 
 def _unconfigured_dispatch(task: str, timeout: int = DEFAULT_TASK_TIMEOUT) -> dict:
@@ -1158,15 +1172,14 @@ def _draft_confirmed(link: str, payload: dict) -> str:
         if _confirm_text(rev.get("body")) != _confirm_text(payload.get("body")):
             return ""  # some other sage draft, not the one just sent
         if str(rev.get("commit_id") or "") != expected_commit:
-            return ""    # right text, wrong revision -> anchored to other code
+            return ""  # right text, wrong revision -> anchored to other code
         # The pull request's (head, base) is pinned BEFORE the comments are
         # read, so a pending comment's position is only ever mapped through a
         # diff read under the same pair (see `_diff_positions`). A failed read
         # leaves nothing pinned, which only matters, and then refuses, when a
         # comment needs its position mapped.
         try:
-            pinned: tuple[str, str] | None = _pull_revisions(
-                host, owner, repo, number)
+            pinned: tuple[str, str] | None = _pull_revisions(host, owner, repo, number)
         except Exception:
             pinned = None
         try:
@@ -1179,9 +1192,9 @@ def _draft_confirmed(link: str, payload: dict) -> str:
         except Exception:
             return ""
         want = sorted(
-            (str(c.get("path") or ""), _confirm_text(c.get("body")),
-             int(c.get("line") or 0))
-            for c in (payload.get("comments") or []))
+            (str(c.get("path") or ""), _confirm_text(c.get("body")), int(c.get("line") or 0))
+            for c in (payload.get("comments") or [])
+        )
         # GitHub resolves `line` and `side` only when a review is submitted;
         # every inline comment of a PENDING review reads null for both and
         # carries only a diff `position`, and an outdated comment keeps its
@@ -1209,16 +1222,14 @@ def _draft_confirmed(link: str, payload: dict) -> str:
             line = _resolved_line(c)
             if line is None:
                 if lines_at is None:
-                    positions = _diff_positions(host, owner, repo, number,
-                                                expected_commit, pinned)
+                    positions = _diff_positions(host, owner, repo, number, expected_commit, pinned)
                     if positions is None:
-                        return ""    # diff unreadable or for another head/base -> unprovable
-                    lines_at = {p: {pos: ln for ln, pos in m.items()}
-                                for p, m in positions.items()}
+                        return ""  # diff unreadable or for another head/base -> unprovable
+                    lines_at = {p: {pos: ln for ln, pos in m.items()} for p, m in positions.items()}
                 pos = c.get("position")
                 line = None if pos is None else lines_at.get(path, {}).get(int(pos))
                 if line is None:
-                    return ""    # no position, or one the diff cannot place
+                    return ""  # no position, or one the diff cannot place
             got.append((path, _confirm_text(c.get("body")), line))
         return str(rid) if want == sorted(got) else ""
     return ""
@@ -1234,20 +1245,25 @@ def _resolved_line(comment: dict) -> int | None:
     return None
 
 
-def _pull_revisions(host, owner: str, repo: str,
-                    number: str | int) -> tuple[str, str]:
+def _pull_revisions(host, owner: str, repo: str, number: str | int) -> tuple[str, str]:
     """The pull request's current (head sha, base sha); "" for either one
     GitHub did not report."""
-    pulls = discovery.run_gh_json(
-        f"repos/{owner}/{repo}/pulls/{number}", host=host)
+    pulls = discovery.run_gh_json(f"repos/{owner}/{repo}/pulls/{number}", host=host)
     pull = pulls[0] if pulls else {}
-    return (str((pull.get("head") or {}).get("sha") or ""),
-            str((pull.get("base") or {}).get("sha") or ""))
+    return (
+        str((pull.get("head") or {}).get("sha") or ""),
+        str((pull.get("base") or {}).get("sha") or ""),
+    )
 
 
-def _diff_positions(host, owner: str, repo: str, number: str | int,
-                    commit: str, pinned: tuple[str, str] | None,
-                    ) -> dict[str, dict[int, int]] | None:
+def _diff_positions(
+    host,
+    owner: str,
+    repo: str,
+    number: str | int,
+    commit: str,
+    pinned: tuple[str, str] | None,
+) -> dict[str, dict[int, int]] | None:
     """Map each changed file to {new-file line: diff position} for the pull
     request at `commit`, or None when that diff cannot be read.
 
@@ -1269,14 +1285,15 @@ def _diff_positions(host, owner: str, repo: str, number: str | int,
         return None
     try:
         files = discovery.run_gh_json(
-            f"repos/{owner}/{repo}/pulls/{number}/files", jq=".[]",
-            paginate=True, host=host)
+            f"repos/{owner}/{repo}/pulls/{number}/files", jq=".[]", paginate=True, host=host
+        )
         if _pull_revisions(host, owner, repo, number) != pinned:
             return None
     except Exception:
         return None
-    return {str(f.get("filename") or ""): _patch_positions(str(f.get("patch") or ""))
-            for f in files}
+    return {
+        str(f.get("filename") or ""): _patch_positions(str(f.get("patch") or "")) for f in files
+    }
 
 
 def _patch_positions(patch: str) -> dict[int, int]:
@@ -1289,7 +1306,7 @@ def _patch_positions(patch: str) -> dict[int, int]:
             new_line = int(match.group(1)) if match else 0
             continue
         if text.startswith("\\"):
-            continue        # "\ No newline at end of file"
+            continue  # "\ No newline at end of file"
         if text.startswith("-"):
             continue
         positions[new_line] = position
@@ -1371,23 +1388,38 @@ def run_review(
         failed_records: list[dict] = []
         for link in changes:
             change_id = _cid(link)
-            progress(change_id, "failed", {
-                "error": runtime_error, "reason": "runtime_unavailable"})
-            failed_records.append({
-                "change": link, "change_id": change_id,
-                "gate_spawn_ok": False, "gate_error": runtime_error,
-                "gate_verdict": "UNKNOWN", "phase2_ran": False,
-                "deep_spawn_ok": False, "deep_error": runtime_error,
-                "deep_reviewed": False, "result_recorded": False,
-                "design_block": False, "deep_rounds": 0,
-                "skipped_reason": "runtime_unavailable",
-            })
+            progress(change_id, "failed", {"error": runtime_error, "reason": "runtime_unavailable"})
+            failed_records.append(
+                {
+                    "change": link,
+                    "change_id": change_id,
+                    "gate_spawn_ok": False,
+                    "gate_error": runtime_error,
+                    "gate_verdict": "UNKNOWN",
+                    "phase2_ran": False,
+                    "deep_spawn_ok": False,
+                    "deep_error": runtime_error,
+                    "deep_reviewed": False,
+                    "result_recorded": False,
+                    "design_block": False,
+                    "deep_rounds": 0,
+                    "skipped_reason": "runtime_unavailable",
+                }
+            )
         return {
-            "ok": False, "error": runtime_error,
-            "changes": len(failed_records), "gate_spawns": 0, "deep_spawns": 0,
-            "design_blocked": 0, "phase2_skipped_on_block": 0, "cancelled": 0,
-            "deep_reviewed": 0, "deep_rounds": 0, "design_comments_posted": 0,
-            "result_records": 0, "failures": failed_records,
+            "ok": False,
+            "error": runtime_error,
+            "changes": len(failed_records),
+            "gate_spawns": 0,
+            "deep_spawns": 0,
+            "design_blocked": 0,
+            "phase2_skipped_on_block": 0,
+            "cancelled": 0,
+            "deep_reviewed": 0,
+            "deep_rounds": 0,
+            "design_comments_posted": 0,
+            "result_records": 0,
+            "failures": failed_records,
             "per_change": failed_records,
         }
 
@@ -1512,8 +1544,7 @@ def run_review(
             )
         except pipeline.adapters.AdapterError as exc:
             refused = f"refusing to review: {exc}"
-            progress(change_id, "failed", {
-                "error": refused, "reason": "review_failed"})
+            progress(change_id, "failed", {"error": refused, "reason": "review_failed"})
             return {
                 "change": link,
                 "change_id": change_id,
@@ -1577,9 +1608,11 @@ def run_review(
         # already-written verdicts/findings.
         if not review_spawn.get("ok", False):
             rec["skipped_reason"] = "review_failed"
-            progress(change_id, "failed", {
-                "error": review_spawn.get("error", "review failed"),
-                "reason": "review_failed"})
+            progress(
+                change_id,
+                "failed",
+                {"error": review_spawn.get("error", "review failed"), "reason": "review_failed"},
+            )
             return rec
         if not rec["deep_reviewed"]:
             if rev_rec is None:
@@ -1589,17 +1622,24 @@ def run_review(
                 # consumers key on; environment failures are discriminated by
                 # the preflight before any dispatch.
                 rec["skipped_reason"] = "no_review_recorded"
-                progress(change_id, "failed", {
-                    "error": "review produced no result record",
-                    "reason": "no_review_recorded"})
+                progress(
+                    change_id,
+                    "failed",
+                    {"error": "review produced no result record", "reason": "no_review_recorded"},
+                )
             else:
                 # A record landed but never marked the review complete: the
                 # worker got far enough to write, then stopped short. Distinct
                 # from "wrote nothing" so the two can be triaged apart.
                 rec["skipped_reason"] = "review_record_incomplete"
-                progress(change_id, "failed", {
-                    "error": "review wrote a result record but never completed the review",
-                    "reason": "review_record_incomplete"})
+                progress(
+                    change_id,
+                    "failed",
+                    {
+                        "error": "review wrote a result record but never completed the review",
+                        "reason": "review_record_incomplete",
+                    },
+                )
             return rec
 
         # --- Bounded coverage backstop: AT MOST ONE targeted follow-up, and only

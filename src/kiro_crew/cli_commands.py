@@ -91,6 +91,7 @@ from kiro_crew.cron import (
     CronStoreUnreadable,
     format_schedule,
     get_local_tz,
+    is_valid_timezone,
     lookup_cron_folder_id,
     parse_time_string,
 )
@@ -118,7 +119,7 @@ from kiro_crew.mcp_cron import (
     _vet_shell_command,
 )
 from kiro_crew.member_memory_auth import require_member_memory_creation
-from kiro_crew.members import MemberNameError, validate_member_name
+from kiro_crew.members import MemberNameError, key_new_crew, validate_member_name
 from kiro_crew.memory import MemoryStore
 from kiro_crew.memory_stores import (
     DEFAULT_MEMORY_STORE,
@@ -216,6 +217,16 @@ def _cli_validated_workspace_dst(ws_dir: str, *, operation: str, name: str) -> P
     return validated
 
 
+def _ws_dir_composed(ws_dir: str) -> Path:
+    """*ws_dir* as a path: ``~`` expanded, a relative dir joined onto the data home.
+
+    NOT resolved. The one composition the containment check resolves and the
+    create hands to the link screen as the unresolved leaf.
+    """
+    expanded = Path(ws_dir).expanduser()
+    return expanded if expanded.is_absolute() else config_dir() / expanded
+
+
 def _ws_dir_resolves_inside_home(ws_dir: str) -> Path | None:
     """The resolved path when *ws_dir* is a STRICT descendant of the data home, else None.
 
@@ -260,8 +271,7 @@ def _ws_dir_resolves_inside_home(ws_dir: str) -> Path | None:
     thing that crashes.
     """
     try:
-        expanded = Path(ws_dir).expanduser()
-        candidate = (expanded if expanded.is_absolute() else config_dir() / expanded).resolve()
+        candidate = _ws_dir_composed(ws_dir).resolve()
         root = config_dir().resolve()
         if candidate == root or not candidate.is_relative_to(root):
             return None
@@ -306,13 +316,19 @@ def _internal_secret(port: int) -> str:
     Returns an empty string if the file is missing or unreadable; the
     server then rejects the request with 403, which is the correct
     failure mode.
+
+    Dials the IPv4 loopback LITERAL, matching the ``http://127.0.0.1`` bases its
+    callers construct: a literal reaches one family, so the credential pairs with
+    the address actually dialled and an ordinary single-family gateway (v4-only or
+    a wildcard/container bind) still authenticates. The ambiguous ``localhost``
+    would demand BOTH families and refuse such a gateway.
     """
-    return read_local_secret(port)
+    return read_local_secret(port, dial_host="127.0.0.1")
 
 
 def _spawn(args: argparse.Namespace) -> None:
     """Dispatch spawn subcommands: run, list."""
-    base = f"http://localhost:{args.port}"
+    base = f"http://127.0.0.1:{args.port}"
     action = getattr(args, "spawn_action", None)
 
     if action == "list":
@@ -634,7 +650,9 @@ def _handle_workspace(args: argparse.Namespace) -> None:
             # write -- a concurrent create can already have adopted and registered it.
             else:
                 try:
-                    materialize_workspace_dir(dst_path, display=ws_dir)
+                    materialize_workspace_dir(
+                        dst_path, leaf=_ws_dir_composed(ws_dir), display=ws_dir
+                    )
                 except WorkspaceDirUnusable as exc:
                     raise _CliConflict(str(exc)) from exc
             workspaces[args.name] = dataclasses.asdict(WorkspaceConfig(dir=ws_dir))
@@ -1441,9 +1459,14 @@ def _handle_agent(args: argparse.Namespace) -> None:
         except MemberNameError as exc:
             print(f"Error: invalid Crew Member name ({exc})", file=sys.stderr)
             sys.exit(1)
-        if args.name in cfg.agents:
-            print(f"Error: agent '{args.name}' already exists", file=sys.stderr)
+        # Same keying as POST /api/agents.
+        keyed = key_new_crew(
+            args.name, (getattr(args, "display_name", None) or "").strip(), cfg.agents
+        )
+        if keyed.taken:
+            print(f"Error: agent '{keyed.taken}' already exists", file=sys.stderr)
             sys.exit(1)
+        args.name, display_name = keyed.key, keyed.display_name
         if not TEMPLATE_NAME_RE.fullmatch(args.kiro_agent):
             print("Error: invalid kiro agent name", file=sys.stderr)
             sys.exit(1)
@@ -1463,6 +1486,7 @@ def _handle_agent(args: argparse.Namespace) -> None:
             kiro_agent=args.kiro_agent,
             workspace=args.workspace,
             memory_store=memory_store,
+            display_name=display_name,
         )
         previous_store = cfg.agents[args.name].memory_store
         previous_member_id = cfg.agents[args.name].member_id
@@ -1493,7 +1517,10 @@ def _handle_agent(args: argparse.Namespace) -> None:
                 raise
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
-        print(f"Created agent: {args.name}")
+        if display_name:
+            print(f"Created agent: {args.name} (display name: {display_name})")
+        else:
+            print(f"Created agent: {args.name}")
 
     elif action == "update":
         if args.name not in cfg.agents:
@@ -1761,17 +1788,19 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
     ]
     if len(given) != 1:
         _cron_add_fail("provide exactly one of --every, --cron or --at")
-    # --timezone governs how a --cron expression's hour/minute fields are read.
-    # An interval (--every) has no wall clock to interpret, and a time string
-    # given to --at is resolved by parse_time_string in the configured timezone
-    # with its confirmation rendered in that same timezone -- a per-job value
-    # would change only the render. Either pair is refused rather than
+    # --timezone is the zone the job's wall clocks are read in: a --cron
+    # expression's hour/minute fields and a time string given to --at, which
+    # parse_time_string resolves in it (the configured timezone when omitted),
+    # with its confirmation rendered in that same zone. An interval (--every)
+    # has no wall clock to interpret, so that pair is refused rather than
     # persisted as a field the schedule never consults.
-    if tz and not cron_expr:
+    if tz and every:
         _cron_add_fail(
-            "--timezone applies to --cron only; a time string given to --at is read "
-            "in the configured timezone"
+            "--timezone applies to --cron and --at only; an --every interval has no "
+            "wall clock to read in it"
         )
+    if tz and not is_valid_timezone(tz):
+        _cron_add_fail(f"invalid timezone: {tz!r}")
     at_ts: float | None = None
     if at_raw:
         if len(at_raw) > 64:
@@ -1780,7 +1809,7 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
             try:
                 at_ts = float(at_raw)
             except ValueError:
-                parsed = parse_time_string(at_raw)
+                parsed = parse_time_string(at_raw, tz)
                 if isinstance(parsed, str):
                     _cron_add_fail(parsed)
                 at_ts = parsed
@@ -1793,8 +1822,8 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
             if at_ts < _time.time():
                 # Render in the zone parse_time_string resolved the value in,
                 # so the refusal echoes a wall clock the operator recognises.
-                _, configured_tz = get_local_tz()
-                local = datetime.fromtimestamp(at_ts, configured_tz)
+                shown_tz = ZoneInfo(tz) if tz else get_local_tz()[1]
+                local = datetime.fromtimestamp(at_ts, shown_tz)
                 _cron_add_fail(
                     f"resolved time {local.strftime('%Y-%m-%d %I:%M %p %Z')} is in the past"
                 )
@@ -2050,16 +2079,36 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 # first and only falls back to rehydrating from history, so a
                 # brand-new tab that has not logged anything yet is a legitimate
                 # target and absence of a log does not prove the key is wrong.
-                slot = session_key.removeprefix("dashboard:")
+                #
+                # Resolve the transcript the way DELIVERY resolves it, rather
+                # than guessing at the spelling. The original bug was asking for
+                # the prefix-stripped slot, which found nothing for EVERY
+                # dashboard session and warned on every correct adopt -- which
+                # trains the operator to ignore the one message that would also
+                # be a real typo's only signal. Passing the raw session key
+                # instead fixes the common ``chat-N`` spelling but reintroduces
+                # the same false warning for the two spellings where the two
+                # differ: a channel-origin slot (``dashboard:slack_<ts>``, whose
+                # transcript is ``slack_<ts>.jsonl`` with no ``dashboard_``
+                # prefix) and a stacked prefix (``--session-of
+                # dashboard_chat-N-...`` becomes ``dashboard:dashboard_chat-N``).
+                # ``_normalize_slot_key`` + ``slot_transcript_key`` are the pair
+                # the delivery path itself composes, so reusing them keeps the
+                # check and the delivery it predicts from drifting apart.
                 try:
-                    known = ConversationLog().has_log(slot)
+                    from kiro_crew.dashboard.chat_utils import slot_transcript_key
+                    from kiro_crew.dashboard.state import _normalize_slot_key
+
+                    transcript_key = slot_transcript_key(_normalize_slot_key(session_key))
+                    known = ConversationLog().has_log(transcript_key)
                 except Exception:
                     known = True  # cannot tell -> stay quiet rather than cry wolf
                 if not known:
                     print(
-                        f"Warning: no recorded session named {slot!r}. If that is a typo, "
-                        f"the job's results will not reach anyone -- re-run with the right "
-                        f"key, or `--release` to undo.",
+                        f"Warning: no recorded session named "
+                        f"{session_key.removeprefix('dashboard:')!r}. If that is a "
+                        f"typo, the job's results will not reach anyone -- re-run "
+                        f"with the right key, or `--release` to undo.",
                         file=sys.stderr,
                     )
             else:
@@ -2217,6 +2266,9 @@ def _cron_preview(args: argparse.Namespace) -> None:
         print(f"Error: cannot load {script_path}")
         sys.exit(1)
     module = importlib.util.module_from_spec(spec)
+    # Registered before exec, as the production child does: dataclasses resolves
+    # a postponed annotation through sys.modules[cls.__module__].
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     func = getattr(module, func_name, None)
     if func is None:
@@ -2968,7 +3020,7 @@ def _learn(args: argparse.Namespace) -> None:
             "kirocrew config set memory.persistence_enabled true"
         )
         return
-    vs = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim)
+    vs = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim, config=cfg)
     vs.init()
     try:
         if action == "add":
@@ -3044,7 +3096,8 @@ def _learn(args: argparse.Namespace) -> None:
                     "significant words with it can coexist."
                 )
             # The category is echoed ONLY where the store adopted the submitted one.
-            # It is write-once (vector_memory.py builds an enrichment with the STORED
+            # It is write-once (write_lesson's exact-rule pass, `resolve_exact_rule` in
+            # vector_memory_runtime/lessons.py, builds an enrichment with the STORED
             # category, falling back to the submitted one only when the row has none),
             # so an insert is the single outcome where what was typed is what is held.
             # Anything else printing it would show a value the store may not have --
@@ -3544,7 +3597,7 @@ def _memory_carve(args: argparse.Namespace) -> None:
     db_path = _admitted_store_path(name, cfg, may_create=False)
     if db_path is None:
         return
-    store = VectorMemoryStore(db_path=db_path, embedding_dim=cfg.memory.embedding_dim)
+    store = VectorMemoryStore(db_path=db_path, embedding_dim=cfg.memory.embedding_dim, config=cfg)
     store.init()
     try:
         # Keyed by facet NAME, read off the namespace by that name: an omitted flag
@@ -3848,7 +3901,9 @@ def _memory_cmd(args: argparse.Namespace) -> None:
         preexisting_sidecars = (
             set(db_path.parent.glob(db_path.name + "-*")) if import_created_db else set()
         )
-        store = VectorMemoryStore(db_path=db_path, embedding_dim=cfg.memory.embedding_dim)
+        store = VectorMemoryStore(
+            db_path=db_path, embedding_dim=cfg.memory.embedding_dim, config=cfg
+        )
         try:
             # INSIDE the try, because `init()` is itself a creation step: SQLite makes
             # `memory.db` there, and an interrupt raising out of it would otherwise
@@ -4101,7 +4156,7 @@ def _artifact(args: argparse.Namespace) -> None:
     """List, save, view, update, or delete artifacts."""
     cfg = KiroCrewConfig.load()
     _host, port = parse_dashboard_url(cfg.dashboard.url)
-    base = f"http://localhost:{port}"
+    base = f"http://127.0.0.1:{port}"
 
     action = getattr(args, "artifact_action", None) or "list"
 

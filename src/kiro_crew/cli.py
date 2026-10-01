@@ -1247,7 +1247,33 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     # would follow the renamed inode through .1 → .2 → .3 → unlink, losing
     # later raw stderr from all retained logs.
     handler_cls = _FdTrackingRotatingFileHandler if detached else RotatingFileHandler
-    fh = handler_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    # Seatbelt/sandbox children (e.g. ``kirocrew mcp-core`` under a sandboxed
+    # agent profile) inherit a deny on ``gateway.log``. For those, opening the
+    # file handler must not abort the process: the console handler
+    # ``basicConfig`` installed above still carries every record, so the
+    # warning lands somewhere a human reads and the MCP handshake proceeds.
+    #
+    # A DETACHED process is the opposite case and must still fail loudly: no
+    # console handler was installed (the branch above skips ``basicConfig`` to
+    # avoid double-writing into the log stderr already points at), so
+    # soft-failing here would boot a long-lived gateway with no persistent log
+    # AND no destination for the warning saying so. Let the OSError propagate.
+    try:
+        fh = handler_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    except OSError as exc:
+        if detached:
+            raise
+        logging.getLogger("kiro_crew").warning(
+            "persistent log file %s unavailable (%s); continuing with console logging only",
+            log_file,
+            exc,
+        )
+        # Install redaction BEFORE returning: long-lived commands still emit
+        # Bearer/JWT-bearing records to the console, and the normal
+        # install_log_redaction call below is skipped by this early return.
+        if command in _LONG_LIVED_COMMANDS:
+            install_log_redaction([])
+        return
     # No level on the handler: every record that can reach it is already gated
     # by a logger level -- kiro_crew records by the kiro_crew logger set above,
     # third-party records (root attach, detached mode) by the root logger's
@@ -1714,15 +1740,15 @@ Examples:
         dest="at",
         help="One-shot: fire once at this time and then delete the job. A Unix timestamp, "
         "or a time string ('5pm', 'in 30 minutes', 'tomorrow 9am', '2026-10-01 09:00') "
-        "read in the configured timezone.",
+        "read in --timezone, or in the configured timezone when --timezone is omitted.",
     )
     cron_add.add_argument(
         "--timezone",
         dest="timezone",
         default="",
-        help="IANA timezone the --cron expression is evaluated in (e.g. America/New_York). "
-        "Applies to --cron only; refused with --every (an interval has no wall clock) "
-        "and with --at, whose time string is read in the configured timezone.",
+        help="IANA timezone the job's wall clock is read in (e.g. America/New_York): the "
+        "--cron expression's fields, or an --at time string such as '9am'. Defaults to the "
+        "configured timezone; refused with --every (an interval has no wall clock).",
     )
     cron_add.add_argument("--channel", help="Slack channel ID to post results to")
     # One job KIND per job. A script or command job never launches an agent,
@@ -2204,6 +2230,20 @@ Examples:
         help="Provision (venv + SPA dist) if needed before bringing the pod up",
     )
     pod_up.add_argument("--ttl", default="2h", help="Token TTL (default: 2h)")
+    pod_up.add_argument(
+        "--no-token",
+        dest="no_token",
+        action="store_true",
+        help=(
+            "Boot the pod but do NOT mint a dashboard token: `token` in the "
+            "--json handle is empty and no /api/token/local call is made. The "
+            "gateway's agent pod surface uses this so it can mint in-process "
+            "instead (see agent_pod_api); a sandboxed `pod up` child is in its "
+            "own user namespace and the pod refuses to certify it as the local "
+            "owner. A human running `pod up` should omit this and let the CLI "
+            "mint, then `pod token` to re-mint."
+        ),
+    )
     pod_up.add_argument(
         "--seed",
         default="",
@@ -3035,7 +3075,12 @@ Examples:
     agent_sub = agent_parser.add_subparsers(dest="agent_action")
     agent_sub.add_parser("list", help="List Kiro Crew agents")
     agent_create = agent_sub.add_parser("create", help="Create a Kiro Crew agent")
-    agent_create.add_argument("--name", required=True, help="Agent name")
+    agent_create.add_argument(
+        "--name",
+        required=True,
+        help="Agent id, or any name: shown as typed, stored under a URL-safe id",
+    )
+    agent_create.add_argument("--display-name", default="", help="Label the dashboard shows")
     agent_create.add_argument("--kiro-agent", default="kirocrew", help="Kiro agent name")
     agent_create.add_argument("--workspace", default="default", help="Workspace name")
     agent_create.add_argument(
@@ -3395,6 +3440,16 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # keys off to decide whether to arm itself (see start_dashboard). Cheap
         # and gateway-only — other CLI subcommands are short-lived and skip it.
         faulthandler.enable()
+        # An in-app restart reaches this image through os.execv, and execve
+        # preserves ITIMER_REAL while resetting a caught SIGALRM to its default
+        # disposition: the predecessor cancels its stall alarm before it execs,
+        # and this clears any deadline that still arrived -- one this image
+        # never armed -- before boot spends the seconds the watchdog is not yet
+        # running. Only while SIGALRM is at its default disposition, the same
+        # ownership rule the watchdog applies when it arms.
+        from kiro_crew.dashboard.loop_watchdog import disarm_inherited_alarm
+
+        disarm_inherited_alarm()
         # Install crash breadcrumbs (atexit + excepthook) before asyncio.run
         # so any fatal exception writes to crash.log.
         # The asyncio loop handler is installed later inside run().

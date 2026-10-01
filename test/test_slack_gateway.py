@@ -3565,6 +3565,7 @@ class TestRunMethod:
         stall = threading.Event()
         original_write_marker = run_marker.write_marker
         original_clear_marker = run_marker.clear_marker
+        original_clear_late = run_marker.clear_late_marker_write
 
         def stalled_write_marker(port):
             events.append("write-start")
@@ -3576,8 +3577,13 @@ class TestRunMethod:
             events.append("clear")
             original_clear_marker(port)
 
+        def recording_clear_late(port):
+            events.append("late-clear")
+            return original_clear_late(port)
+
         monkeypatch.setattr(run_marker, "write_marker", stalled_write_marker)
         monkeypatch.setattr(run_marker, "clear_marker", recording_clear_marker)
+        monkeypatch.setattr(run_marker, "clear_late_marker_write", recording_clear_late)
         marker = run_marker.marker_path(orch._dashboard_port)
         pid_marker = run_marker.pid_path(orch._dashboard_port)
         assert marker.exists()
@@ -3620,7 +3626,7 @@ class TestRunMethod:
             # worker would wake later and write markers OUTSIDE tmp_path.
             stall.set()
             for _ in range(200):  # up to ~10s; normally a few ms
-                if "write-start" not in events or events.count("clear") >= 2:
+                if "write-start" not in events or "late-clear" in events:
                     break
                 await asyncio.sleep(0.05)
 
@@ -3634,9 +3640,17 @@ class TestRunMethod:
         # timed-out clear. The writer thread must then self-clear them
         # (same thread, no event-loop callback os._exit could beat),
         # otherwise a stopped gateway leaves stale runtime state behind.
+        #
+        # The thread's clear is ``clear_late_marker_write``, scoped to the
+        # generation: it may run after the listener is free, where a location
+        # does not identify its owner, so it removes only this process's own
+        # write and only while the pid record still names this process. The
+        # shutdown-side ``clear_marker`` runs once and holds the listener.
         assert "write-end" in events
         assert events.index("write-end") > events.index("clear")
-        assert events.count("clear") == 2  # timed-out clear + writer self-clear
+        assert events.count("clear") == 1  # the timed-out shutdown clear
+        assert events.count("late-clear") == 1  # the writer's own self-clear
+        assert events.index("late-clear") > events.index("write-end")
         assert not marker.exists()
         assert not pid_marker.exists()
 
@@ -9249,6 +9263,27 @@ class TestWheelApplyReadsTheCapabilityCommand:
         assert handlers._update_info["latest_version"] == "9.9.9"
         assert handlers._update_info["check_status"] == "succeeded"
         ds.push_refresh.assert_called_with("update_available")
+
+    @pytest.mark.asyncio
+    async def test_provider_check_publishes_command_ownership_when_up_to_date(self, monkeypatch):
+        """The status frame must say a command owns updates even when the
+        provider finds nothing and no dashboard-side check has run."""
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+        from kiro_crew.platform.update_provider import CommandProvider, UpdateCheckResult
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        handlers._update_info.clear()
+        monkeypatch.setattr(gov, "update_required", lambda _v: False)
+        provider = CommandProvider(check_command="c", apply_command="a")
+        provider.check = AsyncMock(  # type: ignore[method-assign]
+            return_value=UpdateCheckResult(available=False)
+        )
+
+        await orch._check_for_updates_via_provider(provider)
+
+        assert handlers._update_info["managed_by"] == "command"
 
     @pytest.mark.asyncio
     async def test_auto_update_busy_defers_provider_apply(self, monkeypatch):

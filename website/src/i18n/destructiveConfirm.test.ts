@@ -207,6 +207,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'pages.artifactDeployPage.remove_profile_confirm',
   'pages.artifactsPage.remove_artifact_confirm',
   'pages.chatSidebar.delete_folder_confirm',
+  'pages.chatSidebar.unlink_source_link_confirm', // {{label}} = PR/Issue chip label, glyph-quoted per locale (UX #8072)
   'pages.devFleetPage.keeps_name_the_live_target_and_discards_the_stag', // cancel-branch body, bare {{name}}/{{staged}} #5725
   'pages.devFleetPage.keeps_this_checkout_the_live_target_and_discards', // cancel-branch body, bare {{staged}} #5725
   'pages.devFleetPage.make_name_live', // ASCII quotes → locale pair #5725
@@ -223,6 +224,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'pages.settings.remoteCrewPanel.confirm_cancel_remove', // instance operand on the armed cancel, quoted per locale
   'settings.secrets.delete_confirm',
   'settings.secrets.delete_managed_confirm',
+  'pages.overview.kiroCrewCfgTab.type_workspace_name_to_confirm', // quoted in all catalogs at introduction
   'pages.settings.securityPanel.trustedApps.revoke_confirm_title',
   'pages.settings.securityPanel.trustedApps.revoke_confirm_body',
 ]

@@ -48,6 +48,12 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/update", handlers.api_update_apply)
     app.router.add_post("/api/update/auto", handlers.api_update_auto)
     app.router.add_post("/api/update/channel", handlers.api_update_channel)
+    # A terminal `kirocrew update` on a git checkout pokes this so the running
+    # gateway drops its stale update verdict and re-checks now, instead of the
+    # About badge waiting up to 12h for the next poll. Self-authenticates over
+    # loopback + the local secret (the token-auth middleware lets the POST
+    # through via its method-scoped bypass), like /api/logout.
+    app.router.add_post("/api/update/revalidate", handlers.api_update_revalidate)
     app.router.add_post("/api/update/cancel", handlers.api_update_cancel)
     # In-app wheel update step-up (RFC OQ7): the SPA arms, only the host
     # approves. Arm/status are ordinary authenticated routes; approve

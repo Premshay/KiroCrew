@@ -72,17 +72,35 @@ def _ensure_utf8_process_environment() -> None:
     os.environ.update(_UTF8_PROCESS_ENV)
 
 
+def _disarm_process_alarm_before_exec() -> None:
+    """Cancel any pending process alarm before ``execv`` replaces this image.
+
+    ``execve`` preserves interval timers (``ITIMER_REAL`` included) and resets
+    every caught signal to its default disposition.  A dump-then-exit deadline
+    the loop-stall watchdog armed in this image would therefore reach the
+    successor as a default-action ``SIGALRM`` it never armed -- during its own
+    boot, before its watchdog exists to replace the deadline -- and end it with
+    no dump and no log line.  No process-wide deadline may outlive the image
+    that armed it, so both exec seams cancel it here, with no await between the
+    cancel and the exec.  A no-op where the timer does not exist (Windows).
+    """
+    arm_process_alarm(0.0)
+
+
 def reexec_launcher(launcher: str, args: Sequence[str]) -> None:
     """Re-enter a validated stable launcher, preserving its dispatch pathname.
 
     The launcher, not the core, replaces version-specific environment values.
     Windows execv joins its arguments without quoting, so quote each token for
     the native CRT parser. POSIX receives the original argument vector directly.
+    The pending loop-stall alarm is cancelled immediately before the exec (see
+    :func:`_disarm_process_alarm_before_exec`).
     """
     _ensure_utf8_process_environment()
     argv = [launcher, *args]
     if IS_WINDOWS:
         argv = [subprocess.list2cmdline([arg]) for arg in argv]
+    _disarm_process_alarm_before_exec()
     os.execv(launcher, argv)
 
 
@@ -98,7 +116,9 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     it in the child.  A full ``argv[0]`` containing spaces is split before the
     module flag, so Python treats the path suffix as a script name.  The
     executable path passed separately to ``execv`` still selects the exact
-    interpreter; only its display name needs to be space-free.
+    interpreter; only its display name needs to be space-free.  The pending
+    loop-stall alarm is cancelled immediately before the exec (see
+    :func:`_disarm_process_alarm_before_exec`).
     """
     # Publish UTF-8 before exec so in-app gateway restarts (Tailnet, update,
     # stale-assets, explicit restart) cannot create a successor that inherits a
@@ -113,6 +133,7 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     # there would shadow the stdlib in the restarted process.
     argv = isolated_python_argv("-P", "-m", module, *args, executable=resolved)
     argv[0] = argv0
+    _disarm_process_alarm_before_exec()
     os.execv(resolved, argv)
 
 
@@ -820,18 +841,43 @@ _WIN_LOCK_POLL_SECS = _LOCK_POLL_SECS
 _WIN_LOCK_TIMEOUT_SECS = _LOCK_TIMEOUT_SECS
 
 
-def _lock_timeout_message(timeout: float, *, exclusive: bool = True) -> str:
-    """The one refusal string both platforms raise when the ceiling is hit.
+def _on_event_loop() -> bool:
+    """True when called on a thread that is running an asyncio event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
-    Names the ceiling and the reason. A caller that catches this as best-effort
+
+def _lock_timeout_message(
+    waited: float,
+    *,
+    exclusive: bool = True,
+    ceiling: float | None = None,
+    on_loop: bool = False,
+) -> str:
+    """The one refusal string both platforms raise when an acquire gives up.
+
+    Names how long the acquire REALLY waited and what was observed: the lock was
+    still held. It deliberately names no cause. The acquire cannot tell a hung
+    holder from a busy one or from a queue of waiters, and naming one of them
+    sends an operator after the wrong fix. On the event-loop thread the acquire
+    makes one attempt and never waits, so the message says that instead of
+    naming a ceiling it never applied. A caller that catches this as best-effort
     work has nothing else to report, so this message is the only evidence of WHY
     the critical section was declined.
     """
     kind = "exclusive" if exclusive else "shared"
-    return (
-        f"could not acquire {kind} file lock within {timeout:g}s "
-        "(a holder is stuck); refusing to proceed unserialized"
-    )
+    if on_loop:
+        detail = (
+            f"still held after waiting {waited:.2f}s (one attempt: an acquire on "
+            "the event-loop thread never waits; take it from a worker thread to wait)"
+        )
+    else:
+        limit = waited if ceiling is None else ceiling
+        detail = f"still held after waiting {waited:.2f}s (limit {limit:g}s)"
+    return f"could not acquire {kind} file lock: {detail}; refusing to proceed unserialized"
 
 
 def _posix_acquire_blocking(
@@ -879,12 +925,7 @@ def _posix_acquire_blocking(
                 raise
             return False
 
-    try:
-        asyncio.get_running_loop()
-        on_loop = True
-    except RuntimeError:
-        on_loop = False
-    if on_loop:
+    if _on_event_loop():
         # Single attempt only -- a poll-sleep here blocks the event loop.
         return _try_once()
 
@@ -926,12 +967,7 @@ def _win_acquire_blocking(fd: int, *, timeout: float = _LOCK_TIMEOUT_SECS) -> bo
         except OSError:
             return False
 
-    try:
-        asyncio.get_running_loop()
-        on_loop = True
-    except RuntimeError:
-        on_loop = False
-    if on_loop:
+    if _on_event_loop():
         # Single attempt only — a spin-sleep here blocks the event loop.
         return _try_once()
 
@@ -974,7 +1010,11 @@ def file_lock(
     called on the asyncio event-loop thread: a poll-sleep there would freeze chat
     and heartbeat for the whole wait, and a freeze long enough to miss a heartbeat
     is a supervisor kill, so a contended on-loop caller is refused at once and
-    fails closed rather than stalling every other session. The timeout is a safety
+    fails closed rather than stalling every other session. ``flock`` counts a
+    second descriptor in this same process as a competing holder, so even a
+    sibling thread's brief critical section refuses an on-loop caller: a caller
+    that must wait for the lock calls this from a worker thread
+    (``asyncio.to_thread``), where the wait is a real one. The timeout is a safety
     ceiling against a stuck holder, not a normal wait. ``required`` is kept for
     call-site intent and does not change the outcome (both paths refuse to proceed
     without the lock).
@@ -1011,19 +1051,22 @@ def file_lock(
             # BlockingIOError (an OSError) when held: same fail-closed contract
             # as the Windows branch, reported by the platform rather than by us.
             fcntl.flock(fd, mode | fcntl.LOCK_NB)
-        elif not _posix_acquire_blocking(fd, mode, timeout=timeout):
-            # Past the ceiling the holder is stuck, not busy. Refuse LOUDLY
-            # rather than wait on it without limit: an unbounded wait here leaves
-            # a boot with no port bound and no log line, while a raise is
-            # something the caller can report and recover from -- the gateway
-            # boot path logs it at ERROR, prints the repair command, and still
-            # binds its port.
-            raise OSError(
-                _lock_timeout_message(
-                    _LOCK_TIMEOUT_SECS if timeout is None else timeout,
-                    exclusive=exclusive,
+        else:
+            started = time.monotonic()
+            if not _posix_acquire_blocking(fd, mode, timeout=timeout):
+                # Refuse LOUDLY rather than wait without limit: an unbounded wait
+                # here leaves a boot with no port bound and no log line, while a
+                # raise is something the caller can report and recover from --
+                # the gateway boot path logs it at ERROR, prints the repair
+                # command, and still binds its port.
+                raise OSError(
+                    _lock_timeout_message(
+                        time.monotonic() - started,
+                        exclusive=exclusive,
+                        ceiling=_LOCK_TIMEOUT_SECS if timeout is None else timeout,
+                        on_loop=_on_event_loop(),
+                    )
                 )
-            )
         try:
             yield
         finally:
@@ -1041,6 +1084,7 @@ def file_lock(
         # change the outcome — both paths refuse to proceed lock-less.
         # The waiting path with no explicit ceiling is called with no keyword, so
         # the default-argument call shape existing tests stub out is preserved.
+        started = time.monotonic()
         if not wait:
             ceiling = 0.0
             acquired = _win_acquire_blocking(fd, timeout=0.0)
@@ -1053,9 +1097,16 @@ def file_lock(
         if not acquired:
             if not wait:
                 # Held right now. BlockingIOError so the caller can tell this
-                # from the stuck-holder ceiling below, matching POSIX LOCK_NB.
+                # from the timed-out wait below, matching POSIX LOCK_NB.
                 raise BlockingIOError("file lock is held; not waiting for it")
-            raise OSError(_lock_timeout_message(ceiling, exclusive=exclusive))
+            raise OSError(
+                _lock_timeout_message(
+                    time.monotonic() - started,
+                    exclusive=exclusive,
+                    ceiling=ceiling,
+                    on_loop=_on_event_loop(),
+                )
+            )
         try:
             yield
         finally:
@@ -1109,13 +1160,27 @@ def acquire_lock(fd: int, *, exclusive: bool = True) -> None:
     proceeding lock-less is the fail-open that loses writes. Pair every call
     with :func:`release_lock` on the same ``fd``.
     """
+    started = time.monotonic()
     if IS_POSIX:
         mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         if not _posix_acquire_blocking(fd, mode):
-            raise OSError(_lock_timeout_message(_LOCK_TIMEOUT_SECS, exclusive=exclusive))
+            raise OSError(
+                _lock_timeout_message(
+                    time.monotonic() - started,
+                    exclusive=exclusive,
+                    ceiling=_LOCK_TIMEOUT_SECS,
+                    on_loop=_on_event_loop(),
+                )
+            )
         return
     if not _win_acquire_blocking(fd):
-        raise OSError(_lock_timeout_message(_LOCK_TIMEOUT_SECS))
+        raise OSError(
+            _lock_timeout_message(
+                time.monotonic() - started,
+                ceiling=_LOCK_TIMEOUT_SECS,
+                on_loop=_on_event_loop(),
+            )
+        )
 
 
 def release_lock(fd: int) -> None:
@@ -1736,6 +1801,136 @@ def darwin_process_path(pid: int) -> str | None:
         if length <= 0:
             return None
         return buf.raw[:length].decode("utf-8", errors="replace") or None
+    except Exception:
+        return None
+
+
+# ``proc_pidinfo(PROC_PIDLISTFDS)`` lists a process's open descriptors as
+# ``proc_fdinfo`` records: an int32 ``proc_fd`` and a uint32 ``proc_fdtype``
+# (8 bytes each). ``PROX_FDTYPE_SOCKET`` marks a socket.
+_DARWIN_PROC_PIDLISTFDS = 1
+_DARWIN_PROC_FDINFO_SIZE = 8
+_DARWIN_PROX_FDTYPE_SOCKET = 2
+# ``proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`` fills a ``socket_fdinfo``: a 24-byte
+# ``proc_fileinfo`` then a ``socket_info``. Inside ``socket_info`` the
+# 136-byte ``vinfo_stat`` is followed by the socket fields, putting ``soi_kind``
+# at 232 and the ``soi_proto`` union at 240; for ``SOCKINFO_TCP`` that union is
+# a ``tcp_sockinfo`` whose ``tcpsi_state`` follows the 80-byte ``in_sockinfo``.
+# The union is sized by ``un_sockinfo`` (528), so the whole record is 792 bytes;
+# the fill size doubles as the layout check, as for the probes above.
+_DARWIN_PROC_PIDFDSOCKETINFO = 3
+_DARWIN_SOCKET_FDINFO_SIZE = 792
+_DARWIN_SOI_KIND_OFFSET = 24 + 232
+_DARWIN_TCPSI_STATE_OFFSET = 24 + 240 + 80
+_DARWIN_SOCKINFO_TCP = 2
+_DARWIN_TSI_S_ESTABLISHED = 4
+# Inside ``in_sockinfo`` (which opens ``tcp_sockinfo``): ``insi_vflag`` at 24,
+# then ``insi_faddr`` at 32, a 16-byte union whose IPv4 form keeps the address
+# in its last four bytes. ``INI_IPV4`` / ``INI_IPV6`` are the vflag bits.
+_DARWIN_INSI_VFLAG_OFFSET = 24 + 240 + 24
+_DARWIN_INSI_FADDR_OFFSET = 24 + 240 + 32
+_DARWIN_INI_IPV4 = 0x1
+_DARWIN_INI_IPV6 = 0x2
+_DARWIN_IN6_LOOPBACK = bytes(15) + b"\x01"
+_DARWIN_IN6_V4MAPPED_PREFIX = bytes(10) + b"\xff\xff"
+# Descriptor-count bound for one listing. A process past it is not enumerated
+# rather than enumerated in part, so a partial answer never reads as "none".
+_DARWIN_MAX_FDS = 16384
+
+_darwin_libproc_fd_bound = False
+
+
+def _darwin_libproc_fd_handle() -> Any:
+    """The cached ``libproc`` handle with ``proc_pidfdinfo`` declared, or None.
+
+    Bound separately so a libproc without the symbol still serves every probe
+    that needs only ``proc_pidinfo``.
+    """
+    global _darwin_libproc_fd_bound
+    lib = _darwin_libproc_handle()
+    if lib is None:
+        return None
+    if _darwin_libproc_fd_bound:
+        return lib
+    try:
+        lib.proc_pidfdinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        lib.proc_pidfdinfo.restype = ctypes.c_int
+    except Exception:
+        return None
+    _darwin_libproc_fd_bound = True
+    return lib
+
+
+def _darwin_peer_is_loopback(record: bytes) -> bool:
+    """Whether a ``socket_fdinfo`` record's foreign address is loopback.
+
+    An unknown address family reads as loopback, so a record this parser does
+    not understand is never counted as a remote call.
+    """
+    vflag = record[_DARWIN_INSI_VFLAG_OFFSET]
+    faddr = record[_DARWIN_INSI_FADDR_OFFSET : _DARWIN_INSI_FADDR_OFFSET + 16]
+    if vflag & _DARWIN_INI_IPV4:
+        return faddr[12] == 127
+    if vflag & _DARWIN_INI_IPV6:
+        if faddr == _DARWIN_IN6_LOOPBACK:
+            return True
+        return faddr[:12] == _DARWIN_IN6_V4MAPPED_PREFIX and faddr[12] == 127
+    return True
+
+
+def darwin_established_tcp_count(pid: int) -> int | None:
+    """How many ESTABLISHED TCP sockets to a non-loopback peer *pid* holds.
+
+    None when unreadable. A loopback peer is a local service, not a remote call.
+
+    The macOS counterpart of reading ``/proc/<pid>/fd`` against
+    ``/proc/<pid>/net/tcp``: in-process, no entitlement for a same-uid process,
+    nothing exec'd. A socket whose record does not come back at the exact
+    ``socket_fdinfo`` size is skipped, and a listing that cannot be read at all
+    is None, so a caller never reads a layout mismatch as "no connections".
+    """
+    lib = _darwin_libproc_fd_handle()
+    if lib is None:
+        return None
+    try:
+        needed = lib.proc_pidinfo(pid, _DARWIN_PROC_PIDLISTFDS, 0, None, 0)
+        if needed <= 0:
+            return None
+        # Headroom for descriptors opened between the size query and the read.
+        size = min(
+            needed + 32 * _DARWIN_PROC_FDINFO_SIZE, _DARWIN_MAX_FDS * _DARWIN_PROC_FDINFO_SIZE
+        )
+        buf = ctypes.create_string_buffer(size)
+        filled = lib.proc_pidinfo(pid, _DARWIN_PROC_PIDLISTFDS, 0, buf, size)
+        if filled <= 0 or filled % _DARWIN_PROC_FDINFO_SIZE:
+            return None
+        if filled >= size:
+            # A full buffer may be a truncated one: refuse rather than undercount.
+            return None
+        info = ctypes.create_string_buffer(_DARWIN_SOCKET_FDINFO_SIZE)
+        count = 0
+        for off in range(0, filled, _DARWIN_PROC_FDINFO_SIZE):
+            fd, fdtype = struct.unpack_from("<iI", buf.raw, off)
+            if fdtype != _DARWIN_PROX_FDTYPE_SOCKET:
+                continue
+            got = lib.proc_pidfdinfo(
+                pid, fd, _DARWIN_PROC_PIDFDSOCKETINFO, info, _DARWIN_SOCKET_FDINFO_SIZE
+            )
+            if got != _DARWIN_SOCKET_FDINFO_SIZE:
+                continue
+            kind = struct.unpack_from("<i", info.raw, _DARWIN_SOI_KIND_OFFSET)[0]
+            if kind != _DARWIN_SOCKINFO_TCP:
+                continue
+            state = struct.unpack_from("<i", info.raw, _DARWIN_TCPSI_STATE_OFFSET)[0]
+            if state == _DARWIN_TSI_S_ESTABLISHED and not _darwin_peer_is_loopback(info.raw):
+                count += 1
+        return count
     except Exception:
         return None
 
@@ -7173,10 +7368,7 @@ def pin_directory(path: str | os.PathLike) -> int:
     O_NOFOLLOW``. Release with ``os.close``.
     """
     if IS_POSIX:
-        return os.open(
-            os.fspath(path),
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
+        return os.open(os.fspath(path), pinned_dir_flags())
 
     fd = _win_open_without_following(path)
     try:
@@ -7187,6 +7379,325 @@ def pin_directory(path: str | os.PathLike) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def pinned_dir_flags() -> int:
+    """POSIX open flags for a pinned directory: read-only, a directory, never a link.
+
+    ``O_NOFOLLOW`` is part of the requirement rather than an extra: without it each
+    open would happily traverse whatever link sits at the name, which is the hole the
+    pin exists to close. Called rather than captured at import, because the
+    Windows-simulation tests delete ``os.O_NOFOLLOW`` at runtime and a frozen constant
+    would keep offering a flag the platform does not have.
+
+    This is the same triple ``pinned_fs.dir_flags()`` publishes, and it is spelled
+    again here because of the import direction, not by preference: ``pinned_fs``
+    imports THIS module for its own Windows no-reparse open, so this layer cannot
+    import it back. ``test_pinned_directory.py`` asserts the two are equal, so the
+    copy cannot drift silently -- a flag added on either side reddens that test.
+    """
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+# Levels a pin CHAIN may descend below the directory it was opened on. The
+# recursion this class invites is bounded here rather than at each call site,
+# because the hazard belongs to the chain: every level holds a descriptor for as
+# long as the level below it is in use, so a planted chain costs both stack frames
+# and file descriptors, and the inputs are untrusted content (an agent-writable
+# artifact store, a hand-built snapshot archive). Unbounded, a deep chain turns a
+# delete into a swallowed RecursionError/EMFILE whose only visible effect is the
+# root refusing to go with ENOTEMPTY, and an import into an unclassified crash.
+# The refusal is an OSError from :meth:`PinnedDirectory.child`, so each caller's
+# EXISTING error policy classifies it -- warn-and-continue where residue is
+# already reported, propagate where the operation must fail closed.
+#
+# 64 is ``skills._PROJECT_SKILL_MAX_DEPTH``'s number and its reasoning: past any
+# legitimate tree, far short of the interpreter's recursion limit and of any
+# descriptor soft limit. A caller whose domain is shallower states its own tighter
+# cap (``skills._PENDING_SCRIPT_MAX_DEPTH`` is 8) and reaches it first.
+PINNED_TREE_MAX_DEPTH = 64
+
+
+class PinnedDirectory:
+    """Act on the ENTRIES of the directory this was opened on, never on its name.
+
+    :func:`pin_directory` hands back a descriptor; this is the operations that go
+    with it, because holding the descriptor is only half of what a caller needs. A
+    screen and the act that follows it must reach the same object, and the two
+    platforms reach that property by OPPOSITE routes:
+
+    * POSIX: every call is ``dir_fd=``-relative, so the descriptor IS the
+      directory whatever its name now resolves to. It must be that way, because
+      the pin does NOT stop a rename here -- a name re-resolved after the screen
+      is exactly the hole.
+    * Windows: there are no ``dir_fd`` operations at all (``os.open``,
+      ``os.listdir``, ``os.unlink`` and ``os.rmdir`` are in neither
+      ``os.supports_fd`` nor ``os.supports_dir_fd``), so every call goes by path
+      -- and that is sound only because the pin makes the path stable: the handle
+      is opened without ``FILE_SHARE_DELETE``, so while it lives this directory
+      and every ancestor refuse a rename and a delete.
+
+    So neither route works on the other platform, and a caller written in terms of
+    one of them is broken on the other. That asymmetry is the whole reason this
+    exists rather than each site branching on ``IS_POSIX`` itself.
+
+    A child is opened THROUGH the parent, and the parent stays pinned while the
+    child is in use, so a chain of these pins the whole path. :meth:`child`
+    refuses a link at the name on both platforms, which is what makes a
+    screen-then-descend sequence safe: the refusal happens in the open, not in a
+    check before it.
+
+    Use it as a context manager; the descriptor is closed on exit. Removing the
+    directory ITSELF is the parent's job (``parent.rmdir(name)``), both because a
+    pinned directory on Windows cannot be removed while the handle lives and
+    because a by-name removal is the thing this class exists to avoid.
+
+    A chain is bounded: :meth:`child` refuses past ``PINNED_TREE_MAX_DEPTH`` levels
+    below the directory the chain started on. See that constant for why the bound
+    lives here and not in each caller.
+    """
+
+    __slots__ = ("_depth", "_fd", "_path")
+
+    def __init__(self, fd: int, path: str, depth: int = 0) -> None:
+        self._fd = fd
+        self._path = path
+        self._depth = depth
+
+    @property
+    def path(self) -> str:
+        """The path this was opened on -- for MESSAGES, not for operations."""
+        return self._path
+
+    def __enter__(self) -> PinnedDirectory:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        os.close(self._fd)
+
+    def names(self) -> list[str]:
+        """The entry names, read through the pin."""
+        if IS_POSIX:
+            return os.listdir(self._fd)
+        return os.listdir(self._path)
+
+    def names_bounded(self, limit: int) -> list[str] | None:
+        """Up to *limit* entry names, or None when the directory holds more than that.
+
+        The counterpart to :meth:`names` for a directory whose contents are written by
+        an agent. Scanning stops at ``limit + 1``, so an attacker-sized directory is
+        never materialized in one allocation the way ``sorted(os.listdir(...))`` would:
+        that eager list is itself the exhaustion, spent BEFORE any budget the caller
+        applies afterwards could refuse it.
+
+        None means "over budget", deliberately not a truncated list -- a caller handed
+        the first *limit* names would act on a partial view of the directory while
+        believing it saw all of it. Refusing is the only honest answer.
+        """
+        out: list[str] = []
+        with os.scandir(self._fd if IS_POSIX else self._path) as scanner:
+            for entry in scanner:
+                out.append(entry.name)
+                if len(out) > limit:
+                    return None
+        return out
+
+    def _lstat(self, name: str) -> os.stat_result | None:
+        """``lstat`` of *name* in this directory, or None if it cannot be read."""
+        try:
+            if IS_POSIX:
+                return os.stat(name, dir_fd=self._fd, follow_symlinks=False)
+            return os.lstat(os.path.join(self._path, name))
+        except OSError:
+            return None
+
+    def is_link(self, name: str) -> bool:
+        """Whether *name* is a symlink or (on Windows) a directory junction."""
+        if IS_POSIX:
+            info = self._lstat(name)
+            return info is not None and stat.S_ISLNK(info.st_mode)
+        return is_link_or_junction(os.path.join(self._path, name))
+
+    def is_dir(self, name: str) -> bool:
+        """Whether *name* is a real directory -- a link answers False, not its target's shape."""
+        if self.is_link(name):
+            return False
+        info = self._lstat(name)
+        return info is not None and stat.S_ISDIR(info.st_mode)
+
+    def unlink(self, name: str) -> None:
+        """Remove the non-directory *name*. A link is removed, never its target."""
+        if IS_POSIX:
+            os.unlink(name, dir_fd=self._fd)
+            return
+        unlink_link_or_junction(os.path.join(self._path, name))
+
+    def rmdir(self, name: str) -> None:
+        """Remove the EMPTY directory *name* in this directory."""
+        if IS_POSIX:
+            os.rmdir(name, dir_fd=self._fd)
+            return
+        os.rmdir(os.path.join(self._path, name))
+
+    def child(self, name: str) -> PinnedDirectory:
+        """Pin the child directory *name*, reached through this pin.
+
+        Raises ``NotADirectoryError`` for a link or a non-directory at the name --
+        the refusal is the open itself, so there is no window between deciding the
+        name is a real directory and having it open.
+
+        Raises ``OSError`` with ``ENAMETOOLONG`` past ``PINNED_TREE_MAX_DEPTH``
+        levels below where the chain started, BEFORE opening anything, so a planted
+        chain cannot spend another frame or another descriptor. A caller that
+        dispatches on what is at the name -- the shape every consumer here uses --
+        re-raises this for a real directory, which is the intended outcome: too deep
+        is a refusal to be classified by the caller, never a link to be removed.
+        """
+        depth = self._depth + 1
+        if depth > PINNED_TREE_MAX_DEPTH:
+            raise OSError(
+                errno.ENAMETOOLONG,
+                f"pinned traversal deeper than {PINNED_TREE_MAX_DEPTH} levels",
+                os.path.join(self._path, name),
+            )
+        if IS_POSIX:
+            fd = os.open(name, pinned_dir_flags(), dir_fd=self._fd)
+            return PinnedDirectory(fd, os.path.join(self._path, name), depth)
+        child_path = os.path.join(self._path, name)
+        return PinnedDirectory(pin_directory(child_path), child_path, depth)
+
+    def child_if_real_dir(self, name: str) -> PinnedDirectory | None:
+        """Pin the child directory *name*, or None when *name* is not a real directory.
+
+        The screen-then-descend fallback, in one place. Three callers need it and each
+        one does something DIFFERENT with the answer, so what is shared is the
+        question, not the action: two of them remove the entry, one deliberately
+        leaves it alone. Hoisting the question and leaving the action at the call site
+        is what keeps the difference visible.
+
+        The subtle part is here rather than copied: when :meth:`child` refuses, the
+        dispatch asks what is at the name NOW and never keys on the exception class.
+        Linux answers ENOTDIR for ``O_DIRECTORY | O_NOFOLLOW`` on a symlink but ELOOP
+        is equally permitted, and the Windows open raises ``NotADirectoryError`` for a
+        reparse point; a caller keying on one class silently takes the wrong branch
+        wherever the kernel picks another.
+
+        A real directory that still refuses to open RE-RAISES, which is also how the
+        ``ENAMETOOLONG`` refusal :meth:`child` makes past ``PINNED_TREE_MAX_DEPTH``
+        reaches the caller: a tree nested past the bound fails the operation instead of
+        being treated as an entry to delete.
+        """
+        try:
+            return self.child(name)
+        except OSError:
+            if self.is_link(name) or not self.is_dir(name):
+                return None
+            raise
+
+    def _open_file(self, name: str) -> int:
+        """Open the regular file *name* in this directory for reading.
+
+        The leaf counterpart to :meth:`child`, and the reason a caller can both
+        JUDGE and READ an entry in one traversal instead of screening names and
+        re-resolving them afterwards. A link at the name is refused by the open
+        itself, so there is no check-to-read window for an adversary to aim at.
+
+        ``O_NONBLOCK`` is set so the OPEN cannot block: a FIFO at the name would
+        otherwise wait for a writer, and a hung read is a lost test RUN rather than
+        a failed one. It has no effect on a regular file. What was opened is then a
+        question for ``fstat`` on the descriptor, which is why :meth:`_read_bytes`
+        asserts there rather than predicting here.
+
+        Raises ``OSError``/``NotADirectoryError`` for a link, ``IsADirectoryError``
+        for a directory. Release the descriptor with ``os.close``.
+        """
+        if IS_POSIX:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            return os.open(name, flags, dir_fd=self._fd)
+        return open_file_no_reparse(os.path.join(self._path, name), nonblocking=True)
+
+    def _read_bytes(self, name: str, max_bytes: int | None = None) -> bytes:
+        """The bytes of the regular file *name*, read through this pin.
+
+        Refuses a link at the name, as :meth:`_open_file` does, so the bytes come
+        from the entry that was inspected rather than from wherever its name points
+        by the time the read happens. Every further question is asked of the
+        DESCRIPTOR, which is a fact about what was opened rather than a prediction
+        about what a later open would find:
+
+        * not a REGULAR file -- a directory, a device, a FIFO -- is refused.
+        * ``st_nlink > 1`` is refused. A hardlink is invisible to every
+          path-based guard because it shares its target's inode while carrying its
+          own name, so a sensitive file hardlinked into a tree the caller believes
+          it owns would otherwise be read out through it. This is the refusal
+          ``pinned_fs.refuse_hardlink_alias`` makes for that module's write and copy
+          paths, applied to a READ because what this serves is an agent-written tree
+          going out through an API.
+        * over *max_bytes*, when given, is refused with ``EFBIG`` -- and refused from
+          that same ``fstat`` rather than from a stat taken before the open, so the
+          size belongs to the file actually being read. The READ is bounded too, not
+          just the size check: a file that grows between the two stops at the cap
+          instead of being followed upward.
+        """
+        fd = self._open_file(name)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+                raise OSError(
+                    errno.EINVAL,
+                    "not a private regular file",
+                    os.path.join(self._path, name),
+                )
+            if max_bytes is not None and info.st_size > max_bytes:
+                raise OSError(
+                    errno.EFBIG,
+                    f"larger than the {max_bytes}-byte cap",
+                    os.path.join(self._path, name),
+                )
+            chunks: list[bytes] = []
+            held = 0
+            while True:
+                block = os.read(fd, 1 << 16)
+                if not block:
+                    return b"".join(chunks)
+                held += len(block)
+                if max_bytes is not None and held > max_bytes:
+                    raise OSError(
+                        errno.EFBIG,
+                        f"grew past the {max_bytes}-byte cap while being read",
+                        os.path.join(self._path, name),
+                    )
+                chunks.append(block)
+        finally:
+            os.close(fd)
+
+    def read_text(self, name: str, encoding: str = "utf-8", max_bytes: int | None = None) -> str:
+        """The text of the regular file *name*, read through this pin.
+
+        The whole read surface: a link at the name is refused by the open, and the
+        descriptor's own ``fstat`` rejects a non-regular entry, a hardlink, and
+        anything over *max_bytes* when the caller sets one, so the bytes come from the
+        entry that was inspected and cannot exceed what the caller agreed to hold. The
+        layers under this one are private because nothing outside needs them -- a
+        caller reaching for a raw descriptor here would be operating outside the pin
+        this class exists to hold.
+
+        Newlines are translated exactly as ``Path.read_text`` translates them. That
+        is not cosmetic: a caller swapping a by-path ``read_text`` for this must not
+        begin serving ``\\r\\n`` to its own consumers on Windows, where the bytes on
+        disk carry it and the old read silently normalised it away.
+        """
+        text = self._read_bytes(name, max_bytes).decode(encoding)
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def pinned_directory(path: str | os.PathLike) -> PinnedDirectory:
+    """Open *path* as a :class:`PinnedDirectory`. Refuses a link at the name."""
+    target = os.fspath(path)
+    return PinnedDirectory(pin_directory(target), target)
 
 
 def _win_open_without_following(path: str | os.PathLike) -> int:
@@ -9358,6 +9869,69 @@ def host_available_mib() -> int:
         mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
         return (mem[1] // _MIB_BYTES) if mem else 0
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Process alarm and the suspend-inclusive clock
+# ---------------------------------------------------------------------------
+
+
+def process_alarm_available() -> bool:
+    """Whether :func:`arm_process_alarm` can arm anything on this platform."""
+    return hasattr(signal, "setitimer") and hasattr(signal, "ITIMER_REAL")
+
+
+def arm_process_alarm(seconds: float) -> bool:
+    """Deliver ``SIGALRM`` to this process after *seconds*; ``0`` cancels.
+
+    ``setitimer(ITIMER_REAL)`` is the kernel's per-process countdown: it
+    needs no thread, no GIL and no root, and re-arming replaces the pending
+    deadline.  On Linux the kernel runs it on ``CLOCK_MONOTONIC``, which
+    stands still through a suspend, so a deadline armed before a sleep keeps
+    its remaining time on resume instead of firing the instant the host wakes
+    (``copy_signal`` initialises the process's ``real_timer`` on that clock).
+    macOS schedules it on the absolute mach timebase, which also stops during
+    sleep.  Returns ``False`` on a platform without the timer (Windows), where
+    the caller must do without a deadline of this kind.
+    """
+    if not process_alarm_available():
+        return False
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    return True
+
+
+def boottime_now() -> float | None:
+    """Now, on the clock this host dates process starts against.
+
+    Linux: ``CLOCK_BOOTTIME`` counts time spent suspended, exactly as
+    ``/proc/uptime`` and the ``starttime`` field of ``/proc/<pid>/stat`` do.
+    ``time.monotonic()`` (``CLOCK_MONOTONIC``) does not, so the two MUST NOT be
+    mixed in one comparison: after a suspend of S seconds, a boot-clock age minus
+    a monotonic stamp places a process S seconds EARLIER than it really started,
+    which is how a live shell child comes to look like it predates its own
+    dispatch.  Read beside ``time.monotonic()`` across one interval, the
+    difference in their advance is the time the host spent suspended — the
+    reading the loop watchdog uses to name a resume.
+
+    macOS: ``libproc`` reports a process's start as an absolute wall-clock
+    instant (``pbi_start_tvsec``), so the stamp is ``time.time()`` — the same
+    clock, suspend included. That clock can STEP (NTP correction after a VM
+    resume, an admin reset), and a backward step between the stamp and the
+    runtime's fork dates a live child before its own dispatch. The liveness
+    oracle pairs this stamp with :func:`kiro_crew.acp.liveness.steady_now` and
+    refuses to attribute by start time once the two disagree (see
+    :meth:`kiro_crew.acp.liveness.LivenessOracle._started_after_dispatch`);
+    the stamp alone cannot tell a step from a slow spawn.
+
+    Returns None where no such clock is available, which every caller must read
+    as "cannot attribute" rather than as a time.
+    """
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):  # pragma: no cover - platform dependent
+        if sys.platform == "darwin":
+            return time.time()
+        return None
 
 
 # ---------------------------------------------------------------------------

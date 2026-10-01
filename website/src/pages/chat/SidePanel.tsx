@@ -5,62 +5,26 @@ import { useDevMode } from '../../hooks/useDevMode'
 import { usePointerDrag } from '../../hooks/usePointerDrag'
 import { useLongPressReorder } from '../../hooks/useLongPressReorder'
 import { Reorder } from 'framer-motion'
-import {
-  FileText,
-  Bot,
-  Workflow,
-  ScrollText,
-  MessageCircleQuestionMark,
-  TerminalSquare,
-  GitCompare,
-  GitPullRequest,
-  GitBranch,
-  History,
-  Plus,
-  MoreHorizontal,
-  X,
-  Hash,
-  Pen,
-  Columns2,
-  Component,
-  Globe,
-  CircleDot,
-  Folder,
-  Folders,
-  Link as LinkIcon,
-  PanelRight,
-  PanelBottom,
-  Layers,
-  ListTree,
-  Pin,
-} from 'lucide-react'
+import { FileText, Bot, Workflow, ScrollText, MessageCircleQuestionMark, TerminalSquare, GitCompare, GitPullRequest, GitBranch, History, Plus, MoreHorizontal, X, Hash, Pen, Columns2, Component, Globe, CircleDot, Folder, Folders, Link as LinkIcon, PanelRight, PanelBottom, Layers, ListTree, Pin } from 'lucide-react'
 import { PanelRightLight } from '../../components/icons/panels'
 import ActivityViewer from './ActivityViewer'
+import CommandCenterPanel from './command-center/CommandCenterPanel'
 import DiffPanel from '../../components/DiffPanel'
 import DetailPanel from '../../components/DetailPanel'
 import MarkdownPanel, { type MarkdownPanelHandle } from '../../components/MarkdownPanel'
 import ArtifactPanel from '../../components/ArtifactPanel'
 import FolderPanel from './FolderPanel'
 import FilesHomePanel from './FilesHomePanel'
-import FileBrowserRail, { useTreeAvailable } from './FileBrowserRail'
+import FileBrowserRail from './FileBrowserRail'
 import WebPreviewPanel from '../../components/WebPreviewPanel'
-import CliPanel, {
-  disposeTerminalSession,
-  useDeleteTerminalSession,
-} from '../../components/CliPanel'
+import CliPanel, { disposeTerminalSession, useDeleteTerminalSession } from '../../components/CliPanel'
 import { countLines } from '../../components/FileChangeChips'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { useTerminalEnabled, useTerminalTitle } from '../../utils/terminalRegistry'
 import type { usePanelTabs, ViewKind, PanelTab, TabKind } from '../../hooks/usePanelTabs'
 import { PINNED_VIEWS, useAllAppTabs, usePanelTerminalsPending } from '../../hooks/usePanelTabs'
-import {
-  usePanelTabDescriptors,
-  useInstalledApps,
-  panelTabDescriptor,
-  isPanelTabKind,
-  type PanelTabDescriptor,
-} from '../../hooks/panelTabRegistry'
+import { usePanelTabDescriptors, useInstalledApps, panelTabDescriptor, isPanelTabKind, type PanelTabDescriptor } from '../../hooks/panelTabRegistry'
 import AppHost from '../../components/AppHost'
 import { appIcon } from '../../apps/appIcons'
 import { scrollMemoryKeyFor } from '../../hooks/useScrollMemory'
@@ -68,22 +32,15 @@ import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { useDiffSplit } from '../../hooks/useDiffSplit'
 import { useSidePanelDock } from '../../hooks/useSidePanelDock'
 import {
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
+  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator
 } from '../../components/ui/dropdown-menu'
-import { safeSetItem } from '../../utils/safeStorage'
 import { ContentSkeleton } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
-import {
-  fetchFileRead,
-  fileReadQueryKey,
-  FILE_READ_STALE_MS,
-  isPartialRead,
-} from '../../utils/fileReadQuery'
+import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS, isPartialRead } from '../../utils/fileReadQuery'
 import { errMessage } from '../../utils/thunkError'
+import { useReducedMotion } from '../../hooks/useReducedMotion'
+import { SIDE_PANEL_HEIGHT_KEY, SIDE_PANEL_WIDTH_KEY, loadSidePanelDim, ownDim, saveSidePanelDim } from './sidePanelWidth'
+import { SIDE_PANEL_MOTION_MS, sidePanelDimTransition } from './sidePanelMount'
 import { useAppSelector } from '../../store'
 import { selectSlotSubagents, selectSlotToolLog } from '../../store/chatSlice'
 import { mcpAppKey } from '../../store/chatSlice'
@@ -98,27 +55,13 @@ import { i18nT } from '../../i18n/t'
 // — their icon comes from the manifest descriptor via `iconForKind` instead.
 type BuiltinTabKind = Exclude<TabKind, `app:${string}`>
 const KIND_ICON: Record<BuiltinTabKind, ReactNode> = {
-  changes: <GitPullRequest size={16} />,
-  issues: <CircleDot size={16} />,
-  files: <Folders size={16} />,
-  links: <LinkIcon size={16} />,
-  artifacts: <Component size={16} />,
-  subagents: <Bot size={16} />,
-  workflows: <Workflow size={16} />,
-  logs: <ScrollText size={16} />,
-  crewlog: <History size={16} />,
-  context: <Layers size={16} />,
-  side: <MessageCircleQuestionMark size={16} />,
-  terminal: <TerminalSquare size={16} />,
-  browser: <Globe size={16} />,
+  'command-center': <PanelRight size={16} />,
+  changes: <GitPullRequest size={16} />, issues: <CircleDot size={16} />, files: <Folders size={16} />, links: <LinkIcon size={16} />, artifacts: <Component size={16} />, subagents: <Bot size={16} />, workflows: <Workflow size={16} />,
+  logs: <ScrollText size={16} />, crewlog: <History size={16} />, context: <Layers size={16} />, side: <MessageCircleQuestionMark size={16} />, terminal: <TerminalSquare size={16} />, browser: <Globe size={16} />,
   summary: <ListTree size={16} />,
   pins: <Pin size={16} />,
-  file: <FileText size={16} />,
-  diff: <GitCompare size={16} />,
-  artifact: <Component size={16} />,
-  folder: <Folder size={16} />,
-  app: <PanelRight size={16} />,
-  git: <GitBranch size={16} />,
+  file: <FileText size={16} />, diff: <GitCompare size={16} />, artifact: <Component size={16} />, folder: <Folder size={16} />,
+  app: <PanelRight size={16} />, git: <GitBranch size={16} />,
 }
 
 /** The strip/menu glyph for a tab kind. A built-in reads `KIND_ICON`; an
@@ -148,6 +91,7 @@ function iconForKind(kind: TabKind, descriptors: readonly PanelTabDescriptor[]):
  * label and description is a type error rather than a missing-key render.
  */
 export const NEW_MENU_LABEL_KEY: Record<ViewKind | 'terminal', string> = {
+  'command-center': 'commandCenter.title',
   changes: 'pages.chat.sidePanel.menu_changes',
   issues: 'pages.chat.sidePanel.menu_issues',
   files: 'pages.chat.sidePanel.menu_files',
@@ -167,6 +111,7 @@ export const NEW_MENU_LABEL_KEY: Record<ViewKind | 'terminal', string> = {
 }
 
 export const NEW_MENU_DESC_KEY: Record<ViewKind | 'terminal', string> = {
+  'command-center': 'commandCenter.description',
   changes: 'pages.chat.sidePanel.menu_changes_desc',
   issues: 'pages.chat.sidePanel.menu_issues_desc',
   files: 'pages.chat.sidePanel.menu_files_desc',
@@ -206,64 +151,49 @@ export const NEW_MENU_DESC_KEY: Record<ViewKind | 'terminal', string> = {
  *  Every key of `NEW_MENU_LABEL_KEY` must appear exactly once across the
  *  groups — `sidePanelAddMenu.test.tsx` pins that partition, so adding a view
  *  without placing it in a group fails rather than silently dropping it. */
-const NEW_MENU_GROUPS: { id: string; items: { kind: ViewKind | 'terminal'; icon: ReactNode }[] }[] =
-  [
-    // Session output — what this chat referenced or produced. (Changes / Files /
-    // Artifacts are auto-pinned and filtered out below; they are listed here so
-    // this table stays the complete catalog of views.)
-    {
-      id: 'session-output',
-      items: [
-        { kind: 'summary', icon: <ListTree size={15} /> },
-        { kind: 'pins', icon: <Pin size={15} /> },
-        { kind: 'changes', icon: <GitPullRequest size={15} /> },
-        { kind: 'issues', icon: <CircleDot size={15} /> },
-        { kind: 'files', icon: <Folders size={15} /> },
-        { kind: 'links', icon: <LinkIcon size={15} /> },
-        { kind: 'artifacts', icon: <Component size={15} /> },
-        { kind: 'subagents', icon: <Bot size={15} /> },
-        { kind: 'workflows', icon: <Workflow size={15} /> },
-        { kind: 'git', icon: <GitBranch size={15} /> },
-      ],
-    },
-    // Interactive workspaces — the surfaces the user types into. Terminal is a
-    // per-chat shell: its tab lives in this chat's panel state, so it comes and
-    // goes with the session, unlike the app-wide dock terminal in the nav rail.
-    {
-      id: 'workspaces',
-      items: [
-        { kind: 'side', icon: <MessageCircleQuestionMark size={15} /> },
-        { kind: 'browser', icon: <Globe size={15} /> },
-        { kind: 'terminal', icon: <TerminalSquare size={15} /> },
-      ],
-    },
-    // Diagnostics.
-    {
-      id: 'diagnostics',
-      items: [
-        { kind: 'logs', icon: <ScrollText size={15} /> },
-        { kind: 'context', icon: <Layers size={15} /> },
-        { kind: 'crewlog', icon: <History size={15} /> },
-      ],
-    },
-  ]
+const NEW_MENU_GROUPS: { id: string; items: { kind: ViewKind | 'terminal'; icon: ReactNode }[] }[] = [
+  // Session output — what this chat referenced or produced. (Changes / Files /
+  // Artifacts are auto-pinned and filtered out below; they are listed here so
+  // this table stays the complete catalog of views.)
+  {
+    id: 'session-output',
+    items: [
+      { kind: 'command-center', icon: <PanelRight size={15} /> },
+      { kind: 'summary', icon: <ListTree size={15} /> },
+      { kind: 'pins', icon: <Pin size={15} /> },
+      { kind: 'changes', icon: <GitPullRequest size={15} /> },
+      { kind: 'issues', icon: <CircleDot size={15} /> },
+      { kind: 'files', icon: <Folders size={15} /> },
+      { kind: 'links', icon: <LinkIcon size={15} /> },
+      { kind: 'artifacts', icon: <Component size={15} /> },
+      { kind: 'subagents', icon: <Bot size={15} /> },
+      { kind: 'workflows', icon: <Workflow size={15} /> },
+      { kind: 'git', icon: <GitBranch size={15} /> },
+    ],
+  },
+  // Interactive workspaces — the surfaces the user types into. Terminal is a
+  // per-chat shell: its tab lives in this chat's panel state, so it comes and
+  // goes with the session, unlike the app-wide dock terminal in the nav rail.
+  {
+    id: 'workspaces',
+    items: [
+      { kind: 'side', icon: <MessageCircleQuestionMark size={15} /> },
+      { kind: 'browser', icon: <Globe size={15} /> },
+      { kind: 'terminal', icon: <TerminalSquare size={15} /> },
+    ],
+  },
+  // Diagnostics.
+  {
+    id: 'diagnostics',
+    items: [
+      { kind: 'logs', icon: <ScrollText size={15} /> },
+      { kind: 'context', icon: <Layers size={15} /> },
+      { kind: 'crewlog', icon: <History size={15} /> },
+    ],
+  },
+]
 
-const VIEW_KINDS = new Set<TabKind>([
-  'changes',
-  'issues',
-  'links',
-  'files',
-  'artifacts',
-  'subagents',
-  'workflows',
-  'logs',
-  'crewlog',
-  'context',
-  'side',
-  'git',
-  'summary',
-  'pins',
-])
+const VIEW_KINDS = new Set<TabKind>(['changes', 'issues', 'links', 'files', 'artifacts', 'subagents', 'workflows', 'logs', 'crewlog', 'context', 'side', 'git', 'summary', 'pins'])
 
 /** Views behind the Developer Mode consent gate (Settings > Developer) — the
  *  same gate the standalone Developer page uses. All three are raw
@@ -300,23 +230,21 @@ const DEV_ONLY_VIEWS = new Set<ViewKind | 'terminal'>(['logs', 'context', 'crewl
  *  the host's slot is not yet confirmed (a PTY opened into the provisional
  *  bucket would be orphaned by the re-key). Withheld here and from the pinned
  *  block alike — an empty view is worse than no view. */
-export function newMenuSections(opts: {
-  devMode: boolean
-  terminalEnabled: boolean
-  summaryEnabled: boolean
-  hiddenViews?: ReadonlySet<SidePanelWithholdable>
-}): { id: string; items: { kind: ViewKind | 'terminal'; icon: ReactNode }[] }[] {
-  return NEW_MENU_GROUPS.map((group) => ({
-    id: group.id,
-    items: group.items.filter(
-      (item) =>
-        (opts.terminalEnabled || item.kind !== 'terminal') &&
-        (opts.devMode || !DEV_ONLY_VIEWS.has(item.kind)) &&
-        (opts.summaryEnabled || item.kind !== 'summary') &&
-        !opts.hiddenViews?.has(item.kind) &&
-        !(PINNED_VIEWS as string[]).includes(item.kind),
-    ),
-  })).filter((group) => group.items.length > 0)
+export function newMenuSections(
+  opts: { devMode: boolean; terminalEnabled: boolean; summaryEnabled: boolean; hiddenViews?: ReadonlySet<SidePanelWithholdable> },
+): { id: string; items: { kind: ViewKind | 'terminal'; icon: ReactNode }[] }[] {
+  return NEW_MENU_GROUPS
+    .map(group => ({
+      id: group.id,
+      items: group.items.filter(item =>
+        (opts.terminalEnabled || item.kind !== 'terminal')
+        && (opts.devMode || !DEV_ONLY_VIEWS.has(item.kind))
+        && (opts.summaryEnabled || item.kind !== 'summary')
+        && !opts.hiddenViews?.has(item.kind)
+        && !(PINNED_VIEWS as string[]).includes(item.kind),
+      ),
+    }))
+    .filter(group => group.items.length > 0)
 }
 
 /** What a host may withdraw through `hiddenViews`: a chat view, the per-chat
@@ -333,24 +261,33 @@ export interface SidePanelLeadingTab {
   /** Strip glyph. The host owns it — these are the chips whose icon `KIND_ICON`
    *  does not own. */
   icon: ReactNode
-  /** Body, rendered only while the tab is active (it is a query-driven view
-   *  like the category tabs, not a mounted editor). */
+  /** Preserve a visited body that owns drafts or a published iframe. */
+  keepMounted?: boolean
+  /** Body; query-only views normally mount just while active. */
   render: () => ReactNode
 }
 
 interface SidePanelProps {
   tabsCtl: ReturnType<typeof usePanelTabs>
   slot: string
-  onFileOpen?: (
-    path: string,
-    opts?: {
-      replaceId?: string
-      line?: number
-      endLine?: number
-      diffMode?: boolean
-      canReplace?: () => boolean
-    },
-  ) => void
+  /** Stable identity of the chat the panel shows, held constant while the host
+   *  is still confirming its `slot` (the Members page passes the member's name,
+   *  since its slot stays '' until the thread POST answers). A resize drag that
+   *  starts on an empty slot is saved under the key confirmed mid-drag ONLY when
+   *  this identity is the same at release as at the start, so the key is that
+   *  chat's own. Unset, or changed mid-drag (a keyboard switch to another chat),
+   *  an empty-start drag is saved to the shared default alone. */
+  slotOwner?: string
+  /** The key the host has CONFIRMED is this chat's own, when that can differ
+   *  from `slot`. `slot` is the bodies' identity and may hold a stale key the
+   *  endpoint has since refused (the Members page keeps its last good key
+   *  through a 409 so live bodies are not re-keyed). A released drag is saved
+   *  under a per-chat key only when that key is the confirmed one at the start
+   *  or at the release; otherwise it goes to the shared default alone, so a
+   *  refused chat never writes into the session that owns the key. Unset, the
+   *  panel treats `slot` as confirmed. */
+  persistSlot?: string
+  onFileOpen?: (path: string, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; canReplace?: () => boolean }) => void
   /** Open an artifact as a panel tab (the artifact twin of onFileOpen).
    *  Threaded to the Artifacts tab so its rows open here instead of
    *  hard-navigating to the standalone detail page. */
@@ -493,17 +430,10 @@ export const CHAT_PANE_MIN_W = 320
  * NOT change when the panel opens. Feeding it the chat container's painted
  * width instead would oscillate, since opening the panel shrinks that width.
  */
-export function sidePanelFillWidth({
-  winW,
-  railW,
-  sidebarW,
-  isMobile,
-}: {
-  winW: number
-  railW: number
-  sidebarW: number
-  isMobile: boolean
-}): number | undefined {
+export function sidePanelFillWidth(
+  { winW, railW, sidebarW, isMobile }:
+  { winW: number; railW: number; sidebarW: number; isMobile: boolean },
+): number | undefined {
   if (isMobile) return Math.max(SIDE_PANEL_MIN_W, winW)
   const chatAvail = winW - railW - sidebarW
   if (chatAvail >= SIDE_PANEL_MIN_W + CHAT_PANE_MIN_W) return undefined
@@ -522,19 +452,10 @@ export function sidePanelFillWidth({
  * deterministic in BOTH paths. '100%' survives only as the fallback for a
  * mobile frame that somehow receives no fillWidth.
  */
-export function sidePanelEffectiveWidth({
-  fillWidth,
-  isMobile,
-  expanded,
-  width,
-  maxW,
-}: {
-  fillWidth?: number
-  isMobile: boolean
-  expanded?: boolean
-  width: number
-  maxW: number
-}): number | string {
+export function sidePanelEffectiveWidth(
+  { fillWidth, isMobile, expanded, width, maxW }:
+  { fillWidth?: number; isMobile: boolean; expanded?: boolean; width: number; maxW: number },
+): number | string {
   if (fillWidth != null) return fillWidth
   if (isMobile) return '100%'
   if (expanded) return Math.max(SIDE_PANEL_MIN_W, maxW)
@@ -542,60 +463,20 @@ export function sidePanelEffectiveWidth({
 }
 
 export default function SidePanel({
-  tabsCtl,
-  slot,
-  onFileOpen,
-  onArtifactOpen,
-  onAddToContext,
-  projectDir,
-  navLinks,
-  navResolving,
-  sources,
-  selectedSourceUrl,
-  onSelectSource,
-  onReconcileSource,
-  issues,
-  selectedIssueUrl,
-  onSelectIssue,
-  onReconcileIssue,
-  onAddSourceToChat,
-  onSubmitComments,
-  connected = true,
-  onFileSave,
-  onClose,
-  panelHidden,
-  pins,
-  pinsLoading,
-  onJumpToPin,
-  onUnpin,
-  slotTitle,
-  chatMode,
-  expanded,
-  fillWidth,
-  canDockBottom = true,
-  leadingTabs,
-  extraReserveW = 0,
-  hiddenViews,
-  onActiveTabChange,
+  tabsCtl, slot, slotOwner, persistSlot, onFileOpen, onArtifactOpen, onAddToContext,
+  projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource,
+  issues, selectedIssueUrl, onSelectIssue, onReconcileIssue,
+  onAddSourceToChat, onSubmitComments, connected = true, onFileSave, onClose, panelHidden,
+  pins, pinsLoading, onJumpToPin, onUnpin,
+  slotTitle, chatMode,
+  expanded, fillWidth, canDockBottom = true,
+  leadingTabs, extraReserveW = 0, hiddenViews, onActiveTabChange,
 }: SidePanelProps) {
-  const {
-    tabs,
-    activeId: storedActiveId,
-    openView,
-    openPanelTab,
-    openTerminal,
-    setActive,
-    closeTab,
-    patchTab,
-    setOrder,
-    syncPinned,
-  } = tabsCtl
+  const { tabs, activeId: storedActiveId, openView, openPanelTab, openTerminal, setActive, closeTab, patchTab, setOrder, syncPinned } = tabsCtl
   // A permanent panel has no close control and answers Escape with nothing —
   // the views' `onToggle` still needs a function, so it gets a no-op.
   const closable = !!onClose
-  const closePanel = useCallback(() => {
-    onClose?.()
-  }, [onClose])
+  const closePanel = useCallback(() => { onClose?.() }, [onClose])
   // App-contributed side-panel tabs from the installed-app manifests. Empty ⇒
   // the "+" menu and launcher show nothing extra and the strip renders no app tab.
   // A host that withholds `'app'` (the Members page before its thread is
@@ -613,8 +494,8 @@ export default function SidePanel({
   // default — holding the subscription in ChatPage re-rendered the whole page
   // for data nothing was displaying. This component only mounts while the
   // panel is open, so the subscription now costs nothing when it is closed.
-  const subagents = useAppSelector((s) => selectSlotSubagents(s, slot))
-  const toolLog = useAppSelector((s) => selectSlotToolLog(s, slot))
+  const subagents = useAppSelector(s => selectSlotSubagents(s, slot))
+  const toolLog = useAppSelector(s => selectSlotToolLog(s, slot))
   const terminalEnabled = useTerminalEnabled()
   const devMode = useDevMode()
   // Whether to offer the Summary row at all. Read from the panel's OWN endpoint
@@ -643,16 +524,14 @@ export default function SidePanel({
   // The empty-state launcher shows the same entries flat: its two-column grid
   // has nowhere to put a separator, but it must not disagree with the menu
   // about ORDER, so it reads the groups rather than its own list.
-  const menuItems = menuSections.flatMap((section) => section.items)
+  const menuItems = menuSections.flatMap(section => section.items)
   // Files / Artifacts / Changes are ALWAYS present — pinned to the front,
   // non-closable, and never in the + menu — regardless of whether they
   // currently have content. Always the WHOLE list, whatever the host withholds:
   // a withdrawal (`hiddenViews`) is a render-time filter over the bucket (see
   // `visibleTabs` below), never a deletion from it — the bucket is shared with
   // the chat page, which must find the view again.
-  useEffect(() => {
-    syncPinned(PINNED_VIEWS)
-  }, [syncPinned])
+  useEffect(() => { syncPinned(PINNED_VIEWS) }, [syncPinned])
   // Split the strip: pinned (fixed, non-closable) vs. dynamic (draggable).
   // A host withdrawal (`hiddenViews`) also applies to tabs ALREADY in the bucket:
   // the strip is keyed per slot and a member's DM slot can have been opened on the
@@ -661,35 +540,28 @@ export default function SidePanel({
   // neither rendered as a chip nor given a body here, and focus on it falls back
   // to the leading tab — otherwise the withdrawal would hold only for a fresh
   // strip, which is not what the feature map promises.
-  const isWithheld = useCallback(
-    (kind: TabKind): boolean => {
-      if (!hiddenViews) return false
-      if (kind === 'terminal') return hiddenViews.has('terminal')
-      if (kind === 'app' || isPanelTabKind(kind)) return hiddenViews.has('app')
-      // Document tabs are not views themselves but belong to one: a file, diff
-      // or folder editor is opened FROM the Files view (and reads the same slot),
-      // an artifact preview from Artifacts. Withholding the parent view withholds
-      // its documents, or a persisted file tab would stay on the strip — and stay
-      // ACTIVE — while every slot-bound view is withdrawn.
-      if (kind === 'file' || kind === 'diff' || kind === 'folder') return hiddenViews.has('files')
-      if (kind === 'artifact') return hiddenViews.has('artifacts')
-      return hiddenViews.has(kind)
-    },
-    [hiddenViews],
-  )
+  const isWithheld = useCallback((kind: TabKind): boolean => {
+    if (!hiddenViews) return false
+    if (kind === 'terminal') return hiddenViews.has('terminal')
+    if (kind === 'app' || isPanelTabKind(kind)) return hiddenViews.has('app')
+    // Document tabs are not views themselves but belong to one: a file, diff
+    // or folder editor is opened FROM the Files view (and reads the same slot),
+    // an artifact preview from Artifacts. Withholding the parent view withholds
+    // its documents, or a persisted file tab would stay on the strip — and stay
+    // ACTIVE — while every slot-bound view is withdrawn.
+    if (kind === 'file' || kind === 'diff' || kind === 'folder') return hiddenViews.has('files')
+    if (kind === 'artifact') return hiddenViews.has('artifacts')
+    return hiddenViews.has(kind)
+  }, [hiddenViews])
   // Restored terminal chips wait for the liveness ruling too, as the dock's do.
   const terminalsPending = usePanelTerminalsPending()
-  const visibleTabs = useMemo(
-    () =>
-      hiddenViews || terminalsPending
-        ? tabs.filter((t) => !isWithheld(t.kind) && !(terminalsPending && t.kind === 'terminal'))
-        : tabs,
-    [tabs, hiddenViews, isWithheld, terminalsPending],
-  )
+  const visibleTabs = useMemo(() => (hiddenViews || terminalsPending
+    ? tabs.filter(t => !isWithheld(t.kind) && !(terminalsPending && t.kind === 'terminal'))
+    : tabs), [tabs, hiddenViews, isWithheld, terminalsPending])
   const activeId = useMemo(() => {
     if (storedActiveId === null) return null
-    if (leadingTabs?.some((t) => t.id === storedActiveId)) return storedActiveId
-    if (visibleTabs.some((t) => t.id === storedActiveId)) return storedActiveId
+    if (leadingTabs?.some(t => t.id === storedActiveId)) return storedActiveId
+    if (visibleTabs.some(t => t.id === storedActiveId)) return storedActiveId
     return leadingTabs?.[0]?.id ?? visibleTabs[0]?.id ?? null
   }, [storedActiveId, visibleTabs, leadingTabs])
   // The fallback is REPORTED to the host, never written back into the store.
@@ -700,33 +572,20 @@ export default function SidePanel({
   // bucket would wipe it: a withdrawal can be TEMPORARY (the Members page
   // withholds every slot view for the moment its thread POST is in flight), and
   // a stored focus on Files must come back as Files once the views return.
-  useEffect(() => {
-    onActiveTabChange?.(activeId)
-  }, [activeId, onActiveTabChange])
-  const pinnedTabs = useMemo(
-    () => visibleTabs.filter((t) => (PINNED_VIEWS as string[]).includes(t.id)),
-    [visibleTabs],
-  )
-  const dynamicTabs = useMemo(
-    () => visibleTabs.filter((t) => !(PINNED_VIEWS as string[]).includes(t.id)),
-    [visibleTabs],
-  )
+  useEffect(() => { onActiveTabChange?.(activeId) }, [activeId, onActiveTabChange])
+  const pinnedTabs = useMemo(() => visibleTabs.filter(t => (PINNED_VIEWS as string[]).includes(t.id)), [visibleTabs])
+  const dynamicTabs = useMemo(() => visibleTabs.filter(t => !(PINNED_VIEWS as string[]).includes(t.id)), [visibleTabs])
   // Terminal opens a NEW tab (its own PTY session) starting in the chat's
   // working dir; every other menu item is a singleton view.
   // Spawn a terminal whose cwd is the chat's project directory. Shared with the
   // Files header's per-project quick action (issue #1142) so the two entry
   // points cannot drift on WHERE the shell starts — that cwd is the whole point
   // of the affordance.
-  const openProjectTerminal = useCallback(() => {
-    openTerminal({ cwd: projectDir })
-  }, [openTerminal, projectDir])
-  const openMenuItem = useCallback(
-    (kind: ViewKind | 'terminal') => {
-      if (kind === 'terminal') openProjectTerminal()
-      else openView(kind)
-    },
-    [openProjectTerminal, openView],
-  )
+  const openProjectTerminal = useCallback(() => { openTerminal({ cwd: projectDir }) }, [openTerminal, projectDir])
+  const openMenuItem = useCallback((kind: ViewKind | 'terminal') => {
+    if (kind === 'terminal') openProjectTerminal()
+    else openView(kind)
+  }, [openProjectTerminal, openView])
   // Closing a terminal tab kills its PTY (server) and disposes local state. The
   // server delete goes through a React Query mutation (use-react-query
   // guideline); the synchronous WS + xterm teardown stays in disposeTerminalSession.
@@ -734,17 +593,14 @@ export default function SidePanel({
   // rendered by the always-mounted BottomTerminalPanel root — this tab is
   // already gone by then.
   const deleteTerminalSession = useDeleteTerminalSession()
-  const handleCloseTab = useCallback(
-    (id: string) => {
-      const t = tabs.find((x) => x.id === id)
-      if (t?.kind === 'terminal' && t.sessionId) {
-        deleteTerminalSession.mutate(t.sessionId)
-        disposeTerminalSession(t.sessionId)
-      }
-      closeTab(id)
-    },
-    [tabs, closeTab, deleteTerminalSession],
-  )
+  const handleCloseTab = useCallback((id: string) => {
+    const t = tabs.find(x => x.id === id)
+    if (t?.kind === 'terminal' && t.sessionId) {
+      deleteTerminalSession.mutate(t.sessionId)
+      disposeTerminalSession(t.sessionId)
+    }
+    closeTab(id)
+  }, [tabs, closeTab, deleteTerminalSession])
   // Move a terminal tab OUT of this chat into the app-wide bottom panel. Unlike
   // handleCloseTab this must NOT dispose the session — the PTY + xterm live in
   // Diff view preferences — persisted; 'mc-diff-split' is shared with the
@@ -753,28 +609,76 @@ export default function SidePanel({
   const [diffSideBySide, setDiffSideBySide] = useDiffSplit()
 
   // Resizable width (the actbar grid column is auto-sized, so the panel owns
-  // its own width).
-  const WIDTH_KEY = 'mc-side-panel-width'
+  // its own width), remembered PER CHAT rather than once for the panel (see
+  // sidePanelWidth.ts): the size follows `slot` and never moves on a tab switch
+  // inside the chat. Held as a map keyed by slot so switching chats reads the
+  // other chat's size without a round trip through storage, and a slot never
+  // dragged in this session falls through to what is stored (`loadSidePanelDim`).
   const MIN_W = SIDE_PANEL_MIN_W
-  const [width, setWidth] = useState(() => {
-    const v = parseInt(localStorage.getItem(WIDTH_KEY) || '', 10)
-    return !isNaN(v) && v >= MIN_W ? v : 460
-  })
-  const widthRef = useRef(width)
-  widthRef.current = width
+  // The slot a resize drag started on, held for the whole gesture and `null`
+  // outside one. The host can re-key the panel mid-drag (the Members page
+  // confirms its thread's slot when the POST answers, which flips `slot` from
+  // '' to the key), and reading the live slot would retarget the remaining
+  // movement and the release to the new chat and discard the adjustment the
+  // user is making. State rather than a ref because the RENDERED size reads it
+  // too: the size on screen and the size being written must be the same chat's,
+  // or a mid-drag re-key shows one chat's width while the pointer moves another's.
+  const [dragSlot, setDragSlot] = useState<string | null>(null)
+  // The chat whose size is shown AND written: the dragged one during a gesture,
+  // the shown one otherwise. One resolver for both, read by the render path
+  // directly and by the drag callbacks through the latest-value ref.
+  const dimSlot = dragSlot ?? slot
+  const dimSlotRef = useRef(dimSlot); dimSlotRef.current = dimSlot
+  const slotRef = useRef(slot); slotRef.current = slot
+  // Where a released drag is saved: the chat it started on, with one exception.
+  // A drag that started on an empty slot goes to the key confirmed mid-gesture
+  // only when the host says it is the SAME chat receiving its key: `slotOwner`
+  // unchanged from the start (the Members page confirming its thread). Saved on
+  // the bare key alone, it would never become that chat's. Without that proof
+  // the new key may be ANOTHER chat (a Ctrl+digit switch while the handle is
+  // held), whose own size must not be overwritten, so the drag stays on ''.
+  const ownerRef = useRef(slotOwner); ownerRef.current = slotOwner
+  const dragOwnerRef = useRef<string | undefined>(undefined)
+  // Either way, a host that confirms keys (`persistSlot`, the Members page) must
+  // still confirm this one at the RELEASE: a stale key kept through a refusal
+  // belongs to another session, so the drag stays on ''. Confirmation at the
+  // start does not count, because a refusal that lands mid-drag must still win.
+  // The cost is a release during a routine re-confirm, which saves only the
+  // shared default. A host that passes no `persistSlot` (the chat page) owns
+  // every key it passes, so nothing is gated.
+  const persistRef = useRef(persistSlot); persistRef.current = persistSlot
+  const releaseSlot = () => {
+    const started = dimSlotRef.current
+    const owner = dragOwnerRef.current
+    const target = started || (owner && owner === ownerRef.current ? slotRef.current : '')
+    return target && (persistRef.current === undefined || target === persistRef.current) ? target : ''
+  }
+  const [widthBySlot, setWidthBySlot] = useState<Record<string, number>>({})
+  const width = useMemo(
+    () => ownDim(widthBySlot, dimSlot) ?? loadSidePanelDim({ base: SIDE_PANEL_WIDTH_KEY, slot: dimSlot, min: MIN_W, fallback: 460 }),
+    [widthBySlot, dimSlot, MIN_W],
+  )
+  const setWidth = useCallback((w: number) => {
+    const target = dimSlotRef.current
+    setWidthBySlot(m => ({ ...m, [target]: w }))
+  }, [])
+  const widthRef = useRef(width); widthRef.current = width
   // Dock position (right column vs bottom row). Bottom dock is height-
   // resizable instead of width-resizable, so it carries its own persisted
   // dimension. Kept separate from width so flipping back and forth restores
   // each orientation's last size.
   const [dock, setDock] = useSidePanelDock()
-  const HEIGHT_KEY = 'mc-side-panel-height'
   const MIN_H = 200
-  const [height, setHeight] = useState(() => {
-    const v = parseInt(localStorage.getItem(HEIGHT_KEY) || '', 10)
-    return !isNaN(v) && v >= MIN_H ? v : 360
-  })
-  const heightRef = useRef(height)
-  heightRef.current = height
+  const [heightBySlot, setHeightBySlot] = useState<Record<string, number>>({})
+  const height = useMemo(
+    () => ownDim(heightBySlot, dimSlot) ?? loadSidePanelDim({ base: SIDE_PANEL_HEIGHT_KEY, slot: dimSlot, min: MIN_H, fallback: 360 }),
+    [heightBySlot, dimSlot, MIN_H],
+  )
+  const setHeight = useCallback((h: number) => {
+    const target = dimSlotRef.current
+    setHeightBySlot(m => ({ ...m, [target]: h }))
+  }, [])
+  const heightRef = useRef(height); heightRef.current = height
   // Responsive clamp: the user's chosen width is persisted untouched, but the
   // rendered width yields to the window so the chat keeps its reserved
   // minimum. On mobile the panel simply takes the full width. Re-measured on
@@ -793,14 +697,34 @@ export default function SidePanel({
   // Bottom-dock height cap: leave the topbar row + a usable chat minimum
   // visible above the panel. Re-measured on resize.
   const [maxH, setMaxH] = useState(() => Math.max(MIN_H, Math.round(window.innerHeight * 0.85)))
+  // A window drag fires `resize` continuously, and easing each clamp step
+  // retargets the tween every frame so the edge trails the window instead of
+  // tracking it. An active window resize therefore suppresses the ease the same
+  // way holding the handle does. It decays rather than opting out permanently,
+  // so a DISCRETE clamp change — a sibling column settling — still eases.
+  const [windowResizing, setWindowResizing] = useState(false)
+  const settleRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   useEffect(() => {
     const recalc = () => {
       setMaxW(window.innerWidth - reserveW)
       setMaxH(Math.max(MIN_H, Math.round(window.innerHeight * 0.85)))
     }
+    const onWindowResize = () => {
+      setWindowResizing(true)
+      clearTimeout(settleRef.current)
+      settleRef.current = setTimeout(() => setWindowResizing(false), SIDE_PANEL_MOTION_MS)
+      recalc()
+    }
     recalc()
-    window.addEventListener('resize', recalc)
-    return () => window.removeEventListener('resize', recalc)
+    window.addEventListener('resize', onWindowResize)
+    // Clearing the settle timer without resetting the flag would latch it on
+    // whenever `reserveW` changes mid-resize (the last event can re-run this
+    // effect), and every later chat switch would then snap.
+    return () => {
+      window.removeEventListener('resize', onWindowResize)
+      clearTimeout(settleRef.current)
+      setWindowResizing(false)
+    }
     // `reserveW` folds in LIVE widths (the rail collapses; the Members roster
     // and the chat sidebar are drag-resizable), so the clamp re-derives when
     // any of them moves.
@@ -813,13 +737,80 @@ export default function SidePanel({
   // sees the chips' screen positions change and spring-animates them toward
   // the new spot each frame — so tabs visibly lag the resize and "catch up"
   // when it stops. During a resize we make the layout transition instant.
-  const [resizing, setResizing] = useState(false)
+  const resizing = dragSlot !== null
+  // Switching to a chat whose remembered size differs moves the panel's free
+  // edge, which the chips' layout projection reads exactly like a drag frame
+  // and springs after. `slotSwitched` covers the render that carries the
+  // switch; `dimAnimating` covers the rest of the eased move, because the edge
+  // travels over SIDE_PANEL_MOTION_MS rather than jumping, and without it the
+  // chips trail the panel for the whole animation and catch up at the end,
+  // which is the same artifact `resizing` exists to suppress.
+  //
+  // Tracks `dimSlot`, the chat whose size is on screen, not the `slot` prop: a
+  // re-key that lands mid-drag changes nothing on screen until the release, and
+  // that release is the move to ease.
+  const reduceMotion = useReducedMotion()
+  // Maximize, restore and the browser tab's fill-width mode move the edge
+  // INSTANTLY, as they did before per-chat sizes, and that has to hold even
+  // when one of them lands inside a chat switch's ease: switching away from a
+  // chat maximized on its Browser tab clears `expanded` in the same render, and
+  // without this the restore would ride the switch's tween. A render whose
+  // sizing mode changed never eases, and a mode change also ends an ease that
+  // is already running.
+  const sizingMode = fillWidth != null ? `fill:${fillWidth}` : expanded ? 'max' : 'free'
+  const paintedModeRef = useRef(sizingMode)
+  const modeChanged = paintedModeRef.current !== sizingMode
+  const paintedSlotRef = useRef(dimSlot)
+  const slotSwitched = paintedSlotRef.current !== dimSlot
+  const [dimAnimating, setDimAnimating] = useState(false)
+  useEffect(() => {
+    // Equal on mount and on any re-render that did not change chat, so this
+    // never fires an animation the user did not cause. A tab switch inside the
+    // chat leaves `dimSlot` alone and therefore never lands here.
+    const slotMoved = paintedSlotRef.current !== dimSlot
+    const modeMoved = paintedModeRef.current !== sizingMode
+    paintedSlotRef.current = dimSlot
+    paintedModeRef.current = sizingMode
+    if (modeMoved) { setDimAnimating(false); return }
+    if (!slotMoved) return
+    setDimAnimating(true)
+    const t = setTimeout(() => setDimAnimating(false), SIDE_PANEL_MOTION_MS)
+    return () => clearTimeout(t)
+  }, [dimSlot, sizingMode])
+  // A drag starts from the size ON SCREEN. Outside a chat switch's ease that is
+  // the logical size, exactly as before per-chat sizes. Inside the ease the
+  // edge is mid-flight and the logical size is where it is HEADING: starting
+  // there would jump the panel to the target the moment the handle is pressed
+  // (`resizing` drops the transition) and save a size the user never saw. So
+  // while the ease is live and the painted size is not yet the target, the
+  // gesture starts from the painted size. A zero-size rect (not laid out, or
+  // hidden) and a non-numeric target (mobile's full width) keep the logical
+  // size, as does a clamped or maximized panel, whose painted size already
+  // equals its target.
+  const rootRef = useRef<HTMLDivElement>(null)
+  const easingRef = useRef(false)
+  const effectiveRef = useRef<{ width: number | string; height: number }>({ width: 0, height: 0 })
+  const grabbedDim = (axis: 'width' | 'height', logical: number): number => {
+    const target = effectiveRef.current[axis]
+    const el = rootRef.current
+    if (!easingRef.current || typeof target !== 'number' || !el) return logical
+    const painted = Math.round(el.getBoundingClientRect()[axis])
+    return painted > 0 && Math.abs(painted - target) >= 1 ? painted : logical
+  }
   const startWRef = useRef(0)
+  // The width the gesture last computed. `widthRef` follows the RENDERED width,
+  // which lags the pointer by a render, so a release that lands before the last
+  // move has painted would store the previous frame's number. This holds what
+  // the pointer produced, whatever has or has not rendered in between.
+  const dragWRef = useRef(0)
   const panelResize = usePointerDrag({
     threshold: 0,
     onStart: () => {
-      startWRef.current = widthRef.current
-      setResizing(true)
+      setDragSlot(slot)
+      dragOwnerRef.current = slotOwner
+      const w0 = grabbedDim('width', widthRef.current)
+      startWRef.current = w0
+      dragWRef.current = w0
     },
     onMove: ({ dx }) => {
       // Left-edge handle with the right edge pinned: dragging left (dx < 0) widens.
@@ -828,64 +819,92 @@ export default function SidePanel({
       // fraction on top of it. A 70% cap sat well under that reserve on wide
       // windows and read as an arbitrary stop.
       const max = window.innerWidth - reserveW
-      setWidth(Math.max(MIN_W, Math.min(startWRef.current - dx, max)))
+      const w = Math.max(MIN_W, Math.min(startWRef.current - dx, max))
+      dragWRef.current = w
+      setWidth(w)
     },
     onEnd: () => {
-      setResizing(false)
-      safeSetItem(WIDTH_KEY, String(widthRef.current))
+      // The chat's own key AND the bare key, so a new chat opens at this size.
+      // The in-memory size is set too: a chat re-keyed onto mid-drag may hold
+      // an older drag's size there, which would otherwise shadow the saved one.
+      const target = releaseSlot()
+      const w = dragWRef.current
+      saveSidePanelDim({ base: SIDE_PANEL_WIDTH_KEY, slot: target, value: w })
+      setWidthBySlot(m => ({ ...m, [target]: w }))
+      setDragSlot(null)
     },
   })
   // Top-edge resize for the bottom dock: drag up to grow the panel's height.
   // The bottom edge is pinned to the window, so a negative dy (dragging up)
   // widens the panel.
   const startHRef = useRef(0)
+  const dragHRef = useRef(0)
   const panelResizeV = usePointerDrag({
     threshold: 0,
     onStart: () => {
-      startHRef.current = heightRef.current
-      setResizing(true)
+      setDragSlot(slot)
+      dragOwnerRef.current = slotOwner
+      const h0 = grabbedDim('height', heightRef.current)
+      startHRef.current = h0
+      dragHRef.current = h0
     },
     onMove: ({ dy }) => {
       const max = Math.max(MIN_H, Math.round(window.innerHeight * 0.85))
-      setHeight(Math.max(MIN_H, Math.min(startHRef.current - dy, max)))
+      const h = Math.max(MIN_H, Math.min(startHRef.current - dy, max))
+      dragHRef.current = h
+      setHeight(h)
     },
     onEnd: () => {
-      setResizing(false)
-      safeSetItem(HEIGHT_KEY, String(heightRef.current))
+      const target = releaseSlot()
+      const h = dragHRef.current
+      saveSidePanelDim({ base: SIDE_PANEL_HEIGHT_KEY, slot: target, value: h })
+      setHeightBySlot(m => ({ ...m, [target]: h }))
+      setDragSlot(null)
     },
   })
 
+  // The remembered size is per chat, so switching chats MOVES the panel's free
+  // edge. Ease it on the panel's own open/close curve (`sidePanelDimTransition`)
+  // rather than letting it jump: opening the panel and moving between chats
+  // are the same edge traveling the same distance, and a person reads them as
+  // one gesture. A tab switch inside the chat never moves the edge, so it never
+  // reaches this.
+  //
+  // Gated to the chat switch, via the `slotSwitched` / `dimAnimating` pair
+  // above: `slotSwitched` carries the switch render, `dimAnimating` the rest of
+  // the eased move. Maximize (`expanded`) and the browser tab's fill-width mode
+  // reach the same `effectiveWidth`, and before per-chat sizes they moved the
+  // edge INSTANTLY. Easing those is a behavior change this feature does not
+  // need, so they keep jumping.
+  //
+  // Suppressed while dragging the resize handle (a transition there makes the
+  // edge lag the pointer), under prefers-reduced-motion, which framer does not
+  // apply to a CSS transition on our behalf, and during a live window resize,
+  // which retargets the tween every frame. Same shape as DiagramLightbox's
+  // `pinching || dragging || reduceMotion` guard.
+  const dimTransition = (slotSwitched || dimAnimating) && !modeChanged && !resizing && !windowResizing && !reduceMotion
+    ? sidePanelDimTransition(isBottom ? 'height' : 'width')
+    : undefined
+  easingRef.current = dimTransition !== undefined
+  effectiveRef.current = { width: effectiveWidth, height: effectiveHeight }
+
   return (
     <div
+      ref={rootRef}
+      data-testid="side-panel-root"
       className={`shrink-0 flex flex-col bg-bg overflow-hidden relative ${isBottom ? 'min-w-0 w-full border-t border-border' : 'min-h-0 mt-0 mb-2 border-l border-t border-b border-border rounded-l-xl'}`}
-      style={
-        isBottom
-          ? { height: effectiveHeight, maxHeight: '85vh', width: '100%' }
-          : { width: effectiveWidth, maxWidth: '100vw' }
-      }
+      style={isBottom
+        ? { height: effectiveHeight, maxHeight: '85vh', width: '100%', ...dimTransition }
+        : { width: effectiveWidth, maxWidth: '100vw', ...dimTransition }}
     >
       {isBottom ? (
         /* Top-edge resize handle — drag up/down to size the bottom dock. */
-        <div
-          role="separator"
-          aria-orientation="horizontal"
-          aria-label={i18nT('pages.chat.sidePanel.resize_panel')}
-          className="absolute left-0 right-0 top-0 h-[6px] cursor-row-resize z-30 group/drag"
-          style={{ touchAction: 'none' }}
-          {...panelResizeV}
-        >
+        <div role="separator" aria-orientation="horizontal" aria-label={i18nT('pages.chat.sidePanel.resize_panel')} className="absolute left-0 right-0 top-0 h-[6px] cursor-row-resize z-30 group/drag" style={{ touchAction: 'none' }} {...panelResizeV}>
           <div className="absolute left-0 right-0 top-0 h-[2px] transition-colors duration-200 bg-transparent group-hover/drag:bg-accent resize-accent" />
         </div>
       ) : fillWidth == null ? (
         /* Left-edge resize handle */
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label={i18nT('pages.chat.sidePanel.resize_panel')}
-          className="absolute left-0 top-0 bottom-0 w-[6px] cursor-col-resize z-30 group/drag"
-          style={{ touchAction: 'none' }}
-          {...panelResize}
-        >
+        <div role="separator" aria-orientation="vertical" aria-label={i18nT('pages.chat.sidePanel.resize_panel')} className="absolute left-0 top-0 bottom-0 w-[6px] cursor-col-resize z-30 group/drag" style={{ touchAction: 'none' }} {...panelResize}>
           <div className="absolute left-0 top-0 bottom-0 w-[2px] transition-colors duration-200 bg-transparent group-hover/drag:bg-accent resize-accent" />
         </div>
       ) : null}
@@ -909,9 +928,7 @@ export default function SidePanel({
           frameless Linux paint their caption controls — the panel chrome below
           would sit under them, covered and unclickable. Bottom-docked the strip
           is nowhere near that corner, so it takes no reserve. */}
-      <div
-        className={`side-panel-strip flex items-end gap-1.5 shrink-0 px-2 pt-2 pb-0 min-h-10 rounded-tl-xl bg-bg-elevated border-b border-border${isBottom ? '' : ' focus-caption-reserve'}`}
-      >
+      <div className={`side-panel-strip flex items-end gap-1.5 shrink-0 px-2 pt-2 pb-0 min-h-10 rounded-tl-xl bg-bg-elevated border-b border-border${isBottom ? '' : ' focus-caption-reserve'}`}>
         {/* Pinned views (Changes / Files / Artifacts): always present, fixed at
             the front, non-closable, not draggable, compact. The group's 8px gap
             matches the active chip's corner-piece width, so a piece lands in the
@@ -925,7 +942,7 @@ export default function SidePanel({
               pinned chips beside these have never had their own. */}
           {!!leadingTabs?.length && (
             <div className="flex items-end gap-2 shrink-0" data-testid="side-panel-leading-tabs">
-              {leadingTabs.map((lt) => (
+              {leadingTabs.map(lt => (
                 <TabChip
                   key={lt.id}
                   tab={{ title: lt.title }}
@@ -941,16 +958,8 @@ export default function SidePanel({
               ))}
             </div>
           )}
-          {pinnedTabs.map((t) => (
-            <TabChip
-              key={t.id}
-              tab={t}
-              active={t.id === activeId}
-              closable={false}
-              pinned
-              onSelect={() => setActive(t.id)}
-              onClose={() => {}}
-            />
+          {pinnedTabs.map(t => (
+            <TabChip key={t.id} tab={t} active={t.id === activeId} closable={false} pinned onSelect={() => setActive(t.id)} onClose={() => {}} />
           ))}
         </div>
         {/* Chrome's separator rule, extended to the pinned↔dynamic divider: a
@@ -988,7 +997,7 @@ export default function SidePanel({
               // suppressed on both edges of the selected tab (its pill
               // background already delineates it).
               separator={i > 0 && t.id !== activeId && dynamicTabs[i - 1].id !== activeId}
-              instantLayout={resizing}
+              instantLayout={resizing || slotSwitched || dimAnimating}
               onSelect={() => setActive(t.id)}
               onClose={() => handleCloseTab(t.id)}
             />
@@ -1017,7 +1026,7 @@ export default function SidePanel({
               // the group, detaching the row mid-click.
               <Fragment key={section.id}>
                 {i > 0 && <DropdownMenuSeparator />}
-                {section.items.map((item) => (
+                {section.items.map(item => (
                   <DropdownMenuItem
                     key={item.kind}
                     className="gap-2.5 py-2"
@@ -1036,7 +1045,7 @@ export default function SidePanel({
             {panelTabDescriptors.length > 0 && (
               <Fragment key="app-panel-tabs">
                 <DropdownMenuSeparator />
-                {panelTabDescriptors.map((d) => (
+                {panelTabDescriptors.map(d => (
                   <DropdownMenuItem
                     key={d.kind}
                     className="gap-2.5 py-2"
@@ -1059,50 +1068,41 @@ export default function SidePanel({
             panel (no onClose) that cannot dock has no chrome here at all — the
             divider goes with it rather than ruling off an empty group. */}
         {(closable || (canDockBottom && !isMobile)) && (
-          <span
-            aria-hidden="true"
-            className="w-px h-5 bg-border shrink-0 self-center relative z-10"
-          />
+          <span aria-hidden="true" className="w-px h-5 bg-border shrink-0 self-center relative z-10" />
         )}
         <div className="flex items-center gap-0.5 shrink-0 self-center">
-          {canDockBottom && !isMobile && (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  className="flex items-center justify-center w-7 h-7 shrink-0 rounded-md text-muted hover:text-text hover:bg-bg-hover data-[state=open]:bg-bg-hover data-[state=open]:text-text transition-colors bg-transparent border-none cursor-pointer"
-                  title={i18nT('pages.chatSidebar.more_options')}
-                  aria-label={i18nT('pages.chatSidebar.more_options')}
-                >
-                  <MoreHorizontal size={15} />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" sideOffset={6} className="min-w-[200px]">
-                <DropdownMenuItem
-                  className="gap-2.5 py-2"
-                  onSelect={() => setDock(isBottom ? 'right' : 'bottom')}
-                >
-                  <span className="text-muted shrink-0">
-                    {isBottom ? <PanelRight size={16} /> : <PanelBottom size={16} />}
-                  </span>
-                  <span className="flex-1">
-                    {isBottom
-                      ? i18nT('pages.chat.sidePanel.dock_right')
-                      : i18nT('pages.chat.sidePanel.dock_bottom')}
-                  </span>
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-          {closable && (
-            <button
-              className="pi-morph flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
-              onClick={closePanel}
-              title={i18nT('pages.chat.sidePanel.close_panel')}
-              aria-label={i18nT('pages.chat.sidePanel.close_panel')}
-            >
-              <PanelRightLight size={15} />
-            </button>
-          )}
+        {canDockBottom && !isMobile && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="flex items-center justify-center w-7 h-7 shrink-0 rounded-md text-muted hover:text-text hover:bg-bg-hover data-[state=open]:bg-bg-hover data-[state=open]:text-text transition-colors bg-transparent border-none cursor-pointer"
+                title={i18nT('pages.chatSidebar.more_options')}
+                aria-label={i18nT('pages.chatSidebar.more_options')}
+              >
+                <MoreHorizontal size={15} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" sideOffset={6} className="min-w-[200px]">
+              <DropdownMenuItem
+                className="gap-2.5 py-2"
+                onSelect={() => setDock(isBottom ? 'right' : 'bottom')}
+              >
+                <span className="text-muted shrink-0">{isBottom ? <PanelRight size={16} /> : <PanelBottom size={16} />}</span>
+                <span className="flex-1">{isBottom ? i18nT('pages.chat.sidePanel.dock_right') : i18nT('pages.chat.sidePanel.dock_bottom')}</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        {closable && (
+        <button
+          className="pi-morph flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
+          onClick={closePanel}
+          title={i18nT('pages.chat.sidePanel.close_panel')}
+          aria-label={i18nT('pages.chat.sidePanel.close_panel')}
+        >
+          <PanelRightLight size={15} />
+        </button>
+        )}
         </div>
       </div>
 
@@ -1112,86 +1112,65 @@ export default function SidePanel({
       {/* Content area: left + top border (square corner) so the border wraps
           only the content, NOT the tab strip above (which stays borderless). */}
       <div className="flex-1 min-h-0 relative">
-        {/* The ACTIVE leading tab's body. Only that one mounts, like the
-            category views: each is a query-driven view, not an editor whose
-            buffer a switch would lose. Scrolls itself — the host renders plain
-            content, and this keeps the strip pinned above a long body. */}
-        {leadingTabs
-          ?.filter((lt) => lt.id === activeId)
-          .map((lt) => (
-            <div
-              key={lt.id}
-              className="absolute inset-0 overflow-y-auto"
-              data-testid="side-panel-leading-body"
-              data-leading-id={lt.id}
-            >
-              {lt.render()}
-            </div>
-          ))}
+        {/* Query-only leading views mount while active. A host can retain a
+            visited dashboard so tab switches preserve its drafts and iframe. */}
+        {leadingTabs?.filter(lt => lt.id === activeId || lt.keepMounted).map(lt => (
+          <div key={lt.id} className="absolute inset-0 overflow-y-auto" hidden={lt.id !== activeId} data-testid="side-panel-leading-body" data-leading-id={lt.id}>
+            {lt.render()}
+          </div>
+        ))}
         {visibleTabs.length === 0 && !leadingTabs?.length && (
           /* Empty state: launcher — the available views themselves, roomy and
              clickable, instead of a hint pointing at the + menu. */
           <div className="flex items-center justify-center h-full px-6">
             <div className="flex flex-col items-center gap-4 w-full max-w-[420px]">
-              <div className="text-[22px] text-muted font-semibold">
-                {i18nT('pages.chat.sidePanel.pick_a_panel_to_view')}
-              </div>
+              <div className="text-[22px] text-muted font-semibold">{i18nT('pages.chat.sidePanel.pick_a_panel_to_view')}</div>
               <div className="grid grid-cols-2 gap-2.5 w-full">
-                {menuItems.map((item) => {
-                  // Live badges from data already flowing into the panel — a
-                  // quiet accent pill when non-zero, muted otherwise. Files
-                  // carries none: it browses the project tree rather than
-                  // listing what this session touched, so there is no count.
-                  const badge =
-                    item.kind === 'subagents' &&
-                    Object.values(subagents).some(
-                      (s) => s.status === 'running' || s.status === 'tool',
-                    )
-                      ? `${Object.values(subagents).filter((s) => s.status === 'running' || s.status === 'tool').length} running`
-                      : item.kind === 'logs' && toolLog.length > 0
-                        ? `${toolLog.length} calls`
-                        : null
-                  return (
-                    <button
-                      key={item.kind}
-                      className="flex flex-col items-start gap-1.5 px-3.5 py-3 rounded-xl border border-border bg-transparent hover:bg-bg-hover hover:border-border-strong text-left cursor-pointer transition-colors"
-                      onClick={() => openMenuItem(item.kind)}
-                    >
-                      <div className="flex items-center gap-2.5 w-full text-text">
-                        <span className="shrink-0 opacity-80">{item.icon}</span>
-                        <span className="text-[13px] font-medium">
-                          {i18nT(NEW_MENU_LABEL_KEY[item.kind])}
-                        </span>
-                        {badge && (
-                          <span className="ml-auto text-[10px] px-2 py-0.5 rounded-full bg-accent-subtle text-accent font-medium shrink-0">
-                            {badge}
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-[11px] text-muted leading-snug">
-                        {i18nT(NEW_MENU_DESC_KEY[item.kind])}
-                      </div>
-                    </button>
-                  )
-                })}
-                {/* App-contributed tabs share the launcher grid, so it presents the
-                  full set rather than the "+" menu carrying tabs the launcher
-                  hides. This is the one surface that renders menuDescription. */}
-                {panelTabDescriptors.map((d) => (
+              {menuItems.map(item => {
+                // Live badges from data already flowing into the panel — a
+                // quiet accent pill when non-zero, muted otherwise. Files
+                // carries none: it browses the project tree rather than
+                // listing what this session touched, so there is no count.
+                const badge = item.kind === 'subagents' && Object.values(subagents).some(s => s.status === 'running' || s.status === 'tool')
+                  ? `${Object.values(subagents).filter(s => s.status === 'running' || s.status === 'tool').length} running`
+                  : item.kind === 'logs' && toolLog.length > 0
+                    ? `${toolLog.length} calls`
+                    : null
+                return (
                   <button
-                    key={d.kind}
+                    key={item.kind}
                     className="flex flex-col items-start gap-1.5 px-3.5 py-3 rounded-xl border border-border bg-transparent hover:bg-bg-hover hover:border-border-strong text-left cursor-pointer transition-colors"
-                    onClick={() => openPanelTab(d)}
+                    onClick={() => openMenuItem(item.kind)}
                   >
                     <div className="flex items-center gap-2.5 w-full text-text">
-                      <span className="shrink-0 opacity-80">{appIcon(d.icon)}</span>
-                      <span className="text-[13px] font-medium">{d.menuLabel}</span>
+                      <span className="shrink-0 opacity-80">{item.icon}</span>
+                      <span className="text-[13px] font-medium">{i18nT(NEW_MENU_LABEL_KEY[item.kind])}</span>
+                      {badge && (
+                        <span className="ml-auto text-[10px] px-2 py-0.5 rounded-full bg-accent-subtle text-accent font-medium shrink-0">{badge}</span>
+                      )}
                     </div>
-                    {d.menuDescription && (
-                      <div className="text-[11px] text-muted leading-snug">{d.menuDescription}</div>
-                    )}
+                    <div className="text-[11px] text-muted leading-snug">{i18nT(NEW_MENU_DESC_KEY[item.kind])}</div>
                   </button>
-                ))}
+                )
+              })}
+              {/* App-contributed tabs share the launcher grid, so it presents the
+                  full set rather than the "+" menu carrying tabs the launcher
+                  hides. This is the one surface that renders menuDescription. */}
+              {panelTabDescriptors.map(d => (
+                <button
+                  key={d.kind}
+                  className="flex flex-col items-start gap-1.5 px-3.5 py-3 rounded-xl border border-border bg-transparent hover:bg-bg-hover hover:border-border-strong text-left cursor-pointer transition-colors"
+                  onClick={() => openPanelTab(d)}
+                >
+                  <div className="flex items-center gap-2.5 w-full text-text">
+                    <span className="shrink-0 opacity-80">{appIcon(d.icon)}</span>
+                    <span className="text-[13px] font-medium">{d.menuLabel}</span>
+                  </div>
+                  {d.menuDescription && (
+                    <div className="text-[11px] text-muted leading-snug">{d.menuDescription}</div>
+                  )}
+                </button>
+              ))}
               </div>
             </div>
           </div>
@@ -1203,7 +1182,7 @@ export default function SidePanel({
             and hidden. A withdrawal can be temporary (the Members page withholds
             every slot view for the moment its thread POST is in flight), and
             unmounting a live browser for that moment would destroy its page. */}
-        {tabs.map((t) => {
+        {tabs.map(t => {
           const isActive = t.id === activeId
           // Category views: mount only the active one. They hold no editable
           // buffer, so unmounting an inactive one loses nothing, and it keeps
@@ -1213,6 +1192,12 @@ export default function SidePanel({
           // body-owning kinds skip: an MCP frame's iframe and an app-contributed
           // tab's `AppHost` are equally destroyed by a key change on chat switch.
           if (t.kind === 'app' || isPanelTabKind(t.kind)) return null
+          // Keep the authored document and per-question drafts alive on tab switches.
+          if (t.kind === 'command-center') return (
+            <div key={`${t.id}:${slot}`} className="absolute inset-0" hidden={!isActive}>
+              <CommandCenterPanel slot={slot ?? null} active={isActive && !panelHidden} />
+            </div>
+          )
           // The pinned Files tab renders the file-browser home directly — it
           // is not one of ActivityViewer's multiplexed session views.
           if (t.kind === 'files') {
@@ -1221,18 +1206,14 @@ export default function SidePanel({
               <div key={t.id} className="absolute inset-0">
                 <FilesHomePanel
                   projectDir={projectDir ?? ''}
-                  onFileOpen={(abs, diff, opts) =>
-                    onFileOpen?.(abs, { diffMode: diff, line: opts?.line })
-                  }
+                  onFileOpen={(abs, diff, opts) => onFileOpen?.(abs, { diffMode: diff, line: opts?.line })}
                   onAddToContext={onAddToContext}
                   // Withheld, not disabled, when the terminal feature is off or
                   // the host withdraws the terminal view — the same withdrawal
                   // that removes Terminal from the + menu must remove its
                   // per-project shortcut, or the button promises a shell this
                   // panel will not open.
-                  onOpenTerminal={
-                    terminalEnabled && !isWithheld('terminal') ? openProjectTerminal : undefined
-                  }
+                  onOpenTerminal={terminalEnabled && !isWithheld('terminal') ? openProjectTerminal : undefined}
                 />
               </div>
             )
@@ -1242,27 +1223,9 @@ export default function SidePanel({
             return (
               <div key={t.id} className="absolute inset-0">
                 <ActivityViewer
-                  view={
-                    t.kind as
-                      | 'changes'
-                      | 'issues'
-                      | 'links'
-                      | 'artifacts'
-                      | 'subagents'
-                      | 'workflows'
-                      | 'logs'
-                      | 'crewlog'
-                      | 'context'
-                      | 'side'
-                      | 'git'
-                      | 'summary'
-                      | 'pins'
-                  }
-                  open
-                  onToggle={closePanel}
-                  slot={slot}
-                  subagents={subagents}
-                  toolLog={toolLog}
+                  view={t.kind as 'changes' | 'issues' | 'links' | 'artifacts' | 'subagents' | 'workflows' | 'logs' | 'crewlog' | 'context' | 'side' | 'git' | 'summary' | 'pins'}
+                  open onToggle={closePanel} slot={slot}
+                  subagents={subagents} toolLog={toolLog}
                   sources={sources}
                   selectedSourceUrl={selectedSourceUrl}
                   onSelectSource={onSelectSource}
@@ -1279,49 +1242,29 @@ export default function SidePanel({
                   // rows as artifact tabs via onArtifactOpen.
                   onFileOpen={onFileOpen}
                   onArtifactOpen={onArtifactOpen}
-                  pins={pins}
-                  pinsLoading={pinsLoading}
-                  onJumpToPin={onJumpToPin}
-                  onUnpin={onUnpin}
-                  slotTitle={slotTitle}
-                  chatMode={chatMode}
-                  projectDir={projectDir}
-                  navLinks={navLinks}
-                  navResolving={navResolving}
+                  pins={pins} pinsLoading={pinsLoading} onJumpToPin={onJumpToPin} onUnpin={onUnpin}
+                  slotTitle={slotTitle} chatMode={chatMode}
+                  projectDir={projectDir} navLinks={navLinks} navResolving={navResolving}
                 />
               </div>
             )
           }
           // Terminal + documents: keep mounted, toggle visibility.
           return (
-            <div
-              key={t.id}
-              className="absolute inset-0"
-              style={{ display: isActive ? 'block' : 'none' }}
-            >
+            <div key={t.id} className="absolute inset-0" style={{ display: isActive ? 'block' : 'none' }}>
               <TabBody
                 // Visible to the user means BOTH: this tab is the selected one
                 // AND the panel itself is on screen. A hidden panel still has a
                 // selected tab, so selection alone would let a closed panel's
                 // editor answer Escape and Cmd+S.
-                tab={t}
-                active={isActive && !panelHidden}
+                tab={t} active={isActive && !panelHidden}
                 slot={slot}
                 onClose={() => handleCloseTab(t.id)}
                 onContentChange={(c) => patchTab(t.id, { content: c })}
-                onDiskContent={(c, binary, partial) =>
-                  patchTab(t.id, {
-                    content: c,
-                    savedContent: c,
-                    ...(binary === undefined ? {} : { binary }),
-                    ...(partial === undefined ? {} : { partial }),
-                  })
-                }
+                onDiskContent={(c, binary, partial) => patchTab(t.id, { content: c, savedContent: c, ...(binary === undefined ? {} : { binary }), ...(partial === undefined ? {} : { partial }) })}
                 onDiffModeChange={(diffMode) => patchTab(t.id, { diffMode })}
                 onRevealConsumed={() => patchTab(t.id, { revealLine: undefined })}
-                onPathChange={(p) =>
-                  patchTab(t.id, { path: p, title: p.replace(/\/+$/, '').split('/').pop() || p })
-                }
+                onPathChange={(p) => patchTab(t.id, { path: p, title: p.replace(/\/+$/, '').split('/').pop() || p })}
                 onFileSave={onFileSave}
                 onFileOpen={onFileOpen}
                 onAddToContext={onAddToContext}
@@ -1346,7 +1289,7 @@ export default function SidePanel({
         {/* Panel-level and above the bodies, so a failed app list is reported even though
             the pruning it causes has already moved focus off every contributed tab. */}
         <AppPanelTabsErrorNotice />
-        {allAppTabs.map((t) => {
+        {allAppTabs.map(t => {
           // Key and visibility BOTH carry the slot. A tool-call id is only unique
           // within a session -- `chat.mcpApps` keys by session + tool-call id for
           // exactly that reason -- so keying on the tab id alone let two slots
@@ -1358,23 +1301,16 @@ export default function SidePanel({
           // A withheld app tab (`hiddenViews` has 'app') is never the shown one.
           const shown = t.id === activeId && tabSlot === slot && !isWithheld(t.kind)
           return (
-            <div
-              key={`${tabSlot}\u001F${t.id}`}
-              className="absolute inset-0"
-              style={{ display: shown ? 'block' : 'none' }}
-              aria-hidden={!shown}
-            >
-              {t.kind === 'app' ? (
-                <McpAppTabBody tab={t} slot={tabSlot} />
-              ) : (
+            <div key={`${tabSlot}\u001F${t.id}`} className="absolute inset-0" style={{ display: shown ? 'block' : 'none' }} aria-hidden={!shown}>
+              {t.kind === 'app'
+                ? <McpAppTabBody tab={t} slot={tabSlot} />
                 /* `active` means visible to the USER, so it carries `panelHidden` for the
                    reason the `TabBody` above gives: a hidden panel still has a selected
                    tab, and `shown` alone would leave a collapsed panel's app polling and
                    holding global handlers. `display` stays on `shown` alone -- the body
                    must keep its box when the panel is merely collapsed, or it would
                    remount. */
-                <AppPanelTabBody kind={t.kind} active={shown && !panelHidden} slot={tabSlot} />
-              )}
+                : <AppPanelTabBody kind={t.kind} active={shown && !panelHidden} slot={tabSlot} />}
             </div>
           )
         })}
@@ -1400,7 +1336,7 @@ function AppPanelTabBody({ kind, active, slot }: { kind: string; active: boolean
   // see `useInstalledApps` for why a hand-rolled copy breaks an unrelated consumer.
   const { apps } = useInstalledApps()
   const d = panelTabDescriptor(kind, descriptors)
-  const app = d ? apps.find((a) => a.name === d.appName) : undefined
+  const app = d ? apps.find(a => a.name === d.appName) : undefined
   if (!d || !app) return null
   // The OWNING slot, not the active one: with cross-slot hosting this body may belong
   // to another chat, and the identity its requests carry has to be that chat's.
@@ -1450,7 +1386,7 @@ function AppPanelTabsErrorNotice() {
  *  never persists.) */
 function McpAppTabBody({ tab, slot }: { tab: PanelTab; slot: string }) {
   const sk = tab.slot || slot
-  const payload = useAppSelector((s) =>
+  const payload = useAppSelector(s =>
     tab.appToolCallId && sk ? s.chat.mcpApps?.[mcpAppKey(sk, tab.appToolCallId)] : undefined,
   )
   if (!payload) {
@@ -1462,11 +1398,7 @@ function McpAppTabBody({ tab, slot }: { tab: PanelTab; slot: string }) {
       </div>
     )
   }
-  return (
-    <div className="h-full w-full overflow-auto">
-      <McpAppFrame payload={payload} />
-    </div>
-  )
+  return <div className="h-full w-full overflow-auto"><McpAppFrame payload={payload} /></div>
 }
 
 /**
@@ -1475,26 +1407,11 @@ function McpAppTabBody({ tab, slot }: { tab: PanelTab; slot: string }) {
  * Every file-open path — chat file chips, a diff tab's title, the pinned
  * Files tab's tree, another file tab's tree — lands in a tab rendering this.
  *
- * Rail visibility is a single app-wide preference; the rail only renders at
- * all when the chat has a project dir whose tree the backend serves.
+ * Rail visibility is a single app-wide preference; with a project directory
+ * and file-open host it stays mounted through tree-read failures so its notice,
+ * toggle, and Refresh escape hatch remain reachable.
  */
-function FileTabBody({
-  tab,
-  active,
-  projectDir,
-  scrollMemoryKey,
-  onContentChange,
-  onDiskContent,
-  onDiffModeChange,
-  onFileSave,
-  onFileOpen,
-  onAddToContext,
-  onClose,
-  isTabActive,
-  onSubmitComments,
-  connected = true,
-  onRevealConsumed,
-}: {
+function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange, onDiskContent, onDiffModeChange, onFileSave, onFileOpen, onAddToContext, onClose, onSubmitComments, connected = true, onRevealConsumed }: {
   tab: PanelTab
   /** Is this the visible tab? Background file tabs stay mounted, so the panel
    *  needs this to keep its Cmd+F handler off a document the user cannot see. */
@@ -1509,21 +1426,16 @@ function FileTabBody({
   onDiskContent: (c: string, binary?: boolean, partial?: boolean) => void
   onDiffModeChange: (diffMode: boolean) => void
   onFileSave: (fp: string, c: string) => Promise<void>
-  onFileOpen?: (
-    p: string,
-    opts?: { diffMode?: boolean; line?: number; replaceId?: string; canReplace?: () => boolean },
-  ) => void
+  onFileOpen?: (p: string, opts?: { diffMode?: boolean; line?: number; replaceId?: string; canReplace?: () => boolean }) => void
   /** Right-click "Add to context" on a rail row. */
   onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
   onClose: () => void
-  isTabActive: boolean
   onSubmitComments?: (m: string) => void | boolean | Promise<void | boolean>
   connected?: boolean
   onRevealConsumed: () => void
 }) {
   const [railOpen, setRailOpen] = usePersistedBool('mc-files-rail-open', false)
-  const treeAvailable = useTreeAvailable(projectDir)
-  const railUsable = treeAvailable && !!projectDir && !!onFileOpen
+  const railUsable = !!projectDir && !!onFileOpen
   // The rail re-targets this tab in place, so the panel's own dirty guard has to
   // approve the navigation the way it approves a close.
   const panelRef = useRef<MarkdownPanelHandle>(null)
@@ -1545,40 +1457,33 @@ function FileTabBody({
       onSave={onFileSave}
       onClose={onClose}
       liveWatch
-      isTabActive={isTabActive}
       onSubmitComments={onSubmitComments}
       connected={connected}
       revealLine={tab.revealLine}
       onRevealConsumed={onRevealConsumed}
       railOpen={railUsable && railOpen}
-      onRailToggle={railUsable ? () => setRailOpen((v) => !v) : undefined}
-      browserRail={
-        railUsable ? (
-          <FileBrowserRail
-            projectDir={projectDir}
-            onAddToContext={onAddToContext}
-            selectedPath={tab.path || null}
-            // In-place navigation: a tree click RE-TARGETS this tab (replaceId)
-            // rather than spawning a sibling — only the pinned Files tab fans
-            // out into new tabs. Re-targeting discards the buffer, so it asks
-            // through the panel's dirty guard first, exactly as closing does.
-            // `canReplace` re-asks after the file read: the user can start typing
-            // during a slow load, and by then the up-front answer is stale.
-            onFileOpen={(abs, diff, opts) => {
-              const nav = (stillClean?: () => boolean) =>
-                onFileOpen(abs, {
-                  diffMode: diff,
-                  line: opts?.line,
-                  replaceId: tab.id,
-                  canReplace: stillClean,
-                })
-              const panel = panelRef.current
-              if (panel) panel.requestNavigate(nav)
-              else nav()
-            }}
-          />
-        ) : undefined
-      }
+      onRailToggle={railUsable ? () => setRailOpen(v => !v) : undefined}
+      browserRail={railUsable ? (
+        <FileBrowserRail
+          projectDir={projectDir}
+          onAddToContext={onAddToContext}
+          selectedPath={tab.path || null}
+          // In-place navigation: a tree click RE-TARGETS this tab (replaceId)
+          // rather than spawning a sibling — only the pinned Files tab fans
+          // out into new tabs. Re-targeting discards the buffer, so it asks
+          // through the panel's dirty guard first, exactly as closing does.
+          // `canReplace` re-asks after the file read: the user can start typing
+          // during a slow load, and by then the up-front answer is stale.
+          onFileOpen={(abs, diff, opts) => {
+            const nav = (stillClean?: () => boolean) =>
+              onFileOpen(abs, {
+                diffMode: diff, line: opts?.line, replaceId: tab.id, canReplace: stillClean,
+              })
+            const panel = panelRef.current
+            if (panel) panel.requestNavigate(nav); else nav()
+          }}
+        />
+      ) : undefined}
     />
   )
 }
@@ -1607,21 +1512,13 @@ function FileTabBody({
  * this placeholder and that page ask for costs one GET and yields one answer
  * rather than two racing reads of the same file.
  */
-function HydratingFileTab({
-  path,
-  onDiskContent,
-}: {
-  path: string
-  onDiskContent: (c: string, binary?: boolean, partial?: boolean) => void
-}) {
+function HydratingFileTab({ path, onDiskContent }: { path: string; onDiskContent: (c: string, binary?: boolean, partial?: boolean) => void }) {
   const [error, setError] = useState<string | null>(null)
   const qc = useQueryClient()
   // Held in a ref so a new callback identity from the parent's render does not
   // re-trigger the read; only the path does.
   const applyRef = useRef(onDiskContent)
-  useEffect(() => {
-    applyRef.current = onDiskContent
-  })
+  useEffect(() => { applyRef.current = onDiskContent })
   useEffect(() => {
     const ac = new AbortController()
     setError(null)
@@ -1637,34 +1534,22 @@ function HydratingFileTab({
           staleTime: FILE_READ_STALE_MS,
         })
         if (ac.signal.aborted) return
-        if (r.ok) {
-          applyRef.current(r.text, r.binary, isPartialRead(r))
-          return
-        }
+        if (r.ok) { applyRef.current(r.text, r.binary, isPartialRead(r)); return }
         if (r.status === 404) {
-          applyRef.current(
-            i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or'),
-            false,
-          )
+          applyRef.current(i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or'), false)
           return
         }
         // The same sentence the chip click reports for a failed read: a human
         // line naming the file, with the status as the detail -- a bare "HTTP
         // 500" is a code machines produce, not something a reader can act on.
-        setError(
-          i18nT('pages.chatPage.could_not_read_file_reason', {
-            path,
-            reason: i18nT('pages.chatPage.http_status', { status: r.status }),
-          }),
-        )
+        setError(i18nT('pages.chatPage.could_not_read_file_reason', {
+          path, reason: i18nT('pages.chatPage.http_status', { status: r.status }),
+        }))
       } catch (e) {
         if (!ac.signal.aborted) {
-          setError(
-            i18nT('pages.chatPage.could_not_read_file_reason', {
-              path,
-              reason: errMessage(e) || i18nT('pages.chatPage.unknown_error'),
-            }),
-          )
+          setError(i18nT('pages.chatPage.could_not_read_file_reason', {
+            path, reason: errMessage(e) || i18nT('pages.chatPage.unknown_error'),
+          }))
         }
       }
     })()
@@ -1682,38 +1567,11 @@ function HydratingFileTab({
       </div>
     )
   }
-  return (
-    <div data-testid="file-tab-hydrating" className="h-full p-4">
-      <ContentSkeleton rows={8} />
-    </div>
-  )
+  return <div data-testid="file-tab-hydrating" className="h-full p-4"><ContentSkeleton rows={8} /></div>
 }
 
-function TabBody({
-  tab,
-  active,
-  slot,
-  projectDir,
-  onClose,
-  onContentChange,
-  onDiskContent,
-  onDiffModeChange,
-  onRevealConsumed,
-  onPathChange,
-  onFileSave,
-  onFileOpen,
-  onAddToContext,
-  onSubmitComments,
-  connected = true,
-  onTerminalSendToChat,
-  diffLineNumbers,
-  setDiffLineNumbers,
-  diffSideBySide,
-  setDiffSideBySide,
-}: {
-  tab: PanelTab
-  active: boolean
-  slot: string
+function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDiskContent, onDiffModeChange, onRevealConsumed, onPathChange, onFileSave, onFileOpen, onAddToContext, onSubmitComments, connected = true, onTerminalSendToChat, diffLineNumbers, setDiffLineNumbers, diffSideBySide, setDiffSideBySide }: {
+  tab: PanelTab; active: boolean; slot: string
   /** The chat's project directory — the file-browser rail's tree root. */
   projectDir?: string
   onClose: () => void
@@ -1728,34 +1586,21 @@ function TabBody({
    *  so the strip label tracks where the user actually is. */
   onPathChange: (p: string) => void
   onFileSave: (fp: string, c: string) => Promise<void>
-  onFileOpen?: (
-    p: string,
-    opts?: { diffMode?: boolean; line?: number; replaceId?: string; canReplace?: () => boolean },
-  ) => void
+  onFileOpen?: (p: string, opts?: { diffMode?: boolean; line?: number; replaceId?: string; canReplace?: () => boolean }) => void
   /** Right-click "Add to context" on a file-browser rail row. */
   onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
   onSubmitComments?: (m: string) => void | boolean | Promise<void | boolean>
   connected?: boolean
   onTerminalSendToChat?: (text: string) => void
-  diffLineNumbers: boolean
-  setDiffLineNumbers: (fn: (v: boolean) => boolean) => void
-  diffSideBySide: boolean
-  setDiffSideBySide: (fn: (v: boolean) => boolean) => void
+  diffLineNumbers: boolean; setDiffLineNumbers: (fn: (v: boolean) => boolean) => void
+  diffSideBySide: boolean; setDiffSideBySide: (fn: (v: boolean) => boolean) => void
 }) {
   // An app-contributed tab (contributes.panelTabs) never reaches here: like the MCP
   // `app` kind, its body renders from the cross-slot `allAppTabs` list so a chat
   // switch cannot remount its `AppHost`. The tab loop above returns null for both.
   const terminalsPending = usePanelTerminalsPending()
   // A restored shell may be gone: connecting before the ruling would spawn a new one.
-  if (tab.kind === 'terminal')
-    return terminalsPending ? null : (
-      <CliPanel
-        sessionId={tab.sessionId ?? ''}
-        cwd={tab.cwd}
-        visible={active}
-        onSendToChat={onTerminalSendToChat}
-      />
-    )
+  if (tab.kind === 'terminal') return terminalsPending ? null : <CliPanel sessionId={tab.sessionId ?? ''} cwd={tab.cwd} visible={active} onSendToChat={onTerminalSendToChat} />
   if (tab.kind === 'browser') return <WebPreviewPanel sessionKey={slot} active={active} />
   if (tab.kind === 'app') return <McpAppTabBody tab={tab} slot={slot} />
   // Cross-remount scroll identity for document bodies. Same slot+id key shape
@@ -1773,7 +1618,6 @@ function TabBody({
       <FileTabBody
         tab={tab}
         active={active}
-        isTabActive={active}
         projectDir={projectDir}
         scrollMemoryKey={scrollMemoryKey}
         onContentChange={onContentChange}
@@ -1804,7 +1648,6 @@ function TabBody({
   if (tab.kind === 'artifact') {
     return (
       <ArtifactPanel
-        isTabActive={active}
         embedded
         active={active}
         slug={tab.artifactSlug || ''}
@@ -1830,77 +1673,21 @@ function TabBody({
           // bar carries breadcrumb (click → open editor), change stats, and the
           // two view controls. Divider to content lives on the bar's border-b.
           <div className="flex items-center gap-2 h-[38px] px-3 shrink-0 border-b border-border">
-            <button
-              className="text-[12px] text-text-strong truncate hover:text-accent cursor-pointer transition-colors bg-transparent border-none p-0"
-              onClick={() => {
-                onFileOpen?.(tab.path || '')
-              }}
-              title={i18nT('pages.chat.sidePanel.open_in_editor_2', { path: tab.path || '' })}
-            >
+            <button className="text-[12px] text-text-strong truncate hover:text-accent cursor-pointer transition-colors bg-transparent border-none p-0" onClick={() => { onFileOpen?.(tab.path || '') }} title={i18nT('pages.chat.sidePanel.open_in_editor_2', { path: tab.path || '' })}>
               {/* Bare filename: the tab title carries '- Diff', which would
                   read redundantly next to the Turn Diff badge here. */}
               {(tab.path || '').split('/').pop() || tab.title}
             </button>
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/15 text-accent font-medium shrink-0">
-              {i18nT('pages.chat.sidePanel.turn_diff')}
-            </span>
-            {(added > 0 || removed > 0) && (
-              <span className="text-[11px] font-mono font-semibold shrink-0">
-                {added > 0 && <span className="text-ok">+{added}</span>}
-                {removed > 0 && <span className="text-danger ml-1.5">-{removed}</span>}
-              </span>
-            )}
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/15 text-accent font-medium shrink-0">{i18nT('pages.chat.sidePanel.turn_diff')}</span>
+            {(added > 0 || removed > 0) && <span className="text-[11px] font-mono font-semibold shrink-0">{added > 0 && <span className="text-ok">+{added}</span>}{removed > 0 && <span className="text-danger ml-1.5">-{removed}</span>}</span>}
             <span className="flex-1" />
-            <button
-              onClick={() => onFileOpen?.(tab.path || '')}
-              className="flex items-center justify-center w-[26px] h-[26px] rounded-md cursor-pointer transition-colors text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none"
-              title={i18nT('pages.chat.sidePanel.open_in_editor')}
-              aria-label={i18nT('pages.chat.sidePanel.open_in_editor')}
-            >
-              <Pen size={14} />
-            </button>
-            <button
-              onClick={() => setDiffSideBySide((v) => !v)}
-              className={`flex items-center justify-center w-[26px] h-[26px] rounded-md cursor-pointer transition-colors border-none ${diffSideBySide ? 'text-accent bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'}`}
-              title={
-                diffSideBySide
-                  ? i18nT('pages.chat.sidePanel.switch_to_unified_view')
-                  : i18nT('pages.chat.sidePanel.switch_to_split_view')
-              }
-              aria-label={
-                diffSideBySide
-                  ? i18nT('pages.chat.sidePanel.switch_to_unified_view')
-                  : i18nT('pages.chat.sidePanel.switch_to_split_view')
-              }
-            >
-              <Columns2 size={14} />
-            </button>
-            <button
-              onClick={() => setDiffLineNumbers((v) => !v)}
-              className={`flex items-center justify-center w-[26px] h-[26px] rounded-md cursor-pointer transition-colors border-none ${diffLineNumbers ? 'text-accent bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'}`}
-              title={
-                diffLineNumbers
-                  ? i18nT('pages.chat.sidePanel.hide_line_numbers')
-                  : i18nT('pages.chat.sidePanel.show_line_numbers')
-              }
-              aria-label={
-                diffLineNumbers
-                  ? i18nT('pages.chat.sidePanel.hide_line_numbers')
-                  : i18nT('pages.chat.sidePanel.show_line_numbers')
-              }
-            >
-              <Hash size={14} />
-            </button>
+            <button onClick={() => onFileOpen?.(tab.path || '')} className="flex items-center justify-center w-[26px] h-[26px] rounded-md cursor-pointer transition-colors text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none" title={i18nT('pages.chat.sidePanel.open_in_editor')} aria-label={i18nT('pages.chat.sidePanel.open_in_editor')}><Pen size={14} /></button>
+            <button onClick={() => setDiffSideBySide(v => !v)} className={`flex items-center justify-center w-[26px] h-[26px] rounded-md cursor-pointer transition-colors border-none ${diffSideBySide ? 'text-accent bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'}`} title={diffSideBySide ? i18nT('pages.chat.sidePanel.switch_to_unified_view') : i18nT('pages.chat.sidePanel.switch_to_split_view')} aria-label={diffSideBySide ? i18nT('pages.chat.sidePanel.switch_to_unified_view') : i18nT('pages.chat.sidePanel.switch_to_split_view')}><Columns2 size={14} /></button>
+            <button onClick={() => setDiffLineNumbers(v => !v)} className={`flex items-center justify-center w-[26px] h-[26px] rounded-md cursor-pointer transition-colors border-none ${diffLineNumbers ? 'text-accent bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'}`} title={diffLineNumbers ? i18nT('pages.chat.sidePanel.hide_line_numbers') : i18nT('pages.chat.sidePanel.show_line_numbers')} aria-label={diffLineNumbers ? i18nT('pages.chat.sidePanel.hide_line_numbers') : i18nT('pages.chat.sidePanel.show_line_numbers')}><Hash size={14} /></button>
           </div>
         }
       >
-        <DiffPanel
-          filePath={tab.path || ''}
-          original={tab.original || ''}
-          modified={tab.modified || ''}
-          lineNumbers={diffLineNumbers}
-          sideBySide={diffSideBySide}
-        />
+        <DiffPanel filePath={tab.path || ''} original={tab.original || ''} modified={tab.modified || ''} lineNumbers={diffLineNumbers} sideBySide={diffSideBySide} />
       </DetailPanel>
     )
   }
@@ -1920,22 +1707,14 @@ function TerminalTabTitle({ sessionId, fallback }: { sessionId: string; fallback
  *
  *  A component rather than inline JSX inside the map: each chip owns its own
  *  long-press drag state, and a hook cannot be called from a loop. */
-function DraggableTabItem({
-  tab,
-  active,
-  separator,
-  instantLayout,
-  onSelect,
-  onClose,
-}: {
+function DraggableTabItem({ tab, active, separator, instantLayout, onSelect, onClose}: {
   tab: PanelTab
   active: boolean
   separator: boolean
   /** Skip the layout spring while the panel is being resized — see the caller. */
   instantLayout: boolean
   onSelect: () => void
-  onClose: () => void
-}) {
+  onClose: () => void}) {
   const { itemProps, dragging } = useLongPressReorder()
   return (
     <Reorder.Item
@@ -1953,35 +1732,18 @@ function DraggableTabItem({
     >
       {separator && (
         // Centered in the group's gap-2.
-        <span
-          aria-hidden="true"
-          className="absolute -left-[4.5px] top-1/2 -translate-y-1/2 w-px h-4 bg-border"
-        />
+        <span aria-hidden="true" className="absolute -left-[4.5px] top-1/2 -translate-y-1/2 w-px h-4 bg-border" />
       )}
       <TabChip tab={tab} active={active} onSelect={onSelect} onClose={onClose} />
     </Reorder.Item>
   )
 }
 
-function TabChip({
-  tab,
-  active,
-  onSelect,
-  onClose,
-  closable = true,
-  pinned = false,
-  host = false,
-  icon,
-  testId,
-}: {
+function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = false, host = false, icon, testId }: {
   /** A stored tab, or — for the host's leading tab — just a title: that chip has
    *  no `kind` (it is not a `PanelTab`) and brings its own `icon`. */
   tab: Pick<PanelTab, 'title'> & Partial<Pick<PanelTab, 'kind' | 'sessionId' | 'path'>>
-  active: boolean
-  onSelect: () => void
-  onClose: () => void
-  closable?: boolean
-  pinned?: boolean
+  active: boolean; onSelect: () => void; onClose: () => void; closable?: boolean; pinned?: boolean
   /** A host-owned leading chip: always labelled like a document tab, but named
    *  (aria-label) like a pinned view, since it is the strip's own navigation. */
   host?: boolean
@@ -2006,18 +1768,8 @@ function TabChip({
       onClick={onSelect}
       // Guard on e.target so Enter/Space on the nested transfer/close buttons
       // activates them natively instead of also selecting the tab.
-      onKeyDown={(e) => {
-        if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
-          e.preventDefault()
-          onSelect()
-        }
-      }}
-      onAuxClick={(e) => {
-        if (closable && e.button === 1) {
-          e.preventDefault()
-          onClose()
-        }
-      }}
+      onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onSelect() } }}
+      onAuxClick={(e) => { if (closable && e.button === 1) { e.preventDefault(); onClose() } }}
       // Icon-only pinned chips have no visible text, so give them an explicit
       // accessible name + hover tooltip. Harmless (and a nice tooltip) when the
       // label is also shown.
@@ -2045,28 +1797,21 @@ function TabChip({
       className={`group relative isolate flex items-center gap-1 h-8 rounded-t-md rounded-b-none border cursor-pointer shrink-0 select-none transition-colors ${
         showLabel ? `max-w-[240px] ${closable ? 'pl-2 pr-1' : 'px-2'}` : 'w-8 justify-center px-0'
       } ${
-        active
-          ? 'side-tab-active bg-bg text-accent border-x-border border-t-border border-b-transparent'
-          : 'side-tab-inactive border-transparent text-muted hover:text-text'
+        active ? 'side-tab-active bg-bg text-accent border-x-border border-t-border border-b-transparent' : 'side-tab-inactive border-transparent text-muted hover:text-text'
       }`}
     >
       <span className="shrink-0">{glyph}</span>
       {showLabel && (
         <span className="min-w-0 text-[12px] truncate text-left">
-          {tab.kind === 'terminal' && tab.sessionId ? (
-            <TerminalTabTitle sessionId={tab.sessionId} fallback={tab.title} />
-          ) : (
-            tab.title
-          )}
+          {tab.kind === 'terminal' && tab.sessionId
+            ? <TerminalTabTitle sessionId={tab.sessionId} fallback={tab.title} />
+            : tab.title}
         </span>
       )}
       {closable && (
         <div className="flex items-center gap-0.5 shrink-0">
           <button
-            onClick={(e) => {
-              e.stopPropagation()
-              onClose()
-            }}
+            onClick={(e) => { e.stopPropagation(); onClose() }}
             className={`shrink-0 -ml-0.5 flex items-center justify-center w-[18px] h-[18px] rounded-full transition-all bg-transparent border-none cursor-pointer text-muted hover:text-text hover:bg-bg-hover ${active ? 'opacity-70' : 'opacity-0 group-hover:opacity-70'}`}
             title={i18nT('pages.chat.sidePanel.close_tab')}
             aria-label={i18nT('pages.chat.sidePanel.close_tab')}

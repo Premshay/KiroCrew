@@ -92,6 +92,9 @@ with no row here.
      - driver-internal (whether a member's own webview can be mounted)
    * - ``ACP_BACKENDS_STEER``
      - pre-session registry query (whether ``_session/steer`` exists)
+   * - ``ACP_BACKENDS_STEERING_REQUEST``
+     - pre-session registry query (whether a user steer travels on codex-acp's
+       ``_session/steering`` request instead)
    * - ``ACP_BACKENDS_COMPACT``
      - pre-session registry query (whether manual ``/compact`` is offered at all)
    * - ``ACP_BACKENDS_INLINE_COMPACTION``
@@ -168,6 +171,9 @@ with no row here.
    * - ``ACP_BACKENDS_HOST_AUTH_CALLBACK``
      - driver-internal (whether the reader loop may answer the engine's
        ``_kiro/auth/getAccessToken`` from Crew's own vault)
+   * - ``ACP_BACKENDS_OPEN_EXTERNAL_URL``
+     - driver-internal (whether the reader loop answers ``_kiro/openExternalUrl``
+       and a session starts MCP sign-ins with ``_kiro/mcp/resetServer``)
    * - ``ACP_BACKENDS_SIDE_READONLY``
      - pre-session registry query (whether a side-chat turn may execute
        read-only tools under the derived ``<agent>--readonly`` spec; asked
@@ -293,8 +299,10 @@ ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
 #: kiro-cli (and KAS, which is kiro-cli's relay) is handed ``--agent`` and loads
 #: the spec itself, so Crew passes it an empty array — a duplicate there would
 #: shadow the spec's own entries. claude-agent-acp reads no agent file at all, so
-#: the array is the ENTIRE MCP surface of the session: an empty one means the
-#: harness works while every Crew tool is silently absent.
+#: the array is the only channel CREW has onto the session's MCP surface (the harness
+#: mounts what its own user- and project-scope ``mcpServers`` and plugins declare
+#: beside it): an empty one means the harness works while every Crew tool is
+#: silently absent.
 #:
 #: codex-acp is the second member, and it joins on the same terms rather than on
 #: an exact likeness to claude: it does load a config file of its OWN
@@ -1056,12 +1064,53 @@ ACP_BACKENDS_MEMBER_PANEL = frozenset(
 # exactly like kiro-cli. Membership is gated on the handshake advertisement
 # (``ACP_BACKENDS_STEER_ADVERTISED``), so an installed dsh-acp without the verb
 # reads as unsteerable and takes the queue fallback instead of dropping a message.
+#
+# This set answers the DENY-NOTICE question as well as the user one: a member's
+# steer can carry a refusal reason into the turn that was refused. A backend that
+# can take a USER's mid-turn message but not a deny notice belongs in
+# ``ACP_BACKENDS_STEERING_REQUEST`` below instead, and the two questions are read
+# off separate properties (``supports_steer`` and ``supports_refusal_steer``).
 ACP_BACKENDS_STEER = frozenset({
     ACP_BACKEND_KIRO,
     ACP_BACKEND_KAS,
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_DEEPSEEK,
 })
+
+# Backends that take a USER's mid-turn message over codex-acp's
+# ``_session/steering`` request rather than kiro-cli's ``_session/steer``.
+#
+# Measured against a live codex-acp 1.11.0: a steer sent while a prompt is in
+# flight is answered ``{outcome: "injected"}`` within milliseconds and the running
+# turn reads it; the same request with no turn running is answered
+# ``{outcome: "startedNewTurn"}`` and the adapter runs a turn of its own that no
+# ``session/prompt`` owns; ``session/cancel`` stops that turn and the next
+# ``session/prompt`` runs normally. There is no ``steering_consumed`` echo, so the
+# request's own answer is the delivery evidence.
+#
+# The session handle therefore AWAITS the answer (the kiro verb is
+# fire-and-forget), until it arrives or the aimed-at turn ends: ``injected``
+# settles the steer inside that turn, ``failed`` or no answer before the turn ends
+# reports it undelivered so the caller queues it as the next turn, and
+# ``startedNewTurn`` is cancelled first so the text cannot run twice. The result
+# is at-least-once: codex orders the answer against the turn's terminal in no
+# way, so a steer injected just as its turn ends can be queued as well and run a
+# second time, visibly, as its own turn. Only the
+# shared-runtime path speaks it -- ``AcpSessionHandle`` -- because only there can
+# a request be awaited without competing with the turn for the adapter's stdout.
+#
+# Deliberately NOT ``ACP_BACKENDS_STEER``: the deny-notice path needs a steer
+# that survives the refusal, and codex discards an injected steer with a turn
+# its approval answer cancels (see the note above).
+#
+# The same discard reaches a user steer already accepted into the turn, when a
+# LATER approval is denied or the turn is cancelled. So a codex steer is reported
+# consumed only when its turn ends cleanly, and otherwise the caller's pending
+# entry for it is queued by the turn's teardown. Only the dashboard composer keeps
+# such an entry, so membership here also means ``steer_needs_loss_recovery``: the
+# provider wrapper that the messaging channels, Side Chat and ``spawn_steer``
+# steer refuses, so those queue instead.
+ACP_BACKENDS_STEERING_REQUEST = frozenset({ACP_BACKEND_CODEX})
 
 # Backends that can serve a MANUAL ``/compact`` (the user-typed slash command).
 # Every member acts on the ``/compact`` prompt that ``AcpProvider.compact()``
@@ -1493,8 +1542,10 @@ def overlay_project_scope(backend: str, work_dir: Any) -> dict[str, Any]:
 # by a channel other than the ``session/new`` ``mcpServers`` array.
 #
 # The unresolved-``@server``-ref detector (``agent_sdk.mcp_refs``) judges a spec's
-# ``tools`` refs against the servers the session actually receives, and for an
-# array-backed host that is the wire array: what is not in it is not mounted.
+# ``tools`` refs against the servers Crew's projection delivers, and for an
+# array-backed host that is the wire array: what is not in it, Crew did not mount
+# (the harness may still mount a same-named server from a configuration of its
+# own, which the detector never reads -- so its line says "may", never "absent").
 # These two hosts mount the spec's servers by another channel, so for them the
 # spec's own server names are satisfied by construction and only a ref naming a
 # server the spec does NOT declare is unresolved. kiro-cli resolves ``--agent``
@@ -2098,6 +2149,18 @@ ACP_BACKENDS_STRUCTURED_REFUSAL = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # returns immediate success, so the ACP layer authenticates nothing at all and the
 # provider key it needs is resolved inside the harness from its own credential store.
 ACP_BACKENDS_HOST_AUTH_CALLBACK = frozenset({ACP_BACKEND_KAS})
+
+#: Backends whose engine sends an MCP OAuth consent URL to its client as a
+#: ``_kiro/openExternalUrl`` request, after the client starts a sign-in with
+#: ``_kiro/mcp/resetServer``. Membership makes the handshake-declared channel
+#: live: the reader loop answers that request and the session starts sign-ins.
+#: KAS is the only member; it declares ``openExternalUrl`` in
+#: ``KAS_CLIENT_CAPABILITIES``.
+#: kiro-cli is not a member: its engine runs the OAuth flow itself and reports the
+#: URL as ``_kiro.dev/mcp/oauth_request``.
+#: claude, codex, opencode, pi, goose and deepseek are not members: none of them
+#: defines either method.
+ACP_BACKENDS_OPEN_EXTERNAL_URL = frozenset({ACP_BACKEND_KAS})
 
 #: Backends whose agent asks its CLIENT for the hooks matching a trigger, and to
 #: run one, over ``_kiro/hooks/list``, ``_kiro/hooks/sessionStart`` and

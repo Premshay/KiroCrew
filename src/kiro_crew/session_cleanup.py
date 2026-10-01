@@ -22,10 +22,21 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.process_identity import (
+    audit_kill_decision,
+    audit_kill_phase,
+    teardown_barriers,
+)
+from kiro_crew.runtime_ownership import authorize_runtime_kill
+from kiro_crew.runtime_reconcile import build_reconciler
 from kiro_crew.watchdog import SessionWatchdog
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
+
+
+#: Caller name on this module's kill-decision audit rows.
+_SWEEP = "session_cleanup sweep"
 
 
 class ShutdownSignal(Protocol):
@@ -177,6 +188,19 @@ class CleanupState:
     # linked key before the first turn creates that session.
     slot_owned_keys: set[str] = field(default_factory=set)
     watchdog: SessionWatchdog | None = None
+    # The runtime reconciler, retained across ticks because its two-pass
+    # confirmation IS its state: a process unowned once is remembered, and only
+    # one remembered from the previous pass may be killed. Rebuilding it per tick
+    # would make every pass a first pass and nothing would ever be reclaimed.
+    # Typed loosely so this module need not import the reconciler at load.
+    runtime_reconciler: Any = None
+    # The pid union for the CURRENT reconcile pass, taken on the event loop and
+    # frozen before the pass is dispatched to a worker thread. It is stored rather
+    # than passed because the reconciler outlives any one tick: the pass reads
+    # whatever this tick put here, so the union is still re-read every pass, but
+    # the read that gathers it happens where it is legal. Reading it from the
+    # worker would drain the warm pool's asyncio.Queue off-loop.
+    runtime_reconcile_active: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +459,170 @@ class SessionCleanup:
         except Exception:
             # Best-effort, like the orphan-MCP sweep: never promote severity.
             self._deps.logger.debug("agent-scope reap hook failed", exc_info=True)
+
+    def _sessions_on_pid(self, pid: int) -> list[str]:
+        """The session keys whose provider is running on *pid*.
+
+        Read WITHOUT the registry lock, from the reconciler's worker thread. The
+        lock is an ``asyncio`` lock and cannot be taken off-loop at all, and a
+        reporting question must not be the thing that queues behind a live turn's
+        registration. ``list()`` takes a snapshot so a concurrent registration
+        cannot resize the mapping mid-iteration; a key that changes hands inside
+        the read costs one misaddressed notification and never a signal.
+        """
+        keys: list[str] = []
+        for key in list(self._owner._sessions):
+            try:
+                if self._owner.get_pid(key) == pid:
+                    keys.append(key)
+            except Exception:
+                continue
+        return keys
+
+    def _reconcile_kill_budget(self) -> int:
+        """``session.reconcile_max_kills`` as this tick should act on it.
+
+        The field can only LOWER the arm's shipped budget, never raise it, and at 0
+        it leaves the kill arm observing: the arm still publishes the leak reading
+        and audits the processes it would have signalled. Read from the owner's
+        CURRENT config on every tick, so turning the budget down on a host that
+        shares its data home with another install, or putting it back, takes effect
+        on the next pass instead of at the next restart.
+
+        Defensive about the type for the reason ``_adopt_idle_policy`` is about the
+        RSS ceiling: ``config.json`` is agent-writable, and the value authorizes
+        signals. Anything that is not a plain non-negative int reads as zero, which
+        is the answer that does not kill.
+        """
+        raw = getattr(self._owner._cfg.session, "reconcile_max_kills", 0)
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            return 0
+        return max(0, raw)
+
+    async def _reconcile_runtimes_hook(self) -> None:
+        """Compare the kernel's process list with this gateway's records.
+
+        Every other sweep on this tick asks a record whether a pid is still
+        needed. This one asks the kernel what exists and acts on the two
+        disagreements: a live process no record claims, and a record naming a
+        process that is gone. It publishes both counts whether or not it acted,
+        because a leak that is merely counted is still a leak an operator can see.
+
+        The reconciler object is built once and kept on the cleanup state: the
+        two-pass confirmation that stops it killing a process whose registration
+        is still in flight is that object's memory of the previous pass.
+
+        Blocking work -- ``cgroup.procs`` reads, ``/proc`` reads, the signals --
+        runs on the maintenance executor, exactly like the scope reaper and for
+        the same reason: these are filesystem reads over same-uid agent-writable
+        paths, and doing them on the event loop parks the gateway.
+
+        The pid union is therefore taken HERE, on the loop, and handed to the pass
+        as a frozen set. It cannot be read from the worker: ``_pool_pids`` drains
+        the warm pool's ``asyncio.Queue`` with ``get_nowait`` and puts every entry
+        back, which is safe only on the loop that owns the queue. From a thread it
+        races the refill check, and a refill that sees a momentarily empty pool
+        spawns runtimes to fill one that was never empty.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            # On the loop, before anything is dispatched to the executor.
+            active_now, union_complete = self._active_pids()
+            if not union_complete:
+                # The same completeness rule the membership read inside the pass
+                # imposes on itself: a partial union makes a live runtime look
+                # unowned, and that is the one input that turns this reconciler
+                # into the leak it exists to report. Housekeeping deferred one
+                # tick costs nothing that killing a live runtime would not cost
+                # more.
+                self._deps.logger.debug(
+                    "runtime reconcile skipped: the active-pid union is incomplete"
+                )
+                return
+            snapshot = frozenset(active_now)
+            self.state.runtime_reconcile_active = snapshot
+            reconciler = self.state.runtime_reconciler
+            if reconciler is None:
+                # Both seams are bound to THIS cleanup service rather than
+                # captured values: the union seam reads whatever snapshot this
+                # tick stored, and the notification resolves the session keys as
+                # they are at the moment a death is found. The loop is captured
+                # because the notification is raised from a worker thread and has
+                # to be handed back to the loop that owns the callback.
+                reconciler = build_reconciler(
+                    active_pids=lambda: set(self.state.runtime_reconcile_active),
+                    notify_dead=lambda pid: self._note_dead_runtime(pid, loop),
+                )
+                self.state.runtime_reconciler = reconciler
+            # Adopted before every pass, not frozen into the instance that is
+            # retained for the gateway's life: the two-pass confirmation is that
+            # instance's state, so it cannot be rebuilt to pick up a config write,
+            # and arming or disarming the kill arm must not need a restart. Same
+            # schedule and same live-config source as ``_adopt_idle_policy``.
+            reconciler.set_max_kills(self._reconcile_kill_budget())
+            reading = await loop.run_in_executor(
+                self._deps.get_maintenance_executor(),
+                reconciler.run_once,
+            )
+            if not reading.supported:
+                self._deps.logger.debug(
+                    "runtime reconcile skipped: %s", reading.reason or "unsupported"
+                )
+                return
+            self._deps.emit_counter(
+                "session.runtime_reconcile",
+                reading.as_counter_fields(),
+            )
+            if reading.unowned_alive or reading.owned_dead:
+                # ``would_kill`` belongs beside the other four: it is the number an
+                # operator reads to decide whether to change the budget, and a
+                # summary that published the whole unclaimed population without it
+                # cannot tell "nothing to reclaim" from "candidates are sitting
+                # here and the budget is withholding them".
+                self._deps.logger.warning(
+                    "Runtime reconcile: unowned_alive=%d owned_dead=%d "
+                    "(killed %d, would_kill %d, retracted %d)",
+                    reading.unowned_alive,
+                    reading.owned_dead,
+                    reading.killed,
+                    reading.would_kill,
+                    reading.forgotten,
+                )
+        except Exception:
+            # Best-effort, like the sweeps either side of it.
+            self._deps.logger.debug("runtime reconcile hook failed", exc_info=True)
+
+    def _note_dead_runtime(self, pid: int, loop: asyncio.AbstractEventLoop) -> None:
+        """Tell whoever still holds *pid* that the process behind it is gone.
+
+        The reconciler retracts the record; this says so to the sessions that were
+        using it, which is the difference between a tidy registry and a session
+        that learns its runtime died only when its next turn times out. Reuses the
+        recycle callback the RSS path already fires, so the notification a user
+        sees is the one they already know.
+
+        Called from the reconciler's worker thread, so the callback is SCHEDULED
+        on *loop* rather than awaited here: a slow consumer must not hold the
+        reconciliation open, and a coroutine cannot be awaited off-loop anyway.
+        """
+        keys = self._sessions_on_pid(pid)
+        if not keys:
+            return
+        for key in keys:
+            self._deps.logger.warning(
+                "Runtime reconcile: session %s was on pid %s, which no longer exists",
+                key,
+                pid,
+            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._owner._fire_recycle_callback(key, reason="runtime process is gone"),
+                    loop,
+                )
+            except Exception:
+                self._deps.logger.debug(
+                    "Runtime reconcile: could not notify %s", key, exc_info=True
+                )
 
     async def _rss_threshold_check(self) -> None:
         if not self.state.rss_max_mb:
@@ -815,6 +1003,12 @@ class SessionCleanup:
             await self._maybe_prune_pycache()
             await self._sweep_periodic_pids()
             await self._sweep_untracked_mcps()
+            # LAST on the tick, deliberately. Every sweep above may retract a
+            # record or end a process, so running the comparison after them means
+            # it reconciles the state they left rather than the state they were
+            # about to change -- and a disagreement it still finds is one no sweep
+            # was able to resolve, which is exactly what the two counts are for.
+            await self._reconcile_runtimes_hook()
 
     async def _sweep_session_roots(self) -> None:
         try:
@@ -951,11 +1145,64 @@ class SessionCleanup:
             )
 
     def _active_pids(self) -> tuple[set[int], bool]:
+        """Every pid something in this gateway still needs. Shields all three sweeps.
+
+        The lease table is deliberately NOT a fifth source here, and the reason is
+        about position rather than completeness. This set is gathered before the
+        candidate scan and an event-loop hop before any signal, so a claim taken
+        inside that window is missing from it however many sources it has -- and
+        a cold-starting session's claim lands in exactly that window. The lease is
+        therefore consulted where it can be authoritative: per pid, at the last
+        read before the kill, in :meth:`_kill_authorized`, which every sweep's
+        kill phase passes through.
+        """
         active_pids, safe = self._deps.collect_active_pids(self._owner._sessions)
         active_pids.update(self._owner._pool_pids())
         active_pids.update(self._owner._in_flight_pids())
         active_pids.update(self._owner._companion_runtime_pids())
         return active_pids, safe
+
+    def _kill_authorized(self, pid: int, reason: str) -> bool:
+        """Whether the ownership gate permits signalling *pid* on a sweep path.
+
+        The last read before a sweep hands a pid to its killer, and a different
+        question from the shield above: that one asks a set gathered an
+        event-loop hop ago, this one asks the lease table about one pid at the
+        decision point. It is also what writes the attribution line naming the
+        sweep as the caller, so a sweep kill stops being an anonymous one.
+
+        BOTH outcomes are audited. The gate itself writes only a log line, so an
+        allow that is not audited leaves a signalled process with no record of who
+        decided it, and a refusal that is not audited leaves an operator staring at
+        a leak reading with nothing saying why nothing was done about it.
+
+        The allow is audited as ``allowed``, NOT as ``killed``, and the difference
+        is the whole point: this is the decision point, and the kill phase that
+        follows it drops any candidate whose file entry has gone, whose live token
+        cannot be read, or whose token proves the number was reused -- "prune,
+        never kill". Writing ``killed`` here would put kills of still-running
+        processes in the SEL trail, which is the standard this same change states
+        for the sub-agent path: never ``killed`` for a process the kill left
+        standing. The kill phase owns the ``killed``/``failed`` row, because only it
+        knows what the signal did.
+        """
+        try:
+            allowed = authorize_runtime_kill(pid, reason=reason, caller="session_cleanup sweep")
+        except Exception:
+            # An unanswerable gate is a refusal. A sweep is housekeeping, so
+            # deferring one pid to the next tick costs nothing that killing a
+            # live runtime would not cost more.
+            self._deps.logger.debug(
+                "Sweep: ownership gate could not answer for pid %s; not signalling it",
+                pid,
+                exc_info=True,
+            )
+            audit_kill_decision(
+                pid, "refused", f"{reason}: the ownership gate could not answer", tool_name=_SWEEP
+            )
+            return False
+        audit_kill_decision(pid, "allowed" if allowed else "refused", reason, tool_name=_SWEEP)
+        return allowed
 
     async def _sweep_periodic_pids(self) -> None:
         try:
@@ -976,13 +1223,37 @@ class SessionCleanup:
             if candidates:
                 current_pids, phase2_safe = self._active_pids()
                 if phase2_safe:
-                    confirmed = [pid for pid in candidates if pid not in current_pids]
+                    confirmed = [
+                        pid
+                        for pid in candidates
+                        if pid not in current_pids
+                        and self._kill_authorized(pid, "orphan pid sweep")
+                    ]
             if confirmed or killed_or_dead:
-                orphan_killed = await asyncio.to_thread(
-                    self._deps.kill_confirmed_and_writeback,
-                    gateway_pid,
-                    confirmed,
-                    killed_or_dead,
+                # The gate's verdict above is separated from the signal by a thread
+                # hop, a pid-file read, token reads and a descendant walk. A shared
+                # turn can claim a tenancy anywhere in there, and neither the kill
+                # phase's token re-check nor the live-pid set gathered before that
+                # claimant registered its shield can see it. The barrier makes the
+                # verdict current and shuts the window; a pid it does not grant is
+                # left for the next tick.
+                with teardown_barriers(confirmed, who="Sweep") as barriered:
+                    orphan_killed = await asyncio.to_thread(
+                        self._deps.kill_confirmed_and_writeback,
+                        gateway_pid,
+                        barriered,
+                        killed_or_dead,
+                    )
+                confirmed = barriered
+                # What the phase DID, now that the signal's result is known. The
+                # decision rows above say only that a signal was permitted; this
+                # phase re-judges every candidate against the file as it reads then
+                # and prunes rather than kills, so the two counts differ routinely.
+                audit_kill_phase(
+                    allowed=len(confirmed),
+                    killed=orphan_killed,
+                    reason="orphan pid sweep kill phase",
+                    tool_name=_SWEEP,
                 )
                 if orphan_killed:
                     self._deps.logger.warning(
@@ -1004,12 +1275,32 @@ class SessionCleanup:
                 if candidates:
                     fresh_pids, fresh_safe = self._active_pids()
                     if fresh_safe:
-                        confirmed = [pid for pid in candidates if pid not in fresh_pids]
+                        confirmed = [
+                            pid
+                            for pid in candidates
+                            if pid not in fresh_pids
+                            and self._kill_authorized(pid, "orphan MCP sweep")
+                        ]
                         if confirmed:
-                            await asyncio.get_running_loop().run_in_executor(
-                                self._deps.get_maintenance_executor(),
-                                self._deps.kill_orphan_mcps,
-                                confirmed,
+                            # Same window as the periodic sweep: an executor hop and a
+                            # cmdline re-read sit between the gate and the signal, and
+                            # a tenant claiming in there is invisible to both.
+                            with teardown_barriers(confirmed, who="Sweep") as barriered:
+                                mcp_killed = await asyncio.get_running_loop().run_in_executor(
+                                    self._deps.get_maintenance_executor(),
+                                    self._deps.kill_orphan_mcps,
+                                    barriered,
+                                )
+                            confirmed = barriered
+                            # As above: this phase re-verifies each cmdline
+                            # immediately before the signal and skips any that
+                            # fails to match, so the permitted count is an upper
+                            # bound on the killed one.
+                            audit_kill_phase(
+                                allowed=len(confirmed),
+                                killed=mcp_killed if isinstance(mcp_killed, int) else 0,
+                                reason="orphan MCP sweep kill phase",
+                                tool_name=_SWEEP,
                             )
                     else:
                         self._deps.logger.warning(

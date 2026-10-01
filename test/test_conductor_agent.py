@@ -195,6 +195,10 @@ class TestConductorInstaller:
             "chat_folder_move_session",
             "chat_folder_move",
             "session_send",
+            # The fan-out write, withheld on `session_send`'s reason multiplied by
+            # the fleet: one call runs ingested text as a user-role turn in every
+            # session this agent created, and nothing bounds what is sent.
+            "session_broadcast",
             "session_stop",
         ):
             assert f"@kirocrew-dashboard/{verb}" not in granted, verb
@@ -204,6 +208,11 @@ class TestConductorInstaller:
             "chat_folder_file_self",
             "session_create",
             "session_read_message",
+            # A pure read, narrower than `session_read_message` beside it (a
+            # liveness word per child, no transcript content), and asked on every
+            # unattended patrol cycle -- so gating it would put an approval prompt
+            # in a loop with nobody at the keyboard.
+            "session_status",
         ):
             assert f"@kirocrew-dashboard/{verb}" in granted, verb
 
@@ -223,6 +232,7 @@ class TestConductorInstaller:
             "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
+            "@kirocrew-dashboard/session_status",
         }
         # The bare server must never appear: it would grant every verb, including
         # the four the test above withholds.
@@ -620,6 +630,7 @@ class TestConductorInstaller:
             "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
+            "@kirocrew-dashboard/session_status",
             "@kirocrew-work/work_ledger_read",
             "@kirocrew-work/work_ledger_record",
             "@kirocrew-work/work_ledger_rebuild",
@@ -660,6 +671,7 @@ class TestConductorInstaller:
             "kirocrew-dashboard/chat_folder_tree",
             "kirocrew-dashboard/session_create",
             "kirocrew-dashboard/session_read_message",
+            "kirocrew-dashboard/session_status",
         ]
         work_resources = [
             "kirocrew-work/work_brief",
@@ -812,6 +824,7 @@ class TestConductorInstaller:
             "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
+            "@kirocrew-dashboard/session_status",
             "@kirocrew-work/work_ledger_read",
             "@kirocrew-work/work_ledger_record",
             "@kirocrew-work/work_ledger_rebuild",

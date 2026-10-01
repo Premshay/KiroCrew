@@ -1361,20 +1361,27 @@ This is enforced solely by adding them to `security._SENSITIVE_HOME_DIRS`
 read+write gate across every surface. `assert_governance_paths_protected()` is a
 boot integrity check that fails closed if a refactor ever drops them.
 
-**`~/.kiro/agents/*.json` and `~/.kiro/settings/mcp.json` are NOT on the floor
-today** — an honest gap worth stating here because it bounds what the ceiling can
-claim. Verified on the current tree: `is_sensitive_path("~/.kiro/agents/kirocrew.json")`
-is `False` and `echo x > ~/.kiro/agents/kirocrew.json` is not blocked. Since
+**`~/.kiro/agents/*.json` and `~/.kiro/settings/mcp.json` are on the WRITE-ONLY
+tier of the file-tool floor, and the shell route is still open** — the split is
+worth stating here because it bounds what the ceiling can claim. Both leaves are in
+`_WRITE_PROTECTED_HOME_PATHS`, so `is_sensitive_write_path` refuses an agent
+file-edit write to either at every spelling, including the `KIRO_HOME` relocation
+and a `$HOME` symlinked further down the path; `is_sensitive_path` still answers
+`False` for both, because the gateway's own readers need them. What remains
+unfenced is `echo x > ~/.kiro/agents/kirocrew.json`:
+`is_sensitive_bash_command` does not match sensitive PATHS in command text — a
+documented design choice — so the shell route rests on the OS sandbox, which seals
+the agents dir and not yet the registry leaf.
+
+That residual matters for the same reason the whole gap did. Since
 `hooks.on_tool_call` runs **only** from the `EVENT_PERMISSION_REQUEST` branch (the
 `EVENT_TOOL_CALL` branch is documented informational-only — "the tool is already
 running (auto-approved by kiro-cli). Hook results cannot block execution"), an
 agent that writes itself into `allowedTools` makes kiro-cli stop sending
 permission requests and **Plane A never runs at all** for that tool. This affects
-every governed capability, not just computer use. Hardening those paths is
-deliberately deferred to its own PR (it changes a path floor every legitimate
-writer — `agent.py`, `handlers/mcp.py`, `handlers/agents.py`, `apps/backend.py` —
-touches, and deserves review on its own merits). Until it lands, a capability
-whose only enforcement is Plane A can be skipped this way. Computer use no longer
+every governed capability, not just computer use. So a capability whose only
+enforcement is Plane A can still be skipped by a shell-capable agent, though no
+longer by its file tools. Computer use no longer
 relies on either plane — it is not governed at all, and rests on the keystone enable
 being agent-unwritable. See [computer-use.md](computer-use.md) → "Known limitations".
 
@@ -1810,7 +1817,9 @@ read-your-writes should add it deliberately, with its own tests.
   Both run at `cron_add` (authoring) AND again at fire time — for EVERY job
   kind — via the shared `mcp_cron.vet_job_at_fire_time(job)` entry point
   called from `slack.gateway._cron_callback` immediately before execution:
-  `command` jobs re-run the capability gate + the `commands` ceiling, `script`
+  `command` jobs re-run the capability gate + the `commands` ceiling + the
+  command-body COMPOSITION scan (`mcp_cron._vet_shell_command`, audited under
+  the `cron_command_body` scope), `script`
   jobs re-run the capability gate + the script-body scan
   (`mcp_cron._vet_script_file`) on the freshly re-resolved path (so a script
   file edited on disk after authoring is re-checked too), and `message` (LLM)
@@ -1825,7 +1834,15 @@ read-your-writes should add it deliberately, with its own tests.
   not reach the store left them firing. Only a definite `enabled: true`
   authorizes: app metadata that cannot be READ is no licence to run an app's
   code either, the same closed reading `apps.backend` takes before it spawns
-  one, and the gate persists nothing so the next fire re-asks. Denial at
+  one, and the gate persists nothing so the next fire re-asks.
+
+  The ceiling and the composition scan are DISTINCT decisions and both are
+  re-run: the ceiling authorizes who may run the command, while the scan judges
+  what the command COMPOSES at run time, and only the second moves when
+  `mcp_cron`'s refusals change. Re-running only the ceiling left a command
+  stored before a refusal existed running after it — the case this whole entry
+  exists to prevent — so a composition refusal added to `mcp_cron` now reaches
+  the installed base rather than only jobs authored afterwards. Denial at
   fire time marks the run `last_status="error"`, emits a SEL
   `outcome="denied"` event keyed `cron:<job.id>`, and does not delete or pause
   a RECURRING job — deliberately including the consecutive-failure auto-pause

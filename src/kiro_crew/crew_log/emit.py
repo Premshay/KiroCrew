@@ -35,8 +35,8 @@ deliberate and all explained in the spec:
   when one was caught, and no ``tokens`` or ``credits``, because none were
   measured. Leaving the start open would say the writer died, which this process
   being alive contradicts -- and nothing here would correct it, since the
-  interrupted-turn repair is opt-in and only a resume asks for it. A recovery
-  re-entry anchors its own thread carrying ``depth``.
+  interrupted-turn repair is opt-in and only a resume or a supersede asks for it.
+  A recovery re-entry anchors its own thread carrying ``depth``.
 
 **Storage never runs on the caller's thread when that thread is the event
 loop.** Every entry point is called from the dashboard's async chat path, and
@@ -96,13 +96,14 @@ import atexit
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from kiro_crew.constants import CREW_LOG_ENV, crew_log_enabled
 from kiro_crew.executors import crew_log_executor
@@ -460,6 +461,15 @@ _dropped_count = 0
 #: makes later discards COUNT as loss instead of returning a silent None. Cleared
 #: only by ``reset_caches``; a permanently failed creation does not recover.
 _creation_failed: "set[str]" = set()
+#: Superseded crew logs whose tail repair STOOD DOWN for a turn still running, mapped
+#: to the slot that owes it. The stand-down is correct -- that turn ends in its own
+#: real ``turn/completed`` -- but it is correct only while that terminal is still
+#: coming, and a terminal that spends its attempt budget is dropped instead. This is
+#: what lets the drop re-queue the repair: without it the terminal's drop and the
+#: waiting repair are two facts no site holds together. Keyed by the PREDECESSOR's
+#: id, because that is the session whose terminal resolves the question and the
+#: session the repair would be written into.
+_repair_owed: "dict[str, str]" = {}
 #: Sessions whose loss has already been reported, so a wedged disk is named once
 #: rather than once per batch. Cleared by that session's next successful append,
 #: which is what makes the recovery its own single line.
@@ -819,6 +829,7 @@ def reset_caches() -> None:
         _dropped_reported.clear()
         _overflow_reported.clear()
         _creation_failed.clear()
+        _repair_owed.clear()
         _pending_bytes.clear()
         _inflight_since = 0.0
         _inflight_what = ""
@@ -970,6 +981,65 @@ def _notify_growth(session_id: str) -> None:
             _report("growth listener", exc, op="growth-listener")
 
 
+#: The one entry type whose payload names a BOARD other than its unit's own slot. A
+#: worker's report carries the conductor's ``slot``, so that is the fold it belongs to.
+#: Spelled here rather than imported from ``entry_types``: this module is the boot-path
+#: import gate (see ``_crew_log``), and one string is cheaper than pulling the vocabulary
+#: in. ``test_the_real_append_path_wakes_the_eager_fold`` drives this path end to end.
+_WORK_TYPE: Final[str] = "work/recorded"
+
+
+def _note_eager(entry: Any, entry_type: str, session_id: str, data: Mapping[str, Any]) -> None:
+    """Tell the eager folder one entry of *entry_type* committed. Never raises.
+
+    Called from inside the append job, immediately after the append returned -- the same
+    place the causal-order publish goes, and for the same reason: until the entry is
+    really on disk there is nothing to fold, and a fold run before it would have to be
+    run again.
+
+    The whole call is one ``put_nowait`` behind a set membership test
+    (:func:`kiro_crew.crew_log.eager.note_commit`). It does not resolve the slot, fold
+    anything or build a frame: this runs on the writer thread that every append of this
+    session is serialized through, so work done here is latency for the next entry.
+
+    The BOARD is read from *data* here rather than at each call site, so the rule lives in
+    one place. Only ``work/recorded`` carries a board of its own: a worker's report names
+    the CONDUCTOR's slot, which is not what the worker unit's header says, so folding by
+    the header would advance the worker's board and leave the conductor's -- the one a
+    dashboard reads -- stale. Every other type has no board field and the header is right
+    for it, which is what an empty value asks the folder to use.
+
+    The import is function-local, which is this module's standing rule for anything that
+    reaches the fold surface -- a launch that never commits an eager entry never loads
+    it.
+    """
+    seq = int(getattr(entry, "seq", 0) or 0)
+    if seq <= 0:
+        return
+    try:
+        # boot-path import gate, the same one ``_crew_log`` above documents: this module is
+        # reachable from the gateway's boot path and the fold surface is not, so the import
+        # is paid by the first process that actually commits an eager entry.
+        from kiro_crew.crew_log import eager
+
+        board = str(data.get("slot") or "") if entry_type == _WORK_TYPE else ""
+        eager.note_commit(session_id, entry_type, seq, board)
+    except Exception:  # pragma: no cover - a cache must not cost a committed entry
+        # Rendered text, never ``exc_info``: this runs inside the append job, whose frame
+        # binds the live ``CrewLog`` whose finalizer releases the write lease, so a record
+        # carrying the traceback would keep that handle and its lease alive past the drop
+        # that should have released it. The store's ``log_exception_text`` does exactly
+        # this, but this module is the boot-path import gate (see ``_crew_log``) and may
+        # not import the store at module level, so the render uses the ``traceback``
+        # module already imported above. Pinned by test_crew_log_exc_info_sites.py.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "crew log eager wake not delivered for %s:\n%s",
+                entry_type,
+                traceback.format_exc().rstrip(),
+            )
+
+
 def _on_event_loop() -> bool:
     """True when this thread is running an asyncio event loop."""
     try:
@@ -1080,6 +1150,7 @@ def _submit(
     after: Callable[[], None] | None = None,
     exempt_ceiling: bool = False,
     on_permanent_drop: Callable[[], None] | None = None,
+    queue_only: bool = False,
 ) -> None:
     """Hand *job* to the writer. Returns without waiting and without writing.
 
@@ -1119,6 +1190,14 @@ def _submit(
     no retained batch, no buffered entry, no other inline write. And an inline
     write that FAILS is retained like any other, never swallowed -- otherwise a
     synchronous caller's entry would be the one kind this writer silently loses.
+
+    ``queue_only`` declines the inline path for a caller that is ALREADY RUNNING
+    ON the writer thread -- a job queueing follow-up work of its own. Such a
+    caller is inside a drain pass, so the inline path's ordering wait would wait
+    for the pass it is inside: it cannot be satisfied, and the entry reaches the
+    buffer anyway five seconds later, having held the one writer thread for that
+    whole time. The flag only ever declines an optimisation, so it cannot make an
+    entry land in a weaker order than it would have otherwise.
     """
     pending = _PendingJob(
         job=job,
@@ -1133,7 +1212,7 @@ def _submit(
     # before this entry is handed over, so a stuck write is named while the
     # backlog behind it is still growing rather than after it clears.
     _note_stall_if_any()
-    if not _on_event_loop():
+    if not queue_only and not _on_event_loop():
         if _owes_entries(session_id):
             # This session already owes entries this one belongs after, so there is
             # nothing to wait for: queueing behind them keeps the order and costs
@@ -1270,12 +1349,16 @@ def _buffer(session_id: str, pending: _PendingJob) -> None:
     counted in :func:`overflow_writes` and named once per session, and the entry's
     own cleanup still runs so nothing waits on a record that will never land.
 
-    Two jobs are EXEMPT from the ceiling (``_PendingJob.exempt_ceiling``) and can
-    never be refused here: the record that CREATES a session's crew log file, and a
-    loss marker. Both are O(1) per session, so neither is the memory the ceiling
-    bounds -- and refusing the creating record destroys that session's whole log
-    plus every loss marker that would have reported the damage, while refusing a
-    marker discards the account of the very pressure that rejected it.
+    Three jobs are EXEMPT from the ceiling (``_PendingJob.exempt_ceiling``) and can
+    never be refused here: the record that CREATES a session's crew log file, a
+    loss marker, and the job that closes a SUPERSEDED crew log's interrupted tail.
+    All three are O(1) per session, so none is the memory the ceiling bounds -- and
+    refusing the creating record destroys that session's whole log plus every loss
+    marker that would have reported the damage, while refusing a marker discards the
+    account of the very pressure that rejected it. The supersede repair is exempt
+    because the opening entry that queues it is: refusing only the follow-on creates
+    the successor's crew log and abandons the predecessor's open tail, and nothing
+    re-queues a one-shot job for an id that is never resumed.
     """
     global _pending_count, _pending_total_bytes, _pending_high_water, _overflow_count
     overflow = False
@@ -1314,7 +1397,65 @@ def _buffer(session_id: str, pending: _PendingJob) -> None:
         # then let the writer keep draining the entries that did fit.
         if first_overflow:
             _report_overflow(session_id, overflow_total)
+        # A ceiling rejection is a PERMANENT loss of this entry, exactly like a
+        # spent retry budget in `_drop`, so the tail repair that stood down for a
+        # dropped terminal must be re-queued here too: a terminal handed over for a
+        # superseded crew log carries `_terminal_dropped`, and its loss is the
+        # trigger that re-queues the repair. Skipping it -- and only here, because
+        # `_finish` runs `after` alone -- leaves `_repair_owed` set with nothing to
+        # consume it, so the predecessor's tail stays open for the life of the file,
+        # the very `residual/crash-data-loss-corruption` this repair exists to close.
+        #
+        # TWO constraints pull in opposite directions, and neither ordering of
+        # "finish" and "fire the hook" satisfies both, because `_finish` does two
+        # things at once. `_finish` runs this terminal's `after` = `_closing`'s
+        # `_forget_turn`, which (a) releases the turn's live pin AND (b) pops
+        # `_repair_owed` once no live turn of the session remains.
+        #   * Fire the hook BEFORE `_finish`: the hook re-queues a repair that runs
+        #     on the WRITER thread and can observe this turn's pin still live (our
+        #     `_finish` not yet run), stand down, re-record the debt -- which our
+        #     `_finish` then erases, with no trigger left. (cross-thread race)
+        #   * Fire the hook AFTER `_finish`: `_finish` has already popped the debt,
+        #     so `_terminal_dropped` reads an empty slot and re-queues nothing.
+        # So we do neither blindly. Snapshot the debt BEFORE `_finish` (preserve it
+        # through the cleanup), let `_finish` release the live-turn pin, then re-queue
+        # the repair from the snapshot -- now the pin is gone, so the repair closes
+        # the tail truthfully instead of standing down against our own dying turn.
+        # `_queue_tail_repair` is the one submission site and is guarded, so re-queuing
+        # from the snapshot is exactly what the (now no-op) hook would have done, minus
+        # the stale map read. Other permanent-drop hooks (`settle.fail`,
+        # `_flag_creation_failed`) touch no `_repair_owed` and are fired as-is.
+        with _lock:
+            owed_slot = _repair_owed.get(session_id, "")
+        drop_hook = pending.on_permanent_drop
+        pending.on_permanent_drop = None
         _finish(pending)
+        if owed_slot:
+            # A crew-log terminal stood a repair down; its pin is released now, so
+            # re-queue the repair directly from the snapshot. `_finish` may already
+            # have popped the debt, so consume the snapshot rather than re-reading.
+            with _lock:
+                _repair_owed.pop(session_id, None)
+            logger.warning(
+                "session log %s: the terminal of superseded crew log %s was REJECTED "
+                "at the pending ceiling, so re-queueing the tail repair that stood "
+                "down for it -- the turn it deferred to has no outcome coming now, "
+                "and its tail would otherwise stay open for the life of the file",
+                owed_slot,
+                session_id,
+            )
+            _queue_tail_repair(session_id, owed_slot)
+        elif drop_hook is not None:
+            # Any other permanent-drop hook (settle failure, creation-failed flag):
+            # unrelated to the repair debt, fired as before.
+            try:
+                drop_hook()
+            except Exception as exc:
+                _report(
+                    f"flagging a permanent drop of {pending.what}",
+                    exc,
+                    op="flag-permanent-drop",
+                )
         _notify()
         return
     if over:
@@ -1439,6 +1580,37 @@ def _record_loss_locked(session_id: str, jobs: "list[_PendingJob]", mark: bool) 
             continue
         loss.dropped_count += 1
         loss.dropped_bytes += max(0, job.nbytes)
+
+
+def _uncount_one_requeued_drop(session_id: str) -> None:
+    """Take one append back out of a loss that has NOT been written yet.
+
+    For the single caller shape this exists for: a permanent-drop hook that submits
+    its job AGAIN. The log is then short by nothing on that job's account, and a
+    marker claiming otherwise would overstate the damage in the one record a reader
+    trusts to say what is missing.
+
+    The correction is safe to make here and nowhere later. A marker is authored by a
+    LATER pass of the one writer thread, and a hook runs inside the pass that
+    recorded the debt, so no reader can have seen the count yet. Only the count
+    moves: a job re-submitted this way carries no body, so the marker's byte total
+    was already exact.
+
+    Debt that falls to nothing is REMOVED rather than left at zero, so a session
+    whose only dropped entry is coming back does not append a marker announcing that
+    nothing is missing.
+    """
+    global _dropped_count
+    with _lock:
+        if _dropped_count > 0:
+            _dropped_count -= 1
+        loss = _pending_loss.get(session_id)
+        if loss is None:
+            return
+        if loss.dropped_count > 0:
+            loss.dropped_count -= 1
+        if loss.dropped_count == 0 and loss.dropped_bytes == 0:
+            _pending_loss.pop(session_id, None)
 
 
 def _owed_loss_markers_locked() -> int:
@@ -2519,8 +2691,26 @@ def close_open_tool_calls(
 
 
 def _forget_turn(session_id: str, turn: int) -> None:
+    # Runs when the terminal RESOLVES, written or dropped alike, which is also when a
+    # repair that stood down for this turn stops being owed anything. A drop has
+    # already re-queued it and taken the record by now -- its hook runs ahead of this
+    # -- so what this clears is the LANDED case, where the tail closed truthfully and
+    # the debt is simply paid. Without it the record would outlive every successful
+    # terminal and the map would grow once per supersede for the life of the process.
+    #
+    # But the debt is keyed by SESSION, not by turn, and a session can hold several
+    # live turns at once (a nested turn pins its own record while its parent's is
+    # still open). The stand-down was recorded because SOME live turn made closing
+    # the predecessor's tail unsafe, and it stays unsafe while ANY live turn of this
+    # session remains -- each still-running turn is producing entries the fold would
+    # be told finished. So the debt is paid only once this session has no live turn
+    # left: clearing it on the first terminal to land would let a LATER live turn's
+    # own terminal drop with nothing left to re-queue the repair, and the
+    # predecessor's tail would stay open for the life of the file.
     with _lock:
         _release_live(session_id, turn)
+        if not any(sid == session_id for (sid, _) in _live):
+            _repair_owed.pop(session_id, None)
 
 
 def _closing(session_id: str, turn: int) -> "Callable[[], None]":
@@ -2708,6 +2898,7 @@ def _write(
     *,
     src: str = _SRC_ACP,
     after: Callable[[], None] | None = None,
+    on_permanent_drop: Callable[[], None] | None = None,
     ignorable: bool = False,
 ) -> None:
     """Queue one entry.
@@ -2736,9 +2927,20 @@ def _write(
         log = _handle(session_id)
         if log is None:
             return
-        log.append(entry_type, data, src=src, ignorable=ignorable)
+        entry = log.append(entry_type, data, src=src, ignorable=ignorable)
+        # Here rather than at each emitter: this is the append every ordinary entry type
+        # goes through, so an entry type that becomes eager later is covered without a
+        # second edit. The hook's own membership test drops the types no eager fold
+        # names, which is nearly all of them.
+        _note_eager(entry, entry_type, session_id, data)
 
-    _submit(_job, f"appending {entry_type}", session_id, after=after)
+    _submit(
+        _job,
+        f"appending {entry_type}",
+        session_id,
+        after=after,
+        on_permanent_drop=on_permanent_drop,
+    )
 
 
 def _latch_class(session_id: str, observed: "tuple[str, str, bool, str]") -> None:
@@ -3101,6 +3303,258 @@ def slot_previous_store(slot: str) -> "tuple[str, bool, bool]":
     return (head.sid, head.decided, head.complete)
 
 
+def _durable_previous(session_id: str) -> str:
+    """The predecessor id *session_id*'s own opening entry records, or ``""``.
+
+    The recovery read for a crew log this process is re-attaching to. Imported
+    locally for the same reason :func:`_candidate_is_same_slot` does it: this module
+    is on the gateway boot path and the storage package stays unloaded until a call
+    actually reaches it.
+
+    ``""`` rather than ``None`` because the caller latches the answer and an empty
+    string is the latched "nothing to recover" every other decision in that job
+    uses. The accessor's own ``None`` is "cannot prove" -- a crew log that is gone,
+    a header that does not fold back, an opening entry not yet appended -- and all of
+    those mean the same thing here: no recovery is available from this file.
+    """
+    from kiro_crew.crew_log.store import unit_opened_previous
+
+    return unit_opened_previous(_KIND, session_id) or ""
+
+
+def _queue_tail_repair(previous_sid: str, slot: str, *, requeue_on_drop: bool = True) -> None:
+    """Queue the tail repair for *previous_sid*. The ONE submission site for it.
+
+    Three things reach this: the supersede that names the predecessor, a re-attach
+    recovering a job a crash lost, and a dropped terminal that a stand-down had
+    deferred to. They differ only in what brought them here, never in what is
+    submitted, so the guards, the bucket and the ceiling exemption cannot drift apart
+    between them.
+
+    Queued under the PREDECESSOR's id, which IS the deferral: the writer runs a
+    session's jobs in submission order, so this cannot run until everything that crew
+    log already owes has been attempted -- written, or dropped and admitted in a
+    marker. ``queue_only`` because every caller is already on the writer thread, where
+    the inline path would wait for the pass it is inside.
+
+    ``exempt_ceiling`` on the ceiling's own criterion, O(1) per session: one such job
+    per supersede, carrying no ``nbytes``, so it is not the memory the ceiling bounds.
+    It needs the exemption because the opening entry that queues it HAS one -- so under
+    pressure the successor's crew log is created while its follow-on repair is refused,
+    and nothing re-queues a one-shot job for an id that is never resumed.
+
+    ``requeue_on_drop`` bounds this at ONE extra attempt per loss. The first submission
+    arms a hook that submits again if the whole retained batch is dropped; the
+    re-submission arms none, because the order the first was waiting for is gone once
+    nothing ahead of it will be written, and a hook that re-armed itself would follow a
+    wedged disk around its retry budget for as long as the disk stayed wedged.
+    """
+    hook: "Callable[[], None] | None" = None
+    if requeue_on_drop:
+
+        def _requeue_after_drop() -> None:
+            # The drop counted this job as one missing append before reaching here, and
+            # it is not missing: it is being submitted again. Correct the count first,
+            # so the marker the next pass writes states the damage the log really took.
+            _uncount_one_requeued_drop(previous_sid)
+            _queue_tail_repair(previous_sid, slot, requeue_on_drop=False)
+
+        hook = _requeue_after_drop
+
+    _submit(
+        lambda: _repair_superseded(previous_sid, slot),
+        "closing a superseded crew log's interrupted tail",
+        previous_sid,
+        queue_only=True,
+        exempt_ceiling=True,
+        on_permanent_drop=hook,
+    )
+
+
+def _terminal_dropped(session_id: str) -> "Callable[[], None]":
+    """The hook a terminal carries so its DROP re-queues a repair that stood down.
+
+    Paired with :func:`_closing` at the same three handover sites, and separate from it
+    because the two answer different questions. ``after`` runs when the append is
+    RESOLVED, written or given up on alike, so it cannot tell those apart; a
+    permanent-drop hook fires only on the giving up, which is the one outcome that
+    makes a stand-down wrong in hindsight.
+
+    A repair that stood down for a running turn is correct exactly while that turn's
+    terminal is still coming. Once the terminal is gone the turn has no outcome coming
+    at all, and leaving the stand-down in place keeps a ``turn/started`` open for the
+    life of a file nothing rewrites.
+
+    The returned callable does nothing unless this session actually owes a repair, so
+    the ordinary terminal -- no supersede, nothing waiting -- pays one dict read.
+    """
+
+    def _dropped() -> None:
+        with _lock:
+            slot = _repair_owed.pop(session_id, "")
+        if not slot:
+            return
+        logger.warning(
+            "session log %s: the terminal of superseded crew log %s was DROPPED, so "
+            "re-queueing the tail repair that stood down for it -- the turn it "
+            "deferred to has no outcome coming now, and its tail would otherwise stay "
+            "open for the life of the file",
+            slot,
+            session_id,
+        )
+        _queue_tail_repair(session_id, slot)
+
+    return _dropped
+
+
+def _repair_superseded(previous_sid: str, slot: str) -> None:
+    """Close *previous_sid*'s interrupted tail. WRITER THREAD, never a caller's.
+
+    The repair half of a supersede. The successor's ``session/opened`` only NAMES
+    the crew log the slot was writing before; this closes that crew log's own
+    dangling ``turn/started`` as ``turn/completed {stop_reason: "interrupted"}``
+    and its open ``tool/called`` frames as ``status: "unknown"``, which is what
+    makes a fold able to tell an interrupted turn from one still running. Without
+    it every gateway restart leaves one permanently open tail per active slot, and
+    that turn's cost, duration and outcome are absent from every reading of the
+    file for the rest of its life.
+
+    **The deferral is the queue, not a decision.** This job is submitted into
+    ``previous_sid``'s OWN bucket, and the writer runs a session's jobs in
+    submission order -- so it cannot run until everything already owed for that
+    crew log has been attempted. That is the whole ordering requirement, and
+    taking it from the buffer rather than from a fresh predicate is what makes it
+    resumable by construction: a real ``turn/completed`` still queued or retrying
+    at supersede time is written BEFORE this runs, and one abandoned after its
+    attempt budget is spent is dropped and admitted in a ``write/dropped`` marker
+    before this runs. Either way the tail is closed exactly once and the file
+    never carries two outcomes for one turn. Asking at create time instead --
+    whether the predecessor still owes anything, standing down while it does --
+    leaves nothing that can re-run it: a superseded id is never resumed and
+    nothing maps to it once the successor takes over, so precisely the crew log
+    that most needs repairing is the one left open for good.
+
+    **The candidate is re-verified adjacent to the write.** The edge already
+    refused to NAME a crew log whose own header does not name this slot, so a
+    forged mapping entry cannot reach this function through
+    :func:`on_session_opened`. What CAN change between that decision and this one
+    is the crew log itself: the deferral window lasts as long as the predecessor's
+    outstanding writes do, and retention can collect the unit inside it. Asking
+    again covers both -- the accessor's ``None`` means "cannot prove", which a
+    collected crew log and a foreign one answer alike -- so a unit that is gone is
+    a quiet stand-down rather than a ``no_ledger`` refusal the writer would drop
+    and count as a lost append, reporting a hole in a file that is gone.
+    Asking again is also what keeps the guarantee local: this is the one place an
+    outcome is authored into a unit that is not this session's own, and a check
+    whose failure costs a foreign outcome belongs next to the write rather than
+    inherited from a caller two decisions away. The same
+    :func:`_candidate_is_same_slot` the edge uses answers it, against the
+    candidate's own immutable header -- one spelling of the rule, so the two
+    cannot drift.
+
+    A live turn of ours for that id stands the repair down, exactly as it does on
+    the resume path and for the same reason: the turn is still producing entries,
+    so closing it would record an outcome it never had and then be followed by the
+    rest of it. Standing down is not a hole here, because such a turn ends in its
+    own real ``turn/completed``, which closes the tail truthfully.
+
+    Its live record is read as it stands, never released first. ``closer_owed`` is
+    set where a terminal is HANDED OVER, so a turn still running is indistinguishable
+    from a leaked record by that field alone, and releasing on it would drop the
+    record of a turn a forced reset tore down mid-flight -- the one case whose
+    closer arrives later, from its own ``finally``. ``on_session_closed`` preserves
+    those records for exactly this reason; a release here would undo that and let
+    this job write an outcome ahead of a real one. A predecessor whose turn was
+    still running at supersede time and whose real closer is later DROPPED is
+    covered: the stand-down records the debt in ``_repair_owed`` and the terminal's
+    own permanent-drop hook (:func:`_terminal_dropped`) re-queues this job once its
+    outcome is given up on, so the tail is closed rather than left open. The debt is
+    cleared only once the session has no live turn left, so a nested turn landing
+    first cannot pay it out from under a sibling still running.
+
+    No ``child_gone`` predicate is passed, so an unmatched ``subagent/spawned`` is
+    left OPEN. A superseded crew log's children were dispatched by a session that
+    is gone, and this process cannot answer for another process's children: a child
+    still running can file its own real terminal, and a synthesised ``unknown``
+    ahead of it would leave two outcomes for one ``agent_id`` in a file nothing
+    rewrites. Leaving the opener unmatched leaves a reader one fact short; closing
+    it can leave a reader wrong.
+    """
+    # Live records are LEFT ALONE, which is the same rule `on_session_closed`
+    # applies to them and for the same reason: a forced reset tears a session down
+    # MID-TURN, that turn goes on running, and its closer is handed over later by
+    # its own ``finally``. Releasing such a record here would take back the one
+    # signal that says so -- ``closer_owed`` is set at handover, so a turn still
+    # running reads exactly like a leaked record -- and ``live_turn`` would then
+    # report 0 and let this job write ``interrupted`` ahead of a real
+    # ``turn/completed`` that is still coming. That is the two-outcomes-for-one-turn
+    # hazard, in a file nothing rewrites.
+    # Whether a live turn stands the repair down, and the debt recorded when one
+    # does, are read and written in ONE critical section. A separate `live_turn`
+    # read (which takes and releases `_lock`) followed by a second acquisition to
+    # set `_repair_owed` leaves a window between them: a producer-thread ceiling
+    # rejection running in that gap snapshots `_repair_owed` while it is still
+    # empty, releases the terminal's pin, and finds no debt to re-queue -- then this
+    # writes the debt with no consumer left, and the predecessor's tail stays open
+    # for the life of the file. Reading `_live` inline here (the same expression
+    # `live_turn` uses) and setting the debt without dropping the lock closes that
+    # window, the way `_forget_turn` already reads `_live` and pops the debt in one
+    # section.
+    with _lock:
+        running = max((turn for (sid, turn) in _live if sid == previous_sid), default=0)
+        if running:
+            # Standing down is right only while that terminal is still COMING, and
+            # it may instead spend its attempt budget and be dropped. Record the
+            # debt against the predecessor so the drop can re-queue this job: the
+            # terminal's drop hook is the one site that learns the deferral ended
+            # badly, and without this it has no way to know a repair was waiting.
+            _repair_owed[previous_sid] = slot
+    if running:
+        logger.warning(
+            "session log %s: NOT closing the interrupted tail of superseded crew "
+            "log %s -- turn %d is still running for it in this process, so closing "
+            "it would record an outcome that turn never had and then be followed "
+            "by the rest of it",
+            slot,
+            previous_sid,
+            running,
+        )
+        return
+    if not _candidate_is_same_slot(previous_sid, slot):
+        # Also the answer for a unit RETENTION COLLECTED while this job waited, and
+        # deliberately the same branch: the accessor reports None for a crew log
+        # that is gone as readily as for one whose header names another slot, and
+        # both mean "not known to be this slot's predecessor". A separate existence
+        # check ahead of it can change no outcome, because this branch already
+        # returns before the open that would raise ``no_ledger``.
+        logger.warning(
+            "session log %s: NOT closing the interrupted tail of %s -- its own "
+            "header does not name this slot, or the crew log is gone, so it is not "
+            "known to be this slot's predecessor",
+            slot,
+            previous_sid,
+        )
+        return
+    # Opened WITHOUT ``repair`` and repaired through the method, for the count:
+    # ``open(repair=True)`` does the same work and returns a handle rather than how
+    # many closers landed, and a repair that closed nothing is worth telling apart
+    # from one that closed a turn and three calls.
+    log = _crew_log().CrewLog.open(_KIND, previous_sid)
+    closed = log.repair_interrupted_turn()
+    if closed:
+        logger.info(
+            "session log %s: closed %d dangling entr%s on superseded crew log %s",
+            slot,
+            closed,
+            "y" if closed == 1 else "ies",
+            previous_sid,
+        )
+    # The handle goes out of scope here, which is what releases the write ownership
+    # ``repair_interrupted_turn`` took: the lease is bound to the object's lifetime,
+    # so holding this handle any longer would keep a crew log nothing is writing
+    # owned by this process.
+
+
 def on_session_opened(
     session_id: str,
     *,
@@ -3203,11 +3657,12 @@ def on_session_opened(
     could not name, are both "nothing to follow" rather than a store with an empty
     name.
 
-    The edge is a citation and nothing more: this entry records which store came
-    before, and no writer here touches that store. Closing a superseded store's own
-    dangling turn and tool calls needs a same-slot check on the candidate and a
-    deferral that can be resumed, so it is tracked separately rather than attempted
-    from this job.
+    The edge itself is a citation and nothing more: this entry records which store
+    came before, and no writer here touches that store. Closing the superseded
+    store's own dangling turn and tool calls is a SEPARATE job, queued under that
+    store's id so it runs behind whatever that store still owes -- see
+    :func:`_repair_superseded`. Keeping the two apart is what lets the entry land
+    at once while the repair waits for an ordering it cannot have yet.
     """
     if not session_id or not enabled():
         return
@@ -3285,6 +3740,43 @@ def on_session_opened(
                 needs_seed = bool(resumed) or session_id not in _attempts
             if needs_seed:
                 _seed_attempts(session_id, log)
+            if slot:
+                # CRASH RECOVERY. The edge is DURABLE and the repair job is not: the
+                # opening entry carrying ``previous.sid`` is an append, while the
+                # repair rides the in-memory buffer, so a crash between the two loses
+                # the repair and a superseded id is never resumed to re-queue it. A
+                # re-attach is the one moment a later process holds this crew log
+                # again and can read its OWN edge back, so the repair is recovered
+                # from the file rather than from state that did not survive.
+                #
+                # This log's own entry, never the caller's ``previous_sid``. The latch
+                # below refuses the caller's value on a re-attach for a stated reason
+                # -- the unit it names may be this same one or an unrelated one that
+                # is still LIVE -- and that reason does not apply here: this value was
+                # written by an earlier attempt of THIS session's opening entry, which
+                # verified it against the slot before writing it.
+                #
+                # Gated on ``slot`` because the repair verifies the candidate against
+                # that slot and refuses without one, and nothing is lost by the gate:
+                # an edge is only ever written for two crew logs KNOWN to be one
+                # slot's, so a session with no slot has no durable edge to recover.
+                #
+                # Latched like every other decision in this job, so a retry acts on
+                # the first attempt's reading rather than re-deriving from a file the
+                # attempt before it may have changed.
+                recovered = announce.setdefault(
+                    "recovered_previous",
+                    _durable_previous(session_id),
+                )
+                if recovered:
+                    logger.info(
+                        "session log %s: recovered the superseded crew log %s from "
+                        "this log's own session/opened entry, so its interrupted "
+                        "tail is repaired even though the queued repair did not "
+                        "survive",
+                        session_id,
+                        recovered,
+                    )
         else:
             log = _crew_log().CrewLog.create(
                 _KIND,
@@ -3463,6 +3955,16 @@ def on_session_opened(
             # themselves against. Seeding it here is what stops the first warm turn
             # from restating an unchanged class as though it had moved.
             _latch_class(session_id, observed)
+        # The caller's edge when this open wrote one, else the durable edge recovered
+        # from this log's own opening entry on a re-attach. ONE submission site for
+        # both, so the guards, the bucket and the ceiling exemption cannot differ
+        # between a first pass and a recovery.
+        repair_target = superseded or str(announce.get("recovered_previous") or "")
+        if repair_target:
+            # AFTER the append, so the repair is queued exactly once: a failed
+            # ``session/opened`` is retained and this job runs again, and queueing
+            # above would queue one repair per attempt.
+            _queue_tail_repair(repair_target, slot)
 
     def _flag_creation_failed() -> None:
         # The creating record died with no crew log file behind it: no later append
@@ -3570,6 +4072,7 @@ def on_turn_refused(
         },
         src=_SRC_GATEWAY,
         after=_closing(session_id, turn),
+        on_permanent_drop=_terminal_dropped(session_id),
     )
 
 
@@ -3609,6 +4112,7 @@ def on_turn_completed(
         "turn/completed",
         data,
         after=_closing(session_id, turn),
+        on_permanent_drop=_terminal_dropped(session_id),
     )
 
 
@@ -3658,6 +4162,7 @@ def on_turn_failed(
         data,
         src=_SRC_GATEWAY,
         after=_closing(session_id, turn),
+        on_permanent_drop=_terminal_dropped(session_id),
     )
 
 
@@ -4838,22 +5343,28 @@ def on_subagent_steered(session_id: str, *, agent_id: str, mode: str = "") -> No
     _write(session_id, "subagent/steered", data, src=_SRC_GATEWAY)
 
 
-def on_subagent_completed(session_id: str, *, agent_id: str, duration_ms: int = 0) -> None:
-    """Close a child that finished its work.
+def on_subagent_completed(
+    session_id: str, *, agent_id: str, duration_ms: int = 0, credits: float = 0.0
+) -> None:
+    """Close a child that finished its work, and what it cost.
 
     Only for the ``completed`` outcome. A stopped or failed child closes through
     :func:`on_subagent_failed`, because the runtime's own three-way outcome exists
     precisely to stop consumers reading "no error" as success.
 
-    No ``tokens`` and no ``credits``, and their absence is the record. The schema
-    has both fields, but nothing in the subagent runtime measures either: a run's
-    record carries elapsed time and peak resource use, and the child's spend is
-    never reported back to the parent. Writing zeros would present the absence of
-    a measurement as a measurement of zero.
+    ``credits`` is the run's own accumulator, cumulative across every attempted
+    turn including billed retries that failed before the last one. It is written
+    only when positive: a provider that does not bill in credits reports zero
+    through the shared ``TurnUsage`` contract, which is indistinguishable at this
+    seam from a run that was genuinely free, so writing the zero would present the
+    absence of a measurement as a measurement of zero. ``tokens`` stays absent
+    throughout -- nothing in the subagent runtime measures them.
     """
     data: dict[str, Any] = {"agent_id": agent_id}
     if duration_ms > 0:
         data["ms"] = int(duration_ms)
+    if credits > 0 and math.isfinite(credits):
+        data["credits"] = float(credits)
     _write(session_id, "subagent/completed", data, src=_SRC_GATEWAY)
 
 
@@ -4864,14 +5375,21 @@ def on_subagent_failed(
     reason: str = "",
     outcome: str = "failed",
     duration_ms: int = 0,
+    credits: float = 0.0,
 ) -> None:
-    """Close a child that did NOT finish its work.
+    """Close a child that did NOT finish its work, and what it cost anyway.
 
     Covers both non-success outcomes, and says which in ``outcome``: a run the
     user stopped is not a failure and must not read as one, but it is also not a
     completion, and the schema offers no third closer. Carrying the runtime's own
     outcome verbatim keeps the two distinguishable without renaming a frozen type
     or leaving the ``subagent/spawned`` entry open forever.
+
+    ``credits`` follows :func:`on_subagent_completed`: positive only, because a
+    zero cannot be told apart from an unbilled provider. A run that did not finish
+    still billed for the turns it attempted, so this is the one place that charge
+    would otherwise be lost. The crash-repair closer passes nothing, which is
+    correct -- it knows only that the writer is gone.
     """
     data: dict[str, Any] = {"agent_id": agent_id}
     shown = _clip(_safe_text(reason), _MAX_SHORT_TEXT)
@@ -4881,6 +5399,8 @@ def on_subagent_failed(
         data["outcome"] = outcome
     if duration_ms > 0:
         data["ms"] = int(duration_ms)
+    if credits > 0 and math.isfinite(credits):
+        data["credits"] = float(credits)
     _write(session_id, "subagent/failed", data, src=_SRC_GATEWAY)
 
 
@@ -5133,7 +5653,7 @@ def on_panel_published(session_id: str, data: dict[str, Any], *, timeout: float 
             log = _handle(session_id)
             if log is None:
                 return
-            log.append("panel/published", data, src=_SRC_GATEWAY)
+            entry = log.append("panel/published", data, src=_SRC_GATEWAY)
             # The panel fold spans replacement sessions, and a unit header's clock can
             # step BACKWARD, which would fold a retired session's publish last and make
             # it the current panel with history built against the wrong predecessor.
@@ -5141,6 +5661,12 @@ def on_panel_published(session_id: str, data: dict[str, Any], *, timeout: float 
             from kiro_crew import session_ledger
 
             session_ledger.note_panel_unit_recorded("", session_id)
+            # AFTER the order is recorded, never before. The fold the wake triggers reads
+            # that order to decide which unit applies last, so a wake enqueued first can
+            # be folded on a thread that still sees this unit unordered -- and the panel
+            # fold takes the newest entry whole, so it would serve a retired session's
+            # panel as the current one.
+            _note_eager(entry, "panel/published", session_id, data)
             outcome["ok"] = True
 
     _submit(_job, "appending panel/published", session_id, after=landed.set)
@@ -5198,12 +5724,15 @@ def on_work_recorded(session_id: str, data: dict[str, Any], *, timeout: float = 
             log = _handle(session_id)
             if log is None:
                 return
-            log.append("work/recorded", data, src=_SRC_GATEWAY)
+            entry = log.append("work/recorded", data, src=_SRC_GATEWAY)
             # The work fold spans replacement sessions, so header wall clocks are
             # not a causal order. Publish only after this append has really landed.
             from kiro_crew import session_ledger
 
             session_ledger.note_work_unit_recorded(str(data.get("by") or ""), session_id)
+            # AFTER the order is recorded, for the reason the panel emitter gives: the
+            # fold this wake triggers reads that order.
+            _note_eager(entry, "work/recorded", session_id, data)
             outcome["ok"] = True
 
     _submit(_job, "appending work/recorded", session_id, after=landed.set)

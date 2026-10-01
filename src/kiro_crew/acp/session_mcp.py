@@ -450,7 +450,7 @@ def agent_spec_snapshot(
     Exported for the unresolved-ref detector's two callers --
     :mod:`kiro_crew.acp.mcp_ref_guard` at session establishment and
     ``agent_sdk.drivers.acp.agent_spec_mcp_refs`` for ``kirocrew doctor`` -- which
-    have to judge the spec's ``tools`` refs against the array a session receives.
+    have to judge the spec's ``tools`` refs against the array Crew sends a session.
     Reading the file themselves would give them a SECOND resolution order, and
     either could then report a ref as unresolved because it read a different spec
     than the one the projection ran on -- see :func:`_agent_spec_for` for why the order (project

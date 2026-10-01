@@ -43,7 +43,19 @@ from kiro_crew.constants import (
     strip_control_comments,
 )
 from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S, adoptable_reservation
-from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.display_safety import (
+    TELEGRAM_FALLBACK_BOLD_STAR,
+    TELEGRAM_FALLBACK_BOLD_USCORE,
+    TELEGRAM_FALLBACK_FENCE,
+    TELEGRAM_FALLBACK_HEADING,
+    TELEGRAM_FALLBACK_INLINE_CODE,
+    TELEGRAM_FALLBACK_LINK,
+    TELEGRAM_FALLBACK_LINK_TEXT,
+    redact_for_display,
+    safe_split_offset,
+    severs_a_credential,
+    telegram_fallback_heading_text,
+)
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
     OutboundFile,
@@ -350,7 +362,7 @@ def _strip_hr(text: str) -> str:
         stash.append(fragment)
         return f"\x00H{len(stash) - 1}\x00"
 
-    text = _FENCE_RE.sub(lambda m: _keep(m.group(0)), text)
+    text = TELEGRAM_FALLBACK_FENCE.sub(lambda m: _keep(m.group(0)), text)
     # Max 3 leading spaces (markdown HR rule) — a 4-space-indented "---" is
     # indented CODE (e.g. a YAML separator) and must survive.
     out = re.sub(r"(?m)^[ ]{0,3}([-*_])\1{2,}[ \t]*$", "", text)
@@ -434,14 +446,15 @@ def _split_markdown(text: str, limit: int) -> list[str]:
 # final message. Code spans are stashed first so their contents are never
 # treated as markup, then the remaining text is HTML-escaped before any tags
 # are introduced -- so raw '<', '>' and '&' in the answer can't break the parse.
-_FENCE_RE = re.compile(r"```[^\n]*\n?(.*?)```", re.DOTALL)
-_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
-_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*)$", re.MULTILINE)
-_BOLD_STAR_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-_BOLD_USCORE_RE = re.compile(r"__(.+?)__", re.DOTALL)
+# The fence, inline-code, heading, ``**``, ``__`` and link patterns are the
+# display-safety screen's (``TELEGRAM_FALLBACK_*``): the screen models
+# ``_strip_md`` with the same objects, so what it scans is what the fallback
+# shows. The link's label class is the screen's (no ``[``, ``]`` or line break),
+# so this never links (or, in ``_strip_md``, flattens) a label the screen left raw,
+# and its url is the shared destination unit, so a balanced pair may sit inside
+# it; see :func:`kiro_crew.constants.md_link_destination`.
 _ITALIC_STAR_RE = re.compile(r"(?<!\w)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\w)")
 _ITALIC_USCORE_RE = re.compile(r"(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)")
-_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 _BULLET_RE = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
 
 # Characters a GFM separator row may contain (`| --- |`, `|:---|---:|`, `- | -`).
@@ -649,17 +662,21 @@ def _md_to_telegram_html(text: str) -> str:
         stash.append(fragment)
         return f"\x00{len(stash) - 1}\x00"
 
-    text = _FENCE_RE.sub(
-        lambda m: _keep(f"<pre>{html.escape(m.group(1).rstrip(chr(10)))}</pre>"), text
+    text = TELEGRAM_FALLBACK_FENCE.sub(
+        lambda m: _keep(f"<pre>{html.escape((m.group(1) or '').rstrip(chr(10)))}</pre>"), text
     )
-    text = _INLINE_CODE_RE.sub(lambda m: _keep(f"<code>{html.escape(m.group(1))}</code>"), text)
+    text = TELEGRAM_FALLBACK_INLINE_CODE.sub(
+        lambda m: _keep(f"<code>{html.escape(m.group(1))}</code>"), text
+    )
     text = html.escape(text)
-    text = _HEADING_RE.sub(lambda m: f"<b>{m.group(1).strip()}</b>", text)
-    text = _BOLD_STAR_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
-    text = _BOLD_USCORE_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
+    text = TELEGRAM_FALLBACK_HEADING.sub(
+        lambda m: f"<b>{telegram_fallback_heading_text(m)}</b>", text
+    )
+    text = TELEGRAM_FALLBACK_BOLD_STAR.sub(lambda m: f"<b>{m.group(1)}</b>", text)
+    text = TELEGRAM_FALLBACK_BOLD_USCORE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
     text = _ITALIC_STAR_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
     text = _ITALIC_USCORE_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
-    text = _LINK_RE.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', text)
+    text = TELEGRAM_FALLBACK_LINK.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', text)
     text = _BULLET_RE.sub(lambda m: f"{m.group(1)}\u2022 ", text)
     # Group consecutive "> " lines (escaped to "&gt; ") into a native Telegram
     # <blockquote> — the ▎ quote bar. Runs after inline formatting so bold/italic
@@ -707,6 +724,18 @@ def _shrunk_limit(current: int, rendered_cap: int, worst: int) -> int:
     scaled = int(current * (rendered_cap / worst) * 0.95)
     nxt = max(_MIN_SPLIT_LIMIT, min(scaled, current - _SHRINK_STEP))
     return nxt if nxt < current else _MIN_SPLIT_LIMIT
+
+
+def _delivered_form(source: str) -> str:
+    """What a seal actually SENDS for ``source``, as a credential scan must see it.
+
+    Mirrors ``_segment_text`` followed by ``_seal_current``'s own ``strip``. A cut is
+    graded before the seal runs, so grading the raw chunk grades text the reader
+    never gets: the facing edges of two chunks can be whitespace, a steering marker
+    or a horizontal rule, all of which disappear here -- and once they do, the two
+    messages sit flush against each other on screen.
+    """
+    return _strip_hr(_strip_steering(source)).strip()
 
 
 def _rendered_len(source: str) -> int:
@@ -854,22 +883,30 @@ def _split_markdown_table_aware(text: str, rendered_limit: int, rich_limit: int)
         elif block.strip():
             out.extend(_split_markdown_bounded(block, rendered_limit))
     kept = [c for c in out if c.strip()]
-    repaired = repaired_for_delivery(text, kept, _default_redactor)
+
+    def bounded(repaired: str) -> list[str]:
+        return _split_markdown_bounded(repaired, rendered_limit)
+
+    repaired = repaired_for_delivery(text, kept, _default_redactor, bounded)
     if repaired is None:
         return kept
-    return _split_markdown_bounded(repaired, rendered_limit)
+    return bounded(repaired)
 
 
 def _strip_md(text: str) -> str:
     """Flatten Markdown to clean plaintext for the streaming typewriter frames
     (and as the safe fallback if an HTML final edit is ever rejected) -- avoids
-    showing raw ``**``/``##``/``[x](url)`` noise while the answer is forming."""
-    text = _FENCE_RE.sub(lambda m: m.group(1), text)
-    text = _INLINE_CODE_RE.sub(lambda m: m.group(1), text)
-    text = _HEADING_RE.sub(lambda m: m.group(1).strip(), text)
-    text = _BOLD_STAR_RE.sub(lambda m: m.group(1), text)
-    text = _BOLD_USCORE_RE.sub(lambda m: m.group(1), text)
-    text = _LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
+    showing raw ``**``/``##``/``[x](url)`` noise while the answer is forming.
+    The fence, inline-code, heading, ``**``, ``__`` and link passes are the
+    display-safety screen's own objects and replacements, in the order its
+    ``_plain_reading`` applies them. The bullet pass keeps a visible bullet
+    between surrounding text and remains this renderer's own."""
+    text = TELEGRAM_FALLBACK_FENCE.sub(lambda m: m.group(1) or "", text)
+    text = TELEGRAM_FALLBACK_INLINE_CODE.sub(lambda m: m.group(1), text)
+    text = TELEGRAM_FALLBACK_HEADING.sub(telegram_fallback_heading_text, text)
+    text = TELEGRAM_FALLBACK_BOLD_STAR.sub(lambda m: m.group(1), text)
+    text = TELEGRAM_FALLBACK_BOLD_USCORE.sub(lambda m: m.group(1), text)
+    text = TELEGRAM_FALLBACK_LINK.sub(TELEGRAM_FALLBACK_LINK_TEXT, text)
     text = _BULLET_RE.sub(lambda m: f"{m.group(1)}\u2022 ", text)
     return text
 
@@ -1445,9 +1482,36 @@ class TelegramRenderer(Renderer):
                 if spans[0][0] == 0:
                     return  # the whole buffer is protected — do not rotate at all
                 held = raw[spans[0][0] :]
-                for chunk in await asyncio.to_thread(
-                    _split_markdown_bounded, raw[: spans[0][0]], rendered_cap
+                # The boundary between the last sealed chunk and ``held`` needs no
+                # grade, deliberately. ``held`` begins AT the ref span, so its first
+                # two characters are always ``![`` -- and ``!`` survives
+                # canonicalising, standing between the sealed chunk's last character
+                # and anything the tail could contribute. Measured over alt-text,
+                # link-target, trailing-text and bare-adjacency shapes: no join
+                # reaches a credential pattern, so a gate there would be a gate on an
+                # unreachable boundary.
+                #
+                # The boundaries AMONG the prefix chunks are a different matter. The
+                # splitter redacts before choosing one, but it reads the RAW pieces,
+                # where a horizontal rule still stands between two fragments; the
+                # seal strips rules, so the reader sees them flush. And the seam
+                # repair that does read the delivered form reads one predecessor
+                # only. A key whose fragments sit across three chunks separated by
+                # ``---`` is therefore clean in every reading that runs. Grade the
+                # prefix as a SEQUENCE in its delivered form, the same gate the
+                # length path below carries, and carve on it when it severs.
+                prefix = raw[: spans[0][0]]
+                chunks = await asyncio.to_thread(_split_markdown_bounded, prefix, rendered_cap)
+                if await asyncio.to_thread(
+                    severs_a_credential, chunks, _default_redactor, _delivered_form
                 ):
+                    carved = await self._carve_graded(prefix, limit, rendered_cap)
+                    if carved is None:
+                        # Deliver NOTHING: the whole buffer, reference included, rides
+                        # the next rotation and the semantic seal redacts it intact.
+                        return
+                    chunks = carved
+                for chunk in chunks:
                     self._buf = [chunk]
                     await self._seal_current(extract_uploads=False)
                     self._open_new_message()
@@ -1496,6 +1560,46 @@ class TelegramRenderer(Renderer):
             tail = chunks[-1].rstrip()
             if tail.endswith("```"):
                 chunks[-1] = tail[:-3].rstrip("\n")
+        # The chunks are sealed as separate messages and each is redacted on its own,
+        # so a key the cut severed matches nothing in any one of them while the
+        # reader's client renders the markup away and reads them as one key down the
+        # screen. Grade the DELIVERED form, which the seal strips.
+        if await asyncio.to_thread(severs_a_credential, chunks, _default_redactor, _delivered_form):
+            # Cut where the reader cannot rejoin rather than where the budget lands.
+            # Both sides are SOURCE slices: splitter output does not concatenate back
+            # to its input (fences are closed and reopened), so rejoining chunks
+            # would hand the user text the model never wrote.
+            #
+            # The offset is bounded by the SOURCE budget, and escaping inflates, so a
+            # safe head can still render past the HTML cap. Shrink the budget by the
+            # inflation actually observed and look again, which is the same loop the
+            # splitter itself runs -- a safe cut that fits is worth more than giving
+            # up on the rotation, since a deferral holds the whole buffer.
+            # The search grades the DELIVERED form of both sides, so the offset it
+            # returns is one this caller can take. Grading raw here and re-checking
+            # afterwards would deadlock the segment: the search is deterministic, so a
+            # rejected answer is the same answer every rotation and nothing ever goes
+            # out. Off the loop for the cost reason the redaction above carries -- each
+            # sampled offset is two full-buffer redaction passes.
+            budget, head, offset = limit, "", 0
+            while True:
+                offset = await asyncio.to_thread(
+                    safe_split_offset, raw, budget, _default_redactor, _delivered_form
+                )
+                head = raw[:offset]
+                worst = await asyncio.to_thread(_rendered_len, head)
+                if not offset or worst <= rendered_cap:
+                    break
+                if budget <= _MIN_SPLIT_LIMIT:
+                    offset = 0
+                    break
+                budget = _shrunk_limit(budget, rendered_cap, worst)
+            if not offset:
+                # Deliver NOTHING: the withheld text rides the next rotation, and the
+                # final seal re-splits and seals an over-cap segment chunk by chunk.
+                self._buf = [raw + protocol_suffix]
+                return
+            chunks = [head, raw[offset:]]
         for ch in chunks[:-1]:
             self._buf = [ch]
             # A length rotation never extracts: only a SEMANTIC seal (steer
@@ -1505,6 +1609,50 @@ class TelegramRenderer(Renderer):
             await self._seal_current(extract_uploads=False)
             self._open_new_message()
         self._buf = [(chunks[-1] if chunks else "") + protocol_suffix]
+
+    async def _carve_graded(self, source: str, limit: int, rendered_cap: int) -> list[str] | None:
+        """``source`` cut into pieces no reader can rejoin into a credential, or
+        ``None`` when no safe cut exists and the text must be withheld whole.
+
+        Every piece this returns is SEALED by the caller, with no rotation left
+        ahead of any of them, so the carve continues until the remainder fits the
+        budget rather than stopping at one offset. A piece left over the cap is
+        re-split by ``_seal_current`` on length alone, with no credential grade,
+        which is the cut this gate exists to close -- so taking a single offset
+        would buy ONE safe boundary by handing every later boundary in the same
+        text to an ungraded one.
+
+        Each step grades its head against the whole remainder, which is the
+        per-boundary reading ``severs_a_credential`` applies to the finished list.
+        That reading is still asked for once at the end: canonicalising DROPS a
+        link target, so markup spanning a middle piece can collapse two distant
+        pieces together in a way no single boundary check sees. The cost is
+        confined to text that already severs -- a prefix the splitter cut safely
+        never reaches here.
+        """
+        graded: list[str] = []
+        rest = source
+        while len(rest) > limit or await asyncio.to_thread(_rendered_len, rest) > rendered_cap:
+            budget = limit
+            while True:
+                offset = await asyncio.to_thread(
+                    safe_split_offset, rest, budget, _default_redactor, _delivered_form
+                )
+                if not offset:
+                    return None
+                head = rest[:offset]
+                worst = await asyncio.to_thread(_rendered_len, head)
+                if worst <= rendered_cap:
+                    break
+                if budget <= _MIN_SPLIT_LIMIT:
+                    return None
+                budget = _shrunk_limit(budget, rendered_cap, worst)
+            graded.append(head)
+            rest = rest[offset:]
+        chunks = [*graded, rest]
+        if await asyncio.to_thread(severs_a_credential, chunks, _default_redactor, _delivered_form):
+            return None
+        return chunks
 
     def _open_new_message(self) -> None:
         """Next render creates a fresh message instead of editing the old one."""

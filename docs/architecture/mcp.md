@@ -397,6 +397,18 @@ Probes run from `POST /api/mcp/probe`:
   are cached for `_PROBE_TTL_SECS` (1800s), after which status reads as
   "outdated" — with `probedAt` preserved, because *when it was last true* is
   the most useful thing an outdated row can say.
+- The cache is keyed by server name, and each entry also records a fingerprint
+  of the config it was probed under (`_probe_identity`: command, args as the
+  probe spawns them, and non-secret env for a local server; url and header
+  names for a remote one). An entry whose fingerprint does not match the current
+  config reads as NOT cached (`unknown`, no tools, no `probedAt`) rather than
+  `outdated`: an expired entry was true of this server, a mismatched one
+  describes a different target. Every reader that takes an entry by name
+  applies that check: `list_servers()` compares the fingerprint for tools and
+  `authChallenge`, and the handler-side readers call `cached_probe_is_current`
+  (`GET /api/mcp`'s handler-cache overlay, `GET /api/mcp/probe`, and the
+  shareability verdict). A failed probe after an edit does not inherit the
+  previous target's tools.
 - The handshake response is kept, not just the tool names: advertised
   `capabilities`, the `protocolVersion` the server ANSWERED with, `serverInfo`,
   and per-tool `annotations`. These feed the shareability verdict (below); the
@@ -490,8 +502,9 @@ Probes run from `POST /api/mcp/probe`:
   error or a broken mount. Reporting an unanswerable lookup as `false` would tell
   the owner of an already-authorized server to sign in again, so the three-valued
   result is preserved to the wire rather than flattened. Each probe clears both
-  fields before it runs: the probe cache is keyed by NAME, so a row whose url was
-  edited would otherwise inherit the previous endpoint's verdict.
+  fields before it runs, and `list_servers()` re-attaches them from the cache only
+  when the entry's config fingerprint matches, so a row whose url was edited does
+  not inherit the previous endpoint's verdict from either side.
 
   One degradation is NOT covered by that, and the limit is worth stating. The
   lookup mirrors kiro-cli's own cache-key derivation and artifact layout, both
@@ -579,7 +592,11 @@ Probes run from `POST /api/mcp/probe`:
 
 `GET /api/mcp` also kicks off a background re-probe when it sees a server that
 is not in the probe cache yet, so a freshly added server transitions from
-"Unknown" on the next page load rather than waiting out the TTL.
+"Unknown" on the next page load rather than waiting out the TTL. It and
+`GET /api/mcp/probe` do the same for a server whose config was edited since its
+last probe, once per edit: the arming is keyed on the stale entry's fingerprint,
+so a row `probe_all` never re-probes (a quarantined server) cannot re-arm the
+fan-out on every request.
 
 `_fix_stale_managed_command()` re-resolves the `kirocrew` binary on every
 `list_servers()` call, because the stored absolute path goes stale after an
@@ -711,6 +728,14 @@ A stub roster entry selects routing, while
 command and arguments together with the derived effective-environment hash that
 gatewayd may run outside a session sandbox. Command and environment hashes are
 stored and checked as one pair, so values from two approvals cannot be combined.
+The approved fingerprint hashes the declared environment with its `${VAR}`
+references unexpanded. When that declared launch is approved and only an
+expansion changed, a rewrite pass whose environment sidecars all publish records
+the new pair and drops the older expansion of the same launch: the values come
+from the gateway environment (the operator's shell and the crew `.env`), which
+no agent can write. A sidecar publication failure drops every rebind from that
+pass, so gatewayd refuses the changed expansion and the next boot retries. A
+changed command, argument or declared env text is still refused.
 An absent or empty store approves nothing. A stub
 without a matching fingerprint stays on the session's unpooled, sandboxed launch
 path. A queued cold spawn reloads the store after admission and resolves the same
@@ -1094,7 +1119,7 @@ broken `foo.json` matched `foo` and withheld a good user-level agent's stubs, wh
 kiro-cli reports that file as an error and offers no such mode -- measured the same
 way: a malformed project spec yields `Error: Json supplied at ... is invalid` and
 zero workspace agents. `_project_shadow_of` takes `dispatchable_only` for that, and
-its default is unchanged so the governance refusal in `agent.py`, for which a file
+its default is unchanged so the governance refusal in `agent_materialization/worker_agent.py`, for which a file
 in any state is a claim on the name, keeps refusing.
 
 ## How app agents reach MCP servers
@@ -1181,7 +1206,7 @@ text names the missing token, its usual cause, the `policy_unreadable` text the 
 directory -- and
 audited as `rejected_policy_unresolved`; the read that produced `identity_unattested` is
 itself audited as `tool_policy.unattested`. A control-plane backend
-(`CONTROL_PLANE_BACKENDS` in `mcp_gateway/gatewayd.py`) is handed the token per frame in
+(`CONTROL_PLANE_BACKENDS` in `mcp_gateway/daemon/control_plane.py`) is handed the token per frame in
 the caller block and the policy read sends it, so its calls do not land there. The test
 for admitting a reason here is that it means ONE thing, because a refusal derived from an
 ambiguous reason is wrong for half the callers it hits.
@@ -1319,7 +1344,7 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger`, `cron_secret_request` |
 | `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
-| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `chat_session_pin`, `session_create`, `session_fork`, `session_send`, `session_read_message`, `session_stop`, `session_close`, `session_adopt`, `session_release` |
+| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `chat_session_pin`, `session_create`, `session_fork`, `session_stop`, `session_set_model`, `session_close`, `session_revive`, `session_send`, `session_broadcast`, `session_status`, `session_adopt`, `session_release`, `session_read_message`, `session_summary` |
 | `kirocrew-work` | `kirocrew mcp-work` (`mcp_work.py`) | `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_record` |
 | `kirocrew-crew-log` | `kirocrew mcp-crew-log` (`mcp_crew_log.py`) | `crew_log_list`, `crew_log_read`, `crew_log_projection` |
 | `kirocrew-debug` | `kirocrew mcp-debug` (`mcp_debug.py`) | `debug_gateway`, `debug_refusals`, `debug_threads`, `debug_processes`, `debug_snapshots` |
@@ -1950,7 +1975,7 @@ without every agent inheriting it.
 Adding a managed server is a **parity tax** — the name must appear in
 `agent._MANAGED_MCP_SERVERS`, `mcp_discovery._MANAGED_SERVER_SUBCOMMANDS` and
 `_MANAGED_SERVER_TOOL_MODULES`, `mcp_cleanup.KIROCREW_BIN_MCP_SERVERS`,
-`onboarding_import._MANAGED_MCP_NAMES`, and the hidden `cli.py` subcommand.
+`onboarding_sources._CORE_MANAGED_MCP_NAMES`, and the hidden `cli.py` subcommand.
 `test_computer_use_registration.py` asserts those registries are the same set, so
 a half-registered server fails the suite rather than shipping.
 
@@ -2185,7 +2210,7 @@ guarantee: the classifier sees an environment free of every denied namespace, an
 lands on a child whose verdict is already fixed -- the same pair present before
 the verdict would deny every control plane its own token.
 `Backend.control_plane` is set from that pre-spawn verdict and never recomputed.
-The token joins a caller in one place, `gatewayd._caller_for_backend`, which
+The token joins a caller in one place, `daemon/control_plane.py::_caller_for_backend`, which
 reads the flag off the backend that receives THAT frame and returns a
 token-bearing copy; the connection's base `CallerContext` stays tokenless for
 its whole life. A transparent respawn is therefore judged on its own: the
@@ -2208,7 +2233,7 @@ in the caller block, emitted only when set), and the backend's
 `logs/mcp-gatewayd.stdout`, which no session surfaces, and the refusal's generic
 text pointed at the token and the spec when the cause was neither.
 
-`CONTROL_PLANE_BACKENDS` is named in gatewayd itself (importing
+`CONTROL_PLANE_BACKENDS` is named in the daemon itself, in `mcp_gateway/daemon/control_plane.py` (importing
 `acp.session_mcp` would put `kiro_crew.agent` on the daemon's boot path; the
 set is read from the `mcp_cleanup` leaf instead). It is
 a superset of `acp.session_mcp.CONTROL_PLANE_SERVERS`, not a mirror, because the

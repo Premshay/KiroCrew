@@ -63,8 +63,8 @@ function FloatingGhost({
 export function ShellAside({ copy }: { copy: ShellAsideCopy }) {
   return (
     <aside className="relative flex min-h-[248px] w-full shrink-0 overflow-hidden bg-accent text-accent-fg sm:min-h-0 sm:w-[36%]">
-      <FloatingGhost className="-left-8 top-[24%] h-24 w-20 rotate-90 lg:h-28 lg:w-24" delay={0.15} rotate={90} />
-      <FloatingGhost className="-right-5 top-5 h-28 w-20 -rotate-12 lg:h-36 lg:w-28" delay={0.35} rotate={-12} />
+      <FloatingGhost className="-left-8 top-[24%] hidden h-24 w-20 rotate-90 sm:block lg:h-28 lg:w-24" delay={0.15} rotate={90} />
+      <FloatingGhost className="-right-5 top-5 hidden h-28 w-20 -rotate-12 sm:block lg:h-36 lg:w-28" delay={0.35} rotate={-12} />
       {/* Peeks in 2rem from the panel edge: the mascot is near-white and the
           copy column paints in near-white too, so any overlap renders text
           white-on-white. The visible sliver stays inside the panel's own
@@ -95,12 +95,26 @@ export function ShellAside({ copy }: { copy: ShellAsideCopy }) {
 // shell's <section> are byte-identical (same flex layout / min-heights).
 // Exported for the Kiro CLI setup gate, which composes the same three pieces
 // (scrim + panel + section) around its own non-chapter content.
+//
+// Narrow viewports stack the aside above the section and the SCRIM scrolls, so
+// the heights use `svh` (the viewport with the URL bar showing) rather than
+// `100vh`, which on iOS Safari is the LARGE viewport and pushed the footer below
+// the toolbar. The panel clips with `overflow-clip`, not `overflow-hidden`: a
+// hidden ancestor would become the sticky footer's scrollport and stop it
+// pinning to the bottom of the scrim.
 export const SECTION_CLASS =
-  'flex min-h-[calc(100vh-248px)] min-w-0 flex-1 flex-col bg-card sm:min-h-0'
+  'flex min-h-[calc(100svh-248px)] min-w-0 flex-1 flex-col bg-card sm:min-h-0'
 export const SCRIM_CLASS =
   'fixed inset-0 z-[120] flex min-h-0 overflow-y-auto bg-bg/70 backdrop-blur-xs p-0 text-text sm:items-center sm:justify-center sm:p-6'
 export const PANEL_CLASS =
-  'relative flex min-h-screen w-full flex-col overflow-hidden bg-card shadow-xl sm:h-[min(760px,calc(100vh-48px))] sm:min-h-0 sm:max-w-6xl sm:flex-row sm:rounded-2xl sm:border sm:border-border'
+  'relative flex min-h-svh w-full flex-col overflow-clip bg-card shadow-xl sm:h-[calc(100vh-48px)] sm:max-h-[760px] sm:min-h-0 sm:max-w-6xl sm:flex-row sm:rounded-2xl sm:border sm:border-border'
+
+// The pinned-footer behaviour every consumer of the stacked shell needs: on a
+// narrow viewport the SCRIM scrolls, so the actions stick to its bottom (the
+// panel's `overflow-clip` keeps it the sticky scrollport); from `sm` up the
+// section scrolls internally and the footer is ordinary flow. Each footer adds
+// its own padding, bottom padding clearing the safe-area inset.
+export const PINNED_FOOTER_CLASS = 'sticky bottom-0 z-10 bg-card sm:static'
 
 export interface ShellAsideCopy {
   ariaLabel: string
@@ -289,7 +303,10 @@ export default function OnboardingChapterShell({
         </main>
       </div>
       {footer && (
-        <footer className="flex shrink-0 flex-wrap items-center justify-end gap-3 px-6 pt-4 pb-6 sm:px-10 sm:pb-10">
+        // Sticky on narrow viewports so the step's navigation stays on screen
+        // however tall the stacked aside + body grow; the bottom padding
+        // clears the home indicator / floating browser toolbar.
+        <footer className={`${PINNED_FOOTER_CLASS} flex shrink-0 flex-wrap items-center justify-end gap-3 border-t border-border px-6 pt-4 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:border-t-0 sm:px-10 sm:pb-10`}>
           {footer}
         </footer>
       )}

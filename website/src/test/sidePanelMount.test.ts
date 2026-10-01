@@ -6,12 +6,17 @@
 import { describe, it, expect } from 'vitest'
 import { join } from 'node:path'
 import { readSource } from './readSource'
-import { shouldMountSidePanel, isSidePanelHidden } from '../pages/chat/sidePanelMount'
+import { shouldMountSidePanel, isSidePanelHidden, SIDE_PANEL_DOCK_TRANSITION, SIDE_PANEL_MOTION_EASE, SIDE_PANEL_MOTION_MS, sidePanelDimTransition } from '../pages/chat/sidePanelMount'
 
 const S = (activityOpen: boolean, hasLiveAppTab: boolean, searchOpen = false, hasBrowserTab = false) =>
   ({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen })
 
 describe('side panel mount decision', () => {
+  it('keeps dashboard documents and answer drafts mounted when closed or searching', () => {
+    const input = { ...S(false, false, true), hasTaskDashboard: true }
+    expect(shouldMountSidePanel(input)).toBe(true)
+    expect(isSidePanelHidden(input)).toBe(true)
+  })
   it('mounts while open, with or without an app tab', () => {
     expect(shouldMountSidePanel(S(true, false))).toBe(true)
     expect(shouldMountSidePanel(S(true, true))).toBe(true)
@@ -86,7 +91,9 @@ describe('side panel mount decision', () => {
     // already names the fullscreen icon.
     expect(panel).toContain('active: visible = true')
     expect(panel).toContain('if (!visible) return')
-    expect(panel).toContain('}, [visible, fullscreen, onClose])')
+    // Close and exit-fullscreen go through the comment-draft guard, so those
+    // guarded callbacks are the deps rather than `onClose` itself.
+    expect(panel).toContain('}, [visible, fullscreen, exitFullscreen, requestClose, active])')
   })
 
   describe('find pane claims the dock', () => {
@@ -133,5 +140,35 @@ describe('side panel mount decision', () => {
     it('is shown while the panel is open and unobstructed', () => {
       expect(isSidePanelHidden(S(true, false, false, true))).toBe(false)
     })
+  })
+})
+
+/**
+ * Opening the panel and switching to a chat with a different remembered width
+ * move the SAME edge, so they have to look like one motion. They cannot share a
+ * code path — one is a framer tween on the dock wrapper, the other a CSS
+ * transition on the panel — so they share constants, and these cases are what
+ * stops a later edit to one from silently desynchronising the other.
+ */
+describe('side panel motion timing is shared, not copied', () => {
+  it('expresses the same duration and curve through both mechanisms', () => {
+    // framer takes seconds and a bezier array…
+    expect(SIDE_PANEL_DOCK_TRANSITION.duration).toBe(SIDE_PANEL_MOTION_MS / 1000)
+    expect(SIDE_PANEL_DOCK_TRANSITION.ease).toEqual(SIDE_PANEL_MOTION_EASE)
+    // …CSS takes ms and a cubic-bezier() function. Same numbers either way.
+    expect(sidePanelDimTransition('width')).toEqual({ transition: 'width 180ms cubic-bezier(0.2, 0, 0, 1)' })
+    expect(sidePanelDimTransition('height')).toEqual({ transition: 'height 180ms cubic-bezier(0.2, 0, 0, 1)' })
+  })
+
+  it('derives the CSS curve from the constant rather than restating it', () => {
+    const src = readSource(join(__dirname, '..', 'pages', 'chat', 'sidePanelMount.ts'))
+    // One bezier literal in the module — the exported constant. A second one
+    // would mean the CSS builder had been given its own copy to drift from.
+    expect(src.match(/0\.2, 0, 0, 1/g)).toHaveLength(1)
+  })
+
+  it('is the shared constant that the dock wrapper actually uses', () => {
+    const host = readSource(join(__dirname, '..', 'pages', 'ChatPage.tsx'))
+    expect(host).toContain('transition={SIDE_PANEL_DOCK_TRANSITION}')
   })
 })

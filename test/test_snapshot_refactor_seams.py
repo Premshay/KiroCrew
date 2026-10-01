@@ -255,6 +255,7 @@ def _notification_files(tmp_path: Path, bundle_bytes: bytes) -> tuple[Path, Path
     return src, dst
 
 
+@requires_o_nofollow
 @pytest.mark.parametrize("name", ["_notification_key", "strict_raw_records"])
 def test_a_facade_spy_sees_the_notification_merge_call_it(
     name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -264,6 +265,7 @@ def test_a_facade_spy_sees_the_notification_merge_call_it(
     assert "kiro_crew.snapshot_merge" in callers, f"snapshot.{name} never reached the owner"
 
 
+@requires_o_nofollow
 def test_a_facade_record_cap_is_the_one_the_merge_enforces(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

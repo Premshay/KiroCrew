@@ -30,6 +30,7 @@ function ControlledHost({
   onUploadFiles,
   onSelectionChange,
   sentMessages,
+  historyScope,
   showFullPastes,
 }: {
   initial?: string
@@ -39,7 +40,9 @@ function ControlledHost({
   controlRef?: MutableRefObject<ComposerControl | null>
   onUploadFiles?: (files: File[]) => void
   onSelectionChange?: (selection: { start: number; end: number }) => void
+  /** Prompt texts; the host wraps each one as an id-less history entry. */
   sentMessages?: string[]
+  historyScope?: string
   showFullPastes?: boolean
 }) {
   const [value, setValue] = useState(initial)
@@ -59,7 +62,8 @@ function ControlledHost({
         controlRef={controlRef}
         onUploadFiles={onUploadFiles}
         onSelectionChange={onSelectionChange}
-        sentMessages={sentMessages}
+        sentMessages={sentMessages?.map(text => ({ text }))}
+        historyScope={historyScope}
       />
       <output data-testid="value">{value}</output>
       <output data-testid="blocks">{JSON.stringify(blocks)}</output>
@@ -338,15 +342,15 @@ describe('LexicalComposerInput', () => {
     expect(screen.getByTestId('blocks').textContent).not.toContain('four\\n\\n')
   })
 
-  it('keeps raw paste inline and preserves trailing blanks', async () => {
+  it.each([
+    ['Ctrl+Shift+V', { key: 'V', code: 'KeyV', ctrlKey: true, shiftKey: true }],
+    ['Cmd+Option+Shift+V', { key: '◊', code: 'KeyV', metaKey: true, altKey: true, shiftKey: true }],
+  ])('keeps a %s raw paste inline and preserves trailing blanks', async (_chord, init) => {
     const editorRef = createRef<LexicalEditor>()
     render(<ControlledHost editorRef={editorRef} />)
     await waitFor(() => expect(editorRef.current).not.toBeNull())
     act(() => {
-      editorRef.current!.dispatchCommand(
-        KEY_MODIFIER_COMMAND,
-        new KeyboardEvent('keydown', { key: 'v', ctrlKey: true, shiftKey: true }),
-      )
+      editorRef.current!.dispatchCommand(KEY_MODIFIER_COMMAND, new KeyboardEvent('keydown', init))
     })
     const payload = 'one\ntwo\nthree\nfour\n\n'
     const event = new Event('paste', { cancelable: true }) as ClipboardEvent
@@ -357,6 +361,24 @@ describe('LexicalComposerInput', () => {
     await waitFor(() => expect(screen.getByTestId('value').textContent).toBe(payload))
     expect(screen.getByTestId('blocks')).toHaveTextContent('[]')
     expect(screen.queryByTestId('paste-token-1')).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['Cmd+Option+V', { key: '√', code: 'KeyV', metaKey: true, altKey: true }],
+    ['Ctrl+Alt+Shift+V', { key: 'V', code: 'KeyV', ctrlKey: true, altKey: true, shiftKey: true }],
+  ])('still collapses a large paste after %s', async (_chord, init) => {
+    const editorRef = createRef<LexicalEditor>()
+    render(<ControlledHost editorRef={editorRef} />)
+    await waitFor(() => expect(editorRef.current).not.toBeNull())
+    act(() => {
+      editorRef.current!.dispatchCommand(KEY_MODIFIER_COMMAND, new KeyboardEvent('keydown', init))
+    })
+    const event = new Event('paste', { cancelable: true }) as ClipboardEvent
+    Object.defineProperty(event, 'clipboardData', {
+      value: { types: ['text/plain'], items: [], getData: () => 'one\ntwo\nthree\nfour' },
+    })
+    await dispatchAtEnd(editorRef.current!, PASTE_COMMAND, event)
+    await waitFor(() => expect(screen.getByTestId('paste-token-1')).toBeInTheDocument())
   })
 
   it('keeps a large paste inline when showFullPastes is on', async () => {
@@ -425,6 +447,73 @@ describe('LexicalComposerInput', () => {
     })
     await waitFor(() => expect(screen.getByTestId('value')).toHaveTextContent('draft'))
     await waitFor(() => expect(controlRef.current!.getSelection()).toEqual({ start: 5, end: 5 }))
+  })
+
+  function pressArrow(editor: LexicalEditor, key: 'ArrowUp' | 'ArrowDown'): boolean {
+    let handled = false
+    act(() => {
+      handled = editor.dispatchCommand(
+        key === 'ArrowUp' ? KEY_ARROW_UP_COMMAND : KEY_ARROW_DOWN_COMMAND,
+        new KeyboardEvent('keydown', { key }),
+      )
+    })
+    return handled
+  }
+
+  it('keeps the recalled prompt when older history loads in front mid-browse', async () => {
+    const editorRef = createRef<LexicalEditor>()
+    const controlRef: MutableRefObject<ComposerControl | null> = { current: null }
+    const { rerender } = render(
+      <ControlledHost editorRef={editorRef} controlRef={controlRef} sentMessages={['first', 'second', 'third']} />,
+    )
+    await waitFor(() => expect(controlRef.current).not.toBeNull())
+    act(() => controlRef.current!.setSelection(0))
+    pressArrow(editorRef.current!, 'ArrowUp')
+    await waitFor(() => expect(screen.getByTestId('value')).toHaveTextContent('third'))
+    act(() => controlRef.current!.setSelection(0))
+    pressArrow(editorRef.current!, 'ArrowUp')
+    await waitFor(() => expect(screen.getByTestId('value')).toHaveTextContent('second'))
+    rerender(
+      <ControlledHost editorRef={editorRef} controlRef={controlRef} sentMessages={['zero', 'first', 'second', 'third']} />,
+    )
+    act(() => controlRef.current!.setSelection(0))
+    pressArrow(editorRef.current!, 'ArrowUp')
+    await waitFor(() => expect(screen.getByTestId('value')).toHaveTextContent(/^first$/))
+  })
+
+  it('ends browsing when the history scope changes, so another slot never gets this draft', async () => {
+    const editorRef = createRef<LexicalEditor>()
+    const controlRef: MutableRefObject<ComposerControl | null> = { current: null }
+    const { rerender } = render(
+      <ControlledHost initial="draft A" editorRef={editorRef} controlRef={controlRef} historyScope="a" sentMessages={['same']} />,
+    )
+    await waitFor(() => expect(controlRef.current).not.toBeNull())
+    act(() => controlRef.current!.setSelection(0))
+    pressArrow(editorRef.current!, 'ArrowUp')
+    await waitFor(() => expect(screen.getByTestId('value')).toHaveTextContent('same'))
+    rerender(
+      <ControlledHost initial="draft A" editorRef={editorRef} controlRef={controlRef} historyScope="b" sentMessages={['other', 'same']} />,
+    )
+    act(() => controlRef.current!.setSelection('same'.length))
+    expect(pressArrow(editorRef.current!, 'ArrowDown')).toBe(false)
+    expect(screen.getByTestId('value')).toHaveTextContent(/^same$/)
+  })
+
+  it('moves the caret instead of recalling once a recalled prompt is edited', async () => {
+    const editorRef = createRef<LexicalEditor>()
+    const controlRef: MutableRefObject<ComposerControl | null> = { current: null }
+    render(
+      <ControlledHost initial="draft" editorRef={editorRef} controlRef={controlRef} sentMessages={['first', 'second']} />,
+    )
+    await waitFor(() => expect(controlRef.current).not.toBeNull())
+    act(() => controlRef.current!.setSelection(0))
+    pressArrow(editorRef.current!, 'ArrowUp')
+    await waitFor(() => expect(screen.getByTestId('value')).toHaveTextContent('second'))
+    await dispatchAtEnd(editorRef.current!, CONTROLLED_TEXT_INSERTION_COMMAND, '!')
+    await waitFor(() => expect(screen.getByTestId('value')).toHaveTextContent('second!'))
+    act(() => controlRef.current!.setSelection('second!'.length))
+    expect(pressArrow(editorRef.current!, 'ArrowDown')).toBe(false)
+    expect(screen.getByTestId('value')).toHaveTextContent('second!')
   })
 
 })

@@ -177,7 +177,7 @@ def _token(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     port = resolve_client_port(args.port)
-    secret = read_local_secret(port)
+    secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
     if not secret:
         print("❌ Gateway not running — start it with: kirocrew gateway", file=sys.stderr)
         sys.exit(1)
@@ -316,7 +316,7 @@ def _emit_session_urls(port: int, token: str) -> None:
 
 def _logout(port: int) -> None:
     """Revoke all dashboard sessions by calling the gateway's /api/logout endpoint."""
-    secret = read_local_secret(port)
+    secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
     if not secret:
         print("❌ Gateway not running — start it with: kirocrew gateway")
         sys.exit(1)
@@ -363,7 +363,7 @@ def _request_gateway_shutdown(port: int) -> bool:
     refusal, malformed response, or transport failure returns ``False`` so the
     caller retains the existing no-target diagnostic.
     """
-    secret = run_marker.read_secret(port)
+    secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
     if not secret:
         return False
     request = urllib.request.Request(
@@ -1190,7 +1190,7 @@ def _print_token_url(port: int) -> None:
     deadline = time.monotonic() + _RESTART_READY_TIMEOUT
     while time.monotonic() < deadline:
         try:
-            secret = read_local_secret(port)
+            secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
             if not secret:
                 time.sleep(_RESTART_READY_POLL_INTERVAL)
                 continue
@@ -1983,6 +1983,65 @@ def _update(force: bool = False) -> None:
 
     _refresh_agent_config(proj)
 
+    # Reconcile the running gateway's update badge. The reset above moved the
+    # tree, but a long-lived gateway keeps serving the pre-update verdict from
+    # its cache until the next 12-hourly poll, a manual check, or a restart --
+    # so the About panel shows "Update available" for a checkout that is now
+    # current. Poke it to drop the cache and re-check. Best-effort: the update
+    # has already succeeded, so a gateway that is not running or a call that
+    # fails must not change the outcome or the exit code.
+    _revalidate_gateway_update_check()
+
+
+def _revalidate_gateway_update_check() -> None:
+    """Best-effort: tell the running gateway to re-check for updates now.
+
+    Called at the end of a successful git-checkout update so the About panel's
+    "Update available" badge reconciles immediately instead of waiting for the
+    next scheduled poll. Reuses the CLI's own loopback transport and the
+    per-generation local secret, the same pair `kirocrew token` and
+    `kirocrew logout` use to reach the gateway.
+
+    No gateway (no secret to reach one) returns silently — the next boot
+    re-checks anyway. A reachable gateway that refuses or errors prints one
+    fallback line. Nothing here raises, and nothing changes the exit code: the
+    update has already succeeded.
+    """
+    try:
+        port = resolve_client_port(None)
+        # Verify the port is held by THIS install's gateway before reading or
+        # sending the secret. Without this, a stale configured port bound by a
+        # co-resident local user would receive the shared local secret -- the
+        # live gateway's own accepted credential -- which they could replay to
+        # mint owner tokens. _gateway_owns_port closes exactly that escalation.
+        if not _gateway_owns_port(port):
+            return
+        secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
+        if not secret:
+            # No gateway running (or no secret to reach one) -- the next boot
+            # re-checks anyway, so there is nothing to reconcile.
+            return
+        req = urllib.request.Request(
+            f"http://{_CLI_LOOPBACK}:{port}/api/update/revalidate",
+            method="POST",
+            headers={"X-Local-Secret": secret, "Content-Type": "application/json"},
+            data=b"{}",
+        )
+        with loopback_urlopen(req, timeout=5) as resp:
+            if int(resp.status) == 200:
+                print("  🔄 Update badge refreshed on the running gateway")
+                return
+        print("  ℹ️  Could not refresh the update badge; it reconciles on next check")
+    except (
+        http.client.HTTPException,
+        OSError,
+        ValueError,
+        urllib.error.URLError,
+    ):
+        # Includes a gateway that is not up (connection refused) and any
+        # malformed response. The update stands regardless.
+        print("  ℹ️  Could not refresh the update badge; it reconciles on next check")
+
 
 def _refresh_agent_config(proj: str) -> None:
     """Re-install agent config so new denied commands take effect.
@@ -2261,7 +2320,7 @@ def _update_approve() -> None:
     # by /api/token/local). Reading the secret is itself host-local evidence,
     # the same class as the nonce file. An absent secret still works on a
     # default loopback install where no token auth runs.
-    secret = read_local_secret(port)
+    secret = read_local_secret(port, dial_host="127.0.0.1")
     if secret:
         headers["X-Internal-Secret"] = secret
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
@@ -2321,7 +2380,7 @@ def _file_delivery_approve() -> None:
     # Same local-secret / unix-socket authentication as _update_approve: reading
     # the secret is itself host-local evidence, and an absent secret still works
     # on a default loopback install where no token auth runs.
-    secret = read_local_secret(port)
+    secret = read_local_secret(port, dial_host="127.0.0.1")
     if secret:
         headers["X-Internal-Secret"] = secret
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
@@ -2566,14 +2625,7 @@ async def _run_task(args: argparse.Namespace) -> None:
 
     # Vector memory (structured semantic store)
 
-    vector_memory = VectorMemoryStore(
-        confidence_threshold=cfg.memory.semantic_confidence_threshold,
-        extra_prefixes=cfg.memory.semantic_keys or None,
-        episodic_limit=cfg.memory.episodic_max_results,
-        embedding_dim=cfg.memory.embedding_dim,
-        decay_rates=cfg.memory.decay_rates or None,
-        dedup_threshold=cfg.memory.episodic_dedup_threshold,
-    )
+    vector_memory = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim, config=cfg)
     # CALLER CONTRACT (vector_memory.py): async callers offload init() — it is
     # blocking file IO end to end (sqlite connect, migrations, lockdown pass)
     # and would stall the loop.

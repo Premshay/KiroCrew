@@ -44,6 +44,7 @@ import { useHandsFreeLoop, type HandsFreeLoop } from '../../hooks/useHandsFreeLo
 import { isSendableTranscript, HANDS_FREE_LS_KEY } from '../../hooks/handsFreeVad'
 import { markEndOfSpeech, clearTurnMarks } from '../../utils/voiceTurnMetrics'
 import { usePersistedBool } from '../../hooks/usePersistedBool'
+import { haptic } from '../../lib/haptic'
 
 /** How long the "dictation added" cue stays after a held transcript lands. */
 const HELD_LANDED_MS = 4000
@@ -647,6 +648,24 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   useEffect(() => {
     if (micOwner === instanceId && !startingRef.current && !voice.recording && !voice.transcribing) setMicOwner(null)
   })
+  // Whether the capture that is starting or running was asked for by a HAND
+  // (the mic button) rather than a key. Set per start, read when the engine
+  // reports the mic open and when the session is stopped. The keyboard path
+  // is never tapped: a bare modifier keydown opens capture speculatively and a
+  // chord (⌥e → é) cancels it a beat later, so a tap there would announce
+  // recordings that never happen on every modifier press.
+  const tapThisSessionRef = useRef(false)
+  const wasRecordingRef = useRef(false)
+  // The open tap rides the engine's own `recording` flip, not the start call:
+  // a denied or revoked microphone fails inside `voice.start()` and never
+  // flips it, so a tap placed before the call would promise a mic that never
+  // opened. Nothing on screen has changed yet when the finger lifts off the
+  // button, which is why the hand is told at all.
+  useEffect(() => {
+    const opened = voice.recording && !wasRecordingRef.current
+    wasRecordingRef.current = voice.recording
+    if (opened && micOwner === instanceId && tapThisSessionRef.current) haptic('medium')
+  }, [voice.recording, instanceId])
   useEffect(() => () => { if (micOwner === instanceId) setMicOwner(null) }, [instanceId])
 
   /**
@@ -697,6 +716,7 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     lastDictationValueRef.current = null
     postStopEditedRef.current = false
     frozenCaretRef.current = null
+    tapThisSessionRef.current = !opts?.silent
     setMicOwner(instanceId, sessionIdRef.current)
     startingRef.current = true
     const gen = ++startGenRef.current
@@ -711,6 +731,8 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   const stopCapture = voice.stop
   const stopVoice = useCallback(() => {
     protectStoppedDictation()
+    // The stop is the finger's own act, so it is felt at once, not on settle.
+    if (tapThisSessionRef.current) haptic('medium')
     stopCapture()
   }, [protectStoppedDictation, stopCapture])
 

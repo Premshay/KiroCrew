@@ -511,6 +511,61 @@ def _metadata_file(agents, prepared, name="custom"):
     return agents / projection._PROJECTION_METADATA_DIR_NAME / f"{prepared.agent(name)}.json"
 
 
+def _spec_with_injected_env(value, extra=None):
+    env = {"INJECTION_ID": value, **(extra or {})}
+    return json.dumps(
+        {"name": "custom", "mcpServers": {"injected": {"command": "helper", "env": env}}}
+    )
+
+
+def test_a_rewritten_env_value_reuses_the_alias(native_tree):
+    home, agents, project = native_tree
+    source = agents / "custom.json"
+    source.write_text(_spec_with_injected_env("first-write"), encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project).agent("custom")
+    source.write_text(_spec_with_injected_env("second-write"), encoding="utf-8")
+    prepared = projection.prepare_native_skill_projection(project)
+    assert prepared.agent("custom") == first
+    view = json.loads(_alias_file(agents, prepared).read_text(encoding="utf-8"))
+    assert view["mcpServers"]["injected"]["env"]["INJECTION_ID"] == "second-write"
+    aliases = [
+        p for p in agents.iterdir() if p.name.startswith(projection.NATIVE_SKILL_ALIAS_PREFIX)
+    ]
+    assert aliases == [agents / f"{first}.json"]
+
+
+def test_an_added_env_key_names_a_new_alias(native_tree):
+    home, agents, project = native_tree
+    source = agents / "custom.json"
+    source.write_text(_spec_with_injected_env("same"), encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project).agent("custom")
+    source.write_text(_spec_with_injected_env("same", {"NEW_VAR": "1"}), encoding="utf-8")
+    assert projection.prepare_native_skill_projection(project).agent("custom") != first
+
+
+def test_project_agents_differing_only_in_env_values_never_share_an_alias(
+    native_tree, tmp_path, monkeypatch
+):
+    home, agents, project = native_tree
+    monkeypatch.setattr(
+        projection,
+        "list_agents",
+        lambda **kw: [SimpleNamespace(name="custom", filename="custom.json", scope="project")],
+    )
+    views = {}
+    for name, token in (("one", "token-one"), ("two", "token-two")):
+        work = tmp_path / name
+        (work / ".kiro" / "agents").mkdir(parents=True)
+        (work / ".kiro" / "agents" / "custom.json").write_text(
+            _spec_with_injected_env(token), encoding="utf-8"
+        )
+        prepared = projection.prepare_native_skill_projection(work)
+        views[name] = (prepared.agent("custom"), _alias_file(agents, prepared))
+    assert views["one"][0] != views["two"][0]
+    first = json.loads(views["one"][1].read_text(encoding="utf-8"))
+    assert first["mcpServers"]["injected"]["env"]["INJECTION_ID"] == "token-one"
+
+
 def test_generated_view_keeps_lifecycle_ownership_out_of_the_agent_spec(native_tree):
     home, agents, project = native_tree
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
@@ -2860,7 +2915,20 @@ def test_lease_scan_stops_on_its_deadline_and_answers_uncertain(native_tree, mon
         probed.append(path.name)
         return real_probe(path)
 
-    monkeypatch.setattr(projection.time, "monotonic", clock)
+    # The schedule is keyed on call count, so ONLY the module under test may read
+    # it: patching ``time.monotonic`` itself hands the same three slots to every
+    # other thread in the worker (the subprocess-pool reaper polls it every
+    # 0.5 s), and one consumed zero makes the first entry's check read the budget
+    # as already spent -- the scan then reports 0 entries where the test expects 1.
+    real_time = projection.time
+
+    class _ModuleClock:
+        monotonic = staticmethod(clock)
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+    monkeypatch.setattr(projection, "time", _ModuleClock())
     monkeypatch.setattr(projection, "_probe_projection_lease", probe)
 
     with caplog.at_level("INFO", logger=projection.logger.name):

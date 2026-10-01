@@ -164,14 +164,236 @@ class TestMappingTable:
     def test_quiet_outcomes_are_the_only_quiet(self, value: str) -> None:
         assert point.map_answers(answers(outcome=value)).outcome is Outcome.QUIET
 
-    def test_quiet_is_an_allowlist(self) -> None:
-        """No outcome outside :data:`QUIET_OUTCOMES` can produce silence."""
+    def test_quiet_is_exactly_the_two_rules_that_produce_it(self) -> None:
+        """Which answers are silent, as an if-and-only-if over the WHOLE answer space.
+
+        This replaces an earlier sweep that asserted one direction only -- no outcome
+        outside :data:`QUIET_OUTCOMES` may be silent -- and it is deliberately STRONGER
+        than what it replaces, in three ways. It sweeps both ``needs_owner`` answers and
+        both probabilities independently rather than the outcome's alone; it asserts
+        equality rather than non-membership, so an answer that SHOULD be silent and
+        wakes fails here too; and it carries no allowlist, exception or skip, so a
+        future rule that quietly widens what may be suppressed cannot slip through as
+        one more admitted case.
+
+        The predicate below is the mapping's quiet condition written out. Two rules
+        produce silence and nothing else may:
+
+        * a :data:`QUIET_OUTCOMES` outcome at or above :data:`OUTCOME_MIN_P`;
+        * an :data:`ACTION_OUTCOMES` outcome under :data:`ACTION_OVERRIDE_MIN_P` whose
+          ``needs_owner`` answered ``quiet``, cleared :data:`NEEDS_OWNER_MIN_P`, AND was
+          the more confident of the two -- the owner's own criterion outranking a
+          question that carries no criterion.
+
+        So ``finished`` and ``broken`` are silent at no confidence and under no
+        ``needs_owner`` answer, an unsure outcome always wakes, an unsure quiet never
+        suppresses an action outcome, and neither does a quiet the outcome outranks.
+        """
+
+        def expect_quiet(owner: str, owner_p: float, value: str, outcome_p: float) -> bool:
+            if outcome_p < point.OUTCOME_MIN_P:
+                return False  # rule 2: an unsure judge hands the tick over
+            if owner == point.NEEDS_OWNER_WAKE and owner_p >= point.NEEDS_OWNER_MIN_P:
+                return False  # rule 3: the owner's criterion asked for the turn
+            if value in point.ACTION_OUTCOMES:
+                return (
+                    owner == point.NEEDS_OWNER_QUIET
+                    and owner_p >= point.NEEDS_OWNER_MIN_P
+                    and owner_p > outcome_p
+                    and outcome_p < point.ACTION_OVERRIDE_MIN_P
+                )
+            return value in point.QUIET_OUTCOMES
+
+        probabilities = (0.0, 0.39, 0.4, 0.41, 0.49, 0.5, 0.59, 0.6, 0.75, 1.0)
+        seen_quiet = 0
         for value in point.OUTCOME_OPTIONS:
-            if value in point.QUIET_OUTCOMES:
-                continue
-            for probability in (0.41, 0.5, 0.59, 0.75, 1.0):
-                verdict = point.map_answers(answers(outcome=value, outcome_p=probability))
-                assert verdict.outcome is not Outcome.QUIET, (value, probability)
+            for owner in point.NEEDS_OWNER_OPTIONS:
+                for owner_p in probabilities:
+                    for outcome_p in probabilities:
+                        verdict = point.map_answers(
+                            answers(
+                                owner=owner,
+                                owner_p=owner_p,
+                                outcome=value,
+                                outcome_p=outcome_p,
+                            )
+                        )
+                        want = expect_quiet(owner, owner_p, value, outcome_p)
+                        assert (verdict.outcome is Outcome.QUIET) is want, (
+                            value,
+                            owner,
+                            owner_p,
+                            outcome_p,
+                            verdict.outcome,
+                        )
+                        seen_quiet += int(want)
+        # A control on the sweep itself: a predicate that never expects silence would
+        # make every assertion above trivially true.
+        assert seen_quiet > 0
+
+    def test_a_confident_owner_quiet_survives_a_barely_confident_action_outcome(self) -> None:
+        """The defect this bar exists for, at the numbers it was measured at.
+
+        Eleven wakes in one logged window came only from the ``ACTION_OUTCOMES``
+        clause, every one of them over a ``needs_owner`` that answered ``quiet``, and
+        eight of those had ``outcome`` under 0.52 -- barely over the shared floor of
+        0.40. A red pull request under repair answers ``needs_action`` every tick, so
+        the veto fired for the whole repair.
+        """
+        verdict = point.map_answers(
+            answers(
+                owner=point.NEEDS_OWNER_QUIET,
+                owner_p=0.9,
+                outcome=point.OUTCOME_NEEDS_ACTION,
+                outcome_p=0.45,
+            )
+        )
+        assert verdict.outcome is Outcome.QUIET
+        # Both answers in the body: the reader of a suppressed tick has to be able to
+        # see WHICH two readings disagreed, or the suppression is unexplainable.
+        assert "0.90" in verdict.body and "0.45" in verdict.body
+        assert point.OUTCOME_NEEDS_ACTION in verdict.body
+
+    def test_an_action_outcome_at_the_override_bar_still_wakes(self) -> None:
+        verdict = point.map_answers(
+            answers(
+                owner=point.NEEDS_OWNER_QUIET,
+                owner_p=0.9,
+                outcome=point.OUTCOME_NEEDS_ACTION,
+                outcome_p=point.ACTION_OVERRIDE_MIN_P,
+            )
+        )
+        assert verdict.outcome is Outcome.WAKE
+
+    def test_an_unsure_outcome_still_wakes_under_a_confident_owner_quiet(self) -> None:
+        """Rule 2 is untouched: below the shared floor the call goes to the session.
+
+        The new bar narrows one backstop. It must not reach underneath
+        :data:`OUTCOME_MIN_P`, where an unsure judge has always handed the tick to the
+        main session rather than guessing quiet.
+        """
+        verdict = point.map_answers(
+            answers(
+                owner=point.NEEDS_OWNER_QUIET,
+                owner_p=0.9,
+                outcome=point.OUTCOME_NEEDS_HUMAN,
+                outcome_p=point.OUTCOME_MIN_P - 0.05,
+            )
+        )
+        assert verdict.outcome is Outcome.WAKE
+        assert "unsure" in verdict.body
+
+    def test_a_below_bar_owner_wake_is_not_a_quiet_answer(self) -> None:
+        """Only ``needs_owner``'s VALUE being ``quiet`` may withhold the backstop.
+
+        A ``wake`` answer that missed :data:`NEEDS_OWNER_MIN_P` fires no rule of its
+        own, but nobody asserted the owner can be left alone either, so the
+        unconditional action backstop still applies to it.
+        """
+        verdict = point.map_answers(
+            answers(
+                owner=point.NEEDS_OWNER_WAKE,
+                owner_p=point.NEEDS_OWNER_MIN_P - 0.01,
+                outcome=point.OUTCOME_NEEDS_ACTION,
+                outcome_p=0.45,
+            )
+        )
+        assert verdict.outcome is Outcome.WAKE
+
+    def test_the_override_bar_sits_above_the_confidence_floor(self) -> None:
+        """A bar at or under the floor would be unreachable and change nothing."""
+        assert point.ACTION_OVERRIDE_MIN_P > point.OUTCOME_MIN_P
+
+    def test_the_override_bar_covers_the_measured_range_at_literal_numbers(self) -> None:
+        """The bar's VALUE, pinned at literal probabilities rather than through itself.
+
+        Every other assertion here spells the threshold as ``ACTION_OVERRIDE_MIN_P``, so
+        all of them stay green if the constant is lowered -- and a drop to 0.5 would let
+        back exactly the 0.50-0.59 band the logged verdicts were found in. These
+        numbers are literal so that a change to the constant has to be made here too,
+        in the open.
+        """
+        assert point.ACTION_OVERRIDE_MIN_P == 0.6
+        confident_quiet = {"owner": point.NEEDS_OWNER_QUIET, "owner_p": 0.94}
+        for probability in (0.41, 0.48, 0.5, 0.52, 0.59):
+            verdict = point.map_answers(
+                answers(
+                    outcome=point.OUTCOME_NEEDS_ACTION, outcome_p=probability, **confident_quiet
+                )
+            )
+            assert verdict.outcome is Outcome.QUIET, probability
+        for probability in (0.6, 0.61, 0.9):
+            verdict = point.map_answers(
+                answers(
+                    outcome=point.OUTCOME_NEEDS_ACTION, outcome_p=probability, **confident_quiet
+                )
+            )
+            assert verdict.outcome is Outcome.WAKE, probability
+
+    def test_the_quiet_answer_must_be_the_more_confident_of_the_two(self) -> None:
+        """The veto is a RANKING, not just two independent floors.
+
+        :data:`NEEDS_OWNER_MIN_P` cannot carry this rule on its own: with two options
+        the chosen answer is the argmax, so it clears 0.5 by construction. Without the
+        comparison a ``quiet`` at 0.51 would silence a ``needs_action`` at 0.59 -- the
+        exact inversion this exception exists to prevent, since its justification is
+        that a barely-confident answer must not beat a confident one.
+        """
+        loses = point.map_answers(
+            answers(
+                owner=point.NEEDS_OWNER_QUIET,
+                owner_p=0.51,
+                outcome=point.OUTCOME_NEEDS_ACTION,
+                outcome_p=0.59,
+            )
+        )
+        assert loses.outcome is Outcome.WAKE
+        wins = point.map_answers(
+            answers(
+                owner=point.NEEDS_OWNER_QUIET,
+                owner_p=0.62,
+                outcome=point.OUTCOME_NEEDS_ACTION,
+                outcome_p=0.55,
+            )
+        )
+        assert wins.outcome is Outcome.QUIET
+        assert "0.62" in wins.body and "0.55" in wins.body
+
+    def test_an_equal_confidence_tie_wakes(self) -> None:
+        """Strictly more confident, so a tie does not buy silence.
+
+        The comparison is the owner's answer OUTRANKING what it overrides; equal
+        readings rank neither, and the direction this whole point fails in is toward
+        spending the turn.
+        """
+        verdict = point.map_answers(
+            answers(
+                owner=point.NEEDS_OWNER_QUIET,
+                owner_p=0.55,
+                outcome=point.OUTCOME_NEEDS_ACTION,
+                outcome_p=0.55,
+            )
+        )
+        assert verdict.outcome is Outcome.WAKE
+
+    def test_an_unsure_owner_quiet_cannot_suppress_an_action_outcome(self) -> None:
+        """The quiet answer must clear its OWN bar before it withholds a wake.
+
+        ``NEEDS_OWNER_MIN_P`` is enforced literally rather than assumed from a
+        two-option argmax, precisely because a provider may return a non-argmax choice.
+        Such a ``quiet`` answer asserts nothing anyone was sure of, so it must not buy
+        silence about a ``needs_human`` tick -- the owner would otherwise hear nothing
+        until the quiet-streak floor.
+        """
+        verdict = point.map_answers(
+            answers(
+                owner=point.NEEDS_OWNER_QUIET,
+                owner_p=0.01,
+                outcome=point.OUTCOME_NEEDS_HUMAN,
+                outcome_p=0.59,
+            )
+        )
+        assert verdict.outcome is Outcome.WAKE
 
     def test_terminal_bar_is_above_the_confidence_floor(self) -> None:
         """Ordering still matters, for the wording rather than for the outcome.
@@ -3741,6 +3963,51 @@ class TestTheReadingHappensBeforeTheJudge:
         finally:
             service.stop()
 
+    @staticmethod
+    def _stored_baseline(tmp_path: Any, loop_id: str) -> dict:
+        """What the record on disk holds for this loop's baseline."""
+        import json
+
+        rows = json.loads((tmp_path / "autonudge.json").read_text())["loops"]
+        return next(row for row in rows if row["id"] == loop_id)["judge_pr_seen"]
+
+    @staticmethod
+    def _tap_commit_writes(
+        service: AutoNudgeService,
+        loop: NudgeLoop,
+        answers: list[bool],
+        *,
+        on_refuse: Any = None,
+    ) -> list[tuple[dict, dict]]:
+        """Intercept the writes that CARRY a baseline memory does not yet hold.
+
+        Every store write goes through ``_write_monitor_snapshot_locked`` on this path,
+        and the reading's own write carries whatever baseline memory already has. A
+        write whose row disagrees with memory is therefore a commit, and that is the
+        property under test -- the baseline reaches disk before it reaches memory. Each
+        commit pops one answer: ``True`` lets the real write through, ``False`` refuses
+        it after calling *on_refuse*. Returns ``(written, in_memory)`` per commit.
+        """
+        real = service._write_monitor_snapshot_locked
+        seen: list[tuple[dict, dict]] = []
+
+        async def _write(payload: dict | None = None) -> None:
+            # A payload-less call serializes live state, which by definition carries the
+            # baseline memory already holds; only a staged payload can be a commit.
+            row = None
+            if payload is not None:
+                row = next((r for r in payload["loops"] if r["id"] == loop.id), None)
+            if row is not None and row["judge_pr_seen"] != loop.judge_pr_seen:
+                seen.append((dict(row["judge_pr_seen"]), dict(loop.judge_pr_seen or {})))
+                if not answers.pop(0):
+                    if on_refuse is not None:
+                        on_refuse()
+                    raise OSError("disk went away")
+            await real(payload)
+
+        service._write_monitor_snapshot_locked = _write  # type: ignore[method-assign]
+        return seen
+
     def test_the_baseline_is_committed_with_an_awaited_write(self, tmp_path, monkeypatch) -> None:
         """The stored record is this baseline's authority, so memory may not run ahead of it.
 
@@ -3752,8 +4019,9 @@ class TestTheReadingHappensBeforeTheJudge:
 
         Pinned by WHAT THE WRITE SEES rather than by counting calls: the judge call makes
         awaited writes of its own, so a call count cannot tell them from this one. A
-        write that observes the committed baseline can only have happened after the
-        commit, which is exactly the ordering at issue.
+        write that carries the committed baseline while memory still holds the old one
+        can only be the commit, and that ordering -- disk first -- is exactly what is at
+        issue.
         """
         import kiro_crew.autonudge as _an
 
@@ -3771,38 +4039,32 @@ class TestTheReadingHappensBeforeTheJudge:
         loop = self._judged_pr_loop()
         service._loops[loop.id] = loop
 
-        seen_baselines: list[dict] = []
-
-        async def _spy_persist(inner: NudgeLoop) -> bool:
-            seen_baselines.append(dict(inner.judge_pr_seen or {}))
-            return True
-
         async def _answer(inner: NudgeLoop) -> bool | None:
             return None
 
-        service._persist_judge_state = _spy_persist  # type: ignore[method-assign]
         service._judge_tick_is_quiet = _answer  # type: ignore[method-assign]
+        commits = self._tap_commit_writes(service, loop, [True])
         try:
             asyncio.run(service._monitor_tick_is_quiet(loop))
             assert loop.judge_pr_seen, "the tick staged a baseline to commit"
-            assert any(seen for seen in seen_baselines), (
-                "a durable write must have been AWAITED while the committed baseline was "
-                "in place -- a scheduled write leaves the old baseline on disk"
-            )
-            assert (
-                seen_baselines[-1] == loop.judge_pr_seen
-            ), "and the write that saw it carries exactly what memory holds"
+            assert len(commits) == 1, "exactly one write carried the new baseline"
+            written, in_memory = commits[0]
+            assert written == loop.judge_pr_seen, "the write carries what memory now holds"
+            assert in_memory == {}, "and memory still held the old baseline while it was written"
+            assert self._stored_baseline(tmp_path, loop.id) == loop.judge_pr_seen
         finally:
             service.stop()
 
-    def test_a_baseline_whose_write_does_not_land_is_dropped(self, tmp_path, monkeypatch) -> None:
+    def test_a_baseline_whose_write_does_not_land_is_never_published(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """Memory may not claim what disk does not.
 
-        Keeping the commit after a refused write is the same defect from the other side:
-        this tick screened against a baseline the record does not hold, so a restart
-        re-reads the remarks it passed on -- except nothing ever fires to reveal it,
-        because memory believes they are seen. Dropping the commit costs a turn and
-        withholds nothing, which is the only safe direction.
+        Publishing before the write would let this tick screen against a baseline the
+        record does not hold, so a restart re-reads the remarks it passed on -- except
+        nothing ever fires to reveal it, because memory believes they are seen. So the
+        commit reaches memory only once it has reached disk, and a refused write leaves
+        both exactly as they were.
         """
         import kiro_crew.autonudge as _an
 
@@ -3820,19 +4082,284 @@ class TestTheReadingHappensBeforeTheJudge:
         loop = self._judged_pr_loop()
         service._loops[loop.id] = loop
 
-        async def _refuse(inner: NudgeLoop) -> bool:
-            return False
+        async def _answer(inner: NudgeLoop) -> bool | None:
+            return None
+
+        service._judge_tick_is_quiet = _answer  # type: ignore[method-assign]
+        commits = self._tap_commit_writes(service, loop, [False])
+        try:
+            asyncio.run(service._monitor_tick_is_quiet(loop))
+            assert len(commits) == 1, "the commit was attempted"
+            assert (
+                loop.judge_pr_seen == {}
+            ), "a baseline whose write was refused must never reach memory"
+            assert self._stored_baseline(tmp_path, loop.id) == {}
+        finally:
+            service.stop()
+
+    def test_a_refused_write_leaves_the_prior_baseline_in_place(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Refusing the commit means keeping what the record holds, not emptying it.
+
+        The awaited judge write inside the judge call has already landed a snapshot
+        holding the PRIOR baseline, so that is the value memory must still carry once
+        this tick's write is refused. An empty one matches nothing on disk: the next tick
+        would call every remark in the horizon new, spend a turn on remarks the record
+        already knows, and keep doing so until a write lands.
+        """
+        import kiro_crew.autonudge as _an
+
+        async def on_fire(loop: NudgeLoop) -> bool:
+            return True
+
+        reading = self._observation()
+
+        def _poll(identity, message, probe):
+            probe.observation = reading
+            return _an.irq.Verdict(Outcome.QUIET, "pinned")
+
+        monkeypatch.setattr(_an.irq, "poll", _poll)
+        service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+        loop = self._judged_pr_loop()
+        prior = {"digest": "earlier-reading", "remarks": ["review:R0"]}
+        loop.judge_pr_seen = dict(prior)
+        service._loops[loop.id] = loop
 
         async def _answer(inner: NudgeLoop) -> bool | None:
             return None
 
-        service._persist_judge_state = _refuse  # type: ignore[method-assign]
         service._judge_tick_is_quiet = _answer  # type: ignore[method-assign]
+        commits = self._tap_commit_writes(service, loop, [False])
         try:
             asyncio.run(service._monitor_tick_is_quiet(loop))
+            assert len(commits) == 1, "the commit was attempted"
             assert (
-                loop.judge_pr_seen == {}
-            ), "a baseline whose write was refused must not stay in memory"
+                loop.judge_pr_seen == prior
+            ), "a refused write must leave the baseline the stored record holds, not an empty one"
+            assert self._stored_baseline(tmp_path, loop.id) == prior
+        finally:
+            service.stop()
+
+    def test_memory_and_disk_agree_however_a_refusal_interleaves(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The invariant a rollback cannot give: no writer ever sees a half-committed baseline.
+
+        A commit that published to memory first and rolled back on refusal would leave a
+        window in which another writer -- an update, a delivery label, a scheduled
+        write -- serializes the loop with the NEW baseline and lands it, after which the
+        rollback rewinds memory alone and the two disagree. Here the commit is the only
+        thing that changes memory and it does so after the write, so the latest snapshot
+        any other writer can take before the refusal still carries the prior baseline,
+        and memory, that snapshot, and the record all agree afterwards.
+        """
+        import kiro_crew.autonudge as _an
+
+        async def on_fire(loop: NudgeLoop) -> bool:
+            return True
+
+        reading = self._observation()
+
+        def _poll(identity, message, probe):
+            probe.observation = reading
+            return _an.irq.Verdict(Outcome.QUIET, "pinned")
+
+        monkeypatch.setattr(_an.irq, "poll", _poll)
+        service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+        loop = self._judged_pr_loop()
+        prior = {"digest": "earlier-reading", "remarks": ["review:R0"]}
+        loop.judge_pr_seen = dict(prior)
+        service._loops[loop.id] = loop
+
+        async def _answer(inner: NudgeLoop) -> bool | None:
+            return None
+
+        concurrent: list[dict] = []
+
+        def _another_writer_snapshots() -> None:
+            # What any other writer serializes at the last instant before the refusal.
+            rows = service._serialize_state()["loops"]
+            concurrent.append(next(r for r in rows if r["id"] == loop.id)["judge_pr_seen"])
+
+        service._judge_tick_is_quiet = _answer  # type: ignore[method-assign]
+        self._tap_commit_writes(service, loop, [False], on_refuse=_another_writer_snapshots)
+        try:
+            asyncio.run(service._monitor_tick_is_quiet(loop))
+            assert concurrent == [prior], "no other writer can ever snapshot the new baseline"
+            assert loop.judge_pr_seen == prior
+            assert self._stored_baseline(tmp_path, loop.id) == prior
+        finally:
+            service.stop()
+
+    def test_a_streak_cleared_during_the_commit_write_stays_cleared(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The commit publishes ONE field, so it cannot revert another writer's change.
+
+        ``notify_cycle_landed`` clears the start-failure streak on the live loop
+        synchronously and without the lock, from the turn-completion path, so it can
+        land while the baseline write is in flight. A commit that copied the whole
+        staged snapshot back over the live loop would put the streak back silently, and
+        the loop would back off or stand down on a failure a completed turn had just
+        disproved.
+        """
+        import kiro_crew.autonudge as _an
+
+        async def on_fire(loop: NudgeLoop) -> bool:
+            return True
+
+        reading = self._observation()
+
+        def _poll(identity, message, probe):
+            probe.observation = reading
+            return _an.irq.Verdict(Outcome.QUIET, "pinned")
+
+        monkeypatch.setattr(_an.irq, "poll", _poll)
+        service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+        loop = self._judged_pr_loop()
+        loop.consecutive_start_failures = 3
+        service._loops[loop.id] = loop
+
+        async def _answer(inner: NudgeLoop) -> bool | None:
+            return None
+
+        real = service._write_monitor_snapshot_locked
+
+        async def _turn_lands_mid_write(payload: dict | None = None) -> None:
+            await real(payload)
+            if payload is None:
+                return
+            row = next(r for r in payload["loops"] if r["id"] == loop.id)
+            if row["judge_pr_seen"] != loop.judge_pr_seen:
+                # What the turn-completion hook does, at the point it really can: after
+                # the commit's snapshot was taken and before the commit publishes.
+                service.notify_cycle_landed(loop.slot_key)
+
+        service._judge_tick_is_quiet = _answer  # type: ignore[method-assign]
+        service._write_monitor_snapshot_locked = _turn_lands_mid_write  # type: ignore[method-assign]
+        try:
+            asyncio.run(service._monitor_tick_is_quiet(loop))
+            assert loop.judge_pr_seen, "the baseline was committed"
+            assert (
+                loop.consecutive_start_failures == 0
+            ), "a streak cleared while the baseline was written must stay cleared"
+        finally:
+            service.stop()
+
+    def test_a_commit_write_that_lands_and_is_then_cancelled_still_publishes(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Disk holds the new baseline, so memory must match it before the cancel goes on.
+
+        The snapshot writer absorbs cancellation until the executor write settles and
+        raises it only afterwards, so at that point the record already carries the
+        committed baseline. Leaving memory on the old one would hand the next tick a
+        record it does not match, which is the disagreement this whole commit exists to
+        rule out.
+        """
+        import kiro_crew.autonudge as _an
+
+        async def on_fire(loop: NudgeLoop) -> bool:
+            return True
+
+        reading = self._observation()
+
+        def _poll(identity, message, probe):
+            probe.observation = reading
+            return _an.irq.Verdict(Outcome.QUIET, "pinned")
+
+        monkeypatch.setattr(_an.irq, "poll", _poll)
+        service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+        loop = self._judged_pr_loop()
+        service._loops[loop.id] = loop
+
+        async def _answer(inner: NudgeLoop) -> bool | None:
+            return None
+
+        real = service._write_monitor_snapshot_locked
+
+        async def _lands_then_cancelled(payload: dict | None = None) -> None:
+            await real(payload)
+            # A payload-less write serializes live state; the reading's own write stages
+            # a payload too. The commit is the one whose row carries a baseline memory
+            # does not yet hold.
+            if payload is None:
+                return
+            row = next(r for r in payload["loops"] if r["id"] == loop.id)
+            if row["judge_pr_seen"] != loop.judge_pr_seen:
+                raise asyncio.CancelledError()
+
+        service._judge_tick_is_quiet = _answer  # type: ignore[method-assign]
+        service._write_monitor_snapshot_locked = _lands_then_cancelled  # type: ignore[method-assign]
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(service._monitor_tick_is_quiet(loop))
+            assert loop.judge_pr_seen, "a write that landed is published before the cancel goes on"
+            assert self._stored_baseline(tmp_path, loop.id) == loop.judge_pr_seen
+        finally:
+            service.stop()
+
+    def test_the_tick_after_a_refused_write_stamps_only_the_new_remark(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """What keeping the prior baseline is FOR: the next reading is screened against it.
+
+        Three ticks on one service. The first commits a baseline holding one remark. The
+        second reads a new remark beside it but its write is refused. The third reads
+        the same pair and must stamp ``first_seen_this_tick`` only on the remark the
+        stored baseline has never held -- an emptied baseline would stamp both.
+        """
+        import kiro_crew.autonudge as _an
+        from kiro_crew.probes import gh_pr
+
+        async def on_fire(loop: NudgeLoop) -> bool:
+            return True
+
+        def _remark(ident: str) -> Any:
+            return gh_pr.Remark(
+                kind="comment",
+                ident=ident,
+                author="a-reviewer",
+                at="2026-09-25T06:00:00Z",
+                age_s=120.0,
+                verdict="",
+                body="please guard the windows branch",
+            )
+
+        first_only = self._observation(remarks=(_remark("comment:C1"),), remarks_total=1)
+        both = self._observation(
+            remarks=(_remark("comment:C1"), _remark("comment:C2")), remarks_total=2
+        )
+        readings = [first_only, both, both]
+
+        def _poll(identity, message, probe):
+            probe.observation = readings.pop(0)
+            return _an.irq.Verdict(Outcome.QUIET, "pinned")
+
+        monkeypatch.setattr(_an.irq, "poll", _poll)
+        service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+        loop = self._judged_pr_loop()
+        service._loops[loop.id] = loop
+
+        async def _answer(inner: NudgeLoop) -> bool | None:
+            return None
+
+        service._judge_tick_is_quiet = _answer  # type: ignore[method-assign]
+        commits = self._tap_commit_writes(service, loop, [True, False, True])
+        try:
+            for _ in range(3):
+                asyncio.run(service._monitor_tick_is_quiet(loop))
+            assert len(commits) == 3, "every tick reached a verdict and tried to commit"
+            assert loop.monitor is not None
+            remarks = loop.monitor.last_observation["remarks"]
+            assert isinstance(remarks, list)
+            stamped = {row["id"]: row["first_seen_this_tick"] for row in remarks}
+            assert stamped == {
+                "comment:C1": False,
+                "comment:C2": True,
+            }, "only the remark the stored baseline never held reads as new"
+            assert self._stored_baseline(tmp_path, loop.id) == loop.judge_pr_seen
         finally:
             service.stop()
 

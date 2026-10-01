@@ -1,15 +1,16 @@
 # Session Control — driving another session
 
-One chat session can open, fork, seed, watch, stop and close another one, change its model, and take
-another one under itself in the sidebar. The tools come from the
+One chat session can open, fork, seed, watch, stop, close and revive another one,
+change its model, and take another one under itself in the sidebar. The tools come from the
 `kirocrew-dashboard` MCP server, so an agent that does not mount that server
 never has them — exactly like any other MCP server. This page is the reference
-for all 19 of its tools, written for the agent that is about to use them.
+for all 23 of its tools, written for the agent that is about to use them.
 
 The server is defined in `src/kiro_crew/mcp_dashboard.py`. Two halves:
 
 - **Session control** — `session_create`, `session_fork`, `session_send`,
-  `session_read_message`, `session_stop`, `session_set_model`, `session_close`,
+  `session_read_message`, `session_summary`, `session_stop`, `session_set_model`,
+  `session_close`, `session_revive`, `session_broadcast`, `session_status`,
   `session_adopt`, `session_release`. These reach another session.
 - **Sidebar shape** — `chat_folder_tree`, `chat_folder_create`,
   `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`,
@@ -136,6 +137,128 @@ is heading the wrong way, or the thing it is grinding on is already done.
 The message lands in the target's transcript tagged as sent by your session, so
 the person reading it can tell it from their own typing.
 
+### `session_broadcast`
+
+One message, several sessions. Use it when the thing you have to say is true of
+every worker rather than of one: the base moved, the approach changed, stop.
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `message` | yes | Becomes each target's next user-role turn |
+| `mode` | yes | `queue` or `steer`. No default |
+| `targets` | no | Session keys or titles. Omit to reach every session you created |
+
+`mode` is required because the two are different instructions, not two settings
+of one. `queue` lets every target finish what it is doing; `steer` cuts into
+every running turn. "The base moved, rebase before you push" is the first. "Stop,
+that issue is already fixed" is the second, and it is worth interrupting eight
+turns for. A default either way would silently pick one of those for a caller who
+meant the other.
+
+Each delivery goes through the same checks a single `session_send` does, so a
+broadcast can reach nothing a `session_send` could not — including the ownership
+fence, which is why the default audience (what you created) is always within
+reach.
+
+**Partial delivery is normal.** Deliveries happen one at a time, and a target
+that was closed, went incognito, or belongs to an app is one refused row while
+the rest still get the message. A target that simply never answers is one row
+too: each delivery has its own few-second bound, and on expiry the broadcast
+stops waiting for that session and moves to the next. The reply is per target:
+
+```
+📣 Queued for 2/6 session(s):
+  ✅ `chat-7` — queued until its turn ends
+  ✅ `chat-8` — started a turn on it
+  ❌ `chat-9` — no open session matches 'chat-9' (target_not_found)
+  ❌ `chat-10` — timed out; pending or queued, do not re-send (delivery_timeout)
+  ❌ `chat-11` — timed out before hand-over, safe to re-send (delivery_timeout)
+  ❌ `chat-12` — timed out and unavailable to inspect, outcome unknown (delivery_timeout)
+Some targets were not reached — the rows above say which and why. Nothing
+retries them for you.
+```
+
+Read the rows. Treating the call as all-or-nothing is how a worker silently
+misses an instruction its siblings acted on. Nothing retries a refused row, and
+at most **50** sessions are reachable in one call — an audience over that is
+refused rather than truncated, because a silently-cut broadcast is one you
+believe reached everyone.
+
+`delivery_timeout` means only that this side stopped waiting. The gateway
+records the delivery's own progress instead of reconstructing it from target state:
+
+- **Before authorization:** the steer await was never entered, so the delivery did
+  not reach hand-over. Re-sending the same text is safe.
+- **Inside or after the steer await:** the outcome is unknown. Do not re-send; the
+  instruction may already have executed.
+- **Pending or queued:** retained text is additional evidence that it may still
+  run. Do not re-send it; a duplicate could run too. Empty containers do not prove
+  the opposite because successful delivery clears them as it progresses.
+- **Target unavailable:** the gateway cannot inspect the original slot. The
+  outcome is unknown, and the row advises neither action.
+
+Every timeout row avoids claiming delivery or certain execution. Cancellation at
+the SEL and configuration prewarms remains distinguishable from cancellation in
+or after the steer await.
+
+The target's transcript tags the message as a broadcast rather than a plain send,
+so a worker can tell an instruction its siblings also received from one aimed at
+it alone. That difference changes what the worker should do: the same sentence is
+a fact about its own branch in one case and a fact about the base in the other.
+
+### `session_status`
+
+Takes no arguments. The roster of sessions you stood up, and what each is doing.
+
+| `status` | Meaning | What to do |
+|---|---|---|
+| `working` | A turn is in flight | Wait |
+| `queued` | Idle, messages waiting to run | Wait; a steer would land on nothing |
+| `idle` | Open and doing nothing | This is the one that needs a decision |
+| `gone` | The crew log has it, the dashboard does not | Re-dispatch or drop it |
+| `unknown` | History has its birth metadata, but no live slot or crew-log edge exists | Inspect or re-dispatch without assuming it finished or was lost |
+
+`gone` and `unknown` are why this tool exists rather than reading sessions one at
+a time. Live slots forget a session the moment it is closed or lost with the
+process that ran it. The crew log preserves a gateway-attested edge after a
+session starts its first turn. History metadata fills the earlier window because
+`session_create` persists `created_by` at birth. A row's `source` names exactly
+which evidence placed it: `crew_log`, `history`, `live`, or a `+`-joined
+combination. A history-only row stays `unknown` because editable transcript
+metadata proves the creator but cannot prove why the live slot is absent.
+
+The ownership fence applies to all three sources. A history row is shown only
+when its persisted `created_by` exactly names you and its workspace matches
+yours, so another caller's archived session and title do not appear.
+
+A LIVE row passes the same target containment `session_broadcast` resolves names
+against — one shared predicate, not a second copy of its clauses. So a session you
+created contributes no title and no live status once it becomes something you
+could not message anyway: bound to a channel thread, mirrored into one,
+app-scoped, ephemeral, or moved to another workspace. Rows carry titles, and a
+linked session's title is derived from a conversation other people are in.
+
+The containment covers LIVE rows. A session the attested tree recorded still
+leaves its titleless `gone` row once its slot is gone, which carries no title and
+no live state — it says only that a session on your own tree is not live. That
+tree follows the CURRENT parent edge, so it covers a session you adopted as well
+as one you created.
+
+The two quality fields describe the durable sources independently:
+
+| Field | Value | Meaning |
+|---|---|---|
+| `tree` | `readable` | The crew-log fold was read completely |
+| `tree` | `incomplete` | Crew-log rows may be missing; its contribution is a floor |
+| `tree` | `unreadable` | No crew-log roster was available |
+| `history` | `readable` | The transcript metadata catalog was read completely |
+| `history` | `incomplete` | History rows may be missing; its contribution is a floor |
+| `history` | `unreadable` | No transcript metadata roster was available |
+
+Neither field alone says the combined count is exact. A short list under an
+`incomplete` or `unreadable` value is not evidence that you created nothing.
+Read-only: it sends nothing and changes nothing.
+
 ### `session_read_message`
 
 | Argument | Required | Meaning |
@@ -166,6 +289,46 @@ not re-read what it already saw. Two readings matter:
   rows this window did not reach — read again immediately instead of waiting.
 
 `wait`, then read. See [Monitor loops](monitor-loops.md) for the loop shape.
+
+### `session_summary`
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `target` | yes | Session key, or its exact title |
+
+Returns the target's intent summary, the digest the dashboard's summary panel
+shows: each goal with its status, recent progress and next steps, then the
+session's recurring project notes. The reply is bounded: the ten most recently
+touched goals, the last five progress items and first five next steps of each,
+ten notes, and 500 characters per line, with a count of anything it left out. Use it when a patrol cycle needs to know what
+a peer is doing and a transcript tail would cost 20 rows to find out.
+
+```
+🧭 `chat-7` — fix the build (idle)
+Summary written 2026-09-29T21:40:12Z.
+- [in-progress] Get the build green
+    progress: 3 of 5 failing tests fixed
+    next: fix the two remaining snapshot tests
+```
+
+It is a cached read and never spends a model call. The dashboard writes the
+summary at turn end, and only when the operator has turned on
+`session_summary.enabled`, so three answers are normal:
+
+- Summaries are off: the reply says so. Use `session_read_message`.
+- No summary yet: a session with too few turns has none.
+- `STALE`: turns have landed since the summary was written. The digest still
+  describes the session, but anything newer is only in the transcript.
+
+It is authorized exactly as `session_read_message` is, because the summary is
+derived from the same transcript: a session you cannot read, you cannot
+summarize. The check runs again after the summary is read, so a session that
+gains a channel link or is replaced in between is refused (`target_replaced`)
+rather than answered. An incognito session never has one. Read-only.
+
+Each goal carries the panel's state word (`in-progress`, `needs-you`, `done`,
+`dropped`), so work that finished without being verified reads `needs-you`
+rather than done.
 
 ### `session_adopt` and `session_release`
 
@@ -225,8 +388,8 @@ The reply distinguishes the two facts a stop can report: `nothing to stop` for a
 target that was never running, and `the earlier stop still stands` for one whose
 cancel is still in flight.
 
-`session_close` is not a permanent delete — the conversation is archived and can
-be reopened — but it does discard a running turn's work. Read the session first
+`session_close` is not a permanent delete — the conversation is archived and
+`session_revive` brings it back — but it does discard a running turn's work. Read the session first
 when you are not sure what it is doing.
 
 ### `session_set_model`
@@ -254,6 +417,37 @@ To force the change, call `session_stop`, then retry once the target is idle.
 Also refused: `auto` and `Auto (Jev)` (`model_owner_only`), because with the Jev
 preview on a slot on `auto` hands each turn's model to Jev routing, which only the
 owner may arm; and a target bound to a remote crew (`remote_target_unsupported`).
+
+### `session_revive`
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `target` | yes | The archived session: its slot key (`chat-7-...`), its `dashboard:<slot>` session key, the transcript name `list_sessions` reports, or its exact title when it is unique among archived sessions |
+| `folder` | no | Sidebar folder id or `/`-separated path to file it into once it is live (best-effort; the result's `filed` says whether it happened). Missing path segments are created (`mkdir -p`), like `session_create`'s `folder` |
+
+The mirror of `session_close`: it pulls a history session back up into a live
+tab with its full transcript — the same thing as clicking it in the History tab.
+Nothing runs until someone sends it a message, so the revived session is idle
+and addressable by the key the reply returns: `session_send`,
+`session_read_message`, `chat_folder_move_session` and `chat_tag_assign` all
+work on it afterwards. Reviving does not transfer ownership — the session keeps
+the creator it had — and a session that is already open is refused with its
+live key (`target_already_live`) rather than opened twice.
+
+The same containment as the other verbs applies, read from the archived
+session's own metadata since there is no live slot yet: same workspace only, no
+app-scoped or channel-linked sessions, and an ownership-fenced caller (a crew
+member, a scheduled run, an agent-created session) may revive only a session it
+created itself. Because the archived metadata line is a file an agent's tools can
+edit, that ownership is corroborated against the crew log's session-tree lineage,
+which only the gateway writes: a fenced caller's revive is refused
+`ownership_unverified` when the lineage is off or names a different parent. The
+crew log is on by default (`KIROCREW_CREW_LOG` unset, empty or truthy); a fenced
+revive is refused when the log is off, its projection is unseeded, or the session
+predates it, since none of those leaves a lineage to check. The person's own sessions are not ownership-gated and are
+unaffected. A revive also spends the caller's create budget and per-caller slot
+cap (the revived slot is charged to the reviver for the cap while keeping its own
+creator) and the global slot cap.
 
 ## Folders
 
@@ -285,8 +479,8 @@ worker under one heading. It can write no placement but its own, which is why it
 is safe to grant where `chat_folder_move_session` is withheld.
 
 Folder moves are metadata only: the session keeps its transcript, its model, and
-any running turn. Archived (history) sessions cannot be moved — revive one into
-the sidebar first. There is no delete verb here.
+any running turn. Archived (history) sessions cannot be moved — bring one back
+with `session_revive` first. There is no delete verb here.
 
 ## Tags
 
@@ -331,7 +525,8 @@ gateway-issued key counts. Refusals you should expect, by code:
 
 | Code | Meaning |
 |---|---|
-| `target_not_found` | No open session matches that key or title. A closed tab is out of scope |
+| `target_not_found` | No open session matches that key or title. A closed tab is out of scope for every verb except session_revive, whose target is precisely an archived session |
+| `target_already_live` | session_revive only: the session is open already. The message carries its live key — address it directly |
 | `ambiguous_target` | The string matches more than one session across the three forms below. Address it by its session key |
 | `self_target` | A session cannot control itself |
 | `not_creator` | The caller is fenced to sessions it created itself (a crew member's DM slot, a scheduled run, and anything either of them created) |
@@ -343,6 +538,11 @@ gateway-issued key counts. Refusals you should expect, by code:
 | `session_control_disabled` | `agent.session_control` is off in config |
 | `create_rate_limited` | Per-caller creation budget spent — a fork spends the same budget |
 | `target_busy` | Model change only: the target has a turn or sub-agents in flight, so its model was not changed |
+| `invalid_broadcast_mode` | `session_broadcast` needs `mode` to be `queue` or `steer`; there is no default |
+| `caller_changed_mid_broadcast` | The calling session moved workspace while a broadcast was in flight, so its per-target report is withheld. The deliveries already happened — do not re-send |
+| `too_many_targets` | A broadcast reaches at most 50 sessions. Refused, never truncated — name a subset |
+| `target_required` | A broadcast was given a target list that names no session. Omit the list to reach everything you created |
+| `delivery_timeout` | One target exceeded its per-delivery bound, so the broadcast cancelled that call and continued. The row reflects the exact text's observed state: pending or queued means it may still run and must not be re-sent; absent from both means the hand-over was not reached and re-sending is safe; an unavailable original slot means the outcome is unknown and the row advises neither action. No case claims delivery or certain execution |
 
 `target` resolves three ways, all of them checked before any answer: the slot
 key (`chat-7`), the transcript name `list_sessions` prints
@@ -357,14 +557,17 @@ session-control tool refuses it: its identity would resolve to its parent slot,
 handing it the parent's authority. Drive sessions from a real session, not from
 inside a subagent.
 
-A **channel agent** (Slack, Telegram, and the rest) is blocked from all nine
-session tools by `CHANNEL_AGENT_BLOCKED_TOOLS` in `src/kiro_crew/channel.py`.
+A **channel agent** (Slack, Telegram, and the rest) is blocked from every
+session tool by `CHANNEL_AGENT_BLOCKED_TOOLS` in `src/kiro_crew/channel.py`.
 Reading a dashboard transcript would pull a private conversation into a channel
 other humans can see, and sending would run channel text as a turn inside it.
 `chat_session_pin` is blocked there too, because it rearranges the person's
 sidebar the same way `session_adopt` and `session_release` do. The tool also
 refuses a `channel:` caller itself, before listing any session, so an
 auto-approved call that never reaches the permission prompt is still refused.
+`session_broadcast` is blocked for that reason multiplied by the fleet, and
+`session_status` because its rows carry other sessions' titles — the names of the
+user's private work, in front of whoever is in the thread.
 
 ### Switches and ceilings
 

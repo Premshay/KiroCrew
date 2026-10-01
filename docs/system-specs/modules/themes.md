@@ -85,6 +85,21 @@ failure, which the dashboard fetches for every theme at boot. Enforcing it there
 would drop a pre-rule pack out of the theme map entirely, colours included. The
 runtime scoper still removes the pin, so the preference is protected either way.
 
+## File-drop artwork contrast
+
+`ChatDropOverlay` renders its transparent file-chomper image with the stable
+class `chat-drop-art` and paints no inline colour. `website/src/index.css`
+(next to the loader-ghost block) gives that class a 1px black silhouette
+shadow (`drop-shadow`) under `[data-mode="light"]`, the resolved mode
+`useTheme` writes on `<html>`, so it applies to installed light palettes too.
+The white ghost and paper stay visible against light backgrounds without
+recoloring the artwork or changing drag behavior. Dark palettes are excluded
+by the selector, not by an assumption about their `--bg`, and render the art
+as they did before. Only a compiled edition theme's own CSS can override the
+rule. An installed pack cannot: `chat-drop-art` is not an `overrides.css` class
+hook, so `scopeOverridesCss` drops any rule that targets it, and palette tokens
+cannot reach the hardcoded shadow value.
+
 ## Install Pipeline
 
 1. **Source** — a local directory (read in place, then copied into staging) or an https `github.com` repo
@@ -134,10 +149,12 @@ predate this subsystem and remain the color-theme surface.)
 
 ### Asset, overlay and topbar responses revalidate, never expire
 
-All three serving routes answer through one helper (`_theme_asset_response`).
+All three serving routes answer through one helper (`_theme_asset_response`),
+which itself calls the dashboard-wide `kiro_crew.dashboard.conditional_get`
+(the same compare the appearance-media, app-art and crew-avatar routes use).
 A `200` carries `ETag: W/"<hex>"` — the 8-byte blake2b digest of the body bytes
 just read — and `Cache-Control: private, max-age=0, must-revalidate`. A request
-whose `If-None-Match` matches (weak comparison via aiohttp's parsed
+whose `If-None-Match` matches (RFC 9110 weak comparison via aiohttp's parsed
 `request.if_none_match`, so a list, the strong form of the same value and `*`
 all match) answers `304` with no body. The `304` repeats the `200`'s `ETag`,
 `Cache-Control`, `X-Content-Type-Options: nosniff` and
