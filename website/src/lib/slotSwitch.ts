@@ -19,6 +19,8 @@
  *  yet — without it a rapid triple-press computes the same "next" three times
  *  and lands one step ahead instead of three.
  *
+ *  Agent/model coupling follows docs/system-specs/modules/session.md.
+ *
  *  THE ADJUDICATION MODEL. `performSlotSwitch` dispatches requests for one
  *  slot+field strictly one at a time, in ticket order — two rapid picks on
  *  separate pooled connections could otherwise arrive at the gateway
@@ -72,6 +74,7 @@ import { i18nT } from '../i18n/t'
 export interface AgentSwitchValue {
   agent: string
   model?: string
+  modelReset?: boolean
   /** The namespace the backend committed the pick in; absent when the
    *  response omitted it (an older gateway), in which case the write leaves
    *  the slot's stored value alone. */
@@ -131,13 +134,10 @@ const verdicts = new Map<string, Promise<void>>()
 
 const keyOf = (field: SlotSwitchField, slot: string): string => field + ':' + slot
 
-/** The COUPLED set a field belongs to, for the shared adjudication entry —
- *  derived from the chain coupling below, so the two structures cannot
- *  drift apart. */
+/** An agent switch clears its model pin, so both fields must share request
+ *  ordering and adjudication; otherwise a failed pick can restore a stale pin. */
 const coupledFieldsOf = (field: SlotSwitchField): SlotSwitchField[] =>
-  COUPLED_CHAIN_FIELDS[field].length > 1
-    ? COUPLED_CHAIN_FIELDS[field]
-    : [field]
+  field === 'agent' || field === 'model' ? ['agent', 'model'] : [field]
 
 /** The adjudication entry key: every field of one coupled set shares ONE
  *  entry (a superseded model success must be adjudicated against the agent
@@ -351,17 +351,10 @@ export const SWITCH_CONFIRM_TIMEOUT_MS = 15_000
  *  on the value the backend actually holds. Every other field chains alone:
  *  a project or effort request must not queue behind an agent pick.
  */
-const COUPLED_CHAIN_FIELDS: Readonly<Record<SlotSwitchField, SlotSwitchField[]>> = {
-  agent: ['agent', 'model'],
-  model: ['agent', 'model'],
-  project: ['project'],
-  reasoning_effort: ['reasoning_effort'],
-}
-
 /** The chain keys a request for this slot+field queues behind (and registers
  *  its own tail under) — the field itself, plus every field it couples with. */
 const chainKeysOf = (field: SlotSwitchField, slot: string): string[] =>
-  COUPLED_CHAIN_FIELDS[field].map(f => keyOf(f, slot))
+  coupledFieldsOf(field).map(f => keyOf(f, slot))
 
 /** Run `request` after every earlier chained request for the same slot+field
  *  — or any field it couples with — has settled or timed out. At most one
@@ -437,7 +430,6 @@ export async function performSlotSwitch<F extends SlotSwitchField>(
    *  newest request failed; its `pairSeq` lets a coupled payload drop a member
    *  a newer commit already wrote (see `fieldWrittenAfter`). */
   write: (value: SlotSwitchValueMap[F], recovered?: { pairSeq: number }) => void,
-  extraSettles?: (value: SlotSwitchValueMap[F]) => ReadonlyArray<readonly [SlotSwitchField, unknown]>,
 ): Promise<void> {
   const { pairSeq, fieldSeq } = beginSlotSwitch(field, slot, target)
   // The wire outcome ALWAYS adjudicates, whether or not the caller is still
@@ -450,8 +442,9 @@ export async function performSlotSwitch<F extends SlotSwitchField>(
       // without their own writes: their values ride the primary write above
       // (the call site's payload carries them), while the entry still holds
       // or discards them for the pair's failure path.
-      for (const [member, memberValue] of extraSettles?.(value) ?? []) {
-        recordSettledSuccess(member, slot, pairSeq, memberValue)
+      if (field === 'agent') {
+        const model = (value as AgentSwitchValue).model
+        if (model !== undefined) recordSettledSuccess('model', slot, pairSeq, model)
       }
       return { ok: true as const, value }
     },

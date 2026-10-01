@@ -404,8 +404,7 @@ describe('performSlotSwitch — agent/effort field growth (#5120)', () => {
       (v) => writes.push('mA:' + v))
     const switchAgent = performSlotSwitch('agent', 'slot-clear-race', 'researcher',
       () => new Promise<AgentSwitchValue>(res => { releaseAgent = res }),
-      (v) => writes.push('ag:' + v.agent + '+' + (v.model ?? '∅')),
-      (v) => (v.model !== undefined ? [['model', v.model] as const] : []))
+      (v) => writes.push('ag:' + v.agent + '+' + (v.model ?? '∅')))
     const pickB = performSlotSwitch('model', 'slot-clear-race', 'model-b',
       () => new Promise<string>((_, rej) => { rejectB = rej }),
       (v) => writes.push('mB:' + v))
@@ -435,13 +434,12 @@ describe('performSlotSwitch — agent/effort field growth (#5120)', () => {
         !(recovered && fieldWrittenAfter('model', 'slot-held-model', recovered.pairSeq))
       writes.push('ag:' + v.agent + (keepModel ? '+' + v.model : ''))
     }
-    const settles = (v: AgentSwitchValue) => (v.model !== undefined ? [['model', v.model] as const] : [])
     const agentA = performSlotSwitch('agent', 'slot-held-model', 'agent-a',
-      () => new Promise<AgentSwitchValue>(res => { releaseA = res }), agentWrite, settles)
+      () => new Promise<AgentSwitchValue>(res => { releaseA = res }), agentWrite)
     const pickM = performSlotSwitch('model', 'slot-held-model', 'model-m',
       async () => 'model-m', (v) => writes.push('m:' + v))
     const agentB = performSlotSwitch('agent', 'slot-held-model', 'agent-b',
-      () => new Promise<AgentSwitchValue>((_, rej) => { rejectB = rej }), agentWrite, settles)
+      () => new Promise<AgentSwitchValue>((_, rej) => { rejectB = rej }), agentWrite)
     await new Promise(res => setTimeout(res, 0))
     releaseA({ agent: 'agent-a', model: '' })
     await agentA
