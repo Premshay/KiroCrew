@@ -79,6 +79,22 @@ instead of the row simply disappearing.
 | Notes git subprocess (`md_notebook/git_ops.py`) | A non-zero exit reports git's last 3 stderr lines PLUS the first transport-caused line when one sits outside that tail. git ends every fetch/push failure with the same access-rights boilerplate and prints an SSH diagnosis first, so a tail alone reports a permission problem the operator does not have (a host reachable only via `~/.ssh/config` never resolved at all). The extra line widens what the message reports; it does not decide whether the command failed. |
 | asyncio loop callback | A Windows Proactor reset repeated by its `connection_lost` close callback is warning-only; task-level connection resets and other exceptions remain ERRORs with crash breadcrumbs |
 
+## Code Review Sage consolidation refusal
+
+`consolidate_apply` validates the merge before any catalog write, backup,
+candidate clearing, or audit append. The worker's text must parse as a ruleset;
+it is then redacted, and the redacted text must still parse and must contain no
+repeated `pattern_id(title, scope)` — uniqueness is judged on the text that
+would actually be stored, because redaction can erase the only difference
+between two titles. Any refusal returns `ok: false` and an `error` message;
+duplicate refusal names the colliding titles in `error`, so the caller can merge
+each repeated title and scope into one rule before retrying. If redaction leaves
+no recognizable patterns, the merge is also refused rather than replacing the
+catalog with text that contains no rules. The existing rules and staged
+candidates remain intact.
+Different scopes may carry the same title. This guard does not identify semantic
+near-duplicates or choose between conflicting guidance.
+
 ## Dashboard Error Codes
 
 Dashboard JSON errors include a stable lower-snake `code` alongside advisory
