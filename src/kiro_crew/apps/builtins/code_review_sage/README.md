@@ -22,9 +22,10 @@ If a retry requests different findings while recovering an earlier delivery,
 Sage reports that the earlier delivery was reconciled and the requested selection
 is still pending. Post the remaining selection again to deliver it.
 
-GitHub permits only one pending review per account on a pull request. A legacy
-Sage draft carrying only the generic marker has no exact delivery receipt, so
-Sage cannot automatically delete it. If posting fails with 422, inspect your
+GitHub permits only one pending review per account on a pull request. A draft
+from an earlier run, including a legacy Sage draft with only the generic marker,
+has no delivery receipt in the current run, so Sage cannot automatically delete
+it. If posting fails with 422, inspect your
 pending review in GitHub. Manually delete it there only if you intend to discard
 it, then retry posting in Sage. Human drafts receive the same protection;
 submitted reviews are never deleted by this recovery path.

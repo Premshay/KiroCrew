@@ -88,21 +88,19 @@ class TestRecordContractAtRead(_Base):
 
 class TestAdoption(_Base):
     def test_utf8_stays_within_cap_and_oversize_preserves_files(self):
-        from unittest.mock import patch
-
         record = _record()
         record["title"] = "\u754c" * 400
         source = results.result_path("CR-1", self.root)
         raw = json.dumps(record, indent=2, ensure_ascii=False).encode("utf-8")
         source.write_bytes(raw)
-        with patch.object(results, "_RECORD_MAX_BYTES", len(raw)):
+        with unittest.mock.patch.object(results, "_RECORD_MAX_BYTES", len(raw)):
             self.assertTrue(results.adopt_from_shared("CR-1", self.root, "run-a"))
         destination = results.result_path("CR-1", self.root, "run-a")
         before = destination.read_bytes()
         self.assertLessEqual(len(before), len(raw))
         compact = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         source.write_bytes(compact)
-        with patch.object(results, "_RECORD_MAX_BYTES", len(compact)):
+        with unittest.mock.patch.object(results, "_RECORD_MAX_BYTES", len(compact)):
             self.assertFalse(results.adopt_from_shared("CR-1", self.root, "run-a"))
         self.assertEqual(source.read_bytes(), compact)
         self.assertEqual(destination.read_bytes(), before)

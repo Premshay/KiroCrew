@@ -62,6 +62,7 @@ vi.mock('../api/client', () => ({
     chatSlotReasoningEffort: vi.fn().mockResolvedValue({}),
     chatSlotModel: vi.fn().mockResolvedValue({}),
     chatMode: vi.fn().mockResolvedValue({}),
+    connectInstance: vi.fn().mockResolvedValue({ state: 'connected', local_port: 7778, token: 'tok' }),
     listInstances: vi.fn().mockResolvedValue({ active: true, instances: [crew], warm_set_cap: 5 }),
   },
   isAuthBannerShown: vi.fn(() => false),
