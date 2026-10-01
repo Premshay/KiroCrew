@@ -2703,6 +2703,21 @@ adapter honors the session's MCP overrides even when a global configuration
 contains the same server name. This applies to both create and load; it changes
 configuration precedence, not authentication or the sandbox's credential mask.
 
+The Codex spawn environment also sets `CODEX_SQLITE_HOME`, so concurrent
+`codex app-server` processes (Codex Desktop and each Crew runtime) do not share
+one set of SQLite databases and fail new sessions with `database is locked`. The
+harness names the need (`SpawnPlan.private_state_env`) and the runtime points the
+variable at its own per-process scratch directory -- the one `TMPDIR` already
+names, allocated before the sandbox wrap and reclaimed by
+`agent_scratch.sweep_dead_scratch` once the process is dead -- so no new tree,
+lock or slot exists. Only the databases move: config, auth and the thread
+rollouts stay in `CODEX_HOME`, and a thread resumes from its rollout (measured on
+codex 0.159), so `spawn_continue` works across runtimes; a fresh home rebuilds
+its index on first start, an accepted cost. A value the operator set, or one a
+cron or workflow `extra_env` carries, reaches the child as set. Without a scratch
+directory nothing is set and one warning is logged: the child gets codex's shared
+default rather than a refused spawn.
+
 ### Native adapter compaction lifecycle
 
 Only the Codex and Claude handshakes advertise `session.compaction = {}`
@@ -2720,18 +2735,3 @@ synthesized failure at turn end.
 Legacy tool-marker/text paths remain available for older adapters. No AIR
 capability is advertised, so read, terminal and MCP output contracts remain
 unchanged. Unknown lifecycle statuses and summary chunks are tolerated.
-
-The Codex spawn environment also sets `CODEX_SQLITE_HOME`, so concurrent
-`codex app-server` processes (Codex Desktop and each Crew runtime) do not share
-one set of SQLite databases and fail new sessions with `database is locked`. The
-harness names the need (`SpawnPlan.private_state_env`) and the runtime points the
-variable at its own per-process scratch directory -- the one `TMPDIR` already
-names, allocated before the sandbox wrap and reclaimed by
-`agent_scratch.sweep_dead_scratch` once the process is dead -- so no new tree,
-lock or slot exists. Only the databases move: config, auth and the thread
-rollouts stay in `CODEX_HOME`, and a thread resumes from its rollout (measured on
-codex 0.159), so `spawn_continue` works across runtimes; a fresh home rebuilds
-its index on first start, an accepted cost. A value the operator set, or one a
-cron or workflow `extra_env` carries, reaches the child as set. Without a scratch
-directory nothing is set and one warning is logged: the child gets codex's shared
-default rather than a refused spawn.
