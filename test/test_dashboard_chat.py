@@ -18169,6 +18169,7 @@ class TestStopDuringSessionPrep:
                         client.post(f"/api/chat/slots/{slot.key}/interrupt"), timeout=5
                     )
                     assert response.status == 200
+                    assert (await response.json())["queue_held"] is True
                     assert teardown.is_set()
                     assert slot.task is None
                     assert not turn.done()
@@ -18180,8 +18181,15 @@ class TestStopDuringSessionPrep:
                     dispatched.assert_not_awaited()
                     assert [item["content"] for item in slot._queue] == ["next prompt"]
 
+                    response = await client.post(
+                        f"/api/chat/slots/{slot.key}/interrupt", json={"queue_id": queue_id}
+                    )
+                    assert response.status == 200
+                    assert (await response.json())["queue_held"] is True
+                    dispatched.assert_not_awaited()
                     release_teardown.set()
                     await asyncio.wait_for(turn, timeout=5)
+                    assert slot._stop_teardown_task is None
                     dispatched.assert_not_awaited()
                     response = await client.post(
                         f"/api/chat/slots/{slot.key}/interrupt", json={"queue_id": queue_id}

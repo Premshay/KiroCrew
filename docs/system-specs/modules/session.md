@@ -1529,7 +1529,12 @@ seconds emits a warning for investigation.
 An idle interrupt starts preserved queued work only after the captured runner
 settles and clears `slot.task`, including cancellation before memory admission.
 If teardown exceeds the cancellation deadline, the queue remains available for
-a later explicit retry rather than dispatching over unfinished cleanup. Under the slot
+a later explicit retry rather than dispatching over unfinished cleanup. The response
+sets `queue_held: true`; both chat surfaces show a retry notice and release the
+selected card's pending latch. A runtime-only `_stop_teardown_task` reference
+keeps an early retry from dispatching until cleanup actually completes, even
+when `slot.task` has already cleared. Completion clears that reference by identity.
+Under the slot
 lock, the handler rechecks slot identity, authorizes the current session, and
 withholds dispatch after an authentication failure or a superseding stop.
 

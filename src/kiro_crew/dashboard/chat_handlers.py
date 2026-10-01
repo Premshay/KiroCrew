@@ -5680,6 +5680,15 @@ async def _cancel_terminal_stop_task(
         or task_at_stop.done()
     ):
         return False
+    # Teardown can clear slot.task before it finishes; retain its identity so
+    # an explicit retry cannot dispatch over the timed-out cleanup.
+    slot._stop_teardown_task = task_at_stop
+
+    def clear_teardown(completed: asyncio.Task[Any]) -> None:
+        if slot._stop_teardown_task is completed:
+            slot._stop_teardown_task = None
+
+    task_at_stop.add_done_callback(clear_teardown)
     task_at_stop.cancel()
     try:
         await asyncio.wait_for(asyncio.shield(task_at_stop), timeout=2.0)
@@ -6628,6 +6637,18 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
             )
             if denied is not None:
                 return denied
+            teardown = slot._stop_teardown_task
+            if teardown is not None and not teardown.done():
+                sel().log_tool_invocation(
+                    session_key=_history_key_for(name),
+                    agent=getattr(slot, "agent", "") or "kirocrew",
+                    source="dashboard",
+                    tool_name="dashboard_interrupt",
+                    tool_kind="command",
+                    outcome="queue_held",
+                    metadata={"slot": name, "queue_id": queue_id},
+                )
+                return web.json_response({"ok": True, "queue_held": True})
             started = await _start_next_queued_turn(
                 state,
                 slot,
@@ -6825,8 +6846,11 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         on_soft=_on_soft,
         on_hard=_on_hard,
     )
+    queue_held = False
     if outcome in {"hard", "idle"}:
         await _cancel_terminal_stop_task(slot, task_at_stop)
+        teardown = slot._stop_teardown_task
+        queue_held = teardown is not None and not teardown.done()
     # Resolve orphaned card when provider reports no active turn
     if outcome == "idle":
         if slot._stop_event_id:
@@ -6876,7 +6900,7 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         outcome=outcome,
         metadata={"slot": name, "queue_id": queue_id},
     )
-    return web.json_response({"ok": True, "outcome": outcome})
+    return web.json_response({"ok": True, "outcome": outcome, "queue_held": queue_held})
 
 
 async def api_chat_slot_queue_cancel(request: web.Request) -> web.Response:
