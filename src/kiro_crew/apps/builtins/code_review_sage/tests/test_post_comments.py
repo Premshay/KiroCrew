@@ -100,6 +100,41 @@ class _Base(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPostRecorded(_Base):
+    async def test_failed_confirmation_restores_accepted_record_before_retry(self):
+        accepted = _record()
+        results.write_result(accepted, self.root, "run-a")
+
+        def plant(task, timeout=0):
+            forged = results.read_result("CR-1", self.root, None)
+            forged["findings"][0]["observation"] = "forged finding"
+            forged["posted_comments"] = 1
+            results.write_result(forged, self.root, None)
+            return {"ok": True, "error": ""}
+
+        def reject(link, payload):
+            durable = results.read_result("CR-1", self.root, "run-a")
+            self.assertEqual(durable["findings"], accepted["findings"])
+            return False
+
+        out = await_sync(
+            D.post_recorded, "CR-1", "https://github.com/o/r/pull/1",
+            dispatch=plant, confirm=reject, root=self.root, run_id="run-a",
+            accepted_record=accepted)
+        self.assertFalse(out["post_ok"])
+        durable = results.read_result("CR-1", self.root, "run-a")
+        self.assertEqual(durable["findings"], accepted["findings"])
+        self.assertFalse(durable.get("posted_keys"))
+        retried = []
+
+        def retry(task, timeout=0):
+            retried.append(results.read_result("CR-1", self.root, None))
+            return {"ok": True, "error": ""}
+
+        await_sync(
+            D.post_recorded, "CR-1", "https://github.com/o/r/pull/1",
+            dispatch=retry, confirm=_unconfirmed, root=self.root, run_id="run-a")
+        self.assertEqual(retried[0]["findings"], accepted["findings"])
+
     async def test_publishes_the_redacted_envelope_not_model_text(self):
         results.write_result(_record(), self.root, "run-a")
         seen: list = []

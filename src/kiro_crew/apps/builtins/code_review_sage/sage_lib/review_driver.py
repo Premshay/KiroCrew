@@ -1105,6 +1105,7 @@ def post_recorded(
         }
         after = json.loads(json.dumps(cur))
         after.update(delivery)
+        results.write_result(after, root, run_id)
     ok = bool(spawn.get("ok", False))
     # The poster writes the count it actually delivered. That write is the ONLY
     # evidence of delivery — a spawn that merely returned cleanly proves nothing,
