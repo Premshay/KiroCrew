@@ -24,7 +24,11 @@ const engine = {
   error: null as string | null, level: 0, deviceLabel: '', deviceId: '', clearError: vi.fn(), partial: '',
   download: null, sampleRef: { current: {} }, switchDevice: vi.fn(), deviceSwitchIsLive: false,
 }
-vi.mock('../hooks/useVoiceInput', () => ({ useVoiceInput: () => engine, voiceInputSupported: true }))
+let voiceOptions: { onPartial?: (text: string) => void; onEndpoint?: () => void } = {}
+vi.mock('../hooks/useVoiceInput', () => ({
+  useVoiceInput: (_onText: unknown, options: typeof voiceOptions) => { voiceOptions = options; return engine },
+  voiceInputSupported: true,
+}))
 vi.mock('../hooks/usePushToTalk', () => ({ usePushToTalk: () => undefined }))
 vi.mock('react-virtuoso', () => ({
   Virtuoso: ({ data, itemContent }: { data?: unknown[]; itemContent: (index: number, item: unknown) => ReactNode }) => (
@@ -46,9 +50,10 @@ vi.mock('../api/client', () => ({
     screenshot: vi.fn().mockResolvedValue({ path: null }),
     fileSearch: vi.fn().mockResolvedValue({ root: '/repo', results: [] }),
     chatSlotAgent: vi.fn().mockResolvedValue(undefined),
-    dashboardConfig: vi.fn().mockResolvedValue({ quick_send: false }),
+    dashboardConfig: vi.fn().mockResolvedValue({ quick_send: false, preference_advisor_enabled: true }),
     planAction: vi.fn().mockResolvedValue({ ok: true }),
     sttConfig: vi.fn().mockResolvedValue({ enabled: true, available: true, streaming: false, dictation_panel: true, provider: 'local' }),
+    getPreferenceAdvice: vi.fn().mockResolvedValue({ id: 'advice', current: '', model: 'suggested', reason: 'similar_preferences' }),
   },
   SEARCH_MIN_CHARS: 2,
   ApiError: class ApiError extends Error {
@@ -73,6 +78,7 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatPane from '../components/ChatPane'
+import { api } from '../api/client'
 
 const SLOT = 'chat-1-parity'
 
@@ -90,11 +96,12 @@ function makeStore(slotKey: string) {
   })
 }
 
-async function renderPane() {
+async function renderPane(streaming = false) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   // The STT config is what lets the mic START (an unloaded config opens the
   // setup modal instead); seed it so the press below reaches the engine.
-  qc.setQueryData(['sttConfig'], { enabled: true, available: true, streaming: false, dictation_panel: true, provider: 'local' })
+  qc.setQueryData(['sttConfig'], { enabled: true, available: true, streaming, dictation_panel: true, provider: 'local' })
+  engine.streamEnabled = streaming
   const store = makeStore(SLOT)
   await act(async () => {
     render(
@@ -115,9 +122,46 @@ async function renderPane() {
 
 const mic = () => screen.getByRole('button', { name: 'Voice input' })
 
-beforeEach(() => { localStorage.clear(); engine.start.mockClear() })
+beforeEach(() => {
+  localStorage.clear()
+  engine.recording = false
+  engine.start.mockClear().mockImplementation(async () => { engine.recording = true })
+  engine.stop.mockImplementation(() => { engine.recording = false })
+  vi.mocked(api.sendChat).mockClear()
+  vi.mocked(api.getPreferenceAdvice).mockClear()
+})
 
 describe('ChatPane composer parity (chat-core P3-b): voice through the Composer root', () => {
+  it('disarms a first manual Send before delayed advice can receive another partial', async () => {
+    let resolve!: (value: { reason: string }) => void
+    vi.mocked(api.getPreferenceAdvice).mockImplementationOnce(() => new Promise(r => { resolve = r }))
+    await renderPane(true)
+    const input = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    await act(async () => { fireEvent.click(mic()) })
+    await act(async () => { voiceOptions.onPartial?.('first utterance') })
+    await act(async () => { fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' }) })
+    await waitFor(() => expect(resolve).toBeDefined())
+    await act(async () => { voiceOptions.onPartial?.('late utterance'); resolve({ reason: 'no_examples' }) })
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalled())
+    expect(vi.mocked(api.sendChat).mock.calls[0][0]).toBe('first utterance')
+    expect(input.value).toBe('')
+  })
+
+  it('delivers the first semantic voice endpoint without querying manual advice', async () => {
+    await renderPane(true)
+    const input = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    await act(async () => { fireEvent.click(mic()) })
+    expect(typeof voiceOptions.onEndpoint).toBe('function')
+    await act(async () => { voiceOptions.onPartial?.('classify these rules') })
+    expect(input.value).toBe('classify these rules')
+    await act(async () => { voiceOptions.onEndpoint?.() })
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalled())
+    expect(api.getPreferenceAdvice).not.toHaveBeenCalled()
+    expect(input.value).toBe('')
+    await act(async () => { voiceOptions.onPartial?.('late transcript') })
+    expect(input.value).toBe('')
+  })
+
   it('renders the microphone with no voice props on the pane', async () => {
     await renderPane()
     expect(mic()).toBeTruthy()

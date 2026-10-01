@@ -161,6 +161,8 @@ _CAP_REASONS = {
 #: opt-out, ``"<default>"`` for the shared 64 KB ceiling, or the literal
 #: expression passed for a per-route cap.
 _CAP_REGISTER: dict[str, tuple[str, str]] = {
+    "handlers/preference_advisor.py::api_preference_advice": ("<default>", _BOUNDED_BY_DEFAULT),
+    "handlers/preference_advisor.py::api_preference_feedback": ("<default>", _BOUNDED_CONTROL_FIELDS),
     # Pre-existing capped sites -- the bounded read's live consumers.
     "chat_pins.py::api_chat_pins_create": ("<default>", _BOUNDED_BY_DEFAULT),
     # A checklist tick is one task id and one boolean, so the shared default

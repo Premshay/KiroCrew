@@ -258,6 +258,7 @@ import InboundLinkChip from '../components/InboundLinkChip'
 import ModelEffortDropdown from '../components/ModelEffortDropdown'
 
 import ChatInput from '../components/ChatInput'
+import { usePreferenceAdvisor } from './chat/usePreferenceAdvisor'
 import { useStableCallbackProps } from './chat/useStableCallbackProps'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { promptHistoryFromMessages, samePromptHistory, type PromptHistoryItem } from '../components/composerPromptHistory'
@@ -1097,7 +1098,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Whether the picker may offer `Auto (Jev)` (see `lib/jevRoute.ts`): the fleet's
   // answer AND the owner's keystone consent, both required. Two reads the page
   // already makes for other reasons, so the row costs no new request.
-  const jevDashCfgQ = useQuery<{ decisions_enabled?: boolean }>({
+  const jevDashCfgQ = useQuery<{ decisions_enabled?: boolean; preference_advisor_enabled?: boolean }>({
     queryKey: ['dashboardConfig'],
     queryFn: () => api.dashboardConfig(),
     staleTime: 30_000,
@@ -1133,6 +1134,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     [effectiveModels, hiddenModelIds, slots, activeSlot, jevRouteOn, jevRouteLabel, codexPairModels],
   )
   const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(modelPickerModels)
+  const adviceSlot = slots.find(slot => slot.key === activeSlot)
+  const preferenceAdvisor = usePreferenceAdvisor({
+    enabled: jevDashCfgQ.data?.preference_advisor_enabled === true,
+    slot: activeSlot,
+    model: adviceSlot?.model || '',
+    eligible: !!adviceSlot && !adviceSlot.messages && !adviceSlot.running && !remoteCrew.isRemote && (adviceSlot.memory_mode ?? 'persistent') === 'persistent',
+    models: modelPickerModels.map(model => model.name),
+    readDraft: composerDraft.get,
+    subscribeDraft: composerDraft.subscribe,
+    applyModel: model => switchModel(model, true),
+    openModelPicker: trigger => { anchorModelBtn(trigger.getBoundingClientRect(), trigger); setModelDropdown(true) },
+  })
   // Whether the composer held focus when the picker was opened from its chip
   // (ChatInput reads this before the press moves focus). A pick closes the
   // picker, which unmounts the focused row and would otherwise drop focus on
@@ -2722,7 +2735,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // intercepted locally, transport error, refused). UI reactions all stay
   // inside send(); the verdict exists for callers that persist state only on
   // delivery (ArtifactPanel's submit-to-chat batch marks comments sent on it).
-  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean, isolated = false): Promise<boolean> => {
+  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean, isolated = false, origin: 'manual' | 'voice' = 'manual'): Promise<boolean> => {
     // Defense-in-depth: ChatInput already gates Send/Optimize buttons and
     // the keyboard Enter shortcut on `connected`, but a future caller (a
     // programmatic dispatch from a hotkey, a follow-up option click, an
@@ -2736,7 +2749,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const widgetOrigin = !isolated && !!widgetPrefillRef.current && raw.includes(widgetPrefillRef.current)
     if (!isolated) widgetPrefillRef.current = null
     if (!raw && (isolated || (!pendingFilesRef.current.length && !pendingSessionsRef.current.length))) return false
-
     // Sending while STREAMING dictation is live ends the dictation (see
     // `useComposerVoice.disarmForSend` for the full rationale — streaming only,
     // batch keeps capturing and lands its transcript when the user stops).
@@ -2771,6 +2783,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // the POST is in flight does not inherit this send's age.
     const folderCardAtSend =
       !isolated && entrySendSlot && entrySendSlot === uiSlot ? store.getState().chat.folderSuggestions?.[entrySendSlot] : undefined
+
+    if (origin === 'manual' && !isolated && !optionText && !targetSlot && !pendingFilesRef.current.length && !pendingSessionsRef.current.length && !pasteBlocksRef.current.length) {
+      const snapshot = { slot: uiSlot, files: pendingFilesRef.current, sessions: pendingSessionsRef.current, pastes: pasteBlocksRef.current }
+      const advice = preferenceAdvisor.beforeSend(raw)
+      if (!(typeof advice === 'boolean' ? advice : await advice)) return false
+      if (activeSlotRef.current !== snapshot.slot || inputRef.current.trim() !== raw ||
+        pendingFilesRef.current !== snapshot.files || pendingSessionsRef.current !== snapshot.sessions ||
+        pasteBlocksRef.current !== snapshot.pastes) return false
+    }
 
     // Slash command interception (e.g. /side): runs before knowledge so a
     // bare prefix like /side returns immediately without touching input parse.
@@ -3406,7 +3427,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Keep sendRef current so the streaming endpointer's auto-submit callback
   // (wired into the voice hook above, before send is declared) always invokes
   // the latest send(). Assigned in render like inputRef.current = input above.
-  sendRef.current = send
+  sendRef.current = (text, slot) => { void send(text, slot, undefined, false, 'voice') }
   const submitComments = useCallback((message: string) => {
     // Defense-in-depth: the panels' submit buttons are gated on `connected`,
     // but bail here too so an offline call can't switch the active session
@@ -3490,7 +3511,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // a fresh array on every agents refetch, so naming it would rebuild the
     // callback — and every picker holding it — for no behavioral gain.
   }, [activeSlot, dispatch, setPendingAgent, setPendingModel])
-  const switchModel = useCallback(async (modelName: string) => {
+  const switchModel = useCallback(async (modelName: string, adviser = false) => {
     // 'auto' is stored VERBATIM, not collapsed to ''. Both resolve to the same
     // provider behaviour server-side, but '' is also the "never chosen" state,
     // and every reader of an empty model re-resolves it to the agent template's
@@ -3509,6 +3530,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       setPendingModel(modelName)
       return
     }
+    const finishAdvicePick = adviser ? undefined : preferenceAdvisor.beginModelPick(modelName)
+    let appliedModel: string | undefined
     try {
       const slotState = store.getState().dashboard.slots.find(s => s.key === activeSlot)
       // A staged slider pick or a legacy pair level is carried; an effort
@@ -3560,14 +3583,21 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           // `model`: the gateway resolves the sentinel to `auto`, so the stored
           // model cannot tell a routed pick from a plain Auto one. Written on
           // every pick, because picking a concrete model is what clears it.
-          (value) => dispatch(updateSlot({
+          (value) => {
+            appliedModel = value
+            dispatch(updateSlot({
             key: activeSlot,
             model: value,
             jev_route: modelName === JEV_ROUTE_MODEL,
-          })))
+          }))
+          })
       }, () => inFlightSlotSwitchOutcome('reasoning_effort', activeSlot))
       queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', activeSlot] })
+      finishAdvicePick?.(appliedModel)
+      return appliedModel
     } catch (e) {
+      finishAdvicePick?.()
+      if (adviser) throw e
       // Same failure surface as the agent switch beside this: the shared
       // notice toast, preferring the server's own message. The chip keeps
       // showing what is actually running either way.
@@ -3581,7 +3611,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // notice toast above, never by a menu left open. Reasoning-effort edits
     // live on the drill-in page and keep the menu open on their own.
     // setPendingModel is a stable useState setter.
-  }, [activeSlot, codexPairModels, dispatch, queryClient, setPendingModel])
+  }, [activeSlot, codexPairModels, dispatch, queryClient, setPendingModel, preferenceAdvisor.beginModelPick])
   // A pick from the picker: a row click or Enter on the sole filtered match.
   // Closes the menu and, when the composer held focus at open time, hands
   // focus back to it (see `modelPickerReturnsFocusRef`). The picker's other
@@ -9304,6 +9334,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   />
                 </div>
               )}
+              {preferenceAdvisor.card}
               {showComposerMemoryChip && (
                 // No backdrop: the chip is glass and whatever scrolls under it is meant to show.
                 // `w-fit`, not a full-width flex row: the box is a `dock-inert` child, so

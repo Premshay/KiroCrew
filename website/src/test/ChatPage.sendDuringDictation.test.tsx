@@ -14,6 +14,8 @@ import chatReducer from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import type { RootState } from '../store'
+import { store as liveStore } from '../store'
+import { setQuestionCard, clearQuestionCard, setFolderSuggestion, clearFolderSuggestion } from '../store/chatSlice'
 
 vi.mock('react-virtuoso', () => ({ Virtuoso: ({ data, itemContent }: { data?: unknown[]; itemContent: (i: number, d: unknown) => React.ReactNode }) => <div data-testid="virtuoso">{data?.map((d: unknown, i: number) => <div key={i}>{itemContent(i, d)}</div>)}</div> }))
 vi.mock('../api/client', () => ({
@@ -31,6 +33,9 @@ vi.mock('../api/client', () => ({
     uploadFiles: vi.fn().mockResolvedValue({ paths: [] }),
     screenshot: vi.fn().mockResolvedValue({ path: null }),
     sttConfig: vi.fn(),
+    getPreferenceAdvice: vi.fn().mockResolvedValue({ id: 'advice', current: '', model: 'suggested', reason: 'similar_preferences' }),
+    dashboardConfig: vi.fn().mockResolvedValue({ preference_advisor_enabled: true }),
+    answerQuestion: vi.fn().mockResolvedValue({ ok: true }),
   },
   SEARCH_MIN_CHARS: 2,
 }))
@@ -116,7 +121,7 @@ import { api } from '../api/client'
 import { savePttConfig } from '../lib/pushToTalk'
 import { DRAFTS_KEY } from '../utils/chatDrafts'
 
-function makeStore(activeSlot: string, slots: { key: string; mode?: string }[], running = false) {
+function makeStore(activeSlot: string, slots: { key: string; mode?: string }[], running = false, messages = 1) {
   return configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
     preloadedState: {
@@ -127,7 +132,7 @@ function makeStore(activeSlot: string, slots: { key: string; mode?: string }[], 
         // widget event, question card), so without this seed send() bails before
         // api.sendChat is invoked. dashboardSlice initial state defaults connected
         // to false (= fresh page load before WS handshake).
-        status: null, connected: true, slots: slots.map(s => ({ key: s.key, messages: 1, running, mode: s.mode || '', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined })),
+        status: null, connected: true, slots: slots.map(s => ({ key: s.key, messages, running, mode: s.mode || '', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined })),
         unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
         subagentRunning: {}, subagentDetails: {}, subagentText: {},
       } as unknown as RootState['dashboard'],
@@ -166,9 +171,75 @@ beforeEach(() => {
   sessionStorage.clear()
   localStorage.clear()
   vi.mocked(api.sendChat).mockClear()
+  vi.mocked(api.getPreferenceAdvice).mockClear()
 })
 
 describe('ChatPage — sending while dictating', () => {
+  it.each([false, true])('preserves questions and folder cards arriving during advice (replacement=%s)', async replacement => {
+    let resolve!: (value: { reason: string }) => void
+    vi.mocked(api.answerQuestion).mockClear()
+    liveStore.dispatch(clearQuestionCard('chat-main'))
+    liveStore.dispatch(clearFolderSuggestion({ slot: 'chat-main' }))
+    if (replacement) liveStore.dispatch(setQuestionCard({ slot: 'chat-main', ask_id: 'original', questions: [{ question: 'Original?', options: [] }] }))
+    vi.mocked(api.getPreferenceAdvice).mockImplementationOnce(() => new Promise(r => { resolve = r }))
+    vi.mocked(api.chatSlotDetail).mockResolvedValueOnce({ messages: [], running: false, has_more: false, total: 0 })
+    const localStore = makeStore('chat-main', [{ key: 'chat-main' }], false, 0)
+    await renderAndWaitForInput(localStore)
+    const input = screen.getByLabelText('Message input')
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'draft task' } })
+      fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' })
+    })
+    await waitFor(() => expect(resolve).toBeDefined())
+    const question = setQuestionCard({ slot: 'chat-main', ask_id: 'new-unseen', questions: [{ question: 'New?', options: [] }] })
+    const folder = setFolderSuggestion({ slot: 'chat-main', folderId: 'new', folderName: 'New', breadcrumb: 'New', ts: 123 })
+    await act(async () => {
+      liveStore.dispatch(question); localStore.dispatch(question)
+      liveStore.dispatch(folder); localStore.dispatch(folder)
+      resolve({ reason: 'keep_current' })
+    })
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalled())
+    expect(api.answerQuestion).not.toHaveBeenCalledWith('new-unseen')
+    if (replacement) await waitFor(() => expect(api.answerQuestion).toHaveBeenCalledWith('original'))
+    expect(localStore.getState().chat.pendingQuestions['chat-main']?.ask_id).toBe('new-unseen')
+    expect(localStore.getState().chat.folderSuggestions['chat-main']?.turns).toBe(0)
+    liveStore.dispatch(clearQuestionCard('chat-main'))
+    liveStore.dispatch(clearFolderSuggestion({ slot: 'chat-main' }))
+  })
+
+  it('disarms a first manual Send before delayed advice can receive another partial', async () => {
+    let resolve!: (value: { reason: string }) => void
+    vi.mocked(api.getPreferenceAdvice).mockImplementationOnce(() => new Promise(r => { resolve = r }))
+    vi.mocked(api.chatSlotDetail).mockResolvedValueOnce({ messages: [], running: false, has_more: false, total: 0 })
+    await renderAndWaitForInput(makeStore('chat-main', [{ key: 'chat-main' }], false, 0))
+    const input = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /voice input/i })) })
+    await act(async () => { voice.onPartial?.('first utterance') })
+    await act(async () => { fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' }) })
+    await waitFor(() => expect(resolve).toBeDefined())
+    await act(async () => { voice.onPartial?.('late utterance'); resolve({ reason: 'no_examples' }) })
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalled())
+    expect(vi.mocked(api.sendChat).mock.calls[0][0]).toBe('first utterance')
+    expect(input.value).toBe('')
+  })
+
+  it('delivers the first semantic voice endpoint without querying manual advice', async () => {
+    vi.mocked(api.chatSlotDetail).mockResolvedValueOnce({ messages: [], running: false, has_more: false, total: 0 })
+    const store = makeStore('chat-main', [{ key: 'chat-main' }], false, 0)
+    await renderAndWaitForInput(store)
+    const input = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /voice input/i })) })
+    expect(typeof voice.onEndpoint).toBe('function')
+    await act(async () => { voice.onPartial?.('classify these rules') })
+    expect(input.value).toBe('classify these rules')
+    await act(async () => { voice.onEndpoint?.() })
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalled())
+    expect(api.getPreferenceAdvice).not.toHaveBeenCalled()
+    expect(input.value).toBe('')
+    await act(async () => { voice.onPartial?.('late transcript') })
+    expect(input.value).toBe('')
+  })
+
   const setStt = (streaming: boolean) => vi.mocked(api.sttConfig).mockResolvedValue({
     enabled: true, streaming, dictation_panel: true,
     provider: streaming ? 'transcribe' : 'whisper', available: true,

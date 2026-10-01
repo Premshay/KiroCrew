@@ -1,4 +1,16 @@
 {
+  "preference_advisor": {
+    "timeout": "O tempo da recomendação esgotou. Continue sem recomendação ou tente novamente.",
+    "loading": "Verificando suas preferências de tarefa…",
+    "recommend": "Sugestão para esta tarefa: {{model}}",
+    "reason": "Com base em {{examples}} preferências semelhantes revisadas. É uma sugestão, não uma garantia de capacidade.",
+    "use": "Usar sugestão",
+    "keep": "Manter atual",
+    "choose": "Escolher outro",
+    "draft": "Seu rascunho foi mantido. Após escolher, pressione Enviar para começar.",
+    "skip": "Continuar sem sugestão",
+    "saved": "Preferência salva. Pressione Enviar quando estiver pronto."
+  },
   "commandCenter": {
     "automatic_cards": "Cartões automáticos para todas as sessões",
     "card_limits": "Desativados por padrão. O modelo em segundo plano faz uma chamada por vez. No máximo uma tentativa por sessão a cada {{minutes}} minutos e {{hourly}} tentativas por hora compartilhadas por todas as sessões, incluindo falhas. O estado em tempo real e as decisões não usam o modelo.",
