@@ -36,6 +36,7 @@ class _FakeSlot:
         #: nobody owns is cancellable by the dashboard caller.
         self._app = None
         self._active_turn_session_key = ""
+        self._stop_teardown_task = None
         #: Runtime-only runner bookkeeping, mirrors ``_ChatSlot``: which task the
         #: slot currently runs, and whether that task is still preparing.
         self.task = None
