@@ -234,7 +234,8 @@ def _load_runs() -> None:
         data = json.loads(f.read_text(encoding="utf-8"))
         if not isinstance(data, list):
             return
-        for r in data:
+        _RUNS = data[:_RUNS_MAX]
+        for r in _RUNS:
             if not isinstance(r, dict):
                 continue
             if r.get("status") == "running":
@@ -248,7 +249,6 @@ def _load_runs() -> None:
                 r["posting"] = False
                 r["post_error"] = ("Posting was interrupted by a gateway restart; "
                                    "reconcile before posting again.")
-        _RUNS = data[:_RUNS_MAX]
     except Exception:  # pragma: no cover - defensive
         logger.warning("failed to load runs.json", exc_info=True)
 
@@ -1109,11 +1109,13 @@ async def _post_comments_bg(run_id: str, run: dict,
     is what keeps LLM free-text out of the pull request. Nothing here composes
     comment text.
     """
+    pool_started = False
     try:
         loop = asyncio.get_running_loop()
         pool = review_pool.get_pool()
         dispatch = review_pool.make_sync_dispatch(loop, pool)
         await pool.begin_batch()
+        pool_started = True
         try:
             results_out = []
             for i, link in enumerate(run.get("changes") or []):
@@ -1180,12 +1182,14 @@ async def _post_comments_bg(run_id: str, run: dict,
         await asyncio.to_thread(_record_reviewed, run)
         await _notify_posted(run, posted, bool(failed))
     except (OSError, ValueError) as exc:
-        logger.exception("posting delivery intent persistence failed")
+        logger.exception("posting delivery intent persistence failed" if pool_started
+                         else "posting runtime startup failed")
         async with _LOCK:
             run["posting"] = False
             run["post_error"] = (
                 "posting durability state could not be persisted; reconcile the "
-                f"pull request before posting again: {exc}")
+                f"pull request before posting again: {exc}"
+                if pool_started else f"posting runtime could not start; check the reviewer runtime: {exc}")
             await _save_runs()
         raise
     except Exception as e:

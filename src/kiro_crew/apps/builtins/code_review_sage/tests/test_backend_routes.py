@@ -1099,6 +1099,21 @@ class TestRestartClearsAStrandedPostingFlag(unittest.TestCase):
         listing.assert_not_called()
         self.assertEqual(self.routes._POSTING_RECOVERY_IDS, ["r4"])
 
+    def test_restart_recovery_only_visits_retained_runs(self):
+        path = self._write_runs([
+            {"run_id": "kept", "status": "done", "posting": True},
+            {"run_id": "retired", "status": "done", "posting": True},
+        ])
+        with (
+            unittest.mock.patch.object(self.routes, "_runs_file", lambda: path),
+            unittest.mock.patch.object(self.routes, "_RUNS_MAX", 1),
+            unittest.mock.patch.object(self.routes, "_mark_restart_delivery_indeterminate") as mark,
+        ):
+            self.routes._load_runs()
+            self.routes._recover_interrupted_posting()
+        self.assertEqual(self.routes._POSTING_RECOVERY_IDS, ["kept"])
+        mark.assert_called_once_with("kept")
+
     def test_restart_recovery_marks_an_attempting_delivery_indeterminate(self):
         path = self._write_runs([{"run_id": "r4", "status": "done", "posting": True}])
         record = {

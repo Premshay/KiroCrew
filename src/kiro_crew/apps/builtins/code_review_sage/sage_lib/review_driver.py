@@ -567,7 +567,8 @@ def build_post_task(
         "object (fields: body, comments[], optional commit_id). It was assembled "
         "AND redacted in Python — use it EXACTLY as given; do NOT rebuild it. Parse "
         "<owner>/<repo>/<number> from the PR URL. Add this exact hidden HTML comment "
-        "to the END of the outbound `body` in the TEMP JSON only: `"
+        "on its own final line, preceded by a newline, at the END of the outbound "
+        "`body` in the TEMP JSON only: `"
         + _operation_marker(operation_id)
         + "`. Do not write the marker back to the "
         "result record or alter any other payload content.\n"
@@ -746,6 +747,7 @@ class DeliveryProbe(str, Enum):
 
     FOUND = "FOUND"
     ABSENT = "ABSENT"
+    PREDECESSOR_SUBMITTED = "PREDECESSOR_SUBMITTED"
     UNKNOWN = "UNKNOWN"
     CONFLICT = "CONFLICT"
 
@@ -1029,7 +1031,8 @@ def _probe_delivery(link: str, intent: dict, payload: dict) -> tuple[DeliveryPro
         return DeliveryProbe.CONFLICT, "", "multiple reviews match the operation marker"
     found_id = ""
     predecessor_seen = False
-    for review in reviews:
+    predecessor_submitted = False
+    for review in sorted(reviews, key=lambda r: marker not in str(r.get("body") or "")):
         review_id = str(review.get("id") or "")
         body = str(review.get("body") or "")
         pinned = None
@@ -1082,9 +1085,11 @@ def _probe_delivery(link: str, intent: dict, payload: dict) -> tuple[DeliveryPro
                 )
             found_id = review_id
             continue
-        if str(review.get("state") or "") != "PENDING":
+        if found_id and str(review.get("state") or "") != "PENDING":
             continue
-        if review_id == predecessor_id and predecessor_marker in body:
+        if review_id == predecessor_id:
+            if predecessor_marker not in body:
+                return DeliveryProbe.CONFLICT, "", "known predecessor no longer has its marker"
             try:
                 comments = discovery.run_gh_json(
                     f"repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/comments",
@@ -1109,6 +1114,22 @@ def _probe_delivery(link: str, intent: dict, payload: dict) -> tuple[DeliveryPro
                     "",
                     "known predecessor no longer matches its recorded payload",
                 )
+            if str(review.get("state") or "") != "PENDING":
+                login = _authenticated_login(host=host)
+                if login is None:
+                    return DeliveryProbe.UNKNOWN, "", "could not confirm the predecessor account"
+                author = str((review.get("user") or {}).get("login") or "")
+                if author.casefold() != login.casefold():
+                    return DeliveryProbe.CONFLICT, "", "predecessor was posted by another account"
+                if str(review.get("state") or "") not in {
+                    "COMMENTED",
+                    "APPROVED",
+                    "CHANGES_REQUESTED",
+                    "DISMISSED",
+                }:
+                    return DeliveryProbe.UNKNOWN, "", "could not confirm the predecessor state"
+                predecessor_submitted = True
+                continue
             # The verified content rides to the poster, which re-reads the
             # review and compares it to this immediately before any DELETE: a
             # human can edit the pending draft between this probe and that call.
@@ -1136,13 +1157,9 @@ def _probe_delivery(link: str, intent: dict, payload: dict) -> tuple[DeliveryPro
         if predecessor_seen:
             return DeliveryProbe.CONFLICT, "", "multiple pending drafts block confirmation"
         return DeliveryProbe.FOUND, found_id, ""
+    if predecessor_submitted:
+        return DeliveryProbe.PREDECESSOR_SUBMITTED, predecessor_id, ""
     if predecessor and not predecessor_seen:
-        # The predecessor is not a matching pending draft. Deleted and
-        # submitted (or otherwise out of the draft state) get the same answer:
-        # gone. Answering CONFLICT for the submitted case would strand the
-        # operation permanently — no retry can un-submit a review — while a
-        # duplicate posted draft is visible on the PR and a human can remove
-        # it. A blocked pipeline has no such remedy.
         intent.pop("predecessor", None)
     return DeliveryProbe.ABSENT, "", ""
 
@@ -1205,6 +1222,7 @@ def post_recorded(
         target = str(link or "")
 
     reconciled_absent = False
+    submitted_predecessor = False
     previous = cur.get("delivery_intent")
     if isinstance(previous, dict) and previous.get("state") in {
         "prepared",
@@ -1254,7 +1272,7 @@ def post_recorded(
                 "posted_keys": cur["posted_keys"],
                 "posted_review_id": review_id,
             }
-        if probe is not DeliveryProbe.ABSENT:
+        if probe not in {DeliveryProbe.ABSENT, DeliveryProbe.PREDECESSOR_SUBMITTED}:
             _write_intent(cur, previous, "indeterminate", root=root, run_id=run_id, error=error)
             return {
                 "post_ok": False,
@@ -1267,6 +1285,7 @@ def post_recorded(
             }
         _write_intent(cur, previous, "prepared", root=root, run_id=run_id)
         intent = previous
+        submitted_predecessor = probe is DeliveryProbe.PREDECESSOR_SUBMITTED
         reconciled_absent = True
     else:
         if not new:
@@ -1303,13 +1322,15 @@ def post_recorded(
                     "operation_id": previous_operation_id,
                     "payload_digest": str(previous.get("payload_digest") or ""),
                 }
-        # A replacement re-posts what the predecessor carried (`already`)
+        # A replacement re-posts only what the predecessor carried;
         # because it deletes that pending draft first. A predecessor a human
         # has since SUBMITTED is delivered, not a draft: it is not deleted, so
         # re-posting its findings would duplicate them. Settled before the
         # payload is built, because the payload's digest is the operation's
         # identity. Unknown state refuses rather than guesses.
-        replaces = already
+        replaces = (
+            {str(key) for key in previous.get("selected_keys") or []} if predecessor else set()
+        )
         if predecessor:
             submitted = _predecessor_submitted(link, predecessor)
             if submitted is None:
@@ -1329,7 +1350,8 @@ def post_recorded(
             if submitted:
                 predecessor = None
                 replaces = set()
-        pending = [entry for entry in all_entries if str(entry.get("key")) in (wanted | replaces)]
+        selected = {str(entry.get("key")) for entry in new} | replaces
+        pending = [entry for entry in all_entries if str(entry.get("key")) in selected]
         cur["pending_comments"] = pending
         try:
             cur["github_review_payload"] = pipeline.build_github_review_payload(cur)
@@ -1378,7 +1400,8 @@ def post_recorded(
         }
     if confirm is None and not reconciled_absent:
         probe, _review_id, error = _probe_delivery(link, intent, wire)
-        if probe is not DeliveryProbe.ABSENT:
+        submitted_predecessor = probe is DeliveryProbe.PREDECESSOR_SUBMITTED
+        if probe not in {DeliveryProbe.ABSENT, DeliveryProbe.PREDECESSOR_SUBMITTED}:
             message = error or "delivery intent is already present on GitHub"
             _write_intent(cur, intent, "indeterminate", root=root, run_id=run_id, error=message)
             return {
@@ -1390,6 +1413,41 @@ def post_recorded(
                 "expected_units": int(intent.get("selected_units") or 0),
                 "posted_keys": sorted(already),
             }
+    if submitted_predecessor:
+        try:
+            # Rebuild from the saved selection, never a retry's new selection.
+            # Its digest must still prove the entry-to-payload correspondence.
+            rebuilt = pipeline.build_github_review_payload(cur)
+            if _payload_digest(rebuilt) != intent["payload_digest"]:
+                raise ValueError("saved selection no longer matches the prepared delivery")
+            remaining = [entry for entry in pending if str(entry.get("key")) not in already]
+            replacement = dict(cur, pending_comments=remaining)
+            payload = pipeline.build_github_review_payload(replacement)
+        except ValueError as exc:
+            error = f"could not reconcile submitted predecessor: {exc}"
+            _write_intent(cur, intent, "indeterminate", root=root, run_id=run_id, error=error)
+            return {
+                "post_ok": False,
+                "post_error": error,
+                "posted_comments": 0,
+                "design_comment_posted": False,
+                "pending": len(pending),
+                "expected_units": int(intent.get("selected_units") or 0),
+                "posted_keys": sorted(already),
+            }
+        pending = remaining
+        cur["pending_comments"] = pending
+        cur["github_review_payload"] = payload
+        intent = {
+            "operation_id": uuid4().hex,
+            "target": intent["target"],
+            "revision": intent["revision"],
+            "payload_digest": _payload_digest(payload),
+            "selected_keys": sorted(str(entry["key"]) for entry in pending),
+            "selected_units": pipeline.review_payload_units(payload),
+        }
+        _write_intent(cur, intent, "prepared", root=root, run_id=run_id)
+        wire = _outbound_payload(payload, intent["operation_id"])
     if run_id and not results.publish_to_shared(change_id, root, run_id):
         error = "could not stage the prepared delivery intent for the poster"
         _write_intent(cur, intent, "indeterminate", root=root, run_id=run_id, error=error)

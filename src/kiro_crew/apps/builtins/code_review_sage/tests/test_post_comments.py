@@ -91,6 +91,23 @@ class _Base(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPostRecorded(_Base):
+    async def test_runtime_start_failure_does_not_report_a_durability_failure(self):
+        run: dict = {"run_id": "run-a", "posting": True, "changes": []}
+        pool = unittest.mock.Mock()
+        pool.begin_batch = unittest.mock.AsyncMock(side_effect=OSError("missing executable"))
+        with (
+            unittest.mock.patch.object(routes.review_pool, "get_pool", return_value=pool),
+            unittest.mock.patch.object(routes.review_pool, "make_sync_dispatch"),
+            unittest.mock.patch.object(routes, "_save_runs", new=unittest.mock.AsyncMock()),
+            unittest.mock.patch.object(routes, "_release_claims"),
+        ):
+            with self.assertRaisesRegex(OSError, "missing executable"):
+                await routes._post_comments_bg("run-a", run)
+        self.assertFalse(run["posting"])
+        self.assertIn("runtime could not start", run["post_error"])
+        self.assertNotIn("durability", run["post_error"])
+        pool.end_batch.assert_not_called()
+
     async def test_publishes_the_redacted_envelope_not_model_text(self):
         results.write_result(_record(), self.root, "run-a")
         seen: list = []
@@ -323,6 +340,19 @@ class TestSelectivePosting(_Base):
         self.assertEqual(seen[0][0], 1, "the submitted draft's finding was re-posted")
         self.assertIn("Do NOT delete", seen[0][1])
         self.assertEqual(sorted(out["posted_keys"]), ["finding:0", "finding:1"])
+
+    async def test_later_replacements_do_not_reintroduce_submitted_findings(self):
+        results.write_result(_record(), self.root, "run-a")
+        for index, submitted in ((0, False), (1, True), (2, False)):
+            self.predecessor_submitted.return_value = submitted
+            D.post_recorded(
+                "CR-1", "https://github.com/o/r/pull/1",
+                dispatch=self._poster(), confirm=_confirmed,
+                root=self.root, run_id="run-a", keys=[f"finding:{index}"],
+            )
+        saved = results.read_result("CR-1", self.root, "run-a")
+        self.assertEqual(saved["posted_keys"], ["finding:0", "finding:1", "finding:2"])
+        self.assertEqual(saved["delivery_intent"]["selected_keys"], ["finding:1", "finding:2"])
 
     async def test_an_unreadable_predecessor_refuses_rather_than_guessing(self):
         results.write_result(_record(), self.root, "run-a")
@@ -1855,28 +1885,106 @@ class TestDeliveryOutbox(_Base):
             status, review_id, error = D._probe_delivery(self.LINK, intent, wire)
         self.assertEqual((status, review_id, error), (D.DeliveryProbe.ABSENT, "", ""))
 
-    def test_a_predecessor_that_left_the_draft_state_is_treated_as_gone(self):
-        """Submitted, not deleted, gets the deleted answer: the intent drops the
-        predecessor and re-dispatches. A duplicate is visible on the PR and
-        removable; a stranded CONFLICT has no remedy at all."""
-        payload = {"body": "summary", "commit_id": "head", "comments": []}
-        operation_id = "4" * 32
-        wire = D._outbound_payload(payload, operation_id)
-        intent = {"operation_id": operation_id, "target": self.LINK,
-                  "revision": "head", "payload_digest": D._payload_digest(wire),
-                  "predecessor": {"operation_id": "5" * 32, "review_id": "99",
-                                  "payload_digest": "sha256:whatever"}}
+    def test_submitted_predecessor_reconciles_before_replacement_dispatch(self):
+        for scenario in ("retry", "prepared", "indeterminate", "fresh-race", "found",
+                         "foreign", "unreadable", "no-login", "unknown-state",
+                         "edited", "missing-marker", "changed-selection"):
+            with self.subTest(scenario=scenario):
+                record = _record()
+                entries = D.pipeline.build_pending_comments(record)
+                old_entries = [e for e in entries if e["key"] == "finding:0"]
+                union = [e for e in entries if e["key"] in {"finding:0", "finding:1"}]
+                old_payload = D.pipeline.build_github_review_payload(
+                    dict(record, pending_comments=old_entries))
+                old_wire = D._outbound_payload(old_payload, "a" * 32)
+                payload = D.pipeline.build_github_review_payload(dict(record, pending_comments=union))
+                wire = D._outbound_payload(payload, "b" * 32)
+                predecessor = {"review_id": "99", "operation_id": "a" * 32,
+                               "payload_digest": D._payload_digest(old_wire)}
+                record.update(pending_comments=union, github_review_payload=payload,
+                              posted_keys=["finding:0"], posted_review_id="99")
+                record["delivery_intent"] = {
+                    "operation_id": "b" * 32, "target": self.LINK, "revision": "1",
+                    "payload_digest": D._payload_digest(wire), "state": "attempting",
+                    "selected_keys": ["finding:0", "finding:1"], "selected_units": 2,
+                    "predecessor": predecessor,
+                }
+                if scenario in {"prepared", "indeterminate"}:
+                    record["delivery_intent"]["state"] = scenario
+                if scenario == "fresh-race":
+                    record.update(pending_comments=old_entries, github_review_payload=old_payload)
+                    record["delivery_intent"] = {
+                        **predecessor, "state": "confirmed", "selected_keys": ["finding:0"],
+                        "selected_units": 1, "target": self.LINK, "revision": "1",
+                    }
+                if scenario == "changed-selection":
+                    record["pending_comments"][1]["body"] += "edited locally"
+                results.write_result(record, self.root, "run-a")
+                submitted = {"id": "99", "state": "COMMENTED", "commit_id": "1",
+                             "body": old_wire["body"], "user": {"login": "sage"}}
+                if scenario == "unknown-state":
+                    submitted["state"] = ""
+                if scenario == "foreign":
+                    submitted["user"] = {"login": "someone-else"}
+                if scenario == "edited":
+                    submitted["body"] += "edited remotely"
+                if scenario == "missing-marker":
+                    submitted["body"] = "marker removed"
+                dispatched = []
 
-        def github(path, jq=None, *, paginate=False, host=None):
-            if path.endswith("/reviews"):
-                return [{"id": "99", "state": "COMMENTED", "commit_id": "head",
-                         "user": {"login": "sage-bot"}, "body": "submitted already"}]
-            return []
+                def github(path, **kwargs):
+                    if path.endswith("/reviews"):
+                        reviews = [submitted]
+                        if scenario == "found":
+                            reviews.append({"id": "100", "state": "PENDING", "commit_id": "1",
+                                            "body": wire["body"], "user": {"login": "sage"}})
+                        return reviews
+                    if path.endswith("/99/comments"):
+                        if scenario == "unreadable":
+                            raise OSError("GitHub unavailable")
+                        return old_wire["comments"]
+                    if path.endswith("/100/comments"):
+                        return wire["comments"]
+                    raise AssertionError(path)
 
-        with unittest.mock.patch.object(D.discovery, "run_gh_json", github):
-            status, _review_id, error = D._probe_delivery(self.LINK, intent, wire)
-        self.assertEqual((status, error), (D.DeliveryProbe.ABSENT, ""))
-        self.assertNotIn("predecessor", intent)
+                def dispatch(task, timeout):
+                    dispatched.append(results.read_result("CR-1", self.root, "run-a"))
+                    self.assertNotIn("reviews/99", task)
+                    return {"ok": True}
+
+                with (
+                    unittest.mock.patch.object(D.discovery, "run_gh_json", github),
+                    unittest.mock.patch.object(D, "_pull_revisions", return_value=("1", "base")),
+                    unittest.mock.patch.object(D, "_authenticated_login",
+                                               return_value=None if scenario == "no-login" else "sage"),
+                    unittest.mock.patch.object(D, "_predecessor_submitted", return_value=False),
+                ):
+                    out = D.post_recorded(
+                        "CR-1", self.LINK,
+                        keys=["finding:1"] if scenario == "fresh-race" else ["finding:2"],
+                        dispatch=dispatch, root=self.root, run_id="run-a",
+                        confirm=(lambda *a: "100") if scenario != "fresh-race" else None)
+                if scenario in {"foreign", "unreadable", "edited", "missing-marker",
+                                "changed-selection", "no-login", "unknown-state"}:
+                    self.assertFalse(out["post_ok"])
+                    self.assertFalse(dispatched)
+                    saved = results.read_result("CR-1", self.root, "run-a")
+                    self.assertEqual(saved["github_review_payload"], payload)
+                    self.assertEqual(saved["delivery_intent"]["operation_id"], "b" * 32)
+                elif scenario == "found":
+                    self.assertFalse(dispatched)
+                    self.assertEqual(out["posted_keys"], ["finding:0", "finding:1"])
+                else:
+                    self.assertEqual(len(dispatched), 1)
+                    saved = dispatched[0]
+                    self.assertEqual(saved["delivery_intent"]["selected_keys"], ["finding:1"])
+                    self.assertNotEqual(saved["delivery_intent"]["operation_id"], "b" * 32)
+                    self.assertNotIn("predecessor", saved["delivery_intent"])
+                    self.assertEqual(saved["github_review_payload"]["comments"], wire["comments"][1:])
+                    self.assertEqual(saved["delivery_intent"]["selected_units"], 1)
+                    self.assertEqual(saved["delivery_intent"]["state"], "attempting")
+                    if scenario == "retry":
+                        self.assertEqual(out["requested_pending_keys"], ["finding:2"])
 
     def test_unknown_marker_and_payload_mismatches(self):
         """A different operation's marker is not ours to judge (the POST's 422
