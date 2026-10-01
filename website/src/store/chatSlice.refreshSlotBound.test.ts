@@ -20,7 +20,9 @@
  *  touched here; `chatSlice.warmSlotCacheBound.test.ts` owns it.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { configureStore } from '@reduxjs/toolkit'
+import { configureStore, type Reducer } from '@reduxjs/toolkit'
+import { withRefreshRevision } from './chat/slotRefresh'
+import type { ChatState } from './chat/state'
 
 const TOTAL = 300
 /** The slot-detail handler's own clamp (`min(int(limit), 500)`), mirrored so a
@@ -102,10 +104,34 @@ import { api } from '../api/client'
 
 const SLOT = 'slot-1'
 
+// Ordering receipts do not describe the visible view. Context meters seed only
+// missing values, so a concurrent measured update cannot be overwritten.
+const refreshBookkeeping = new Set<keyof ChatState>([
+  'recoveryRevision', 'refreshAppliedSeq', 'lastRecoveryRequestId',
+  'slotContextPct', 'slotContextTokens',
+])
+
+const guardedRefreshReducer: Reducer<ChatState> = (before, action) => {
+  const after = chatReducer(before, action)
+  if (before && refreshSlot.fulfilled.match(action)) {
+    // Derive writes from the real reducer, including its helper calls. A new
+    // refresh field must invalidate recovery on its own, not ride a row change.
+    const fields = new Set([...Object.keys(before), ...Object.keys(after)])
+    for (const field of fields as Set<keyof ChatState>) {
+      if (before[field] === after[field] || refreshBookkeeping.has(field)) continue
+      const isolatedWrite = withRefreshRevision(() => ({ ...before, [field]: after[field] }))
+      expect(isolatedWrite(before, { type: 'probe' }).recoveryRevision,
+        `refresh writes ${field}, but that field alone does not invalidate recovery`,
+      ).toBe((before.recoveryRevision ?? 0) + 1)
+    }
+  }
+  return after
+}
+
 function makeStore(extra: Record<string, unknown> = {}, beforeFulfilled?: () => void) {
   const base = chatReducer(undefined, { type: '@@INIT' })
   return configureStore({
-    reducer: { chat: chatReducer },
+    reducer: { chat: guardedRefreshReducer },
     preloadedState: { chat: { ...base, activeSlot: SLOT, ...extra } },
     middleware: (getDefault) => getDefault({ serializableCheck: false, immutableCheck: false }).concat(
       () => next => action => {

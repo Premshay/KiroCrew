@@ -3243,6 +3243,9 @@ including transitions back to the original value. The check applies to bounded
 pages, empty-view reads, and the bounded older-page walk for a disjoint page.
 Recovery retains the shared refresh dispatch sequence, so an older recovery
 cannot overwrite a newer refresh.
+The refresh scenario suite derives changed fields from the actual reducer output,
+including helper writes, and checks each field's independent invalidation. Only
+ordering receipts, the revision itself, and absent-only context seeds are exempt.
 The fulfillment reducer checks the same revision before writing; an update after
 payload creation also invalidates recovery. Reconnect requires the request id
 of an applied recovery and the same active slot. Switching slots resets the
